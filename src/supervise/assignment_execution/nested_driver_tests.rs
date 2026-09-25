@@ -666,10 +666,19 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         "yield-side-effects" => {
             collected.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous)
         }
+        "yield-side-effects-completed" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Completed)
+        }
         "parent-uncertain" | "yield-nonquiescent" => collected.external_run.process_tree = None,
         "parent-unconfined" => collected.external_run.side_effects = None,
         "parent-never-started" => collected.external_run.stdout.target_launch_attempted = false,
         "parent-failed" => collected.external_run.exit_code = Some(1),
+        "parent-external-side-effect-ambiguous" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous);
+        }
+        "parent-external-side-effect-completed" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Completed);
+        }
         "parent-wrong-worktree" => collected.external_run.cwd = repo.clone(),
         "parent-restored" | "yield-restored" => {
             collected.external_run =
@@ -689,10 +698,21 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         attempt,
         &collected,
     );
-    if case.starts_with("parent-")
+    if matches!(case, "yield-side-effects" | "yield-side-effects-completed") {
+        // Side effects invalidate the handoff itself, before a driver may
+        // inspect the yield report or expose any requested Worker IDs.
+        let error = binding
+            .err()
+            .context("accepted parent external side effects")?;
+        assert_eq!(
+            error.to_string(),
+            "nested serial handoff requires verified parent-process quiescence and integrity",
+            "unexpected handoff refusal for {case}"
+        );
+    } else if case.starts_with("parent-")
         || matches!(
             case,
-            "cancelled-before" | "yield-nonquiescent" | "yield-restored"
+            "cancelled-before" | "yield-nonquiescent" | "yield-restored" | "yield-side-effects"
         )
     {
         assert!(binding.is_err(), "accepted {case}");
@@ -833,6 +853,16 @@ fn nested_driver_refuses_unverified_or_substituted_parent_completion() -> Result
 }
 
 #[test]
+fn nested_driver_refuses_ambiguous_parent_external_side_effect() -> Result<()> {
+    driver_fixture("parent-external-side-effect-ambiguous")
+}
+
+#[test]
+fn nested_driver_refuses_completed_parent_external_side_effect() -> Result<()> {
+    driver_fixture("parent-external-side-effect-completed")
+}
+
+#[test]
 fn nested_driver_revalidates_authority_cancellation_and_current_policy_before_worker() -> Result<()>
 {
     for case in [
@@ -866,8 +896,9 @@ fn parent_turn_yield_refuses_nonquiescent_restored_or_revoked_parent() -> Result
         "yield-cancelled",
         "yield-blocked",
         "yield-side-effects",
+        "yield-side-effects-completed",
     ] {
-        driver_fixture(case)?;
+        driver_fixture(case).with_context(|| format!("parent-turn yield fixture case: {case}"))?;
     }
     Ok(())
 }

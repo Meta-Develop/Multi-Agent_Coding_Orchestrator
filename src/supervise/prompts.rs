@@ -37,6 +37,7 @@ fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -
 pub(super) enum PromptMeasurementRole {
     O1ChildOrchestrator,
     TerminalWorker,
+    Researcher,
     ChildSideReviewAuditor,
     ParentAcceptanceAuditor,
 }
@@ -536,10 +537,26 @@ pub(super) fn render_evidence_only_reaudit_prompt(
 The implementation candidate is mounted read-only for this operation. Do not edit repository content, apply patches, commit, reset, clean, delegate, launch workers, or change Git state.
 Run only validation and inspection needed to correct the report evidence. Every tool action remains subject to the supervisor pre-action review boundary.
 Redirect every build output and cache to the private writable $TMPDIR outside the preserved worktree. For Cargo, set CARGO_TARGET_DIR="$TMPDIR/maco-evidence-target" and use --locked so validation cannot generate or update a lockfile. Treat any validation that requires source generation as unavailable instead of changing the candidate.
-Return one OrchestratorReviewReport JSON value through the configured output-last-message path.
+Return one JSON report matching the contract below through the configured output-last-message path.
 "#;
+    let is_researcher = assignment.role == AgentRole::Researcher;
+    let researcher_schema = schema_path.with_file_name("researcher-report.schema.json");
+    let schema_path = if is_researcher {
+        researcher_schema.as_path()
+    } else {
+        schema_path
+    };
+    let report_contract = if is_researcher {
+        "Set role=\"researcher\" in a ResearcherReport with read_only=true and no_further_delegation=true. This read-only terminal report requires files_changed=[], worker_reports=[], audit_reports=[] and decomposition_completions=[]."
+    } else {
+        "Set role=\"child_orchestrator\" for this evidence-only OrchestratorReviewReport envelope, including when the immutable assignment role is Worker. This report format grants no delegation or implementation authority; the supervisor retains the original assignment role."
+    };
     let role_prefix = supervise_role_prefix(
-        SupervisePromptRole::O1ChildOrchestrator,
+        if is_researcher {
+            SupervisePromptRole::Researcher
+        } else {
+            SupervisePromptRole::O1ChildOrchestrator
+        },
         &assignment.id,
         None,
     );
@@ -562,7 +579,7 @@ Evidence-only operation:
 - Required candidate binding: {binding}
 
 Report contract:
-- Set role="child_orchestrator" for this evidence-only OrchestratorReviewReport envelope, including when the immutable assignment role is Worker. This report format grants no delegation or implementation authority; the supervisor retains the original assignment role.
+- {report_contract}
 - Preserve every reported value and all evidence in assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions from the authenticated source report. When the response schema requires a property absent from the authenticated report, represent optional evidence as null and genuinely empty evidence arrays as []; do not invent or discard evidence. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
 - Set audit_reports=[]; the supervisor collects the parent review evidence.
 - Omit review_lens_aggregate, gate_denials, and gate_correction_outcomes; these are supervisor-owned and absent from the Codex response schema.
@@ -593,7 +610,11 @@ Exact preserved diff presented for validation:
         diff = diff,
     );
     let measurement = PromptByteMeasurement::new(
-        PromptMeasurementRole::O1ChildOrchestrator,
+        if is_researcher {
+            PromptMeasurementRole::Researcher
+        } else {
+            PromptMeasurementRole::O1ChildOrchestrator
+        },
         &assignment.id,
         &prompt,
         cacheable_prefix,
@@ -690,6 +711,9 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
     child_launch_runtime: SupervisorRuntime,
     worker_launch_runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
+    if context.assignment.role == AgentRole::Researcher {
+        return render_researcher_prompt(context, field_guide, child_launch_runtime);
+    }
     if context.assignment.role == AgentRole::Worker {
         return render_direct_terminal_worker_prompt(
             context,
@@ -1111,6 +1135,49 @@ Direct worker assignment JSON:
         &assignment.id,
         &prompt,
         &cacheable_prefix,
+        WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
+}
+
+fn render_researcher_prompt(
+    context: ChildOrchestratorPromptContext<'_>,
+    field_guide: &SupervisorFieldGuidePrompt,
+    runtime: SupervisorRuntime,
+) -> Result<RenderedPromptWithMeasurements> {
+    validate_researcher_assignment(context.assignment)?;
+    if runtime != SupervisorRuntime::Codex || context.execution_target.is_some() {
+        bail!("researcher requires a managed Codex read-only worktree");
+    }
+    let prefix = "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect the assigned scope and return evidence in a ResearcherReport. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. Record every actual command execution exactly once in commands_run as command=[the exact executed shell command string] and cwd=the exact absolute working directory. Record its actual exit_code and status. Set timeout_seconds=0 and duration_ms=0, timed_out=false, stdout=\"\", stderr=\"\"; do not claim unobserved command metadata. Each validation_result must reference a distinct successful commands_run entry using the same single-string command. Include findings, remaining risk and next safe action. The parent independently checks the host command transcript and audits the evidence.\n";
+    let (model, effort) = role_model_selection(context.plan, AgentRole::Researcher);
+    let instruction_profile = phase_aware_instruction_profile_section(
+        AgentRole::Researcher,
+        OrchestrationPhase::Planning,
+        model.as_deref(),
+    );
+    let prompt = format!(
+        "{prefix}{}{}{instruction_profile}\nResearcher model: {}\nReasoning effort: {}\nClaim token: {}\nSemantic intent token: {:?}\nWorktree: {}\nReport output-last-message path: {}\nResearcherReport schema: {}\nTask: {}\nAssignment: {}\n",
+        supervise_role_prefix(SupervisePromptRole::Researcher, &context.assignment.id, None),
+        field_guide.section,
+        model.as_deref().unwrap_or("<runtime default>"),
+        effort.as_deref().unwrap_or("<runtime default>"),
+        context.claim_context.claim.token.get(),
+        context.claim_context.semantic_intent_token,
+        context.worktree.path.display(),
+        context.report_path.display(),
+        context.schema_path.with_file_name("researcher-report.schema.json").display(),
+        assignment_task(context.plan, context.assignment),
+        serde_json::to_string(context.assignment)?,
+    );
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::Researcher,
+        &context.assignment.id,
+        &prompt,
+        prefix,
         WORKER_PROMPT_FIXTURE_CEILING_BYTES,
     )?;
     Ok(RenderedPromptWithMeasurements {
@@ -1622,7 +1689,7 @@ pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleM
             vec![ECONOMY_PROFILE_MODEL],
             TerminalUnavailableModelFallback::RuntimeDefault,
         ),
-        AgentRole::Worker => (
+        AgentRole::Worker | AgentRole::Researcher => (
             "medium",
             Vec::new(),
             TerminalUnavailableModelFallback::RuntimeDefault,

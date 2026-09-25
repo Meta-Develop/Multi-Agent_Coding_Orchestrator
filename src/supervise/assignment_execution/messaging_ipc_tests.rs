@@ -60,6 +60,7 @@ const CHILD_PROBE_FILE: &str = "maco-messaging-child-probe";
 const IPC_PROBE_RESULTS_DIR: &str = "ipc-probe-results";
 const FIXTURE_MANIFEST_REL: &str = ".maco/assignment-messaging-fixture.env";
 const FIXTURE_MANIFEST_EMBED: &str = "@@MACO_ASSIGNMENT_MESSAGING_FIXTURE_MANIFEST@@";
+const FIXTURE_STREAM_EMBED: &str = "@@MACO_ASSIGNMENT_MESSAGING_FIXTURE_STREAM@@";
 const DISPOSABLE_PEER_PID_ENV: &str = "MACO_TEST_DISPOSABLE_PEER_PID";
 const DISPOSABLE_PEER_SECRET_ENV: &str = "MACO_TEST_DUMMY_PEER_SECRET";
 const EXACT_FILTER_SIMULATED: &str =
@@ -710,17 +711,15 @@ fn install_grok_provider_fixture(fixture_manifest: &Path) -> Result<(tempfile::T
             .to_str()
             .context("assignment messaging fixture manifest path is not UTF-8")?,
     );
+    // The exact executable is visible; its sibling data files intentionally are not.
+    let stream_embed = shell_single_quote(&fs::read_to_string(&stream)?.replace("\r\n", "\n"));
     // Windows checkouts may use CRLF; the Linux shebang must end with LF.
     fs::write(
         &installed,
         fs::read_to_string(&provider)?
             .replace("\r\n", "\n")
-            .replace(FIXTURE_MANIFEST_EMBED, &manifest_embed),
-    )?;
-    fs::copy(
-        &stream,
-        temp.path()
-            .join("assignment-messaging-provider.streaming-json"),
+            .replace(FIXTURE_MANIFEST_EMBED, &manifest_embed)
+            .replace(FIXTURE_STREAM_EMBED, &stream_embed),
     )?;
     #[cfg(unix)]
     {

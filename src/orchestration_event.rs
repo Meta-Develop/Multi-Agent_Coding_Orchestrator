@@ -44,6 +44,7 @@ pub enum OrchestrationRole {
     Supervisor,
     Orchestrator,
     Worker,
+    Researcher,
     Auditor,
 }
 

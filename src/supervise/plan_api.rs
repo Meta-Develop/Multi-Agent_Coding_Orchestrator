@@ -2253,6 +2253,11 @@ fn flatten_assignments_from_value(
             .transpose()?
             .map(Vec::as_slice)
             .unwrap_or_default();
+        if raw_assignment.get("role").and_then(Value::as_str) == Some("researcher")
+            && (!children.is_empty() || raw_assignment.get("mechanical_duty").is_some())
+        {
+            bail!("researcher assignments cannot delegate or declare mechanical_duty");
+        }
         flatten_assignments_from_value(children, assignments)?;
     }
     Ok(())
