@@ -5064,8 +5064,8 @@ fn publish_assignment_report(
         subject_authority,
         auditor_capability,
     )?;
-    with_supervisor_artifacts(context.artifacts, |writer, journal| {
-        persist_final_assignment_report(
+    let child_report = with_supervisor_artifacts(context.artifacts, |writer, journal| {
+        let persisted_report = persist_final_assignment_report(
             writer,
             journal,
             assignment,
@@ -5085,7 +5085,7 @@ fn publish_assignment_report(
                 role_transition_payload(&executed.record)?,
             );
         }
-        Ok(())
+        Ok(persisted_report)
     })?;
     let failure_flags = final_report_failure_flags(
         child_report.status == ReviewStatus::Succeeded,
@@ -5138,7 +5138,7 @@ pub(super) fn persist_final_assignment_report(
     final_report_relative: &Path,
     final_report_path: &Path,
     report: &OrchestratorReviewReport,
-) -> Result<()> {
+) -> Result<OrchestratorReviewReport> {
     match assignment.role {
         AgentRole::ChildOrchestrator => {
             write_child_report(writer, final_report_relative, report)?;
@@ -5149,12 +5149,23 @@ pub(super) fn persist_final_assignment_report(
             write_worker_report(writer, final_report_relative, &worker)?;
             record_final_worker_report_decision(journal, writer, journal_parent_id, &worker);
         }
+        AgentRole::Researcher => {
+            // Propagate the exact normalized terminal evidence to the parent aggregate.
+            return persist_final_researcher_report(
+                writer,
+                journal,
+                assignment,
+                journal_parent_id,
+                final_report_relative,
+                report,
+            );
+        }
         unsupported => bail!(
             "assignment role '{}' has no final report persistence contract",
             unsupported.as_str()
         ),
     }
-    Ok(())
+    Ok(report.clone())
 }
 
 fn initial_completed_parent_review_cycles(

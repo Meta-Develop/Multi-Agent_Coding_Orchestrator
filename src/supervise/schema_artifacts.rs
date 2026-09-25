@@ -36,6 +36,11 @@ pub(super) fn write_researcher_schemas(writer: &mut ArtifactRunWriter) -> Result
         writer,
         Path::new("schemas/researcher-report.codex-output.schema.json"),
         codex_response_format_schema(researcher_report_schema_value())?,
+    )?;
+    write_schema(
+        writer,
+        Path::new("schemas/researcher-final-report.schema.json"),
+        final_researcher_report_schema_value(),
     )
 }
 
