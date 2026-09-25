@@ -1626,7 +1626,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
         let mut by_id = BTreeMap::new();
         for evidence in completed {
             if by_id
-                .insert(evidence.report.id.as_str(), evidence)
+                .insert(evidence.report().id.as_str(), evidence)
                 .is_some()
             {
                 bail!("continuation contains duplicate completed Worker identities");
@@ -1654,7 +1654,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                 bail!("continuation requires one exact authored terminal Worker");
             }
             let report_bytes = evidence
-                .run
+                .run()
                 .output_last_message()
                 .context("continuation requires a descriptor-held Worker result")?;
             let expected_artifact = PathBuf::from("nested")
@@ -1663,8 +1663,8 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                 .join(worker_id)
                 .join("report.json");
             if report_bytes.len() > MAX_PARENT_CONTINUATION_BYTES
-                || evidence.artifacts.raw_report_relative != expected_artifact
-                || evidence.artifacts.prompt_path
+                || evidence.artifacts().raw_report_relative != expected_artifact
+                || evidence.artifacts().prompt_path
                     != context
                         .run_dir
                         .join("nested")
@@ -1672,40 +1672,41 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                         .join(format!("attempt-{source_attempt}"))
                         .join(worker_id)
                         .join("prompt.md")
-                || evidence.model_provenance.launch_runtime != SupervisorRuntime::Codex
-                || !evidence.run.stdout.target_launch_attempted
-                || evidence.run.cwd != preflight.worktree.path
-                || !evidence.run.scratch_quiescence_verified()
-                || !external_process_completed(&evidence.run, SupervisorRuntime::Codex)
-                || !external_containment_verified(&evidence.run, SupervisorRuntime::Codex)
-                || !evidence.run.sandbox_denials().is_empty()
-                || !evidence.run.gate_denials().is_empty()
-                || evidence.run.external_side_effect_state().is_some()
-                || evidence.run.environment_blocked()
-                || evidence.report.role != AgentRole::Worker
-                || evidence.report.assigned_paths != worker.assigned_paths
-                || evidence.report.semantic_symbols != worker.semantic_symbols
-                || evidence.report.semantic_modules != worker.semantic_modules
-                || evidence.report.claim_token != Some(preflight.claim.token.get())
-                || evidence.report.semantic_intent_token != preflight.semantic_token
-                || evidence.report.no_further_delegation != Some(true)
-                || evidence.report.files_changed != evidence.observed_changed_paths
-                || evidence.journals.len() != 1
-                || !evidence.journals.get(worker_id).is_some_and(|journal| {
+                || evidence.model_provenance().launch_runtime != SupervisorRuntime::Codex
+                || !evidence.run().stdout.target_launch_attempted
+                || evidence.run().cwd != preflight.worktree.path
+                || !evidence.run().scratch_quiescence_verified()
+                || !external_process_completed(evidence.run(), SupervisorRuntime::Codex)
+                || !external_containment_verified(evidence.run(), SupervisorRuntime::Codex)
+                || !evidence.run().sandbox_denials().is_empty()
+                || !evidence.run().gate_denials().is_empty()
+                || evidence.run().external_side_effect_state().is_some()
+                || evidence.run().environment_blocked()
+                || evidence.report().role != AgentRole::Worker
+                || evidence.report().assigned_paths != worker.assigned_paths
+                || evidence.report().semantic_symbols != worker.semantic_symbols
+                || evidence.report().semantic_modules != worker.semantic_modules
+                || evidence.report().claim_token != Some(preflight.claim.token.get())
+                || evidence.report().semantic_intent_token != preflight.semantic_token
+                || evidence.report().no_further_delegation != Some(true)
+                || evidence.report().files_changed != *evidence.observed_changed_paths()
+                || evidence.journals().len() != 1
+                || !evidence.journals().get(worker_id).is_some_and(|journal| {
                     matches!(journal.status, WorkerExecutionJournalStatus::Loaded(_))
                 })
             {
                 bail!("continuation Worker evidence is incomplete, oversized or has a different binding");
             }
-            if read_worker_report(Some(report_bytes), &expected_artifact)?.report != evidence.report
+            if read_worker_report(Some(report_bytes), &expected_artifact)?.report
+                != *evidence.report()
             {
                 bail!("continuation Worker report differs from its held capture");
             }
             summaries.push(json!({
                 "request_id": request_id, "worker_id": worker_id,
-                "worker_report": evidence.report,
-                "observed_changed_paths": evidence.observed_changed_paths,
-                "launched_model": evidence.model_provenance.launched_model,
+                "worker_report": evidence.report(),
+                "observed_changed_paths": evidence.observed_changed_paths(),
+                "launched_model": evidence.model_provenance().launched_model,
                 "report_artifact": expected_artifact,
             }));
             if serde_json::to_vec(&summaries)?.len() > MAX_PARENT_CONTINUATION_BYTES {

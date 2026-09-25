@@ -6,12 +6,70 @@ use super::*;
 
 /// Evidence for the enclosing parent's gate, never an accepted/materialized change.
 pub(super) struct NestedWorkerAttemptEvidence {
-    pub(super) report: WorkerReport,
-    pub(super) journals: WorkerExecutionJournalEvidenceSet,
-    pub(super) artifacts: ChildAttemptArtifacts,
-    pub(super) run: ExternalAgentRun,
-    pub(super) observed_changed_paths: Vec<PathBuf>,
-    pub(super) model_provenance: CompletedLaunchModelProvenance,
+    report: WorkerReport,
+    journals: WorkerExecutionJournalEvidenceSet,
+    artifacts: ChildAttemptArtifacts,
+    run: ExternalAgentRun,
+    observed_changed_paths: Vec<PathBuf>,
+    model_provenance: CompletedLaunchModelProvenance,
+    // Exact snapshots used below for scope and report validation; never recaptured.
+    candidate_before: PrimaryWorktreeSnapshot,
+    candidate_after: PrimaryWorktreeSnapshot,
+}
+
+impl NestedWorkerAttemptEvidence {
+    pub(super) fn report(&self) -> &WorkerReport {
+        &self.report
+    }
+    pub(super) fn journals(&self) -> &WorkerExecutionJournalEvidenceSet {
+        &self.journals
+    }
+    pub(super) fn artifacts(&self) -> &ChildAttemptArtifacts {
+        &self.artifacts
+    }
+    pub(super) fn run(&self) -> &ExternalAgentRun {
+        &self.run
+    }
+    pub(super) fn observed_changed_paths(&self) -> &Vec<PathBuf> {
+        &self.observed_changed_paths
+    }
+    pub(super) fn model_provenance(&self) -> &CompletedLaunchModelProvenance {
+        &self.model_provenance
+    }
+    pub(super) fn candidate_snapshots(
+        &self,
+    ) -> (&PrimaryWorktreeSnapshot, &PrimaryWorktreeSnapshot) {
+        (&self.candidate_before, &self.candidate_after)
+    }
+}
+
+// Deliberate corruptions for the existing negative continuation tests only.
+// Production consumers receive shared references and cannot rewrite evidence.
+#[cfg(test)]
+pub(super) fn corrupt_continuation_evidence_for_test(
+    completed: &mut [NestedWorkerAttemptEvidence],
+    case: &str,
+    max_bytes: usize,
+) -> Result<()> {
+    match case {
+        "continuation-duplicate" => completed[1].report.id = "worker".into(),
+        "continuation-forged-id" => completed[1].report.id = "outside".into(),
+        "continuation-forged-summary" => completed[0].report.remaining_risk = "substituted".into(),
+        "continuation-wrong-attempt-artifact" => {
+            completed[0].artifacts.raw_report_relative =
+                "nested/parent/attempt-99/worker/report.json".into()
+        }
+        "continuation-missing-journal" => completed[0].journals.clear(),
+        "continuation-restored" => {
+            completed[0].run = serde_json::from_value(serde_json::to_value(&completed[0].run)?)?
+        }
+        "continuation-oversize" => {
+            completed[0].report.remaining_risk = "x".repeat(max_bytes);
+            completed[0].run.output_last_message = Some(serde_json::to_vec(&completed[0].report)?);
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 fn terminal_subject(
@@ -519,6 +577,8 @@ pub(super) fn execute_nested_worker_attempt(
             journals,
             artifacts,
             run,
+            candidate_before: worker_before,
+            candidate_after: worker_after,
             observed_changed_paths: worker_changes.paths,
             model_provenance: bound.model_provenance,
         })

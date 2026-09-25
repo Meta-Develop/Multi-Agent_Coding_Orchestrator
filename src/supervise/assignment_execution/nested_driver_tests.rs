@@ -226,6 +226,46 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             parent_running.store(false, Ordering::SeqCst);
         } else if case == "worker-uncertain" {
             run.process_tree = None;
+        } else if case.starts_with("bound-evidence-") {
+            match case {
+                "bound-evidence-edits" | "bound-evidence-second-failure"
+                    if case == "bound-evidence-edits" || subject.id == "worker-two" =>
+                {
+                    fs::write(
+                        command.cwd.join("src/lib.rs"),
+                        format!("// written by {}\n", subject.id),
+                    )
+                    .unwrap();
+                    let mut report: WorkerReport =
+                        serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+                    report.files_changed = vec!["src/lib.rs".into()];
+                    report.commands_run = vec![serde_json::from_value(json!({
+                        "command":["fixture-edit"], "cwd":command.cwd, "exit_code":0,
+                        "status":"succeeded", "timeout_seconds":1, "duration_ms":1, "timed_out":false
+                    })).unwrap()];
+                    run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+                    let mut captures = run.worker_journal_artifacts().to_vec();
+                    captures[0].status = crate::external_agent::WorkerJournalArtifactCaptureStatus::Loaded(
+                        serde_json::to_vec(&json!({"command":["fixture-edit"], "cwd":command.cwd,
+                            "start_timestamp":"fixture-start", "end_timestamp":"fixture-end", "changed_paths":["src/lib.rs"]})).unwrap());
+                    run.replace_worker_journal_artifacts(captures);
+                }
+                "bound-evidence-forged" | "bound-evidence-widened" => {
+                    let mut report: WorkerReport =
+                        serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+                    if case == "bound-evidence-forged" {
+                        report.id = "forged".into();
+                    } else {
+                        report.assigned_paths.push("outside".into());
+                    }
+                    run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+                }
+                "bound-evidence-failure" | "bound-evidence-second-failure" => {
+                    run.exit_code = Some(1)
+                }
+                "bound-evidence-cancel-during" => cancellation.cancel(),
+                _ => {}
+            }
         }
         run
     };
@@ -375,10 +415,20 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             &mut outcome,
             &mut collected,
         )?;
-        let expected = if case == "bound-shared-driver" {
-            vec!["parent", "worker-two", "worker"]
-        } else {
-            vec!["parent"]
+        let expected = match case {
+            "bound-shared-driver"
+            | "bound-evidence-happy"
+            | "bound-evidence-edits"
+            | "bound-evidence-candidate-after"
+            | "bound-evidence-cancel-after"
+            | "bound-evidence-second-failure"
+            | "bound-evidence-claim-revoked" => vec!["parent", "worker-two", "worker"],
+            "bound-evidence-forged"
+            | "bound-evidence-widened"
+            | "bound-evidence-failure"
+            | "bound-evidence-cancel-during" => vec!["parent", "worker-two"],
+            case if case.starts_with("bound-evidence-handoff-") => vec!["parent", "worker-two"],
+            _ => vec!["parent"],
         };
         assert_eq!(*calls.lock().unwrap(), expected);
         context.manager.verify_write_execution_lease(
@@ -418,29 +468,14 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             driver.execute_worker("worker-two", &policy)?,
         ];
         drop(driver);
-        match case {
-            "continuation-missing" => {
-                completed.pop();
-            }
-            "continuation-duplicate" => completed[1].report.id = "worker".into(),
-            "continuation-forged-id" => completed[1].report.id = "outside".into(),
-            "continuation-forged-summary" => {
-                completed[0].report.remaining_risk = "substituted".into()
-            }
-            "continuation-wrong-attempt-artifact" => {
-                completed[0].artifacts.raw_report_relative =
-                    "nested/parent/attempt-99/worker/report.json".into()
-            }
-            "continuation-missing-journal" => completed[0].journals.clear(),
-            "continuation-restored" => {
-                completed[0].run = serde_json::from_value(serde_json::to_value(&completed[0].run)?)?
-            }
-            "continuation-oversize" => {
-                completed[0].report.remaining_risk = "x".repeat(MAX_PARENT_CONTINUATION_BYTES);
-                completed[0].run.output_last_message =
-                    Some(serde_json::to_vec(&completed[0].report)?);
-            }
-            _ => {}
+        if case == "continuation-missing" {
+            completed.pop();
+        } else {
+            nested_worker_executor::corrupt_continuation_evidence_for_test(
+                &mut completed,
+                case,
+                MAX_PARENT_CONTINUATION_BYTES,
+            )?;
         }
         let contract = ParentContinuationLaunch::from_unbound_completed_workers_for_test(
             &context, &preflight, &yielded, &completed,
@@ -521,7 +556,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             assert_eq!(summaries[0]["request_id"], "request-2");
             assert_eq!(
                 summaries[0]["worker_report"],
-                serde_json::to_value(&completed[1].report)?
+                serde_json::to_value(completed[1].report())?
             );
             assert!(contract.revalidate(&context, &preflight, 1).is_err());
             let prepared = match prepare_child_attempt(
@@ -717,8 +752,8 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         );
         if case == "happy" {
             let evidence = result?;
-            assert_eq!(evidence.report.id, "worker");
-            assert_eq!(evidence.journals.len(), 1);
+            assert_eq!(evidence.report().id, "worker");
+            assert_eq!(evidence.journals().len(), 1);
             assert!(
                 driver.execute_worker("worker", &active_policy).is_err(),
                 "replayed worker"

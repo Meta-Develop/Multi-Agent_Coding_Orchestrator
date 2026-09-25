@@ -142,7 +142,7 @@ pub(super) fn exercise(
         "bound-cancelled-before" => context.cancellation.cancel(),
         _ => {}
     }
-    let mut foreign_binding = binding;
+    let mut foreign_binding = binding.clone();
     if case == "bound-foreign-generation" {
         foreign_binding = with_supervisor_messaging_session(context.run_dir, |factory| {
             factory.worker_request_binding(
@@ -215,6 +215,186 @@ pub(super) fn exercise(
     assert_eq!(view.turn, 7);
     assert_eq!(view.watermark.last_sequence, 2);
     let before = context.sync_store.status_snapshot()?;
+    if case.starts_with("bound-evidence-") {
+        let mut policy = context.budget_policy.clone();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Codex,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
+            },
+        );
+        let consumer = if case == "bound-evidence-stale" {
+            &foreign_turn
+        } else {
+            &turn
+        };
+        if case == "bound-evidence-cancel-before" {
+            context.cancellation.cancel();
+        }
+        if case == "bound-evidence-candidate-before" {
+            fs::write(
+                preflight.worktree.path.join("src/lib.rs"),
+                "changed before dispatch\n",
+            )?;
+        }
+        if let Some(boundary) = case.strip_prefix("bound-evidence-handoff-") {
+            bound_parent_turn::set_candidate_handoff_mutation(
+                boundary.starts_with("before"),
+                if boundary.ends_with("outside") {
+                    "outside.txt"
+                } else {
+                    "src/lib.rs"
+                }
+                .into(),
+            );
+        }
+        let usage_start = outcome.usage_samples.len();
+        let commands_start = outcome.command_records.len();
+        let completed = bound.execute_serial(context, preflight, 1, consumer, outcome, &policy);
+        if matches!(
+            case,
+            "bound-evidence-stale"
+                | "bound-evidence-cancel-before"
+                | "bound-evidence-candidate-before"
+        ) {
+            assert!(completed.is_err());
+            return Ok(());
+        }
+        // Even failure cannot produce another driver with a fresh outcome/attempt.
+        for attempt in [1, 2] {
+            let mut other = AssignmentExecutionOutcome::default();
+            assert!(NestedWorkerSerialDriver::from_collected_parent(
+                context, preflight, &mut other, attempt, parent
+            )
+            .is_err());
+        }
+        if matches!(
+            case,
+            "bound-evidence-forged"
+                | "bound-evidence-widened"
+                | "bound-evidence-failure"
+                | "bound-evidence-cancel-during"
+                | "bound-evidence-second-failure"
+        ) || case.starts_with("bound-evidence-handoff-")
+        {
+            let error = completed
+                .err()
+                .with_context(|| format!("accepted {case}"))?;
+            if case.starts_with("bound-evidence-handoff-before") {
+                assert!(
+                    format!("{error:#}").contains("bound predecessor"),
+                    "{error:#}"
+                );
+            } else if case.starts_with("bound-evidence-handoff-after") {
+                assert!(
+                    format!("{error:#}").contains("candidate snapshot changed"),
+                    "{error:#}"
+                );
+            } else if case == "bound-evidence-second-failure" {
+                assert!(
+                    format!("{error:#}").contains("did not complete successfully"),
+                    "{error:#}"
+                );
+                assert_eq!(
+                    fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
+                    "// written by worker-two\n"
+                );
+                assert_eq!(outcome.command_records.len() - commands_start, 2);
+            }
+            assert!(context.cancellation.is_cancelled());
+            assert!(outcome.assignment_failed);
+            let mut recovered = WorkerRequestInbox::recover(
+                repository_authenticator_key_only(context.repo)?,
+                binding.clone(),
+            )?;
+            assert!(recovered.requires_reconciliation());
+            assert!(recovered.submit("z-first", "worker-two").is_err());
+            assert!(recovered.transition("z-first", crate::supervise::messaging_bridge::worker_requests::WorkerRequestStatus::Reserved).is_err());
+            return Ok(());
+        }
+        let completed = completed?;
+        let (view, workers) = completed.revalidate(context, preflight, 1, &turn)?;
+        assert_eq!(view.binding, &binding);
+        assert_eq!(view.turn, 7);
+        assert_eq!(view.watermark.last_sequence, 2);
+        assert_eq!(
+            workers.iter().map(|w| w.identity()).collect::<Vec<_>>(),
+            [(1, "z-first", "worker-two"), (2, "a-second", "worker")]
+        );
+        assert_eq!(
+            workers.iter().flat_map(|w| w.usage()).collect::<Vec<_>>(),
+            outcome.usage_samples[usage_start..]
+                .iter()
+                .collect::<Vec<_>>()
+        );
+        for worker in workers {
+            assert_eq!(worker.evidence().report().id, worker.identity().2);
+            assert_eq!(worker.evidence().journals().len(), 1);
+            assert!(worker.evidence().run().output_last_message().is_some());
+            if case == "bound-evidence-edits" {
+                assert_eq!(
+                    worker.evidence().observed_changed_paths(),
+                    &[PathBuf::from("src/lib.rs")]
+                );
+                assert_ne!(
+                    worker.candidate_snapshots().0,
+                    worker.candidate_snapshots().1
+                );
+            }
+        }
+        assert_eq!(
+            workers[0].candidate_snapshots().1,
+            workers[1].candidate_snapshots().0
+        );
+        assert!(completed.revalidate(context, preflight, 2, &turn).is_err());
+        assert!(completed
+            .revalidate(context, preflight, 1, &foreign_turn)
+            .is_err());
+        // Process liveness is a fresh observation, not part of claim identity.
+        let after = context.sync_store.status_snapshot()?;
+        assert_eq!(after.len(), before.len());
+        for (after, before) in after.iter().zip(&before) {
+            assert_eq!(after.claim, before.claim);
+            assert_eq!(after.owner_run_id, before.owner_run_id);
+            assert_eq!(after.owner_process_id, before.owner_process_id);
+        }
+        if case == "bound-evidence-candidate-after" {
+            fs::write(
+                preflight.worktree.path.join("src/lib.rs"),
+                "changed after completion\n",
+            )?;
+            assert!(completed.revalidate(context, preflight, 1, &turn).is_err());
+        }
+        if case == "bound-evidence-cancel-after" {
+            context.cancellation.cancel();
+            assert!(completed.revalidate(context, preflight, 1, &turn).is_err());
+        }
+        if case == "bound-evidence-claim-revoked" {
+            context.sync_store.release(preflight.claim.token)?;
+            assert!(completed.revalidate(context, preflight, 1, &turn).is_err());
+        }
+        // A bound result is still evidence, not permission to activate continuation.
+        assert!(ParentContinuationLaunch::from_completed_workers(
+            context,
+            preflight,
+            &parent_turn_yield::validate_frozen_yield_bytes(
+                parent.external_run.output_last_message().unwrap(),
+                context.options.run_id.as_str(),
+                &preflight.assignment,
+                1,
+                &[
+                    parent_turn_yield::ExpectedWorkerRequest::new("z-first", "worker-two")?,
+                    parent_turn_yield::ExpectedWorkerRequest::new("a-second", "worker")?
+                ]
+            )?,
+            &[]
+        )
+        .is_err());
+        return Ok(());
+    }
     if matches!(case, "bound-shared-driver" | "bound-shared-cancelled") {
         let mut policy = context.budget_policy.clone();
         policy.set_selector_binding_for_test(
@@ -269,7 +449,7 @@ pub(super) fn exercise(
         assert_eq!(
             completed
                 .iter()
-                .map(|e| e.report.id.as_str())
+                .map(|e| e.report().id.as_str())
                 .collect::<Vec<_>>(),
             ["worker-two", "worker"]
         );
@@ -354,6 +534,35 @@ pub(super) fn exercise(
 }
 
 #[test]
+fn bound_nested_evidence_two_workers_preserve_frozen_identity_and_block_replay() -> Result<()> {
+    nested_driver_tests::driver_fixture("bound-evidence-happy")?;
+    nested_driver_tests::driver_fixture("bound-evidence-edits")
+}
+
+#[test]
+fn bound_nested_evidence_rejects_forged_widened_failed_and_cancelled_results() -> Result<()> {
+    for case in ["forged", "widened", "failure", "cancel-during"] {
+        nested_driver_tests::driver_fixture(&format!("bound-evidence-{case}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn bound_nested_evidence_revalidates_source_candidate_and_held_resources() -> Result<()> {
+    for case in [
+        "stale",
+        "cancel-before",
+        "candidate-before",
+        "candidate-after",
+        "cancel-after",
+        "claim-revoked",
+    ] {
+        nested_driver_tests::driver_fixture(&format!("bound-evidence-{case}"))?;
+    }
+    Ok(())
+}
+
+#[test]
 fn bound_parent_turn_shares_preflight_with_one_driver_and_serial_workers() -> Result<()> {
     nested_driver_tests::driver_fixture("bound-shared-driver")
 }
@@ -423,4 +632,17 @@ fn bound_parent_turn_rejects_same_path_candidate_drift_and_incomplete_inspection
         nested_driver_tests::driver_fixture(&format!("bound-candidate-{case}"))?;
     }
     Ok(())
+}
+
+#[test]
+fn bound_nested_evidence_rejects_mutation_at_executor_handoffs() -> Result<()> {
+    for boundary in ["before", "before-outside", "after", "after-outside"] {
+        nested_driver_tests::driver_fixture(&format!("bound-evidence-handoff-{boundary}"))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn bound_nested_evidence_second_failure_retains_first_edit_without_replay() -> Result<()> {
+    nested_driver_tests::driver_fixture("bound-evidence-second-failure")
 }
