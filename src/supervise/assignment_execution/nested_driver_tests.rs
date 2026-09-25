@@ -185,6 +185,25 @@ fn driver_fixture(case: &str) -> Result<()> {
             executable_identity: "fixture".into(),
         });
         if subject.id == "parent" {
+            if case.starts_with("yield-") {
+                let report = json!({
+                    "version":1, "outcome":"yield_workers", "run_id":run_id.as_str(),
+                    "parent_id":"parent", "parent_attempt":1,
+                    "requests":[{"request_id":"request-1", "worker_id":"worker"}]
+                });
+                let mut captured = report.clone();
+                if case == "yield-forged-capture" {
+                    captured["requests"][0]["request_id"] = json!("forged");
+                }
+                // Path bytes disagree with the held descriptor result. Yield
+                // validation must use the latter, including when it is invalid.
+                fs::write(
+                    &command.output_last_message,
+                    serde_json::to_vec(&report).unwrap(),
+                )
+                .unwrap();
+                run.output_last_message = Some(serde_json::to_vec(&captured).unwrap());
+            }
             parent_running.store(false, Ordering::SeqCst);
         } else if case == "worker-uncertain" {
             run.process_tree = None;
@@ -258,12 +277,16 @@ fn driver_fixture(case: &str) -> Result<()> {
     )?;
     assert_eq!(*calls.lock().unwrap(), ["parent"]);
     match case {
-        "parent-uncertain" => collected.external_run.process_tree = None,
+        "yield-blocked" => collected.environment_blocked = true,
+        "yield-side-effects" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous)
+        }
+        "parent-uncertain" | "yield-nonquiescent" => collected.external_run.process_tree = None,
         "parent-unconfined" => collected.external_run.side_effects = None,
         "parent-never-started" => collected.external_run.stdout.target_launch_attempted = false,
         "parent-failed" => collected.external_run.exit_code = Some(1),
         "parent-wrong-worktree" => collected.external_run.cwd = repo.clone(),
-        "parent-restored" => {
+        "parent-restored" | "yield-restored" => {
             collected.external_run =
                 serde_json::from_value(serde_json::to_value(&collected.external_run)?)?;
         }
@@ -281,8 +304,36 @@ fn driver_fixture(case: &str) -> Result<()> {
         attempt,
         &collected,
     );
-    if case.starts_with("parent-") || case == "cancelled-before" {
+    if case.starts_with("parent-")
+        || matches!(
+            case,
+            "cancelled-before" | "yield-nonquiescent" | "yield-restored"
+        )
+    {
         assert!(binding.is_err(), "accepted {case}");
+    } else if case.starts_with("yield-") {
+        let driver = binding?;
+        if case == "yield-revoked" {
+            sync_store.release(claim.token)?;
+        }
+        if case == "yield-cancelled" {
+            cancellation.cancel();
+        }
+        let expected = [parent_turn_yield::ExpectedWorkerRequest::new(
+            "request-1",
+            "worker",
+        )?];
+        let result = driver.validate_parent_turn_yield(&expected);
+        if case == "yield-happy" {
+            let validated = result?;
+            assert_eq!(validated.parent_binding(), (run_id.as_str(), "parent", 1));
+            assert_eq!(
+                validated.requests().collect::<Vec<_>>(),
+                [("request-1", "worker")]
+            );
+        } else {
+            assert!(result.is_err(), "accepted {case}");
+        }
     } else {
         let mut driver = binding?;
         let mut active_policy = context.budget_policy.clone();
@@ -347,7 +398,7 @@ fn driver_fixture(case: &str) -> Result<()> {
         &parent.id,
         preflight.worktree_write_lease.as_ref().unwrap(),
     )?;
-    if case != "claim-revoked" {
+    if !matches!(case, "claim-revoked" | "yield-revoked") {
         assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
     }
     assert_eq!(ledger.report()?.active_reservations, 0);
@@ -400,4 +451,25 @@ fn nested_driver_revalidates_authority_cancellation_and_current_policy_before_wo
 #[test]
 fn nested_driver_uncertain_worker_cancels_parent_continuation() -> Result<()> {
     driver_fixture("worker-uncertain")
+}
+
+#[test]
+fn parent_turn_yield_validates_held_capture_without_executing_workers() -> Result<()> {
+    driver_fixture("yield-happy")?;
+    driver_fixture("yield-forged-capture")
+}
+
+#[test]
+fn parent_turn_yield_refuses_nonquiescent_restored_or_revoked_parent() -> Result<()> {
+    for case in [
+        "yield-nonquiescent",
+        "yield-restored",
+        "yield-revoked",
+        "yield-cancelled",
+        "yield-blocked",
+        "yield-side-effects",
+    ] {
+        driver_fixture(case)?;
+    }
+    Ok(())
 }

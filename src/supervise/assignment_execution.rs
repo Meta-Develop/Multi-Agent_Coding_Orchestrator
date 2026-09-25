@@ -5,6 +5,10 @@ mod nested_worker;
 #[allow(dead_code)]
 #[path = "nested_worker_executor.rs"]
 mod nested_worker_executor;
+// Staged typed yield validation only; no scheduler or IPC consumer.
+#[allow(dead_code)]
+#[path = "parent_turn_yield.rs"]
+mod parent_turn_yield;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
