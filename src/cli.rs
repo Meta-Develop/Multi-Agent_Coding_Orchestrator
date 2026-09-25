@@ -1183,7 +1183,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .map(|path| supervise::bind_operator_prior_data(&resolved_repo, path))
                     .transpose()?
             };
-            let options = SupervisorRunOptions {
+            let supplied_runtime_bin = args.runtime_bin.clone();
+            let mut options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
@@ -1207,6 +1208,37 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     owner: "maco-supervise".to_string(),
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
+            };
+            let additional_runtime_bins = args
+                .additional_runtime_bin
+                .iter()
+                .map(|binding| (binding.runtime, binding.executable.clone()))
+                .collect::<Vec<_>>();
+            let _runtime_executable_guard = if resume_existing {
+                supervise::bind_frozen_runtime_executables_for_run(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    supplied_runtime_bin.as_deref(),
+                    &additional_runtime_bins,
+                )?
+                .map(|(guard, primary)| {
+                    options.codex_bin = primary;
+                    guard
+                })
+            } else if additional_runtime_bins.is_empty() {
+                None
+            } else {
+                let primary = supplied_runtime_bin
+                    .as_deref()
+                    .context("--additional-runtime-bin requires an explicit --runtime-bin")?;
+                Some(supervise::bind_explicit_runtime_executables(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    primary,
+                    &additional_runtime_bins,
+                )?)
             };
             let outcome = (|| {
                 let report = match (goal_spec, resume_existing) {
@@ -1654,6 +1686,14 @@ struct RunSuperviseArgs {
     /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
+    /// Additional exact executable for a distinct runtime in this supervise run.
+    /// Requires an absolute primary --runtime-bin as well.
+    #[arg(
+        long = "additional-runtime-bin",
+        value_name = "RUNTIME=ABSOLUTE_EXECUTABLE",
+        value_parser = parse_additional_runtime_bin
+    )]
+    additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
@@ -5184,6 +5224,48 @@ mod cli_integration_tests {
         ]);
         assert_eq!(from_goal.runtime, Some(supervise::SupervisorRuntime::Grok));
         assert_eq!(from_goal.from_goal, Some(PathBuf::from("goal.md")));
+    }
+
+    #[test]
+    fn supervise_run_parses_bounded_additional_runtime_bindings() {
+        let args = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--runtime",
+            "codex",
+            "--runtime-bin",
+            "/opt/codex",
+            "--additional-runtime-bin",
+            "grok=/opt/grok",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(args.additional_runtime_bin.len(), 1);
+        assert_eq!(
+            args.additional_runtime_bin[0].runtime,
+            supervise::SupervisorRuntime::Grok
+        );
+        assert_eq!(
+            args.additional_runtime_bin[0].executable,
+            PathBuf::from("/opt/grok")
+        );
+        assert!(Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--additional-runtime-bin",
+            "unknown=/opt/agent",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ])
+        .is_err());
     }
 
     #[test]

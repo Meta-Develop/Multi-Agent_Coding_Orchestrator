@@ -125,6 +125,9 @@ pub(crate) fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
 ) -> Result<PathBuf> {
+    if let Some(program) = super::runtime_executables::selected_program(launch_runtime, options)? {
+        return Ok(program);
+    }
     match launch_runtime {
         SupervisorRuntime::Codex if options.runtime == SupervisorRuntime::Codex => {
             Ok(options.codex_bin.clone())
@@ -610,8 +613,12 @@ fn bind_selected_runtime_launch(
         );
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
-    if launch_runtime.is_adapter_subprocess() {
+    if launch_runtime.is_adapter_subprocess()
+        || super::runtime_executables::captured_binding().is_some()
+    {
         command.program = selected_runtime_program(launch_runtime, options)?;
+    }
+    if launch_runtime.is_adapter_subprocess() {
         command = command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?,
@@ -2941,6 +2948,14 @@ fn dispatch_and_capture_child_attempt<'a>(
             }
         }
     }
+    if let Err(error) = super::runtime_executables::validate_launch(&command) {
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+        })?;
+        return Err(error);
+    }
     let external_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
             let review_context = if requires_hosted_pre_action_review(&command) {
@@ -4230,8 +4245,12 @@ fn prepare_parent_auditor<'a>(
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
-    if launch_runtime.is_adapter_subprocess() {
+    if launch_runtime.is_adapter_subprocess()
+        || super::runtime_executables::captured_binding().is_some()
+    {
         auditor_command.program = selected_runtime_program(launch_runtime, options)?;
+    }
+    if launch_runtime.is_adapter_subprocess() {
         auditor_command = auditor_command.with_runtime_adapter(
             launch_runtime,
             crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?,
@@ -4509,6 +4528,18 @@ fn dispatch_and_collect_parent_auditor(
                 return Err(error);
             }
         }
+    }
+    if let Err(error) = super::runtime_executables::validate_launch(&auditor_command) {
+        drop(auditor_incoming_root);
+        drop(auditor_capture_root);
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            discard_invocation_scratches(
+                writer,
+                &auditor_incoming_scratch,
+                &auditor_capture_scratch,
+            )
+        })?;
+        return Err(error);
     }
     let auditor_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
