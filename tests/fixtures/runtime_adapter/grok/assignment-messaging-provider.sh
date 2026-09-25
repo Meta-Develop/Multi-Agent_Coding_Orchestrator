@@ -141,5 +141,4 @@ else
 fi
 "$binary" --exact "$filter" --nocapture --quiet >&2
 
-stream="$(dirname "$0")/assignment-messaging-provider.streaming-json"
-cat "$stream"
+printf '%s' @@MACO_ASSIGNMENT_MESSAGING_FIXTURE_STREAM@@

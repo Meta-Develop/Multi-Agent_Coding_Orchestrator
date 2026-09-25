@@ -1099,6 +1099,7 @@ fn role_model_refusal_reason(role: AgentRole, model: Option<&str>) -> Option<Str
         }
         AgentRole::Auditor | AgentRole::GateClassifier => "model_ineligible_for_review_auditor",
         AgentRole::Worker => return None,
+        AgentRole::Researcher => "model_ineligible_for_read_only_researcher",
     };
     validate_known_judgment_role_model(role, Some(model))
         .is_err()
@@ -1108,7 +1109,7 @@ fn role_model_refusal_reason(role: AgentRole, model: Option<&str>) -> Option<Str
 fn minimum_authority_capability(role: AgentRole) -> ModelCapabilityClass {
     match role {
         AgentRole::Worker => ModelCapabilityClass::WeakMechanical,
-        AgentRole::Supervisor | AgentRole::ChildOrchestrator => {
+        AgentRole::Supervisor | AgentRole::ChildOrchestrator | AgentRole::Researcher => {
             ModelCapabilityClass::GeneralJudgment
         }
         AgentRole::Auditor | AgentRole::GateClassifier => ModelCapabilityClass::CriticalJudgment,
@@ -1120,6 +1121,7 @@ fn agent_role_label(role: AgentRole) -> &'static str {
         AgentRole::Supervisor => "supervisor",
         AgentRole::ChildOrchestrator => "child_orchestrator",
         AgentRole::Worker => "worker",
+        AgentRole::Researcher => "researcher",
         AgentRole::GateClassifier => "gate_classifier",
         AgentRole::Auditor => "auditor",
     }

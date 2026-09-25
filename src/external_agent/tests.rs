@@ -1,4 +1,111 @@
 use super::*;
+
+thread_local! {
+    static GROK_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
+}
+
+pub(super) fn run_grok_preflight_hook() {
+    GROK_PREFLIGHT_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().take() {
+            hook();
+        }
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_preflight_launch_evidence_and_source_replacement() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
+    for mutation in ["none", "missing", "replaced"] {
+        let temp = tempfile::tempdir()?;
+        let (harness, home, binding) = build_cam_grok_test_harness("account-a")?;
+        let command = admitted_verified_grok_cam_command(temp.path())?
+            .with_environment_requirement(EnvironmentRequirement::executable(
+                EnvironmentExecutable::Git,
+                None,
+            ))
+            .with_environment_requirement(EnvironmentRequirement::network(
+                EnvironmentNetworkAccess::Enabled,
+            ));
+        GROK_PREFLIGHT_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move || {
+                if mutation != "none" {
+                    let auth = home.join("auth.json");
+                    fs::rename(&auth, home.join("held-auth.json")).unwrap();
+                    if mutation == "replaced" {
+                        fs::copy(CAM_GROK_AUTH_FIXTURE, auth).unwrap();
+                    }
+                }
+            }));
+        });
+        let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+        assert!(
+            GROK_PREFLIGHT_HOOK.with(|hook| hook.borrow().is_none()),
+            "launch must reach preflight: {report:#?}"
+        );
+        let auth = report
+            .environment_preflight_results()
+            .iter()
+            .find(|result| result.requirement == grok_auth_environment_requirement())
+            .expect("launch must record auth preflight");
+        if mutation == "none" {
+            assert_verified_grok_cam_admitted_provider_failure(&report, &binding)?;
+            assert_eq!(auth.status, EnvironmentPreflightStatus::Satisfied);
+            assert!(report
+                .environment_preflight_results()
+                .iter()
+                .any(|result| result.requirement
+                    == external_sandbox_requirement(ExternalAgentInvocation::Grok)
+                    && result.status == EnvironmentPreflightStatus::Satisfied));
+            assert!(!report
+                .environment_preflight_results()
+                .iter()
+                .any(|result| result.requirement == codex_environment_requirement()));
+            for requirement in &command.environment_requirements {
+                assert!(report.environment_preflight_results().iter().any(|result| {
+                    &result.requirement == requirement
+                        && result.status == EnvironmentPreflightStatus::Satisfied
+                }));
+            }
+        } else {
+            assert_eq!(auth.status, EnvironmentPreflightStatus::Blocked);
+            assert!(!report.stdout.target_launch_attempted);
+            assert!(
+                !report
+                    .stdout
+                    .run_metadata
+                    .environment_preflight_process_started
+            );
+            assert_eq!(
+                report.environment_failures()[0].category,
+                EnvironmentFailureCategory::MissingCredential
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_preflight_rejects_unavailable_offline_requirement_before_launch() -> Result<()> {
+    let _no_socket = CamSocketEnvGuard::unset();
+    let temp = tempfile::tempdir()?;
+    let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+    let command = admitted_verified_grok_cam_command(temp.path())?.with_environment_requirement(
+        EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
+    );
+    let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
+    assert!(!report.stdout.target_launch_attempted, "{report:#?}");
+    assert!(report.environment_preflight_results().iter().any(|result| {
+        result.requirement == EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled)
+            && result.status == EnvironmentPreflightStatus::Blocked
+    }));
+    assert!(report
+        .environment_failures()
+        .iter()
+        .any(|failure| { failure.category == EnvironmentFailureCategory::SandboxUnavailable }));
+    Ok(())
+}
 #[cfg(target_os = "linux")]
 use crate::agent_lifecycle::{AgentListFilter, AgentRegistry};
 use crate::process_runner::{
@@ -385,6 +492,437 @@ fn validate_universal_pre_action_coverage_allows_worktree_and_refuses_primary() 
 }
 
 #[test]
+fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions() {
+    let spec = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(5),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_agent_lifecycle("/registry", "researcher", "research-run", "research-task");
+    let selected =
+        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+    assert_eq!(selected, cfg!(target_os = "linux"));
+    assert!(!should_use_duplex_review(
+        &spec,
+        ExternalExecutionRuntime::Verified,
+        true
+    ));
+    assert!(!should_use_read_only_researcher_app_server(
+        &spec,
+        ExternalExecutionRuntime::NonpublishableSimulation
+    ));
+    for role in ["worker", "auditor", "child_orchestrator", "Researcher"] {
+        let mut other = spec.clone();
+        other.agent_lifecycle.as_mut().unwrap().role = role.to_string();
+        assert!(!should_use_read_only_researcher_app_server(
+            &other,
+            ExternalExecutionRuntime::Verified
+        ));
+    }
+    let mut other = spec.clone();
+    other.agent_lifecycle = None;
+    assert!(!should_use_read_only_researcher_app_server(
+        &other,
+        ExternalExecutionRuntime::Verified
+    ));
+    other = spec
+        .clone()
+        .with_workspace_access(WorkspaceAccess::ReadWrite);
+    assert!(!should_use_read_only_researcher_app_server(
+        &other,
+        ExternalExecutionRuntime::Verified
+    ));
+    for invocation in [
+        ExternalAgentInvocation::CodexConsultant,
+        ExternalAgentInvocation::Grok,
+    ] {
+        other = spec.clone();
+        other.invocation = invocation;
+        assert!(!should_use_read_only_researcher_app_server(
+            &other,
+            ExternalExecutionRuntime::Verified
+        ));
+    }
+    let controls = ProtectedWorktreeControls {
+        writable_artifact_root: Some(PathBuf::from("/run/private-output")),
+        ..ProtectedWorktreeControls::default()
+    };
+    let argv = codex_app_server_argv(&spec, &controls);
+    assert_eq!(argv[0], "app-server");
+    assert!(argv.iter().any(|arg| arg == "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"read\"},\"/run/private-output\"=\"write\"}"));
+    assert!(argv
+        .iter()
+        .any(|arg| arg == "permissions.maco_external_codex.network={enabled=false}"));
+    let profile_workspace = tempfile::tempdir().expect("outer profile workspace");
+    let mut profile_spec = spec.clone();
+    profile_spec.cwd = profile_workspace.path().to_path_buf();
+    let profile = external_side_effect_profile(
+        &profile_spec,
+        Path::new("/trusted/codex"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )
+    .expect("existing Codex outer profile");
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        panic!("Researcher must keep the existing ExternalCodex confinement");
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadOnly);
+    assert!(matches!(
+        external_agent_stdin_mode(&spec, true, Vec::new()),
+        StdinMode::Interactive
+    ));
+    assert!(matches!(
+        external_agent_stdin_mode(&spec, false, b"prompt".to_vec()),
+        StdinMode::Bytes(_)
+    ));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_researcher_app_server_refuses_custom_version_claim_before_launch() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let marker = temp.path().join("must-not-execute");
+    let shim = temp.path().join("fake-codex");
+    fs::write(
+        &shim,
+        format!(
+            "#!/bin/sh\ntouch '{}'\nprintf '%s\\n' 'codex-cli 0.144.4'\n",
+            marker.display()
+        ),
+    )?;
+    fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
+    let spec = ExternalAgentCommand::codex(
+        &shim,
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("events.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(5),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_agent_lifecycle(temp.path(), "researcher", "custom-run", "custom-task");
+    assert!(should_use_read_only_researcher_app_server(
+        &spec,
+        ExternalExecutionRuntime::Verified
+    ));
+    assert_eq!(
+        external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
+        ExternalProgramTrust::ExplicitCustom
+    );
+    let report = run_external_agent(&spec);
+    assert!(
+        report.error.as_deref().is_some_and(
+            |error| error.contains("requires a verified TrustedSystemCodex executable")
+        ),
+        "{report:?}"
+    );
+    assert!(report.environment_blocked());
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(!marker.exists());
+    assert!(report.codex_command_execution_evidence().is_none());
+    assert!(!report.publishable);
+    Ok(())
+}
+
+#[test]
+fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal() {
+    use codex_app_server::{AppServerOutcome, CommandExecutionEvidence, TurnTerminalStatus};
+
+    let mut outcome = AppServerOutcome {
+        thread_id: "research-thread".to_string(),
+        turn_id: "research-turn".to_string(),
+        status: TurnTerminalStatus::Completed,
+        completed_items: 0,
+        item_outcomes: Vec::new(),
+        command_execution_evidence: CommandExecutionEvidence {
+            thread_id: "research-thread".to_string(),
+            turn_id: "research-turn".to_string(),
+            turn_status: TurnTerminalStatus::Completed,
+            observations: Vec::new(),
+        },
+        refused_ceiling_expansions: 0,
+        gate_denials: Vec::new(),
+        final_message: Some("{}".to_string()),
+        auto_reviews: Vec::new(),
+        duplex_fallback_required: true,
+        messages_received: 1,
+        bytes_received: 1,
+    };
+    assert!(validate_read_only_researcher_app_server_outcome(&outcome, false).is_ok());
+    assert!(
+        validate_read_only_researcher_app_server_outcome(&outcome, true)
+            .is_err_and(|error| error.contains("refused an approval request"))
+    );
+    // No fileChange item and no gate-denial payload are needed to keep a permission refusal.
+    outcome.refused_ceiling_expansions = 1;
+    assert!(
+        validate_read_only_researcher_app_server_outcome(&outcome, false)
+            .is_err_and(|error| error.contains("refused an approval request"))
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn contained_read_only_researcher_app_server(
+    mode: &str,
+) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    fs::write(workspace.join("README.md"), "read-only fixture\n")?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    fs::set_permissions(&incoming, fs::Permissions::from_mode(0o700))?;
+    let python = [
+        "/run/current-system/sw/bin/python3",
+        "/usr/bin/python3",
+        "/bin/python3",
+    ]
+    .into_iter()
+    .map(PathBuf::from)
+    .find(|path| path.is_file())
+    .context("trusted python3")?;
+    let python = fs::canonicalize(python)?;
+    let script_path = workspace.join("fake-read-only-app-server.py");
+    fs::write(
+        &script_path,
+        r#"
+import json, pathlib, sys
+mode, workspace, argv = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3:]
+assert argv[:3] == ["app-server", "--stdio", "--strict-config"]
+permissions = next(x for x in argv if x.startswith("permissions.maco_external_codex.filesystem="))
+assert '\":workspace_roots\"={\".\"=\"read\"}' in permissions
+assert '\":workspace_roots\"={\".\"=\"write\"}' not in permissions
+assert 'permissions.maco_external_codex.network={enabled=false}' in argv
+def receive():
+    line = sys.stdin.readline()
+    assert line, "unexpected client EOF"
+    return json.loads(line)
+def send(value):
+    print(json.dumps(value), flush=True)
+initialize = receive()
+assert initialize["method"] == "initialize"
+send({"id":initialize["id"], "result":{}})
+assert receive()["method"] == "initialized"
+start = receive()
+assert start["method"] == "thread/start"
+assert start["params"]["cwd"] == str(workspace)
+assert start["params"]["approvalsReviewer"] == "user"
+send({"id":start["id"], "result":{
+    "thread":{"id":"research-thread"}, "cwd":str(workspace),
+    "approvalPolicy":"on-request", "approvalsReviewer":"user",
+    "activePermissionProfile":{"id":"maco_external_codex"}
+}})
+turn = receive()
+assert turn["method"] == "turn/start"
+send({"id":turn["id"], "result":{"turn":{"id":"research-turn", "status":"inProgress"}}})
+send({"method":"turn/started", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"inProgress"}}})
+def item_event(method, item):
+    send({"method":method, "params":{"threadId":"research-thread", "turnId":"research-turn", "item":item}})
+item = {"id":"read-command", "type":"commandExecution", "command":"cat README.md",
+        "cwd":str(workspace), "status":"inProgress", "exitCode":None}
+if mode in ("file-approval", "write"):
+    item = {"id":"write-item", "type":"fileChange", "status":"inProgress"}
+item_event("item/started", item)
+if mode.endswith("approval"):
+    method = {"command-approval":"item/commandExecution/requestApproval",
+              "file-approval":"item/fileChange/requestApproval",
+              "permission-approval":"item/permissions/requestApproval"}[mode]
+    send({"id":77, "method":method, "params":{"threadId":"research-thread", "turnId":"research-turn",
+          "itemId":item["id"], "command":"cat README.md", "cwd":str(workspace), "startedAtMs":1}})
+    response = receive()
+    assert response["id"] == 77
+    if mode == "permission-approval":
+        assert response["result"]["permissions"] == {}
+        # No fileChange item: finish a successful command and Completed turn after refusal.
+        # The host must remember that any approval request invalidates read-only research.
+    else:
+        assert response["result"]["decision"] == "cancel"
+        sys.exit(0)
+if mode == "write":
+    try:
+        (workspace / "README.md").write_text("unauthorized write")
+    except OSError:
+        pass
+    else:
+        raise AssertionError("outer read-only confinement allowed a workspace write")
+    item["status"] = "failed"
+else:
+    assert (workspace / "README.md").read_text() == "read-only fixture\n"
+    item.update(status="completed", exitCode=0)
+item_event("item/completed", item)
+item_event("item/started", {"id":"answer", "type":"agentMessage"})
+item_event("item/completed", {"id":"answer", "type":"agentMessage", "text":'{"summary":"read-only fixture"}'})
+send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"completed"}}})
+"#,
+    )?;
+    let spec = ExternalAgentCommand::codex(
+        &python,
+        &workspace,
+        workspace.join("prompt.md"),
+        incoming.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(15),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_agent_lifecycle(&workspace, "researcher", "research-run", "research-task");
+    let selected =
+        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+    assert!(selected);
+    assert!(!should_use_duplex_review(
+        &spec,
+        ExternalExecutionRuntime::Verified,
+        false
+    ));
+    validate_duplex_app_server_version(EnvironmentVersion::new(0, 144, 4))?;
+    let mut staging = ExternalOutputStaging::create(&workspace, None)?;
+    let mut controls = protected_worktree_controls(&spec)?;
+    controls.writable_artifact_root = Some(staging.root_path().to_path_buf());
+    let argv = codex_app_server_argv(&spec, &controls);
+    let digest = argv_digest(&argv)?;
+    let identity = external_program_identity(&python)?;
+    let args = [
+        script_path.into_os_string(),
+        OsString::from(mode),
+        workspace.as_os_str().to_os_string(),
+    ]
+    .into_iter()
+    .chain(argv);
+    let process_spec = ProcessSpec::direct(
+        "read-only Researcher app-server fixture",
+        &python,
+        args,
+        &workspace,
+        256 * 1024,
+    )
+    .with_stdin(external_agent_stdin_mode(&spec, selected, Vec::new()))
+    .with_stdin_limit(MAX_PROMPT_BYTES)
+    .with_timeout(Some(spec.timeout))
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        StrictOfflineWorkspaceProfile::read_only(&workspace)
+            .with_visible_read_only_root(python.parent().context("python parent")?),
+    ));
+    let interactive = run_read_only_researcher_app_server_process(
+        process_spec,
+        &ProcessCancellation::new(),
+        &spec,
+        "read the fixture".to_string(),
+    )?;
+    assert!(
+        interactive.process.safety_evidence_verified(),
+        "{interactive:?}"
+    );
+    assert!(interactive.process.process_tree.is_verified_empty());
+    let mut report = failed_external_run(
+        &spec,
+        Instant::now(),
+        vec!["contained-fake-app-server".to_string()],
+        false,
+        String::new(),
+    );
+    report.error = None;
+    let mut output = reserve_external_output(&spec.output_last_message)?;
+    let mut log = reserve_external_output(&spec.json_log)?;
+    record_completed_app_server_target(
+        &mut report,
+        interactive,
+        &mut staging,
+        &mut output,
+        &mut log,
+        &CredentialRedactor::default(),
+        CompletedTargetContext {
+            runtime: ExternalExecutionRuntime::Verified,
+            codex_version: Some((0, 144, 4)),
+            spec: &spec,
+            protected_controls: &controls,
+            argv_digest: &digest,
+            program_identity: &identity,
+            grok_acp_parent_evidence: None,
+            grok_acp_launch_schema_identity: None,
+        },
+    );
+    Ok((report, workspace, temp))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_researcher_app_server_contained_runner_retains_observations_and_final_message(
+) -> Result<()> {
+    skip_without_containment!(ok);
+    let (report, workspace, _temp) = contained_read_only_researcher_app_server("read")?;
+    assert_eq!(report.exit_code, Some(0), "{report:?}");
+    assert!(report.error.is_none(), "{report:?}");
+    assert_eq!(
+        report.output_last_message(),
+        Some(b"{\"summary\":\"read-only fixture\"}".as_slice())
+    );
+    let evidence = report
+        .codex_command_execution_evidence()
+        .context("host-collected observations")?;
+    assert_eq!(evidence.thread_id, "research-thread");
+    assert_eq!(evidence.turn_id, "research-turn");
+    let [codex_app_server::CommandExecutionObservation::Complete {
+        started, completed, ..
+    }] = evidence.observations.as_slice()
+    else {
+        panic!("expected one host observation: {evidence:?}");
+    };
+    assert_eq!(started.command, "cat README.md");
+    assert_eq!(completed.command, started.command);
+    assert_eq!(completed.cwd, workspace.to_str().unwrap());
+    assert_eq!(
+        completed.status,
+        codex_app_server::CommandExecutionStatus::Completed
+    );
+    assert_eq!(completed.exit_code, Some(0));
+    assert_eq!(
+        fs::read_to_string(workspace.join("README.md"))?,
+        "read-only fixture\n"
+    );
+    assert!(
+        !report.publishable,
+        "a fake executable never acquires provider trust"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_researcher_app_server_contained_runner_refuses_approvals_and_writes() -> Result<()> {
+    skip_without_containment!(ok);
+    for mode in [
+        "command-approval",
+        "file-approval",
+        "permission-approval",
+        "write",
+    ] {
+        let (report, workspace, _temp) = contained_read_only_researcher_app_server(mode)?;
+        let error = report.error.as_deref().context("read-only refusal")?;
+        assert!(
+            error.contains(match mode {
+                "write" => "file change",
+                _ => "cancelled",
+            }),
+            "{mode}: {error}"
+        );
+        assert!(report.codex_command_execution_evidence().is_none());
+        assert!(!report.publishable);
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md"))?,
+            "read-only fixture\n"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn hosted_reviewer_does_not_reroute_managed_worktree_codex_into_duplex() {
     let managed = ExternalAgentCommand::codex(
         "codex",
@@ -447,6 +985,12 @@ fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_it
             status: codex_app_server::TurnTerminalStatus::Completed,
             completed_items: 0,
             item_outcomes: Vec::new(),
+            command_execution_evidence: codex_app_server::CommandExecutionEvidence {
+                thread_id: "thread-forwarded".to_string(),
+                turn_id: "turn-forwarded".to_string(),
+                turn_status: codex_app_server::TurnTerminalStatus::Completed,
+                observations: Vec::new(),
+            },
             refused_ceiling_expansions: 0,
             gate_denials: Vec::new(),
             final_message: Some("forwarded".to_string()),
@@ -4934,11 +5478,13 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
         let (result, failure, timed_out) = evaluate_environment_requirement(
             &requirement,
+            ExternalAgentInvocation::CodexSupervisor,
             Path::new("/workspace"),
             Duration::from_secs(1),
             &cancellation,
             &environment,
             &wrong_profile,
+            None,
             None,
             codex_version,
             verified_confinement,
@@ -4958,11 +5504,13 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
     let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
     let (result, failure, _) = evaluate_environment_requirement(
         &disabled_network,
+        ExternalAgentInvocation::CodexSupervisor,
         Path::new("/workspace"),
         Duration::from_secs(1),
         &cancellation,
         &environment,
         &wrong_profile,
+        None,
         None,
         Some(EnvironmentVersion::new(0, 142, 0)),
         None,
@@ -7677,6 +8225,241 @@ fn grok_prompt_file_is_an_exact_read_only_sandbox_input() -> Result<()> {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn grok_managed_worker_profile_binds_only_exact_program() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    create_mandatory_control_roots(&workspace)?;
+    let incoming = temp.path().join("incoming");
+    let bin = temp.path().join("custom-bin");
+    fs::create_dir(&incoming)?;
+    fs::create_dir(&bin)?;
+    let prompt = workspace.join("prompt.md");
+    let program = bin.join("grok");
+    fs::write(&prompt, "bounded worker prompt\n")?;
+    fs::write(&program, "#!/bin/sh\nexit 0\n")?;
+    let command = selected_writable_grok_command(&program, &workspace, &prompt, &incoming)?;
+    let controls = protected_worktree_controls(&command)?;
+    let SideEffectConfinementProfile::ExternalGrok(profile) = external_side_effect_profile(
+        &command,
+        &program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )?
+    else {
+        bail!("expected managed Grok profile")
+    };
+    assert_eq!(profile.workspace_access(), WorkspaceAccess::ReadWrite);
+    assert!(profile.visible_read_only_files().contains(&program));
+    assert!(!profile
+        .visible_read_only_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile
+        .visible_read_write_roots()
+        .iter()
+        .any(|root| program.starts_with(root)));
+    assert!(!profile.visible_read_write_files().contains(&program));
+    let properties = crate::process_runner::external_grok_systemd_properties_for_test(
+        profile, &program, &workspace,
+    )?;
+    assert!(properties.contains(&"--property=ProtectHome=tmpfs".to_string()));
+    assert!(properties.contains(&format!(
+        "--property=BindReadOnlyPaths={}",
+        program.display()
+    )));
+    assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", program.display())));
+    assert!(!properties.contains(&format!("--property=BindReadOnlyPaths={}", bin.display())));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_accepts_only_the_exact_bound_profile() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&workspace)?;
+    fs::create_dir(&grok_home)?;
+    let auth = grok_home.join("auth.json");
+    fs::write(&auth, "held-auth-fixture")?;
+    let credentials = AdmittedGrokCredentials::from_managed_grok_home(&grok_home)?;
+
+    for base in [
+        ExternalGrokProfile::read_only(&workspace),
+        ExternalGrokProfile::read_write(&workspace),
+    ] {
+        let unbound = SideEffectConfinementProfile::ExternalGrok(base.clone());
+        let bound = BoundGrokCredentials::new(&credentials, base)?;
+        let profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+        assert_grok_configuration_preflight(Some(&bound), &profile, true);
+        assert_grok_configuration_preflight(None, &profile, false);
+        assert_grok_configuration_preflight(Some(&bound), &unbound, false);
+        let mutated = SideEffectConfinementProfile::ExternalGrok(
+            bound
+                .profile
+                .clone()
+                .with_visible_read_only_root(&grok_home),
+        );
+        assert_grok_configuration_preflight(Some(&bound), &mutated, false);
+        assert_eq!(
+            bound.profile.visible_read_only_files(),
+            std::slice::from_ref(&auth)
+        );
+        assert!(bound.profile.visible_read_only_roots().is_empty());
+        assert!(bound.profile.visible_read_write_roots().is_empty());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn assert_grok_configuration_preflight(
+    credentials: Option<&BoundGrokCredentials<'_>>,
+    profile: &SideEffectConfinementProfile,
+    expected_present: bool,
+) {
+    // A plausible environment pathname cannot substitute for the held capability.
+    let environment = BTreeMap::from([("GROK_HOME".to_string(), "/ambient/grok".to_string())]);
+    let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
+    let (result, failure, timed_out) = evaluate_environment_requirement(
+        &grok_auth_environment_requirement(),
+        ExternalAgentInvocation::Grok,
+        Path::new("/workspace"),
+        Duration::from_secs(1),
+        &ProcessCancellation::new(),
+        &environment,
+        profile,
+        None,
+        credentials,
+        None,
+        None,
+        None,
+        None,
+        &mut process_evidence,
+    );
+    assert_eq!(
+        result.status,
+        if expected_present {
+            EnvironmentPreflightStatus::Satisfied
+        } else {
+            EnvironmentPreflightStatus::Blocked
+        }
+    );
+    assert_eq!(
+        result.observation,
+        expected_present.then_some(EnvironmentPreflightObservation::ConfigurationPresent {
+            configuration: EnvironmentConfiguration::GrokAuthFile,
+        })
+    );
+    assert_eq!(
+        failure.as_ref().map(|failure| failure.category),
+        (!expected_present).then_some(EnvironmentFailureCategory::MissingCredential)
+    );
+    assert!(!timed_out);
+    assert!(!process_evidence.started);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_rejects_missing_replaced_and_symlinked_sources() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempfile::tempdir()?;
+    let grok_home = temp.path().join("grok-home");
+    fs::create_dir(&grok_home)?;
+    assert!(AdmittedGrokCredentials::from_managed_grok_home(&grok_home).is_err());
+    let unbound =
+        SideEffectConfinementProfile::ExternalGrok(ExternalGrokProfile::read_only(temp.path()));
+    assert_grok_configuration_preflight(None, &unbound, false);
+
+    for leaf in ["auth.json", "config.toml"] {
+        for change in ["remove", "replace", "symlink"] {
+            let fixture = tempfile::tempdir()?;
+            let auth = fixture.path().join("auth.json");
+            let config = fixture.path().join("config.toml");
+            let secret = "credential-fixture-must-not-escape";
+            fs::write(&auth, secret)?;
+            fs::write(&config, secret)?;
+            let credentials = AdmittedGrokCredentials::from_managed_grok_home(fixture.path())?;
+            let bound = BoundGrokCredentials::new(
+                &credentials,
+                ExternalGrokProfile::read_only(temp.path()),
+            )?;
+            let profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+            assert_grok_configuration_preflight(Some(&bound), &profile, true);
+
+            let source = fixture.path().join(leaf);
+            let moved = fixture.path().join("held-original");
+            fs::rename(&source, &moved)?;
+            match change {
+                "replace" => fs::write(&source, secret)?,
+                "symlink" => symlink(&moved, &source)?,
+                "remove" => (),
+                _ => unreachable!(),
+            }
+            assert_grok_configuration_preflight(Some(&bound), &profile, false);
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_configuration_preflight_rejects_foreign_source_and_non_grok_profiles() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let source_home = temp.path().join("source");
+    let other_home = temp.path().join("other");
+    fs::create_dir(&source_home)?;
+    fs::create_dir(&other_home)?;
+    fs::write(source_home.join("auth.json"), "source-auth")?;
+    fs::write(other_home.join("auth.json"), "other-auth")?;
+    let source = AdmittedGrokCredentials::from_managed_grok_home(&source_home)?;
+    let other = AdmittedGrokCredentials::from_managed_grok_home(&other_home)?;
+    let bound = BoundGrokCredentials::new(&source, ExternalGrokProfile::read_only(temp.path()))?;
+    let foreign = BoundGrokCredentials::new(&other, ExternalGrokProfile::read_only(temp.path()))?;
+    for profile in [
+        SideEffectConfinementProfile::ExternalGrok(foreign.profile),
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(temp.path())),
+        SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_only(temp.path()),
+        ),
+        SideEffectConfinementProfile::TrustedCompatibility,
+    ] {
+        assert_grok_configuration_preflight(Some(&bound), &profile, false);
+    }
+    let grok_profile = SideEffectConfinementProfile::ExternalGrok(bound.profile.clone());
+    assert!(!configuration_present(
+        EnvironmentConfiguration::CodexAuthFile,
+        None,
+        Some(&bound),
+        &grok_profile,
+    ));
+    let codex_auth = ValidatedCodexAuth {
+        path: temp.path().join("codex-auth.json"),
+        length: 2,
+        modified: None,
+        device: 1,
+        inode: 2,
+        bytes: b"{}".to_vec(),
+    };
+    let codex_profile =
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(temp.path()));
+    assert!(configuration_present(
+        EnvironmentConfiguration::CodexAuthFile,
+        Some(&codex_auth),
+        None,
+        &codex_profile,
+    ));
+    assert!(!configuration_present(
+        EnvironmentConfiguration::GrokAuthFile,
+        Some(&codex_auth),
+        None,
+        &codex_profile,
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
@@ -9347,6 +10130,109 @@ fn codex_inner_permissions_keep_exact_reads_writes_and_toml_escaping() -> Result
         "{}=\"write\"",
         toml_basic_string(incoming.to_str().context("UTF-8 incoming path")?)
     )));
+    Ok(())
+}
+
+#[test]
+fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_run_json(
+) -> Result<()> {
+    use codex_app_server::{
+        AppServerOutcome, CommandExecutionEvidence, CommandExecutionObservation,
+        CommandExecutionObservationIssue, CommandExecutionSnapshot, CommandExecutionStatus,
+        TurnTerminalStatus,
+    };
+
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    let mut report = refused_external_run_before_launch(&command, "test fixture".to_string());
+    assert!(report.codex_command_execution_evidence().is_none());
+    let snapshot = CommandExecutionSnapshot {
+        command: "printf private-observed-command".to_string(),
+        cwd: "/private-observed-cwd".to_string(),
+        status: CommandExecutionStatus::InProgress,
+        exit_code: None,
+    };
+    let evidence = CommandExecutionEvidence {
+        thread_id: "thread-1".to_string(),
+        turn_id: "turn-1".to_string(),
+        turn_status: TurnTerminalStatus::Completed,
+        observations: vec![
+            CommandExecutionObservation::Complete {
+                item_id: "command-1".to_string(),
+                started: snapshot.clone(),
+                completed: CommandExecutionSnapshot {
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: Some(0),
+                    ..snapshot
+                },
+            },
+            CommandExecutionObservation::Incomplete {
+                item_id: "command-2".to_string(),
+                reason: CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
+            },
+        ],
+    };
+    let outcome = AppServerOutcome {
+        thread_id: evidence.thread_id.clone(),
+        turn_id: evidence.turn_id.clone(),
+        status: evidence.turn_status,
+        completed_items: 2,
+        item_outcomes: Vec::new(),
+        command_execution_evidence: evidence.clone(),
+        refused_ceiling_expansions: 0,
+        gate_denials: Vec::new(),
+        final_message: None,
+        auto_reviews: Vec::new(),
+        duplex_fallback_required: false,
+        messages_received: 9,
+        bytes_received: 1024,
+    };
+    // The same host-only attachment used by the live app-server path, before stdout replacement.
+    report.retain_codex_command_execution_evidence(&outcome);
+    replace_report_stdout(&mut report, CapturedOutput::default());
+    assert_eq!(report.codex_command_execution_evidence(), Some(&evidence));
+    let mut injected = refused_external_run_before_launch(&command, "injected fixture".to_string());
+    injected.set_codex_command_execution_evidence_for_test(evidence.clone());
+    assert_eq!(injected.codex_command_execution_evidence(), Some(&evidence));
+    assert_eq!(
+        report.clone().codex_command_execution_evidence(),
+        Some(&evidence)
+    );
+    // Observation attachment does not turn an unsuccessful run into execution success.
+    assert!(!report.succeeded());
+    let value = serde_json::to_value(&report)?;
+    let encoded = value.to_string();
+    let debug = format!("{report:?} {evidence:?}");
+    for private in [
+        "private-observed-command",
+        "private-observed-cwd",
+        "command-2",
+    ] {
+        assert!(!encoded.contains(private));
+    }
+    assert!(!debug.contains("private-observed-command"));
+    assert!(!debug.contains("private-observed-cwd"));
+    assert!(value.get("codex_command_execution_evidence").is_none());
+    let decoded: ExternalAgentRun = serde_json::from_value(value.clone())?;
+    assert!(decoded.codex_command_execution_evidence().is_none());
+    let mut forged = value;
+    let forged_evidence = serde_json::json!({
+        "thread_id":"thread-1", "turn_id":"turn-1", "turn_status":"completed",
+        "observations":[{"command":"printf forged", "cwd":"/workspace", "exit_code":0}]
+    });
+    forged["codex_command_execution_evidence"] = forged_evidence.clone();
+    forged["stdout"]["run_metadata"] = serde_json::json!({
+        "codex_command_execution_evidence": forged_evidence
+    });
+    forged["stdout"]["text"] = serde_json::json!("claimed commandExecution exitCode=0");
+    let decoded: ExternalAgentRun = serde_json::from_value(forged)?;
+    assert!(decoded.codex_command_execution_evidence().is_none());
     Ok(())
 }
 

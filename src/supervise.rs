@@ -328,7 +328,9 @@ mod checkpoint;
 use checkpoint::*;
 
 mod acceptance;
+mod researcher;
 use acceptance::*;
+use researcher::*;
 
 mod reporting;
 use reporting::*;
@@ -1989,7 +1991,8 @@ pub enum AssignmentPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
-    /// The sole planning-versus-execution capability selector for launch.
+    /// Planning-versus-execution capability selector for implementation roles.
+    /// A Researcher remains read-only in either phase.
     ///
     /// Schedule lineage determines admission order only. The launcher binds
     /// this typed phase to the validated schedule entry at the same flattened
@@ -2345,6 +2348,7 @@ pub enum AgentRole {
     Supervisor,
     ChildOrchestrator,
     Worker,
+    Researcher,
     GateClassifier,
     Auditor,
 }
@@ -2467,6 +2471,7 @@ impl AgentRole {
             Self::Supervisor => "supervisor",
             Self::ChildOrchestrator => "child_orchestrator",
             Self::Worker => "worker",
+            Self::Researcher => "researcher",
             Self::GateClassifier => "gate_classifier",
             Self::Auditor => "auditor",
         }
@@ -2476,6 +2481,7 @@ impl AgentRole {
         match self {
             Self::Supervisor | Self::ChildOrchestrator => RoleCategory::DelegatingCoordinator,
             Self::Worker => RoleCategory::NonDelegatingTerminalWorker,
+            Self::Researcher => RoleCategory::ReadOnlyResearcher,
             Self::GateClassifier | Self::Auditor => RoleCategory::ReadOnlyReviewAuditor,
         }
     }
@@ -2484,13 +2490,15 @@ impl AgentRole {
         match self {
             Self::GateClassifier => Some(ReasoningEffort::High),
             Self::Auditor => Some(ReasoningEffort::Xhigh),
-            Self::Supervisor | Self::ChildOrchestrator | Self::Worker => None,
+            Self::Supervisor | Self::ChildOrchestrator | Self::Worker | Self::Researcher => None,
         }
     }
 
     const fn minimum_model_capability(self) -> ModelCapabilityClass {
         match self {
-            Self::Supervisor | Self::ChildOrchestrator => ModelCapabilityClass::GeneralJudgment,
+            Self::Supervisor | Self::ChildOrchestrator | Self::Researcher => {
+                ModelCapabilityClass::GeneralJudgment
+            }
             Self::Worker => ModelCapabilityClass::WeakMechanical,
             Self::GateClassifier | Self::Auditor => ModelCapabilityClass::CriticalJudgment,
         }

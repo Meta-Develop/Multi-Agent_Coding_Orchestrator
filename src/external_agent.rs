@@ -1764,6 +1764,37 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.worker_journal_artifacts
     }
 
+    /// Correlated app-server notifications retained by the live host protocol driver.
+    /// `None` means unavailable, not zero commands. Reject incomplete observations and check
+    /// turn/process/containment success before reconciling any agent-authored command claims.
+    /// Serialized runs and agent output cannot supply this private evidence.
+    #[allow(dead_code)] // Consumed by the supervisor's separate reconciliation change.
+    pub(crate) fn codex_command_execution_evidence(
+        &self,
+    ) -> Option<&codex_app_server::CommandExecutionEvidence> {
+        self.stdout
+            .run_metadata
+            .codex_command_execution_evidence
+            .as_ref()
+    }
+
+    /// Injection seam for supervisor acceptance tests; never parses an agent-authored report.
+    #[cfg(test)]
+    pub(crate) fn set_codex_command_execution_evidence_for_test(
+        &mut self,
+        evidence: codex_app_server::CommandExecutionEvidence,
+    ) {
+        self.stdout.run_metadata.codex_command_execution_evidence = Some(evidence);
+    }
+
+    fn retain_codex_command_execution_evidence(
+        &mut self,
+        outcome: &codex_app_server::AppServerOutcome,
+    ) {
+        self.stdout.run_metadata.codex_command_execution_evidence =
+            Some(outcome.command_execution_evidence.clone());
+    }
+
     pub(crate) fn replace_worker_journal_artifacts(
         &mut self,
         captures: Vec<WorkerJournalArtifactCapture>,
@@ -2064,6 +2095,7 @@ struct ExternalAgentRunMetadata {
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
+    codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -2164,6 +2196,31 @@ fn default_environment_preflight_process_started() -> bool {
 struct AdmittedGrokCredentials {
     #[cfg(target_os = "linux")]
     source: GrokCredentialSource,
+}
+
+/// Retains the admitted source and the exact profile produced by its successful binding.
+/// Neither a pathname nor a profile kind alone proves that the child receives Grok auth.
+struct BoundGrokCredentials<'a> {
+    credentials: &'a AdmittedGrokCredentials,
+    profile: ExternalGrokProfile,
+}
+
+impl<'a> BoundGrokCredentials<'a> {
+    fn new(credentials: &'a AdmittedGrokCredentials, profile: ExternalGrokProfile) -> Result<Self> {
+        Ok(Self {
+            credentials,
+            profile: credentials.bind_to_profile(profile)?,
+        })
+    }
+
+    fn present_in(&self, profile: &SideEffectConfinementProfile) -> bool {
+        let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+            return false;
+        };
+        // Binding revalidates the held descriptors against their original path identities.
+        // Discard the new profile: preflight must not add access to the actual launch profile.
+        *profile == self.profile && self.credentials.bind_to_profile(profile.clone()).is_ok()
+    }
 }
 
 impl AdmittedGrokCredentials {
@@ -2593,6 +2650,8 @@ fn run_external_agent_runtime(
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
     let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
+    let read_only_researcher_app_server = should_use_read_only_researcher_app_server(spec, runtime);
+    let app_server_required = duplex_review_required || read_only_researcher_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -2662,6 +2721,15 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
+    if read_only_researcher_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex
+    {
+        return failed_external_environment_run(
+            spec, started, command_display(&resolved_program, &[]), false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(external_sandbox_requirement(spec.invocation)),
+            "read-only Researcher app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
+        );
+    }
     let program_identity = match external_program_identity(&resolved_program) {
         Ok(identity) => identity,
         Err(error) => {
@@ -2748,10 +2816,10 @@ fn run_external_agent_runtime(
     } else {
         None
     };
-    // Duplex argv stays empty until the contained version probe matches the audited
+    // App-server argv stays empty until the contained version probe matches the audited
     // app-server protocol. This remains a mandatory latent release gate even if
     // universal pre-action coverage becomes available in a future Codex protocol.
-    let mut argv = if duplex_review_required {
+    let mut argv = if app_server_required {
         Vec::new()
     } else {
         match command_argv_with_controls(&target_spec, &target_controls) {
@@ -2767,7 +2835,7 @@ fn run_external_agent_runtime(
             }
         }
     };
-    let mut bound_argv_digest = if duplex_review_required {
+    let mut bound_argv_digest = if app_server_required {
         None
     } else {
         match argv_digest(&argv) {
@@ -2995,14 +3063,14 @@ fn run_external_agent_runtime(
             return report;
         }
     };
-    let duplex_prompt = if duplex_review_required {
+    let app_server_prompt = if app_server_required {
         match String::from_utf8(prompt.clone()) {
             Ok(prompt) => Some(prompt),
             Err(_) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 record_external_error(
                     &mut report,
-                    "writable Codex app-server prompt is not valid UTF-8".to_string(),
+                    "Codex app-server prompt is not valid UTF-8".to_string(),
                 );
                 return report;
             }
@@ -3144,10 +3212,15 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    let mut bound_grok_credentials = None;
     let side_effect_profile = match (grok_credentials.as_ref(), side_effect_profile) {
         (Some(credentials), Some(SideEffectConfinementProfile::ExternalGrok(profile))) => {
-            match credentials.bind_to_profile(profile) {
-                Ok(profile) => Some(SideEffectConfinementProfile::ExternalGrok(profile)),
+            match BoundGrokCredentials::new(credentials, profile) {
+                Ok(bound) => {
+                    let profile = bound.profile.clone();
+                    bound_grok_credentials = Some(bound);
+                    Some(SideEffectConfinementProfile::ExternalGrok(profile))
+                }
                 Err(error) => {
                     report.duration_ms = duration_millis(started.elapsed());
                     record_grok_credential_environment_failure(&mut report, &error);
@@ -3254,6 +3327,36 @@ fn run_external_agent_runtime(
             }
         };
     if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        #[cfg(test)]
+        tests::run_grok_preflight_hook();
+        let mut preflight = run_grok_environment_preflight(
+            &target_spec,
+            spec.timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            &external_environment,
+            side_effect_profile
+                .as_ref()
+                .expect("verified Grok profile admitted above"),
+            bound_grok_credentials.as_ref(),
+            agent_lifecycle.as_ref(),
+            &credential_redactor,
+        );
+        for failure in &mut preflight.failures {
+            failure.summary = credential_redactor.redact_string(&failure.summary);
+        }
+        report.timed_out = preflight.timed_out;
+        report.stdout.run_metadata.environment_preflight_results = preflight.results;
+        report.stdout.run_metadata.environment_failures = preflight.failures;
+        retain_environment_preflight_process_evidence(&mut report, &preflight.process_evidence);
+        if report.environment_blocked() {
+            report.duration_ms = duration_millis(started.elapsed());
+            report.error = Some(environment_blocked_message(report.environment_failures()));
+            return report;
+        }
+    }
+    if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::TrustedSystemCodex
         && matches!(
             spec.invocation,
@@ -3282,6 +3385,7 @@ fn run_external_agent_runtime(
             &external_environment,
             preflight_profile,
             codex_auth.as_ref(),
+            bound_grok_credentials.as_ref(),
             agent_lifecycle.as_ref(),
             Some(&credential_redactor),
         );
@@ -3301,7 +3405,7 @@ fn run_external_agent_runtime(
             return report;
         }
     }
-    if duplex_review_required {
+    if app_server_required {
         let Some(version) =
             codex_version.map(|(major, minor, patch)| EnvironmentVersion::new(major, minor, patch))
         else {
@@ -3310,8 +3414,7 @@ fn run_external_agent_runtime(
                 &mut report,
                 EnvironmentFailureCategory::ProbeFailed,
                 Some(codex_environment_requirement()),
-                "writable Codex app-server version was unavailable after mandatory preflight"
-                    .to_string(),
+                "Codex app-server version was unavailable after mandatory preflight".to_string(),
             );
             return report;
         };
@@ -3429,7 +3532,7 @@ fn run_external_agent_runtime(
     )
     .with_stdin(external_agent_stdin_mode(
         &target_spec,
-        duplex_review_required,
+        app_server_required,
         prompt,
     ))
     .with_stdin_limit(MAX_PROMPT_BYTES)
@@ -3545,82 +3648,52 @@ fn run_external_agent_runtime(
     };
     let mut retained_gate_denials = Vec::new();
     let mut retained_review_metrics = None;
-    let process_result = if duplex_review_required {
-        let Some(prompt) = duplex_prompt else {
+    let process_result = if app_server_required {
+        let Some(prompt) = app_server_prompt else {
             report.duration_ms = duration_millis(started.elapsed());
             record_external_error(
                 &mut report,
-                "writable Codex duplex prompt was unavailable".to_string(),
+                "Codex app-server prompt was unavailable".to_string(),
             );
             return report;
         };
-        let Some(review_runtime) = review_runtime.as_mut() else {
-            report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
-                &mut report,
-                EnvironmentFailureCategory::SandboxUnavailable,
-                Some(EnvironmentRequirement::sandbox(
-                    EnvironmentSandboxCapability::VerifiedExternalCodex,
-                )),
-                "writable Codex duplex review runtime was unavailable".to_string(),
+        let process = if read_only_researcher_app_server {
+            run_read_only_researcher_app_server_process(process_spec, cancellation, spec, prompt)
+        } else {
+            let Some(review_runtime) = review_runtime.as_mut() else {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(EnvironmentRequirement::sandbox(
+                        EnvironmentSandboxCapability::VerifiedExternalCodex,
+                    )),
+                    "writable Codex duplex review runtime was unavailable".to_string(),
+                );
+                return report;
+            };
+            let attempt = run_duplex_app_server_process(
+                process_spec,
+                cancellation,
+                spec,
+                prompt,
+                review_runtime,
             );
-            return report;
+            retained_gate_denials = attempt.gate_denials;
+            retained_review_metrics = Some(attempt.metrics);
+            attempt.process
         };
-        let attempt =
-            run_duplex_app_server_process(process_spec, cancellation, spec, prompt, review_runtime);
-        retained_gate_denials = attempt.gate_denials;
-        retained_review_metrics = Some(attempt.metrics);
-        match attempt.process {
+        match process {
             Ok(interactive) => {
-                let protocol = interactive.interaction;
-                let mut final_message_error = None;
-                if let Ok(outcome) = &protocol {
-                    if let Some(final_message) = &outcome.final_message {
-                        let final_message =
-                            credential_redactor.redact_bytes(final_message.as_bytes());
-                        let staged = output_staging.reservation_mut().and_then(|reservation| {
-                            reservation.write_bytes_atomic(&final_message, OUTPUT_TEE_LIMIT_BYTES)
-                        });
-                        if let Err(error) = staged {
-                            final_message_error = Some(format!(
-                                "failed to stage app-server final message: {error:#}"
-                            ));
-                        }
-                    }
-                }
-                match output_staging.completion_handles() {
-                    Ok(staging) => record_completed_target(
-                        &mut report,
-                        interactive.process,
-                        staging,
-                        &mut output_reservation,
-                        &mut json_log_reservation,
-                        &credential_redactor,
-                        completed_context,
-                    ),
-                    Err(error) => {
-                        report.error = append_external_error(
-                            report.error.take(),
-                            Some(format!(
-                                "private external-agent output staging became unavailable: {error:#}"
-                            )),
-                        );
-                        report.publishable = false;
-                    }
-                }
-                if let Some(error) = final_message_error {
-                    report.error = append_external_error(report.error.take(), Some(error));
-                    report.publishable = false;
-                }
-                if let Err(error) = protocol {
-                    report.error = append_external_error(
-                        report.error.take(),
-                        Some(credential_redactor.redact_string(&format!(
-                            "duplex app-server protocol failed closed: {error}"
-                        ))),
-                    );
-                    report.publishable = false;
-                }
+                record_completed_app_server_target(
+                    &mut report,
+                    interactive,
+                    &mut output_staging,
+                    &mut output_reservation,
+                    &mut json_log_reservation,
+                    &credential_redactor,
+                    completed_context,
+                );
                 Ok(())
             }
             Err(error) => Err(error),
@@ -3882,6 +3955,20 @@ fn run_external_agent_runtime(
     report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+fn should_use_read_only_researcher_app_server(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> bool {
+    cfg!(target_os = "linux")
+        && runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadOnly
+        && spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == AgentRole::Researcher.as_str())
 }
 
 fn should_use_duplex_review(
@@ -4181,6 +4268,67 @@ struct DuplexProcessAttempt {
     >,
     metrics: ReviewMetricSnapshot,
     gate_denials: Vec<GateDenial>,
+}
+
+fn run_read_only_researcher_app_server_process(
+    process_spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    spec: &ExternalAgentCommand,
+    prompt: String,
+) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
+    let turn = codex_app_server::AppServerTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        permission_profile: "maco_external_codex".to_string(),
+        prompt,
+        model: spec.model.clone(),
+    };
+    run_process_interactive(process_spec, cancellation, |session| {
+        let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
+        // Read-only research has no approval authority, even if a hosted reviewer exists.
+        let mut approval_requested = false;
+        let mut reviewer = |_: codex_app_server::ApprovalRequest| {
+            approval_requested = true;
+            Ok(codex_app_server::ApprovalReview::cancel(None))
+        };
+        let outcome = codex_app_server::run_app_server_turn(
+            &mut transport,
+            &turn,
+            codex_app_server::AppServerLimits {
+                turn_timeout: spec.timeout,
+                ..codex_app_server::AppServerLimits::default()
+            },
+            &mut reviewer,
+            || cancellation.is_cancelled(),
+        )
+        .map_err(|error| error.to_string())?;
+        validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)?;
+        // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
+        // the existing verified outer profile remains enforced, and every approval cancels.
+        Ok(outcome)
+    })
+}
+
+fn validate_read_only_researcher_app_server_outcome(
+    outcome: &codex_app_server::AppServerOutcome,
+    approval_requested: bool,
+) -> Result<(), String> {
+    // The shared driver currently cancels immediately. Retain this independent guard so a
+    // later Completed turn after an empty permission grant can never erase the refusal.
+    if approval_requested || outcome.refused_ceiling_expansions != 0 {
+        return Err("read-only Researcher app-server refused an approval request".to_string());
+    }
+    if outcome.status != codex_app_server::TurnTerminalStatus::Completed
+        || outcome
+            .item_outcomes
+            .iter()
+            .any(|item| item.item_type == "fileChange")
+    {
+        return Err(
+            "read-only Researcher app-server refused a non-completed turn or file change"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn run_duplex_app_server_process(
@@ -4603,6 +4751,67 @@ struct CompletedTargetStaging<'a> {
     output: &'a mut ReservedOutputFile,
     /// The parent-owned Codex home, present only for supervisor launches.
     codex_home: Option<&'a SecureOutputRoot>,
+}
+
+fn record_completed_app_server_target(
+    report: &mut ExternalAgentRun,
+    interactive: InteractiveProcessOutput<codex_app_server::AppServerOutcome>,
+    output_staging: &mut ExternalOutputStaging,
+    output_reservation: &mut ReservedOutputFile,
+    json_log_reservation: &mut ReservedOutputFile,
+    credential_redactor: &CredentialRedactor,
+    context: CompletedTargetContext<'_>,
+) {
+    let protocol = interactive.interaction;
+    let mut final_message_error = None;
+    if let Ok(outcome) = &protocol {
+        report.retain_codex_command_execution_evidence(outcome);
+        if let Some(final_message) = &outcome.final_message {
+            let final_message = credential_redactor.redact_bytes(final_message.as_bytes());
+            let staged = output_staging.reservation_mut().and_then(|reservation| {
+                reservation.write_bytes_atomic(&final_message, OUTPUT_TEE_LIMIT_BYTES)
+            });
+            if let Err(error) = staged {
+                final_message_error = Some(format!(
+                    "failed to stage app-server final message: {error:#}"
+                ));
+            }
+        }
+    }
+    match output_staging.completion_handles() {
+        Ok(staging) => record_completed_target(
+            report,
+            interactive.process,
+            staging,
+            output_reservation,
+            json_log_reservation,
+            credential_redactor,
+            context,
+        ),
+        Err(error) => {
+            report.error = append_external_error(
+                report.error.take(),
+                Some(format!(
+                    "private external-agent output staging became unavailable: {error:#}"
+                )),
+            );
+            report.publishable = false;
+        }
+    }
+    if let Some(error) = final_message_error {
+        report.error = append_external_error(report.error.take(), Some(error));
+        report.publishable = false;
+    }
+    if let Err(error) = protocol {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(
+                credential_redactor
+                    .redact_string(&format!("Codex app-server protocol failed closed: {error}")),
+            ),
+        );
+        report.publishable = false;
+    }
 }
 
 fn record_completed_target(
@@ -5411,6 +5620,7 @@ fn preflight_codex_version(
     let requirement = codex_environment_requirement();
     let version = run_fixed_version_probe(
         EnvironmentExecutable::Codex,
+        ExternalAgentInvocation::CodexSupervisor,
         program,
         cwd,
         timeout,
@@ -5492,6 +5702,129 @@ fn preflight_custom_codex_version(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_grok_environment_preflight(
+    spec: &ExternalAgentCommand,
+    timeout: Duration,
+    cancellation: &ProcessCancellation,
+    environment: &BTreeMap<String, String>,
+    profile: &SideEffectConfinementProfile,
+    credentials: Option<&BoundGrokCredentials<'_>>,
+    lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: &CredentialRedactor,
+) -> EnvironmentPreflightReport {
+    let mut report = EnvironmentPreflightReport::default();
+    if let Err(error) = validate_environment_requirements(&spec.environment_requirements) {
+        report.failures.push(environment_failure(
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
+            format!("invalid environment requirements: {error}"),
+        ));
+        return report;
+    }
+    let started = Instant::now();
+    let auth = grok_auth_environment_requirement();
+    let (result, failure, _) = evaluate_environment_requirement(
+        &auth,
+        ExternalAgentInvocation::Grok,
+        &spec.cwd,
+        timeout,
+        cancellation,
+        environment,
+        profile,
+        None,
+        credentials,
+        None,
+        None,
+        lifecycle,
+        None,
+        &mut report.process_evidence,
+    );
+    report.results.push(result);
+    if let Some(failure) = failure {
+        report.failures.push(failure);
+        return report;
+    }
+
+    // Prove the actual bound sandbox with a fixed no-op, never the provider or Codex.
+    let probe_program = [
+        "/usr/bin/true",
+        "/bin/true",
+        "/run/current-system/sw/bin/true",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| Path::new("/usr/bin/true"));
+    let probe = with_external_runtime_context(
+        ProcessSpec::direct(
+            "Grok sandbox preflight",
+            probe_program,
+            std::iter::empty::<&str>(),
+            &spec.cwd,
+            4096,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(timeout.saturating_sub(started.elapsed()))),
+        environment.clone(),
+        profile.clone(),
+        ExternalAgentInvocation::Grok,
+        None,
+        lifecycle,
+        None,
+    );
+    match run_process_cancellable(probe, cancellation) {
+        Ok(output) => {
+            report.process_evidence.record_output(&output);
+            report.timed_out = output.timed_out;
+            if output.safety_sensitive_succeeded()
+                && output.side_effects
+                    == SideEffectConfinementEvidence::Verified(
+                        SideEffectConfinementProfileKind::ExternalGrok,
+                    )
+            {
+                report.verified_confinement = Some(SideEffectConfinementProfileKind::ExternalGrok);
+            }
+        }
+        Err(error) => {
+            report.process_evidence.record_error(&error);
+            report.timed_out = matches!(error, ProcessRunError::SetupTimeout { .. });
+        }
+    }
+    let sandbox = external_sandbox_requirement(ExternalAgentInvocation::Grok);
+    for requirement in std::iter::once(&sandbox).chain(
+        spec.environment_requirements
+            .iter()
+            .filter(|r| **r != auth && **r != sandbox),
+    ) {
+        let (result, failure, timed_out) = evaluate_environment_requirement(
+            requirement,
+            ExternalAgentInvocation::Grok,
+            &spec.cwd,
+            timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            environment,
+            profile,
+            None,
+            credentials,
+            None,
+            report.verified_confinement,
+            lifecycle,
+            Some(credential_redactor),
+            &mut report.process_evidence,
+        );
+        report.results.push(result);
+        if let Some(failure) = failure {
+            report.failures.push(failure);
+        }
+        report.timed_out |= timed_out;
+        if !report.failures.is_empty() {
+            break;
+        }
+    }
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_environment_preflight(
     spec: &ExternalAgentCommand,
     resolved_codex: &Path,
@@ -5500,6 +5833,7 @@ fn run_environment_preflight(
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    grok_credentials: Option<&BoundGrokCredentials<'_>>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
     credential_redactor: Option<&CredentialRedactor>,
 ) -> EnvironmentPreflightReport {
@@ -5555,12 +5889,14 @@ fn run_environment_preflight(
         let remaining = timeout.saturating_sub(started.elapsed());
         let (result, failure, timed_out) = evaluate_environment_requirement(
             requirement,
+            spec.invocation,
             &spec.cwd,
             remaining,
             cancellation,
             environment,
             side_effect_profile,
             codex_auth,
+            grok_credentials.filter(|_| spec.invocation == ExternalAgentInvocation::Grok),
             report.codex_version,
             report.verified_confinement,
             agent_lifecycle,
@@ -5579,12 +5915,14 @@ fn run_environment_preflight(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_environment_requirement(
     requirement: &EnvironmentRequirement,
+    invocation: ExternalAgentInvocation,
     cwd: &Path,
     timeout: Duration,
     cancellation: &ProcessCancellation,
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    grok_credentials: Option<&BoundGrokCredentials<'_>>,
     observed_codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
@@ -5610,6 +5948,7 @@ fn evaluate_environment_requirement(
                 resolve_environment_executable(*executable).and_then(|program| {
                     run_fixed_version_probe(
                         *executable,
+                        invocation,
                         &program,
                         cwd,
                         timeout,
@@ -5712,7 +6051,12 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Configuration { configuration } => {
-            let present = configuration_present(*configuration, codex_auth);
+            let present = configuration_present(
+                *configuration,
+                codex_auth,
+                grok_credentials,
+                side_effect_profile,
+            );
             if present {
                 (
                     EnvironmentPreflightResult {
@@ -5747,6 +6091,12 @@ fn evaluate_environment_requirement(
         EnvironmentRequirement::Network { access } => {
             let enforced_offline =
                 verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            let verified_networked_grok = verified_confinement
+                == Some(SideEffectConfinementProfileKind::ExternalGrok)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalGrok(_)
+                );
             if *access == EnvironmentNetworkAccess::Disabled && enforced_offline {
                 (
                     EnvironmentPreflightResult {
@@ -5754,6 +6104,18 @@ fn evaluate_environment_requirement(
                         status: EnvironmentPreflightStatus::Satisfied,
                         observation: Some(EnvironmentPreflightObservation::Network {
                             enabled: false,
+                        }),
+                    },
+                    None,
+                    false,
+                )
+            } else if *access == EnvironmentNetworkAccess::Enabled && verified_networked_grok {
+                (
+                    EnvironmentPreflightResult {
+                        requirement: requirement.clone(),
+                        status: EnvironmentPreflightStatus::Satisfied,
+                        observation: Some(EnvironmentPreflightObservation::Network {
+                            enabled: true,
                         }),
                     },
                     None,
@@ -5787,7 +6149,7 @@ fn evaluate_environment_requirement(
                     Some(environment_failure(
                         EnvironmentFailureCategory::NetworkForbidden,
                         Some(requirement.clone()),
-                        "the supervised child requires network access, but its fixed permission profile disables network access"
+                        "the supervised child requires network access, but its fixed permission profile did not verify network access"
                             .to_string(),
                     )),
                     false,
