@@ -48,6 +48,7 @@ pub(super) fn exercise(
     case: &str,
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
+    outcome: &mut AssignmentExecutionOutcome,
     parent: &mut CollectedChildAttempt<'_>,
 ) -> Result<()> {
     let resources = || WorkerInboxResources {
@@ -214,6 +215,84 @@ pub(super) fn exercise(
     assert_eq!(view.turn, 7);
     assert_eq!(view.watermark.last_sequence, 2);
     let before = context.sync_store.status_snapshot()?;
+    if matches!(case, "bound-shared-driver" | "bound-shared-cancelled") {
+        let mut policy = context.budget_policy.clone();
+        policy.set_selector_binding_for_test(
+            AgentRole::Worker,
+            SupervisorRuntime::Codex,
+            RoleModelSelection {
+                model: Some("gpt-5.6-sol".into()),
+                reasoning_effort: Some("xhigh".into()),
+                ..Default::default()
+            },
+        );
+        // Compile regression: the frozen turn still borrows this exact lease.
+        // No move/drop/reconstruction of preflight or bound evidence is needed.
+        let mut driver = NestedWorkerSerialDriver::from_collected_parent(
+            context, preflight, outcome, 1, parent,
+        )?;
+        let mut other_outcome = AssignmentExecutionOutcome::default();
+        let error = NestedWorkerSerialDriver::from_collected_parent(
+            context,
+            preflight,
+            &mut other_outcome,
+            1,
+            parent,
+        )
+        .err()
+        .context("second driver accepted a distinct outcome")?;
+        assert!(error.to_string().contains("already been issued"));
+        if case == "bound-shared-cancelled" {
+            context.cancellation.cancel();
+            assert!(driver.execute_worker("worker-two", &policy).is_err());
+            assert!(bound.revalidate(context, preflight, 1, &turn).is_err());
+            return Ok(());
+        }
+        let mut completed = Vec::new();
+        for (_, worker) in bound.requests() {
+            bound.revalidate(context, preflight, 1, &turn)?;
+            completed.push(driver.execute_worker(worker, &policy)?);
+            let error = driver
+                .execute_worker(worker, &policy)
+                .err()
+                .context("replayed worker")?;
+            assert!(error.to_string().contains("already been reserved"));
+        }
+        drop(driver);
+        assert!(NestedWorkerSerialDriver::from_collected_parent(
+            context, preflight, outcome, 1, parent,
+        )
+        .is_err());
+        // These injected Workers make no edits. The pre-Worker candidate remains
+        // evidence only; even held completions do not open production continuation.
+        bound.revalidate(context, preflight, 1, &turn)?;
+        assert_eq!(
+            completed
+                .iter()
+                .map(|e| e.report.id.as_str())
+                .collect::<Vec<_>>(),
+            ["worker-two", "worker"]
+        );
+        let expected = bound
+            .requests()
+            .map(|(r, w)| parent_turn_yield::ExpectedWorkerRequest::new(r, w))
+            .collect::<Result<Vec<_>>>()?;
+        let yielded = parent_turn_yield::validate_frozen_yield_bytes(
+            parent.external_run.output_last_message().unwrap(),
+            context.options.run_id.as_str(),
+            &preflight.assignment,
+            1,
+            &expected,
+        )?;
+        let error = ParentContinuationLaunch::from_completed_workers(
+            context, preflight, &yielded, &completed,
+        )
+        .err()
+        .context("continuation opened")?;
+        assert!(error.to_string().contains("construction unavailable"));
+        assert_eq!(context.sync_store.status_snapshot()?, before);
+        return Ok(());
+    }
     match case {
         "bound-candidate-content" => fs::write(
             preflight.worktree.path.join("src/lib.rs"),
@@ -272,6 +351,16 @@ pub(super) fn exercise(
         );
     }
     Ok(())
+}
+
+#[test]
+fn bound_parent_turn_shares_preflight_with_one_driver_and_serial_workers() -> Result<()> {
+    nested_driver_tests::driver_fixture("bound-shared-driver")
+}
+
+#[test]
+fn bound_parent_turn_shared_driver_still_refuses_cancellation() -> Result<()> {
+    nested_driver_tests::driver_fixture("bound-shared-cancelled")
 }
 
 #[test]

@@ -58,7 +58,8 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let semantic_store = SemanticIntentStore::open(&repo)?;
     let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
     let cancellation = ProcessCancellation::new();
-    let mut preflight = AssignmentExecutionPreflight {
+    let preflight = AssignmentExecutionPreflight {
+        nested_turn_issued: AtomicBool::new(false),
         journal_parent_id: run_id.as_str(),
         environment_requirements: Vec::new(),
         semantic_token: None,
@@ -295,9 +296,91 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         prepared,
     )?;
     assert_eq!(*calls.lock().unwrap(), ["parent"]);
-    if case.starts_with("bound-") {
-        super::bound_parent_turn_tests::exercise(case, &context, &preflight, &mut collected)?;
+    if case.starts_with("permit-") {
+        match case {
+            "permit-failed-issue" => {
+                assert!(preflight.issue_nested_turn(0).is_err());
+            }
+            "permit-failed-construction" => {
+                let evidence = collected.external_run.process_tree.take();
+                assert!(NestedWorkerSerialDriver::from_collected_parent(
+                    &context,
+                    &preflight,
+                    &mut outcome,
+                    1,
+                    &collected,
+                )
+                .is_err());
+                collected.external_run.process_tree = evidence;
+            }
+            "permit-drop" => {
+                drop(NestedWorkerSerialDriver::from_collected_parent(
+                    &context,
+                    &preflight,
+                    &mut outcome,
+                    1,
+                    &collected,
+                )?);
+            }
+            "permit-race" => {
+                let barrier = std::sync::Barrier::new(2);
+                std::thread::scope(|scope| {
+                    let construct = || {
+                        let mut independent_outcome = AssignmentExecutionOutcome::default();
+                        barrier.wait();
+                        let result = NestedWorkerSerialDriver::from_collected_parent(
+                            &context,
+                            &preflight,
+                            &mut independent_outcome,
+                            1,
+                            &collected,
+                        );
+                        // Hold the successful driver until both constructors return.
+                        barrier.wait();
+                        result.is_ok()
+                    };
+                    let first = scope.spawn(construct);
+                    let second = scope.spawn(construct);
+                    assert_eq!(
+                        usize::from(first.join().unwrap()) + usize::from(second.join().unwrap()),
+                        1
+                    );
+                });
+            }
+            _ => bail!("unknown permit case {case}"),
+        }
+        for attempt in [1, 2] {
+            let mut different_outcome = AssignmentExecutionOutcome::default();
+            let error = NestedWorkerSerialDriver::from_collected_parent(
+                &context,
+                &preflight,
+                &mut different_outcome,
+                attempt,
+                &collected,
+            )
+            .err()
+            .context("nested permit was reissued")?;
+            assert!(error.to_string().contains("already been issued"));
+        }
         assert_eq!(*calls.lock().unwrap(), ["parent"]);
+        assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
+    if case.starts_with("bound-") {
+        super::bound_parent_turn_tests::exercise(
+            case,
+            &context,
+            &preflight,
+            &mut outcome,
+            &mut collected,
+        )?;
+        let expected = if case == "bound-shared-driver" {
+            vec!["parent", "worker-two", "worker"]
+        } else {
+            vec!["parent"]
+        };
+        assert_eq!(*calls.lock().unwrap(), expected);
         context.manager.verify_write_execution_lease(
             &parent.id,
             preflight.worktree_write_lease.as_ref().unwrap(),
@@ -319,7 +402,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         );
         let mut driver = NestedWorkerSerialDriver::from_collected_parent(
             &context,
-            &mut preflight,
+            &preflight,
             &mut outcome,
             1,
             &collected,
@@ -566,7 +649,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let attempt = if case == "parent-wrong-attempt" { 2 } else { 1 };
     let binding = NestedWorkerSerialDriver::from_collected_parent(
         &context,
-        &mut preflight,
+        &preflight,
         &mut outcome,
         attempt,
         &collected,
@@ -675,6 +758,19 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             .selected_runtime_for(AgentRole::Worker),
         None
     );
+    Ok(())
+}
+
+#[test]
+fn nested_driver_permit_is_one_shot_across_failure_drop_and_concurrent_issuance() -> Result<()> {
+    for case in [
+        "permit-failed-issue",
+        "permit-failed-construction",
+        "permit-drop",
+        "permit-race",
+    ] {
+        driver_fixture(case)?;
+    }
     Ok(())
 }
 
