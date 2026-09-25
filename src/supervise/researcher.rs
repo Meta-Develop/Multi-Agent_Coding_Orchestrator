@@ -45,6 +45,94 @@ struct ResearcherReport {
     no_further_delegation: bool,
 }
 
+/// Supervisor-owned terminal evidence, not another model-authored ResearcherReport.
+/// Preserve parent audits and observed violations, including nonzero diffs on failure.
+/// The input parser discards child attestations; never invent them during finalization.
+#[derive(Serialize)]
+#[serde(transparent)]
+struct FinalResearcherReport(OrchestratorReviewReport);
+
+pub(super) fn persist_final_researcher_report(
+    writer: &mut ArtifactRunWriter,
+    journal: &mut Option<OrchestrationEventJournal>,
+    assignment: &OrchestratorAssignment,
+    parent_id: &str,
+    relative: &Path,
+    report: &OrchestratorReviewReport,
+) -> Result<OrchestratorReviewReport> {
+    validate_researcher_assignment(assignment)?;
+    if assignment.role != AgentRole::Researcher {
+        bail!("researcher finalization requires an authored researcher assignment");
+    }
+    let mut normalized = report.clone();
+    if report.role != AgentRole::Researcher || report.id != assignment.id {
+        normalized.status = ReviewStatus::Failed;
+        normalized.accepted = false;
+        normalized.rejected = true;
+        normalized.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "researcher final report identity '{}/{}' differs from authored researcher '{}'",
+                report.role.as_str(),
+                report.id,
+                assignment.id
+            ),
+            paths: vec![relative.to_path_buf()],
+        });
+        normalized.id.clone_from(&assignment.id);
+        normalized.role = AgentRole::Researcher;
+    }
+    enforce_researcher_zero_diff(&mut normalized);
+    enforce_orchestrator_environment_failure_outcome(&mut normalized);
+    let finalized = FinalResearcherReport(normalized);
+    write_artifact_json(
+        writer,
+        relative,
+        &finalized,
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )
+    .with_context(|| {
+        format!(
+            "failed to persist final researcher report {}",
+            relative.display()
+        )
+    })?;
+    // Record the same normalized outcome only after its typed evidence was persisted.
+    let report = &finalized.0;
+    record_orchestration_event(
+        journal,
+        writer,
+        &report.id,
+        Some(parent_id),
+        OrchestrationRole::Researcher,
+        if report_failed(report) {
+            OrchestrationEventKind::Reject
+        } else {
+            OrchestrationEventKind::Accept
+        },
+        json!({
+            "status": report.status,
+            "accepted": report.accepted,
+            "rejected": report.rejected,
+        }),
+    );
+    Ok(finalized.0)
+}
+
+pub(super) fn final_researcher_report_schema_value() -> Value {
+    let mut schema = orchestrator_report_schema_value();
+    schema["title"] = json!("FinalResearcherReport");
+    schema["properties"]["role"] = json!({"type": "string", "const": "researcher"});
+    // This private artifact retains exact host-observed working directories.
+    // Do not apply the public report's redacted-path constraint to this evidence,
+    // or relax that constraint in the public/child schemas themselves.
+    schema["properties"]["commands_run"]["items"]["properties"]["cwd"] = json!({"type": "string"});
+    schema["properties"]["audit_reports"]["items"]["properties"]["commands_run"]["items"]
+        ["properties"]["cwd"] = json!({"type": "string"});
+    schema
+}
+
 pub(super) fn read_researcher_report(
     contents: Option<&[u8]>,
     display_path: &Path,
