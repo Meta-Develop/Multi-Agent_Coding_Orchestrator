@@ -55,6 +55,150 @@ fn sandbox_program_visibility_rejects_private_tmp_and_hidden_roots() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandbox_program_visibility_requires_explicit_protected_home_binding() {
+    for root in ["/home/user", "/root", "/run/user/1000"] {
+        let program = Path::new(root).join("custom-bin/grok");
+        let mut sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+        let error = sandbox.validate_program_visibility(&program).unwrap_err();
+        let (failure, started) = environment_failure_from_source(&error).unwrap();
+        assert!(!started);
+        assert!(failure.summary.contains("ProtectHome=tmpfs"));
+        sandbox.visible_read_only_files.push(program.clone());
+        assert!(sandbox.validate_program_visibility(&program).is_ok());
+        assert!(sandbox
+            .validate_program_visibility(&program.with_file_name("sibling"))
+            .is_err());
+        sandbox
+            .hidden_roots
+            .push(program.parent().unwrap().to_path_buf());
+        assert!(sandbox.validate_program_visibility(&program).is_err());
+    }
+    let sandbox = program_visibility_sandbox(Path::new("/opt/maco/workspace"));
+    for adjacent in [
+        "/home-adjacent/grok",
+        "/root-adjacent/grok",
+        "/run/user-adjacent/grok",
+    ] {
+        assert!(sandbox
+            .validate_program_visibility(Path::new(adjacent))
+            .is_ok());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_home_program_exact_bind_starts_without_exposing_siblings() {
+    use std::os::unix::fs::PermissionsExt;
+
+    skip_without_containment!();
+    let home = PathBuf::from(env::var_os("HOME").expect("test home"));
+    assert!(
+        ["/home", "/root", "/run/user"]
+            .iter()
+            .any(|root| home.starts_with(root)),
+        "test requires HOME under a ProtectHome-covered root"
+    );
+    let temp = tempfile::Builder::new()
+        .prefix("maco-grok-program-")
+        .tempdir_in(home)
+        .unwrap();
+    let workspace = temp.path().join("worktree");
+    let bin = temp.path().join("bin");
+    fs::create_dir(&workspace).unwrap();
+    fs::create_dir(&bin).unwrap();
+    let program = bin.join("grok");
+    let sibling = bin.join("unrelated-private-file");
+    fs::write(&sibling, "must stay hidden\n").unwrap();
+    let script = b"#!/bin/sh\nset -eu\n[ ! -e \"$1\" ]\nif (printf changed >> \"$0\") 2>/dev/null; then exit 71; fi\nprintf 'exact-grok-program-ok\\n'\n";
+    fs::write(&program, script).unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    for profile in [
+        ExternalGrokProfile::read_only(&workspace),
+        ExternalGrokProfile::read_write(&workspace),
+    ] {
+        let spec = ProcessSpec::direct(
+            "home Grok executable probe",
+            &program,
+            [&sibling],
+            &workspace,
+            4096,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT));
+        let error = run_process(spec.clone().with_side_effect_confinement(
+            SideEffectConfinementProfile::ExternalGrok(profile.clone()),
+        ))
+        .expect_err("unbound home program must fail before dispatch");
+        let ProcessRunError::EnvironmentFailure {
+            failure,
+            target_process_started,
+            ..
+        } = error
+        else {
+            panic!("expected typed preflight error: {error}");
+        };
+        assert!(!target_process_started);
+        assert!(failure.summary.contains("ProtectHome=tmpfs"));
+        let output = run_process(spec.with_side_effect_confinement(
+            SideEffectConfinementProfile::ExternalGrok(
+                profile.with_visible_read_only_file(&program),
+            ),
+        ))
+        .expect("exact bound home program");
+        assert!(
+            output.status.is_some_and(|status| status.success()),
+            "{output:#?}"
+        );
+        assert!(output.safety_evidence_verified(), "{output:#?}");
+        assert_eq!(output.stdout.bytes, b"exact-grok-program-ok\n");
+        assert_eq!(fs::read(&program).unwrap(), script);
+        assert_eq!(fs::read_to_string(&sibling).unwrap(), "must stay hidden\n");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn external_grok_exact_program_preserves_identity_and_hardlink_guards() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir().unwrap();
+    let workspace = temp.path().join("worktree");
+    fs::create_dir(&workspace).unwrap();
+    let program = workspace.join("grok");
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    let spec = ProcessSpec::direct(
+        "exact program guards",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(
+        ExternalGrokProfile::read_write(&workspace).with_visible_read_only_file(&program),
+    ));
+    let sandbox = resolve_systemd_sandbox(&spec).unwrap().unwrap();
+    fs::rename(&program, program.with_extension("old")).unwrap();
+    fs::write(&program, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+    assert!(sandbox
+        .verify_path_identities()
+        .unwrap_err()
+        .to_string()
+        .contains("identity changed"));
+    fs::hard_link(&program, workspace.join("writable-alias")).unwrap();
+    let error = resolve_systemd_sandbox(&spec)
+        .err()
+        .expect("writable program alias must be rejected");
+    assert!(
+        error.to_string().contains("writable hard-link alias"),
+        "{error}"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn sandbox_program_visibility_accepts_explicit_private_tmp_bindings() {
     let workspace_program = Path::new("/tmp/workspace/bin/probe");
     let mut sandbox = program_visibility_sandbox(Path::new("/tmp/workspace"));
@@ -3607,25 +3751,12 @@ fn completion_first_observed_after_deadline_is_a_timeout() {
 }
 
 #[cfg(unix)]
-#[test]
-fn normal_exit_terminates_descendants_holding_pipes() {
+fn run_normal_exit_pipe_fixture(command: String, workdir: &Path) -> ProcessOutput {
     const WHOLE_CALL_BOUND: Duration = Duration::from_secs(3);
 
-    let temp = tempfile::tempdir().expect("tempdir");
-    let descendant_pid = temp.path().join("descendant.pid");
-    let command = format!(
-            "(trap '' TERM; echo descendant-started; echo descendant-error >&2; while :; do sleep 1; done) & descendant=$!; echo \"$descendant\" > '{}'; echo parent-exiting",
-            descendant_pid.display()
-        );
-    let spec = ProcessSpec::shell(
-        "hung command",
-        Shell::UnixSh,
-        command,
-        temp.path(),
-        8 * 1024,
-    )
-    .with_containment(ContainmentPolicy::TrustedBestEffort)
-    .with_timeout(Some(Duration::from_secs(2)));
+    let spec = ProcessSpec::shell("hung command", Shell::UnixSh, command, workdir, 8 * 1024)
+        .with_containment(ContainmentPolicy::TrustedBestEffort)
+        .with_timeout(Some(Duration::from_secs(2)));
 
     let (completion_tx, completion_rx) = mpsc::channel();
     // Start before `thread::spawn`: worker creation and scheduling are part of the whole call.
@@ -3650,6 +3781,29 @@ fn normal_exit_terminates_descendants_holding_pipes() {
     assert!(!output.timed_out);
     assert!(output.status.is_some_and(|status| status.success()));
     assert_eq!(output.process_error, None);
+    output
+}
+
+#[cfg(unix)]
+#[test]
+fn normal_exit_terminates_descendants_holding_pipes() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid = temp.path().join("descendant.pid");
+    // Parent exit permits immediate cleanup. Publish readiness only after the TERM
+    // trap and both pipe writes, so successful cleanup cannot preempt those writes.
+    // Polling observes a condition, not an assumed scheduling delay; the runner's
+    // unchanged two-second timeout also bounds a missing readiness notification.
+    let command = format!(
+        "(trap '' TERM; echo descendant-started; echo descendant-error >&2; : > descendant.ready; while :; do sleep 1; done) & descendant=$!; echo \"$descendant\" > '{}'; while [ ! -f descendant.ready ]; do sleep 0.01; done; echo parent-exiting",
+        descendant_pid.display()
+    );
+    let output = run_normal_exit_pipe_fixture(command, temp.path());
+    assert!(temp.path().join("descendant.ready").is_file());
+    assert!(output
+        .stdout
+        .summarize_chars(8 * 1024)
+        .text
+        .contains("parent-exiting"));
     assert!(output
         .stdout
         .summarize_chars(8 * 1024)
@@ -3662,6 +3816,32 @@ fn normal_exit_terminates_descendants_holding_pipes() {
         .contains("descendant-error"));
     let pid = std::fs::read_to_string(descendant_pid).expect("descendant pid");
     assert_process_gone(&pid, "output-pipe descendant");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn normal_exit_terminates_descendant_stopped_before_output() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let descendant_pid = temp.path().join("descendant.pid");
+    // A separate shell gives $$ the descendant's PID. SIGSTOP deterministically
+    // prevents its trap and output from running. The parent observes /proc state T
+    // before exiting; no guessed sleep duration stands in for that observation.
+    let command = format!(
+        r#"sh -c 'kill -STOP "$$"; trap "" TERM; echo descendant-started; echo descendant-error >&2; while :; do sleep 1; done' & descendant=$!; echo "$descendant" > '{}'; while :; do IFS= read -r stat < "/proc/$descendant/stat" || exit 1; case "$stat" in *") T "*) break;; esac; sleep 0.01; done; echo descendant-stopped; echo parent-exiting"#,
+        descendant_pid.display()
+    );
+    let output = run_normal_exit_pipe_fixture(command, temp.path());
+    let stdout = output.stdout.summarize_chars(8 * 1024).text;
+    assert!(stdout.contains("descendant-stopped"));
+    assert!(stdout.contains("parent-exiting"));
+    assert!(!stdout.contains("descendant-started"));
+    assert!(!output
+        .stderr
+        .summarize_chars(8 * 1024)
+        .text
+        .contains("descendant-error"));
+    let pid = fs::read_to_string(descendant_pid).expect("stopped descendant pid");
+    assert_process_gone(&pid, "stopped-before-output descendant");
 }
 
 #[cfg(unix)]

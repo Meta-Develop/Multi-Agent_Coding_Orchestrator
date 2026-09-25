@@ -1781,7 +1781,9 @@ fn screened_grok_catalog_process_spec_with_credential_source(
         "GROK_HOME".to_string(),
         sources.grok_home_environment().to_string(),
     );
-    let profile = sources.bind_to_profile(ExternalGrokProfile::read_only(spec.current_dir()))?;
+    let profile = sources.bind_to_profile(
+        ExternalGrokProfile::read_only(spec.current_dir()).with_visible_read_only_file(&program),
+    )?;
     Ok(ProcessSpec::direct(
         "Grok runtime model catalog",
         program,
@@ -2818,7 +2820,11 @@ mod tests {
     #[test]
     fn screened_process_spec_is_bounded_cleared_and_confined() -> Result<()> {
         let dir = tempfile::tempdir()?;
-        let program = dir.path().join("catalog-standin");
+        let workspace = dir.path().join("workspace");
+        let program_root = dir.path().join("custom-bin");
+        fs::create_dir(&workspace)?;
+        fs::create_dir(&program_root)?;
+        let program = program_root.join("catalog-standin");
         fs::write(&program, "")?;
         let grok_home = dir.path().join("reviewed-grok-home");
         fs::create_dir(&grok_home)?;
@@ -2826,7 +2832,7 @@ mod tests {
         let config = grok_home.join(GROK_CONFIG_FILE);
         fs::write(&auth, "hermetic-auth-fixture")?;
         fs::write(&config, "hermetic-config-fixture")?;
-        let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
+        let spec = GrokCatalogCommandSpec::new(&workspace).with_program(&program);
         let process = screened_grok_catalog_process_spec_with_sources(
             &spec,
             program.clone(),
@@ -2888,21 +2894,31 @@ mod tests {
         assert!(profile.visible_read_only_roots().is_empty());
         assert_eq!(
             profile.visible_read_only_files(),
-            &[auth.clone(), config.clone()],
-            "only the exact reviewed identity/config leaves may escape ProtectHome=tmpfs"
+            &[program.clone(), auth.clone(), config.clone()],
+            "only the exact program and reviewed identity/config leaves may escape ProtectHome=tmpfs"
         );
         assert!(profile.visible_read_write_roots().is_empty());
         assert!(profile.visible_read_write_files().is_empty());
         let properties = crate::process_runner::external_grok_systemd_properties_for_test(
             profile.clone(),
             &program,
-            dir.path(),
+            &workspace,
         )?;
+        assert!(!properties.contains(&format!(
+            "--property=BindReadOnlyPaths={}",
+            program_root.display()
+        )));
         assert!(properties.contains(&format!(
             "--property=InaccessiblePaths=-{}",
             grok_home.display()
         )));
         assert!(properties.contains(&"--property=PrivateTmp=yes".to_string()));
+        assert!(properties.contains(&"--property=ProtectHome=tmpfs".to_string()));
+        assert!(properties.contains(&format!(
+            "--property=BindReadOnlyPaths={}",
+            program.display()
+        )));
+        assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", program.display())));
         for (source, name) in [(&auth, GROK_AUTH_FILE), (&config, GROK_CONFIG_FILE)] {
             let target = private_home.join(name);
             assert!(properties.contains(&format!(
@@ -3125,7 +3141,7 @@ mod tests {
 
         let process = screened_grok_catalog_process_spec_with_sources(
             &spec,
-            program,
+            program.clone(),
             Some(dir.path().as_os_str()),
             None,
         )?;
@@ -3142,7 +3158,7 @@ mod tests {
         let SideEffectConfinementProfile::ExternalGrok(profile) = &process.side_effects else {
             panic!("screened catalog must use ExternalGrok confinement");
         };
-        assert_eq!(profile.visible_read_only_files(), &[auth]);
+        assert_eq!(profile.visible_read_only_files(), &[program, auth]);
         assert!(profile.visible_read_only_roots().is_empty());
         Ok(())
     }

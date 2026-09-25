@@ -2098,6 +2098,7 @@ fn scope_role(role: Option<&str>) -> OrchestrationRole {
         "supervisor" | "o2" | "top_supervisor" => OrchestrationRole::Supervisor,
         "orchestrator" | "child_orchestrator" | "o1" => OrchestrationRole::Orchestrator,
         "auditor" | "review_auditor" | "review-auditor" => OrchestrationRole::Auditor,
+        "researcher" => OrchestrationRole::Researcher,
         _ => OrchestrationRole::Worker,
     }
 }
@@ -2476,6 +2477,7 @@ fn role_rank(role: OrchestrationRole) -> u8 {
         OrchestrationRole::Orchestrator => 2,
         OrchestrationRole::Worker => 3,
         OrchestrationRole::Auditor => 4,
+        OrchestrationRole::Researcher => 5,
     }
 }
 

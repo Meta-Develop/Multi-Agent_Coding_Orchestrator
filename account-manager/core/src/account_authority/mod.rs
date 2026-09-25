@@ -39,5 +39,7 @@ pub use registry::StoredAccountRegistry;
 pub use server::{
     listen, AuthorityListener, AuthorityServerConfig, GeminiLoginPort, ListenError, PeerPolicy,
 };
+#[cfg(unix)]
+pub(crate) use socket_path::reject_owner_and_mode;
 pub use socket_path::{resolve_socket_path, SafeSocketPath, SocketPathError};
 pub use use_lease::{PendingLoginBinding, PendingLoginLease, SelectedUseLease};

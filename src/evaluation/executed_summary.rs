@@ -580,6 +580,7 @@ fn role_name(role: AgentRole) -> &'static str {
         AgentRole::Supervisor => "supervisor",
         AgentRole::ChildOrchestrator => "child_orchestrator",
         AgentRole::Worker => "worker",
+        AgentRole::Researcher => "researcher",
         AgentRole::GateClassifier => "gate_classifier",
         AgentRole::Auditor => "auditor",
     }

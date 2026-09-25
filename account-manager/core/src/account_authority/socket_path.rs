@@ -174,18 +174,35 @@ fn inspect_existing(
 }
 
 #[cfg(unix)]
-fn reject_owner_and_mode(path: &Path, metadata: &std::fs::Metadata) -> Result<(), SocketPathError> {
+pub(crate) fn reject_owner_and_mode(
+    path: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<(), SocketPathError> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    let uid = metadata.uid();
-    let euid = effective_uid();
+    reject_owner_and_mode_values(
+        path,
+        metadata.uid(),
+        metadata.permissions().mode(),
+        metadata.is_dir(),
+        effective_uid(),
+    )
+}
+
+#[cfg(unix)]
+fn reject_owner_and_mode_values(
+    path: &Path,
+    uid: u32,
+    mode: u32,
+    is_dir: bool,
+    euid: u32,
+) -> Result<(), SocketPathError> {
     if uid != euid && uid != 0 {
         return Err(SocketPathError::WrongOwner(path.to_path_buf()));
     }
 
-    let mode = metadata.permissions().mode();
     let group_or_world_writable = mode & 0o022 != 0;
-    let root_sticky_directory = metadata.is_dir() && uid == 0 && mode & 0o1000 != 0;
+    let root_sticky_directory = is_dir && uid == 0 && mode & 0o1000 != 0;
     if group_or_world_writable && !root_sticky_directory {
         return Err(SocketPathError::WritableAncestry(path.to_path_buf()));
     }
@@ -201,6 +218,29 @@ fn effective_uid() -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_owner_mode_policy_rejects_foreign_owners_and_only_allows_root_sticky_directories() {
+        let path = Path::new("/FAKE-component");
+        assert_eq!(
+            reject_owner_and_mode_values(path, 1001, 0o700, true, 1000),
+            Err(SocketPathError::WrongOwner(path.to_path_buf()))
+        );
+        assert_eq!(
+            reject_owner_and_mode_values(path, 1001, 0o1777, true, 1000),
+            Err(SocketPathError::WrongOwner(path.to_path_buf()))
+        );
+        for (owner, mode, is_dir) in [(1000, 0o1777, true), (0, 0o777, true), (0, 0o1777, false)] {
+            assert_eq!(
+                reject_owner_and_mode_values(path, owner, mode, is_dir, 1000),
+                Err(SocketPathError::WritableAncestry(path.to_path_buf()))
+            );
+        }
+        reject_owner_and_mode_values(path, 0, 0o1777, true, 1000).unwrap();
+        reject_owner_and_mode_values(path, 0, 0o755, true, 1000).unwrap();
+        reject_owner_and_mode_values(path, 1000, 0o700, true, 1000).unwrap();
+    }
 
     #[cfg(not(unix))]
     #[test]

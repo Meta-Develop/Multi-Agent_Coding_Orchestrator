@@ -12,7 +12,7 @@ use crate::fsx;
 use super::binding::SelectedAccountBinding;
 use super::document::metadata_write_error;
 use super::incarnation::validate_account_incarnation;
-use super::lock::{open_file_identity_matches_path, open_regular_lock_file};
+use super::lock::{is_lock_contention, open_file_identity_matches_path, open_regular_lock_file};
 
 /// RAII shared lease on the exact account incarnation named by a selection binding.
 pub struct SelectedUseLease {
@@ -61,7 +61,7 @@ impl SelectedUseLease {
         }
         let file = open_or_create_use_lock_file(&path)?;
         FileExt::lock_shared(&file).map_err(|source| {
-            if source.kind() == io::ErrorKind::WouldBlock {
+            if is_lock_contention(&source) {
                 Error::AccountAuthorityBusy {
                     reason: format!(
                         "account `{}` is already mutating under an exclusive authority lock",
@@ -188,7 +188,7 @@ pub(crate) fn refuse_provider_authority_mutations(
             Ok(()) => {
                 let _ = FileExt::unlock(&file);
             }
-            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+            Err(error) if is_lock_contention(&error) => {
                 return Err(Error::AccountAuthorityBusy {
                     reason: format!("provider `{provider_id}` has an active account-use lease"),
                 });

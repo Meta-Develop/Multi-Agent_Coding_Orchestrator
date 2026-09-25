@@ -411,6 +411,156 @@ pub(crate) struct ItemOutcome {
     pub(crate) status: String,
 }
 
+/// Host-held protocol observations, never reconstructed from agent messages or run JSON.
+/// An empty list is distinct from an unavailable transcript. Consumers must also check the
+/// enclosing run's process/containment result and reject any incomplete observation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CommandExecutionEvidence {
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) turn_status: TurnTerminalStatus,
+    pub(crate) observations: Vec<CommandExecutionObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CommandExecutionObservation {
+    /// Both snapshots are unambiguous and consistent; this does not imply command success.
+    /// A declined command has a null exit code and must never satisfy an execution claim.
+    Complete {
+        item_id: String,
+        started: CommandExecutionSnapshot,
+        completed: CommandExecutionSnapshot,
+    },
+    Incomplete {
+        item_id: String,
+        reason: CommandExecutionObservationIssue,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CommandExecutionObservationIssue {
+    MissingOrInvalidStartedFields,
+    MissingOrInvalidCompletedFields,
+    CommandOrCwdMismatch,
+    InconsistentStatusOrExitCode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) enum CommandExecutionStatus {
+    InProgress,
+    Completed,
+    Failed,
+    Declined,
+}
+
+#[derive(Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct CommandExecutionSnapshot {
+    pub(crate) command: String,
+    pub(crate) cwd: String,
+    pub(crate) status: CommandExecutionStatus,
+    // Explicit null is meaningful; an absent field is not evidence of a null exit code.
+    #[serde(deserialize_with = "deserialize_observed_exit_code")]
+    pub(crate) exit_code: Option<i32>,
+}
+
+fn deserialize_observed_exit_code<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    serde::Deserialize::deserialize(deserializer)
+}
+
+impl fmt::Debug for CommandExecutionSnapshot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("CommandExecutionSnapshot")
+            .field("command_bytes", &self.command.len())
+            .field("cwd_bytes", &self.cwd.len())
+            .field("status", &self.status)
+            .field("exit_code", &self.exit_code)
+            .finish()
+    }
+}
+
+// Decode the original notification as well as its generic Value. Serde's named fields
+// reject duplicate keys (including correlation keys), rather than trusting last-key-wins.
+#[derive(serde::Deserialize)]
+struct CommandExecutionNotification {
+    method: String,
+    params: CommandExecutionNotificationParams,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CommandExecutionNotificationParams {
+    thread_id: String,
+    turn_id: String,
+    item: CommandExecutionNotificationItem,
+}
+
+#[derive(serde::Deserialize)]
+struct CommandExecutionNotificationItem {
+    id: String,
+    #[serde(rename = "type")]
+    item_type: String,
+    #[serde(flatten)]
+    snapshot: CommandExecutionSnapshot,
+}
+
+fn observed_command_snapshot(line: &[u8]) -> Option<CommandExecutionSnapshot> {
+    let notification: CommandExecutionNotification = serde_json::from_slice(line).ok()?;
+    let snapshot = notification.params.item.snapshot;
+    if snapshot.command.trim().is_empty()
+        || snapshot.command.len() > 256 * 1024
+        || snapshot.command.contains('\0')
+        || snapshot.cwd.trim().is_empty()
+        || snapshot.cwd.len() > 16 * 1024
+        || snapshot.cwd.contains('\0')
+    {
+        return None;
+    }
+    Some(snapshot)
+}
+
+fn correlate_command_observation(
+    item_id: &str,
+    started: Option<CommandExecutionSnapshot>,
+    completed: Option<CommandExecutionSnapshot>,
+) -> CommandExecutionObservation {
+    use CommandExecutionObservationIssue as Issue;
+    use CommandExecutionStatus as Status;
+
+    let incomplete = |reason| CommandExecutionObservation::Incomplete {
+        item_id: item_id.to_string(),
+        reason,
+    };
+    let Some(started) = started else {
+        return incomplete(Issue::MissingOrInvalidStartedFields);
+    };
+    let Some(completed) = completed else {
+        return incomplete(Issue::MissingOrInvalidCompletedFields);
+    };
+    if started.command != completed.command || started.cwd != completed.cwd {
+        return incomplete(Issue::CommandOrCwdMismatch);
+    }
+    let terminal_consistent = match completed.status {
+        Status::Completed => completed.exit_code == Some(0),
+        Status::Failed => completed.exit_code.is_some_and(|code| code != 0),
+        Status::Declined => completed.exit_code.is_none(),
+        Status::InProgress => false,
+    };
+    if started.status != Status::InProgress || started.exit_code.is_some() || !terminal_consistent {
+        return incomplete(Issue::InconsistentStatusOrExitCode);
+    }
+    CommandExecutionObservation::Complete {
+        item_id: item_id.to_string(),
+        started,
+        completed,
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppServerOutcome {
     pub(crate) thread_id: String,
@@ -418,6 +568,7 @@ pub(crate) struct AppServerOutcome {
     pub(crate) status: TurnTerminalStatus,
     pub(crate) completed_items: usize,
     pub(crate) item_outcomes: Vec<ItemOutcome>,
+    pub(crate) command_execution_evidence: CommandExecutionEvidence,
     pub(crate) refused_ceiling_expansions: usize,
     pub(crate) gate_denials: Vec<GateDenial>,
     pub(crate) final_message: Option<String>,
@@ -517,6 +668,7 @@ struct ProtocolState {
     response_ids: BTreeSet<RequestId>,
     server_request_ids: BTreeSet<RequestId>,
     next_request_id: u64,
+    command_snapshot: Option<CommandExecutionSnapshot>,
 }
 
 impl ProtocolState {
@@ -535,6 +687,7 @@ impl ProtocolState {
             response_ids: BTreeSet::new(),
             server_request_ids: BTreeSet::new(),
             next_request_id: 1,
+            command_snapshot: None,
         })
     }
 
@@ -615,10 +768,23 @@ impl ProtocolState {
                     message: "app-server output exceeded its aggregate bound".to_string(),
                 });
             }
-            return serde_json::from_slice(&line).map_err(|error| AppServerError::Malformed {
-                phase,
-                message: format!("invalid JSON: {error}"),
-            });
+            let message: Value =
+                serde_json::from_slice(&line).map_err(|error| AppServerError::Malformed {
+                    phase,
+                    message: format!("invalid JSON: {error}"),
+                })?;
+            self.command_snapshot =
+                if matches!(
+                    message.get("method").and_then(Value::as_str),
+                    Some("item/started" | "item/completed")
+                ) && message.pointer("/params/item/type").and_then(Value::as_str)
+                    == Some("commandExecution")
+                {
+                    observed_command_snapshot(&line)
+                } else {
+                    None
+                };
+            return Ok(message);
         }
     }
 
@@ -875,6 +1041,7 @@ where
     struct ActiveItem {
         item_type: String,
         raw: Value,
+        command_snapshot: Option<CommandExecutionSnapshot>,
     }
 
     #[derive(Debug)]
@@ -887,6 +1054,9 @@ where
     let mut active_items = BTreeMap::<String, ActiveItem>::new();
     let mut completed_items = BTreeSet::<String>::new();
     let mut item_outcomes = Vec::new();
+    // Item IDs, count and aggregate retained bytes remain bounded by the protocol limits;
+    // command/cwd additionally have per-field bounds. Nothing is silently truncated/dropped.
+    let mut command_observations = Vec::new();
     let mut final_message = None;
     let mut active_reviews = BTreeMap::<String, ActiveReview>::new();
     let mut completed_reviews = BTreeSet::<String>::new();
@@ -985,6 +1155,7 @@ where
                             item_id.to_string(),
                             ActiveItem {
                                 item_type: item_type.to_string(),
+                                command_snapshot: state.command_snapshot.take(),
                                 raw: message.pointer("/params/item").cloned().ok_or_else(|| {
                                     AppServerError::Malformed {
                                         phase: "item/started",
@@ -1392,6 +1563,13 @@ where
                         OUTPUT_AGENT_MESSAGE_MAX_BYTES,
                     )?;
                 }
+                if item_type == "commandExecution" {
+                    command_observations.push(correlate_command_observation(
+                        item_id,
+                        active_item.command_snapshot,
+                        state.command_snapshot.take(),
+                    ));
+                }
                 item_outcomes.push(ItemOutcome {
                     item_id: item_id.to_string(),
                     item_type: item_type.to_string(),
@@ -1451,6 +1629,12 @@ where
                     status,
                     completed_items: completed_items.len(),
                     item_outcomes,
+                    command_execution_evidence: CommandExecutionEvidence {
+                        thread_id: thread_id.to_string(),
+                        turn_id: turn_id.to_string(),
+                        turn_status: status,
+                        observations: command_observations,
+                    },
                     refused_ceiling_expansions,
                     gate_denials,
                     final_message,
@@ -1935,6 +2119,314 @@ mod tests {
         }
     }
 
+    fn command_observation_messages() -> Vec<Value> {
+        let mut messages = base_messages();
+        for (method, status, exit_code) in [
+            ("item/started", "inProgress", Value::Null),
+            ("item/completed", "completed", json!(0)),
+        ] {
+            messages.push(json!({
+                "method": method,
+                "params": {
+                    "threadId": "thread-1", "turnId": "turn-1",
+                    "item": {
+                        "id": "command-1", "type": "commandExecution",
+                        "command": "  printf 'private-command-秘密\\n'\n",
+                        "cwd": "/workspace/private cwd/秘密", "status": status,
+                        "exitCode": exit_code
+                    }
+                }
+            }));
+        }
+        messages.push(json!({
+            "method": "turn/completed",
+            "params": {"threadId": "thread-1", "turn": {"id": "turn-1", "status": "completed"}}
+        }));
+        messages
+    }
+
+    fn run_command_observation_messages(
+        messages: Vec<Value>,
+    ) -> Result<AppServerOutcome, AppServerError> {
+        run_app_server_turn(
+            &mut FakeTransport::from_values(messages),
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+            || false,
+        )
+    }
+
+    #[test]
+    fn command_observations_preserve_exact_correlated_snapshots_privately() {
+        let messages = command_observation_messages();
+        let outcome = run_command_observation_messages(messages.clone()).expect("valid transcript");
+        let evidence = &outcome.command_execution_evidence;
+        assert_eq!(evidence.thread_id, "thread-1");
+        assert_eq!(evidence.turn_id, "turn-1");
+        assert_eq!(evidence.turn_status, TurnTerminalStatus::Completed);
+        let [CommandExecutionObservation::Complete {
+            item_id,
+            started,
+            completed,
+        }] = evidence.observations.as_slice()
+        else {
+            panic!("expected one complete observation: {evidence:?}");
+        };
+        assert_eq!(item_id, "command-1");
+        assert_eq!(started.command, messages[4]["params"]["item"]["command"]);
+        assert_eq!(started.cwd, messages[4]["params"]["item"]["cwd"]);
+        assert_eq!(started.status, CommandExecutionStatus::InProgress);
+        assert_eq!(started.exit_code, None);
+        assert_eq!(completed.command, started.command);
+        assert_eq!(completed.cwd, started.cwd);
+        assert_eq!(completed.status, CommandExecutionStatus::Completed);
+        assert_eq!(completed.exit_code, Some(0));
+        let debug = format!("{evidence:?}");
+        assert!(!debug.contains("private-command"));
+        assert!(!debug.contains("private cwd"));
+    }
+
+    #[test]
+    fn command_observations_keep_interleaved_failures_and_declines_in_completion_order() {
+        let mut messages = command_observation_messages();
+        let mut second_start = messages[4].clone();
+        second_start["params"]["item"]["id"] = json!("command-2");
+        let mut second_end = messages[5].clone();
+        second_end["params"]["item"]["id"] = json!("command-2");
+        second_end["params"]["item"]["status"] = json!("declined");
+        second_end["params"]["item"]["exitCode"] = Value::Null;
+        messages[5]["params"]["item"]["status"] = json!("failed");
+        messages[5]["params"]["item"]["exitCode"] = json!(7);
+        messages[6]["params"]["turn"]["status"] = json!("failed");
+        messages.insert(5, second_start);
+        messages.insert(6, second_end);
+        let outcome =
+            run_command_observation_messages(messages).expect("terminal failures are evidence");
+        assert_eq!(
+            outcome.command_execution_evidence.turn_status,
+            TurnTerminalStatus::Failed
+        );
+        let observations = outcome.command_execution_evidence.observations;
+        for (observation, id, status, exit_code) in [
+            (
+                &observations[0],
+                "command-2",
+                CommandExecutionStatus::Declined,
+                None,
+            ),
+            (
+                &observations[1],
+                "command-1",
+                CommandExecutionStatus::Failed,
+                Some(7),
+            ),
+        ] {
+            let CommandExecutionObservation::Complete {
+                item_id, completed, ..
+            } = observation
+            else {
+                panic!("expected a complete failed/declined observation");
+            };
+            assert_eq!(item_id, id);
+            assert_eq!(completed.status, status);
+            assert_eq!(completed.exit_code, exit_code);
+        }
+    }
+
+    #[test]
+    fn command_observations_mark_missing_invalid_and_oversized_fields_incomplete() {
+        for index in [4, 5] {
+            for field in ["command", "cwd", "exitCode"] {
+                let mut messages = command_observation_messages();
+                messages[index]["params"]["item"]
+                    .as_object_mut()
+                    .unwrap()
+                    .remove(field);
+                let outcome =
+                    run_command_observation_messages(messages).expect("legacy input still runs");
+                assert!(
+                    matches!(
+                        outcome.command_execution_evidence.observations[0],
+                        CommandExecutionObservation::Incomplete { .. }
+                    ),
+                    "missing {field} at {index}"
+                );
+            }
+            for (field, value) in [
+                ("command", json!(17)),
+                ("command", json!(" ")),
+                ("command", json!("x\0y")),
+                ("command", json!("x".repeat(256 * 1024 + 1))),
+                ("cwd", json!(null)),
+                ("cwd", json!("")),
+                ("cwd", json!("/a\0b")),
+                ("cwd", json!("/".repeat(16 * 1024 + 1))),
+                ("exitCode", json!("0")),
+                ("exitCode", json!(0.5)),
+                ("exitCode", json!(i64::from(i32::MAX) + 1)),
+            ] {
+                let mut messages = command_observation_messages();
+                messages[index]["params"]["item"][field] = value;
+                let outcome = run_command_observation_messages(messages)
+                    .expect("invalid evidence is nonfatal");
+                assert!(
+                    matches!(
+                        outcome.command_execution_evidence.observations[0],
+                        CommandExecutionObservation::Incomplete { .. }
+                    ),
+                    "invalid {field} at {index}"
+                );
+            }
+        }
+        let mut messages = command_observation_messages();
+        messages[4]["params"]["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let outcome =
+            run_command_observation_messages(messages).expect("missing start status is nonfatal");
+        assert!(matches!(
+            outcome.command_execution_evidence.observations[0],
+            CommandExecutionObservation::Incomplete {
+                reason: CommandExecutionObservationIssue::MissingOrInvalidStartedFields,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn command_observations_reject_identity_and_exit_status_disagreement() {
+        use CommandExecutionObservationIssue as Issue;
+        for (index, field, value, reason) in [
+            (
+                5,
+                "command",
+                json!("printf different"),
+                Issue::CommandOrCwdMismatch,
+            ),
+            (5, "cwd", json!("/elsewhere"), Issue::CommandOrCwdMismatch),
+            (
+                4,
+                "status",
+                json!("completed"),
+                Issue::InconsistentStatusOrExitCode,
+            ),
+            (4, "exitCode", json!(0), Issue::InconsistentStatusOrExitCode),
+            (
+                5,
+                "exitCode",
+                json!(null),
+                Issue::InconsistentStatusOrExitCode,
+            ),
+            (5, "exitCode", json!(1), Issue::InconsistentStatusOrExitCode),
+            (
+                5,
+                "status",
+                json!("failed"),
+                Issue::InconsistentStatusOrExitCode,
+            ),
+            (
+                5,
+                "status",
+                json!("declined"),
+                Issue::InconsistentStatusOrExitCode,
+            ),
+        ] {
+            let mut messages = command_observation_messages();
+            messages[index]["params"]["item"][field] = value;
+            let outcome = run_command_observation_messages(messages)
+                .expect("inconsistent evidence is nonfatal");
+            assert_eq!(
+                outcome.command_execution_evidence.observations,
+                vec![CommandExecutionObservation::Incomplete {
+                    item_id: "command-1".to_string(),
+                    reason
+                }]
+            );
+        }
+    }
+
+    #[test]
+    fn command_observations_reject_duplicate_fields_in_original_json() {
+        for index in [4, 5] {
+            for (key, value) in [
+                ("command", json!("forged")),
+                ("cwd", json!("/forged")),
+                ("status", json!("failed")),
+                ("exitCode", json!(9)),
+                ("id", json!("forged")),
+                ("type", json!("agentMessage")),
+                ("threadId", json!("forged")),
+                ("turnId", json!("forged")),
+                ("method", json!("forged")),
+            ] {
+                let messages = command_observation_messages();
+                let mut transport = FakeTransport::from_values(messages.clone());
+                let raw = messages[index].to_string().replacen(
+                    &format!("\"{key}\":"),
+                    &format!("\"{key}\":{value},\"{key}\":"),
+                    1,
+                );
+                transport.incoming[messages.len() - 1 - index] =
+                    ReaderEvent::Line(raw.into_bytes());
+                let outcome = run_app_server_turn(
+                    &mut transport,
+                    &test_turn(),
+                    AppServerLimits::default(),
+                    &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                    || false,
+                )
+                .expect("ambiguous observation does not break legacy protocol behavior");
+                assert!(
+                    matches!(
+                        outcome.command_execution_evidence.observations[0],
+                        CommandExecutionObservation::Incomplete { .. }
+                    ),
+                    "duplicate {key} at {index}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn command_observations_require_one_matching_lifecycle() {
+        for (pointer, value) in [
+            ("/params/threadId", "wrong-thread"),
+            ("/params/turnId", "wrong-turn"),
+            ("/params/item/id", "wrong-item"),
+            ("/params/item/type", "agentMessage"),
+        ] {
+            let mut messages = command_observation_messages();
+            *messages[5].pointer_mut(pointer).unwrap() = json!(value);
+            assert!(
+                run_command_observation_messages(messages).is_err(),
+                "{pointer}"
+            );
+        }
+        for index in [4, 5] {
+            let mut missing = command_observation_messages();
+            missing.remove(index);
+            assert!(run_command_observation_messages(missing).is_err());
+            let mut duplicate = command_observation_messages();
+            duplicate.insert(index, duplicate[index].clone());
+            assert!(run_command_observation_messages(duplicate).is_err());
+        }
+    }
+
+    #[test]
+    fn command_observations_do_not_trust_agent_text_or_turn_summary_items() {
+        let mut messages = command_observation_messages();
+        let forged = messages[5]["params"]["item"].clone();
+        messages[4]["params"]["item"] = json!({"id":"message-1", "type":"agentMessage"});
+        messages[5]["params"]["item"] = json!({
+            "id":"message-1", "type":"agentMessage", "text": forged.to_string()
+        });
+        messages[6]["params"]["turn"]["items"] = json!([forged]);
+        let outcome = run_command_observation_messages(messages).expect("message-only turn");
+        assert!(outcome.command_execution_evidence.observations.is_empty());
+    }
+
     fn sent_interrupt(transport: &FakeTransport) -> bool {
         transport
             .sent
@@ -2231,6 +2723,10 @@ mod tests {
         .expect("command approval transcript");
 
         assert_eq!(outcome.completed_items, 1);
+        assert!(matches!(
+            outcome.command_execution_evidence.observations.as_slice(),
+            [CommandExecutionObservation::Incomplete { .. }]
+        ));
         assert!(outcome.duplex_fallback_required);
         let response = transport
             .sent
