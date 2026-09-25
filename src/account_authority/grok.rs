@@ -136,6 +136,39 @@ pub(crate) fn acquire_grok_launch_authority(
     }
 }
 
+/// Acquire a selected CAM account for optional live catalog discovery.
+/// An absent selection is optional only to the caller; drift and registry errors fail closed.
+#[cfg(not(test))]
+pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLaunchAuthority>> {
+    if let Some(socket_path) = configured_cam_authority_socket() {
+        let selected =
+            super::selected_binding_via_authority_socket(&socket_path, GROK_CLI_PROVIDER_ID)
+                .context(
+                    "failed to observe Coding Agent Manager Grok selection for catalog discovery",
+                )?;
+        let Some((authority_id, binding)) = selected else {
+            return Ok(None);
+        };
+        let frozen = FrozenGrokSelectedBinding::from_selected_binding(Some(authority_id), &binding);
+        return acquire_grok_launch_authority(Some(&frozen)).map(Some);
+    }
+    let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
+        return Ok(None);
+    };
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+    let selected = registry
+        .selected_binding(GROK_CLI_PROVIDER_ID)
+        .context("failed to inspect Coding Agent Manager Grok selection for catalog discovery")?;
+    let Some(binding) = selected else {
+        return Ok(None);
+    };
+    let frozen = FrozenGrokSelectedBinding::from_selected_binding(
+        Some(authority_id_for(registry.metadata_path())),
+        &binding,
+    );
+    acquire_grok_launch_authority(Some(&frozen)).map(Some)
+}
+
 fn revalidate_frozen_selection_via_socket(
     socket_path: &Path,
     frozen: &FrozenGrokSelectedBinding,

@@ -1066,6 +1066,37 @@ impl GrokCatalogCommandRunner for ScreenedGrokCatalogCommandRunner {
     }
 }
 
+/// Catalog runner bound to an already selected managed Grok home.
+#[cfg(target_os = "linux")]
+pub(crate) struct BoundGrokCatalogCommandRunner {
+    sources: GrokCredentialSource,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundGrokCatalogCommandRunner {
+    pub(crate) fn new(managed_grok_home: &Path) -> Result<Self> {
+        Ok(Self {
+            sources: GrokCredentialSource::from_environment(
+                None,
+                Some(managed_grok_home.as_os_str()),
+            )?,
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl GrokCatalogCommandRunner for BoundGrokCatalogCommandRunner {
+    fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput> {
+        let program = resolve_catalog_program(spec.program())?;
+        let process_spec = screened_grok_catalog_process_spec_with_credential_source(
+            spec,
+            program,
+            &self.sources,
+        )?;
+        run_screened_grok_catalog_process(process_spec)
+    }
+}
+
 /// One constructed or observed Grok model and its human-facing label.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokModelCatalogEntry {
@@ -1430,6 +1461,12 @@ fn run_screened_grok_catalog_command(
     spec: &GrokCatalogCommandSpec,
 ) -> Result<GrokCatalogCommandOutput> {
     let process_spec = screened_grok_catalog_process_spec(spec)?;
+    run_screened_grok_catalog_process(process_spec)
+}
+
+fn run_screened_grok_catalog_process(
+    process_spec: ProcessSpec,
+) -> Result<GrokCatalogCommandOutput> {
     let output = run_process(process_spec).context(
         "Grok runtime model catalog command failed before a verified result was available",
     )?;
@@ -3159,6 +3196,46 @@ mod tests {
             panic!("screened catalog must use ExternalGrok confinement");
         };
         assert_eq!(profile.visible_read_only_files(), &[program, auth]);
+        assert!(profile.visible_read_only_roots().is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bound_catalog_runner_uses_managed_home_instead_of_ambient_auth() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let program = dir.path().join("catalog-standin");
+        fs::write(&program, "")?;
+        let managed = dir.path().join("managed");
+        let ambient = dir.path().join("ambient");
+        fs::create_dir(&managed)?;
+        fs::create_dir(&ambient)?;
+        let managed_auth = managed.join(GROK_AUTH_FILE);
+        let ambient_auth = ambient.join(GROK_AUTH_FILE);
+        fs::write(&managed_auth, "managed fixture")?;
+        fs::write(&ambient_auth, "ambient fixture")?;
+        let runner = BoundGrokCatalogCommandRunner::new(&managed)?;
+        let spec = GrokCatalogCommandSpec::new(dir.path()).with_program(&program);
+        let process = screened_grok_catalog_process_spec_with_credential_source(
+            &spec,
+            program.clone(),
+            &runner.sources,
+        )?;
+        let EnvironmentMode::ClearAndSet(environment) = &process.environment else {
+            panic!("bound catalog environment must be ClearAndSet");
+        };
+        assert_eq!(
+            environment.get("GROK_HOME").map(String::as_str),
+            managed.to_str()
+        );
+        assert!(!environment.contains_key("HOME"));
+        assert!(process.private_runtime_home);
+        assert!(process.private_runtime_grok_home);
+        let SideEffectConfinementProfile::ExternalGrok(profile) = &process.side_effects else {
+            panic!("bound catalog must use ExternalGrok confinement");
+        };
+        assert_eq!(profile.visible_read_only_files(), &[program, managed_auth]);
+        assert!(!profile.visible_read_only_files().contains(&ambient_auth));
         assert!(profile.visible_read_only_roots().is_empty());
         Ok(())
     }
