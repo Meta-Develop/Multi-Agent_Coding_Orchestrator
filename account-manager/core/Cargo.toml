@@ -16,6 +16,10 @@ crate-type = ["rlib"]
 name = "account-authority"
 path = "src/bin/account_authority.rs"
 
+[[bin]]
+name = "cam-grok-setup"
+path = "src/bin/grok_setup.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

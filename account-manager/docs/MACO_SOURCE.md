@@ -43,6 +43,59 @@ Release packaging verifies headless tarballs with
 `cargo package --locked --workspace --no-default-features` at the repository
 root (see the root supply-chain workflow).
 
+## Owner-operated Grok device-auth setup (Linux/WSL)
+
+The source-built `cam-grok-setup` binary prepares CAM-managed Grok homes without
+launching a provider, reading stdin, or copying an ordinary `~/.grok` login.
+Run from the MACO repository root in the same Linux user environment that MACO
+will use:
+
+```bash
+cargo run --locked -p coding-agent-manager --bin cam-grok-setup -- prepare work
+```
+
+This prints the managed `GROK_HOME` and an `env -u GROK_AUTH_PATH ... grok login
+--device-auth` command. Run that printed command **yourself in your own terminal**
+and handle the vendor's device code there. Do not send codes or credentials to
+an agent. The setup tool does not start or observe that login.
+
+```bash
+cargo run --locked -p coding-agent-manager --bin cam-grok-setup -- status
+cargo run --locked -p coding-agent-manager --bin cam-grok-setup -- complete work --incarnation INCARNATION_FROM_STATUS
+```
+
+`status` shows stored metadata only; it does not read vendor auth. `complete`
+requires the exact pending incarnation, validates the vendor-written OAuth
+file using the adapter, and atomically marks the account complete and selects
+it. This explicit command may replace a previous Grok selection. Active CAM
+use/login leases, vendor locks, unsafe homes, stale incarnations, missing or
+invalid auth, and completion replay are refused. Failed validation leaves the
+previous selection and pending state unchanged. If a storage write fails,
+inspect `status` before retrying; a failure after atomic rename may already have
+committed both changes.
+
+The default is CAM's existing platform data directory. The optional leading
+`--data-dir ABSOLUTE_PATH` selects an explicit isolated directory for setup and
+tests; MACO must use the same directory to see that selection. `prepare` never
+selects an account and refuses duplicate IDs or retained existing homes, even
+empty homes left by a concurrent prepare/delete. It reserves a fresh home with
+exclusive directory creation while holding the registry lock and the new
+incarnation's lease, and publishes the pending row only after preparation
+succeeds. IDs containing `__` or ending in `_` are rejected before any writes
+because they are ambiguous in the existing lease filename format; this tool
+does not repair older malformed lease files. Data-directory ancestors must be
+owned by the caller or root and not group/world writable, except for root-owned
+sticky directories such as `/tmp`. Managed directories must remain owner-only.
+If preparation is interrupted, inspect metadata and the managed home before
+retrying; this tool provides no automatic recovery, deletion, or overwrite.
+Its pending lease covers preparation; completion reacquires the exact lease
+under the registry lock after the owner-run login. It does not keep a process
+or lease alive while the owner logs in.
+
+Completeness is the adapter's structural check, not online token validity or
+provider E2E acceptance. This setup utility is not automatically installed by
+the existing `maco` package and does not activate a provider run.
+
 ## Existing desktop build
 
 The desktop shell crate enables the `desktop` feature by default. It includes

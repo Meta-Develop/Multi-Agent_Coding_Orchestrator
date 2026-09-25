@@ -57,6 +57,8 @@ use crate::model::{
 };
 use crate::{fsx, paths};
 
+pub mod device_setup;
+
 const PROVIDER_ID: &str = "grok-cli";
 
 /// Map keys that live in `auth.json` but are not a signed-in identity.
