@@ -167,14 +167,17 @@ fn bind_runtime_output_schema(
     Ok(command)
 }
 
-fn direct_assignment_report_schema_path<'a>(
+fn direct_assignment_report_schema_path(
     role: AgentRole,
-    orchestrator_schema_path: &'a Path,
-    worker_schema_path: &'a Path,
-) -> Result<&'a Path> {
+    orchestrator_schema_path: &Path,
+    worker_schema_path: &Path,
+) -> Result<PathBuf> {
     match role {
-        AgentRole::ChildOrchestrator => Ok(orchestrator_schema_path),
-        AgentRole::Worker => Ok(worker_schema_path),
+        AgentRole::ChildOrchestrator => Ok(orchestrator_schema_path.to_path_buf()),
+        AgentRole::Worker => Ok(worker_schema_path.to_path_buf()),
+        AgentRole::Researcher => {
+            Ok(orchestrator_schema_path.with_file_name("researcher-report.schema.json"))
+        }
         unsupported => bail!(
             "assignment role '{}' has no direct report schema contract",
             unsupported.as_str()
@@ -190,6 +193,7 @@ fn direct_assignment_report_is_valid(
     match role {
         AgentRole::ChildOrchestrator => Ok(read_child_report(contents, display_path).is_ok()),
         AgentRole::Worker => Ok(read_worker_report(contents, display_path).is_ok()),
+        AgentRole::Researcher => Ok(read_researcher_report(contents, display_path).is_ok()),
         unsupported => bail!(
             "assignment role '{}' has no direct report parser contract",
             unsupported.as_str()
@@ -201,6 +205,7 @@ fn direct_assignment_orchestration_role(role: AgentRole) -> Result<Orchestration
     match role {
         AgentRole::ChildOrchestrator => Ok(OrchestrationRole::Orchestrator),
         AgentRole::Worker => Ok(OrchestrationRole::Worker),
+        AgentRole::Researcher => Ok(OrchestrationRole::Researcher),
         unsupported => bail!(
             "assignment role '{}' has no direct orchestration role contract",
             unsupported.as_str()
@@ -574,6 +579,12 @@ fn bind_selected_runtime_launch(
     catalog: &RuntimeModelCatalog,
     mechanical_duty: Option<MechanicalTerminalDuty>,
 ) -> Result<BoundSelectedRuntimeLaunch> {
+    if assignment.role == AgentRole::Researcher {
+        validate_researcher_assignment(assignment)?;
+        if launch_runtime != SupervisorRuntime::Codex {
+            bail!("researcher requires the Codex strict Linux read-only runtime");
+        }
+    }
     let configured = effective_role_model_selection(plan, assignment.role);
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
     let model_provenance =
@@ -1853,6 +1864,9 @@ fn prepare_child_attempt<'a>(
     );
     let corrective_retry_used = retry_feedback.is_some();
     let budget_plan = budget_policy.apply(plan);
+    if assignment.role == AgentRole::Researcher && execution_target.is_some() {
+        bail!("researcher requires a managed read-only worktree");
+    }
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let nested_worker_runtime = nested_worker_launch_runtime(launch_runtime, budget_policy);
     let resolved_prompt_plan = (evidence_only_reaudit.is_none() && continuation.is_none())
@@ -1963,6 +1977,10 @@ fn prepare_child_attempt<'a>(
                 OrchestrationRole::Worker,
                 SupervisePromptRole::TerminalWorker,
             ),
+            AgentRole::Researcher => (
+                OrchestrationRole::Researcher,
+                SupervisePromptRole::Researcher,
+            ),
             unsupported => bail!(
                 "assignment role '{}' has no direct prompt journal contract",
                 unsupported.as_str()
@@ -2056,23 +2074,23 @@ fn prepare_child_attempt<'a>(
     )?;
     command = bound_launch.command;
     let direct_report_schema_path = match continuation_schema.as_deref() {
-        Some(path) => path,
+        Some(path) => path.to_path_buf(),
         None => direct_assignment_report_schema_path(
             assignment_attempt_report_role(assignment.role, evidence_only_reaudit.is_some()),
             schema_path,
             worker_schema_path,
         )?,
     };
-    command = bind_runtime_output_schema(command, launch_runtime, direct_report_schema_path)?;
-    command = bind_runtime_read_only_schema_files(
-        command,
-        launch_runtime,
-        &if continuation.is_some() {
-            vec![direct_report_schema_path]
-        } else {
-            vec![schema_path, worker_schema_path, auditor_schema_path]
-        },
-    );
+    command = bind_runtime_output_schema(command, launch_runtime, &direct_report_schema_path)?;
+    let mut read_only_schemas = if continuation.is_some() {
+        vec![direct_report_schema_path.as_path()]
+    } else {
+        vec![schema_path, worker_schema_path, auditor_schema_path]
+    };
+    if continuation.is_none() && assignment.role == AgentRole::Researcher {
+        read_only_schemas.push(&direct_report_schema_path);
+    }
+    command = bind_runtime_read_only_schema_files(command, launch_runtime, &read_only_schemas);
     // Agent lifecycle records and binds repository metadata. Child-visible Git paths are
     // derived separately from `command.cwd` as an exact linked-worktree allowlist; the
     // owning primary/common checkout is not made visible.
@@ -2086,7 +2104,9 @@ fn prepare_child_attempt<'a>(
     command = bind_supervisor_machine_global_staging_cleanup(command, options)?;
     command =
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
-    command = if evidence_only_reaudit.is_some() || continuation.is_some() {
+    command = if assignment.role == AgentRole::Researcher {
+        configure_researcher_command(command, launch_runtime)?
+    } else if evidence_only_reaudit.is_some() || continuation.is_some() {
         configure_read_only_auditor_command(command)?
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
@@ -2460,6 +2480,7 @@ impl<'turn, 'context, 'writer, 'resources>
             || parent._primary_after.inspection_problem().is_some()
             || !parent.sandbox_denials.is_empty()
             || !parent.pre_action_refusals.is_empty()
+            || parent.external_side_effect_state.is_some()
         {
             bail!(
                 "nested serial handoff requires verified parent-process quiescence and integrity"
@@ -9989,7 +10010,7 @@ done
         let reaudit_command = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Codex,
-            reaudit_schema,
+            &reaudit_schema,
         )?;
         assert_eq!(
             reaudit_command.output_schema.as_deref(),
@@ -10001,7 +10022,7 @@ done
         let child_codex = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Codex,
-            direct_assignment_report_schema_path(
+            &direct_assignment_report_schema_path(
                 AgentRole::ChildOrchestrator,
                 orchestrator_schema,
                 worker_schema,
@@ -10017,7 +10038,7 @@ done
         let codex = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Codex,
-            direct_worker_schema,
+            &direct_worker_schema,
         )?;
         assert_eq!(
             codex.output_schema.as_deref(),
@@ -10029,14 +10050,14 @@ done
         let fake = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Fake,
-            direct_worker_schema,
+            &direct_worker_schema,
         )?;
         assert_eq!(fake.output_schema.as_deref(), Some(worker_schema));
 
         let grok = bind_runtime_output_schema(
             launch_fixture_command(),
             SupervisorRuntime::Grok,
-            direct_worker_schema,
+            &direct_worker_schema,
         )?;
         assert_eq!(grok.output_schema.as_deref(), Some(worker_schema));
 
@@ -10048,7 +10069,7 @@ done
             assert!(bind_runtime_output_schema(
                 launch_fixture_command(),
                 runtime,
-                direct_worker_schema,
+                &direct_worker_schema,
             )?
             .output_schema
             .is_none());

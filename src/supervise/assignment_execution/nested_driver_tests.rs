@@ -552,6 +552,12 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         "parent-unconfined" => collected.external_run.side_effects = None,
         "parent-never-started" => collected.external_run.stdout.target_launch_attempted = false,
         "parent-failed" => collected.external_run.exit_code = Some(1),
+        "parent-external-side-effect-ambiguous" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Ambiguous);
+        }
+        "parent-external-side-effect-completed" => {
+            collected.external_side_effect_state = Some(ExternalSideEffectState::Completed);
+        }
         "parent-wrong-worktree" => collected.external_run.cwd = repo.clone(),
         "parent-restored" | "yield-restored" => {
             collected.external_run =
@@ -574,7 +580,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     if case.starts_with("parent-")
         || matches!(
             case,
-            "cancelled-before" | "yield-nonquiescent" | "yield-restored"
+            "cancelled-before" | "yield-nonquiescent" | "yield-restored" | "yield-side-effects"
         )
     {
         assert!(binding.is_err(), "accepted {case}");
@@ -699,6 +705,16 @@ fn nested_driver_refuses_unverified_or_substituted_parent_completion() -> Result
         driver_fixture(case)?;
     }
     Ok(())
+}
+
+#[test]
+fn nested_driver_refuses_ambiguous_parent_external_side_effect() -> Result<()> {
+    driver_fixture("parent-external-side-effect-ambiguous")
+}
+
+#[test]
+fn nested_driver_refuses_completed_parent_external_side_effect() -> Result<()> {
+    driver_fixture("parent-external-side-effect-completed")
 }
 
 #[test]

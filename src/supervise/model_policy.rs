@@ -351,7 +351,7 @@ pub fn trusted_model_capability(model: &str) -> Option<ModelCapabilityClass> {
 
 pub const fn role_minimum_model_capability(role: AgentRole) -> ModelCapabilityClass {
     match role {
-        AgentRole::Supervisor | AgentRole::ChildOrchestrator => {
+        AgentRole::Supervisor | AgentRole::ChildOrchestrator | AgentRole::Researcher => {
             ModelCapabilityClass::GeneralJudgment
         }
         AgentRole::Worker => ModelCapabilityClass::WeakMechanical,
@@ -361,7 +361,7 @@ pub const fn role_minimum_model_capability(role: AgentRole) -> ModelCapabilityCl
 
 pub fn role_default_phase(role: AgentRole) -> Option<OrchestrationPhase> {
     match role {
-        AgentRole::Supervisor => Some(OrchestrationPhase::Planning),
+        AgentRole::Supervisor | AgentRole::Researcher => Some(OrchestrationPhase::Planning),
         AgentRole::ChildOrchestrator => Some(OrchestrationPhase::Implementation),
         AgentRole::Worker => None,
         AgentRole::GateClassifier => Some(OrchestrationPhase::GateClassification),
@@ -616,7 +616,7 @@ fn authority_role_for(role: AgentRole) -> crate::selection::AuthorityRole {
     match role {
         AgentRole::Supervisor => crate::selection::AuthorityRole::AcceptanceGate,
         AgentRole::ChildOrchestrator => crate::selection::AuthorityRole::Delegating,
-        AgentRole::Worker => crate::selection::AuthorityRole::TerminalLeaf,
+        AgentRole::Worker | AgentRole::Researcher => crate::selection::AuthorityRole::TerminalLeaf,
         AgentRole::GateClassifier => crate::selection::AuthorityRole::FailureClassification,
         AgentRole::Auditor => crate::selection::AuthorityRole::ReviewAuditor,
     }
