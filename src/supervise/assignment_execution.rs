@@ -917,6 +917,7 @@ fn refuse_source_head_execution_base(
 }
 
 pub(super) struct AssignmentExecutionPreflight<'a> {
+    nested_turn_issued: AtomicBool,
     journal_parent_id: &'a str,
     environment_requirements: Vec<EnvironmentRequirement>,
     semantic_token: Option<u64>,
@@ -932,10 +933,56 @@ pub(super) struct AssignmentExecutionPreflight<'a> {
 }
 
 impl<'a> AssignmentExecutionPreflight<'a> {
+    /// Burn the slot before checking the request. Failed construction and permit
+    /// drop never authorize a replacement driver, including for another attempt.
+    fn issue_nested_turn(
+        &self,
+        parent_attempt: usize,
+    ) -> Result<NestedTurnExecutionPermit<'_, 'a>> {
+        if self.nested_turn_issued.swap(true, Ordering::AcqRel) {
+            bail!("nested turn execution permit has already been issued");
+        }
+        if parent_attempt == 0
+            || self.assignment.role != AgentRole::ChildOrchestrator
+            || self.assignment.phase != AssignmentPhase::Execution
+        {
+            bail!("nested turn execution permit requires an authored parent execution attempt");
+        }
+        Ok(NestedTurnExecutionPermit {
+            preflight: self,
+            parent_attempt,
+        })
+    }
+
     pub(super) fn managed_process_cancellation(
         &self,
     ) -> &crate::sync_store::ManagedClaimProcessCancellation {
         &self.managed_process_cancellation
+    }
+}
+
+/// Supervisor-local and deliberately neither Clone nor Deserialize. The reference
+/// pins the exact preflight identity for the permit's lifetime, not just its labels.
+/// Shared lease observations (including a frozen inbox) are allowed; execution
+/// requires an exclusive borrow of this unique permit as well as the outcome.
+struct NestedTurnExecutionPermit<'owner, 'resources> {
+    preflight: &'owner AssignmentExecutionPreflight<'resources>,
+    parent_attempt: usize,
+}
+
+impl NestedTurnExecutionPermit<'_, '_> {
+    fn revalidate(
+        &self,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        parent_attempt: usize,
+    ) -> Result<()> {
+        if !std::ptr::eq(self.preflight, preflight)
+            || self.parent_attempt != parent_attempt
+            || !preflight.nested_turn_issued.load(Ordering::Acquire)
+        {
+            bail!("nested turn execution permit differs from the current preflight or attempt");
+        }
+        Ok(())
     }
 }
 
@@ -1463,6 +1510,7 @@ fn prepare_assignment_execution<'a>(
         })?;
     Ok(AssignmentExecutionDisposition::Continue(
         AssignmentExecutionPreflight {
+            nested_turn_issued: AtomicBool::new(false),
             journal_parent_id,
             environment_requirements,
             semantic_token,
@@ -2414,11 +2462,15 @@ struct CollectedChildAttempt<'a> {
 
 /// Internal readiness only: the scheduler/IPC does not construct this driver yet.
 /// A collected supervisor result, never a child report, proves the parent turn
-/// ended. Holding the mutable preflight serializes subsequent users of its lease.
+/// ended. The one-shot permit serializes nested execution even with separate
+/// outcomes. Shared preflight lets the non-cloneable frozen turn keep its lease
+/// borrow and journal lock; neither that evidence nor shared preflight authorizes
+/// dispatch. The driver owns the permit and exclusively borrows the outcome.
 #[allow(dead_code)]
 struct NestedWorkerSerialDriver<'turn, 'context, 'writer, 'resources> {
     context: &'turn AssignmentExecutionContext<'context, 'writer>,
-    preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+    preflight: &'turn AssignmentExecutionPreflight<'resources>,
+    permit: NestedTurnExecutionPermit<'turn, 'resources>,
     outcome: &'turn mut AssignmentExecutionOutcome,
     parent: &'turn CollectedChildAttempt<'context>,
     parent_attempt: usize,
@@ -2431,11 +2483,12 @@ impl<'turn, 'context, 'writer, 'resources>
 {
     fn from_collected_parent(
         context: &'turn AssignmentExecutionContext<'context, 'writer>,
-        preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+        preflight: &'turn AssignmentExecutionPreflight<'resources>,
         outcome: &'turn mut AssignmentExecutionOutcome,
         parent_attempt: usize,
         parent: &'turn CollectedChildAttempt<'context>,
     ) -> Result<Self> {
+        let permit = preflight.issue_nested_turn(parent_attempt)?;
         if context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
@@ -2454,6 +2507,7 @@ impl<'turn, 'context, 'writer, 'resources>
         Ok(Self {
             context,
             preflight,
+            permit,
             outcome,
             parent,
             parent_attempt,
@@ -2548,6 +2602,7 @@ impl<'turn, 'context, 'writer, 'resources>
         nested_worker_executor::execute_nested_worker_attempt(
             &context,
             self.preflight,
+            &mut self.permit,
             self.outcome,
             self.parent_attempt,
             worker_id,
