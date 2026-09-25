@@ -1152,7 +1152,7 @@ fn render_researcher_prompt(
     if runtime != SupervisorRuntime::Codex || context.execution_target.is_some() {
         bail!("researcher requires a managed Codex read-only worktree");
     }
-    let prefix = "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect the assigned scope and return evidence in a ResearcherReport. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. Record every actual command execution exactly once in commands_run as command=[the exact executed shell command string] and cwd=the exact absolute working directory. Record its actual exit_code and status. Set timeout_seconds=0 and duration_ms=0, timed_out=false, stdout=\"\", stderr=\"\"; do not claim unobserved command metadata. Each validation_result must reference a distinct successful commands_run entry using the same single-string command. If a required command tool is unavailable, do not invent an inspection: preserve every command already executed in commands_run and each valid validation_result; use empty arrays only when no such evidence exists. Return status=failed, accepted=false, rejected=true, and a concise finding explaining the tool failure. Set environment_failures=[] unless an observed failure matches an existing typed category. Never emit status=blocked. Include findings, remaining risk and next safe action. The parent independently checks the host command transcript and audits the evidence.\n";
+    let prefix = "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect the assigned scope and return evidence in a ResearcherReport. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. On successful inspection set status=succeeded, accepted=true, rejected=false. Execute the requested inspection command directly; do not manually add /bin/bash -lc or any other shell wrapper to the tool invocation. The host adds its own wrapper. Record every actual command execution exactly once in commands_run. The command field is a JSON array containing exactly one string: the complete executed host command, including the host-added wrapper, not merely its inner script. Set cwd to the exact absolute working directory. For a successful exit set command status=succeeded and exit_code=0. Set timeout_seconds=0 and duration_ms=0, timed_out=false, stdout=\"\", stderr=\"\"; do not claim unobserved command metadata. Each validation_result must reference a distinct successful commands_run entry using the same one-element command array and status=succeeded. If a required command tool is unavailable, do not invent an inspection: preserve every command already executed in commands_run and each valid validation_result; use empty arrays only when no such evidence exists. Return status=failed, accepted=false, rejected=true, and a concise finding explaining the tool failure. Set environment_failures=[] unless an observed failure matches an existing typed category. Never emit status=blocked. Include findings, remaining risk and next safe action. The parent independently checks the host command transcript and audits the evidence.\n";
     let (model, effort) = role_model_selection(context.plan, AgentRole::Researcher);
     let instruction_profile = phase_aware_instruction_profile_section(
         AgentRole::Researcher,
@@ -1576,7 +1576,10 @@ pub(super) fn render_review_lens_auditor_prompt(
         OrchestrationPhase::ReviewAcceptance,
         Some(lens.backend.model()),
     );
-    let withheld_evidence_rule = review_lens_withheld_evidence_rule(lens.information_scope);
+    let withheld_evidence_rule = review_lens_withheld_evidence_rule(
+        lens.information_scope,
+        assignment.role == AgentRole::Researcher,
+    );
     let prompt = format!(
         r#"{cacheable_prefix}{role_prefix}{instruction_profile_section}
 
@@ -1621,15 +1624,24 @@ REVIEW_LENS_REQUEST_JSON:
     })
 }
 
-fn review_lens_withheld_evidence_rule(scope: ReviewInformationScope) -> &'static str {
-    match scope {
-        ReviewInformationScope::DiffOnly => {
+fn review_lens_withheld_evidence_rule(
+    scope: ReviewInformationScope,
+    read_only_researcher: bool,
+) -> &'static str {
+    match (scope, read_only_researcher) {
+        (ReviewInformationScope::DiffOnly, true) => {
+            "This is a read-only Researcher assignment. The expected diff is empty; reject any changed file or out-of-scope diff. This lens cannot inspect the source assertion or command transcript, so do not demand a code change or claim to verify source contents. Judge only the supplied diff and required path coverage; the independent full-transcript lens validates the inspection evidence."
+        }
+        (ReviewInformationScope::OutputReportOnly, true) => {
+            "This is a read-only Researcher assignment. Judge the supplied report for internal consistency, zero changed files, no delegation, and matching successful command and validation claims. The command stdout is intentionally empty because the report cannot authenticate stdout; do not reject solely for that empty field or claim this lens independently verified the source assertion. The independent full-transcript lens validates host command evidence and source contents."
+        }
+        (ReviewInformationScope::DiffOnly, false) => {
             "The earlier instruction to reject when worker evidence, the child report, or validation results are missing does not apply to this diff-only scope: those records are withheld by the information boundary. Judge only the supplied diff against REQUIRED_COVERAGE_JSON. Reject with implementation_defect only when that diff is wrong, outside the required paths, or does not show the required change."
         }
-        ReviewInformationScope::OutputReportOnly => {
+        (ReviewInformationScope::OutputReportOnly, false) => {
             "The earlier instruction to reject when the worktree diff is missing does not apply to this output-only scope: the diff is withheld by the information boundary. Judge only the supplied reports against REQUIRED_COVERAGE_JSON."
         }
-        ReviewInformationScope::FullChildTranscript => {
+        (ReviewInformationScope::FullChildTranscript, _) => {
             "This full-transcript scope supplies the child transcript. Missing worker evidence inside that supplied transcript remains grounds for rejection."
         }
     }
@@ -2918,6 +2930,35 @@ mod regression_tests {
         assert!(!report_prompt.contains("TRANSCRIPT_MUST_NOT_CROSS_NARROW_LENSES"));
         assert!(report_prompt
             .contains("does not apply to this output-only scope: the diff is withheld"));
+
+        let mut researcher = assignment.clone();
+        researcher.role = AgentRole::Researcher;
+        researcher.task = Some("inspect the source without changing it".to_string());
+        let researcher_diff_prompt = render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &researcher,
+                lens: &diff_lens,
+                resolved_reasoning_effort: None,
+                request: &diff_request,
+                required_coverage: &coverage,
+            },
+            0,
+        )?
+        .prompt;
+        let researcher_report_prompt = render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &researcher,
+                lens: &report_lens,
+                resolved_reasoning_effort: None,
+                request: &report_request,
+                required_coverage: &coverage,
+            },
+            1,
+        )?
+        .prompt;
+        assert!(researcher_diff_prompt.contains("The expected diff is empty"));
+        assert!(researcher_report_prompt.contains("The command stdout is intentionally empty"));
+        assert!(!researcher_diff_prompt.contains("does not show the required change"));
 
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
             "model-alpha",
