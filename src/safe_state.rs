@@ -3857,14 +3857,14 @@ fn open_stable_private_file_at(
         );
     }
     let mode = metadata.permissions().mode() & 0o777;
-    if created {
+    // O_CREAT publishes the empty coordination inode with mode 0600 (or a
+    // stricter umask). A second opener can lock and snapshot it immediately;
+    // post-publication fchmod would change ctime during that bounded read.
+    if created && policy != LockFilePolicy::EmptyCoordination {
         if unsafe { libc::fchmod(file.as_raw_fd(), 0o600) } != 0 {
             let chmod_error = std::io::Error::last_os_error();
-            if policy != LockFilePolicy::EmptyCoordination {
-                return Err(chmod_error).with_context(|| {
-                    format!("failed to set private lock mode on {}", path.display())
-                });
-            }
+            return Err(chmod_error)
+                .with_context(|| format!("failed to set private lock mode on {}", path.display()));
         }
     } else if policy == LockFilePolicy::OwnerPrivate && mode != 0o600 {
         bail!(
