@@ -727,34 +727,44 @@ fn fallback_recovery_preserves_tampered_duplicate_and_unsafe_residue() -> Result
 
 #[test]
 fn concurrent_heartbeats_preserve_both_audit_entries_under_board_lock() -> Result<()> {
-    let temp = Arc::new(tempfile::tempdir()?);
-    let path = write_claim(
-        temp.path(),
-        "locked-claim",
-        "locked-claim",
-        "active",
-        "2026-05-20T00:00:00Z",
-    )?;
-    let mut threads = Vec::new();
-    for timestamp in ["2026-05-20T00:11:00Z", "2026-05-20T00:11:00Z"] {
-        let temp = Arc::clone(&temp);
-        threads.push(std::thread::spawn(move || -> Result<()> {
-            heartbeat_with_clock(
-                temp.path(),
-                "locked-claim",
-                "locked-claim",
-                &LiveClock::parse(timestamp)?,
-            )?;
-            Ok(())
-        }));
+    for iteration in 0..32 {
+        let temp = Arc::new(tempfile::tempdir()?);
+        let path = write_claim(
+            temp.path(),
+            "locked-claim",
+            "locked-claim",
+            "active",
+            "2026-05-20T00:00:00Z",
+        )?;
+        let barrier = Arc::new(std::sync::Barrier::new(3));
+        let mut threads = Vec::new();
+        for timestamp in ["2026-05-20T00:11:00Z", "2026-05-20T00:11:00Z"] {
+            let temp = Arc::clone(&temp);
+            let barrier = Arc::clone(&barrier);
+            threads.push(std::thread::spawn(move || -> Result<()> {
+                barrier.wait();
+                heartbeat_with_clock(
+                    temp.path(),
+                    "locked-claim",
+                    "locked-claim",
+                    &LiveClock::parse(timestamp)?,
+                )?;
+                Ok(())
+            }));
+        }
+        barrier.wait();
+        for thread in threads {
+            thread
+                .join()
+                .map_err(|_| anyhow::anyhow!("heartbeat thread panicked"))??;
+        }
+        let content = std::fs::read_to_string(path)?;
+        assert_eq!(
+            content.matches(" heartbeat").count(),
+            2,
+            "iteration {iteration}"
+        );
     }
-    for thread in threads {
-        thread
-            .join()
-            .map_err(|_| anyhow::anyhow!("heartbeat thread panicked"))??;
-    }
-    let content = std::fs::read_to_string(path)?;
-    assert_eq!(content.matches(" heartbeat").count(), 2);
     Ok(())
 }
 
