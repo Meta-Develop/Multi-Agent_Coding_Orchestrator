@@ -25,6 +25,59 @@ const HARD_MAX_MESSAGES: usize = 16_384;
 const HARD_MAX_PROMPT_BYTES: usize = 1024 * 1024;
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
+const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
+const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
+
+// Only the informational prelude observed before thread/start on audited Codex 0.144.4.
+// Upstream declares both methods as ServerNotification in app-server-protocol's common.rs.
+// Deserialize the original bytes: Value alone would hide duplicate envelope/parameter keys.
+#[derive(serde::Deserialize)]
+#[serde(tag = "method", content = "params", deny_unknown_fields)]
+enum StartupInformation {
+    #[serde(rename = "configWarning")]
+    ConfigWarning { summary: String, details: Value },
+    #[serde(rename = "remoteControl/status/changed")]
+    RemoteControlStatusChanged {
+        status: String,
+        #[serde(rename = "serverName")]
+        server_name: String,
+        #[serde(rename = "installationId")]
+        installation_id: String,
+        #[serde(rename = "environmentId")]
+        environment_id: Value,
+    },
+}
+
+fn is_startup_information(message: &Value) -> bool {
+    matches!(
+        message.get("method").and_then(Value::as_str),
+        Some("configWarning" | "remoteControl/status/changed")
+    )
+}
+
+fn valid_startup_information(line: &[u8]) -> bool {
+    if line.len() > STARTUP_INFORMATION_MAX_BYTES {
+        return false;
+    }
+    match serde_json::from_slice::<StartupInformation>(line) {
+        Ok(StartupInformation::ConfigWarning { summary, details }) => {
+            !summary.is_empty() && (details.is_null() || details.is_string())
+        }
+        Ok(StartupInformation::RemoteControlStatusChanged {
+            status,
+            server_name,
+            installation_id,
+            environment_id,
+        }) => {
+            // Do not silently admit an active remote-control state or a bound environment.
+            status == "disabled"
+                && !server_name.is_empty()
+                && !installation_id.is_empty()
+                && environment_id.is_null()
+        }
+        Err(_) => false,
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportRead {
@@ -773,6 +826,16 @@ impl ProtocolState {
                     phase,
                     message: format!("invalid JSON: {error}"),
                 })?;
+            if phase == "thread/start"
+                && is_startup_information(&message)
+                && !valid_startup_information(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "startup informational notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
             self.command_snapshot =
                 if matches!(
                     message.get("method").and_then(Value::as_str),
@@ -977,7 +1040,27 @@ where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
-    let message = state.receive(transport, phase, cancelled)?;
+    let starting_bytes = state.bytes_received;
+    let mut startup_information_count = 0;
+    let message = loop {
+        let message = state.receive(transport, phase, cancelled)?;
+        if phase == "thread/start" && is_startup_information(&message) {
+            // receive validated the original envelope, including absence of any request id,
+            // result/error, unknown or duplicate fields. These notices confer no authority.
+            startup_information_count += 1;
+            if startup_information_count > STARTUP_INFORMATION_MAX_MESSAGES
+                || state.bytes_received.saturating_sub(starting_bytes)
+                    > STARTUP_INFORMATION_MAX_BYTES
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "startup informational prelude exceeded its bound".to_string(),
+                });
+            }
+            continue;
+        }
+        break message;
+    };
     let object = message
         .as_object()
         .ok_or_else(|| AppServerError::Malformed {
@@ -2117,6 +2200,315 @@ mod tests {
             prompt: "perform the bounded task".to_string(),
             model: None,
         }
+    }
+
+    fn captured_startup_information() -> Vec<Value> {
+        // Genuine 0.144.4 prelude; only local paths and machine identifiers are redacted.
+        serde_json::from_str(r#"[
+            {"method":"configWarning","params":{"summary":"Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.\n    1. <child-worktree>/.codex\n       To load project-local config, hooks, and exec policies, add <repo-root> as a trusted project in <staging-root>/codex-home/config.toml.\n","details":null}},
+            {"method":"configWarning","params":{"summary":"Codex could not find bubblewrap on PATH. Install bubblewrap with your OS package manager. See the sandbox prerequisites: https://developers.openai.com/codex/concepts/sandboxing#prerequisites. Codex will use the bundled bubblewrap in the meantime.","details":null}},
+            {"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"<redacted-host>","installationId":"<redacted-installation>","environmentId":null}}
+        ]"#).expect("redacted startup capture")
+    }
+
+    fn messages_with_startup_information(prelude: Vec<Value>) -> Vec<Value> {
+        let mut messages = command_observation_messages();
+        messages.splice(1..1, prelude);
+        messages
+    }
+
+    #[test]
+    fn captured_startup_prelude_preserves_correlated_command_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut transport = FakeTransport::from_values(messages_with_startup_information(
+            captured_startup_information(),
+        ));
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("informational prelude is not an approval"),
+            || false,
+        )
+        .expect("captured informational prelude followed by synthetic correlated turn");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 3);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+        assert_eq!(transport.sent.len(), 4);
+        assert_eq!(transport.sent[2]["method"], "thread/start");
+        assert_eq!(transport.sent[2]["id"], 2);
+        assert_eq!(transport.sent[3]["method"], "turn/start");
+        assert_eq!(transport.sent[3]["id"], 3);
+    }
+
+    #[test]
+    fn startup_prelude_rejects_requests_unknown_methods_and_malformed_envelopes() {
+        let notices = captured_startup_information();
+        let mut invalid = vec![
+            json!({"method":"unknown/startup", "params":{}}),
+            json!({"method":"item/commandExecution/requestApproval", "id":77, "params":{}}),
+            json!({"method":"item/fileChange/requestApproval", "id":77, "params":{}}),
+            json!({"method":"item/permissions/requestApproval", "id":77, "params":{}}),
+            json!({"method":"thread/started", "params":{"thread":{"id":"thread-1"}}}),
+            json!({"method":"item/started", "params":{"item":{"type":"commandExecution"}}}),
+        ];
+        for notice in &notices {
+            for (key, value) in [
+                ("id", json!(2)),
+                ("id", json!(77)),
+                ("id", json!("opaque")),
+                ("id", Value::Null),
+                ("result", json!({})),
+                ("error", json!({})),
+                ("unexpected", json!(true)),
+                ("params", Value::Null),
+            ] {
+                let mut mixed = notice.clone();
+                mixed[key] = value;
+                invalid.push(mixed);
+            }
+            let mut unknown_param = notice.clone();
+            unknown_param["params"]["additionalPermissions"] = json!({"network":true});
+            invalid.push(unknown_param);
+            for key in notice["params"].as_object().unwrap().keys() {
+                let mut missing = notice.clone();
+                missing["params"].as_object_mut().unwrap().remove(key);
+                invalid.push(missing);
+            }
+        }
+        for (index, field, value) in [
+            (0, "summary", json!("")),
+            (0, "summary", json!(false)),
+            (0, "details", json!({"approval":true})),
+            (2, "status", json!("connected")),
+            (2, "serverName", json!("")),
+            (2, "installationId", json!(0)),
+            (2, "environmentId", json!("remote-environment")),
+        ] {
+            let mut malformed = notices[index].clone();
+            malformed["params"][field] = value;
+            invalid.push(malformed);
+        }
+        for notice in invalid {
+            let mut transport =
+                FakeTransport::from_values(messages_with_startup_information(vec![notice.clone()]));
+            let error = run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("startup requests must not reach approval"),
+                || false,
+            )
+            .expect_err("invalid startup message");
+            assert!(
+                matches!(
+                    error,
+                    AppServerError::Malformed { .. } | AppServerError::Unexpected { .. }
+                ),
+                "{notice}: {error}"
+            );
+            assert_eq!(
+                transport.sent.len(),
+                3,
+                "no turn or server-request reply: {notice}"
+            );
+        }
+    }
+
+    #[test]
+    fn startup_prelude_rejects_duplicate_original_json_fields() {
+        for notice in captured_startup_information() {
+            let fields = ["method", "params"].into_iter().chain(
+                notice["params"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(String::as_str),
+            );
+            for key in fields {
+                let raw = notice.to_string().replacen(
+                    &format!("\"{key}\":"),
+                    &format!("\"{key}\":null,\"{key}\":"),
+                    1,
+                );
+                let mut transport =
+                    FakeTransport::from_values(messages_with_startup_information(vec![
+                        notice.clone()
+                    ]));
+                let index = transport.incoming.len() - 2;
+                transport.incoming[index] = ReaderEvent::Line(raw.into_bytes());
+                assert!(
+                    matches!(
+                        run_app_server_turn(
+                            &mut transport,
+                            &test_turn(),
+                            AppServerLimits::default(),
+                            &mut |_: ApprovalRequest| panic!("no startup approvals"),
+                            || false,
+                        ),
+                        Err(AppServerError::Malformed {
+                            phase: "thread/start",
+                            ..
+                        })
+                    ),
+                    "duplicate {key}"
+                );
+                assert_eq!(transport.sent.len(), 3);
+            }
+        }
+    }
+
+    #[test]
+    fn startup_prelude_does_not_relax_response_correlation_or_remote_errors() {
+        for (response, expected_kind) in [
+            (json!({"id":1,"result":{}}), "duplicate"),
+            (json!({"id":99,"result":{}}), "unexpected"),
+            (json!({"id":"2","result":{}}), "unexpected"),
+            (json!({"id":null,"result":{}}), "malformed"),
+            (json!({"result":{}}), "malformed"),
+            (json!({"id":2,"result":null}), "malformed"),
+            (json!({"id":2,"error":{"code":-1},"result":{}}), "remote"),
+        ] {
+            let mut messages = messages_with_startup_information(captured_startup_information());
+            messages[4] = response;
+            let error =
+                run_command_observation_messages(messages).expect_err("response still rejected");
+            let kind = match error {
+                AppServerError::Duplicate { .. } => "duplicate",
+                AppServerError::Unexpected { .. } => "unexpected",
+                AppServerError::Malformed { .. } => "malformed",
+                AppServerError::Remote { .. } => "remote",
+                _ => panic!("unexpected error: {error}"),
+            };
+            assert_eq!(kind, expected_kind);
+        }
+        let mut messages = messages_with_startup_information(captured_startup_information());
+        messages.insert(5, messages[4].clone());
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Duplicate {
+                phase: "turn/start",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn startup_prelude_is_not_admitted_during_initialize_or_turn() {
+        for index in [0, 2, 4] {
+            let mut messages = command_observation_messages();
+            messages.splice(index..index, captured_startup_information());
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Unexpected { .. })
+            ));
+        }
+    }
+
+    #[test]
+    fn startup_prelude_has_message_and_original_byte_bounds() {
+        let notice = json!({"method":"configWarning","params":{"summary":"notice","details":null}});
+        assert!(
+            run_command_observation_messages(messages_with_startup_information(
+                vec![notice.clone(); STARTUP_INFORMATION_MAX_MESSAGES]
+            ))
+            .is_ok()
+        );
+        assert!(matches!(
+            run_command_observation_messages(messages_with_startup_information(vec![
+                notice.clone();
+                STARTUP_INFORMATION_MAX_MESSAGES
+                    + 1
+            ])),
+            Err(AppServerError::Malformed { .. })
+        ));
+
+        let mut padded = notice.clone();
+        padded["params"]["summary"] = json!("");
+        let padding =
+            STARTUP_INFORMATION_MAX_BYTES - padded.to_string().len() - notice.to_string().len();
+        padded["params"]["summary"] = json!("x".repeat(padding));
+        let messages = messages_with_startup_information(vec![padded.clone(), notice]);
+        assert!(run_command_observation_messages(messages.clone()).is_ok());
+        // A whitespace byte counts too; measuring reserialized Value would lose this byte.
+        let mut transport = FakeTransport::from_values(messages);
+        let index = transport.incoming.len() - 2;
+        transport.incoming[index] = ReaderEvent::Line(format!("{padded} ").into_bytes());
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approvals"),
+                || false,
+            ),
+            Err(AppServerError::Malformed { .. })
+        ));
+        padded["params"]["summary"] = json!("x".repeat(STARTUP_INFORMATION_MAX_BYTES));
+        assert!(matches!(
+            run_command_observation_messages(messages_with_startup_information(vec![padded])),
+            Err(AppServerError::Malformed { .. })
+        ));
+    }
+
+    #[test]
+    fn startup_prelude_remains_subject_to_global_limits_cancellation_and_eof() {
+        let messages = messages_with_startup_information(captured_startup_information());
+        for limits in [
+            AppServerLimits {
+                max_messages: 2,
+                ..AppServerLimits::default()
+            },
+            AppServerLimits {
+                max_line_bytes: 512,
+                max_total_bytes: 512,
+                ..AppServerLimits::default()
+            },
+        ] {
+            let mut transport = FakeTransport::from_values(messages.clone());
+            assert!(matches!(
+                run_app_server_turn(
+                    &mut transport,
+                    &test_turn(),
+                    limits,
+                    &mut |_: ApprovalRequest| panic!("no approvals"),
+                    || false,
+                ),
+                Err(AppServerError::Malformed {
+                    phase: "thread/start",
+                    ..
+                })
+            ));
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport::from_values(messages.clone());
+        transport.reads = Some(Arc::clone(&reads));
+        assert_eq!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approvals"),
+                || reads.load(Ordering::SeqCst) >= 2,
+            )
+            .expect_err("cancelled after first notice"),
+            AppServerError::Cancelled {
+                phase: "thread/start"
+            }
+        );
+        assert_eq!(transport.sent.len(), 3);
+        let mut only_prelude = messages;
+        only_prelude.truncate(4);
+        assert!(matches!(
+            run_command_observation_messages(only_prelude),
+            Err(AppServerError::ProtocolLoss {
+                phase: "thread/start"
+            })
+        ));
     }
 
     fn command_observation_messages() -> Vec<Value> {
