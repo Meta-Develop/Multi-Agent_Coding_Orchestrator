@@ -1467,14 +1467,18 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     assert_eq!(assignments[1]["phase"], "execution");
     assert_eq!(assignments[1]["assigned_paths"], json!(["src/alpha.rs"]));
     assert_eq!(assignments[1]["spec_fragment_ids"], json!(["fragment-002"]));
-    assert_eq!(
-        assignments[1]["worker_assignments"][0]["id"],
-        "assignment-001-worker"
-    );
-    assert_eq!(
-        assignments[1]["worker_assignments"][0]["task"],
-        "Update AlphaHandler."
-    );
+    assert_eq!(assignments[1]["task"], "Update AlphaHandler.");
+    for index in [0, 2] {
+        assert_eq!(assignments[index]["role"], "child_orchestrator");
+    }
+    for index in [1, 3] {
+        assert_eq!(assignments[index]["role"], "worker");
+        assert_eq!(
+            assignments[index]["role_category"],
+            "non_delegating_terminal_worker"
+        );
+        assert_eq!(assignments[index]["worker_assignments"], json!([]));
+    }
     assert_eq!(assignments[2]["id"], "assignment-002-planning");
     assert_eq!(assignments[2]["phase"], "planning");
     assert_eq!(assignments[2]["assigned_paths"], json!(["src/beta.rs"]));
@@ -1535,6 +1539,44 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
         &serde_json::to_string(&document).expect("serialize generated plan"),
     )
     .expect("reparse generated plan");
+    assert!(reparsed.assignment_metadata.workers.is_empty());
+    let schedule = &reparsed.plan_metadata.assignment_schedule;
+    let mut outcomes = vec![None, None, None, None];
+    assert_eq!(
+        assignment_admission_state(1, schedule, &outcomes).unwrap(),
+        AssignmentAdmissionState::Waiting
+    );
+    outcomes[0] = Some(AssignmentExecutionOutcome {
+        report: Some(injected_child_report(&reparsed.plan.assignments[0])),
+        ..AssignmentExecutionOutcome::default()
+    });
+    assert_eq!(
+        assignment_admission_state(1, schedule, &outcomes).unwrap(),
+        AssignmentAdmissionState::Ready
+    );
+    outcomes[0].as_mut().unwrap().assignment_failed = true;
+    assert_eq!(
+        assignment_admission_state(1, schedule, &outcomes).unwrap(),
+        AssignmentAdmissionState::Suppressed {
+            parent_assignment_id: "assignment-001-planning".to_string()
+        }
+    );
+    assert_eq!(
+        assignment_admission_state(2, schedule, &outcomes).unwrap(),
+        AssignmentAdmissionState::Ready
+    );
+    assert_eq!(
+        reparsed.plan.review_lenses,
+        default_supervisor_review_lenses()
+    );
+    assert_eq!(
+        reparsed.plan.review_aggregation_policy,
+        ReviewAggregationPolicy::AllMustAccept
+    );
+    assert_eq!(
+        reparsed.plan.max_gate_corrections,
+        DEFAULT_MAX_GATE_CORRECTIONS
+    );
     let renormalized = supervisor_plan_value(
         &reparsed.plan,
         &reparsed.consultant,
@@ -1660,14 +1702,27 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
         UnavailableModelFallback::FailClosed
     );
 
-    let ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
+    let mut ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
         .expect("plan ordinary README task");
-    assert_eq!(ordinary.assignments[1].role, AgentRole::ChildOrchestrator);
-    assert_eq!(ordinary.assignments[1].worker_assignments.len(), 1);
+    assert_eq!(ordinary.assignments[1].role, AgentRole::Worker);
+    assert!(ordinary.assignments[1].worker_assignments.is_empty());
     assert!(!ordinary.assignments[1]
         .notes
         .as_deref()
         .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+    ordinary.role_models = plan.role_models.clone();
+    let resolved = runtime_resolved_prompt_plan(
+        &ordinary,
+        &ordinary.assignments[1],
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Grok,
+        &RuntimeModelCatalog::OperatorDeclared,
+    )
+    .expect("resolve ordinary generated terminal worker");
+    assert_eq!(
+        effective_role_model_selection(&resolved, AgentRole::Worker),
+        worker
+    );
 }
 
 #[test]
@@ -4754,7 +4809,8 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
         loaded.plan.assignments[1].assigned_paths,
         vec![PathBuf::from("README.md")]
     );
-    assert_eq!(loaded.plan.assignments[1].worker_assignments.len(), 1);
+    assert_eq!(loaded.plan.assignments[1].role, AgentRole::Worker);
+    assert!(loaded.plan.assignments[1].worker_assignments.is_empty());
     assert_eq!(
         loaded.plan_metadata.assignment_schedule,
         vec![
@@ -4879,7 +4935,27 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
     assert!(plan.assignments[0].worker_assignments.is_empty());
     assert_eq!(plan.assignments[1].id, "alpha");
     assert_eq!(plan.assignments[1].phase, AssignmentPhase::Execution);
-    assert_eq!(plan.assignments[1].worker_assignments.len(), 1);
+    assert_eq!(plan.assignments[0].role, AgentRole::ChildOrchestrator);
+    for (index, path) in [(1, "src/alpha.rs"), (2, "src/beta.rs")] {
+        let leaf = &plan.assignments[index];
+        assert_eq!(leaf.role, AgentRole::Worker);
+        assert_eq!(
+            leaf.role_category,
+            Some(RoleCategory::NonDelegatingTerminalWorker)
+        );
+        assert!(leaf.worker_assignments.is_empty());
+        assert_eq!(leaf.assigned_paths, vec![PathBuf::from(path)]);
+        assert_eq!(
+            assignment_worker_journal_subject_ids(leaf).unwrap(),
+            vec![leaf.id.as_str()]
+        );
+    }
+    assert_eq!(plan.review_lenses, default_supervisor_review_lenses());
+    assert_eq!(
+        plan.review_aggregation_policy,
+        ReviewAggregationPolicy::AllMustAccept
+    );
+    assert_eq!(plan.max_gate_corrections, DEFAULT_MAX_GATE_CORRECTIONS);
     assert_eq!(plan.assignments[2].id, "beta");
     assert_eq!(plan.assignments[2].phase, AssignmentPhase::Execution);
 
@@ -4893,7 +4969,22 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
     .expect("bind provider session");
     assert_eq!(bound.execution_binding.run_id(), &run_id);
     assert_eq!(bound.plan.assignments.len(), 3);
-    assert!(bound.document.get("assignments").is_some());
+    assert_eq!(
+        bound.document["assignment_schedule"],
+        json!([
+            {"assignment_id": "parent", "depth": 2, "flattened_index": 0},
+            {"assignment_id": "alpha", "parent_assignment_id": "parent", "depth": 3, "flattened_index": 1},
+            {"assignment_id": "beta", "parent_assignment_id": "parent", "depth": 3, "flattened_index": 2}
+        ])
+    );
+    assert_eq!(
+        bound.document["assignments"][1]["spec_fragment_ids"],
+        json!(["fragment-001"])
+    );
+    assert_eq!(
+        bound.document["assignments"][2]["spec_fragment_ids"],
+        json!(["fragment-002"])
+    );
 }
 
 #[test]
