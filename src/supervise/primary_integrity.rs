@@ -600,6 +600,32 @@ fn sanitized_git_output(
         .context("supervisor Git snapshot failed after transient retries")
 }
 
+fn snapshot_sensitive_state_mask(common_dir: &Path) -> Result<PathBuf> {
+    use crate::safe_state::SafeRoot;
+
+    let common_root = SafeRoot::open_existing(common_dir)?;
+    let maco_path = common_root.direct_child("maco")?;
+    let state_path = maco_path.join("state");
+    // Ordinary repositories (including gitlink submodules) need not have MACO
+    // state. Prove absence relative to a verified, no-follow directory handle;
+    // never turn an unsafe path or an inspection error into an absent root.
+    if common_root.direct_child_exists("maco")? {
+        let maco_root = SafeRoot::open_existing(&maco_path)?;
+        if maco_root.direct_child_exists("state")? {
+            crate::artifacts::state_auth::sensitive_state_root(common_root.path())?;
+        } else {
+            maco_root.ensure_direct_child_absent("state")?;
+        }
+        maco_root.verify()?;
+    } else {
+        common_root.ensure_direct_child_absent("maco")?;
+    }
+    common_root.verify()?;
+    // Keep the mask even when absent: confinement must hide state if it appears
+    // before namespace setup. No authentication state is created by inspection.
+    Ok(state_path)
+}
+
 fn sanitized_git_output_once(
     workdir: &Path,
     args: &[&str],
@@ -645,11 +671,26 @@ fn sanitized_git_output_once(
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(SNAPSHOT_GIT_TIMEOUT));
     let output = run_process(match runtime {
-        SupervisorExecutionRuntime::Verified => process_spec
-            .with_private_runtime_home(true)
-            .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-                StrictOfflineWorkspaceProfile::read_only(workdir),
-            )),
+        SupervisorExecutionRuntime::Verified => {
+            // A linked worktree's .git marker points outside the workspace. The
+            // trusted snapshot subprocess needs that administration metadata to
+            // read HEAD, status and split-index dependencies, still read-only.
+            // Keep repository authentication state hidden, as for other fixed Git
+            // inspections; this does not change the worker's launch confinement.
+            let repository = crate::git_repository::open(workdir)
+                .context("failed to resolve snapshot Git administration roots")?;
+            let profile = StrictOfflineWorkspaceProfile::read_only(workdir)
+                .with_visible_read_only_root(repository.commondir())
+                .with_hidden_root(
+                    snapshot_sensitive_state_mask(repository.commondir())
+                        .context("failed to verify snapshot sensitive state mask")?,
+                );
+            process_spec
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+                    profile,
+                ))
+        }
         SupervisorExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })?;
@@ -1105,6 +1146,44 @@ pub(super) fn claim_conflict_details(
 #[cfg(test)]
 mod snapshot_git_retry_tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn primary_snapshot_verified_keeps_existing_state_hidden_from_git() -> Result<()> {
+        let (_temp, repo_path) = crate::supervise::tests::injected_repository();
+        let common = repo_path.join(".git");
+        let absent_mask = snapshot_sensitive_state_mask(&common)?;
+        assert_eq!(absent_mask, common.join("maco/state"));
+        assert!(!common.join("maco").exists());
+        crate::safe_state::SafeRoot::open_or_create(&absent_mask)?;
+        assert_eq!(snapshot_sensitive_state_mask(&common)?, absent_mask);
+        let public = common.join("snapshot-config");
+        let secret = absent_mask.join("snapshot-config");
+        for path in [&public, &secret] {
+            fs::write(path, "[snapshot]\nvalue = mask-sentinel\n")?;
+        }
+        let read = |path: &Path| {
+            sanitized_git_output_once(
+                &repo_path,
+                &[
+                    "config",
+                    "--file",
+                    path.to_str().expect("fixture path"),
+                    "--get",
+                    "snapshot.value",
+                ],
+                SupervisorExecutionRuntime::Verified,
+            )
+        };
+        let visible = read(&public)?;
+        assert!(visible.status.success());
+        assert_eq!(visible.stdout, b"mask-sentinel\n");
+        let hidden = read(&secret)?;
+        assert!(!hidden.status.success());
+        assert!(hidden.stdout.is_empty());
+        assert!(String::from_utf8_lossy(&hidden.stderr).contains("Permission denied"));
+        Ok(())
+    }
 
     #[test]
     fn snapshot_git_error_retries_load_failures_but_not_truncated_output() {
