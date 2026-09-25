@@ -106,7 +106,16 @@ The current implementation covers a local-first command-line slice:
   children receive a read-only workspace and read-only access to their own Git
   worktree metadata in both the outer systemd containment and inner Codex
   permission profile. Only their exact private final-message staging root is
-  writable. Execution-phase children retain native workspace-write and their
+  writable. Authored plans may declare a terminal `role: "researcher"` with
+  explicit `role_category: "read_only_researcher"`. Researcher assignments use
+  a distinct `ResearcherReport`, have no nested assignments or mechanical duty,
+  and currently require Codex on Linux in a managed read-only worktree in either
+  phase. They retain their own model binding (general-judgment minimum), claims,
+  scheduling dependencies and parent audit, including subject coverage for a
+  successful zero-diff result. Reports must attest read-only execution and no
+  further delegation; reported or observed changes are rejected. Other runtimes
+  and primary-worktree execution are refused. Generated goal/provider lowering
+  does not emit Researchers. Execution-phase implementation children retain native workspace-write and their
   existing bounded writable Git metadata; the optional app-server duplex
   reviewer is not their release path. Writable access to the
   primary checkout remains fail-closed because Codex cannot force a blocking

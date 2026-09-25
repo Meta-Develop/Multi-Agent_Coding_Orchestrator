@@ -2010,6 +2010,7 @@ pub(super) fn role_usage_report(
             sample.role,
             AgentRole::ChildOrchestrator
                 | AgentRole::Worker
+                | AgentRole::Researcher
                 | AgentRole::GateClassifier
                 | AgentRole::Auditor
         ) {
