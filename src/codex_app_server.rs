@@ -79,6 +79,45 @@ fn valid_startup_information(line: &[u8]) -> bool {
     }
 }
 
+// `thread/started` may follow the thread/start response before turn/start's
+// response. Preserve that lifecycle event without accepting an uncorrelated
+// notification or hiding duplicate ID fields in the original JSON.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterleavedThreadStarted {
+    method: String,
+    params: InterleavedThreadStartedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterleavedThreadStartedParams {
+    thread: InterleavedThreadIdentity,
+}
+
+#[derive(serde::Deserialize)]
+struct InterleavedThreadIdentity {
+    id: String,
+}
+
+fn valid_interleaved_thread_started(line: &[u8]) -> bool {
+    if line.len() > STARTUP_INFORMATION_MAX_BYTES {
+        return false;
+    }
+    matches!(
+        serde_json::from_slice::<InterleavedThreadStarted>(line),
+        Ok(InterleavedThreadStarted {
+            method,
+            params: InterleavedThreadStartedParams {
+                thread: InterleavedThreadIdentity { id }
+            },
+            emitted_at_ms: _,
+        }) if method == "thread/started" && !id.is_empty()
+    )
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TransportRead {
     Line,
@@ -836,6 +875,16 @@ impl ProtocolState {
                         .to_string(),
                 });
             }
+            if phase == "turn/start"
+                && message.get("method").and_then(Value::as_str) == Some("thread/started")
+                && !valid_interleaved_thread_started(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "interleaved thread/started notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
             self.command_snapshot =
                 if matches!(
                     message.get("method").and_then(Value::as_str),
@@ -911,6 +960,7 @@ where
         &initialize_id,
         "initialize",
         &cancelled,
+        None,
     )?;
     state.send(transport, &json!({"method": "initialized"}))?;
 
@@ -948,6 +998,7 @@ where
         &thread_start_id,
         "thread/start",
         &cancelled,
+        None,
     )?;
     require_exact_text(
         &thread_response,
@@ -982,6 +1033,7 @@ where
     .to_string();
 
     let turn_start_id = state.allocate_request_id()?;
+    let mut thread_started_seen = false;
     state.send(
         transport,
         &json!({
@@ -1003,6 +1055,7 @@ where
         &turn_start_id,
         "turn/start",
         &cancelled,
+        Some((&thread_id, &mut thread_started_seen)),
     )?;
     let turn_id = required_text(
         &turn_response,
@@ -1019,7 +1072,13 @@ where
     )?;
 
     match drive_turn(
-        &mut state, transport, &thread_id, &turn_id, reviewer, &cancelled,
+        &mut state,
+        transport,
+        &thread_id,
+        &turn_id,
+        thread_started_seen,
+        reviewer,
+        &cancelled,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -1035,6 +1094,7 @@ fn wait_for_response<T, C>(
     expected_id: &RequestId,
     phase: &'static str,
     cancelled: &C,
+    mut thread_started: Option<(&str, &mut bool)>,
 ) -> Result<Value, AppServerError>
 where
     T: JsonLineTransport,
@@ -1057,6 +1117,25 @@ where
                     message: "startup informational prelude exceeded its bound".to_string(),
                 });
             }
+            continue;
+        }
+        if phase == "turn/start"
+            && message.get("method").and_then(Value::as_str) == Some("thread/started")
+        {
+            let Some((thread_id, seen)) = thread_started.as_mut() else {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "thread/started arrived without a pending thread".to_string(),
+                });
+            };
+            if **seen {
+                return Err(AppServerError::Duplicate {
+                    phase,
+                    message: "thread lifecycle started more than once".to_string(),
+                });
+            }
+            require_exact_text(&message, &["params", "thread", "id"], thread_id, phase)?;
+            **seen = true;
             continue;
         }
         break message;
@@ -1113,6 +1192,7 @@ fn drive_turn<T, C>(
     transport: &mut T,
     thread_id: &str,
     turn_id: &str,
+    thread_started_seen: bool,
     reviewer: &mut dyn ApprovalReviewer,
     cancelled: &C,
 ) -> Result<AppServerOutcome, AppServerError>
@@ -1148,7 +1228,7 @@ where
     let mut approval_request_items = BTreeSet::<String>::new();
     let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
-    let mut thread_started_seen = false;
+    let mut thread_started_seen = thread_started_seen;
     let mut turn_started_seen = false;
 
     loop {
@@ -2243,6 +2323,91 @@ mod tests {
         assert_eq!(transport.sent[2]["id"], 2);
         assert_eq!(transport.sent[3]["method"], "turn/start");
         assert_eq!(transport.sent[3]["id"], 3);
+    }
+
+    #[test]
+    fn correlated_thread_started_between_thread_and_turn_responses_preserves_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("interleaved lifecycle");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn interleaved_thread_started_rejects_wrong_duplicate_and_malformed_identity() {
+        let notice = json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}});
+        for invalid in [
+            json!({"method":"thread/started","params":{"thread":{"id":"other-thread"}}}),
+            json!({"method":"thread/started","params":{"thread":{"id":null}}}),
+            json!({"method":"thread/started","id":77,"params":{"thread":{"id":"thread-1"}}}),
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}},"result":{}}),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(2, invalid);
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Malformed {
+                    phase: "turn/start",
+                    ..
+                }) | Err(AppServerError::Unexpected {
+                    phase: "turn/start",
+                    ..
+                })
+            ));
+        }
+        let mut messages = command_observation_messages();
+        messages.insert(2, notice.clone());
+        messages.insert(3, notice.clone());
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Duplicate {
+                phase: "turn/start",
+                ..
+            })
+        ));
+        let mut messages = command_observation_messages();
+        messages.insert(2, notice.clone());
+        messages.insert(4, notice);
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Duplicate {
+                phase: "thread/started",
+                ..
+            })
+        ));
+
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        let turn_start_index = transport.incoming.len() - 2;
+        transport.incoming.insert(
+            turn_start_index,
+            ReaderEvent::Line(
+                br#"{"method":"thread/started","params":{"thread":{"id":"thread-1","id":"other-thread"}}}"#
+                    .to_vec(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval request expected"),
+                || false,
+            ),
+            Err(AppServerError::Malformed {
+                phase: "turn/start",
+                ..
+            })
+        ));
     }
 
     #[test]
