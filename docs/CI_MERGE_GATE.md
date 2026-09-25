@@ -13,8 +13,9 @@ portability, the Linux gate, and the macOS/Windows portable-build matrix all
 succeed. The Linux gate waits for every partition of `Linux library tests`
 (including `autopilot`, `rest`, and `supervise`) and `Linux integration tests`.
 The account-manager gate in `.github/workflows/account-manager.yml` waits for
-its lockfile, frontend, and Rust jobs. Keep these four gate names stable when
-editing workflows; a renamed or missing required check blocks merging.
+the `desktop-lock`, `frontend`, and `rust` jobs. Keep these four gate names
+stable when editing workflows; a renamed or missing required check blocks
+merging.
 
 The ruleset does not allow a bypass actor. Repository auto-merge is enabled, so
 an ordinary auto-merge request waits for the required checks. The ruleset uses
