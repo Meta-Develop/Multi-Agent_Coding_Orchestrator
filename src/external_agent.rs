@@ -2166,6 +2166,31 @@ struct AdmittedGrokCredentials {
     source: GrokCredentialSource,
 }
 
+/// Retains the admitted source and the exact profile produced by its successful binding.
+/// Neither a pathname nor a profile kind alone proves that the child receives Grok auth.
+struct BoundGrokCredentials<'a> {
+    credentials: &'a AdmittedGrokCredentials,
+    profile: ExternalGrokProfile,
+}
+
+impl<'a> BoundGrokCredentials<'a> {
+    fn new(credentials: &'a AdmittedGrokCredentials, profile: ExternalGrokProfile) -> Result<Self> {
+        Ok(Self {
+            credentials,
+            profile: credentials.bind_to_profile(profile)?,
+        })
+    }
+
+    fn present_in(&self, profile: &SideEffectConfinementProfile) -> bool {
+        let SideEffectConfinementProfile::ExternalGrok(profile) = profile else {
+            return false;
+        };
+        // Binding revalidates the held descriptors against their original path identities.
+        // Discard the new profile: preflight must not add access to the actual launch profile.
+        *profile == self.profile && self.credentials.bind_to_profile(profile.clone()).is_ok()
+    }
+}
+
 impl AdmittedGrokCredentials {
     #[cfg(target_os = "linux")]
     fn from_managed_grok_home(grok_home: &Path) -> Result<Self> {
@@ -3144,10 +3169,15 @@ fn run_external_agent_runtime(
     } else {
         None
     };
+    let mut bound_grok_credentials = None;
     let side_effect_profile = match (grok_credentials.as_ref(), side_effect_profile) {
         (Some(credentials), Some(SideEffectConfinementProfile::ExternalGrok(profile))) => {
-            match credentials.bind_to_profile(profile) {
-                Ok(profile) => Some(SideEffectConfinementProfile::ExternalGrok(profile)),
+            match BoundGrokCredentials::new(credentials, profile) {
+                Ok(bound) => {
+                    let profile = bound.profile.clone();
+                    bound_grok_credentials = Some(bound);
+                    Some(SideEffectConfinementProfile::ExternalGrok(profile))
+                }
                 Err(error) => {
                     report.duration_ms = duration_millis(started.elapsed());
                     record_grok_credential_environment_failure(&mut report, &error);
@@ -3254,6 +3284,36 @@ fn run_external_agent_runtime(
             }
         };
     if runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::Grok
+    {
+        #[cfg(test)]
+        tests::run_grok_preflight_hook();
+        let mut preflight = run_grok_environment_preflight(
+            &target_spec,
+            spec.timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            &external_environment,
+            side_effect_profile
+                .as_ref()
+                .expect("verified Grok profile admitted above"),
+            bound_grok_credentials.as_ref(),
+            agent_lifecycle.as_ref(),
+            &credential_redactor,
+        );
+        for failure in &mut preflight.failures {
+            failure.summary = credential_redactor.redact_string(&failure.summary);
+        }
+        report.timed_out = preflight.timed_out;
+        report.stdout.run_metadata.environment_preflight_results = preflight.results;
+        report.stdout.run_metadata.environment_failures = preflight.failures;
+        retain_environment_preflight_process_evidence(&mut report, &preflight.process_evidence);
+        if report.environment_blocked() {
+            report.duration_ms = duration_millis(started.elapsed());
+            report.error = Some(environment_blocked_message(report.environment_failures()));
+            return report;
+        }
+    }
+    if runtime == ExternalExecutionRuntime::Verified
         && program_trust == ExternalProgramTrust::TrustedSystemCodex
         && matches!(
             spec.invocation,
@@ -3282,6 +3342,7 @@ fn run_external_agent_runtime(
             &external_environment,
             preflight_profile,
             codex_auth.as_ref(),
+            bound_grok_credentials.as_ref(),
             agent_lifecycle.as_ref(),
             Some(&credential_redactor),
         );
@@ -5411,6 +5472,7 @@ fn preflight_codex_version(
     let requirement = codex_environment_requirement();
     let version = run_fixed_version_probe(
         EnvironmentExecutable::Codex,
+        ExternalAgentInvocation::CodexSupervisor,
         program,
         cwd,
         timeout,
@@ -5492,6 +5554,129 @@ fn preflight_custom_codex_version(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_grok_environment_preflight(
+    spec: &ExternalAgentCommand,
+    timeout: Duration,
+    cancellation: &ProcessCancellation,
+    environment: &BTreeMap<String, String>,
+    profile: &SideEffectConfinementProfile,
+    credentials: Option<&BoundGrokCredentials<'_>>,
+    lifecycle: Option<&AgentLaunchMetadata>,
+    credential_redactor: &CredentialRedactor,
+) -> EnvironmentPreflightReport {
+    let mut report = EnvironmentPreflightReport::default();
+    if let Err(error) = validate_environment_requirements(&spec.environment_requirements) {
+        report.failures.push(environment_failure(
+            EnvironmentFailureCategory::ProbeFailed,
+            None,
+            format!("invalid environment requirements: {error}"),
+        ));
+        return report;
+    }
+    let started = Instant::now();
+    let auth = grok_auth_environment_requirement();
+    let (result, failure, _) = evaluate_environment_requirement(
+        &auth,
+        ExternalAgentInvocation::Grok,
+        &spec.cwd,
+        timeout,
+        cancellation,
+        environment,
+        profile,
+        None,
+        credentials,
+        None,
+        None,
+        lifecycle,
+        None,
+        &mut report.process_evidence,
+    );
+    report.results.push(result);
+    if let Some(failure) = failure {
+        report.failures.push(failure);
+        return report;
+    }
+
+    // Prove the actual bound sandbox with a fixed no-op, never the provider or Codex.
+    let probe_program = [
+        "/usr/bin/true",
+        "/bin/true",
+        "/run/current-system/sw/bin/true",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .unwrap_or_else(|| Path::new("/usr/bin/true"));
+    let probe = with_external_runtime_context(
+        ProcessSpec::direct(
+            "Grok sandbox preflight",
+            probe_program,
+            std::iter::empty::<&str>(),
+            &spec.cwd,
+            4096,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(timeout.saturating_sub(started.elapsed()))),
+        environment.clone(),
+        profile.clone(),
+        ExternalAgentInvocation::Grok,
+        None,
+        lifecycle,
+        None,
+    );
+    match run_process_cancellable(probe, cancellation) {
+        Ok(output) => {
+            report.process_evidence.record_output(&output);
+            report.timed_out = output.timed_out;
+            if output.safety_sensitive_succeeded()
+                && output.side_effects
+                    == SideEffectConfinementEvidence::Verified(
+                        SideEffectConfinementProfileKind::ExternalGrok,
+                    )
+            {
+                report.verified_confinement = Some(SideEffectConfinementProfileKind::ExternalGrok);
+            }
+        }
+        Err(error) => {
+            report.process_evidence.record_error(&error);
+            report.timed_out = matches!(error, ProcessRunError::SetupTimeout { .. });
+        }
+    }
+    let sandbox = external_sandbox_requirement(ExternalAgentInvocation::Grok);
+    for requirement in std::iter::once(&sandbox).chain(
+        spec.environment_requirements
+            .iter()
+            .filter(|r| **r != auth && **r != sandbox),
+    ) {
+        let (result, failure, timed_out) = evaluate_environment_requirement(
+            requirement,
+            ExternalAgentInvocation::Grok,
+            &spec.cwd,
+            timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            environment,
+            profile,
+            None,
+            credentials,
+            None,
+            report.verified_confinement,
+            lifecycle,
+            Some(credential_redactor),
+            &mut report.process_evidence,
+        );
+        report.results.push(result);
+        if let Some(failure) = failure {
+            report.failures.push(failure);
+        }
+        report.timed_out |= timed_out;
+        if !report.failures.is_empty() {
+            break;
+        }
+    }
+    report
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_environment_preflight(
     spec: &ExternalAgentCommand,
     resolved_codex: &Path,
@@ -5500,6 +5685,7 @@ fn run_environment_preflight(
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    grok_credentials: Option<&BoundGrokCredentials<'_>>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
     credential_redactor: Option<&CredentialRedactor>,
 ) -> EnvironmentPreflightReport {
@@ -5555,12 +5741,14 @@ fn run_environment_preflight(
         let remaining = timeout.saturating_sub(started.elapsed());
         let (result, failure, timed_out) = evaluate_environment_requirement(
             requirement,
+            spec.invocation,
             &spec.cwd,
             remaining,
             cancellation,
             environment,
             side_effect_profile,
             codex_auth,
+            grok_credentials.filter(|_| spec.invocation == ExternalAgentInvocation::Grok),
             report.codex_version,
             report.verified_confinement,
             agent_lifecycle,
@@ -5579,12 +5767,14 @@ fn run_environment_preflight(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_environment_requirement(
     requirement: &EnvironmentRequirement,
+    invocation: ExternalAgentInvocation,
     cwd: &Path,
     timeout: Duration,
     cancellation: &ProcessCancellation,
     environment: &BTreeMap<String, String>,
     side_effect_profile: &SideEffectConfinementProfile,
     codex_auth: Option<&ValidatedCodexAuth>,
+    grok_credentials: Option<&BoundGrokCredentials<'_>>,
     observed_codex_version: Option<EnvironmentVersion>,
     verified_confinement: Option<SideEffectConfinementProfileKind>,
     agent_lifecycle: Option<&AgentLaunchMetadata>,
@@ -5610,6 +5800,7 @@ fn evaluate_environment_requirement(
                 resolve_environment_executable(*executable).and_then(|program| {
                     run_fixed_version_probe(
                         *executable,
+                        invocation,
                         &program,
                         cwd,
                         timeout,
@@ -5712,7 +5903,12 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Configuration { configuration } => {
-            let present = configuration_present(*configuration, codex_auth);
+            let present = configuration_present(
+                *configuration,
+                codex_auth,
+                grok_credentials,
+                side_effect_profile,
+            );
             if present {
                 (
                     EnvironmentPreflightResult {
@@ -5747,6 +5943,12 @@ fn evaluate_environment_requirement(
         EnvironmentRequirement::Network { access } => {
             let enforced_offline =
                 verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            let verified_networked_grok = verified_confinement
+                == Some(SideEffectConfinementProfileKind::ExternalGrok)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalGrok(_)
+                );
             if *access == EnvironmentNetworkAccess::Disabled && enforced_offline {
                 (
                     EnvironmentPreflightResult {
@@ -5754,6 +5956,18 @@ fn evaluate_environment_requirement(
                         status: EnvironmentPreflightStatus::Satisfied,
                         observation: Some(EnvironmentPreflightObservation::Network {
                             enabled: false,
+                        }),
+                    },
+                    None,
+                    false,
+                )
+            } else if *access == EnvironmentNetworkAccess::Enabled && verified_networked_grok {
+                (
+                    EnvironmentPreflightResult {
+                        requirement: requirement.clone(),
+                        status: EnvironmentPreflightStatus::Satisfied,
+                        observation: Some(EnvironmentPreflightObservation::Network {
+                            enabled: true,
                         }),
                     },
                     None,
@@ -5787,7 +6001,7 @@ fn evaluate_environment_requirement(
                     Some(environment_failure(
                         EnvironmentFailureCategory::NetworkForbidden,
                         Some(requirement.clone()),
-                        "the supervised child requires network access, but its fixed permission profile disables network access"
+                        "the supervised child requires network access, but its fixed permission profile did not verify network access"
                             .to_string(),
                     )),
                     false,

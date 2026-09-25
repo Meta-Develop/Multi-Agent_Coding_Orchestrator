@@ -210,6 +210,7 @@ fn record_fixed_version_probe_output(
 #[allow(clippy::too_many_arguments)]
 fn run_fixed_version_probe(
     executable: EnvironmentExecutable,
+    invocation: ExternalAgentInvocation,
     program: &Path,
     cwd: &Path,
     timeout: Duration,
@@ -231,12 +232,12 @@ fn run_fixed_version_probe(
     )
     .with_stdin(StdinMode::Null)
     .with_timeout(Some(timeout));
-    // Version probes keep the RuntimeDirectory Codex home: they yield no session evidence.
+    // Version probes keep the runtime's private home: they yield no session evidence.
     let process_spec = with_external_runtime_context(
         process_spec,
         environment.clone(),
         side_effect_profile.clone(),
-        ExternalAgentInvocation::CodexSupervisor,
+        invocation,
         codex_auth,
         agent_lifecycle,
         None,
@@ -410,10 +411,14 @@ fn credential_present(
 fn configuration_present(
     configuration: EnvironmentConfiguration,
     codex_auth: Option<&ValidatedCodexAuth>,
+    grok_credentials: Option<&BoundGrokCredentials<'_>>,
+    side_effect_profile: &SideEffectConfinementProfile,
 ) -> bool {
     match configuration {
         EnvironmentConfiguration::CodexAuthFile => codex_auth.is_some(),
-        EnvironmentConfiguration::GrokAuthFile => false,
+        EnvironmentConfiguration::GrokAuthFile => {
+            grok_credentials.is_some_and(|credentials| credentials.present_in(side_effect_profile))
+        }
     }
 }
 
