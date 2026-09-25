@@ -1,4 +1,4 @@
-//! Durable inbox only: no IPC, launch authority, or automatic execution/retry.
+//! Durable inbox core: no launch authority or automatic execution/retry.
 //!
 //! The supervisor supplies the current binding and frozen authored parent. Never construct
 //! them from child JSON. Callers must revoke access when the attempt ends and revalidate
@@ -20,9 +20,12 @@
 //!
 //! Private state-transition messages reuse MessagingStore's authenticated chain, tail anchor,
 //! bounded replay and exclusive lock. They are never sent through the messaging broker.
-#![allow(dead_code)] // Deliberately not wired into IPC or the executor in this slice.
+#![allow(dead_code)] // Reservation/execution and recovery reconciliation remain staged.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::{
+    borrow::Borrow,
+    collections::{BTreeMap, BTreeSet},
+};
 
 use super::persistence::{MESSAGING_ROOT_LOCK, MESSAGING_STATE_NAMESPACE};
 use anyhow::{bail, Context, Result};
@@ -30,7 +33,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     artifacts::state_auth::{
-        random_identifier, sha256_hex, AuthenticationDomain, BoundStateLock,
+        random_identifier, sha256_hex, AuthenticationDomain, BoundStateLock, RepositoryAuthBinding,
         RepositoryAuthenticator,
     },
     hierarchy_ledger::RoleCategory,
@@ -50,7 +53,7 @@ const DOMAIN: AuthenticationDomain = AuthenticationDomain::new(b"MACO\0worker-re
 
 /// Server-owned identity, deliberately not deserializable. Generation must be persisted by
 /// the supervisor and reused on recovery, never regenerated to evade an existing inbox.
-#[derive(Clone, Debug, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(in crate::supervise) struct WorkerRequestBinding {
     state_instance: String,
     run: String,
@@ -61,6 +64,30 @@ pub(in crate::supervise) struct WorkerRequestBinding {
 }
 
 impl WorkerRequestBinding {
+    pub(super) fn verify_session(
+        &self,
+        factory: &super::SupervisorMessagingSessionFactory,
+        task_id: &str,
+    ) -> Result<()> {
+        factory.ensure_authenticated_run_id(&self.run)?;
+        let persistent = factory
+            .persistent
+            .as_ref()
+            .context("worker IPC requires a persistent messaging session")?;
+        if task_id != self.parent
+            || self.state_instance != persistent.state_instance_id()
+            || factory.hierarchy.effective_categories.get(task_id)
+                != Some(&RoleCategory::DelegatingCoordinator)
+            || self.workers.iter().any(|worker| {
+                factory.hierarchy.effective_categories.get(worker)
+                    != Some(&RoleCategory::NonDelegatingTerminalWorker)
+            })
+        {
+            bail!("worker inbox endpoint differs from authenticated messaging authority");
+        }
+        Ok(())
+    }
+
     fn identity(&self) -> Result<String> {
         let identity = serde_json::to_vec(&(
             &self.state_instance,
@@ -133,8 +160,10 @@ pub(in crate::supervise) struct WorkerRequestRecord {
     pub(in crate::supervise) status: WorkerRequestStatus,
 }
 
-pub(in crate::supervise) struct WorkerRequestInbox<'a> {
-    authenticator: &'a RepositoryAuthenticator,
+/// May borrow the authenticator in a scoped caller or own it in an IPC service.
+/// Moving the owner preserves the exclusive journal lock; no key is cloned.
+pub(in crate::supervise) struct WorkerRequestInbox<A: Borrow<RepositoryAuthenticator>> {
+    authenticator: A,
     binding: WorkerRequestBinding,
     store: MessagingStore,
     records: BTreeMap<String, WorkerRequestRecord>,
@@ -145,10 +174,10 @@ pub(in crate::supervise) struct WorkerRequestInbox<'a> {
     requires_reconciliation: bool,
 }
 
-impl<'a> WorkerRequestInbox<'a> {
+impl<A: Borrow<RepositoryAuthenticator>> WorkerRequestInbox<A> {
     /// Fresh creation only. Existing or partially created state is never overwritten.
     pub(in crate::supervise) fn create(
-        authenticator: &'a RepositoryAuthenticator,
+        authenticator: A,
         binding: WorkerRequestBinding,
     ) -> Result<Self> {
         Self::load(authenticator, binding, false)
@@ -157,7 +186,7 @@ impl<'a> WorkerRequestInbox<'a> {
     /// Missing, corrupt or differently bound state is an error, never a fresh inbox.
     /// Recovery preserves queued records for inspection only, not for automatic resumption.
     pub(in crate::supervise) fn recover(
-        authenticator: &'a RepositoryAuthenticator,
+        authenticator: A,
         binding: WorkerRequestBinding,
     ) -> Result<Self> {
         let mut inbox = Self::load(authenticator, binding, true)?;
@@ -173,16 +202,13 @@ impl<'a> WorkerRequestInbox<'a> {
         Ok(inbox)
     }
 
-    fn load(
-        authenticator: &'a RepositoryAuthenticator,
-        binding: WorkerRequestBinding,
-        recover: bool,
-    ) -> Result<Self> {
-        authenticator.verify()?;
-        let (root, root_lock) = inbox_root(authenticator, !recover)?;
+    fn load(authenticator: A, binding: WorkerRequestBinding, recover: bool) -> Result<Self> {
+        let auth = authenticator.borrow();
+        auth.verify()?;
+        let (root, root_lock) = inbox_root(auth, !recover)?;
         let payload = serde_json::to_vec(&binding)?;
         let identity = binding.identity()?;
-        let tag = authenticator.sign(DOMAIN, &payload)?;
+        let tag = auth.sign(DOMAIN, &payload)?;
         let mut key = [0_u8; 32];
         for (index, byte) in key.iter_mut().enumerate() {
             *byte = u8::from_str_radix(&tag.as_str()[index * 2..index * 2 + 2], 16)?;
@@ -226,7 +252,7 @@ impl<'a> WorkerRequestInbox<'a> {
             records.insert(record.request_id.clone(), record);
         }
         let journal_digest = journal_digest(&root, &file_name)?;
-        root_lock.verify(authenticator.state_root())?;
+        root_lock.verify(auth.state_root())?;
         Ok(Self {
             authenticator,
             binding,
@@ -238,6 +264,22 @@ impl<'a> WorkerRequestInbox<'a> {
             root,
             requires_reconciliation: recover,
         })
+    }
+
+    /// Compare the entire supervisor-owned binding before attaching or servicing IPC.
+    pub(super) fn verify_ipc_binding(
+        &self,
+        expected: &WorkerRequestBinding,
+        repository: &RepositoryAuthBinding,
+    ) -> Result<()> {
+        self.verify()?;
+        self.authenticator
+            .borrow()
+            .verify_repository_binding(repository)?;
+        if &self.binding != expected {
+            bail!("worker inbox differs from current supervisor attempt binding");
+        }
+        Ok(())
     }
 
     pub(in crate::supervise) fn submit(
@@ -317,7 +359,7 @@ impl<'a> WorkerRequestInbox<'a> {
         if self.poisoned {
             bail!("worker inbox requires recovery after an uncertain append");
         }
-        self.authenticator.verify()?;
+        self.authenticator.borrow().verify()?;
         self.root.verify()?;
         if journal_digest(&self.root, &self.file_name)? != self.journal_digest {
             bail!("worker inbox journal changed outside its exclusive owner");

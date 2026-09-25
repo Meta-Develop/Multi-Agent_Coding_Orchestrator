@@ -111,6 +111,9 @@ pub(crate) struct AssignmentMessagingServer {
     shutdown: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
     launch: AssignmentMessagingLaunch,
+    // Test-only notification after shutdown is requested, before joining the handler.
+    #[cfg(test)]
+    pub(crate) shutdown_observer: Option<std::sync::mpsc::Sender<()>>,
 }
 
 impl AssignmentMessagingServer {
@@ -152,6 +155,8 @@ impl AssignmentMessagingServer {
             shutdown,
             worker: Some(worker),
             launch,
+            #[cfg(test)]
+            shutdown_observer: None,
         })
     }
 
@@ -172,6 +177,10 @@ impl fmt::Debug for AssignmentMessagingServer {
 impl Drop for AssignmentMessagingServer {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Release);
+        #[cfg(test)]
+        if let Some(observer) = &self.shutdown_observer {
+            let _ = observer.send(());
+        }
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
