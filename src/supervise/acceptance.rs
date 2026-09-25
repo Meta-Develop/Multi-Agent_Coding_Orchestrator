@@ -317,6 +317,16 @@ pub(super) fn collect_child_report(
     collect_child_report_for_runtime(context, runtime)
 }
 
+// The evidence-only stage refreshes the outer report, never the preserved WorkerReport.
+// This is a wire-format choice; it does not change assignment authority or accounting.
+pub(super) fn assignment_attempt_report_role(role: AgentRole, evidence_only: bool) -> AgentRole {
+    if evidence_only && role == AgentRole::Worker {
+        AgentRole::ChildOrchestrator
+    } else {
+        role
+    }
+}
+
 pub(super) fn collect_child_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
@@ -346,7 +356,9 @@ pub(super) fn collect_child_report_for_runtime(
             Vec::new(),
         );
     }
-    let direct_worker = assignment.role == AgentRole::Worker
+    let report_role =
+        assignment_attempt_report_role(assignment.role, evidence_only_source.is_some());
+    let direct_worker = report_role == AgentRole::Worker
         && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut report_shape_problems = Vec::new();
     let parsed_report = if direct_worker {
@@ -393,11 +405,8 @@ pub(super) fn collect_child_report_for_runtime(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
-            if report.role != assignment.role {
-                let message = format!(
-                    "assignment report role must be '{}'",
-                    assignment.role.as_str()
-                );
+            if report.role != report_role {
+                let message = format!("assignment report role must be '{}'", report_role.as_str());
                 report_shape_problems.push(message.clone());
                 report.status = ReviewStatus::Failed;
                 report.accepted = false;
@@ -408,6 +417,8 @@ pub(super) fn collect_child_report_for_runtime(
                     paths: vec![report_path.to_path_buf()],
                 });
             }
+            // Restore the original role for all downstream gates and final accounting.
+            report.role = assignment.role;
             if !external_process_completed(external_run, runtime)
                 && report.status == ReviewStatus::Succeeded
             {
