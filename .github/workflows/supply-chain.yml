@@ -3,6 +3,8 @@ name: Supply-chain policy
 on:
   pull_request:
   push:
+    branches: [main]
+    tags: ['**']
     paths-ignore:
       - maco-coordination.json
   schedule:
