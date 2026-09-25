@@ -208,6 +208,62 @@ fn frozen_inbox_exact_order_watermark_and_duplicate_refusal() -> Result<()> {
 }
 
 #[test]
+fn frozen_inbox_consumer_requires_exact_parent_resources_and_launch() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let run = RunId::new("run")?;
+    turn.verify_parent_resources(&run, 1, fixture.resources())?;
+    assert!(turn
+        .verify_parent_resources(&run, 2, fixture.resources())
+        .is_err());
+    assert!(turn
+        .verify_parent_resources(&RunId::new("foreign")?, 1, fixture.resources())
+        .is_err());
+    let mut different_parent = fixture.parent.clone();
+    // The worker ID set is unchanged, but the authored instruction is not.
+    different_parent.worker_assignments[0].task = Some("substituted task".into());
+    let mut different = fixture.resources();
+    different.parent = &different_parent;
+    assert!(turn.verify_parent_resources(&run, 1, different).is_err());
+    let endpoint = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?;
+    let launch = endpoint.launch();
+    let frozen = endpoint.shutdown()?;
+    frozen.verify_parent_launch(&fixture.directory, &launch)?;
+    assert!(frozen
+        .verify_parent_launch(&fixture.directory.join("foreign"), &launch)
+        .is_err());
+    Ok(())
+}
+
+#[test]
+fn frozen_inbox_refuses_each_substituted_watermark_component() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let mut frozen = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?
+    .shutdown()?;
+    frozen.view(&turn)?;
+    frozen.watermark.last_sequence += 1;
+    assert!(frozen.view(&turn).is_err());
+    frozen.watermark.last_sequence -= 1;
+    let digest = std::mem::replace(&mut frozen.watermark.journal_digest, "foreign".into());
+    assert!(frozen.view(&turn).is_err());
+    frozen.watermark.journal_digest = digest;
+    frozen.watermark.journal_instance = "foreign".into();
+    assert!(frozen.view(&turn).is_err());
+    Ok(())
+}
+
+#[test]
 fn frozen_inbox_rejects_foreign_instance_generation_attempt_and_turn_owner() -> Result<()> {
     let fixture = Fixture::new()?;
     let turn = fixture.turn()?;

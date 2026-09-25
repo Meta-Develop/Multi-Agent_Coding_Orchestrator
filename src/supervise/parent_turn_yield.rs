@@ -188,6 +188,30 @@ fn validate_yield_bytes(
     })
 }
 
+/// Frozen-inbox consumers require the exact durable order, not just set equality.
+/// Keep the original unbound validator's contract unchanged.
+pub(super) fn validate_frozen_yield_bytes(
+    bytes: &[u8],
+    run_id: &str,
+    parent: &OrchestratorAssignment,
+    attempt: usize,
+    expected: &[ExpectedWorkerRequest],
+) -> Result<ValidatedParentTurnYield> {
+    let validated = validate_yield_bytes(bytes, run_id, parent, attempt, expected)?;
+    let wire: YieldWire = serde_json::from_slice(bytes)?;
+    if wire
+        .requests
+        .iter()
+        .zip(expected)
+        .any(|(actual, expected)| {
+            actual.request_id != expected.request_id || actual.worker_id != expected.worker_id
+        })
+    {
+        bail!("parent yield differs from the frozen journal request order");
+    }
+    Ok(validated)
+}
+
 fn validate_request_id(id: &str) -> Result<()> {
     if id.is_empty()
         || id.len() > 128

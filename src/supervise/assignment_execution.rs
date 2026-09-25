@@ -9,6 +9,10 @@ mod nested_worker_executor;
 #[allow(dead_code)]
 #[path = "parent_turn_yield.rs"]
 mod parent_turn_yield;
+// Staged binding of a held yield to a frozen inbox; no execution/collection caller.
+#[allow(dead_code)]
+#[path = "bound_parent_turn.rs"]
+mod bound_parent_turn;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
@@ -1530,8 +1534,8 @@ pub(super) fn bind_worker_journal_artifacts(
 }
 
 /// A staged launch input, not a final-report or resumed-execution authority.
-/// Production construction is unavailable: the yield and completed evidence do
-/// not yet carry the authenticated state-instance and inbox-generation binding.
+/// Production construction is unavailable: even a BoundParentTurnYield cannot
+/// bind completed Worker evidence to its authenticated inbox request/turn yet.
 /// Only an explicitly unbound test fixture exercises this staged preparation.
 pub(super) struct ParentContinuationLaunch<'evidence> {
     run_id: String,
@@ -13591,3 +13595,7 @@ mod messaging_ipc_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/nested_driver_tests.rs"]
 mod nested_driver_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/bound_parent_turn_tests.rs"]
+mod bound_parent_turn_tests;
