@@ -27,6 +27,8 @@ const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
+const THREAD_STATUS_MAX_MESSAGES: usize = 32;
+const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
 
 // Only the informational prelude observed before thread/start on audited Codex 0.144.4.
 // Upstream declares both methods as ServerNotification in app-server-protocol's common.rs.
@@ -77,6 +79,175 @@ fn valid_startup_information(line: &[u8]) -> bool {
         }
         Err(_) => false,
     }
+}
+
+// `thread/started` may follow the thread/start response before turn/start's
+// response. Preserve that lifecycle event without accepting an uncorrelated
+// notification or hiding duplicate ID fields in the original JSON.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterleavedThreadStarted {
+    method: String,
+    params: InterleavedThreadStartedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct InterleavedThreadStartedParams {
+    thread: InterleavedThreadIdentity,
+}
+
+#[derive(serde::Deserialize)]
+struct InterleavedThreadIdentity {
+    id: String,
+}
+
+fn valid_interleaved_thread_started(line: &[u8]) -> bool {
+    if line.len() > STARTUP_INFORMATION_MAX_BYTES {
+        return false;
+    }
+    matches!(
+        serde_json::from_slice::<InterleavedThreadStarted>(line),
+        Ok(InterleavedThreadStarted {
+            method,
+            params: InterleavedThreadStartedParams {
+                thread: InterleavedThreadIdentity { id }
+            },
+            emitted_at_ms: _,
+        }) if method == "thread/started" && !id.is_empty()
+    )
+}
+
+// The audited app-server sends an active thread transition between the
+// turn/start response and turn/started. These status changes are informational;
+// only correlated, schema-valid transitions are admitted. They never complete
+// a turn or grant approval.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadStatusChanged {
+    method: String,
+    params: ThreadStatusParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadStatusParams {
+    #[serde(rename = "threadId")]
+    thread_id: String,
+    status: ThreadProgressStatus,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum ThreadProgressStatus {
+    Active {
+        #[serde(rename = "activeFlags")]
+        active_flags: Vec<ThreadActiveFlag>,
+    },
+    Idle,
+}
+
+#[derive(serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+enum ThreadActiveFlag {
+    WaitingOnApproval,
+    WaitingOnUserInput,
+}
+
+fn valid_thread_status_changed(line: &[u8]) -> bool {
+    if line.len() > STARTUP_INFORMATION_MAX_BYTES {
+        return false;
+    }
+    let Ok(notice) = serde_json::from_slice::<ThreadStatusChanged>(line) else {
+        return false;
+    };
+    if notice.method != "thread/status/changed" || notice.params.thread_id.is_empty() {
+        return false;
+    }
+    match notice.params.status {
+        ThreadProgressStatus::Active { active_flags } => {
+            active_flags.len() <= 2
+                && (active_flags.len() < 2 || active_flags[0] != active_flags[1])
+        }
+        ThreadProgressStatus::Idle => true,
+    }
+}
+
+#[derive(Default)]
+struct ThreadLifecycleNotices {
+    started: bool,
+    status_count: usize,
+}
+
+// Codex emits account-wide rate-limit telemetry during a turn. It has no
+// thread/turn identity and conveys no execution authority, so validate the
+// original bounded JSON against the published shape before ignoring it.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountRateLimitsUpdated {
+    method: String,
+    params: AccountRateLimitsParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountRateLimitsParams {
+    #[serde(rename = "rateLimits")]
+    rate_limits: AccountRateLimitSnapshot,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountRateLimitSnapshot {
+    limit_id: Option<String>,
+    limit_name: Option<String>,
+    normal_model_slug: Option<String>,
+    primary: Option<AccountRateLimitWindow>,
+    secondary: Option<AccountRateLimitWindow>,
+    credits: Option<AccountCreditsSnapshot>,
+    individual_limit: Option<AccountSpendControlLimit>,
+    spend_control_reached: Option<bool>,
+    plan_type: Option<String>,
+    rate_limit_reached_type: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountRateLimitWindow {
+    used_percent: i32,
+    window_duration_mins: Option<i64>,
+    resets_at: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountCreditsSnapshot {
+    has_credits: bool,
+    unlimited: bool,
+    balance: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountSpendControlLimit {
+    limit: String,
+    used: String,
+    remaining_percent: i32,
+    resets_at: i64,
+}
+
+fn valid_account_rate_limits_updated(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<AccountRateLimitsUpdated>(line),
+            Ok(AccountRateLimitsUpdated { method, .. }) if method == "account/rateLimits/updated"
+        )
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -836,6 +1007,36 @@ impl ProtocolState {
                         .to_string(),
                 });
             }
+            if matches!(phase, "turn/start" | "turn")
+                && message.get("method").and_then(Value::as_str) == Some("thread/started")
+                && !valid_interleaved_thread_started(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "interleaved thread/started notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
+            if matches!(phase, "turn/start" | "turn")
+                && message.get("method").and_then(Value::as_str) == Some("thread/status/changed")
+                && !valid_thread_status_changed(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "thread status notification is malformed or oversized".to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str)
+                    == Some("account/rateLimits/updated")
+                && !valid_account_rate_limits_updated(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "account rate-limit notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
             self.command_snapshot =
                 if matches!(
                     message.get("method").and_then(Value::as_str),
@@ -911,6 +1112,7 @@ where
         &initialize_id,
         "initialize",
         &cancelled,
+        None,
     )?;
     state.send(transport, &json!({"method": "initialized"}))?;
 
@@ -948,6 +1150,7 @@ where
         &thread_start_id,
         "thread/start",
         &cancelled,
+        None,
     )?;
     require_exact_text(
         &thread_response,
@@ -982,6 +1185,7 @@ where
     .to_string();
 
     let turn_start_id = state.allocate_request_id()?;
+    let mut lifecycle = ThreadLifecycleNotices::default();
     state.send(
         transport,
         &json!({
@@ -1003,6 +1207,7 @@ where
         &turn_start_id,
         "turn/start",
         &cancelled,
+        Some((&thread_id, &mut lifecycle)),
     )?;
     let turn_id = required_text(
         &turn_response,
@@ -1019,7 +1224,7 @@ where
     )?;
 
     match drive_turn(
-        &mut state, transport, &thread_id, &turn_id, reviewer, &cancelled,
+        &mut state, transport, &thread_id, &turn_id, lifecycle, reviewer, &cancelled,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -1035,6 +1240,7 @@ fn wait_for_response<T, C>(
     expected_id: &RequestId,
     phase: &'static str,
     cancelled: &C,
+    mut thread_started: Option<(&str, &mut ThreadLifecycleNotices)>,
 ) -> Result<Value, AppServerError>
 where
     T: JsonLineTransport,
@@ -1055,6 +1261,60 @@ where
                 return Err(AppServerError::Malformed {
                     phase,
                     message: "startup informational prelude exceeded its bound".to_string(),
+                });
+            }
+            continue;
+        }
+        if phase == "turn/start"
+            && message.get("method").and_then(Value::as_str) == Some("thread/started")
+        {
+            let Some((thread_id, lifecycle)) = thread_started.as_mut() else {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "thread/started arrived without a pending thread".to_string(),
+                });
+            };
+            if lifecycle.started {
+                return Err(AppServerError::Duplicate {
+                    phase,
+                    message: "thread lifecycle started more than once".to_string(),
+                });
+            }
+            require_exact_text(&message, &["params", "thread", "id"], thread_id, phase)?;
+            lifecycle.started = true;
+            continue;
+        }
+        if phase == "turn/start"
+            && message.get("method").and_then(Value::as_str) == Some("thread/status/changed")
+        {
+            let Some((thread_id, lifecycle)) = thread_started.as_mut() else {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "thread status arrived without a pending thread".to_string(),
+                });
+            };
+            if !lifecycle.started {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "thread status arrived before thread/started".to_string(),
+                });
+            }
+            if message
+                .pointer("/params/status/type")
+                .and_then(Value::as_str)
+                != Some("active")
+            {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "thread became idle before turn/start response".to_string(),
+                });
+            }
+            require_exact_text(&message, &["params", "threadId"], thread_id, phase)?;
+            lifecycle.status_count += 1;
+            if lifecycle.status_count > THREAD_STATUS_MAX_MESSAGES {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "thread status notifications exceeded their bound".to_string(),
                 });
             }
             continue;
@@ -1113,6 +1373,7 @@ fn drive_turn<T, C>(
     transport: &mut T,
     thread_id: &str,
     turn_id: &str,
+    mut lifecycle: ThreadLifecycleNotices,
     reviewer: &mut dyn ApprovalReviewer,
     cancelled: &C,
 ) -> Result<AppServerOutcome, AppServerError>
@@ -1148,8 +1409,8 @@ where
     let mut approval_request_items = BTreeSet::<String>::new();
     let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
-    let mut thread_started_seen = false;
     let mut turn_started_seen = false;
+    let mut account_rate_limit_notices = 0usize;
 
     loop {
         let message = state.receive(transport, "turn", cancelled)?;
@@ -1192,14 +1453,57 @@ where
 
         match method {
             "thread/started" => {
-                if thread_started_seen {
+                if lifecycle.started {
                     return Err(AppServerError::Duplicate {
                         phase: "thread/started",
                         message: "thread lifecycle started more than once".to_string(),
                     });
                 }
                 require_exact_text(&message, &["params", "thread", "id"], thread_id, "turn")?;
-                thread_started_seen = true;
+                lifecycle.started = true;
+            }
+            "thread/status/changed" => {
+                if !lifecycle.started {
+                    return Err(AppServerError::Unexpected {
+                        phase: "thread/status/changed",
+                        message: "thread status arrived before thread/started".to_string(),
+                    });
+                }
+                if !turn_started_seen
+                    && message
+                        .pointer("/params/status/type")
+                        .and_then(Value::as_str)
+                        != Some("active")
+                {
+                    return Err(AppServerError::Unexpected {
+                        phase: "thread/status/changed",
+                        message: "thread became idle before turn/started".to_string(),
+                    });
+                }
+                require_exact_text(&message, &["params", "threadId"], thread_id, "turn")?;
+                lifecycle.status_count += 1;
+                if lifecycle.status_count > THREAD_STATUS_MAX_MESSAGES {
+                    return Err(AppServerError::Malformed {
+                        phase: "thread/status/changed",
+                        message: "thread status notifications exceeded their bound".to_string(),
+                    });
+                }
+            }
+            "account/rateLimits/updated" => {
+                if !turn_started_seen {
+                    return Err(AppServerError::Unexpected {
+                        phase: "account/rateLimits/updated",
+                        message: "rate-limit telemetry arrived before turn/started".to_string(),
+                    });
+                }
+                account_rate_limit_notices += 1;
+                if account_rate_limit_notices > ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
+                    return Err(AppServerError::Malformed {
+                        phase: "account/rateLimits/updated",
+                        message: "account rate-limit notifications exceeded their bound"
+                            .to_string(),
+                    });
+                }
             }
             "turn/started" => {
                 if turn_started_seen {
@@ -2243,6 +2547,236 @@ mod tests {
         assert_eq!(transport.sent[2]["id"], 2);
         assert_eq!(transport.sent[3]["method"], "turn/start");
         assert_eq!(transport.sent[3]["id"], 3);
+    }
+
+    #[test]
+    fn correlated_thread_started_between_thread_and_turn_responses_preserves_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("interleaved lifecycle");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn captured_thread_active_status_after_turn_response_preserves_command_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        messages.insert(
+            4,
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":[]}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("audited lifecycle");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 2);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn correlated_status_before_response_and_later_waiting_and_idle_preserve_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        messages.insert(
+            3,
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":[]}}}),
+        );
+        messages.insert(
+            6,
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["waitingOnApproval"]}}}),
+        );
+        messages.insert(
+            7,
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"idle"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("correlated statuses");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 4);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn thread_active_status_requires_correlated_bounded_strict_notification() {
+        let notice = json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":[]}}});
+        for invalid in [
+            json!({"method":"thread/status/changed","params":{"threadId":"other-thread","status":{"type":"active","activeFlags":[]}}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"idle","activeFlags":[]}}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["approval"]}}}),
+            json!({"method":"thread/status/changed","params":{"threadId":"thread-1","status":{"type":"active","activeFlags":["waitingOnApproval","waitingOnApproval"]}}}),
+            json!({"method":"thread/status/changed","id":77,"params":{"threadId":"thread-1","status":{"type":"active","activeFlags":[]}}}),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(
+                2,
+                json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+            );
+            messages.insert(4, invalid);
+            assert!(run_command_observation_messages(messages).is_err());
+        }
+        let mut messages = command_observation_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        for _ in 0..=THREAD_STATUS_MAX_MESSAGES {
+            messages.insert(4, notice.clone());
+        }
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Malformed {
+                phase: "thread/status/changed",
+                ..
+            })
+        ));
+        assert!(!valid_thread_status_changed(
+            br#"{"method":"thread/status/changed","params":{"threadId":"thread-1","threadId":"other-thread","status":{"type":"active","activeFlags":[]}}}"#
+        ));
+    }
+
+    fn captured_rate_limit_notice() -> Value {
+        // The 0.144.4 real-provider notification shape, with account values replaced.
+        json!({"method":"account/rateLimits/updated","params":{"rateLimits":{
+            "limitId":"codex", "limitName":null,
+            "primary":{"usedPercent":1,"windowDurationMins":300,"resetsAt":1},
+            "secondary":null,
+            "credits":{"hasCredits":true,"unlimited":false,"balance":null},
+            "individualLimit":null,"planType":"pro","rateLimitReachedType":null
+        }}})
+    }
+
+    #[test]
+    fn captured_rate_limit_telemetry_does_not_change_command_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages())
+            .expect("baseline turn");
+        let mut messages = command_observation_messages();
+        messages.insert(4, captured_rate_limit_notice());
+        let outcome = run_command_observation_messages(messages).expect("account telemetry");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn rate_limit_telemetry_rejects_malformed_and_excessive_notices() {
+        let notice = captured_rate_limit_notice();
+        for invalid in [
+            json!({"method":"account/rateLimits/updated","id":77,"params":{"rateLimits":{}}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":null}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{"primary":{"usedPercent":"1"}}}}),
+            json!({"method":"account/rateLimits/updated","params":{"rateLimits":{},"grantRoot":"/"}}),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(4, invalid);
+            assert!(run_command_observation_messages(messages).is_err());
+        }
+        let mut messages = command_observation_messages();
+        for _ in 0..=ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
+            messages.insert(4, notice.clone());
+        }
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Malformed {
+                phase: "account/rateLimits/updated",
+                ..
+            })
+        ));
+        assert!(!valid_account_rate_limits_updated(
+            br#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitId":"other"}}}"#
+        ));
+    }
+
+    #[test]
+    fn interleaved_thread_started_rejects_wrong_duplicate_and_malformed_identity() {
+        let notice = json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}});
+        for invalid in [
+            json!({"method":"thread/started","params":{"thread":{"id":"other-thread"}}}),
+            json!({"method":"thread/started","params":{"thread":{"id":null}}}),
+            json!({"method":"thread/started","id":77,"params":{"thread":{"id":"thread-1"}}}),
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}},"result":{}}),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(2, invalid);
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Malformed {
+                    phase: "turn/start",
+                    ..
+                }) | Err(AppServerError::Unexpected {
+                    phase: "turn/start",
+                    ..
+                })
+            ));
+        }
+        let mut messages = command_observation_messages();
+        messages.insert(2, notice.clone());
+        messages.insert(3, notice.clone());
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Duplicate {
+                phase: "turn/start",
+                ..
+            })
+        ));
+        let mut messages = command_observation_messages();
+        messages.insert(2, notice.clone());
+        messages.insert(4, notice);
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Duplicate {
+                phase: "thread/started",
+                ..
+            })
+        ));
+
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        let turn_start_index = transport.incoming.len() - 2;
+        transport.incoming.insert(
+            turn_start_index,
+            ReaderEvent::Line(
+                br#"{"method":"thread/started","params":{"thread":{"id":"thread-1","id":"other-thread"}}}"#
+                    .to_vec(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval request expected"),
+                || false,
+            ),
+            Err(AppServerError::Malformed {
+                phase: "turn/start",
+                ..
+            })
+        ));
     }
 
     #[test]
