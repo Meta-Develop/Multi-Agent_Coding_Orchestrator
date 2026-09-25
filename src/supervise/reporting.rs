@@ -319,6 +319,22 @@ pub(super) fn import_worker_execution_journals(
     incoming_scratch: &ArtifactScratchDirectory,
     external_run: &ExternalAgentRun,
 ) -> Result<WorkerExecutionJournalEvidenceSet> {
+    import_worker_execution_journals_at(
+        writer,
+        assignment,
+        incoming_scratch,
+        external_run,
+        &PathBuf::from("logs/workers").join(&assignment.id),
+    )
+}
+
+pub(super) fn import_worker_execution_journals_at(
+    writer: &mut ArtifactRunWriter,
+    assignment: &OrchestratorAssignment,
+    incoming_scratch: &ArtifactScratchDirectory,
+    external_run: &ExternalAgentRun,
+    evidence_root: &Path,
+) -> Result<WorkerExecutionJournalEvidenceSet> {
     let mut journals = WorkerExecutionJournalEvidenceSet::new();
     let worker_ids = assignment_worker_journal_subject_ids(assignment)?;
     let process_quiescent = external_run.scratch_quiescence_verified();
@@ -368,8 +384,7 @@ pub(super) fn import_worker_execution_journals(
     for worker_id in worker_ids {
         let incoming_relative_path = worker_execution_journal_incoming_relative_for_id(worker_id);
         let scratch_path = incoming_scratch.path().join(&incoming_relative_path);
-        let evidence_relative_path =
-            worker_execution_journal_evidence_relative(&assignment.id, worker_id);
+        let evidence_relative_path = evidence_root.join(format!("{worker_id}.jsonl"));
         let matching_capture = external_run
             .worker_journal_artifacts()
             .iter()
