@@ -1,6 +1,10 @@
 use super::*;
 #[path = "nested_worker.rs"]
 mod nested_worker;
+// Staged supervisor-only entry point; scheduling/IPC cutover is separate.
+#[allow(dead_code)]
+#[path = "nested_worker_executor.rs"]
+mod nested_worker_executor;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,

@@ -1511,6 +1511,125 @@ fn primary_snapshot_captures_real_index_flags_split_storage_and_ignores_untracke
         .contains_key(b".maco-cache/runtime.json".as_slice()));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_snapshot_verified_traverses_submodule_without_maco_state() {
+    let (_temp, repo_path) = injected_repository();
+    let (_source_temp, source_path) = injected_repository();
+    crate::safe_state::SafeRoot::open_or_create(repo_path.join(".git/maco/state"))
+        .expect("parent has existing MACO state");
+    run_injected_git(
+        &repo_path,
+        &[
+            "-c",
+            "protocol.file.allow=always",
+            "submodule",
+            "add",
+            source_path.to_str().expect("fixture path"),
+            "ordinary",
+        ],
+    );
+    commit_injected_repository(&repo_path, "track ordinary submodule");
+    let submodule_path = repo_path.join("ordinary");
+    let submodule = crate::git_repository::open(&submodule_path).expect("open submodule");
+    let maco_path = submodule.commondir().join("maco");
+    assert!(!maco_path.exists());
+
+    let before = primary_worktree_snapshot(&repo_path, SupervisorExecutionRuntime::Verified)
+        .expect("Verified baseline must traverse ordinary submodule without MACO state");
+    assert!(before.inspection_problem().is_none());
+    let PrimaryPathState::Directory {
+        nested_repository: Some(nested),
+        ..
+    } = &before.worktree[b"ordinary".as_slice()]
+    else {
+        panic!("gitlink must include its recursive integrity snapshot");
+    };
+    assert!(nested.index.contains_key(&injected_index_key("README.md")));
+    assert!(
+        !maco_path.exists(),
+        "snapshot must not initialize MACO state"
+    );
+
+    fs::write(submodule_path.join("README.md"), "submodule edit\n").expect("edit submodule");
+    let after = primary_worktree_snapshot(&repo_path, SupervisorExecutionRuntime::Verified)
+        .expect("snapshot must still inspect submodule edits");
+    assert!(primary_integrity_changes(&before, &after)
+        .paths
+        .contains(&PathBuf::from("ordinary")));
+
+    crate::safe_state::SafeRoot::open_or_create(&maco_path).expect("empty MACO directory");
+    let partial = primary_worktree_snapshot(&repo_path, SupervisorExecutionRuntime::Verified)
+        .expect("safely absent state below existing MACO directory");
+    assert!(partial.inspection_problem().is_none());
+    assert!(!maco_path.join("state").exists());
+
+    crate::safe_state::SafeRoot::open_or_create(maco_path.join("state"))
+        .expect("existing submodule state");
+    let existing = primary_worktree_snapshot(&repo_path, SupervisorExecutionRuntime::Verified)
+        .expect("existing submodule state remains supported");
+    assert!(existing.inspection_problem().is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_snapshot_verified_rejects_unsafe_or_inaccessible_state_paths() {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    for component in ["maco", "maco/state"] {
+        for failure in [
+            "dangling-link",
+            "directory-link",
+            "file",
+            "writable",
+            "denied",
+        ] {
+            // A privileged process can open mode-000 directories; permission-denial
+            // coverage applies to the ordinary delegated user used by Linux CI.
+            if failure == "denied" && unsafe { libc::geteuid() } == 0 {
+                continue;
+            }
+            let (temp, repo_path) = injected_repository();
+            let candidate = repo_path.join(".git").join(component);
+            fs::create_dir_all(candidate.parent().expect("candidate parent"))
+                .expect("create candidate parent");
+            match failure {
+                "dangling-link" => {
+                    symlink(temp.path().join("missing"), &candidate).expect("dangling state link")
+                }
+                "directory-link" => {
+                    let target = temp.path().join("elsewhere");
+                    fs::create_dir(&target).expect("link target");
+                    symlink(target, &candidate).expect("state directory link");
+                }
+                "file" => fs::write(&candidate, "not a directory").expect("state file"),
+                "writable" | "denied" => {
+                    fs::create_dir(&candidate).expect("state directory");
+                    fs::set_permissions(
+                        &candidate,
+                        fs::Permissions::from_mode(if failure == "writable" { 0o777 } else { 0 }),
+                    )
+                    .expect("unsafe state permissions");
+                }
+                _ => unreachable!(),
+            }
+            let result =
+                primary_worktree_snapshot(&repo_path, SupervisorExecutionRuntime::Verified);
+            if matches!(failure, "writable" | "denied") {
+                fs::set_permissions(&candidate, fs::Permissions::from_mode(0o700))
+                    .expect("restore fixture permissions for cleanup");
+            }
+            let Err(error) = result else {
+                panic!("accepted unsafe {component}: {failure}");
+            };
+            assert!(
+                format!("{error:#}").contains("failed to verify snapshot sensitive state mask"),
+                "wrong refusal for {component}/{failure}: {error:#}"
+            );
+        }
+    }
+}
+
 #[test]
 fn primary_snapshot_detects_changes_to_preexisting_dirty_untracked_and_tracked_runtime_paths() {
     let (_temp, repo_path) = injected_repository();
