@@ -1756,8 +1756,11 @@ fn prepare_child_attempt<'a>(
         mechanical_duty,
     )?;
     command = bound_launch.command;
-    let direct_report_schema_path =
-        direct_assignment_report_schema_path(assignment.role, schema_path, worker_schema_path)?;
+    let direct_report_schema_path = direct_assignment_report_schema_path(
+        assignment_attempt_report_role(assignment.role, evidence_only_reaudit.is_some()),
+        schema_path,
+        worker_schema_path,
+    )?;
     command = bind_runtime_output_schema(command, launch_runtime, direct_report_schema_path)?;
     command = bind_runtime_read_only_schema_files(
         command,
@@ -2692,7 +2695,7 @@ fn dispatch_and_collect_child_attempt<'a>(
             launch_runtime,
         ));
     let raw_report_validated = direct_assignment_report_is_valid(
-        assignment.role,
+        assignment_attempt_report_role(assignment.role, context.evidence_only_reaudit.is_some()),
         external_run.output_last_message(),
         &attempt_artifacts.raw_report_relative,
     )?;
@@ -9650,6 +9653,23 @@ done
             worker_schema,
         )?;
         assert_eq!(direct_worker_schema, worker_schema);
+        let reaudit_schema = direct_assignment_report_schema_path(
+            assignment_attempt_report_role(AgentRole::Worker, true),
+            orchestrator_schema,
+            worker_schema,
+        )?;
+        assert_eq!(reaudit_schema, orchestrator_schema);
+        let reaudit_command = bind_runtime_output_schema(
+            launch_fixture_command(),
+            SupervisorRuntime::Codex,
+            reaudit_schema,
+        )?;
+        assert_eq!(
+            reaudit_command.output_schema.as_deref(),
+            Some(Path::new(
+                "/hidden-primary/schemas/orchestrator-review-report.codex-output.schema.json"
+            ))
+        );
 
         let child_codex = bind_runtime_output_schema(
             launch_fixture_command(),
