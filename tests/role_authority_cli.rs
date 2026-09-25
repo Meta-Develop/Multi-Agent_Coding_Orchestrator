@@ -187,26 +187,41 @@ fn fake_goal_launch_returns_automatic_authority_and_derived_shape() -> Result<()
     assert!(!assignments.is_empty());
     assert!(assignments
         .iter()
-        .all(|entry| entry["role_category"] == "delegating_coordinator"));
-    assert!(assignments
-        .iter()
         .all(|entry| entry.get("selection_source").is_none()));
-    assert!(assignments.iter().any(|entry| entry["phase"] == "planning"));
-    assert!(assignments
-        .iter()
-        .any(|entry| entry["phase"] == "execution"));
-    let workers = assignments
-        .iter()
-        .filter_map(|entry| entry["worker_assignments"].as_array())
-        .flatten()
-        .collect::<Vec<_>>();
-    assert!(!workers.is_empty());
-    assert!(workers
-        .iter()
-        .all(|worker| worker["role_category"] == "non_delegating_terminal_worker"));
-    assert!(workers
-        .iter()
-        .all(|worker| worker.get("selection_source").is_none()));
+    let mut coordinators = 0;
+    let mut workers = 0;
+    for entry in assignments {
+        let category: RoleCategory = serde_json::from_value(entry["role_category"].clone())?;
+        match entry["phase"].as_str() {
+            Some("planning") => {
+                coordinators += 1;
+                assert_eq!(entry["role"], "child_orchestrator");
+                assert_eq!(category, RoleCategory::DelegatingCoordinator);
+                assert!(category.may_delegate());
+            }
+            Some("execution") => {
+                workers += 1;
+                assert_eq!(entry["role"], "worker");
+                assert_eq!(category, RoleCategory::NonDelegatingTerminalWorker);
+                assert!(!category.may_delegate());
+            }
+            phase => panic!("unexpected generated assignment phase: {phase:?}"),
+        }
+        assert!(category.may_write());
+        assert!(!category.may_judge_acceptance());
+        assert!(!category.may_judge_role_transition());
+        assert!(entry["worker_assignments"]
+            .as_array()
+            .is_some_and(|nested| nested.is_empty()));
+    }
+    assert!(
+        coordinators > 0,
+        "generated plan must retain parent planning"
+    );
+    assert!(
+        workers > 0,
+        "generated plan must schedule direct terminal workers"
+    );
     assert!(plan["review_lenses"]
         .as_array()
         .is_some_and(|lenses| !lenses.is_empty()));
