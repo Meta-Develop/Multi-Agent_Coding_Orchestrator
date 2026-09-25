@@ -1,11 +1,12 @@
 //! Private supervisor bridge for one run's authenticated messaging session.
 //!
 //! The supervisor opens this session before assignment dispatch and keeps every presented
-//! capability process-local. Child IPC/CLI transport deliberately remains outside this bridge;
-//! later transport wiring can borrow the already-admitted capability instead of creating a new
-//! identity.
+//! capability process-local. Loopback IPC borrows only the admitted assignment identity.
+//! An explicitly attached Worker inbox accepts durable intent, never execution authority.
 
 mod persistence;
+pub(super) mod worker_request_ipc;
+pub(super) mod worker_requests;
 
 #[cfg(test)]
 use super::ArtifactFileDisposition;
@@ -618,6 +619,15 @@ pub(super) fn start_assignment_messaging(
     run_id: &str,
     task_id: &str,
 ) -> Result<AssignmentMessagingServer> {
+    start_assignment_messaging_inner(run_directory, run_id, task_id, None)
+}
+
+fn start_assignment_messaging_inner(
+    run_directory: &Path,
+    run_id: &str,
+    task_id: &str,
+    worker_inbox: Option<std::sync::Arc<worker_request_ipc::WorkerRequestIpc>>,
+) -> Result<AssignmentMessagingServer> {
     recover_supervisor_messaging_session(run_directory)?;
     let bound_run_id = with_supervisor_messaging_session(run_directory, |factory| {
         factory.ensure_authenticated_run_id(run_id)?;
@@ -632,16 +642,31 @@ pub(super) fn start_assignment_messaging(
             })?;
         RunId::new(run_id).map(|validated| validated.as_str().to_string())
     })?;
+    if let Some(inbox) = &worker_inbox {
+        with_supervisor_messaging_session(run_directory, |factory| inbox.verify(factory, task_id))?;
+    }
     let run_directory = run_directory.to_path_buf();
     let handler_task_id = task_id.to_string();
     AssignmentMessagingServer::start(&bound_run_id, task_id, move |request| {
-        dispatch_assignment_messaging_operation(&run_directory, &handler_task_id, request)
+        dispatch_assignment_operation(
+            &run_directory,
+            &handler_task_id,
+            worker_inbox.as_deref(),
+            request,
+        )
     })
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 enum AssignmentMessagingOperation {
+    SubmitWorkerRequest {
+        request_id: String,
+        worker_id: String,
+    },
+    WorkerRequestStatus {
+        request_id: String,
+    },
     SendDirect {
         recipient_id: String,
         payload: Value,
@@ -664,17 +689,45 @@ enum AssignmentMessagingOperation {
     },
 }
 
+#[cfg(test)]
 fn dispatch_assignment_messaging_operation(
     run_directory: &Path,
     task_id: &str,
+    request: Value,
+) -> Result<Value> {
+    dispatch_assignment_operation(run_directory, task_id, None, request)
+}
+
+fn dispatch_assignment_operation(
+    run_directory: &Path,
+    task_id: &str,
+    worker_inbox: Option<&worker_request_ipc::WorkerRequestIpc>,
     request: Value,
 ) -> Result<Value> {
     let operation: AssignmentMessagingOperation = serde_json::from_value(request)
         .context("assignment messaging operation is ill-typed or contains unknown fields")?;
     with_supervisor_messaging_session(run_directory, |factory| {
         let credential = factory.capability_for(task_id)?;
+        match &operation {
+            AssignmentMessagingOperation::SubmitWorkerRequest {
+                request_id,
+                worker_id,
+            } => {
+                return worker_inbox
+                    .context("Worker request inbox is not attached to this attempt")?
+                    .submit(factory, task_id, request_id, worker_id);
+            }
+            AssignmentMessagingOperation::WorkerRequestStatus { request_id } => {
+                return worker_inbox
+                    .context("Worker request inbox is not attached to this attempt")?
+                    .status(factory, task_id, request_id);
+            }
+            _ => {}
+        }
         let mut broker = factory.open_or_create()?;
         match operation {
+            AssignmentMessagingOperation::SubmitWorkerRequest { .. }
+            | AssignmentMessagingOperation::WorkerRequestStatus { .. } => unreachable!(),
             AssignmentMessagingOperation::SendDirect {
                 recipient_id,
                 payload,

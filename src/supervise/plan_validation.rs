@@ -325,6 +325,27 @@ pub(super) fn validate_supervisor_plan_in_repo(
         }
         match assignment.role {
             AgentRole::ChildOrchestrator => {}
+            AgentRole::Researcher => {
+                validate_researcher_assignment(assignment)?;
+                if metadata.assignment_schedule.iter().any(|entry| {
+                    entry.parent_assignment_id.as_deref() == Some(assignment.id.as_str())
+                }) {
+                    bail!(
+                        "researcher '{}' cannot be a scheduling parent",
+                        assignment.id
+                    );
+                }
+                if metadata.run_budget.limits.has_any_ceiling()
+                    && !metadata
+                        .run_budget
+                        .role_token_reservations
+                        .contains_key(&AgentRole::Researcher)
+                {
+                    bail!(
+                        "budgeted researcher requires a researcher role_token_reservations entry"
+                    );
+                }
+            }
             AgentRole::Worker => {
                 if assignment.role_category != Some(RoleCategory::NonDelegatingTerminalWorker) {
                     bail!(

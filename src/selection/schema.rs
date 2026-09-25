@@ -760,7 +760,7 @@ pub(crate) fn selection_event_schema_value() -> Value {
         "assignment_id" => nullable(nonempty_string()),
         "attempt" => nonnegative_integer(),
         "role" => enum_schema(&[
-            "supervisor", "child_orchestrator", "worker", "gate_classifier", "auditor"
+            "supervisor", "child_orchestrator", "worker", "researcher", "gate_classifier", "auditor"
         ]),
         "primary_cause" => enum_schema(&["initial", "debug_override", "budget_degrade", "retry"]),
         "provenance" => selection_provenance_schema_value(),
