@@ -204,7 +204,9 @@ fn reserve_fresh_home(data_dir: &Path, home: &Path) -> Result<()> {
     // Non-recursive mkdir is exclusive: even a retained EMPTY home is refused.
     // The caller holds the registry lock and exact-incarnation pending lease;
     // no row is published if this reservation or adapter preparation fails.
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
