@@ -159,6 +159,7 @@ jobs:
     timeout-minutes: 5
     steps:
       - name: Require lockfile, frontend, and all core and desktop matrix jobs
+        working-directory: .
         env:
           LOCK_RESULT: ${{ needs.desktop-lock.result }}
           FRONTEND_RESULT: ${{ needs.frontend.result }}
