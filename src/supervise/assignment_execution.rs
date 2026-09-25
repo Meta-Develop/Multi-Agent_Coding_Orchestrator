@@ -2069,6 +2069,148 @@ struct CollectedChildAttempt<'a> {
     _command: ExternalAgentCommand,
 }
 
+/// Internal readiness only: the scheduler/IPC does not construct this driver yet.
+/// A collected supervisor result, never a child report, proves the parent turn
+/// ended. Holding the mutable preflight serializes subsequent users of its lease.
+#[allow(dead_code)]
+struct NestedWorkerSerialDriver<'turn, 'context, 'writer, 'resources> {
+    context: &'turn AssignmentExecutionContext<'context, 'writer>,
+    preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+    outcome: &'turn mut AssignmentExecutionOutcome,
+    parent: &'turn CollectedChildAttempt<'context>,
+    parent_attempt: usize,
+    parent_admission: AssignmentCommandAdmission,
+}
+
+#[allow(dead_code)]
+impl<'turn, 'context, 'writer, 'resources>
+    NestedWorkerSerialDriver<'turn, 'context, 'writer, 'resources>
+{
+    fn from_collected_parent(
+        context: &'turn AssignmentExecutionContext<'context, 'writer>,
+        preflight: &'turn mut AssignmentExecutionPreflight<'resources>,
+        outcome: &'turn mut AssignmentExecutionOutcome,
+        parent_attempt: usize,
+        parent: &'turn CollectedChildAttempt<'context>,
+    ) -> Result<Self> {
+        if context.execution_runtime != SupervisorExecutionRuntime::Verified
+            || context.execution_target.is_some()
+            || context.evidence_only_reaudit.is_some()
+            || preflight.assignment.role != AgentRole::ChildOrchestrator
+            || parent.model_provenance.launch_runtime != SupervisorRuntime::Codex
+        {
+            bail!("nested serial handoff requires a verified managed Codex parent attempt");
+        }
+        Self::verify_parent_quiescence(parent, preflight)?;
+        let parent_admission =
+            AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?.admit(
+                &preflight.assignment.id,
+                &parent._command,
+                parent.model_provenance.launch_runtime,
+            )?;
+        Ok(Self {
+            context,
+            preflight,
+            outcome,
+            parent,
+            parent_attempt,
+            parent_admission,
+        })
+    }
+
+    fn verify_parent_quiescence(
+        parent: &CollectedChildAttempt<'_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+    ) -> Result<()> {
+        let run = &parent.external_run;
+        // scratch_quiescence_verified alone also accepts a never-started target.
+        // Require live runner evidence of a completed, contained parent process.
+        // The held capture is not serialized: restored public reports cannot
+        // establish this handoff. Its contents remain untrusted report data.
+        if !run.stdout.target_launch_attempted
+            || run.output_last_message().is_none()
+            || !run.scratch_quiescence_verified()
+            || !external_process_completed(run, parent.model_provenance.launch_runtime)
+            || !parent.attempt_containment_verified
+            || run.cwd != preflight.worktree.path
+            || !parent.primary_changes.is_empty()
+            || parent._primary_after.inspection_problem().is_some()
+            || !parent.sandbox_denials.is_empty()
+            || !parent.pre_action_refusals.is_empty()
+        {
+            bail!(
+                "nested serial handoff requires verified parent-process quiescence and integrity"
+            );
+        }
+        Ok(())
+    }
+
+    fn execute_worker(
+        &mut self,
+        worker_id: &str,
+        current_budget_policy: &AssignmentBudgetPolicy,
+    ) -> Result<nested_worker_executor::NestedWorkerAttemptEvidence> {
+        Self::verify_parent_quiescence(self.parent, self.preflight)?;
+        self.parent_admission.revalidate(
+            &AssignmentAttemptAuthority::from_preflight(
+                self.context,
+                self.preflight,
+                self.parent_attempt,
+            )?,
+            &self.preflight.assignment.id,
+            &self.parent._command,
+        )?;
+        // Reborrow the existing context with this turn's policy. The initial
+        // assignment policy may be stale after retry/runtime/model reselection.
+        // Resource owners, cancellation, accounting and artifact sinks stay shared.
+        let context = AssignmentExecutionContext {
+            index: self.context.index,
+            concurrent_mode: self.context.concurrent_mode,
+            plan: self.context.plan,
+            requested_plan: self.context.requested_plan,
+            budget_config: self.context.budget_config,
+            consultant: self.context.consultant,
+            assignment_metadata: self.context.assignment_metadata,
+            assignment: self.context.assignment,
+            evidence_only_reaudit: self.context.evidence_only_reaudit,
+            options: self.context.options,
+            repo: self.context.repo,
+            run_dir: self.context.run_dir,
+            dirs: self.context.dirs,
+            execution_runtime: self.context.execution_runtime,
+            execution_target: self.context.execution_target,
+            worktree_creation: self.context.worktree_creation,
+            manager: self.context.manager,
+            reused: self.context.reused,
+            sync_store: self.context.sync_store,
+            semantic_store: self.context.semantic_store,
+            prepared_semantic_token: self.context.prepared_semantic_token,
+            prepared_semantic_findings: self.context.prepared_semantic_findings,
+            prepared_semantic_signals: self.context.prepared_semantic_signals,
+            prepared_semantic_failed: self.context.prepared_semantic_failed,
+            assignment_schedule: self.context.assignment_schedule,
+            field_guide: self.context.field_guide,
+            serial_semantic_warn_intents: self.context.serial_semantic_warn_intents,
+            semantic_block_order: self.context.semantic_block_order,
+            semantic_block_gate: self.context.semantic_block_gate,
+            artifacts: self.context.artifacts,
+            budget_ledger: self.context.budget_ledger,
+            budget_policy: current_budget_policy.clone(),
+            admission_commit: self.context.admission_commit.clone(),
+            runtime_model_catalog: self.context.runtime_model_catalog,
+            cancellation: self.context.cancellation.clone(),
+            external_runner: self.context.external_runner,
+        };
+        nested_worker_executor::execute_nested_worker_attempt(
+            &context,
+            self.preflight,
+            self.outcome,
+            self.parent_attempt,
+            worker_id,
+        )
+    }
+}
+
 fn capture_managed_child_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
@@ -13076,3 +13218,7 @@ done
 #[cfg(test)]
 #[path = "assignment_execution/messaging_ipc_tests.rs"]
 mod messaging_ipc_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/nested_driver_tests.rs"]
+mod nested_driver_tests;
