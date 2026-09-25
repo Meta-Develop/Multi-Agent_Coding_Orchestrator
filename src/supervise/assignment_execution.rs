@@ -2417,6 +2417,25 @@ fn prepare_child_attempt<'a>(
     ))
 }
 
+// Owned dispatch evidence, not a final report or authority to accept a yield.
+// Preserve scratch and reservation ownership until ordinary collection consumes it.
+// Containment observations may be negative; callers must not infer quiescence.
+struct CapturedChildAttempt<'a> {
+    attempt_artifacts: ChildAttemptArtifacts,
+    corrective_retry_used: bool,
+    model_provenance: CompletedLaunchModelProvenance,
+    external_run: ExternalAgentRun,
+    command: ExternalAgentCommand,
+    primary_before: PrimaryWorktreeSnapshot,
+    primary_scope_before: Option<PrimaryScopeSnapshot>,
+    incoming_scratch: ArtifactScratchDirectory,
+    capture_scratch: ArtifactScratchDirectory,
+    budget_reservation: DispatchBudgetReservation<'a>,
+    launch_runtime: SupervisorRuntime,
+    environment_blocked: bool,
+    attempt_containment_verified: bool,
+}
+
 struct CollectedChildAttempt<'a> {
     attempt_report: OrchestratorReviewReport,
     report_shape_problems: Vec<String>,
@@ -2756,11 +2775,28 @@ fn dispatch_and_collect_child_attempt<'a>(
     attempt: usize,
     prepared: PreparedChildAttempt<'a>,
 ) -> Result<CollectedChildAttempt<'a>> {
+    let captured = dispatch_and_capture_child_attempt(
+        context,
+        outcome,
+        preflight,
+        journal_parent_id,
+        attempt,
+        prepared,
+    )?;
+    collect_ordinary_child_attempt(context, outcome, preflight, captured)
+}
+
+fn dispatch_and_capture_child_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    prepared: PreparedChildAttempt<'a>,
+) -> Result<CapturedChildAttempt<'a>> {
     let AssignmentExecutionContext {
         assignment_metadata,
         options,
-        repo,
-        execution_runtime,
         artifacts,
         external_runner,
         ..
@@ -3070,6 +3106,56 @@ fn dispatch_and_collect_child_attempt<'a>(
             &command,
             launch_runtime,
         ));
+    Ok(CapturedChildAttempt {
+        attempt_artifacts,
+        corrective_retry_used,
+        model_provenance,
+        external_run,
+        command,
+        primary_before,
+        primary_scope_before,
+        incoming_scratch,
+        capture_scratch,
+        budget_reservation,
+        launch_runtime,
+        environment_blocked,
+        attempt_containment_verified,
+    })
+}
+
+// This is the sole ordinary-report path. Keep schema validation, evidence import,
+// scratch cleanup, integrity inspection and Git materialization in their original order.
+fn collect_ordinary_child_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: CapturedChildAttempt<'a>,
+) -> Result<CollectedChildAttempt<'a>> {
+    let AssignmentExecutionContext {
+        assignment_metadata,
+        options,
+        repo,
+        execution_runtime,
+        artifacts,
+        ..
+    } = context;
+    let assignment = &preflight.assignment;
+    let worktree = &preflight.worktree;
+    let CapturedChildAttempt {
+        attempt_artifacts,
+        corrective_retry_used,
+        model_provenance,
+        external_run,
+        command,
+        primary_before,
+        primary_scope_before,
+        incoming_scratch,
+        capture_scratch,
+        budget_reservation,
+        launch_runtime,
+        environment_blocked,
+        attempt_containment_verified,
+    } = captured;
     let raw_report_validated = direct_assignment_report_is_valid(
         assignment_attempt_report_role(assignment.role, context.evidence_only_reaudit.is_some()),
         external_run.output_last_message(),
@@ -6575,6 +6661,20 @@ mod decomposition_tests {
 
     #[test]
     fn extracted_assignment_units_are_directly_exercised_in_phase_order() {
+        exercise_captured_child_boundary("ordinary");
+    }
+
+    #[test]
+    fn captured_child_boundary_ordinary_collection_rejects_malformed_output() {
+        exercise_captured_child_boundary("malformed");
+    }
+
+    #[test]
+    fn captured_child_boundary_drop_retains_unimported_scratch_and_settled_budget() {
+        exercise_captured_child_boundary("drop");
+    }
+
+    fn exercise_captured_child_boundary(case: &str) {
         let temp = tempfile::tempdir().expect("temporary phase fixture");
         let repo = temp.path().join("repo");
         Repository::init(&repo).expect("initialize phase fixture repository");
@@ -6761,7 +6861,7 @@ mod decomposition_tests {
             options.machine_global_retention
         );
         assert!(prepared.command.read_only_input_files.is_empty());
-        let collected = dispatch_and_collect_child_attempt(
+        let mut captured = dispatch_and_capture_child_attempt(
             &context,
             &mut outcome,
             &preflight,
@@ -6770,6 +6870,58 @@ mod decomposition_tests {
             prepared,
         )
         .expect("direct child dispatch invocation");
+        assert_eq!(outcome.command_records.len(), 1);
+        assert_eq!(budget_ledger.report().unwrap().active_reservations, 0);
+        let budget_after_capture = budget_ledger.report().unwrap().consumed;
+        let incoming = captured.incoming_scratch.path().to_path_buf();
+        let capture = captured.capture_scratch.path().to_path_buf();
+        let report_path = run_dir.join(&captured.attempt_artifacts.raw_report_relative);
+        assert!(incoming.is_dir());
+        assert!(capture.is_dir());
+        assert!(
+            !report_path.exists(),
+            "capture must not import the final report"
+        );
+        assert_eq!(
+            current_head_oid(&preflight.worktree.path).unwrap(),
+            preflight.child_base_head
+        );
+        if case == "drop" {
+            drop(captured);
+            assert!(incoming.is_dir());
+            assert!(capture.is_dir());
+            assert!(!report_path.exists());
+            assert_eq!(budget_ledger.report().unwrap().active_reservations, 0);
+            assert_eq!(
+                budget_ledger.report().unwrap().consumed,
+                budget_after_capture
+            );
+            return;
+        }
+        if case == "malformed" {
+            captured.external_run.output_last_message = Some(b"not a report".to_vec());
+        }
+        let collected =
+            collect_ordinary_child_attempt(&context, &mut outcome, &preflight, captured)
+                .expect("ordinary collection after capture");
+        assert_eq!(
+            budget_ledger.report().unwrap().consumed,
+            budget_after_capture
+        );
+        assert_eq!(
+            outcome.command_records.len(),
+            1,
+            "collection must not redispatch or account twice"
+        );
+        if case == "malformed" {
+            assert!(!collected.report_shape_problems.is_empty());
+            assert!(report_failed(&collected.attempt_report));
+            assert_eq!(
+                current_head_oid(&preflight.worktree.path).unwrap(),
+                preflight.child_base_head
+            );
+            return;
+        }
         assert!(collected.attempt_containment_verified);
         assert_eq!(outcome.command_records.len(), 1);
 
