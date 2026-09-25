@@ -745,6 +745,11 @@ mod pending_login_tests {
     #[test]
     fn fresh_home_preparation_holds_exact_identity_and_registry_lock_before_publication() {
         use fs2::FileExt;
+        let contention_code = fs2::lock_contended_error()
+            .raw_os_error()
+            .expect("fs2 provides a native lock-contention code");
+        #[cfg(windows)]
+        assert_eq!(contention_code, 33, "Windows ERROR_LOCK_VIOLATION");
         let (_dir, registry) = registry();
         let result: Result<()> =
             registry.prepare_pending_oauth_vendor_home("grok-cli", "work", |pending| {
@@ -762,22 +767,16 @@ mod pending_login_tests {
                     .read(true)
                     .write(true)
                     .open(lease_path)?;
-                assert_eq!(
-                    FileExt::try_lock_exclusive(&lease_file).unwrap_err().kind(),
-                    std::io::ErrorKind::WouldBlock
-                );
+                let lease_error = FileExt::try_lock_exclusive(&lease_file).unwrap_err();
+                assert_eq!(lease_error.raw_os_error(), Some(contention_code));
                 let registry_path =
                     super::super::lock::registry_lock_path(registry.metadata_path());
                 let registry_file = fs::OpenOptions::new()
                     .read(true)
                     .write(true)
                     .open(registry_path)?;
-                assert_eq!(
-                    FileExt::try_lock_exclusive(&registry_file)
-                        .unwrap_err()
-                        .kind(),
-                    std::io::ErrorKind::WouldBlock
-                );
+                let registry_error = FileExt::try_lock_exclusive(&registry_file).unwrap_err();
+                assert_eq!(registry_error.raw_os_error(), Some(contention_code));
                 assert!(
                     !registry.metadata_path().exists(),
                     "pending row published before fresh-home reservation"
