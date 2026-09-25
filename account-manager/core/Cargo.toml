@@ -37,7 +37,7 @@ chacha20poly1305 = { version = "0.11", features = ["zeroize"] }
 base64 = "0.22"
 getrandom = "0.2"
 subtle = "2"
-sha2 = "0.10.9"
+sha2 = "0.11.0"
 time = { version = "0.3", features = ["formatting", "parsing"] }
 axum = { version = "0.8", default-features = false, features = ["http1", "tokio"] }
 reqwest = { version = "0.13", default-features = false, features = ["form", "json", "rustls", "stream"] }
