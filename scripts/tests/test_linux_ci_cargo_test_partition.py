@@ -143,7 +143,7 @@ class LinuxCiCargoTestPartitionTests(unittest.TestCase):
                 encoding="utf-8",
             )
             result = subprocess.run(
-                ["bash", str(wrapper), "lib"],
+                ["bash", str(wrapper), "lib", "rest"],
                 check=False,
                 capture_output=True,
                 text=True,
