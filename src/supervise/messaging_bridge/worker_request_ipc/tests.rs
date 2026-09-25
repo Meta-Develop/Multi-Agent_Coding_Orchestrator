@@ -7,6 +7,300 @@ use std::net::TcpStream;
 use std::sync::Arc;
 use std::time::Duration;
 
+struct FreshFixture {
+    _temp: tempfile::TempDir,
+    repo: PathBuf,
+    writer: ArtifactRunWriter,
+    plan: SupervisorPlan,
+}
+
+impl FreshFixture {
+    fn new() -> Result<Self> {
+        Self::with_parent(json!({
+            "id":"parent", "phase":"execution", "role":"child_orchestrator",
+            "worker_assignments":[{"id":"worker", "role":"worker"},
+                                  {"id":"other", "role":"worker"}]
+        }))
+    }
+
+    fn with_parent(parent: Value) -> Result<Self> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().to_path_buf();
+        git2::Repository::init(&repo)?;
+        let plan = serde_json::from_value(json!({"assignments":[parent, {
+            "id":"second-parent", "phase":"execution", "role":"child_orchestrator",
+            "worker_assignments":[{"id":"second-worker", "role":"worker"}]
+        }]}))?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            RunId::new("run")?,
+            "fresh-worker-admission-test",
+        )?;
+        initialize_supervisor_messaging_session(
+            &mut writer,
+            &plan,
+            &SupervisorPlanMetadata::default(),
+        )?;
+        Ok(Self {
+            _temp: temp,
+            repo,
+            writer,
+            plan,
+        })
+    }
+
+    fn claim(&self) -> Result<WorkerRequestBinding> {
+        with_supervisor_messaging_session(self.writer.run_dir(), |factory| {
+            factory.claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &self.plan.assignments[0],
+                1,
+                SupervisorRuntime::Codex,
+            )
+        })
+    }
+}
+
+impl Drop for FreshFixture {
+    fn drop(&mut self) {
+        run_sessions().lock().unwrap().remove(self.writer.run_dir());
+    }
+}
+
+#[test]
+fn fresh_worker_admission_claims_once_with_stable_authenticated_generation() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    let binding = fixture.claim()?;
+    let original = serde_json::to_value(&binding)?;
+    assert_eq!(original["run"], "run");
+    assert_eq!(original["parent"], "parent");
+    assert_eq!(original["attempt"], 1);
+    assert!(!original["generation"].as_str().unwrap().is_empty());
+    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        assert_eq!(
+            original["state_instance"],
+            factory.persistent.as_ref().unwrap().state_instance_id()
+        );
+        binding.verify_session(factory, "parent")?;
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &fixture.plan.assignments[1],
+                1,
+                SupervisorRuntime::Codex
+            )
+            .is_err());
+        Ok(())
+    })?;
+    assert!(fixture.claim().is_err());
+    let foreign = FreshFixture::new()?;
+    with_supervisor_messaging_session(foreign.writer.run_dir(), |factory| {
+        assert!(binding.verify_session(factory, "parent").is_err());
+        Ok(())
+    })?;
+    recover_supervisor_messaging_session(fixture.writer.run_dir())?;
+    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        binding.verify_session(factory, "parent")
+    })?;
+    assert_eq!(original, serde_json::to_value(binding)?);
+    assert!(fixture.claim().is_err());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_concurrent_claims_have_one_winner() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        let run = RunId::new("run")?;
+        let parent = &fixture.plan.assignments[0];
+        let barrier = std::sync::Barrier::new(2);
+        let claim = || {
+            barrier.wait();
+            factory.claim_fresh_worker_request_binding(&run, parent, 1, SupervisorRuntime::Codex)
+        };
+        let results = std::thread::scope(|scope| {
+            let first = scope.spawn(claim);
+            let second = scope.spawn(claim);
+            [first.join().unwrap(), second.join().unwrap()]
+        });
+        assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+        Ok(())
+    })
+}
+
+#[test]
+fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result<()> {
+    for mutation in 0..8 {
+        let fixture = FreshFixture::new()?;
+        let mut parent = fixture.plan.assignments[0].clone();
+        let mut attempt = 1;
+        let mut runtime = SupervisorRuntime::Codex;
+        let mut run = RunId::new("run")?;
+        match mutation {
+            0 => run = RunId::new("foreign-run")?,
+            1 => parent.id = "foreign-parent".into(),
+            2 => attempt = 0,
+            3 => attempt = 2,
+            4 => runtime = SupervisorRuntime::Grok,
+            5 => parent.worker_assignments[0].id = "second-worker".into(),
+            6 => parent.worker_assignments.reverse(),
+            7 => parent.assigned_paths.push(PathBuf::from("widened")),
+            _ => unreachable!(),
+        }
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            assert!(
+                factory
+                    .claim_fresh_worker_request_binding(&run, &parent, attempt, runtime)
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            Ok(())
+        })?;
+        assert!(fixture.claim().is_err(), "retry after mutation {mutation}");
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_refuses_ineligible_authored_parent() -> Result<()> {
+    for parent in [
+        json!({"id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"grok", "worker_assignments":[{"id":"worker","role":"worker"}]}),
+        json!({"id":"parent", "phase":"planning", "role":"child_orchestrator", "worker_assignments":[{"id":"worker","role":"worker"}]}),
+        json!({"id":"parent", "phase":"execution", "role":"worker"}),
+        json!({"id":"parent", "phase":"execution", "role":"child_orchestrator"}),
+    ] {
+        let fixture = FreshFixture::with_parent(parent)?;
+        assert!(fixture.claim().is_err());
+        assert!(fixture.claim().is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_refuses_reopened_recovered_and_refreshed_sessions() -> Result<()> {
+    for mode in 0..8 {
+        let mut fixture = FreshFixture::new()?;
+        match mode {
+            0 => with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+                drop(factory.open_or_create()?);
+                Ok(())
+            })?,
+            1 => recover_supervisor_messaging_session(fixture.writer.run_dir())?,
+            2 => initialize_supervisor_messaging_session(
+                &mut fixture.writer,
+                &fixture.plan,
+                &SupervisorPlanMetadata::default(),
+            )?,
+            3 => {
+                forget_supervisor_messaging_session_for_test(fixture.writer.run_dir())?;
+                recover_supervisor_messaging_session(fixture.writer.run_dir())?;
+            }
+            4 => {
+                forget_supervisor_messaging_session_for_test(fixture.writer.run_dir())?;
+                initialize_supervisor_messaging_session(
+                    &mut fixture.writer,
+                    &fixture.plan,
+                    &SupervisorPlanMetadata::default(),
+                )?;
+            }
+            5 => {
+                let mut invalid_plan = fixture.plan.clone();
+                invalid_plan
+                    .assignments
+                    .push(invalid_plan.assignments[0].clone());
+                assert!(initialize_supervisor_messaging_session(
+                    &mut fixture.writer,
+                    &invalid_plan,
+                    &SupervisorPlanMetadata::default()
+                )
+                .is_err());
+            }
+            6 => {
+                let descriptor = fixture
+                    .writer
+                    .run_dir()
+                    .join(MESSAGING_SESSION_DESCRIPTOR_NAME);
+                let held = fixture.writer.run_dir().join("held-descriptor");
+                fs::rename(&descriptor, &held)?;
+                assert!(recover_supervisor_messaging_session(fixture.writer.run_dir()).is_err());
+                fs::rename(&held, &descriptor)?;
+            }
+            7 => {
+                let mut empty_plan = fixture.plan.clone();
+                empty_plan.assignments.clear();
+                initialize_supervisor_messaging_session(
+                    &mut fixture.writer,
+                    &empty_plan,
+                    &SupervisorPlanMetadata::default(),
+                )?;
+            }
+            _ => unreachable!(),
+        }
+        assert!(fixture.claim().is_err(), "mode {mode}");
+        assert!(fixture.claim().is_err(), "retry mode {mode}");
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_authentication_failure_cannot_be_repaired_into_retry() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    let descriptor = fixture
+        .writer
+        .run_dir()
+        .join(MESSAGING_SESSION_DESCRIPTOR_NAME);
+    let held = fixture.writer.run_dir().join("held-descriptor");
+    fs::rename(&descriptor, &held)?;
+    assert!(fixture.claim().is_err());
+    fs::rename(&held, &descriptor)?;
+    assert!(fixture.claim().is_err());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_downstream_failure_and_journal_recovery_never_remint() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    let binding = fixture.claim()?;
+    let mut inbox = WorkerRequestInbox::create(
+        repository_authenticator_key_only(&fixture.repo)?,
+        binding.clone(),
+    )?;
+    inbox.submit("request", "worker")?;
+    // Simulate downstream failure after the binding has escaped: even dropping all
+    // handles or recovering a valid journal cannot produce another fresh identity.
+    drop(inbox);
+    assert!(WorkerRequestInbox::create(
+        repository_authenticator_key_only(&fixture.repo)?,
+        binding.clone()
+    )
+    .is_err());
+    assert!(fixture.claim().is_err());
+    let mut recovered =
+        WorkerRequestInbox::recover(repository_authenticator_key_only(&fixture.repo)?, binding)?;
+    assert!(recovered.requires_reconciliation());
+    assert!(recovered.submit("request", "worker").is_err());
+    assert!(fixture.claim().is_err());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_staged_binding_cannot_authorize_existing_session() -> Result<()> {
+    let fixture = Fixture::new()?;
+    drop(fixture.inbox(false)?);
+    with_supervisor_messaging_session(&fixture.directory, |factory| {
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &fixture.parent,
+                1,
+                SupervisorRuntime::Codex
+            )
+            .is_err());
+        Ok(())
+    })
+}
+
 struct Fixture {
     _temp: tempfile::TempDir,
     repo: PathBuf,
