@@ -1951,7 +1951,13 @@ pub(super) fn complete_external_codex_usage(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
 ) -> Option<Usage> {
-    if let Some(evidence) = run.codex_parent_evidence.as_ref() {
+    // Only the live app-server driver retains this private, correlated turn
+    // transcript. CLI exec can emit more than one turn.completed event; its
+    // JSONL accounting below must continue to sum those per-turn samples.
+    if let Some(evidence) = run
+        .codex_command_execution_evidence()
+        .and(run.codex_parent_evidence.as_ref())
+    {
         if evidence.resolution_status
             == crate::external_agent::CodexParentResolutionStatus::Complete.label()
         {

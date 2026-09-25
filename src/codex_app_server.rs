@@ -918,14 +918,13 @@ fn valid_thread_start_settings_response(line: &[u8]) -> bool {
         return false;
     };
     response.id.is_number()
-        && !response.result.thread.id.is_empty()
-        && !response.result.model.is_empty()
-        && response.result.model.len() <= 256
+        && validate_identifier(&response.result.thread.id, "thread id", 256).is_ok()
+        && validate_identifier(&response.result.model, "resolved model", 256).is_ok()
         && response
             .result
             .reasoning_effort
             .as_ref()
-            .is_none_or(|effort| !effort.is_empty() && effort.len() <= 64 && !effort.contains('\0'))
+            .is_none_or(|effort| validate_identifier(effort, "resolved effort", 64).is_ok())
 }
 
 fn valid_token_usage_notification(line: &[u8]) -> bool {
@@ -3519,6 +3518,29 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn app_server_rejects_control_characters_in_provider_start_settings() {
+        let valid = json!({
+            "id": 2,
+            "result": {
+                "thread": {"id": "thread-1"},
+                "model": "gpt-5.6-sol",
+                "reasoningEffort": "xhigh"
+            }
+        });
+        for pointer in [
+            "/result/thread/id",
+            "/result/model",
+            "/result/reasoningEffort",
+        ] {
+            let mut malformed = valid.clone();
+            *malformed.pointer_mut(pointer).expect("provider field") = json!("forged\nfield");
+            assert!(!valid_thread_start_settings_response(
+                &serde_json::to_vec(&malformed).expect("JSON response")
+            ));
+        }
     }
 
     #[test]
