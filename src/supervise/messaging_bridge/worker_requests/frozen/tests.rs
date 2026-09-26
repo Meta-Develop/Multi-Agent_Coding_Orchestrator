@@ -154,6 +154,15 @@ fn submit(launch: &AssignmentMessagingLaunch, request: &str, worker: &str) -> Re
     Ok(serde_json::from_str(&response)?)
 }
 
+fn assert_endpoint_closed(launch: &AssignmentMessagingLaunch) -> Result<()> {
+    let env: BTreeMap<_, _> = launch
+        .environment_for("run", "parent")?
+        .into_iter()
+        .collect();
+    assert!(TcpStream::connect(env[ENV_MESSAGE_ENDPOINT].as_str()).is_err());
+    Ok(())
+}
+
 #[test]
 fn frozen_inbox_exact_order_watermark_and_duplicate_refusal() -> Result<()> {
     let fixture = Fixture::new()?;
@@ -576,5 +585,133 @@ fn prepared_worker_inbox_turn_rejects_recovered_and_nonempty() -> Result<()> {
     assert!(inbox.requires_reconciliation());
     assert!(inbox.requests()?.is_empty());
     assert!(PreparedWorkerInboxTurn::new(recovered.turn()?, inbox).is_err());
+    Ok(())
+}
+
+#[test]
+fn shutdown_retaining_returns_frozen_submitted_request() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let endpoint = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?;
+    let launch = endpoint.launch();
+    assert_eq!(submit(&launch, "request", "worker")?["ok"], true);
+    let frozen = match endpoint.shutdown_retaining() {
+        WorkerInboxShutdown::Frozen(frozen) => frozen,
+        WorkerInboxShutdown::Rejected(rejected) => {
+            bail!("fresh inbox shutdown rejected: {}", rejected.reason())
+        }
+    };
+    frozen.verify_parent_launch(&fixture.directory, &launch)?;
+    let view = frozen.view(&turn)?;
+    assert_eq!(
+        view.requests
+            .iter()
+            .map(|record| (
+                record.request_id.as_str(),
+                record.worker_id.as_str(),
+                record.status
+            ))
+            .collect::<Vec<_>>(),
+        [("request", "worker", WorkerRequestStatus::Queued)]
+    );
+    assert_endpoint_closed(&launch)?;
+    Ok(())
+}
+
+#[test]
+fn shutdown_retaining_rejects_revoked_binding_and_keeps_journal() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let endpoint = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?;
+    let launch = endpoint.launch();
+    assert_eq!(submit(&launch, "request", "worker")?["ok"], true);
+    fixture.claims.release(fixture.claim.token)?;
+    let rejected = match endpoint.shutdown_retaining() {
+        WorkerInboxShutdown::Rejected(rejected) => rejected,
+        WorkerInboxShutdown::Frozen(_) => bail!("revoked claim must refuse freeze"),
+    };
+    rejected.verify_parent_launch(&fixture.directory, &launch)?;
+    assert!(fixture.inbox(true).is_err());
+    assert_endpoint_closed(&launch)?;
+    drop(rejected);
+    let recovered = fixture.inbox(true)?;
+    assert_eq!(recovered.requests()?.len(), 1);
+    assert!(recovered.requires_reconciliation());
+    Ok(())
+}
+
+#[test]
+fn shutdown_retaining_rejects_shared_owner_until_drop() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let endpoint = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?;
+    let launch = endpoint.launch();
+    let extra = Arc::clone(&endpoint.service);
+    let rejected = match endpoint.shutdown_retaining() {
+        WorkerInboxShutdown::Rejected(rejected) => rejected,
+        WorkerInboxShutdown::Frozen(_) => bail!("shared owner must refuse freeze"),
+    };
+    assert!(rejected.reason().contains("shared"));
+    rejected.verify_parent_launch(&fixture.directory, &launch)?;
+    assert_endpoint_closed(&launch)?;
+    drop(extra);
+    assert!(fixture.inbox(true).is_err());
+    drop(rejected);
+    let recovered = fixture.inbox(true)?;
+    assert!(recovered.requires_reconciliation());
+    Ok(())
+}
+
+#[test]
+fn shutdown_retaining_rejects_poisoned_lock_until_drop() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let turn = fixture.turn()?;
+    let endpoint = WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &turn,
+        fixture.inbox(false)?,
+        ProcessCancellation::new(),
+    )?;
+    let launch = endpoint.launch();
+    assert_eq!(submit(&launch, "request", "worker")?["ok"], true);
+    endpoint.service.poison_inbox_for_test();
+    let rejected = match endpoint.shutdown_retaining() {
+        WorkerInboxShutdown::Rejected(rejected) => rejected,
+        WorkerInboxShutdown::Frozen(_) => bail!("poisoned inbox must refuse freeze"),
+    };
+    assert!(rejected.reason().contains("poisoned"));
+    rejected.verify_parent_launch(&fixture.directory, &launch)?;
+    assert!(fixture.inbox(true).is_err());
+    assert_endpoint_closed(&launch)?;
+    drop(rejected);
+    let recovered = fixture.inbox(true)?;
+    assert_eq!(recovered.requests()?.len(), 1);
+    assert!(recovered.requires_reconciliation());
+    let fresh = fixture.turn()?;
+    let error = match WorkerInboxEndpoint::start(
+        &fixture.directory,
+        &fresh,
+        recovered,
+        ProcessCancellation::new(),
+    ) {
+        Ok(_) => bail!("recovered inbox is not a fresh turn"),
+        Err(error) => error,
+    };
+    assert!(error.to_string().contains("fresh"));
     Ok(())
 }
