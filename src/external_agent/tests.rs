@@ -638,6 +638,10 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
         thread_id: "research-thread".to_string(),
         turn_id: "research-turn".to_string(),
         status: TurnTerminalStatus::Completed,
+        resolved_model: "gpt-5.6-sol".to_string(),
+        resolved_effort: Some("xhigh".to_string()),
+        token_usage: None,
+        reroute_message: None,
         completed_items: 0,
         item_outcomes: Vec::new(),
         command_execution_evidence: CommandExecutionEvidence {
@@ -717,6 +721,7 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
+    "model":"gpt-5.6-sol", "reasoningEffort":"xhigh",
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
@@ -983,6 +988,10 @@ fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_it
             thread_id: "thread-forwarded".to_string(),
             turn_id: "turn-forwarded".to_string(),
             status: codex_app_server::TurnTerminalStatus::Completed,
+            resolved_model: "gpt-5.6-sol".to_string(),
+            resolved_effort: Some("xhigh".to_string()),
+            token_usage: None,
+            reroute_message: None,
             completed_items: 0,
             item_outcomes: Vec::new(),
             command_execution_evidence: codex_app_server::CommandExecutionEvidence {
@@ -1418,6 +1427,8 @@ assert thread_start["method"] == "thread/start"
 assert thread_start["params"]["approvalsReviewer"] == "user"
 send({"id": thread_start["id"], "result": {
     "thread": {"id": "thread-contained"},
+    "model": "gpt-5.6-sol",
+    "reasoningEffort": "xhigh",
     "approvalPolicy": "on-request",
     "approvalsReviewer": "user",
     "activePermissionProfile": {"id": "maco_external_codex"},
@@ -10182,6 +10193,10 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
         thread_id: evidence.thread_id.clone(),
         turn_id: evidence.turn_id.clone(),
         status: evidence.turn_status,
+        resolved_model: "gpt-5.6-sol".to_string(),
+        resolved_effort: Some("xhigh".to_string()),
+        token_usage: None,
+        reroute_message: None,
         completed_items: 2,
         item_outcomes: Vec::new(),
         command_execution_evidence: evidence.clone(),
