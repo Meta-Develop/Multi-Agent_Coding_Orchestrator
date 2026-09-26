@@ -913,6 +913,43 @@ fn valid_reroute_item_notification(line: &[u8]) -> bool {
         && notice.params.item.message.starts_with("model rerouted: ")
 }
 
+// Original bytes, not serde_json::Value. Last-key-wins must not hide a duplicate
+// id, type, status, or message by changing the reroute dispatch predicate.
+// Absent status and message stay valid; unknown item fields stay ignored.
+#[derive(serde::Deserialize)]
+struct CompletedItemNotification {
+    #[serde(rename = "method")]
+    _method: String,
+    #[serde(rename = "params")]
+    _params: CompletedItemParams,
+}
+
+#[derive(serde::Deserialize)]
+struct CompletedItemParams {
+    #[serde(rename = "threadId")]
+    _thread_id: String,
+    #[serde(rename = "turnId")]
+    _turn_id: String,
+    #[serde(rename = "item")]
+    _item: CompletedItemIdentity,
+}
+
+#[derive(serde::Deserialize)]
+struct CompletedItemIdentity {
+    #[serde(rename = "id")]
+    _id: String,
+    #[serde(rename = "type")]
+    _item_type: String,
+    #[serde(default, rename = "status")]
+    _status: Option<Value>,
+    #[serde(default, rename = "message")]
+    _message: Option<Value>,
+}
+
+fn valid_completed_item_notification(line: &[u8]) -> bool {
+    serde_json::from_slice::<CompletedItemNotification>(line).is_ok()
+}
+
 fn valid_thread_start_settings_response(line: &[u8]) -> bool {
     let Ok(response) = serde_json::from_slice::<ThreadStartSettingsResponse>(line) else {
         return false;
@@ -1221,6 +1258,15 @@ impl ProtocolState {
                     phase,
                     message: "token usage notification is malformed or has duplicate fields"
                         .to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str) == Some("item/completed")
+                && !valid_completed_item_notification(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "item completion is malformed or has duplicate fields".to_string(),
                 });
             }
             if phase == "turn"
@@ -3591,6 +3637,81 @@ mod tests {
     }
 
     #[test]
+    fn app_server_rejects_earlier_reroute_message_hidden_by_later_text() {
+        let duplicate = br#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-luna","message":"capacity changed"}}}"#;
+        assert!(!valid_completed_item_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        transport.incoming.insert(
+            2,
+            ReaderEvent::Line(
+                json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"inProgress"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+    }
+
+    #[test]
+    fn app_server_accepts_ordinary_non_reroute_error_item() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.len() - 1;
+        messages.insert(
+            terminal,
+            json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"error-1","type":"error","status":"inProgress"}}}),
+        );
+        messages.insert(
+            terminal + 1,
+            json!({"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"error-1","type":"error","status":"completed","message":"sandbox denied the command"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("ordinary error item");
+        assert_eq!(outcome.reroute_message, None);
+        assert!(outcome.item_outcomes.iter().any(|item| {
+            item.item_id == "error-1" && item.item_type == "error" && item.status == "completed"
+        }));
+    }
+
+    #[test]
+    fn app_server_rejects_duplicate_completed_item_type_in_original_bytes() {
+        let duplicate = br#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","type":"agentMessage","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-terra"}}}"#;
+        assert!(!valid_completed_item_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        transport.incoming.insert(
+            2,
+            ReaderEvent::Line(
+                json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"agentMessage"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+    }
+
+    #[test]
     fn command_observations_preserve_exact_correlated_snapshots_privately() {
         let messages = command_observation_messages();
         let outcome = run_command_observation_messages(messages.clone()).expect("valid transcript");
@@ -3809,8 +3930,24 @@ mod tests {
                     AppServerLimits::default(),
                     &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
                     || false,
-                )
-                .expect("ambiguous observation does not break legacy protocol behavior");
+                );
+                let completed_identity = index == 5
+                    && matches!(
+                        key,
+                        "id" | "type" | "status" | "threadId" | "turnId" | "method"
+                    );
+                if completed_identity {
+                    assert!(
+                        matches!(
+                            outcome,
+                            Err(AppServerError::Malformed { phase: "turn", .. })
+                        ),
+                        "duplicate {key} at {index}"
+                    );
+                    continue;
+                }
+                let outcome =
+                    outcome.expect("ambiguous observation does not break legacy protocol behavior");
                 assert!(
                     matches!(
                         outcome.command_execution_evidence.observations[0],
