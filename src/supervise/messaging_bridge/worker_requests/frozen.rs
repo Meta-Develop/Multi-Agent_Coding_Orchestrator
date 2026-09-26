@@ -232,7 +232,7 @@ impl<'a> WorkerInboxEndpoint<'a> {
     /// Joins all endpoint handlers before reading the journal. Cancellation may
     /// discard a reply after append; exactly the committed records are retained.
     /// This proves endpoint shutdown only, never parent/descendant process quiescence.
-    pub(in crate::supervise) fn shutdown(self) -> Result<FrozenWorkerInbox<'a>> {
+    pub(in crate::supervise) fn shutdown_retaining(self) -> WorkerInboxShutdown<'a> {
         let Self {
             server,
             service,
@@ -241,37 +241,128 @@ impl<'a> WorkerInboxEndpoint<'a> {
         } = self;
         let launch = server.launch();
         drop(server);
-        let service = Arc::try_unwrap(service)
-            .map_err(|_| anyhow::anyhow!("joined endpoint still has a shared inbox owner"))?;
-        let inbox = service.into_inbox()?;
-        turn.verify()?;
-        verify_session(&run_directory, turn)?;
-        inbox.verify_ipc_binding(&turn.binding, &turn.repository)?;
-        if inbox.requires_reconciliation {
-            bail!("recovered inbox cannot become a frozen authenticated turn");
-        }
-        let records = inbox.requests()?;
-        if records
-            .iter()
-            .any(|r| r.status != WorkerRequestStatus::Queued)
-        {
-            bail!(
-                "frozen turn requires only queued requests; prior reservations need reconciliation"
-            );
-        }
-        let watermark = WorkerInboxWatermark {
-            journal_instance: inbox.store.header().broker_instance_id.clone(),
-            last_sequence: inbox.store.events().len() - 1,
-            journal_digest: inbox.journal_digest.clone(),
+        let service = match Arc::try_unwrap(service) {
+            Ok(service) => service,
+            Err(shared) => {
+                return WorkerInboxShutdown::Rejected(Box::new(RejectedWorkerInbox {
+                    _owner: RejectedWorkerInboxOwner::Shared { _service: shared },
+                    _turn: turn,
+                    launch,
+                    run_directory,
+                    reason: "joined endpoint still has a shared inbox owner".to_string(),
+                }));
+            }
         };
-        Ok(FrozenWorkerInbox {
-            inbox,
-            turn,
-            launch,
-            run_directory,
-            records,
-            watermark,
-        })
+        let inbox = match service.into_inbox_retaining() {
+            Ok(inbox) => inbox,
+            Err(poison) => {
+                // Extracting the poisoned inbox only keeps its owner; it is still refused.
+                return WorkerInboxShutdown::Rejected(Box::new(RejectedWorkerInbox {
+                    _owner: RejectedWorkerInboxOwner::Inbox {
+                        _inbox: Box::new(poison.into_inner()),
+                    },
+                    _turn: turn,
+                    launch,
+                    run_directory,
+                    reason: "worker inbox lock poisoned while retaining ownership for shutdown"
+                        .to_string(),
+                }));
+            }
+        };
+        let checked = (|| -> Result<(Vec<WorkerRequestRecord>, WorkerInboxWatermark)> {
+            turn.verify()?;
+            verify_session(&run_directory, turn)?;
+            inbox.verify_ipc_binding(&turn.binding, &turn.repository)?;
+            if inbox.requires_reconciliation {
+                bail!("recovered inbox cannot become a frozen authenticated turn");
+            }
+            let records = inbox.requests()?;
+            if records
+                .iter()
+                .any(|r| r.status != WorkerRequestStatus::Queued)
+            {
+                bail!(
+                    "frozen turn requires only queued requests; prior reservations need reconciliation"
+                );
+            }
+            let watermark = WorkerInboxWatermark {
+                journal_instance: inbox.store.header().broker_instance_id.clone(),
+                last_sequence: inbox.store.events().len() - 1,
+                journal_digest: inbox.journal_digest.clone(),
+            };
+            Ok((records, watermark))
+        })();
+        match checked {
+            Ok((records, watermark)) => WorkerInboxShutdown::Frozen(Box::new(FrozenWorkerInbox {
+                inbox,
+                turn,
+                launch,
+                run_directory,
+                records,
+                watermark,
+            })),
+            Err(error) => WorkerInboxShutdown::Rejected(Box::new(RejectedWorkerInbox {
+                _owner: RejectedWorkerInboxOwner::Inbox {
+                    _inbox: Box::new(inbox),
+                },
+                _turn: turn,
+                launch,
+                run_directory,
+                reason: error.to_string(),
+            })),
+        }
+    }
+
+    /// Test-only adapter. Production callers match [`Self::shutdown_retaining`].
+    #[cfg(test)]
+    pub(in crate::supervise) fn shutdown(self) -> Result<FrozenWorkerInbox<'a>> {
+        match self.shutdown_retaining() {
+            WorkerInboxShutdown::Frozen(frozen) => Ok(*frozen),
+            WorkerInboxShutdown::Rejected(rejected) => bail!("{}", rejected.reason()),
+        }
+    }
+}
+
+/// Supervisor-visible endpoint shutdown. Both outcomes keep the inbox owner.
+/// Neither Clone nor Deserialize, and there is no generic error conversion.
+#[must_use]
+pub(in crate::supervise) enum WorkerInboxShutdown<'a> {
+    Frozen(Box<FrozenWorkerInbox<'a>>),
+    Rejected(Box<RejectedWorkerInbox<'a>>),
+}
+
+enum RejectedWorkerInboxOwner {
+    Shared {
+        _service: Arc<WorkerRequestIpc>,
+    },
+    Inbox {
+        _inbox: Box<WorkerRequestInbox<RepositoryAuthenticator>>,
+    },
+}
+
+/// Opaque refusal. The turn borrow only keeps its owner bound.
+pub(in crate::supervise) struct RejectedWorkerInbox<'a> {
+    _owner: RejectedWorkerInboxOwner,
+    _turn: &'a WorkerInboxTurn<'a>,
+    launch: AssignmentMessagingLaunch,
+    run_directory: PathBuf,
+    reason: String,
+}
+
+impl RejectedWorkerInbox<'_> {
+    pub(in crate::supervise) fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    pub(in crate::supervise) fn verify_parent_launch(
+        &self,
+        run_directory: &Path,
+        launch: &AssignmentMessagingLaunch,
+    ) -> Result<()> {
+        if self.run_directory != run_directory || self.launch != *launch {
+            bail!("parent command did not use this frozen inbox endpoint");
+        }
+        Ok(())
     }
 }
 
