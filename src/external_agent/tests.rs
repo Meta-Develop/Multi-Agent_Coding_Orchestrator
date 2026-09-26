@@ -5638,6 +5638,116 @@ fn supervisor_argv_enables_multi_agent_without_ephemeral() {
 }
 
 #[test]
+fn terminal_lifecycle_roles_disable_multi_agent_goals_and_use_ephemeral() {
+    for role in ["worker", "researcher", "auditor", "gate_classifier"] {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle("/registry", role, "run", "task");
+        let actual = command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|argument| argument.as_str() == "--ephemeral")
+                .count(),
+            1,
+            "{role}"
+        );
+        assert_eq!(
+            actual
+                .windows(2)
+                .filter(|arguments| *arguments == ["--disable", "multi_agent"])
+                .count(),
+            1,
+            "{role}"
+        );
+        assert_eq!(
+            actual
+                .windows(2)
+                .filter(|arguments| *arguments == ["--disable", "goals"])
+                .count(),
+            1,
+            "{role}"
+        );
+        assert!(
+            !actual
+                .windows(2)
+                .any(|arguments| arguments == ["--enable", "multi_agent"]),
+            "{role}"
+        );
+        assert!(
+            !actual
+                .windows(2)
+                .any(|arguments| arguments == ["--enable", "goals"]),
+            "{role}"
+        );
+    }
+}
+
+#[test]
+fn orchestration_lifecycle_roles_enable_multi_agent_goals_without_ephemeral() {
+    for role in ["supervisor", "child_orchestrator"] {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt.md",
+            "/run/events.jsonl",
+            "/run/report.json",
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle("/registry", role, "run", "task");
+        let actual = command_argv(&command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            actual
+                .iter()
+                .filter(|argument| argument.as_str() == "--ephemeral")
+                .count(),
+            0,
+            "{role}"
+        );
+        assert_eq!(
+            actual
+                .windows(2)
+                .filter(|arguments| *arguments == ["--enable", "multi_agent"])
+                .count(),
+            1,
+            "{role}"
+        );
+        assert_eq!(
+            actual
+                .windows(2)
+                .filter(|arguments| *arguments == ["--enable", "goals"])
+                .count(),
+            1,
+            "{role}"
+        );
+        assert!(
+            !actual
+                .windows(2)
+                .any(|arguments| arguments == ["--disable", "multi_agent"]),
+            "{role}"
+        );
+        assert!(
+            !actual
+                .windows(2)
+                .any(|arguments| arguments == ["--disable", "goals"]),
+            "{role}"
+        );
+    }
+}
+
+#[test]
 fn non_multi_agent_hardened_argv_retains_ephemeral() {
     let command = ExternalAgentCommand::codex_read_only_consultant(
         "codex",
