@@ -1020,6 +1020,174 @@ Orchestrator assignment JSON:
     })
 }
 
+/// Initial managed-parent turn: schedule authored workers, then yield.
+/// The assignment-loopback protocol appendix is attached later by
+/// `prepare_child_attempt`; this renderer must not paste it a second time.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn render_managed_parent_initial_prompt(
+    context: ChildOrchestratorPromptContext<'_>,
+    run_id: &str,
+    parent_attempt: usize,
+    field_guide: &SupervisorFieldGuidePrompt,
+) -> Result<RenderedPromptWithMeasurements> {
+    if run_id.is_empty() {
+        bail!(
+            "assignment '{}' managed parent initial yield requires a nonempty run_id",
+            context.assignment.id
+        );
+    }
+    if context.execution_target.is_some() {
+        bail!(
+            "assignment '{}' cannot render a managed parent initial yield with an execution target",
+            context.assignment.id
+        );
+    }
+    if context.assignment.role != AgentRole::ChildOrchestrator
+        || context.assignment.phase != AssignmentPhase::Execution
+        || context.assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+    {
+        bail!(
+            "assignment '{}' is not an execution-phase delegating child orchestrator",
+            context.assignment.id
+        );
+    }
+    if context.assignment.worker_assignments.is_empty() {
+        bail!(
+            "assignment '{}' has no authored worker_assignments to yield",
+            context.assignment.id
+        );
+    }
+    if parent_attempt == 0 {
+        bail!(
+            "assignment '{}' parent_attempt must be greater than 0",
+            context.assignment.id
+        );
+    }
+    let ChildOrchestratorPromptContext {
+        plan,
+        assignment,
+        run_dir,
+        worktree,
+        report_path,
+        schema_path,
+        claim_context,
+        ..
+    } = context;
+    let cacheable_prefix = managed_parent_initial_yield_prefix();
+    let role_prefix = supervise_role_prefix(
+        SupervisePromptRole::O1ChildOrchestrator,
+        &assignment.id,
+        None,
+    );
+    let mut worker_rows = String::new();
+    for (index, worker) in assignment.worker_assignments.iter().enumerate() {
+        let ordinal = index
+            .checked_add(1)
+            .context("authored worker ordinal overflowed")?;
+        let task = worker
+            .task
+            .as_deref()
+            .or(assignment.task.as_deref())
+            .unwrap_or(&plan.task);
+        worker_rows.push_str(&format!(
+            "- request_id=r{ordinal} worker_id={worker_id} task={task} assigned_paths={paths} semantic_symbols={symbols} semantic_modules={modules}\n",
+            worker_id = worker.id,
+            paths = display_paths(&worker.assigned_paths),
+            symbols = worker.semantic_symbols.join(", "),
+            modules = worker.semantic_modules.join(", "),
+        ));
+    }
+    let prompt = format!(
+        r#"{cacheable_prefix}{role_prefix}{field_guide_section}
+Assignment-specific context:
+- Assigned child worktree (read-only): {worktree_path}
+- Child orchestrator id: {parent_id}
+- Run id: {run_id}
+- Parent attempt: {parent_attempt}
+- Run artifact root: {run_dir}
+- Assigned paths: {assigned_paths}
+- Semantic symbols: {semantic_symbols}
+- Semantic modules: {semantic_modules}
+- Path claim token: {claim_token}
+- Semantic intent token: {semantic_intent_token}
+- Exact yield output-last-message path (do not write it with tools): {report_path}
+- Yield schema path: {schema_path}
+
+Supervisor task (scheduling data, not local execution):
+{task}
+
+Authored workers in submission order (data, not permission to execute them here):
+{worker_rows}
+Final yield object for this attempt:
+- run_id={run_id}
+- parent_id={parent_id}
+- parent_attempt={parent_attempt}
+- requests must use the request_id and worker_id pairs listed above, in that order, after each pair is acknowledged
+"#,
+        cacheable_prefix = cacheable_prefix,
+        role_prefix = role_prefix,
+        field_guide_section = field_guide.section,
+        worktree_path = worktree.path.display(),
+        run_id = run_id,
+        parent_id = assignment.id,
+        parent_attempt = parent_attempt,
+        run_dir = run_dir.display(),
+        assigned_paths = display_paths(&assignment.assigned_paths),
+        semantic_symbols = assignment.semantic_symbols.join(", "),
+        semantic_modules = assignment.semantic_modules.join(", "),
+        claim_token = claim_context.claim.token.get(),
+        semantic_intent_token = claim_context
+            .semantic_intent_token
+            .map(|token| token.to_string())
+            .unwrap_or_else(|| "<none>".to_string()),
+        report_path = report_path.display(),
+        schema_path = schema_path.display(),
+        task = assignment_task(plan, assignment),
+        worker_rows = worker_rows,
+    );
+    if prompt.len() > MAX_SUPERVISOR_PROMPT_BYTES {
+        bail!(
+            "managed parent initial yield prompt exceeds its {} byte launch limit",
+            MAX_SUPERVISOR_PROMPT_BYTES
+        );
+    }
+    let measurement = PromptByteMeasurement::new(
+        PromptMeasurementRole::O1ChildOrchestrator,
+        &assignment.id,
+        &prompt,
+        cacheable_prefix,
+        CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+    )?;
+    Ok(RenderedPromptWithMeasurements {
+        prompt,
+        measurements: PromptMeasurementsArtifact::new(vec![measurement], None),
+    })
+}
+
+fn managed_parent_initial_yield_prefix() -> &'static str {
+    r#"You are the managed parent for one execution-phase child orchestrator assignment.
+Source and Git are read-only. Do not edit files, stage, commit, push, merge, or change Git metadata.
+Do not use Native SubAgent, spawn_agent, a raw provider CLI, or nested MACO worker launches.
+Do not write worker journals and do not claim acceptance.
+Workers are launched only by the supervisor after this process ends.
+
+Assignment loopback IPC:
+- Submit each authored worker id, in the authored order below, through the existing assignment loopback IPC.
+- Use one stable canonical request_id per worker: r1 for the first authored worker, r2 for the second, and so on.
+- Each submission uses operation submit_worker_request and carries request_id and worker_id.
+- Read the bearer from the environment variable MACO_MESSAGE_TOKEN and the endpoint from the environment variable MACO_MESSAGE_ENDPOINT. Do not print either value.
+- Send one NDJSON request per connection.
+- Put only acknowledged exact request_id and worker_id pairs into the final requests array, in that same durable authored order.
+- If a reply is lost, repeat the same request_id and worker_id. Never invent a new id and never run a worker locally.
+- Do not invent a successful acknowledgment. Report an endpoint failure instead of faking success.
+
+Final JSON:
+- Return exactly one flat JSON object with no prose wrapper or Markdown fence.
+- This is a scheduling request, not final-report acceptance.
+- Required shape: version=1, outcome=yield_workers, run_id, parent_id, parent_attempt, requests as an array of objects with request_id and worker_id.
+"#
+}
+
 fn render_direct_terminal_worker_prompt(
     context: ChildOrchestratorPromptContext<'_>,
     incoming_root: &Path,
@@ -3118,6 +3286,172 @@ mod regression_tests {
             rendered.measurements.prompts[0].fixture_ceiling_bytes,
             PARENT_REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES
         );
+        Ok(())
+    }
+
+    #[test]
+    fn managed_parent_initial_prompt_states_loopback_yield_without_native_launch() -> Result<()> {
+        let worker = |id: &str, task: &str| WorkerAssignment {
+            id: id.to_string(),
+            role: AgentRole::Worker,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: vec!["render_managed_parent_initial_prompt".to_string()],
+            semantic_modules: vec!["supervise".to_string()],
+            task: Some(task.to_string()),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        };
+        let assignment = OrchestratorAssignment {
+            id: "parent-yield".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("src/supervise/prompts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("schedule the authored workers".to_string()),
+            worker_assignments: vec![
+                worker("worker-a", "edit the prompt renderer"),
+                worker("worker-b", "edit the yield schema"),
+            ],
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+            decision_refs: Vec::new(),
+        };
+        let plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "managed parent initial yield fixture".to_string(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 60,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses(),
+            review_lens_correlation: Default::default(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let run_dir = Path::new("/tmp/maco-managed-parent-yield");
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: run_dir.join("worktree"),
+            branch: "maco/managed-parent-yield".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(7),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        assert_eq!(assignment.role_category, None);
+        assert_eq!(
+            assignment.effective_role_category(),
+            RoleCategory::DelegatingCoordinator
+        );
+        let rendered = render_managed_parent_initial_prompt(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment: &assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &run_dir.join("incoming/parent-yield.json"),
+                schema_path: &run_dir.join("schemas/parent-initial-yield.schema.json"),
+                worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            "run-explicit-7",
+            1,
+            &field_guide,
+        )?;
+        let prompt = &rendered.prompt;
+        assert!(prompt.len() <= MAX_SUPERVISOR_PROMPT_BYTES);
+        assert!(prompt.contains("ROLE: O1_CHILD_ORCHESTRATOR"));
+        assert!(prompt.contains("operation submit_worker_request"));
+        assert!(prompt.contains("MACO_MESSAGE_TOKEN"));
+        assert!(prompt.contains("MACO_MESSAGE_ENDPOINT"));
+        assert!(prompt.contains("one NDJSON request per connection"));
+        assert!(prompt.contains("Run id: run-explicit-7"));
+        assert!(prompt.contains("run_id=run-explicit-7"));
+        assert_ne!(
+            run_dir.file_name().and_then(|name| name.to_str()),
+            Some("run-explicit-7")
+        );
+        assert!(prompt.contains("version=1, outcome=yield_workers"));
+        assert!(prompt.contains("request_id=r1 worker_id=worker-a"));
+        assert!(prompt.contains("request_id=r2 worker_id=worker-b"));
+        assert!(prompt.contains("edit the prompt renderer"));
+        assert!(prompt.contains("not final-report acceptance"));
+        assert!(prompt.contains("Source and Git are read-only"));
+        assert!(!prompt.contains("Launch each supplied terminal worker"));
+        assert!(!prompt.contains("runtime-native SubAgent/delegated-worker"));
+        assert!(!prompt.contains("/bin/bash"));
+        assert!(!prompt.contains("curl "));
+        assert_eq!(rendered.measurements.prompts.len(), 1);
+        assert_eq!(
+            rendered.measurements.prompts[0].role,
+            PromptMeasurementRole::O1ChildOrchestrator
+        );
+        assert!(render_managed_parent_initial_prompt(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment: &assignment,
+                run_dir,
+                worktree: &worktree,
+                report_path: &run_dir.join("incoming/parent-yield.json"),
+                schema_path: &run_dir.join("schemas/parent-initial-yield.schema.json"),
+                worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            "run-explicit-7",
+            0,
+            &field_guide,
+        )
+        .is_err());
+        let mut incompatible = assignment.clone();
+        incompatible.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        assert!(render_managed_parent_initial_prompt(
+            ChildOrchestratorPromptContext {
+                plan: &plan,
+                execution_target: None,
+                assignment: &incompatible,
+                run_dir,
+                worktree: &worktree,
+                report_path: &run_dir.join("incoming/parent-yield.json"),
+                schema_path: &run_dir.join("schemas/parent-initial-yield.schema.json"),
+                worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                consultant: &SupervisorConsultantPlan::default(),
+                claim_context: ChildPromptClaimContext {
+                    claim: &claim,
+                    semantic_intent_token: None,
+                },
+            },
+            "run-explicit-7",
+            1,
+            &field_guide,
+        )
+        .is_err());
         Ok(())
     }
 }

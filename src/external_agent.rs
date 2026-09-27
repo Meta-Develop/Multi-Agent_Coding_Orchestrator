@@ -288,6 +288,9 @@ pub struct ExternalAgentCommand {
     /// the selected account from process-global observation state.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
+    /// Opt-in disable of Codex native multi_agent and goals. Not serialized.
+    /// Does not change role identity, permissions, adapter, model, or effort.
+    codex_native_delegation_disabled: bool,
 }
 
 const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
@@ -1123,6 +1126,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
         }
     }
 
@@ -1166,6 +1170,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
         }
     }
 
@@ -1209,6 +1214,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
         }
     }
 
@@ -1506,6 +1512,19 @@ impl ExternalAgentCommand {
             identity.parent = Some(parent.into());
         }
         self
+    }
+
+    /// Disable Codex native multi_agent and goals for this command only.
+    /// Grants no authority or role change and has no re-enable counterpart.
+    pub(crate) fn with_codex_native_delegation_disabled(mut self) -> Self {
+        self.codex_native_delegation_disabled = true;
+        self
+    }
+
+    /// Reads the existing private Codex native-delegation disable flag.
+    /// This is not a setter and does not re-enable delegation.
+    pub(crate) fn codex_native_delegation_is_disabled(&self) -> bool {
+        self.codex_native_delegation_disabled
     }
 
     pub fn with_worktree_control_exception(mut self, relative: impl Into<PathBuf>) -> Self {

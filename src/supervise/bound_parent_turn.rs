@@ -11,16 +11,16 @@ use crate::supervise::messaging_bridge::worker_requests::{
 /// The candidate here is the quiescent parent's current candidate, before any
 /// subsequent Worker execution. Completion must establish a separate bound result;
 /// it must not relabel this snapshot as a post-Worker candidate.
-pub(super) struct BoundParentTurnYield<'inbox, 'parent, 'context> {
+pub(super) struct BoundParentTurnYield<'inbox, 'parent> {
     frozen: FrozenWorkerInbox<'inbox>,
-    parent: &'parent CollectedChildAttempt<'context>,
+    parent: ParentTurnObservation<'parent>,
     admission: AssignmentCommandAdmission,
     yielded: parent_turn_yield::ValidatedParentTurnYield,
     candidate: PrimaryWorktreeSnapshot,
 }
 
-impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> {
-    pub(super) fn bind(
+impl<'inbox, 'parent> BoundParentTurnYield<'inbox, 'parent> {
+    pub(super) fn bind<'context>(
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
         parent_attempt: usize,
@@ -28,14 +28,58 @@ impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> 
         current: &WorkerInboxTurn<'_>,
         frozen: FrozenWorkerInbox<'inbox>,
     ) -> Result<Self> {
-        verify_parent(context, preflight, parent)?;
-        let admission =
-            AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?.admit(
-                &preflight.assignment.id,
-                &parent._command,
-                SupervisorRuntime::Codex,
-            )?;
-        let view = verify_inbox(context, preflight, parent_attempt, parent, current, &frozen)?;
+        Self::bind_observed(
+            context,
+            preflight,
+            parent_attempt,
+            ParentTurnObservation::from_collected(parent),
+            current,
+            frozen,
+        )
+    }
+
+    #[allow(dead_code)]
+    pub(super) fn bind_inspected(
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        parent_attempt: usize,
+        parent: &'parent InspectedAttachedParent<'_>,
+        current: &WorkerInboxTurn<'_>,
+        frozen: FrozenWorkerInbox<'inbox>,
+    ) -> Result<Self> {
+        Self::bind_observed(
+            context,
+            preflight,
+            parent_attempt,
+            ParentTurnObservation::from_inspected(parent),
+            current,
+            frozen,
+        )
+    }
+
+    fn bind_observed(
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        parent_attempt: usize,
+        parent: ParentTurnObservation<'parent>,
+        current: &WorkerInboxTurn<'_>,
+        frozen: FrozenWorkerInbox<'inbox>,
+    ) -> Result<Self> {
+        verify_parent(context, preflight, &parent)?;
+        let admission = super::admit_parent_turn_command(
+            AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?,
+            &preflight.assignment.id,
+            parent.command,
+            SupervisorRuntime::Codex,
+        )?;
+        let view = verify_inbox(
+            context,
+            preflight,
+            parent_attempt,
+            &parent,
+            current,
+            &frozen,
+        )?;
         if view
             .requests
             .iter()
@@ -93,7 +137,7 @@ impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> 
         current_attempt: usize,
         current: &WorkerInboxTurn<'_>,
     ) -> Result<FrozenWorkerInboxView<'_>> {
-        verify_parent(context, preflight, self.parent)?;
+        verify_parent(context, preflight, &self.parent)?;
         let (run, parent, attempt) = self.yielded.parent_binding();
         if run != context.options.run_id.as_str()
             || parent != preflight.assignment.id
@@ -104,13 +148,13 @@ impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> 
         self.admission.revalidate(
             &AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)?,
             &preflight.assignment.id,
-            &self.parent._command,
+            self.parent.command,
         )?;
         verify_inbox(
             context,
             preflight,
             attempt,
-            self.parent,
+            &self.parent,
             current,
             &self.frozen,
         )
@@ -130,19 +174,19 @@ impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn execute_serial(
         self,
-        context: &AssignmentExecutionContext<'context, '_>,
+        context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
         current_attempt: usize,
         current: &WorkerInboxTurn<'_>,
         outcome: &mut AssignmentExecutionOutcome,
         policy: &AssignmentBudgetPolicy,
-    ) -> Result<BoundNestedWorkerEvidence<'inbox, 'parent, 'context>> {
+    ) -> Result<BoundNestedWorkerEvidence<'inbox, 'parent>> {
         self.revalidate(context, preflight, current_attempt, current)?;
         let requests = self
             .requests()
             .map(|(r, w)| (r.to_owned(), w.to_owned()))
             .collect::<Vec<_>>();
-        let mut driver = NestedWorkerSerialDriver::from_collected_parent(
+        let mut driver = NestedWorkerSerialDriver::from_observation(
             context,
             preflight,
             outcome,
@@ -196,8 +240,8 @@ impl<'inbox, 'parent, 'context> BoundParentTurnYield<'inbox, 'parent, 'context> 
 /// Non-Clone/non-Deserialize authority. Retains the original frozen journal lock,
 /// turn/lease borrow, captured parent, and exact before/after Worker evidence.
 /// Recovery cannot reconstruct it; continuation and scheduler activation stay closed.
-pub(super) struct BoundNestedWorkerEvidence<'inbox, 'parent, 'context> {
-    source: BoundParentTurnYield<'inbox, 'parent, 'context>,
+pub(super) struct BoundNestedWorkerEvidence<'inbox, 'parent> {
+    source: BoundParentTurnYield<'inbox, 'parent>,
     workers: Vec<BoundWorkerResult>,
 }
 
@@ -231,7 +275,7 @@ impl BoundWorkerResult {
     }
 }
 
-impl BoundNestedWorkerEvidence<'_, '_, '_> {
+impl BoundNestedWorkerEvidence<'_, '_> {
     /// The frozen view supplies the original state-instance/generation/turn and
     /// watermark, not labels copied from Worker reports or reconstructed JSON.
     pub(super) fn revalidate(
@@ -299,7 +343,7 @@ fn verify_candidate(
 fn verify_parent(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
-    parent: &CollectedChildAttempt<'_>,
+    parent: &ParentTurnObservation<'_>,
 ) -> Result<()> {
     if context.execution_runtime != SupervisorExecutionRuntime::Verified
         || context.execution_target.is_some()
@@ -320,7 +364,7 @@ fn verify_inbox<'frozen>(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     attempt: usize,
-    parent: &CollectedChildAttempt<'_>,
+    parent: &ParentTurnObservation<'_>,
     current: &WorkerInboxTurn<'_>,
     frozen: &'frozen FrozenWorkerInbox<'_>,
 ) -> Result<FrozenWorkerInboxView<'frozen>> {
@@ -341,7 +385,7 @@ fn verify_inbox<'frozen>(
     frozen.verify_parent_launch(
         context.run_dir,
         parent
-            ._command
+            .command
             .assignment_messaging_launch()
             .context("parent yield command has no bound inbox endpoint")?,
     )?;
