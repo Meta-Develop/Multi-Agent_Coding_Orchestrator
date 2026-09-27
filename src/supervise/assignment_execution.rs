@@ -2222,7 +2222,13 @@ fn prepare_child_attempt_with_purpose<'a>(
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
-    let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
+    let attempt_prompt = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+        crate::external_agent::render_prompt_with_managed_worker_request_tool_appendix(
+            attempt_prompt,
+        )?
+    } else if matches!(purpose, ChildAttemptPurpose::ManagedParentContinuation(_)) {
+        attempt_prompt
+    } else if launch_runtime_binds_assignment_messaging(launch_runtime) {
         crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
             attempt_prompt,
         )?
@@ -2308,6 +2314,11 @@ fn prepare_child_attempt_with_purpose<'a>(
     };
     if managed_parent {
         command = command.with_codex_native_delegation_disabled();
+        command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+            command.with_codex_managed_worker_requests()
+        } else {
+            command.with_codex_managed_readonly_continuation()
+        };
     }
     command = command.with_writable_launch_target(match execution_target {
         Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
@@ -3013,6 +3024,27 @@ fn bind_assignment_messaging_for_external_child_launch(
     Ok(server)
 }
 
+fn bind_assignment_messaging_unless_managed_readonly<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    task_id: &str,
+    command: &mut ExternalAgentCommand,
+) -> Result<Option<crate::messaging::transport::AssignmentMessagingServer>> {
+    if command.codex_managed_readonly_continuation_enabled()
+        || command.codex_managed_worker_requests_enabled()
+    {
+        if command.codex_managed_worker_requests_enabled()
+            && command.assignment_messaging_launch().is_none()
+        {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
+        command.verify_assignment_messaging_protocol_instructions()?;
+        return Ok(None);
+    }
+    Ok(Some(bind_assignment_messaging_for_external_child_launch(
+        context, task_id, command,
+    )?))
+}
+
 impl ManagedChildMaterializationGate {
     fn eligible(self) -> bool {
         self.codex_supervisor
@@ -3202,7 +3234,7 @@ fn dispatch_and_capture_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
                 context,
                 &assignment.id,
                 &mut command,
@@ -3257,7 +3289,7 @@ fn dispatch_and_capture_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
                 context,
                 &assignment.id,
                 &mut command,

@@ -517,6 +517,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     external_environment: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(());
     };
     let identity = spec
@@ -526,6 +529,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(());
+    }
     for (key, value) in pairs {
         external_environment.insert(key, value);
     }
@@ -541,6 +547,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
 
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(BTreeMap::new());
     };
     let identity = spec
@@ -550,6 +559,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(BTreeMap::new());
+    }
     let mut overlay = BTreeMap::new();
     for (key, value) in pairs {
         if key == ENV_MESSAGE_ENDPOINT || key == ENV_MESSAGE_TOKEN {

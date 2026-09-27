@@ -15,7 +15,7 @@ use std::{
     collections::BTreeSet,
     fmt,
     io::{self, Read, Write},
-    net::{TcpListener, TcpStream},
+    net::{SocketAddr, TcpListener, TcpStream},
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc,
@@ -86,6 +86,51 @@ impl AssignmentMessagingLaunch {
             (ENV_MESSAGE_ENDPOINT.to_string(), self.endpoint.clone()),
             (ENV_MESSAGE_TOKEN.to_string(), self.token.clone()),
         ])
+    }
+
+    /// Forwards one sealed worker submit or status request to this launch's own loopback endpoint.
+    ///
+    /// The dial address and bearer always come from this launch. `request` may only be one of the
+    /// two strict worker-request objects; run and task must match before any connection is opened.
+    pub(crate) fn forward_worker_request(
+        &self,
+        run_id: &str,
+        task_id: &str,
+        request: &Value,
+        cancelled: &dyn Fn() -> bool,
+    ) -> Result<Value> {
+        if cancelled() {
+            bail!("assignment messaging forward cancelled");
+        }
+        if self.run_id != run_id || self.task_id != task_id {
+            bail!("assignment messaging launch binding does not match the requested run and task");
+        }
+        let request = seal_forwarded_worker_request(request)?;
+        if cancelled() {
+            bail!("assignment messaging forward cancelled");
+        }
+        let address = require_loopback_endpoint(&self.endpoint)?;
+        let mut encoded = serde_json::to_vec(&json!({
+            "bearer": &self.token,
+            "request": request,
+        }))
+        .map_err(|_| {
+            anyhow::anyhow!("assignment messaging forward request could not be encoded")
+        })?;
+        if encoded.len() > MAX_REQUEST_BYTES {
+            bail!("assignment messaging forward request exceeded its bound");
+        }
+        encoded.push(b'\n');
+
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let budget = ConnectionBudget::new(CONNECTION_BUDGET, shutdown, cancelled);
+        let mut stream = connect_bounded(address, &budget).map_err(map_forward_io)?;
+        let _ = stream.set_nodelay(true);
+        write_all_bounded(&mut stream, &encoded, &budget).map_err(map_forward_io)?;
+        let line = read_exact_ndjson_line(&mut stream, MAX_RESPONSE_BYTES, &budget)
+            .map_err(map_forward_io)?
+            .ok_or_else(|| anyhow::anyhow!("assignment messaging forward response was rejected"))?;
+        accepted_forward_result(&line)
     }
 
     #[cfg(test)]
@@ -221,20 +266,32 @@ fn serve_listener(
     }
 }
 
-struct ConnectionBudget {
+struct ConnectionBudget<'a> {
     deadline: Instant,
     shutdown: Arc<AtomicBool>,
+    cancelled: &'a dyn Fn() -> bool,
 }
 
-impl ConnectionBudget {
-    fn new(total: Duration, shutdown: Arc<AtomicBool>) -> Self {
+fn never_cancelled() -> bool {
+    false
+}
+
+impl<'a> ConnectionBudget<'a> {
+    fn new(total: Duration, shutdown: Arc<AtomicBool>, cancelled: &'a dyn Fn() -> bool) -> Self {
         Self {
             deadline: Instant::now() + total,
             shutdown,
+            cancelled,
         }
     }
 
     fn check_continue(&self) -> io::Result<()> {
+        if (self.cancelled)() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "assignment messaging forward cancelled",
+            ));
+        }
         if self.shutdown.load(Ordering::Acquire) {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionAborted,
@@ -285,7 +342,7 @@ fn handle_connection(
     handler: &dyn Fn(Value) -> Result<Value>,
     shutdown: Arc<AtomicBool>,
 ) -> io::Result<()> {
-    let budget = ConnectionBudget::new(CONNECTION_BUDGET, shutdown);
+    let budget = ConnectionBudget::new(CONNECTION_BUDGET, shutdown, &never_cancelled);
 
     let request_line = match read_ndjson_line(&mut stream, MAX_REQUEST_BYTES, &budget) {
         Ok(Some(line)) => line,
@@ -320,7 +377,24 @@ fn parse_and_dispatch(
 fn read_ndjson_line(
     stream: &mut TcpStream,
     max_bytes: usize,
-    budget: &ConnectionBudget,
+    budget: &ConnectionBudget<'_>,
+) -> io::Result<Option<Vec<u8>>> {
+    read_ndjson_line_inner(stream, max_bytes, budget, false)
+}
+
+fn read_exact_ndjson_line(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+    budget: &ConnectionBudget<'_>,
+) -> io::Result<Option<Vec<u8>>> {
+    read_ndjson_line_inner(stream, max_bytes, budget, true)
+}
+
+fn read_ndjson_line_inner(
+    stream: &mut TcpStream,
+    max_bytes: usize,
+    budget: &ConnectionBudget<'_>,
+    reject_trailing: bool,
 ) -> io::Result<Option<Vec<u8>>> {
     let mut buffer = Vec::new();
     let mut chunk = [0_u8; READ_CHUNK_BYTES];
@@ -340,6 +414,12 @@ fn read_ndjson_line(
             Ok(read) => {
                 if let Some(relative_newline) = chunk[..read].iter().position(|byte| *byte == b'\n')
                 {
+                    if reject_trailing && relative_newline + 1 < read {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "trailing data after NDJSON response",
+                        ));
+                    }
                     buffer.extend_from_slice(&chunk[..relative_newline]);
                     return Ok(Some(buffer));
                 }
@@ -355,18 +435,7 @@ fn read_ndjson_line(
                 if error.kind() == io::ErrorKind::TimedOut
                     || error.kind() == io::ErrorKind::WouldBlock =>
             {
-                if Instant::now() >= budget.deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "assignment messaging connection exceeded its budget",
-                    ));
-                }
-                if budget.shutdown.load(Ordering::Acquire) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "assignment messaging connection interrupted by shutdown",
-                    ));
-                }
+                budget.check_continue()?;
                 continue;
             }
             Err(error) => return Err(error),
@@ -381,7 +450,7 @@ fn read_ndjson_line(
 fn write_response(
     stream: &mut TcpStream,
     response: Value,
-    budget: &ConnectionBudget,
+    budget: &ConnectionBudget<'_>,
 ) -> io::Result<()> {
     let mut encoded = serde_json::to_vec(&response).map_err(|error| {
         io::Error::new(
@@ -402,7 +471,7 @@ fn write_response(
 fn write_all_bounded(
     stream: &mut TcpStream,
     payload: &[u8],
-    budget: &ConnectionBudget,
+    budget: &ConnectionBudget<'_>,
 ) -> io::Result<()> {
     let mut offset = 0_usize;
     while offset < payload.len() {
@@ -420,24 +489,128 @@ fn write_all_bounded(
                 if error.kind() == io::ErrorKind::TimedOut
                     || error.kind() == io::ErrorKind::WouldBlock =>
             {
-                if Instant::now() >= budget.deadline {
-                    return Err(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        "assignment messaging connection exceeded its budget",
-                    ));
-                }
-                if budget.shutdown.load(Ordering::Acquire) {
-                    return Err(io::Error::new(
-                        io::ErrorKind::ConnectionAborted,
-                        "assignment messaging connection interrupted by shutdown",
-                    ));
-                }
+                budget.check_continue()?;
                 continue;
             }
             Err(error) => return Err(error),
         }
     }
     Ok(())
+}
+
+fn connect_bounded(address: SocketAddr, budget: &ConnectionBudget<'_>) -> io::Result<TcpStream> {
+    loop {
+        budget.check_continue()?;
+        let timeout = budget.remaining().min(IO_SLICE_TIMEOUT);
+        if timeout.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "assignment messaging connection exceeded its budget",
+            ));
+        }
+        match TcpStream::connect_timeout(&address, timeout) {
+            Ok(stream) => return Ok(stream),
+            Err(error)
+                if error.kind() == io::ErrorKind::TimedOut
+                    || error.kind() == io::ErrorKind::WouldBlock =>
+            {
+                budget.check_continue()?;
+                continue;
+            }
+            Err(_) => {
+                budget.check_continue()?;
+                let pause = budget.remaining().min(Duration::from_millis(20));
+                if pause.is_zero() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "assignment messaging connection exceeded its budget",
+                    ));
+                }
+                thread::sleep(pause);
+            }
+        }
+    }
+}
+
+const MAX_FORWARD_ID_BYTES: usize = 128;
+
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+enum SealedWorkerForward {
+    SubmitWorkerRequest {
+        request_id: String,
+        worker_id: String,
+    },
+    WorkerRequestStatus {
+        request_id: String,
+    },
+}
+
+fn seal_forwarded_worker_request(request: &Value) -> Result<Value> {
+    let sealed: SealedWorkerForward = serde_json::from_value(request.clone()).map_err(|_| {
+        anyhow::anyhow!("assignment messaging forward request is not an allowed worker operation")
+    })?;
+    match &sealed {
+        SealedWorkerForward::SubmitWorkerRequest {
+            request_id,
+            worker_id,
+        } => {
+            validate_forward_id(request_id)?;
+            validate_forward_id(worker_id)?;
+        }
+        SealedWorkerForward::WorkerRequestStatus { request_id } => {
+            validate_forward_id(request_id)?;
+        }
+    }
+    serde_json::to_value(sealed)
+        .map_err(|_| anyhow::anyhow!("assignment messaging forward request could not be encoded"))
+}
+
+/// Same canonical identifier rule as the supervisor worker-request inbox (`1..=128` ASCII).
+fn validate_forward_id(id: &str) -> Result<()> {
+    if id.is_empty()
+        || id.len() > MAX_FORWARD_ID_BYTES
+        || !id
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || id == "."
+        || id == ".."
+    {
+        bail!("assignment messaging forward identifier is empty, malformed, or oversize");
+    }
+    Ok(())
+}
+
+fn require_loopback_endpoint(endpoint: &str) -> Result<SocketAddr> {
+    let address: SocketAddr = endpoint.parse().map_err(|_| {
+        anyhow::anyhow!("assignment messaging endpoint is not a loopback socket address")
+    })?;
+    if !address.ip().is_loopback() {
+        bail!("assignment messaging endpoint is not a loopback socket address");
+    }
+    Ok(address)
+}
+
+fn accepted_forward_result(line: &[u8]) -> Result<Value> {
+    let response: Value = serde_json::from_slice(line)
+        .map_err(|_| anyhow::anyhow!("assignment messaging forward response was rejected"))?;
+    let Some(object) = response.as_object() else {
+        bail!("assignment messaging forward response was rejected");
+    };
+    if object.len() == 2 && object.get("ok") == Some(&Value::Bool(true)) {
+        if let Some(result) = object.get("result") {
+            return Ok(result.clone());
+        }
+    }
+    bail!("assignment messaging forward response was rejected");
+}
+
+fn map_forward_io(error: io::Error) -> anyhow::Error {
+    match error.kind() {
+        io::ErrorKind::Interrupted => anyhow::anyhow!("assignment messaging forward cancelled"),
+        io::ErrorKind::TimedOut => anyhow::anyhow!("assignment messaging forward timed out"),
+        _ => anyhow::anyhow!("assignment messaging forward failed"),
+    }
 }
 
 fn success_response(result: Value) -> Value {
@@ -485,8 +658,12 @@ mod tests {
         |request| Ok(request)
     }
 
-    fn test_budget() -> ConnectionBudget {
-        ConnectionBudget::new(CONNECTION_BUDGET, Arc::new(AtomicBool::new(false)))
+    fn test_budget() -> ConnectionBudget<'static> {
+        ConnectionBudget::new(
+            CONNECTION_BUDGET,
+            Arc::new(AtomicBool::new(false)),
+            &never_cancelled,
+        )
     }
 
     fn exchange(endpoint: &str, bearer: &str, request: Value) -> Result<Value> {
@@ -646,6 +823,269 @@ mod tests {
         let connect_result = exchange(&endpoint, &bearer, json!({"operation": "after_shutdown"}));
         assert!(connect_result.is_err());
         Ok(())
+    }
+
+    fn not_cancelled() -> bool {
+        false
+    }
+
+    #[test]
+    fn forward_worker_request_submits_and_reads_status_on_loopback() -> Result<()> {
+        let server = AssignmentMessagingServer::start("run-a", "task-a", |request| match request
+            .get("operation")
+            .and_then(Value::as_str)
+        {
+            Some("submit_worker_request") => Ok(json!({
+                "request_id": request.get("request_id").cloned().unwrap_or(Value::Null),
+                "worker_id": request.get("worker_id").cloned().unwrap_or(Value::Null),
+                "status": "queued"
+            })),
+            Some("worker_request_status") => Ok(json!({
+                "request_id": request.get("request_id").cloned().unwrap_or(Value::Null),
+                "status": "queued"
+            })),
+            _ => bail!("unexpected operation"),
+        })?;
+        let launch = server.launch();
+        let submitted = launch.forward_worker_request(
+            "run-a",
+            "task-a",
+            &json!({
+                "operation": "submit_worker_request",
+                "request_id": "request.1",
+                "worker_id": "worker_a"
+            }),
+            &not_cancelled,
+        )?;
+        assert_eq!(
+            submitted,
+            json!({"request_id": "request.1", "worker_id": "worker_a", "status": "queued"})
+        );
+        let status = launch.forward_worker_request(
+            "run-a",
+            "task-a",
+            &json!({"operation": "worker_request_status", "request_id": "request.1"}),
+            &not_cancelled,
+        )?;
+        assert_eq!(
+            status,
+            json!({"request_id": "request.1", "status": "queued"})
+        );
+        let replies = format!("{submitted} {status}");
+        let debug = format!("{launch:?}");
+        let token = launch
+            .environment_for("run-a", "task-a")?
+            .into_iter()
+            .find(|(key, _)| key == ENV_MESSAGE_TOKEN)
+            .map(|(_, value)| value)
+            .expect("token");
+        assert!(!replies.contains(&token));
+        assert!(!debug.contains(&token));
+        assert!(!replies.contains(launch.endpoint()));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_worker_request_rejects_binding_shape_and_cancel_without_handler() -> Result<()> {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_for_handler = Arc::clone(&calls);
+        let server = AssignmentMessagingServer::start("run-a", "task-a", move |_| {
+            calls_for_handler.fetch_add(1, Ordering::AcqRel);
+            Ok(json!({"seen": true}))
+        })?;
+        let launch = server.launch();
+        let valid = json!({"operation": "worker_request_status", "request_id": "request"});
+        assert!(launch
+            .forward_worker_request("run-b", "task-a", &valid, &not_cancelled)
+            .is_err());
+        assert!(launch
+            .forward_worker_request("run-a", "task-b", &valid, &not_cancelled)
+            .is_err());
+        let oversize = "x".repeat(MAX_FORWARD_ID_BYTES + 1);
+        let rejected = [
+            json!({"operation": "worker_request_status", "request_id": "request", "worker_id": "worker"}),
+            json!({"operation": "send_direct", "recipient_id": "peer", "payload": {}}),
+            json!({"operation": "submit_worker_request", "request_id": "", "worker_id": "worker"}),
+            json!({"operation": "submit_worker_request", "request_id": ".", "worker_id": "worker"}),
+            json!({"operation": "submit_worker_request", "request_id": "..", "worker_id": "worker"}),
+            json!({"operation": "submit_worker_request", "request_id": "../escape", "worker_id": "worker"}),
+            json!({"operation": "submit_worker_request", "request_id": oversize, "worker_id": "worker"}),
+            json!({"operation": "submit_worker_request", "request_id": "request"}),
+            json!({"operation": "worker_request_status"}),
+            json!("worker_request_status"),
+        ];
+        for request in &rejected {
+            assert!(
+                launch
+                    .forward_worker_request("run-a", "task-a", request, &not_cancelled)
+                    .is_err(),
+                "accepted rejected request {request}"
+            );
+        }
+        assert!(launch
+            .forward_worker_request("run-a", "task-a", &valid, &|| true)
+            .is_err());
+        assert_eq!(calls.load(Ordering::Acquire), 0);
+        Ok(())
+    }
+
+    #[test]
+    fn forward_worker_request_denies_non_loopback_endpoint_without_dialing() {
+        let token = "t".repeat(MIN_BEARER_BYTES);
+        let launch = AssignmentMessagingLaunch::new(
+            "192.0.2.1:9".to_string(),
+            token.clone(),
+            "run-a".to_string(),
+            "task-a".to_string(),
+        );
+        let started = Instant::now();
+        let error = launch
+            .forward_worker_request(
+                "run-a",
+                "task-a",
+                &json!({"operation": "worker_request_status", "request_id": "request"}),
+                &not_cancelled,
+            )
+            .expect_err("non-loopback endpoint must be denied");
+        assert!(started.elapsed() < Duration::from_secs(1));
+        let message = error.to_string();
+        assert!(!message.contains("192.0.2.1"));
+        assert!(!message.contains(&token));
+        let unparsed = AssignmentMessagingLaunch::new(
+            "localhost:9".to_string(),
+            token,
+            "run-a".to_string(),
+            "task-a".to_string(),
+        );
+        assert!(unparsed
+            .forward_worker_request(
+                "run-a",
+                "task-a",
+                &json!({"operation": "worker_request_status", "request_id": "request"}),
+                &not_cancelled,
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn forward_worker_request_fails_closed_on_invalid_truncated_and_held_replies() -> Result<()> {
+        let token = "s".repeat(MIN_BEARER_BYTES);
+        let cases: Vec<Vec<u8>> = vec![
+            b"not-json\n".to_vec(),
+            br#"{"ok":true}"#.to_vec(),
+            b"{\"ok\":true}\n".to_vec(),
+            format!("{{\"ok\":false,\"error\":\"{token} at 127.0.0.1\"}}\n").into_bytes(),
+            b"{\"ok\":true,\"result\":{\"status\":\"queued\"},\"extra\":1}\n".to_vec(),
+            b"{\"ok\":true,\"result\":1}\n{\"ok\":true,\"result\":2}\n".to_vec(),
+            b"{\"ok\":true,\"result\":".to_vec(),
+        ];
+        for payload in cases {
+            let address = reply_once(payload, false);
+            let launch = forwarded_launch(address, &token);
+            let error = launch
+                .forward_worker_request(
+                    "run-a",
+                    "task-a",
+                    &json!({"operation": "worker_request_status", "request_id": "request"}),
+                    &not_cancelled,
+                )
+                .expect_err("invalid reply must fail closed");
+            let message = error.to_string();
+            assert!(!message.contains(&token));
+            assert!(!message.contains(launch.endpoint()));
+            assert!(!message.contains("127.0.0.1"));
+        }
+
+        let address = reply_once(b"{".to_vec(), true);
+        let launch = forwarded_launch(address, &token);
+        let started = Instant::now();
+        let error = launch
+            .forward_worker_request(
+                "run-a",
+                "task-a",
+                &json!({"operation": "worker_request_status", "request_id": "request"}),
+                &not_cancelled,
+            )
+            .expect_err("held partial reply must time out");
+        assert!(
+            started.elapsed() < CONNECTION_BUDGET + Duration::from_secs(2),
+            "held reply blocked for {:?}",
+            started.elapsed()
+        );
+        let message = error.to_string();
+        assert!(message.contains("timed out"));
+        assert!(!message.contains(&token));
+        assert!(!message.contains(launch.endpoint()));
+
+        let address = reply_once(vec![b'a'; MAX_RESPONSE_BYTES + 1], false);
+        let launch = forwarded_launch(address, &token);
+        let started = Instant::now();
+        assert!(launch
+            .forward_worker_request(
+                "run-a",
+                "task-a",
+                &json!({"operation": "worker_request_status", "request_id": "request"}),
+                &not_cancelled,
+            )
+            .is_err());
+        assert!(started.elapsed() < CONNECTION_BUDGET + Duration::from_secs(2));
+        Ok(())
+    }
+
+    #[test]
+    fn forward_worker_request_observes_cancel_while_waiting_for_reply() -> Result<()> {
+        let listener = TcpListener::bind(LOOPBACK_BIND)?;
+        let address = listener.local_addr()?.to_string();
+        let launch = forwarded_launch(address, &"c".repeat(MIN_BEARER_BYTES));
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cancel_later = Arc::clone(&cancel);
+        thread::spawn(move || {
+            thread::sleep(Duration::from_millis(30));
+            cancel_later.store(true, Ordering::Release);
+        });
+        let started = Instant::now();
+        let error = launch
+            .forward_worker_request(
+                "run-a",
+                "task-a",
+                &json!({"operation": "worker_request_status", "request_id": "request"}),
+                &|| cancel.load(Ordering::Acquire),
+            )
+            .expect_err("cancel must fail the forward");
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "cancel was observed only after {:?}",
+            started.elapsed()
+        );
+        assert!(error.to_string().contains("cancelled"));
+        drop(listener);
+        Ok(())
+    }
+
+    fn forwarded_launch(endpoint: String, token: &str) -> AssignmentMessagingLaunch {
+        AssignmentMessagingLaunch::new(
+            endpoint,
+            token.to_string(),
+            "run-a".to_string(),
+            "task-a".to_string(),
+        )
+    }
+
+    fn reply_once(payload: Vec<u8>, hold_after_write: bool) -> String {
+        let listener = TcpListener::bind(LOOPBACK_BIND).expect("bind reply server");
+        let address = listener
+            .local_addr()
+            .expect("reply server address")
+            .to_string();
+        thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let _ = stream.write_all(&payload);
+                if hold_after_write {
+                    thread::sleep(CONNECTION_BUDGET + Duration::from_secs(2));
+                }
+            }
+        });
+        address
     }
 
     fn launch_environment(

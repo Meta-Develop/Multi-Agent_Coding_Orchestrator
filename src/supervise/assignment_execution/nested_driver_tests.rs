@@ -287,10 +287,11 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     Some("child_orchestrator")
                 );
                 let turn = managed_parent_turns.fetch_add(1, Ordering::SeqCst) + 1;
-                let launch = command
-                    .assignment_messaging_launch()
-                    .expect("managed parent inbox launch");
                 if turn == 1 {
+                    assert!(command.codex_managed_worker_requests_enabled());
+                    let launch = command
+                        .assignment_messaging_launch()
+                        .expect("managed parent inbox launch");
                     if case == "managed-cycle-lost-reply" {
                         super::managed_parent_controller_tests::submit_worker_request(
                             launch,
@@ -336,6 +337,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                         .unwrap(),
                     );
                 } else {
+                    assert!(command.assignment_messaging_launch().is_none());
+                    assert!(command.codex_managed_readonly_continuation_enabled());
+                    assert!(!command.codex_managed_worker_requests_enabled());
                     let reports = captured_worker_reports.lock().unwrap().clone();
                     let completed_worker_ids: Vec<_> =
                         reports.iter().map(|report| report.id.clone()).collect();
