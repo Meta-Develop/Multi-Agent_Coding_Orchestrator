@@ -265,6 +265,101 @@ fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result
 }
 
 #[test]
+fn fresh_worker_admission_accepts_omitted_runtime_projected_to_codex() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    let mut projected = fixture.plan.assignments[0].clone();
+    projected.runtime = Some(SupervisorRuntime::Codex);
+    let binding = with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        let binding = factory.claim_fresh_worker_request_binding(
+            &RunId::new("run")?,
+            &projected,
+            1,
+            SupervisorRuntime::Codex,
+        )?;
+        binding.verify_session(factory, "parent")?;
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &projected,
+                1,
+                SupervisorRuntime::Codex,
+            )
+            .is_err());
+        Ok(binding)
+    })?;
+    assert_eq!(serde_json::to_value(&binding)?["parent"], "parent");
+    assert!(fixture.claim().is_err());
+    assert!(fixture.claim_at(1).is_ok());
+
+    let explicit = FreshFixture::with_parent(json!({
+        "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"codex",
+        "worker_assignments":[{"id":"worker", "role":"worker"}]
+    }))?;
+    let explicit_binding = explicit.claim()?;
+    with_supervisor_messaging_session(explicit.writer.run_dir(), |factory| {
+        explicit_binding.verify_session(factory, "parent")
+    })?;
+    assert!(explicit.claim().is_err());
+    assert!(explicit.claim_at(1).is_ok());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_runtime_projection_refuses_other_drift_and_burns_parent() -> Result<()> {
+    for mutation in 0..7 {
+        let fixture = match mutation {
+            0..=3 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            4..=5 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"codex",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            6 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"grok",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            _ => unreachable!(),
+        };
+        let mut parent = fixture.plan.assignments[0].clone();
+        parent.runtime = Some(SupervisorRuntime::Codex);
+        match mutation {
+            0 => parent.runtime = Some(SupervisorRuntime::Grok),
+            1 => parent.worker_assignments[0].id = "replaced-worker".into(),
+            2 => parent.worker_assignments[0]
+                .assigned_paths
+                .push(PathBuf::from("widened.rs")),
+            3 => parent.task = Some("rewritten parent task".into()),
+            4 => parent.runtime = None,
+            5 => parent.runtime = Some(SupervisorRuntime::Grok),
+            6 => {}
+            _ => unreachable!(),
+        }
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            assert!(
+                factory
+                    .claim_fresh_worker_request_binding(
+                        &RunId::new("run")?,
+                        &parent,
+                        1,
+                        SupervisorRuntime::Codex,
+                    )
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            Ok(())
+        })?;
+        assert!(fixture.claim().is_err(), "retry after mutation {mutation}");
+        assert!(
+            fixture.claim_at(1).is_ok(),
+            "second parent remains after mutation {mutation}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn fresh_worker_admission_refuses_ineligible_authored_parent() -> Result<()> {
     for parent in [
         json!({"id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"grok", "worker_assignments":[{"id":"worker","role":"worker"}]}),

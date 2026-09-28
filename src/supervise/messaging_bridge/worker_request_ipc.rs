@@ -48,11 +48,15 @@ impl SupervisorMessagingSessionFactory {
     /// Claims one fresh inbox identity for an exact authored parent, before any broker reopen.
     /// `parent`, `attempt`, and the resolved runtime must come from supervisor launch
     /// context. The critical section removes only the entry with that parent id. Exact
-    /// authored equality then prevents substituting another parent's Workers. A known
-    /// parent is consumed even when the claim is later refused, so callers must retain
-    /// the returned binding for this live turn and never retry that parent after
-    /// downstream failure. An unknown parent id leaves every remaining permit. This is
-    /// inbox admission only, not permission to dispatch or recover any Worker.
+    /// authored equality then prevents substituting another parent's Workers. The only
+    /// supervisor-controlled exception is runtime projection: the requested-plan freeze
+    /// may still have `runtime: None` when the trusted selector has set the live parent
+    /// to `Some(Codex)`. An explicit frozen runtime must match exactly. No other field,
+    /// including nested Workers, may differ. A known parent is consumed even when the
+    /// claim is later refused, so callers must retain the returned binding for this live
+    /// turn and never retry that parent after downstream failure. An unknown parent id
+    /// leaves every remaining permit. This is inbox admission only, not permission to
+    /// dispatch or recover any Worker.
     #[allow(dead_code)] // No production caller until the complete turn controller lands.
     pub(in crate::supervise) fn claim_fresh_worker_request_binding(
         &self,
@@ -82,7 +86,7 @@ impl SupervisorMessagingSessionFactory {
             || parent
                 .runtime
                 .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
-            || authored != *parent
+            || !authored_parent_accepts_codex_runtime_projection(&authored, parent)
         {
             bail!("fresh Worker request admission requires the exact authored first Codex parent turn");
         }
@@ -115,6 +119,26 @@ impl SupervisorMessagingSessionFactory {
         )?;
         expected.verify_session(self, &parent.id)?;
         Ok(expected)
+    }
+}
+
+/// Requested-plan admission freezes assignments before the selector writes a runtime.
+/// Only an omitted frozen runtime may match a live `Some(Codex)` parent. Every other
+/// field, including nested Workers, stays under authored `PartialEq`.
+fn authored_parent_accepts_codex_runtime_projection(
+    authored: &OrchestratorAssignment,
+    parent: &OrchestratorAssignment,
+) -> bool {
+    match (authored.runtime, parent.runtime) {
+        (None, None) | (Some(SupervisorRuntime::Codex), Some(SupervisorRuntime::Codex)) => {
+            authored == parent
+        }
+        (None, Some(SupervisorRuntime::Codex)) => {
+            let mut projected = parent.clone();
+            projected.runtime = None;
+            authored == &projected
+        }
+        _ => false,
     }
 }
 
