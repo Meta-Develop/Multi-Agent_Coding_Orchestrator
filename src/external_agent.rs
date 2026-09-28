@@ -5351,10 +5351,6 @@ fn record_completed_target(
             })
     {
         report.publishable = false;
-        report.error = append_external_error(
-            report.error.take(),
-            Some("Codex observed model mismatches the requested model or invocation usage is incomplete".to_string()),
-        );
     }
 }
 
