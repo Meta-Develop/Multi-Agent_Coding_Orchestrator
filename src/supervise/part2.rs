@@ -136,7 +136,7 @@ enum DispatchBudgetAdmission<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchBudgetReservationState {
-    Reserved,
+    Reserved(SupervisorRuntime),
     Invoked(SupervisorRuntime),
     Settled,
 }
@@ -189,8 +189,8 @@ fn set_dispatch_pre_runner_fault(role: AgentRole) {
 
 impl DispatchBudgetReservation<'_> {
     fn mark_invoked_for_runtime(&mut self, launch_runtime: SupervisorRuntime) -> Result<()> {
-        if self.state != DispatchBudgetReservationState::Reserved {
-            bail!("budget reservation was invoked outside its reserved state");
+        if self.state != DispatchBudgetReservationState::Reserved(launch_runtime) {
+            bail!("budget reservation was invoked outside its reserved runtime or state");
         }
         if self.ledger.dispatch_stopped() {
             bail!("run budget stopped before provider invocation");
@@ -321,7 +321,7 @@ impl DispatchBudgetReservation<'_> {
 impl Drop for DispatchBudgetReservation<'_> {
     fn drop(&mut self) {
         let result = match self.state {
-            DispatchBudgetReservationState::Reserved => {
+            DispatchBudgetReservationState::Reserved(_) => {
                 self.ledger.release(self.reservation.id).map(|_| ())
             }
             DispatchBudgetReservationState::Invoked(launch_runtime) => self
@@ -898,6 +898,7 @@ impl ReportStatus for AuditorReport {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RoleUsageSample {
+    runtime: SupervisorRuntime,
     role: AgentRole,
     lens_id: Option<String>,
     model: Option<String>,

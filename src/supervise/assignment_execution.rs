@@ -2262,7 +2262,7 @@ fn prepare_child_attempt<'a>(
         &budget_plan,
         budget_config,
         budget_ledger,
-        assignment.role,
+        (assignment.role, launch_runtime),
         &command,
         &context.cancellation,
     )? {
@@ -3068,6 +3068,7 @@ fn dispatch_and_capture_child_attempt<'a>(
     match usage_settlement.reliable_usage() {
         Some(usage) => {
             outcome.usage_samples.push(RoleUsageSample {
+                runtime: launch_runtime,
                 role: assignment.role,
                 lens_id: None,
                 model: command.model.clone(),
@@ -4352,7 +4353,7 @@ fn prepare_parent_auditor<'a>(
         plan,
         budget_config,
         budget_ledger,
-        AgentRole::Auditor,
+        (AgentRole::Auditor, launch_runtime),
         &auditor_command,
         &context.cancellation,
     )? {
@@ -4633,6 +4634,7 @@ fn dispatch_and_collect_parent_auditor(
     match usage_settlement.reliable_usage() {
         Some(usage) => {
             outcome.usage_samples.push(RoleUsageSample {
+                runtime: launch_runtime,
                 role: AgentRole::Auditor,
                 lens_id: Some(lens.id.clone()),
                 model: auditor_command.model.clone(),
@@ -11276,6 +11278,7 @@ done
             assert_eq!(spawn_payload["runtime"], "codex");
             assert_eq!(spawn_payload["request_binding"], request.request_binding);
             usage_samples.push(RoleUsageSample {
+                runtime: SupervisorRuntime::Codex,
                 role: AgentRole::Auditor,
                 lens_id: Some(lens.id.clone()),
                 model: command.model.clone(),
@@ -11372,13 +11375,18 @@ done
         let plan = worker_plan("composer-2.5");
         let budget = SupervisorBudgetConfig::default();
         let command = quota_usage_command(temp.path());
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected cross-runtime budget refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected cross-runtime budget refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         write_injected_usage(&command, 7, 3);
         let run = injected_verified_run(&command);
@@ -11415,13 +11423,18 @@ done
         let expected_tokens = budget
             .reservation_tokens(AgentRole::Worker)
             .context("worker reservation tokens")?;
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &first, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected dropped-dispatch budget refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &first,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected dropped-dispatch budget refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         drop(reservation);
         assert_eq!(first.report()?.active_reservations, 0);
@@ -11451,13 +11464,18 @@ done
         let plan = worker_plan("composer-2.5");
         let budget = SupervisorBudgetConfig::default();
         let command = quota_usage_command(temp.path());
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected settlement fixture refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected settlement fixture refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         write_injected_usage(&command, 1, 1);
         let run = injected_verified_run(&command);

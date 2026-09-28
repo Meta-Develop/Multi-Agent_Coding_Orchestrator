@@ -527,6 +527,7 @@ mod tests {
         let aggregation = role_usage_report(
             &plan,
             vec![RoleUsageSample {
+                runtime: SupervisorRuntime::Codex,
                 role: AgentRole::Researcher,
                 lens_id: None,
                 model: Some(FRONTIER_PROFILE_MODEL.to_string()),
