@@ -3066,3 +3066,223 @@ fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_qui
     }
     Ok(())
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.review_lenses = default_supervisor_review_lenses();
+    let lenses = plan.review_lenses.clone();
+    assert_eq!(lenses.len(), 3);
+    let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
+    let options = injected_options(&repo_path, temp.path(), "observed-auditor-lenses");
+    let mut commands = Vec::new();
+    let mut grants = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let auditor = command
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == "auditor");
+        if auditor {
+            let index = commands.len();
+            assert!(index < 3, "no extra review dispatch");
+            assert!(command.uses_live_app_server_budget());
+            let grant = command
+                .live_token_grant_for_test()
+                .expect("live Auditor grant");
+            assert_eq!(grant.tokens(), 220_000 - 10 * (index as u64 + 1));
+            assert!(grants
+                .iter()
+                .all(crate::supervise_budget::LiveTokenGrant::stopped));
+            grants.push(grant.clone());
+            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+            assert!(command.hidden_roots.contains(&repo_path));
+            assert_eq!(command.hidden_roots.len(), 2);
+            assert!(!command
+                .hidden_roots
+                .iter()
+                .any(|root| command.cwd.starts_with(root)));
+            assert!(command
+                .output_schema
+                .as_ref()
+                .unwrap()
+                .starts_with(&command.cwd));
+            let prompt = fs::read_to_string(&command.prompt).unwrap();
+            let scope = match lenses[index].information_scope {
+                ReviewInformationScope::FullChildTranscript => {
+                    "\"bounded_full_child_transcript\"".to_string()
+                }
+                scope => serde_json::to_string(&scope).unwrap(),
+            };
+            assert!(prompt.contains(&format!("\"scope\":{scope}")));
+            assert_eq!(
+                command.model.as_deref(),
+                Some(lenses[index].backend.model())
+            );
+            assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+            let mut audit =
+                injected_auditor_report(&assignment, &injected_child_report(&assignment));
+            audit.id = command
+                .output_last_message
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            write_injected_json(&command.output_last_message, &audit);
+            commands.push(command.clone());
+        } else {
+            write_injected_assignment_report(command, &assignment);
+        }
+        write_injected_usage(command, 7, 3);
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_budget_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        budget,
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("three-lens dispatch");
+    assert!(report.success, "{report:#?}");
+    assert!(report.accepted);
+    assert_eq!(commands.len(), 3);
+    assert_ne!(commands[0].cwd, commands[1].cwd);
+    assert_ne!(commands[1].cwd, commands[2].cwd);
+    assert!(grants
+        .iter()
+        .all(crate::supervise_budget::LiveTokenGrant::stopped));
+    let ledger = report.run_budget.unwrap();
+    assert_eq!(ledger.consumed.tokens, 40);
+    assert_eq!(ledger.reserved.tokens, 0);
+    assert_eq!(ledger.active_reservations, 0);
+    assert!(ledger.usage_complete);
+    assert!(
+        ledger.consumed.cost_usd.is_none(),
+        "synthetic CLI usage has no private model allocation"
+    );
+    assert_eq!(report.orchestrator_reports[0].audit_reports.len(), 3);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting() {
+    skip_without_containment!();
+    let _capability = install_budget_fixture_models();
+    for effort in [Some("xhigh"), Some("high"), None, Some("invented")] {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 2.0);
+        let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
+        let options = injected_options(&repo_path, temp.path(), "observed-auditor-effort");
+        let mut invocations = 0;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations += 1;
+            assert!(invocations <= 2, "no further dispatch after refusal");
+            let auditor = command
+                .agent_lifecycle
+                .as_ref()
+                .is_some_and(|identity| identity.role == "auditor");
+            if auditor {
+                assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                );
+            } else {
+                write_injected_assignment_report(command, &assignment);
+            }
+            write_injected_usage(command, 7, 3);
+            let mut run = injected_verified_run(command);
+            retain_attribution_fixture(&mut run, command, Some("priced-model"), true, false);
+            if auditor {
+                let evidence = run.codex_parent_evidence.as_mut().unwrap();
+                evidence.observed_effort = effort
+                    .map(|value| {
+                        crate::external_agent::CodexParentResolvedField::Known(value.to_string())
+                    })
+                    .unwrap_or(crate::external_agent::CodexParentResolvedField::Unknown);
+                if effort.is_none() {
+                    evidence.resolution_status = "ambiguous".to_string();
+                }
+                run.retain_app_server_parent_evidence_for_test();
+                run.qualify_codex_auditor_effort_for_test(command);
+                assert!(run.authenticated_codex_usage_complete());
+                assert_eq!(run.authenticated_codex_usage().unwrap().total_tokens, 10);
+                if effort == Some("high") {
+                    assert_eq!(
+                        run.authenticated_app_server_evidence()
+                            .unwrap()
+                            .resolution_status,
+                        "complete"
+                    );
+                    assert!(!run.succeeded());
+                    // Public success and observed-effort labels cannot override private custody.
+                    run.publishable = true;
+                    run.error = None;
+                    run.codex_parent_evidence.as_mut().unwrap().observed_effort =
+                        crate::external_agent::CodexParentResolvedField::Known("xhigh".to_string());
+                    assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+                    run.codex_parent_evidence = run.authenticated_app_server_evidence().cloned();
+                }
+                assert_eq!(
+                    external_process_completed(&run, SupervisorRuntime::Codex),
+                    effort == Some("xhigh")
+                );
+            }
+            run
+        };
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .unwrap();
+        assert_eq!(invocations, 2);
+        assert_eq!(
+            report.success,
+            effort == Some("xhigh"),
+            "{effort:?}: {report:#?}"
+        );
+        assert_eq!(report.accepted, effort == Some("xhigh"));
+        if effort != Some("xhigh") {
+            assert!(!report.publishable);
+        }
+        let child = &report.orchestrator_reports[0];
+        assert_eq!(child.audit_reports.len(), 1);
+        assert_eq!(child.audit_reports[0].accepted, effort == Some("xhigh"));
+        let aggregate = child.review_lens_aggregate.as_ref().unwrap();
+        assert_eq!(
+            aggregate.lens_verdicts[0].effective_verdict,
+            if effort == Some("xhigh") {
+                ReviewLensVerdictStatus::Accept
+            } else {
+                ReviewLensVerdictStatus::ProceduralFailure
+            }
+        );
+        let charged = report.run_budget.as_ref().unwrap();
+        assert_eq!(charged.consumed.tokens, 20);
+        assert_eq!(charged.reserved.tokens, 0);
+        assert_eq!(charged.active_reservations, 0);
+        assert!(charged.usage_complete);
+        let cost = effort.map(|_| 0.00004);
+        assert_eq!(charged.consumed.cost_usd, cost);
+        assert_eq!(report.total_cost_usd, cost);
+        assert_eq!(
+            report.role_usage[&AgentRole::Auditor]
+                .usage
+                .unwrap()
+                .total_tokens,
+            10
+        );
+    }
+}
