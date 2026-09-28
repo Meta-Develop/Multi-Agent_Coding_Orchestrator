@@ -1202,7 +1202,14 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
         write_injected_assignment_report(command, &child_a);
         write_injected_usage(command, 7, 3);
         set_dispatch_pre_runner_fault(AgentRole::Auditor);
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        retain_priced_single_turn_fixture(
+            &mut run,
+            command,
+            "priced-model",
+            &fs::read(&command.json_log).expect("complete child capture"),
+        );
+        run
     };
 
     let report = run_supervisor_plan_with_budget_and_runner(
@@ -1893,6 +1900,14 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
         if capture_limit > transcript.len() {
             assert_eq!(run.stdout.text.chars().count(), 32 * 1024);
             assert_eq!(run.stdout_bytes(), transcript.as_bytes());
+        }
+        if !run.stdout.raw_capture_truncated() {
+            retain_priced_single_turn_fixture(
+                &mut run,
+                &command,
+                "priced-model",
+                capture.stdout.as_bytes(),
+            );
         }
         if !retain_log {
             fs::remove_file(&command.json_log).expect("exercise held stdout fallback");

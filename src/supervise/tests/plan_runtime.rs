@@ -4623,7 +4623,21 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             write_injected_assignment_report(command, &assignment);
             write_injected_usage(command, 50, 10);
         }
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        if name.contains("review-auditor") {
+            let observed_model = if name.contains("lens-0") {
+                "model-alpha"
+            } else {
+                "model-beta"
+            };
+            retain_priced_single_turn_fixture(
+                &mut run,
+                command,
+                observed_model,
+                &fs::read(&command.json_log).expect("complete lens capture"),
+            );
+        }
+        run
     };
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,
