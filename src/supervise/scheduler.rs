@@ -207,6 +207,17 @@ fn take_force_degraded_checkpoint_finalization() -> bool {
 }
 
 #[cfg(test)]
+thread_local! {
+    static LIVE_GRANT_ADMISSION_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<usize>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_live_grant_admission_observer(sender: std::sync::mpsc::Sender<usize>) {
+    LIVE_GRANT_ADMISSION_OBSERVER.with(|observer| *observer.borrow_mut() = Some(sender));
+}
+
+#[cfg(test)]
 fn admission_commit_abort_injections(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, usize>> {
     static INJECTIONS: std::sync::OnceLock<
@@ -1912,6 +1923,22 @@ fn run_serial_assignment_schedule(
     Ok(())
 }
 
+// Preparation rendezvous in budget tests must also wake when a participant
+// returns early or unwinds, before the scoped scheduler joins its workers.
+#[cfg(test)]
+struct BudgetAdmissionTestCompletion<'a> {
+    run_id: &'a str,
+    owner: &'a str,
+    stage: &'static str,
+}
+
+#[cfg(test)]
+impl Drop for BudgetAdmissionTestCompletion<'_> {
+    fn drop(&mut self) {
+        observe_budget_admission_for_test(self.run_id, self.stage, self.owner);
+    }
+}
+
 fn run_concurrent_assignment_schedule(
     context: &AssignmentSchedulerContext<'_, '_>,
     progress: &mut SchedulerProgress,
@@ -1923,6 +1950,12 @@ fn run_concurrent_assignment_schedule(
         .is_none()
         .then(|| scheduler_preclaim_evidence(context));
     thread::scope(|scope| -> Result<()> {
+        #[cfg(test)]
+        let _test_completion = BudgetAdmissionTestCompletion {
+            run_id: context.options.run_id.as_str(),
+            owner: "scheduler",
+            stage: "scheduler_finished",
+        };
         let (completion_sender, completion_receiver) = mpsc::channel::<usize>();
         let mut pending = (0..context.plan.assignments.len()).collect::<BTreeSet<_>>();
         let mut active = BTreeMap::new();
@@ -1945,11 +1978,23 @@ fn run_concurrent_assignment_schedule(
                         stop_scheduling = true;
                         break;
                     }
-                    let budget_report = context
+                    let (budget_report, waiting_for_live_grant) = context
                         .budget_ledger
-                        .report()
+                        .concurrent_admission_report()
                         .context("failed to inspect run budget before concurrent admission")?;
                     if !budget_report.new_dispatch_allowed {
+                        #[cfg(test)]
+                        LIVE_GRANT_ADMISSION_OBSERVER.with(|observer| {
+                            if let Some(sender) = observer.borrow_mut().take() {
+                                let _ = sender.send(budget_report.reserved.tokens);
+                            }
+                        });
+                        if waiting_for_live_grant && !active.is_empty() {
+                            // The admission handshake already bound the active child's grant.
+                            // Wait for its settlement to release unused capacity; do not deny
+                            // pending work or cancel the ordinary running turn.
+                            break;
+                        }
                         progress.budget_prevented_dispatch |= !pending.is_empty();
                         progress
                             .budget_denied_assignment_indices
@@ -2035,6 +2080,12 @@ fn run_concurrent_assignment_schedule(
                     let prior_binding = super::prior_input::captured_binding();
                     let runtime_binding = super::runtime_executables::captured_binding();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
+                        #[cfg(test)]
+                        let _test_completion = BudgetAdmissionTestCompletion {
+                            run_id: context.options.run_id.as_str(),
+                            owner: &assignment.id,
+                            stage: "assignment_finished",
+                        };
                         let _prior_binding_guard =
                             super::prior_input::install_captured(prior_binding);
                         let _runtime_binding_guard =
@@ -2127,8 +2178,20 @@ fn run_concurrent_assignment_schedule(
                                     assignment.id
                                 ));
                             }
+                            #[cfg(test)]
+                            observe_budget_admission_for_test(
+                                context.options.run_id.as_str(),
+                                "admission_committed",
+                                &assignment.id,
+                            );
                         }
                         Err(error) => {
+                            #[cfg(test)]
+                            observe_budget_admission_for_test(
+                                context.options.run_id.as_str(),
+                                "assignment_finished",
+                                &assignment.id,
+                            );
                             cancellation.cancel();
                             record_assignment_spawn_failure(
                                 &mut progress.indexed_outcomes,
@@ -2159,6 +2222,12 @@ fn run_concurrent_assignment_schedule(
                 bail!("supervisor scheduler could not select a hierarchy-ready pending assignment");
             }
 
+            #[cfg(test)]
+            observe_budget_admission_for_test(
+                context.options.run_id.as_str(),
+                "scheduler_draining",
+                "scheduler",
+            );
             let completed_index = match completion_receiver.recv() {
                 Ok(index) => index,
                 Err(error) => {
@@ -2198,13 +2267,14 @@ fn run_concurrent_assignment_schedule(
                         stop_scheduling = true;
                     }
                 }
+                let (budget_report, waiting_for_live_grant) = context
+                    .budget_ledger
+                    .concurrent_admission_report()
+                    .context("failed to inspect run budget after concurrent dispatch")?;
                 if outcome.budget_dispatch_stopped
                     || (!pending.is_empty()
-                        && !context
-                            .budget_ledger
-                            .report()
-                            .context("failed to inspect run budget after concurrent dispatch")?
-                            .new_dispatch_allowed)
+                        && !budget_report.new_dispatch_allowed
+                        && (active.is_empty() || !waiting_for_live_grant))
                 {
                     progress.budget_prevented_dispatch = true;
                     progress
