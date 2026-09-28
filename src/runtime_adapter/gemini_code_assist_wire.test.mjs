@@ -431,3 +431,65 @@ test("exact source fingerprint is required and unknown client shapes cannot inst
   assert.throws(() => attachCodeAssist0412({ client: { request() {} } }, unit, bytes), /unsupported_method_shape/);
   assert.equal(unit.snapshot().attempts.length, 0);
 });
+
+test("explicit OAuth refresh requires separate admission and never exports its tokens", async () => {
+  for (const allowed of [true, false]) {
+    const events = []; let sends = 0;
+    const unit = createCodeAssistWireUnit({ parent: {
+      admit: async (event) => { events.push(event); return allowed; },
+      record: async (event) => { events.push(event); return true; },
+    } });
+    const transport = unit.wrapTransport(async (options) => {
+      sends++;
+      assert.equal(options.retry, false);
+      assert.equal(options.adapter, undefined);
+      assert.equal(options.fetchImplementation, undefined);
+      return { status: 200, data: body(JSON.stringify({ access_token: "never-export-secret", token_type: "Bearer", expires_in: 3600 })) };
+    }, () => {}, { oauthRefresh: true });
+    const pending = unit.request("unary", () => transport({
+      url: "https://oauth2.googleapis.com/token", method: "POST",
+      data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret",
+      adapter: () => assert.fail("hidden adapter"), fetchImplementation: () => assert.fail("hidden fetch"),
+    }));
+    if (allowed) assert.equal((await pending).data.access_token, "never-export-secret");
+    else await assert.rejects(pending);
+    assert.equal(sends, allowed ? 1 : 0);
+    assert.equal(events[0].requestClass, "oauth_refresh");
+    assert.doesNotMatch(JSON.stringify(events), /never-export-secret|client_secret|refresh_token/);
+    assert.equal(unit.snapshot().attempts[0].usageLowerBound, null);
+    assert.equal(unit.snapshot().attempts[0].qualified, false);
+  }
+});
+
+test("malformed refresh, duplicate grants and arbitrary non-generation URLs have no send authority", async () => {
+  for (const patch of [
+    { url: "https://oauth2.googleapis.com/token?copy=1" },
+    { url: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" },
+    { data: "grant_type=refresh_token&grant_type=refresh_token&client_id=owned&client_secret=secret" },
+    { data: "grant_type=authorization_code&refresh_token=secret&client_id=owned&client_secret=secret" },
+  ]) {
+    let sends = 0;
+    const unit = createCodeAssistWireUnit({ parent: { admit: async () => true, record: async () => true } });
+    const transport = unit.wrapTransport(async () => { sends++; }, () => {}, { oauthRefresh: true });
+    await assert.rejects(unit.request("unary", () => transport({
+      url: "https://oauth2.googleapis.com/token", method: "POST",
+      data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret", ...patch,
+    })));
+    assert.equal(sends, 0); assert.equal(unit.snapshot().stopped, true);
+  }
+});
+
+test("cancellation interrupts an uncooperative refresh body without claiming quiescence", async () => {
+  let started;
+  const reading = new Promise((resolve) => { started = resolve; });
+  const unit = createCodeAssistWireUnit({ parent: { admit: async () => true, record: async () => true } });
+  const transport = unit.wrapTransport(async () => ({ status: 200, data: {
+    [Symbol.asyncIterator]() { return this; }, next() { started(); return new Promise(() => {}); },
+  } }), () => {}, { oauthRefresh: true });
+  const pending = unit.request("unary", () => transport({ url: "https://oauth2.googleapis.com/token", method: "POST",
+    data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret" }));
+  await reading; unit.cancel(); await assert.rejects(pending);
+  assert.equal(unit.snapshot().activeCalls, 0);
+  assert.equal(unit.snapshot().attempts[0].terminal, "transport_error");
+  assert.equal(unit.snapshot().attempts[0].quiescence, "unproven");
+});

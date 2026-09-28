@@ -115,7 +115,7 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
   }
   function observation(attempt) {
     return {
-      callId: attempt.call.id, attemptId: attempt.id, mode: attempt.call.mode,
+      callId: attempt.call.id, attemptId: attempt.id, mode: attempt.call.mode, requestClass: attempt.requestClass ?? "generation",
       released: attempt.released, terminal: attempt.terminal,
       terminalAck: attempt.terminalAck,
       frames: attempt.frames, wireBytes: attempt.bytes,
@@ -331,15 +331,23 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
 
   // Low-level dependency-injection interface for offline tests / a future owned
   // bootstrap. Supplying callbacks here does not authenticate vendor execution.
-  function wrapTransport(original, verifyShape = () => {}) {
+  function wrapTransport(original, verifyShape = () => {}, { oauthRefresh = false, offlineTestFetch } = {}) {
     if (typeof original !== "function") throw fault("transport_shape");
     return async function (options) {
       const call = context.getStore();
       if (!call || !calls.has(call.id)) { cancel(); throw fault("unscoped_send"); }
       active(call);
-      try { verifyShape(); } catch { cancel(); throw fault("transport_shape_changed"); }
+      try { verifyShape(this); } catch { cancel(); throw fault("transport_shape_changed"); }
       const method = call.mode === "unary" ? "generateContent" : "streamGenerateContent";
-      if (options?.url !== endpoint + method || options.method !== "POST") {
+      const refresh = oauthRefresh && options?.url === "https://oauth2.googleapis.com/token"
+        && options.method === "POST" && typeof options.data === "string"
+        && new URLSearchParams(options.data).get("grant_type") === "refresh_token"
+        && [...new URLSearchParams(options.data).keys()].every((key) =>
+          ["grant_type", "refresh_token", "client_id", "client_secret"].includes(key))
+        && options.data.length <= bounds.maxFrameBytes
+        && ["grant_type", "refresh_token", "client_id", "client_secret"].every((key) =>
+          new URLSearchParams(options.data).getAll(key).length === 1 && new URLSearchParams(options.data).get(key));
+      if (!refresh && (options?.url !== endpoint + method || options.method !== "POST")) {
         cancel();
         throw fault("unexpected_send");
       }
@@ -347,6 +355,7 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
       const attempt = {
         id: nextAttempt, call, released: false, terminal: null, terminalAck: null, frames: 0,
         bytes: 0, usage: null, model: null, lowerBound: null, sawFinish: false,
+        requestClass: refresh ? "oauth_refresh" : "generation",
       };
       attempts.set(attempt.id, attempt);
       try {
@@ -354,12 +363,13 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
         active(call);
         await acknowledge(parent.record, { kind: "release", ...observation(attempt) });
         active(call);
-        verifyShape();
+        verifyShape(this);
         // 0.41.2's Gaxios merges defaults. Refuse nonempty defaults/interceptors
         // in the bound adapter and overwrite BOTH retry switches on EVERY send.
         // Redirects could also replay POST below this boundary: refuse those.
         const safe = {
           ...options, signal: call.controller.signal, responseType: "stream",
+          adapter: undefined, fetchImplementation: offlineTestFetch,
           retry: false, retryConfig: { retry: 0, noResponseRetries: 0 },
           maxRedirects: 0, redirect: "error", maxContentLength: bounds.maxResponseBytes,
           validateStatus: () => true,
@@ -376,6 +386,26 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
           const error = fault("http_error");
           error.response = { status: response.status, config: { data: options.data } };
           throw error;
+        }
+        if (refresh) {
+          const chunks = [];
+          const iterator = response.data?.[Symbol.asyncIterator]?.();
+          if (!iterator) throw fault("refresh_body_shape");
+          while (true) {
+            const step = await untilAbort(iterator.next(), call.controller.signal);
+            if (step.done) break;
+            const chunk = step.value;
+            if (!(chunk instanceof Uint8Array)) throw fault("refresh_body_shape");
+            attempt.bytes += chunk.byteLength;
+            if (attempt.bytes > Math.min(bounds.maxFrameBytes, bounds.maxResponseBytes)) throw fault("refresh_body_limit");
+            chunks.push(chunk);
+          }
+          const data = parseEnvelope(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+          if (!plain(data) || typeof data.access_token !== "string" || !data.access_token
+              || data.token_type !== "Bearer" || !Number.isSafeInteger(data.expires_in)
+              || data.expires_in < 1) throw fault("refresh_response_shape");
+          await finish(attempt, "eof");
+          return { ...response, data };
         }
         if (call.mode === "stream") return { ...response, data: stream(attempt, response.data) };
         let envelope;
@@ -440,11 +470,19 @@ const signatures = {
   gaxiosResponse: "a9f008d139bf89ca2136210bb2b4c3d27da1e57ec131ad02915fa061a079b8ed",
 };
 
-export function attachCodeAssist0412(server, unit, sourceBytes) {
+const clientBindings = new WeakMap();
+export function bindCodeAssistClient0412(client, unit, sourceBytes, { offlineTestFetch } = {}) {
   if (!(sourceBytes instanceof Uint8Array) || hash(sourceBytes) !== CODE_ASSIST_SOURCE.sha256) {
     throw fault("source_binding");
   }
-  const client = server?.client;
+  const existing = clientBindings.get(client);
+  if (existing) {
+    if (existing.unit !== unit || (offlineTestFetch && existing.offlineTestFetch !== offlineTestFetch)) {
+      existing.unit.cancel(); unit.cancel(); throw fault("client_owner_drift");
+    }
+    existing.verify();
+    return existing;
+  }
   const transporter = client?.transporter;
   const gaxios = transporter?.instance;
   const original = transporter?.request;
@@ -460,19 +498,43 @@ export function attachCodeAssist0412(server, unit, sourceBytes) {
         throw fault("unsupported_method_shape");
       }
     }
-    if (server.client !== client || client.transporter !== transporter || transporter.instance !== gaxios
+    if (client.transporter !== transporter || transporter.instance !== gaxios
+        || client.refreshHandler != null
         || !plain(gaxios.defaults) || Reflect.ownKeys(gaxios.defaults).length !== 0
         || !(gaxios.interceptors?.request instanceof Set) || gaxios.interceptors.request.size !== 0
         || !(gaxios.interceptors?.response instanceof Set) || gaxios.interceptors.response.size !== 0) {
       throw fault("unsupported_transport_shape");
     }
   }
-  verify({ ...methods(), post: server.requestPost, stream: server.requestStreamingPost });
-  for (const [object, key] of [[server, "requestPost"], [server, "requestStreamingPost"], [transporter, "request"]]) {
-    if (!Object.isExtensible(object) || Object.hasOwn(object, key)) throw fault("already_bound");
-  }
-  const wrapped = unit.wrapTransport(original, () => verify(methods()));
+  verify(methods());
+  if (!Object.isExtensible(transporter) || Object.hasOwn(transporter, "request")) throw fault("already_bound");
+  let wrapped;
+  const recheck = (receiver) => {
+    if (receiver !== undefined && receiver !== transporter) throw fault("transport_receiver");
+    verify(methods());
+    if (transporter.request !== wrapped) throw fault("transport_owner_drift");
+  };
+  wrapped = unit.wrapTransport(original, recheck, { oauthRefresh: true, offlineTestFetch });
   Object.defineProperty(transporter, "request", { value: wrapped });
+  const binding = Object.freeze({ unit, offlineTestFetch, verify: recheck });
+  clientBindings.set(client, binding);
+  return binding;
+}
+
+export function attachCodeAssist0412(server, unit, sourceBytes) {
+  if (!(sourceBytes instanceof Uint8Array) || hash(sourceBytes) !== CODE_ASSIST_SOURCE.sha256) throw fault("source_binding");
+  for (const [key, signature] of [["requestPost", "post"], ["requestStreamingPost", "stream"]]) {
+    if (!Object.isExtensible(server) || Object.hasOwn(server, key)
+        || typeof server[key] !== "function" || hash(Function.prototype.toString.call(server[key])) !== signatures[signature]) {
+      throw fault("unsupported_method_shape");
+    }
+  }
+  const client = server.client;
+  const binding = bindCodeAssistClient0412(client, unit, sourceBytes);
+  const verify = () => {
+    if (server.client !== client) throw fault("client_owner_drift");
+    binding.verify();
+  };
   function install(key, method, mode) {
     Object.defineProperty(server, key, { value: async function (selected, req, signal) {
       if (this !== server || selected !== method || !plain(req)
@@ -480,7 +542,7 @@ export function attachCodeAssist0412(server, unit, sourceBytes) {
         unit.cancel();
         throw fault("unsupported_call");
       }
-      try { verify(methods()); } catch { unit.cancel(); throw fault("transport_shape_changed"); }
+      try { verify(); } catch { unit.cancel(); throw fault("transport_shape_changed"); }
       return unit.request(mode, async (ownedSignal) => {
         const result = await Reflect.apply(client.request, client, [{
           url: endpoint + method, method: "POST", responseType: "stream",
