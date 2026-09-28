@@ -155,6 +155,26 @@ impl WorkerRequestIpc {
             .map_err(|_| anyhow::anyhow!("worker inbox lock is poisoned"))
     }
 
+    /// Moves the inbox out. A poisoned mutex returns that inbox inside the poison
+    /// error and is not a successful unlock.
+    pub(in crate::supervise) fn into_inbox_retaining(
+        self,
+    ) -> std::result::Result<
+        WorkerRequestInbox<RepositoryAuthenticator>,
+        Box<std::sync::PoisonError<WorkerRequestInbox<RepositoryAuthenticator>>>,
+    > {
+        self.inbox.into_inner().map_err(Box::new)
+    }
+
+    /// Poisons the live inbox mutex. The poison is left in place for shutdown.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(in crate::supervise) fn poison_inbox_for_test(&self) {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _guard = self.inbox.lock().unwrap();
+            panic!("deliberate worker inbox lock poison");
+        }));
+    }
+
     fn session<'a>(
         &self,
         factory: &'a SupervisorMessagingSessionFactory,
