@@ -887,6 +887,13 @@ impl SystemdUnit {
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
         let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        if let Some(sandbox) = &self.sandbox {
+            // The verified read-only mount owns the inode now. Remove the private
+            // host pathname before releasing any target; retain only read handles.
+            for snapshot in &sandbox.read_only_input_snapshots {
+                snapshot.unlink_before_release()?;
+            }
+        }
         remove_file_if_present(&self.environment_file).map_err(|error| {
             std::io::Error::new(
                 error.kind(),

@@ -2083,6 +2083,20 @@ fn prepare_child_attempt<'a>(
     } else {
         attempt_prompt
     };
+    let source_inputs = assignment_metadata
+        .source_inputs
+        .get(&assignment.id)
+        .cloned()
+        .unwrap_or_default();
+    let attempt_prompt = if source_inputs.is_empty() {
+        attempt_prompt
+    } else {
+        crate::external_agent::researcher_inputs::validate_snapshot(
+            &worktree.path,
+            &source_inputs,
+        )?;
+        format!("{attempt_prompt}\n\nOperator-declared read-only source inputs (relative to this managed workspace):\n{}\nInspect these exact files. Hash/visibility receipts prove preparation only, not source inspection or acceptance. Do not infer access to any external path from prose.\n", serde_json::to_string_pretty(&source_inputs)?)
+    };
     measurements.record_final_launch_prompt_bytes(&attempt_prompt)?;
     let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&prompt_relative);
@@ -2160,6 +2174,10 @@ fn prepare_child_attempt<'a>(
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
     };
+    for input in &source_inputs {
+        command = command.with_read_only_input_file(worktree.path.join(&input.path));
+    }
+    command.researcher_source_inputs = source_inputs;
     command = command.with_writable_launch_target(match execution_target {
         Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
             crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree

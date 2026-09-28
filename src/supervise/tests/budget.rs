@@ -2919,3 +2919,135 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
         }
     }
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_source_inputs_local_refusal_settles_not_started_but_unknown_helper_is_conservative(
+) -> Result<()> {
+    use crate::external_agent::researcher_inputs::tests::{failed_local_probe, fixture};
+    for unknown_helper in [false, true] {
+        let (_root, mut command) = fixture()?;
+        command.model = Some("gpt-5.6-sol".into());
+        let plan = injected_plan(injected_assignment(false), 0);
+        let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
+        budget
+            .role_token_reservations
+            .insert(AgentRole::Researcher, 50);
+        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Researcher, SupervisorRuntime::Codex),
+            &command,
+        )?
+        else {
+            panic!("admission");
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Codex)?;
+        let run = failed_local_probe(&command, unknown_helper)?;
+        assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert!(settlement.observed_usage.is_none());
+        assert!(settlement.cost_usd.is_none());
+        let report = ledger.report()?;
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(report.reserved.tokens, 0);
+        if unknown_helper {
+            assert_eq!(settlement.reliability, DispatchUsageReliability::Missing);
+            assert_eq!(report.consumed.tokens, 50);
+            assert!(!report.new_dispatch_allowed);
+        } else {
+            assert_eq!(settlement.reliability, DispatchUsageReliability::NotStarted);
+            assert_eq!(report.consumed.tokens, 0);
+            assert!(report.new_dispatch_allowed);
+            assert!(settlement
+                .role_sample(AgentRole::Researcher, None)
+                .is_none());
+            // A public wire receipt never restores the private no-release proof.
+            let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
+            assert!(external_dispatch_may_have_started(
+                &restored,
+                SupervisorRuntime::Codex
+            ));
+        }
+        assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+        assert_eq!(
+            ledger.report()?.consumed.tokens,
+            if unknown_helper { 50 } else { 0 }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_quiescent_prelaunch(
+) -> Result<()> {
+    use crate::external_agent::researcher_inputs::tests::{fixture, late_source_refusal};
+    for (mutation, unknown_helper) in [
+        ("changed", false),
+        ("missing", false),
+        ("rebound", false),
+        ("changed", true),
+    ] {
+        let (_root, mut command) = fixture()?;
+        command.model = Some("gpt-5.6-sol".into());
+        let plan = injected_plan(injected_assignment(false), 0);
+        let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
+        budget
+            .role_token_reservations
+            .insert(AgentRole::Researcher, 50);
+        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Researcher, SupervisorRuntime::Codex),
+            &command,
+        )?
+        else {
+            panic!("admission");
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Codex)?;
+        let run = late_source_refusal(&command, mutation, unknown_helper)?;
+        assert!(run
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("source input changed before target release")));
+        assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+        assert!(!run.publishable);
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert!(settlement.observed_usage.is_none());
+        assert!(settlement.cost_usd.is_none());
+        assert!(settlement
+            .role_sample(AgentRole::Researcher, None)
+            .is_none());
+        assert_eq!(
+            settlement.reliability,
+            if unknown_helper {
+                DispatchUsageReliability::Missing
+            } else {
+                DispatchUsageReliability::NotStarted
+            }
+        );
+        let report = ledger.report()?;
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(report.reserved.tokens, 0);
+        assert_eq!(report.consumed.tokens, if unknown_helper { 50 } else { 0 });
+        assert_eq!(report.new_dispatch_allowed, !unknown_helper);
+        assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+        assert_eq!(ledger.report()?.consumed.tokens, report.consumed.tokens);
+        // Public serialization, including a forged witness key, cannot restore
+        // the private proof that only local quiescent probes have run.
+        let mut wire = serde_json::to_value(&run)?;
+        wire["local_source_probe_refusal_quiescent"] = serde_json::json!(true);
+        let restored: ExternalAgentRun = serde_json::from_value(wire)?;
+        assert!(!restored.source_probe_confirmed_no_provider_release());
+        assert!(external_dispatch_may_have_started(
+            &restored,
+            SupervisorRuntime::Codex
+        ));
+    }
+    Ok(())
+}
