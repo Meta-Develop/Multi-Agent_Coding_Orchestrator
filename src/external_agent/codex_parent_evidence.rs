@@ -176,15 +176,15 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
     codex_home: &SecureOutputRoot,
 ) -> CodexParentEvidence {
     let Some(outcome) = outcome else {
-        return codex_parent_evidence_from_stream(inputs, Err(()), codex_home);
+        let mut evidence = codex_parent_evidence_from_stream(inputs, Err(()), codex_home);
+        evidence.resolution_status = CodexParentResolutionStatus::TurnFailed.label().to_string();
+        return evidence;
     };
-    let reroute = match outcome.reroute_message.as_deref() {
-        Some(message) => match parse_reroute_message(message) {
-            Some(reroute) => Some(reroute),
-            None => return codex_parent_evidence_from_stream(inputs, Err(()), codex_home),
-        },
-        None => None,
-    };
+    let reroute = outcome
+        .reroute_message
+        .as_deref()
+        .and_then(parse_reroute_message);
+    let invalid_reroute = outcome.reroute_message.is_some() && reroute.is_none();
     let start_model = if outcome.resolved_model.is_empty() || outcome.resolved_model.len() > 256 {
         CodexParentResolvedField::Unknown
     } else {
@@ -197,6 +197,7 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
         .map(|effort| CodexParentResolvedField::Known(effort.to_string()))
         .unwrap_or(CodexParentResolvedField::Unknown);
     let observed_model = match &reroute {
+        _ if invalid_reroute => CodexParentResolvedField::Unknown,
         Some(reroute) => CodexParentResolvedField::Known(reroute.to.clone()),
         None => start_model.clone(),
     };
@@ -208,7 +209,8 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
     if inputs.codex_version.is_none() {
         status = status.min(CodexParentResolutionStatus::VersionMismatch);
     }
-    if matches!(start_model, CodexParentResolvedField::Unknown)
+    if invalid_reroute
+        || matches!(start_model, CodexParentResolvedField::Unknown)
         || matches!(start_effort, CodexParentResolvedField::Unknown)
         || reroute
             .as_ref()
@@ -220,10 +222,7 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
         status = status.min(CodexParentResolutionStatus::TurnFailed);
     }
     let turn_usage = match outcome.token_usage {
-        Some(usage)
-            if outcome.status == TurnTerminalStatus::Completed
-                && (usage.input_tokens > 0 || usage.output_tokens > 0) =>
-        {
+        Some(usage) if usage.input_tokens > 0 || usage.output_tokens > 0 => {
             CodexParentTurnUsage::Known {
                 input_tokens: usage.input_tokens,
                 output_tokens: usage.output_tokens,
@@ -236,7 +235,7 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
                 status = status.min(CodexParentResolutionStatus::UsageUnavailable);
             }
             CodexParentTurnUsage::Unknown {
-                reason: "the completed app-server turn had no nonzero correlated cumulative usage"
+                reason: "the app-server turn had no nonzero correlated cumulative usage"
                     .to_string(),
             }
         }
@@ -855,6 +854,7 @@ mod tests {
             requested_effort: Some("xhigh"),
         };
         let mut outcome = AppServerOutcome {
+            protocol_error: None,
             thread_id: "ephemeral-thread".to_string(),
             turn_id: "ephemeral-turn".to_string(),
             status: TurnTerminalStatus::Completed,

@@ -7,6 +7,24 @@ pub(super) fn reserve_dispatch_budget<'a>(
     role: AgentRole,
     command: &ExternalAgentCommand,
 ) -> Result<DispatchBudgetAdmission<'a>> {
+    reserve_dispatch_budget_cancellable(
+        plan,
+        budget_config,
+        ledger,
+        role,
+        command,
+        &ProcessCancellation::default(),
+    )
+}
+
+pub(super) fn reserve_dispatch_budget_cancellable<'a>(
+    plan: &SupervisorPlan,
+    budget_config: &SupervisorBudgetConfig,
+    ledger: &'a RunBudgetLedger,
+    role: AgentRole,
+    command: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> Result<DispatchBudgetAdmission<'a>> {
     let tokens = budget_config.reservation_tokens(role).with_context(|| {
         format!(
             "run_budget has no token reservation for dispatched role '{}'",
@@ -26,12 +44,33 @@ pub(super) fn reserve_dispatch_budget<'a>(
             tokens as f64 * conservative_rate / TOKENS_PER_MILLION
         })
         .filter(|cost| cost.is_finite());
+    #[cfg(test)]
+    let mut admission_checks = 0;
     match ledger
-        .reserve(BudgetReservationRequest {
-            role,
-            tokens,
-            cost_usd,
-        })
+        .reserve_waiting_for_live_grants(
+            BudgetReservationRequest {
+                role,
+                tokens,
+                cost_usd,
+            },
+            command.timeout,
+            || {
+                #[cfg(test)]
+                {
+                    admission_checks += 1;
+                    if admission_checks == 2 {
+                        if let Some(identity) = &command.agent_lifecycle {
+                            observe_budget_admission_for_test(
+                                &identity.run_id,
+                                "waiting_for_grant",
+                                &identity.task_id,
+                            );
+                        }
+                    }
+                }
+                cancellation.is_cancelled()
+            },
+        )
         .context("run budget admission failed")?
     {
         BudgetAdmission::Admitted { reservation, .. } => Ok(DispatchBudgetAdmission::Admitted(

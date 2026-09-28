@@ -2258,12 +2258,13 @@ fn prepare_child_attempt<'a>(
             }
         };
     }
-    let budget_reservation = match reserve_dispatch_budget(
+    let budget_reservation = match reserve_dispatch_budget_cancellable(
         &budget_plan,
         budget_config,
         budget_ledger,
         assignment.role,
         &command,
+        &context.cancellation,
     )? {
         DispatchBudgetAdmission::Admitted(reservation) => reservation,
         DispatchBudgetAdmission::Refused(refusal) => {
@@ -2284,6 +2285,13 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    if command.uses_live_app_server_budget() {
+        command.bind_live_token_grant(
+            budget_reservation
+                .ledger
+                .live_token_grant(budget_reservation.reservation.id)?,
+        );
+    }
     let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
@@ -4334,12 +4342,19 @@ fn prepare_parent_auditor<'a>(
         })?;
         bail!("descriptor-held auditor scratch roots changed during setup");
     }
-    let auditor_budget_reservation = match reserve_dispatch_budget(
+    #[cfg(test)]
+    observe_budget_admission_for_test(
+        options.run_id.as_str(),
+        "before_review_admission",
+        &assignment.id,
+    );
+    let auditor_budget_reservation = match reserve_dispatch_budget_cancellable(
         plan,
         budget_config,
         budget_ledger,
         AgentRole::Auditor,
         &auditor_command,
+        &context.cancellation,
     )? {
         DispatchBudgetAdmission::Admitted(reservation) => reservation,
         DispatchBudgetAdmission::Refused(refusal) => {
@@ -4387,6 +4402,13 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
+    if auditor_command.uses_live_app_server_budget() {
+        auditor_command.bind_live_token_grant(
+            auditor_budget_reservation
+                .ledger
+                .live_token_grant(auditor_budget_reservation.reservation.id)?,
+        );
+    }
     let grant = admit_parent_auditor_process_intent(
         options.run_id.as_str(),
         auditor_id.as_str(),
