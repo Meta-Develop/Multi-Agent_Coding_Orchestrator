@@ -521,6 +521,287 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
         .contains("run budget stopped one or more new dispatches")));
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn budget_integration_concurrent_scheduler_waits_for_full_live_grant_and_resumes() {
+    exercise_live_grant_scheduler(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn budget_integration_parent_reviews_wait_for_another_live_grant() {
+    exercise_live_grant_scheduler(true);
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_live_grant_scheduler(interleave_review: bool) {
+    use crate::external_agent::codex_app_server::{
+        CommandExecutionEvidence, CommandExecutionObservation, CommandExecutionSnapshot,
+        CommandExecutionStatus, TurnTerminalStatus,
+    };
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+    };
+
+    let _capability = install_budget_fixture_models();
+    let (temp, repo_path) = injected_repository();
+    let assignments = ["a.txt", "b.txt"]
+        .into_iter()
+        .enumerate()
+        .map(|(index, path)| {
+            let mut assignment = injected_named_assignment(&format!("research-{index}"), path);
+            assignment.role = AgentRole::Researcher;
+            assignment.role_category = Some(RoleCategory::ReadOnlyResearcher);
+            assignment
+        })
+        .collect::<Vec<_>>();
+    let mut plan = injected_multi_plan(assignments.clone(), 0);
+    if interleave_review {
+        plan.review_lenses = default_supervisor_review_lenses();
+    }
+    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    plan.role_models.insert(
+        AgentRole::Researcher,
+        plan.role_models[&AgentRole::ChildOrchestrator].clone(),
+    );
+    let mut budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 1_000);
+    budget
+        .role_token_reservations
+        .insert(AgentRole::Researcher, 16_384);
+    let run_id = if interleave_review {
+        "budget-live-review-interleave"
+    } else {
+        "budget-live-grant-admission"
+    };
+    let options = injected_options(&repo_path, temp.path(), run_id);
+    let (sender, receiver) = std::sync::mpsc::channel();
+    if !interleave_review {
+        crate::supervise::scheduler::set_live_grant_admission_observer(sender);
+    }
+    let receiver = std::sync::Mutex::new(receiver);
+    // Setup includes real containment/worktree preparation. Synchronize on its
+    // completion (or an explicit participant exit), not a wall-clock guess.
+    // Only the actual live-grant contention below has a ten-second deadline.
+    let (review_ready_tx, review_ready_rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+    let review_ready_rx = std::sync::Mutex::new(review_ready_rx);
+    let (b_started_tx, b_started_rx) = std::sync::mpsc::channel::<Result<(), &'static str>>();
+    let b_started_rx = std::sync::Mutex::new(b_started_rx);
+    let (a_waiting_tx, a_waiting_rx) = std::sync::mpsc::channel();
+    let a_waiting_rx = std::sync::Mutex::new(a_waiting_rx);
+    let first_review = AtomicUsize::new(0);
+    let b_admitted = std::sync::atomic::AtomicBool::new(false);
+    let waiting_observations = Arc::new(AtomicUsize::new(0));
+    let _hook = interleave_review.then(|| {
+        let waiting_observations = Arc::clone(&waiting_observations);
+        let b_preparation_tx = b_started_tx.clone();
+        install_budget_admission_test_hook(
+            run_id,
+            Arc::new(move |stage, owner| match stage {
+                "admission_committed" if owner == "research-0" => {
+                    review_ready_rx
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .expect("A preparation lifecycle remains connected")
+                        .expect("A reached mandatory review after settlement");
+                }
+                "admission_committed" if owner == "research-1" => {
+                    b_admitted.store(true, Ordering::SeqCst);
+                }
+                "before_review_admission"
+                    if owner == "research-0"
+                        && first_review.fetch_add(1, Ordering::SeqCst) == 0 =>
+                {
+                    review_ready_tx.send(Ok(())).unwrap();
+                    b_started_rx
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .expect("B preparation lifecycle remains connected")
+                        .expect("B holds remaining grant");
+                }
+                "waiting_for_grant" if owner.starts_with("research-0") => {
+                    waiting_observations.fetch_add(1, Ordering::SeqCst);
+                    a_waiting_tx.send(()).unwrap();
+                }
+                "assignment_finished" if owner == "research-0" => {
+                    let _ = review_ready_tx.send(Err("A exited before mandatory review"));
+                }
+                "assignment_finished" if owner == "research-1" => {
+                    let _ = b_preparation_tx.send(Err("B exited before holding its live grant"));
+                }
+                "scheduler_draining" if !b_admitted.load(Ordering::SeqCst) => {
+                    let _ = b_preparation_tx.send(Err("scheduler drained without admitting B"));
+                }
+                "scheduler_finished" => {
+                    let _ = review_ready_tx.send(Err("scheduler exited during A preparation"));
+                    let _ = b_preparation_tx.send(Err("scheduler exited during B preparation"));
+                }
+                _ => {}
+            }),
+        )
+    });
+    let child_invocations = AtomicUsize::new(0);
+    let audit_invocations = AtomicUsize::new(0);
+    let runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap();
+        let assignment = assignments
+            .iter()
+            .find(|assignment| name.starts_with(&assignment.id))
+            .unwrap();
+        let mut child = injected_child_report(assignment);
+        child.role = AgentRole::Researcher;
+        child.validation_results.clear();
+        let mut inspection = injected_command_record();
+        inspection.command = vec!["git status".to_string()];
+        inspection.cwd = command.cwd.clone();
+        inspection.timeout_seconds = 0;
+        inspection.duration_ms = 0;
+        child.commands_run.push(inspection);
+        child.validation_results.push(ValidationResult {
+            name: "read-only inspection".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: vec!["git status".to_string()],
+            message: None,
+        });
+        if name.contains("review-auditor") {
+            if interleave_review && assignment.id == "research-0" {
+                assert!(
+                    waiting_observations.load(Ordering::SeqCst) > 0,
+                    "A must resume from live-grant admission waiting before any audit runs"
+                );
+            }
+            audit_invocations.fetch_add(1, Ordering::SeqCst);
+            let mut audit = injected_auditor_report(assignment, &child);
+            audit.id = name.strip_suffix(".json").unwrap().to_string();
+            write_injected_json(&command.output_last_message, &audit);
+            write_injected_usage(command, 900, 100);
+            return injected_verified_run(command);
+        }
+        let ordinal = child_invocations.fetch_add(1, Ordering::SeqCst);
+        let grant = command
+            .live_token_grant_for_test()
+            .expect("trusted active grant");
+        if ordinal == 0 {
+            assert_eq!(grant.tokens(), 220_000);
+            // Hold the first turn until the real scheduler has inspected its full
+            // reservation. Without the wait fix, it permanently denies the second child.
+            if !interleave_review {
+                assert_eq!(
+                    receiver
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(Duration::from_secs(10))
+                        .unwrap(),
+                    220_000
+                );
+            }
+        } else {
+            assert!(grant.tokens() > 37_000);
+            assert!(grant.tokens() <= 183_000);
+            if interleave_review {
+                assert_eq!(grant.tokens(), 183_000);
+                b_started_tx.send(Ok(())).unwrap();
+                a_waiting_rx
+                    .lock()
+                    .unwrap()
+                    .recv_timeout(Duration::from_secs(10))
+                    .expect("A actually waits in mandatory review admission");
+            }
+        }
+        assert!(!grant.stopped(), "held capacity must not cancel its owner");
+        let mut wire = serde_json::to_value(&child).unwrap();
+        wire["read_only"] = json!(true);
+        wire["no_further_delegation"] = json!(true);
+        write_injected_json(&command.output_last_message, &wire);
+        let mut run = injected_verified_run(command);
+        let started = CommandExecutionSnapshot {
+            command: "git status".to_string(),
+            cwd: command.cwd.to_string_lossy().into_owned(),
+            status: CommandExecutionStatus::InProgress,
+            exit_code: None,
+        };
+        run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+            thread_id: assignment.id.clone(),
+            turn_id: "turn".to_string(),
+            turn_status: TurnTerminalStatus::Completed,
+            observations: vec![CommandExecutionObservation::Complete {
+                item_id: "inspection".to_string(),
+                completed: CommandExecutionSnapshot {
+                    status: CommandExecutionStatus::Completed,
+                    exit_code: Some(0),
+                    ..started.clone()
+                },
+                started,
+            }],
+        });
+        run.codex_parent_evidence = Some(CodexParentEvidence {
+            codex_version: Some("0.144.4".to_string()),
+            thread_id: Some(assignment.id.clone()),
+            requested_model: command.model.clone(),
+            requested_effort: command.reasoning_effort.clone(),
+            rollout_model: CodexParentResolvedField::Unknown,
+            rollout_effort: CodexParentResolvedField::Unknown,
+            observed_model: CodexParentResolvedField::Known("priced-model".to_string()),
+            observed_effort: CodexParentResolvedField::Known("xhigh".to_string()),
+            server_rerouted_model: None,
+            model_mismatch: false,
+            turn_usage: CodexParentTurnUsage::Known {
+                input_tokens: 35_000,
+                output_tokens: 2_000,
+                cached_input_tokens: 0,
+                reasoning_output_tokens: 0,
+            },
+            resolution_status: "complete".to_string(),
+        });
+        run.retain_app_server_parent_evidence_for_test();
+        run
+    };
+    let report = run_supervisor_plan_with_budget_and_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        budget,
+        options,
+        2,
+        &runner,
+    )
+    .expect("complete pending researcher after live grant settlement");
+    assert_eq!(
+        child_invocations.load(Ordering::SeqCst),
+        2,
+        "{:?}",
+        report.findings
+    );
+    if interleave_review {
+        assert!(waiting_observations.load(Ordering::SeqCst) > 0);
+        assert_eq!(audit_invocations.load(Ordering::SeqCst), 6, "{report:#?}");
+        for child in &report.orchestrator_reports {
+            assert_eq!(child.audit_reports.len(), 3, "{child:#?}");
+            assert!(child.accepted, "{child:#?}");
+        }
+        assert!(report.success, "{report:#?}");
+    }
+    let budget = report.run_budget.unwrap();
+    if interleave_review {
+        assert_eq!(budget.consumed.tokens, 80_000);
+    }
+    assert!(budget.consumed.tokens >= 74_000);
+    assert_eq!(budget.reserved.tokens, 0);
+    assert_eq!(budget.active_reservations, 0);
+    assert!(budget.usage_complete);
+    assert!(budget.new_dispatch_allowed);
+    assert!(!budget
+        .reasons
+        .contains(&BudgetReason::HardTokenCeilingReached));
+    assert!(!report.findings.iter().any(|finding| finding
+        .message
+        .contains("run budget stopped one or more new dispatches")));
+}
+
 #[test]
 fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
     let (temp, repo_path) = injected_repository();
@@ -1366,6 +1647,57 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
         },
         resolution_status: "complete".to_string(),
     });
+    run.retain_app_server_parent_evidence_for_test();
+    assert!(external_process_completed(&run, SupervisorRuntime::Codex));
+    for raw_loss in [false, true] {
+        let mut incomplete = run.clone();
+        let evidence = incomplete.codex_parent_evidence.as_mut().unwrap();
+        evidence.turn_usage = CodexParentTurnUsage::Known {
+            input_tokens: 35_000,
+            output_tokens: 2_000,
+            cached_input_tokens: 30_000,
+            reasoning_output_tokens: 1_000,
+        };
+        if raw_loss {
+            // Legacy/unknown raw provenance is conservatively interpreted as loss.
+            // The contained transport regression separately exercises actual raw loss.
+            incomplete.stdout.truncated = true;
+        } else {
+            evidence.observed_effort = CodexParentResolvedField::Unknown;
+            evidence.resolution_status = "ambiguous".to_string();
+        }
+        incomplete.retain_app_server_parent_evidence_for_test();
+        assert!(!external_process_completed(
+            &incomplete,
+            SupervisorRuntime::Codex
+        ));
+        // No configured ceiling: accounting incompleteness alone must not be the
+        // mechanism that rejects this otherwise-successful process receipt.
+        let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).unwrap();
+        let BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::Researcher,
+                tokens: 16_384,
+                cost_usd: Some(1.0),
+            })
+            .unwrap()
+        else {
+            panic!("admit incomplete receipt fixture")
+        };
+        let mut held = DispatchBudgetReservation {
+            ledger: &ledger,
+            reservation,
+            pricing: None,
+            state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
+        };
+        let settled = held.settle_bound_runtime(&incomplete, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        let charged = ledger.report().unwrap();
+        assert_eq!(charged.consumed.tokens, 37_000);
+        assert!(!charged.usage_complete);
+        assert!(charged.consumed.cost_usd.is_none());
+    }
+
     assert_eq!(
         complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
         Some(32)
@@ -1374,7 +1706,72 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
         .as_mut()
         .expect("parent evidence")
         .resolution_status = "jsonl_invalid".to_string();
-    assert!(complete_external_codex_usage(&run, &command).is_none());
+    assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+    assert_eq!(
+        complete_external_codex_usage(&run, &command)
+            .unwrap()
+            .total_tokens,
+        32
+    );
+    let evidence = run.codex_parent_evidence.as_mut().unwrap();
+    evidence.resolution_status = "turn_failed".to_string();
+    evidence.observed_model = CodexParentResolvedField::Unknown;
+    evidence.turn_usage = CodexParentTurnUsage::Known {
+        input_tokens: 1_287_714,
+        output_tokens: 8_761,
+        cached_input_tokens: 1_219_968,
+        reasoning_output_tokens: 4_288,
+    };
+    run.timed_out = true;
+    run.error = Some("protocol timeout".to_string());
+    run.retain_app_server_parent_evidence_for_test();
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: Some(220_000),
+        ..Default::default()
+    })
+    .unwrap();
+    let BudgetAdmission::Admitted { reservation, .. } = ledger
+        .reserve(BudgetReservationRequest {
+            role: AgentRole::Researcher,
+            tokens: 16_384,
+            cost_usd: Some(1.0),
+        })
+        .unwrap()
+    else {
+        panic!("admission")
+    };
+    let mut held = DispatchBudgetReservation {
+        ledger: &ledger,
+        reservation,
+        pricing: None,
+        state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
+    };
+    assert_eq!(
+        complete_external_codex_usage(&run, &command)
+            .unwrap()
+            .total_tokens,
+        1_296_475
+    );
+    run.codex_parent_evidence.as_mut().unwrap().turn_usage = CodexParentTurnUsage::Known {
+        input_tokens: 1,
+        output_tokens: 1,
+        cached_input_tokens: 0,
+        reasoning_output_tokens: 0,
+    };
+    let settlement = held.settle_bound_runtime(&run, &command).unwrap();
+    assert_eq!(settlement.reliability, DispatchUsageReliability::Estimated);
+    let report = ledger.report().unwrap();
+    assert_eq!(report.consumed.tokens, 1_296_475);
+    assert!(!report.usage_complete);
+    assert!(report.consumed.cost_usd.is_none());
+    assert!(!report.new_dispatch_allowed);
+    assert_eq!(
+        complete_external_codex_usage(&run, &command)
+            .unwrap()
+            .total_tokens,
+        1_296_475,
+        "public tampering must never erase the authenticated billing lower bound"
+    );
 }
 
 #[test]

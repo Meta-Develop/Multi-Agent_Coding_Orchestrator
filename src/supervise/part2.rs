@@ -60,6 +60,50 @@ struct AssignmentExecutionContext<'a, 'writer> {
     external_runner: &'a CancellableExternalRunner<'a>,
 }
 
+#[cfg(test)]
+type BudgetAdmissionTestHook = Arc<dyn Fn(&str, &str) + Send + Sync>;
+
+#[cfg(test)]
+fn budget_admission_test_hooks() -> &'static Mutex<BTreeMap<String, BudgetAdmissionTestHook>> {
+    static HOOKS: std::sync::OnceLock<Mutex<BTreeMap<String, BudgetAdmissionTestHook>>> =
+        std::sync::OnceLock::new();
+    HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+#[cfg(test)]
+struct BudgetAdmissionTestHookGuard(String);
+
+#[cfg(test)]
+impl Drop for BudgetAdmissionTestHookGuard {
+    fn drop(&mut self) {
+        budget_admission_test_hooks().lock().unwrap().remove(&self.0);
+    }
+}
+
+#[cfg(test)]
+fn install_budget_admission_test_hook(
+    run_id: &str,
+    hook: BudgetAdmissionTestHook,
+) -> BudgetAdmissionTestHookGuard {
+    budget_admission_test_hooks()
+        .lock()
+        .unwrap()
+        .insert(run_id.to_string(), hook);
+    BudgetAdmissionTestHookGuard(run_id.to_string())
+}
+
+#[cfg(test)]
+fn observe_budget_admission_for_test(run_id: &str, stage: &str, owner: &str) {
+    let hook = budget_admission_test_hooks()
+        .lock()
+        .unwrap()
+        .get(run_id)
+        .cloned();
+    if let Some(hook) = hook {
+        hook(stage, owner);
+    }
+}
+
 #[derive(Clone)]
 struct AdmissionCommitSignal {
     sender: mpsc::SyncSender<()>,
@@ -148,6 +192,9 @@ impl DispatchBudgetReservation<'_> {
         if self.state != DispatchBudgetReservationState::Reserved {
             bail!("budget reservation was invoked outside its reserved state");
         }
+        if self.ledger.dispatch_stopped() {
+            bail!("run budget stopped before provider invocation");
+        }
         #[cfg(test)]
         if DISPATCH_PRE_RUNNER_FAULT
             .with(|fault| fault.replace(None))
@@ -187,18 +234,34 @@ impl DispatchBudgetReservation<'_> {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
         let usage = complete_external_codex_usage(run, command);
+        // Requested-model pricing is not evidence of the price of an unknown/rerouted model.
+        let pricing = if run.codex_command_execution_evidence().is_some() {
+            run.authenticated_app_server_evidence()
+                .filter(|evidence| {
+                    evidence.observed_model.known().is_some()
+                        && evidence.observed_model.known() == command.model.as_deref()
+                        && evidence.server_rerouted_model.is_none()
+                })
+                .and(self.pricing)
+        } else {
+            self.pricing
+        };
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
                     if external_process_completed(run, launch_runtime)
                         && external_safety_verified(run, launch_runtime)
-                        && !run.stdout.raw_capture_truncated() =>
+                        && !run.stdout.raw_capture_truncated()
+                        && (run.codex_command_execution_evidence().is_none()
+                            || run.authenticated_app_server_evidence().is_some_and(|evidence| {
+                                evidence.resolution_status == "complete"
+                                    && run.codex_parent_evidence.as_ref() == Some(evidence)
+                            })) =>
                 {
                     (
                         UsageMeasurement::Reliable {
                             tokens: usage.total_tokens,
-                            cost_usd: self
-                                .pricing
+                            cost_usd: pricing
                                 .map(|pricing| pricing.cost_usd(usage))
                                 .filter(|cost| cost.is_finite()),
                         },
@@ -208,8 +271,7 @@ impl DispatchBudgetReservation<'_> {
                 Some(usage) => (
                     UsageMeasurement::Estimated {
                         tokens: usage.total_tokens,
-                        cost_usd: self
-                            .pricing
+                        cost_usd: pricing
                             .map(|pricing| pricing.cost_usd(usage))
                             .filter(|cost| cost.is_finite()),
                     },

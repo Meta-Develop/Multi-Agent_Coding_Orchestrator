@@ -635,6 +635,7 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
     use codex_app_server::{AppServerOutcome, CommandExecutionEvidence, TurnTerminalStatus};
 
     let mut outcome = AppServerOutcome {
+        protocol_error: None,
         thread_id: "research-thread".to_string(),
         turn_id: "research-turn".to_string(),
         status: TurnTerminalStatus::Completed,
@@ -721,7 +722,7 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
-    "model":"gpt-5.6-sol", "reasoningEffort":"xhigh",
+    "model":"gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else "xhigh",
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
@@ -763,6 +764,13 @@ else:
     assert (workspace / "README.md").read_text() == "read-only fixture\n"
     item.update(status="completed", exitCode=0)
 item_event("item/completed", item)
+usage = {"inputTokens":35000, "outputTokens":2000, "cachedInputTokens":30000,
+         "reasoningOutputTokens":1000, "totalTokens":37000}
+send({"method":"thread/tokenUsage/updated", "params":{"threadId":"research-thread",
+      "turnId":"research-turn", "tokenUsage":{"last":usage, "total":usage, "modelContextWindow":None}}})
+if mode == "partial":
+    send({"method":"unexpected/protocol/error", "params":{}})
+    sys.exit(0)
 item_event("item/started", {"id":"answer", "type":"agentMessage"})
 item_event("item/completed", {"id":"answer", "type":"agentMessage", "text":'{"summary":"read-only fixture"}'})
 send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"completed"}}})
@@ -788,6 +796,7 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
     ));
     validate_duplex_app_server_version(EnvironmentVersion::new(0, 144, 4))?;
     let mut staging = ExternalOutputStaging::create(&workspace, None)?;
+    staging.stage_codex_home()?;
     let mut controls = protected_worktree_controls(&spec)?;
     controls.writable_artifact_root = Some(staging.root_path().to_path_buf());
     let argv = codex_app_server_argv(&spec, &controls);
@@ -805,7 +814,11 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
         &python,
         args,
         &workspace,
-        256 * 1024,
+        if mode == "truncated-capture" {
+            256
+        } else {
+            256 * 1024
+        },
     )
     .with_stdin(external_agent_stdin_mode(&spec, selected, Vec::new()))
     .with_stdin_limit(MAX_PROMPT_BYTES)
@@ -900,6 +913,81 @@ fn read_only_researcher_app_server_contained_runner_retains_observations_and_fin
 
 #[cfg(target_os = "linux")]
 #[test]
+fn read_only_researcher_app_server_partial_error_retains_authenticated_usage() -> Result<()> {
+    skip_without_containment!(ok);
+    let (report, _, _temp) = contained_read_only_researcher_app_server("partial")?;
+    assert!(!report.publishable);
+    assert!(report.error.is_some());
+    assert!(report.process_tree.as_ref().unwrap().is_verified_empty());
+    let evidence = report
+        .authenticated_app_server_evidence()
+        .context("authentic partial telemetry")?;
+    assert_eq!(evidence.thread_id.as_deref(), Some("research-thread"));
+    assert_eq!(evidence.resolution_status, "turn_failed");
+    assert!(matches!(
+        evidence.turn_usage,
+        CodexParentTurnUsage::Known {
+            input_tokens: 35000,
+            output_tokens: 2000,
+            ..
+        }
+    ));
+    assert_eq!(
+        report
+            .codex_command_execution_evidence()
+            .unwrap()
+            .observations
+            .len(),
+        1
+    );
+    let decoded: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+    assert!(decoded.authenticated_app_server_evidence().is_none());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn read_only_researcher_app_server_incomplete_identity_or_capture_fails_publication() -> Result<()>
+{
+    skip_without_containment!(ok);
+    for mode in ["unknown-effort", "truncated-capture"] {
+        let (run, _, _temp) = contained_read_only_researcher_app_server(mode)?;
+        assert_eq!(run.exit_code, Some(0));
+        assert!(!run.publishable);
+        assert!(run.error.as_deref().is_some_and(
+            |error| error.contains("identity/usage resolution or raw capture is incomplete")
+        ));
+        let held = run
+            .authenticated_app_server_evidence()
+            .context("retained lower bound")?;
+        assert!(matches!(
+            held.turn_usage,
+            CodexParentTurnUsage::Known {
+                input_tokens: 35_000,
+                output_tokens: 2_000,
+                ..
+            }
+        ));
+        assert_eq!(
+            run.codex_command_execution_evidence().unwrap().turn_status,
+            codex_app_server::TurnTerminalStatus::Completed
+        );
+        if mode == "unknown-effort" {
+            assert_eq!(held.resolution_status, "ambiguous");
+            assert!(matches!(
+                held.observed_effort,
+                CodexParentResolvedField::Unknown
+            ));
+        } else {
+            assert!(run.stdout.raw_capture_truncated());
+            assert_eq!(held.resolution_status, "complete");
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn read_only_researcher_app_server_contained_runner_refuses_approvals_and_writes() -> Result<()> {
     skip_without_containment!(ok);
     for mode in [
@@ -913,11 +1001,18 @@ fn read_only_researcher_app_server_contained_runner_refuses_approvals_and_writes
         assert!(
             error.contains(match mode {
                 "write" => "file change",
+                "permission-approval" => "approval request",
                 _ => "cancelled",
             }),
             "{mode}: {error}"
         );
-        assert!(report.codex_command_execution_evidence().is_none());
+        assert_eq!(
+            report
+                .codex_command_execution_evidence()
+                .unwrap()
+                .turn_status,
+            codex_app_server::TurnTerminalStatus::Failed
+        );
         assert!(!report.publishable);
         assert_eq!(
             fs::read_to_string(workspace.join("README.md"))?,
@@ -985,6 +1080,7 @@ fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_it
         context.run_id(),
         "forwarding-test",
         &codex_app_server::AppServerOutcome {
+            protocol_error: None,
             thread_id: "thread-forwarded".to_string(),
             turn_id: "turn-forwarded".to_string(),
             status: codex_app_server::TurnTerminalStatus::Completed,
@@ -1679,16 +1775,36 @@ fn nonpublishable_trusted_compatibility_fake_journals_before_marker() {
     assert_eq!(metrics.reviewed_action_denials.numerator, 0);
 }
 
+fn assert_failed_partial_app_server(
+    interaction: &std::result::Result<codex_app_server::AppServerOutcome, String>,
+) -> &codex_app_server::AppServerOutcome {
+    let partial = interaction
+        .as_ref()
+        .expect("retain private failed protocol outcome");
+    assert_eq!(partial.status, codex_app_server::TurnTerminalStatus::Failed);
+    assert_eq!(
+        partial.command_execution_evidence.turn_status,
+        codex_app_server::TurnTerminalStatus::Failed
+    );
+    assert!(partial.protocol_error.is_some());
+    assert!(partial.final_message.is_none());
+    assert!(!partial.thread_id.is_empty());
+    assert!(!partial.turn_id.is_empty());
+    partial
+}
+
 #[test]
 fn production_duplex_consumer_refuses_fallback_required_child_with_typed_denial() {
     let mut journal = RecordingPreActionJournal::default();
     let (result, metrics, gate_denials, marker) =
         nonpublishable_trusted_compatibility_fake_app_server("fallback_required", &mut journal);
 
-    assert!(result
-        .interaction
-        .as_ref()
-        .is_err_and(|error| error.contains("mandatory duplex pre-action fallback was required")));
+    let partial = assert_failed_partial_app_server(&result.interaction);
+    assert!(partial
+        .protocol_error
+        .as_deref()
+        .unwrap()
+        .contains("mandatory duplex pre-action fallback was required"));
     assert!(
         marker.exists(),
         "fixture must prove the child path was exercised"
@@ -1728,9 +1844,38 @@ fn nonpublishable_trusted_compatibility_fake_journal_failure_cancels() {
     let (result, metrics, gate_denials, marker) =
         nonpublishable_trusted_compatibility_fake_app_server("cancel", &mut journal);
 
-    assert!(result.interaction.is_err());
+    assert_failed_partial_app_server(&result.interaction);
     assert!(!marker.exists());
-    assert!(result.process.status.is_some_and(|status| status.success()));
+    let status = result
+        .process
+        .status
+        .expect("journal-failure child must be reaped");
+    assert!(
+        !result.process.timed_out,
+        "journal failure must cancel promptly"
+    );
+    let cancelled = result.process.process_error.as_deref()
+        == Some("contained fake app-server was cancelled by its run supervisor");
+    assert!(
+        result.process.process_error.is_none() || cancelled,
+        "unexpected cleanup error: {:?}",
+        result.process
+    );
+    #[cfg(unix)]
+    let terminated = {
+        use std::os::unix::process::ExitStatusExt;
+        matches!(status.signal(), Some(libc::SIGTERM) | Some(libc::SIGKILL))
+    };
+    #[cfg(not(unix))]
+    let terminated = false;
+    // The fixture may exit cleanly after the cancel reply, or the host may reap
+    // it first. Only the cancellation receipt plus our termination signals can
+    // justify a nonzero exit; arbitrary failures and missing reaps still fail.
+    assert!(
+        status.success() || (cancelled && terminated),
+        "unexpected journal-failure exit: {:?}",
+        result.process
+    );
     assert!(matches!(
         result.process.process_tree,
         ProcessTreeEvidence::TrustedBestEffort(ContainmentBackend::UnixProcessGroup)
@@ -1746,7 +1891,7 @@ fn nonpublishable_trusted_compatibility_protocol_loss_retains_evidence() {
     let (result, metrics, gate_denials, marker) =
         nonpublishable_trusted_compatibility_fake_app_server("protocol_loss", &mut journal);
 
-    assert!(result.interaction.is_err());
+    let partial = assert_failed_partial_app_server(&result.interaction);
     assert!(!marker.exists());
     assert_eq!(gate_denials.len(), 1);
     assert_eq!(
@@ -1765,8 +1910,18 @@ fn nonpublishable_trusted_compatibility_protocol_loss_retains_evidence() {
         journal.records[1].review_session_id
     );
     assert_eq!(journal.records[0].run_id, journal.records[1].run_id);
-    assert!(journal.records[1].thread_id.is_none());
-    assert!(journal.records[1].turn_id.is_none());
+    assert_eq!(
+        journal.records[1].thread_id.as_deref(),
+        Some(partial.thread_id.as_str())
+    );
+    assert_eq!(
+        journal.records[1].turn_id.as_deref(),
+        Some(partial.turn_id.as_str())
+    );
+    assert_eq!(
+        journal.records[1].turn_status,
+        Some(codex_app_server::TurnTerminalStatus::Failed)
+    );
     assert!(!journal.records[1].review_session_id.is_empty());
 
     let temp = tempfile::tempdir().expect("tempdir");
@@ -1847,7 +2002,7 @@ fn verified_contained_fake_app_server_proves_duplex_ordering_and_confinement() {
     assert!(cancel.process.safety_evidence_verified());
     assert!(cancel.process.process_tree.is_verified_empty());
     assert!(cancel.process.side_effects.is_verified());
-    assert!(cancel.interaction.is_err());
+    assert_failed_partial_app_server(&cancel.interaction);
     assert_eq!(cancel_denials.len(), 1);
     assert!(!cancel_marker.exists());
     assert!(failed_journal.records.is_empty());
@@ -1863,7 +2018,7 @@ fn verified_contained_fake_app_server_proves_duplex_ordering_and_confinement() {
     assert!(loss.process.safety_evidence_verified());
     assert!(loss.process.process_tree.is_verified_empty());
     assert!(loss.process.side_effects.is_verified());
-    assert!(loss.interaction.is_err());
+    assert_failed_partial_app_server(&loss.interaction);
     assert_eq!(loss_denials.len(), 1);
     assert!(!loss_marker.exists());
     assert_eq!(loss_metrics.reviewed_action_denials.numerator, 1);
@@ -10295,11 +10450,13 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
             },
             CommandExecutionObservation::Incomplete {
                 item_id: "command-2".to_string(),
+                started: None,
                 reason: CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
             },
         ],
     };
     let outcome = AppServerOutcome {
+        protocol_error: None,
         thread_id: evidence.thread_id.clone(),
         turn_id: evidence.turn_id.clone(),
         status: evidence.turn_status,
@@ -12301,3 +12458,44 @@ fn assignment_messaging_environment_requires_bound_lifecycle_identity() -> Resul
 }
 
 include!("tests_part2.rs");
+
+#[test]
+fn live_token_grant_rejects_tampered_launch_identity() {
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: Some(220_000),
+        ..Default::default()
+    })
+    .unwrap();
+    let BudgetAdmission::Admitted { reservation, .. } = ledger
+        .reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Researcher,
+            tokens: 16_384,
+            cost_usd: Some(1.0),
+        })
+        .unwrap()
+    else {
+        panic!("admission")
+    };
+    let mut command = ExternalAgentCommand::codex(
+        "codex",
+        ".",
+        "prompt",
+        "events",
+        "output",
+        Duration::from_secs(1),
+    );
+    command.bind_live_token_grant(ledger.live_token_grant(reservation.id).unwrap());
+    assert_eq!(
+        command
+            .verified_live_token_grant()
+            .unwrap()
+            .unwrap()
+            .tokens(),
+        220_000
+    );
+    command.model = Some("tampered-model".to_string());
+    assert!(command.verified_live_token_grant().is_err());
+}
