@@ -1,3 +1,6 @@
+mod input_snapshot;
+pub(crate) use input_snapshot::ReadOnlyInputSnapshot;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -1683,6 +1686,7 @@ impl fmt::Debug for PrivateRuntimeFile {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProcessSpec {
+    pub(crate) read_only_input_snapshots: Vec<ReadOnlyInputSnapshot>,
     pub label: String,
     pub command: ProcessCommand,
     pub current_dir: PathBuf,
@@ -1802,6 +1806,7 @@ impl ProcessSpec {
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
+            read_only_input_snapshots: Vec::new(),
             pinned_direct: None,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
@@ -1840,6 +1845,7 @@ impl ProcessSpec {
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
+            read_only_input_snapshots: Vec::new(),
             pinned_direct: None,
             timeout: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
@@ -2988,6 +2994,15 @@ fn cancel_attached_process(
 }
 
 fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
+    if !spec.read_only_input_snapshots.is_empty()
+        && (spec.containment != ContainmentPolicy::Required
+            || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalCodex)
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "source snapshots require verified ExternalCodex containment",
+        ));
+    }
     if spec.label.is_empty()
         || spec.label.len() > MAX_PROCESS_LABEL_BYTES
         || contains_ascii_control(spec.label.as_bytes())

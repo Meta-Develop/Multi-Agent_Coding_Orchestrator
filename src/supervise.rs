@@ -1873,6 +1873,8 @@ struct AssignmentMetadata {
     parent_validation: Option<held_out::ParentValidationAuthority>,
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    source_inputs:
+        BTreeMap<String, Vec<crate::external_agent::researcher_inputs::ResearcherSourceInput>>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -1921,6 +1923,7 @@ impl AssignmentMetadata {
 
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
+        self.source_inputs.retain(|owner, _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.direct_mechanical_duties
@@ -1934,6 +1937,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             workers,
             parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
+            source_inputs: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }

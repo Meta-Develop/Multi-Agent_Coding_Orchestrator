@@ -3,6 +3,7 @@ use super::*;
 #[cfg(target_os = "linux")]
 fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
     ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: workspace_root.to_path_buf(),
         current_dir: workspace_root.to_path_buf(),
@@ -1877,6 +1878,7 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
     // This absent root is a fail-if-traversed sentinel for an irrelevant large read-only tree.
     let irrelevant_read_only_root = temp.path().join("irrelevant-large-read-only-root");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace,
@@ -1911,6 +1913,7 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
     // such as a whole repository mounted only so Git can read the worktree.
     let disjoint_read_only_root = temp.path().join("disjoint-large-read-only-root");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace,
@@ -1957,6 +1960,7 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
     let protected_file = protected_root.join("policy.md");
     fs::write(&protected_file, "policy\n").expect("protected file");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: writable_root.clone(),
         current_dir: writable_root.clone(),
@@ -2760,6 +2764,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
     let exception = policy_root.join("docs/worker.md");
     let incoming = PathBuf::from("/run/maco/incoming");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: workspace.clone(),
         current_dir: workspace.clone(),
@@ -2818,6 +2823,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
 #[test]
 fn ordinary_external_codex_exact_path_properties_reject_drift() {
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: PathBuf::from("/worktree"),
         current_dir: PathBuf::from("/worktree"),
@@ -3043,6 +3049,7 @@ fn isolated_root_property_requires_exact_single_read_only_root() {
 #[test]
 fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: PathBuf::from("/view"),
         current_dir: PathBuf::from("/view"),
@@ -3282,6 +3289,7 @@ fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
     // SAFETY: fifo_name is a valid NUL-terminated path and mode has no invalid bits.
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace.clone(),

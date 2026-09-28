@@ -108,8 +108,8 @@ pub(super) fn external_dispatch_may_have_started(
     runtime: SupervisorRuntime,
 ) -> bool {
     runtime == SupervisorRuntime::Fake
-        || run.process_tree.is_some()
-        || !run.scratch_quiescence_verified()
+        || (!run.source_probe_confirmed_no_provider_release()
+            && (run.process_tree.is_some() || !run.scratch_quiescence_verified()))
 }
 
 pub(super) fn record_budget_dispatch_refusal(

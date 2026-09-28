@@ -68,6 +68,7 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 mod grok_steering;
+pub(crate) mod researcher_inputs;
 
 use codex_parent_evidence::{
     codex_parent_evidence_from_app_server_run, codex_parent_evidence_from_run,
@@ -230,6 +231,7 @@ pub struct ExternalAgentCommand {
     pub output_schema: Option<PathBuf>,
     /// Exact bounded regular files exposed read-only without exposing their parent directories.
     pub read_only_input_files: Vec<PathBuf>,
+    pub(crate) researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     /// Typed precreated worker journals bound to the original incoming report root.
     pub worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     pub timeout: Duration,
@@ -304,6 +306,8 @@ struct BoundLiveTokenGrant {
     workspace_access: WorkspaceAccess,
     launch_target: WritableLaunchTarget,
     lifecycle: Option<ExternalAgentLifecycleIdentity>,
+    source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
+    input_files: Vec<PathBuf>,
 }
 
 impl ExternalAgentCommand {
@@ -328,6 +332,8 @@ impl ExternalAgentCommand {
             workspace_access: self.workspace_access,
             launch_target: self.writable_launch_target,
             lifecycle: self.agent_lifecycle.clone(),
+            source_inputs: self.researcher_source_inputs.clone(),
+            input_files: self.read_only_input_files.clone(),
         });
     }
 
@@ -355,6 +361,8 @@ impl ExternalAgentCommand {
             || bound.workspace_access != self.workspace_access
             || bound.launch_target != self.writable_launch_target
             || bound.lifecycle != self.agent_lifecycle
+            || bound.source_inputs != self.researcher_source_inputs
+            || bound.input_files != self.read_only_input_files
         {
             return Err("live token grant launch binding changed".to_string());
         }
@@ -490,6 +498,7 @@ struct WorktreeConfinementSnapshot {
     output_last_message: PathBuf,
     output_schema: Option<PathBuf>,
     read_only_input_files: Vec<PathBuf>,
+    researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     workspace_access: WorkspaceAccess,
     hidden_roots: Vec<PathBuf>,
@@ -505,6 +514,7 @@ impl WorktreeConfinementSnapshot {
             output_last_message: command.output_last_message.clone(),
             output_schema: command.output_schema.clone(),
             read_only_input_files: command.read_only_input_files.clone(),
+            researcher_source_inputs: command.researcher_source_inputs.clone(),
             worker_journal_artifacts: command.worker_journal_artifacts.clone(),
             workspace_access: command.workspace_access,
             hidden_roots: command.hidden_roots.clone(),
@@ -1175,6 +1185,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
@@ -1219,6 +1230,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -1263,6 +1275,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -2042,6 +2055,17 @@ impl ExternalAgentRun {
     /// Scratch output may be discarded only when the main target was never
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
+    pub(crate) fn source_probe_confirmed_no_provider_release(&self) -> bool {
+        self.stdout
+            .run_metadata
+            .local_source_probe_refusal_quiescent
+            && !self.stdout.target_launch_attempted
+            && self
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified
+    }
+
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
         if self.stdout.target_launch_attempted {
             return self
@@ -2090,6 +2114,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_preflight_results: &'a Vec<EnvironmentPreflightResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    researcher_input_receipts: &'a Vec<researcher_inputs::ResearcherInputReceipt>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_failures: &'a Vec<EnvironmentFailure>,
     environment_preflight_process_started: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2133,6 +2159,8 @@ struct ExternalAgentRunWireOwned {
     codex_permissions: Option<CodexPermissionEvidence>,
     #[serde(default)]
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
+    #[serde(default)]
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     #[serde(default)]
     environment_failures: Vec<EnvironmentFailure>,
     #[serde(default = "default_environment_preflight_process_started")]
@@ -2180,6 +2208,7 @@ impl Serialize for ExternalAgentRun {
             program_trust: self.program_trust,
             codex_permissions: &self.codex_permissions,
             environment_preflight_results: &self.stdout.run_metadata.environment_preflight_results,
+            researcher_input_receipts: &self.stdout.run_metadata.researcher_input_receipts,
             environment_failures: &self.stdout.run_metadata.environment_failures,
             environment_preflight_process_started: self
                 .stdout
@@ -2215,6 +2244,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             canonicalize_sandbox_denials(wire.sandbox_denials).map_err(serde::de::Error::custom)?;
         let mut stdout = wire.stdout;
         stdout.run_metadata.environment_preflight_results = wire.environment_preflight_results;
+        stdout.run_metadata.researcher_input_receipts = wire.researcher_input_receipts;
         stdout.run_metadata.environment_failures = wire.environment_failures;
         stdout.run_metadata.environment_preflight_process_started =
             wire.environment_preflight_process_started;
@@ -2250,6 +2280,9 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
+    read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
+    local_source_probe_refusal_quiescent: bool,
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
@@ -2779,6 +2812,15 @@ fn run_external_agent_runtime(
             command_display(&spec.program, &[]),
             false,
             "external agent was cancelled before executable preflight".to_string(),
+        );
+    }
+    if let Err(error) = researcher_inputs::validate_command(spec) {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            format!("Researcher source input preparation refused: {error:#}"),
         );
     }
     if let Err(error) = refuse_assignment_process_launch_before_preflight(spec) {
@@ -3669,6 +3711,20 @@ fn run_external_agent_runtime(
             return report;
         }
     }
+    if let Err(error) = researcher_inputs::prepare_source_inputs(
+        &target_spec,
+        side_effect_profile.as_ref(),
+        spec.timeout.saturating_sub(started.elapsed()),
+        cancellation,
+        &mut report,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input preflight refused: {error:#}"),
+        );
+        return report;
+    }
     let mut json_log_reservation = match reserve_external_output(&spec.json_log) {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -3786,6 +3842,9 @@ fn run_external_agent_runtime(
         }
     };
 
+    process_spec.read_only_input_snapshots =
+        report.stdout.run_metadata.read_only_input_snapshots.clone();
+
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(
@@ -3814,11 +3873,27 @@ fn run_external_agent_runtime(
         }
     }
 
+    if let Err(error) = researcher_inputs::revalidate_source_inputs(
+        &target_spec,
+        &report.stdout.run_metadata.researcher_input_receipts,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input changed before target release: {error:#}"),
+        );
+        return report;
+    }
+
     // Preflight evidence describes only the bounded probes. Once the main target is released it
     // must earn fresh process-tree and side-effect evidence of its own; otherwise a target wait
     // or cancellation failure could appear quiescent because an earlier probe was clean.
     report.process_tree = None;
     report.side_effects = None;
+    report
+        .stdout
+        .run_metadata
+        .local_source_probe_refusal_quiescent = false;
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
