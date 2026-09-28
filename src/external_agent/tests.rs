@@ -5073,6 +5073,10 @@ done
             })
         );
         assert!(evidence.model_mismatch);
+        // Successful fixture transport is not qualified provider acceptance.
+        assert!(report.error.is_none());
+        assert!(!report.publishable);
+        assert!(!report.succeeded());
         Ok(())
     }
 
