@@ -265,6 +265,7 @@ pub struct ExternalAgentCommand {
     /// this evidence; writable Grok admission rechecks it against the live command so a later
     /// model, effort, executable, cwd, invocation, or adapter-config change fails closed.
     writable_runtime_selection: Option<WritableRuntimeSelectionEvidence>,
+    live_token_grant: Option<BoundLiveTokenGrant>,
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
@@ -306,6 +307,80 @@ enum CodexManagedReadonlyRoute {
     InitialWorkerRequests,
     /// Continuation: same read-only app-server, no dynamic tool and no fresh inbox.
     Continuation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundLiveTokenGrant {
+    grant: crate::supervise_budget::LiveTokenGrant,
+    invocation: ExternalAgentInvocation,
+    program: PathBuf,
+    cwd: PathBuf,
+    prompt: PathBuf,
+    model: Option<String>,
+    effort: Option<String>,
+    timeout: Duration,
+    workspace_access: WorkspaceAccess,
+    launch_target: WritableLaunchTarget,
+    lifecycle: Option<ExternalAgentLifecycleIdentity>,
+}
+
+impl ExternalAgentCommand {
+    pub(crate) fn uses_live_app_server_budget(&self) -> bool {
+        should_use_read_only_researcher_app_server(self, ExternalExecutionRuntime::Verified)
+            || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
+    }
+
+    pub(crate) fn bind_live_token_grant(
+        &mut self,
+        grant: Option<crate::supervise_budget::LiveTokenGrant>,
+    ) {
+        self.live_token_grant = grant.map(|grant| BoundLiveTokenGrant {
+            grant,
+            invocation: self.invocation,
+            program: self.program.clone(),
+            cwd: self.cwd.clone(),
+            prompt: self.prompt.clone(),
+            model: self.model.clone(),
+            effort: self.reasoning_effort.clone(),
+            timeout: self.timeout,
+            workspace_access: self.workspace_access,
+            launch_target: self.writable_launch_target,
+            lifecycle: self.agent_lifecycle.clone(),
+        });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn live_token_grant_for_test(
+        &self,
+    ) -> Option<&crate::supervise_budget::LiveTokenGrant> {
+        self.verified_live_token_grant()
+            .expect("valid launch grant")
+    }
+
+    fn verified_live_token_grant(
+        &self,
+    ) -> Result<Option<&crate::supervise_budget::LiveTokenGrant>, String> {
+        let Some(bound) = &self.live_token_grant else {
+            return Ok(None);
+        };
+        if bound.invocation != self.invocation
+            || bound.program != self.program
+            || bound.cwd != self.cwd
+            || bound.prompt != self.prompt
+            || bound.model != self.model
+            || bound.effort != self.reasoning_effort
+            || bound.timeout != self.timeout
+            || bound.workspace_access != self.workspace_access
+            || bound.launch_target != self.writable_launch_target
+            || bound.lifecycle != self.agent_lifecycle
+        {
+            return Err("live token grant launch binding changed".to_string());
+        }
+        if bound.grant.stopped() {
+            return Err("live token grant was stopped or released".to_string());
+        }
+        Ok(Some(&bound.grant))
+    }
 }
 
 const ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX: &str = r#"
@@ -1165,6 +1240,7 @@ impl ExternalAgentCommand {
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
+            live_token_grant: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1210,6 +1286,7 @@ impl ExternalAgentCommand {
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
+            live_token_grant: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1255,6 +1332,7 @@ impl ExternalAgentCommand {
             runtime_adapter: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
+            live_token_grant: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1928,6 +2006,20 @@ impl ExternalAgentRun {
         self.stdout.run_metadata.codex_command_execution_evidence = Some(evidence);
     }
 
+    /// The retained copy is never deserialized from reports or writable captures.
+    pub(crate) fn authenticated_app_server_evidence(&self) -> Option<&CodexParentEvidence> {
+        self.stdout
+            .run_metadata
+            .codex_app_server_parent_evidence
+            .as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_app_server_parent_evidence_for_test(&mut self) {
+        self.stdout.run_metadata.codex_app_server_parent_evidence =
+            self.codex_parent_evidence.clone();
+    }
+
     fn retain_codex_command_execution_evidence(
         &mut self,
         outcome: &codex_app_server::AppServerOutcome,
@@ -2237,6 +2329,7 @@ struct ExternalAgentRunMetadata {
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
+    codex_app_server_parent_evidence: Option<CodexParentEvidence>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -2729,6 +2822,15 @@ fn run_external_agent_runtime(
     mut review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
 ) -> ExternalAgentRun {
     let started = Instant::now();
+    if let Err(error) = spec.verified_live_token_grant() {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            error,
+        );
+    }
     if cancellation.is_cancelled() {
         return failed_external_run(
             spec,
@@ -4528,6 +4630,58 @@ struct DuplexProcessAttempt {
     gate_denials: Vec<GateDenial>,
 }
 
+fn run_observed_app_server_turn<T: codex_app_server::JsonLineTransport>(
+    transport: &mut T,
+    turn: &codex_app_server::AppServerTurn,
+    spec: &ExternalAgentCommand,
+    reviewer: &mut dyn codex_app_server::ApprovalReviewer,
+    worker_requests: Option<&mut codex_app_server::WorkerRequestCallback<'_>>,
+    cancellation: &ProcessCancellation,
+) -> Result<codex_app_server::AppServerOutcome, String> {
+    let grant = spec
+        .verified_live_token_grant()
+        .inspect_err(|_| cancellation.cancel())?;
+    let mut partial = None;
+    let result = codex_app_server::run_app_server_turn_with_worker_requests_observed(
+        transport,
+        turn,
+        codex_app_server::AppServerLimits {
+            turn_timeout: spec.timeout,
+            token_grant: grant.map(|grant| grant.tokens()),
+            ..codex_app_server::AppServerLimits::default()
+        },
+        reviewer,
+        worker_requests,
+        || cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped()),
+        codex_app_server::AppServerObservation {
+            partial: &mut partial,
+            budget_exhausted: &mut || {
+                if let Some(grant) = grant {
+                    grant.exhaust();
+                }
+            },
+        },
+    );
+    match result {
+        Ok(outcome) => Ok(outcome),
+        Err(error) => {
+            // After the bounded interrupt drain, promptly reap an uncooperative provider.
+            cancellation.cancel();
+            if let Some(outcome) = &mut partial {
+                outcome.protocol_error = Some(error.to_string());
+            }
+            partial.ok_or_else(|| error.to_string())
+        }
+    }
+}
+
+fn fail_app_server_outcome(outcome: &mut codex_app_server::AppServerOutcome, error: String) {
+    outcome.protocol_error = append_external_error(outcome.protocol_error.take(), Some(error));
+    outcome.status = codex_app_server::TurnTerminalStatus::Failed;
+    outcome.command_execution_evidence.turn_status = codex_app_server::TurnTerminalStatus::Failed;
+    outcome.final_message = None;
+}
+
 fn run_read_only_researcher_app_server_process(
     process_spec: ProcessSpec,
     cancellation: &ProcessCancellation,
@@ -4541,7 +4695,8 @@ fn run_read_only_researcher_app_server_process(
         model: spec.model.clone(),
         output_schema: load_codex_app_server_output_schema(spec)?,
     };
-    run_process_interactive(process_spec, cancellation, |session| {
+    let cancellation = cancellation.child_scope();
+    run_process_interactive(process_spec, &cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
         // Read-only research has no approval authority, even if a hosted reviewer exists.
         let mut approval_requested = false;
@@ -4549,46 +4704,48 @@ fn run_read_only_researcher_app_server_process(
             approval_requested = true;
             Ok(codex_app_server::ApprovalReview::cancel(None))
         };
-        let limits = codex_app_server::AppServerLimits {
-            turn_timeout: spec.timeout,
-            ..codex_app_server::AppServerLimits::default()
-        };
-        let outcome = if spec.codex_managed_worker_requests_enabled() {
+        let mut outcome = if spec.codex_managed_worker_requests_enabled() {
             let launch = spec.assignment_messaging_launch.as_ref().ok_or_else(|| {
                 "managed initial Codex parent is missing its sealed inbox endpoint".to_string()
             })?;
             let identity = spec.agent_lifecycle.as_ref().ok_or_else(|| {
                 "managed initial Codex parent is missing lifecycle identity".to_string()
             })?;
+            let grant = spec
+                .verified_live_token_grant()
+                .inspect_err(|_| cancellation.cancel())?;
             let run_id = identity.run_id.as_str();
             let task_id = identity.task_id.as_str();
             let mut forward = |request: &serde_json::Value| {
                 launch
                     .forward_worker_request(run_id, task_id, request, &|| {
-                        cancellation.is_cancelled()
+                        cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped())
                     })
                     .map_err(|error| error.to_string())
             };
-            codex_app_server::run_app_server_turn_with_worker_requests(
+            run_observed_app_server_turn(
                 &mut transport,
                 &turn,
-                limits,
+                spec,
                 &mut reviewer,
                 Some(&mut forward),
-                || cancellation.is_cancelled(),
+                &cancellation,
             )
         } else {
-            codex_app_server::run_app_server_turn_with_worker_requests(
+            run_observed_app_server_turn(
                 &mut transport,
                 &turn,
-                limits,
+                spec,
                 &mut reviewer,
                 None,
-                || cancellation.is_cancelled(),
+                &cancellation,
             )
+        }?;
+        if let Err(error) =
+            validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)
+        {
+            fail_app_server_outcome(&mut outcome, error);
         }
-        .map_err(|error| error.to_string())?;
-        validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)?;
         // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
         // the existing verified outer profile remains enforced, and every approval cancels.
         Ok(outcome)
@@ -4683,36 +4840,47 @@ fn run_duplex_app_server_process(
             }
         },
     };
-    let mut process = run_process_interactive(process_spec, cancellation, |session| {
+    let cancellation = cancellation.child_scope();
+    let mut process = run_process_interactive(process_spec, &cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
-        let outcome = codex_app_server::run_app_server_turn(
+        let mut outcome = run_observed_app_server_turn(
             &mut transport,
             &turn,
-            codex_app_server::AppServerLimits {
-                turn_timeout: spec.timeout,
-                ..codex_app_server::AppServerLimits::default()
-            },
+            spec,
             &mut reviewer,
-            || cancellation.is_cancelled(),
-        )
-        .map_err(|error| error.to_string())?;
-        let fallback_denial = duplex_fallback_denial(runtime.context, &review_session_id, &outcome)
-            .map_err(|error| format!("failed to construct duplex fallback refusal: {error:#}"))?;
-        reviewer
-            .journal
-            .append(&terminal_turn_journal_record(
-                runtime.context.run_id(),
-                &review_session_id,
-                &outcome,
-                fallback_denial.as_ref(),
-            ))
-            .map_err(|error| format!("strict turn-terminal journal append failed: {error:#}"))?;
-        if let Some(denial) = fallback_denial {
-            reviewer.observed_denials.push(denial);
-            return Err(
-                "child refused because mandatory duplex pre-action fallback was required"
-                    .to_string(),
-            );
+            None,
+            &cancellation,
+        )?;
+        if outcome.protocol_error.is_some() {
+            return Ok(outcome);
+        }
+        let validation = (|| {
+            let fallback_denial =
+                duplex_fallback_denial(runtime.context, &review_session_id, &outcome).map_err(
+                    |error| format!("failed to construct duplex fallback refusal: {error:#}"),
+                )?;
+            reviewer
+                .journal
+                .append(&terminal_turn_journal_record(
+                    runtime.context.run_id(),
+                    &review_session_id,
+                    &outcome,
+                    fallback_denial.as_ref(),
+                ))
+                .map_err(|error| {
+                    format!("strict turn-terminal journal append failed: {error:#}")
+                })?;
+            if let Some(denial) = fallback_denial {
+                reviewer.observed_denials.push(denial);
+                return Err(
+                    "child refused because mandatory duplex pre-action fallback was required"
+                        .to_string(),
+                );
+            }
+            Ok(())
+        })();
+        if let Err(error) = validation {
+            fail_app_server_outcome(&mut outcome, error);
         }
         Ok(outcome)
     });
@@ -4724,9 +4892,11 @@ fn run_duplex_app_server_process(
             terminal_outcome,
             &result.process,
         )) {
-            result.interaction = Err(format!(
-                "strict process-terminal journal append failed: {error:#}"
-            ));
+            let error = format!("strict process-terminal journal append failed: {error:#}");
+            match &mut result.interaction {
+                Ok(outcome) => fail_app_server_outcome(outcome, error),
+                Err(previous) => *previous = format!("{previous}; {error}"),
+            }
         }
     }
     let metrics = reviewer.reviewer.metrics();
@@ -5100,17 +5270,18 @@ fn record_completed_app_server_target(
             requested_model: context.spec.model.as_deref(),
             requested_effort: context.spec.reasoning_effort.as_deref(),
         };
-        codex_parent_evidence_from_app_server_run(
-            &inputs,
-            (!interactive.process.stdout.is_truncated())
-                .then(|| protocol.as_ref().ok())
-                .flatten(),
-            codex_home,
-        )
+        codex_parent_evidence_from_app_server_run(&inputs, protocol.as_ref().ok(), codex_home)
     });
     let mut final_message_error = None;
     if let Ok(outcome) = &protocol {
         report.retain_codex_command_execution_evidence(outcome);
+        if let Some(error) = &outcome.protocol_error {
+            report.error = append_external_error(
+                report.error.take(),
+                Some(credential_redactor.redact_string(error)),
+            );
+            report.publishable = false;
+        }
         if let Some(final_message) = &outcome.final_message {
             let final_message = credential_redactor.redact_bytes(final_message.as_bytes());
             let staged = output_staging.reservation_mut().and_then(|reservation| {
@@ -5146,7 +5317,28 @@ fn record_completed_app_server_target(
     // record_completed_target handles ordinary `codex exec --json` launches.
     // Replace its CLI-stream interpretation only for this verified app-server turn.
     if let Some(evidence) = parent_evidence {
+        report.stdout.run_metadata.codex_app_server_parent_evidence = Some(evidence.clone());
         report.codex_parent_evidence = Some(evidence);
+    }
+    if report
+        .authenticated_app_server_evidence()
+        .is_none_or(|evidence| evidence.resolution_status != "complete")
+        || report.stdout.raw_capture_truncated()
+    {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(
+                "Codex app-server identity/usage resolution or raw capture is incomplete"
+                    .to_string(),
+            ),
+        );
+        report.publishable = false;
+    }
+    if protocol
+        .as_ref()
+        .is_ok_and(|outcome| outcome.protocol_error.is_some())
+    {
+        report.publishable = false;
     }
     if let Some(error) = final_message_error {
         report.error = append_external_error(report.error.take(), Some(error));

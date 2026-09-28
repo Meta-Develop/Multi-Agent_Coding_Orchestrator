@@ -2418,12 +2418,13 @@ fn prepare_child_attempt_with_purpose<'a>(
             }
         };
     }
-    let budget_reservation = match reserve_dispatch_budget(
+    let budget_reservation = match reserve_dispatch_budget_cancellable(
         &budget_plan,
         budget_config,
         budget_ledger,
         assignment.role,
         &command,
+        &context.cancellation,
     )? {
         DispatchBudgetAdmission::Admitted(reservation) => reservation,
         DispatchBudgetAdmission::Refused(refusal) => {
@@ -2444,6 +2445,13 @@ fn prepare_child_attempt_with_purpose<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    if command.uses_live_app_server_budget() {
+        command.bind_live_token_grant(
+            budget_reservation
+                .ledger
+                .live_token_grant(budget_reservation.reservation.id)?,
+        );
+    }
     let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
@@ -3317,74 +3325,102 @@ fn dispatch_and_capture_child_attempt<'a>(
             )
         }
     };
-    record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt)?;
-    let external_run = match external_run_result {
-        Ok(run) => run,
-        Err(error) => {
-            budget_reservation.settle_not_started()?;
-            drop(incoming_output_root);
-            drop(capture_output_root);
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-            })?;
-            return Err(error).context("failed to produce deterministic child output");
+    // Retain returned continuation bytes before checkpoints, settlement diagnostics,
+    // or envelope validation can return early. This does not authorize or clean scratch.
+    let returned_evidence = match &external_run_result {
+        Ok(run) if command.codex_managed_readonly_continuation_enabled() => {
+            let imported = preserve_returned_parent_evidence(
+                context,
+                &attempt_artifacts,
+                &command,
+                launch_runtime,
+                run,
+            );
+            if !run.scratch_quiescence_verified() {
+                // All capture, scratch and reservation owners remain in this frame.
+                // As with an attached initial parent, do not detach a possibly live writer.
+                eprintln!(
+                    "fatal: managed continuation returned without verified scratch quiescence; evidence import: {imported:?}"
+                );
+                std::process::abort();
+            }
+            imported
         }
+        _ => Ok(()),
     };
-    let environment_blocked = external_run.environment_blocked();
-    let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
-    match usage_settlement.reliable_usage() {
-        Some(usage) => {
-            outcome.usage_samples.push(RoleUsageSample {
-                role: assignment.role,
-                lens_id: None,
-                model: command.model.clone(),
-                usage,
-            });
-            record_and_persist_live_invocation(
-                artifacts,
-                LiveInvocationObservation {
-                    run_id: options.run_id.as_str(),
-                    assignment_id: &assignment.id,
-                    attempt,
+    // A completion checkpoint failure must not replace observed usage with the
+    // reservation's Missing-on-drop fallback. Retain it until settlement is attempted.
+    let completion_checkpoint =
+        record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt);
+    let captured_result = (|| {
+        let external_run = match external_run_result {
+            Ok(run) => run,
+            Err(error) => {
+                budget_reservation.settle_not_started()?;
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to produce deterministic child output");
+            }
+        };
+        let environment_blocked = external_run.environment_blocked();
+        let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
+        match usage_settlement.reliable_usage() {
+            Some(usage) => {
+                outcome.usage_samples.push(RoleUsageSample {
                     role: assignment.role,
-                    runtime: launch_runtime,
-                    model: command.model.as_deref(),
-                    effort: command.reasoning_effort.as_deref(),
-                    worktree_id: &worktree.name,
-                    usage: Some(&usage),
-                    duration_ms: Some(external_run.duration_ms),
-                    started_at_unix_millis: live_invocation_started_millis(
-                        external_run.duration_ms,
-                    ),
-                },
-            )?;
+                    lens_id: None,
+                    model: command.model.clone(),
+                    usage,
+                });
+                record_and_persist_live_invocation(
+                    artifacts,
+                    LiveInvocationObservation {
+                        run_id: options.run_id.as_str(),
+                        assignment_id: &assignment.id,
+                        attempt,
+                        role: assignment.role,
+                        runtime: launch_runtime,
+                        model: command.model.as_deref(),
+                        effort: command.reasoning_effort.as_deref(),
+                        worktree_id: &worktree.name,
+                        usage: Some(&usage),
+                        duration_ms: Some(external_run.duration_ms),
+                        started_at_unix_millis: live_invocation_started_millis(
+                            external_run.duration_ms,
+                        ),
+                    },
+                )?;
+            }
+            None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+            None => {}
         }
-        None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
-        None => {}
-    }
-    drop(incoming_output_root);
-    drop(capture_output_root);
-    let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
-    record_shared_orchestration_event(
-        artifacts,
-        &assignment.id,
-        Some(journal_parent_id),
-        assignment_journal_role,
-        OrchestrationEventKind::Status,
-        lifecycle_event_payload(
-            if external_process_completed(&external_run, launch_runtime) {
-                "completed"
-            } else {
-                "failed"
-            },
-            Some(attempt),
-            child_thread_id.as_deref(),
-        ),
-    )?;
-    let attempt_containment_verified = external_containment_verified(&external_run, launch_runtime);
-    if !attempt_containment_verified {
-        outcome.external_containment_failed = true;
-        outcome.findings.push(Finding {
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+        record_shared_orchestration_event(
+            artifacts,
+            &assignment.id,
+            Some(journal_parent_id),
+            assignment_journal_role,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload(
+                if external_process_completed(&external_run, launch_runtime) {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                Some(attempt),
+                child_thread_id.as_deref(),
+            ),
+        )?;
+        let attempt_containment_verified =
+            external_containment_verified(&external_run, launch_runtime);
+        if !attempt_containment_verified {
+            outcome.external_containment_failed = true;
+            outcome.findings.push(Finding {
             severity: FindingSeverity::Error,
             message: format!(
                 "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
@@ -3394,29 +3430,75 @@ fn dispatch_and_capture_child_attempt<'a>(
             ),
             paths: vec![attempt_artifacts.raw_report_relative.clone()],
         });
-    }
-    outcome
-        .command_records
-        .push(command_record_from_external_for_runtime(
-            &external_run,
-            &command,
+        }
+        outcome
+            .command_records
+            .push(command_record_from_external_for_runtime(
+                &external_run,
+                &command,
+                launch_runtime,
+            ));
+        Ok(CapturedChildAttempt {
+            attempt_artifacts,
+            corrective_retry_used,
+            model_provenance,
+            external_run,
+            command,
+            primary_before,
+            primary_scope_before,
+            incoming_scratch,
+            capture_scratch,
+            budget_reservation,
             launch_runtime,
-        ));
-    Ok(CapturedChildAttempt {
-        attempt_artifacts,
-        corrective_retry_used,
-        model_provenance,
-        external_run,
-        command,
-        primary_before,
-        primary_scope_before,
-        incoming_scratch,
-        capture_scratch,
-        budget_reservation,
-        launch_runtime,
-        environment_blocked,
-        attempt_containment_verified,
+            environment_blocked,
+            attempt_containment_verified,
+        })
+    })();
+    let captured_result = match (captured_result, completion_checkpoint) {
+        (result, Ok(())) => result,
+        (Ok(_capture), Err(error)) => Err(error),
+        (Err(error), Err(checkpoint_error)) => Err(error).context(format!(
+            "child post-return dispatch checkpoint also failed: {checkpoint_error:#}"
+        )),
+    };
+    match (captured_result, returned_evidence) {
+        (result, Ok(())) => result,
+        (Ok(_capture), Err(error)) => Err(error),
+        (Err(error), Err(import_error)) => Err(error).context(format!(
+            "managed parent returned evidence import also failed: {import_error:#}"
+        )),
+    }
+}
+
+// Copy only descriptor-held observations into private artifacts. Do not read the
+// response path, validate its report, discard scratch, or settle usage here.
+fn preserve_returned_parent_evidence(
+    context: &AssignmentExecutionContext<'_, '_>,
+    artifacts: &ChildAttemptArtifacts,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    run: &ExternalAgentRun,
+) -> Result<()> {
+    with_supervisor_artifacts(context.artifacts, |writer, _| {
+        let bytes = run.stdout_bytes();
+        if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+            bail!("descriptor-held parent stdout exceeds its configured byte limit");
+        }
+        writer.write_bytes(
+            &artifacts.raw_stdout_relative,
+            bytes,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        write_artifact_json(
+            writer,
+            &artifacts.command_record_relative,
+            &command_record_from_external_for_runtime(run, command, runtime),
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        Ok(())
     })
+    .context("managed parent returned evidence import failed")
 }
 
 const MAX_ATTACHED_PARENT_DIAGNOSTICS: usize = 16;
@@ -3892,6 +3974,16 @@ fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
     );
     let external_run = match run_result {
         Ok(run) => {
+            if let Err(error) = preserve_returned_parent_evidence(
+                context,
+                &prepared.attempt_artifacts,
+                &prepared.command,
+                prepared.launch_runtime,
+                &run,
+            ) {
+                // Inspection refuses diagnostics, but settlement still runs exactly once.
+                push_attached_parent_diagnostic(&mut diagnostics, format!("{error:#}"));
+            }
             observe_returned_attached_parent_run(
                 context,
                 outcome,
@@ -5515,12 +5607,19 @@ fn prepare_parent_auditor<'a>(
         })?;
         bail!("descriptor-held auditor scratch roots changed during setup");
     }
-    let auditor_budget_reservation = match reserve_dispatch_budget(
+    #[cfg(test)]
+    observe_budget_admission_for_test(
+        options.run_id.as_str(),
+        "before_review_admission",
+        &assignment.id,
+    );
+    let auditor_budget_reservation = match reserve_dispatch_budget_cancellable(
         plan,
         budget_config,
         budget_ledger,
         AgentRole::Auditor,
         &auditor_command,
+        &context.cancellation,
     )? {
         DispatchBudgetAdmission::Admitted(reservation) => reservation,
         DispatchBudgetAdmission::Refused(refusal) => {
@@ -5568,6 +5667,13 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
+    if auditor_command.uses_live_app_server_budget() {
+        auditor_command.bind_live_token_grant(
+            auditor_budget_reservation
+                .ledger
+                .live_token_grant(auditor_budget_reservation.reservation.id)?,
+        );
+    }
     let grant = admit_parent_auditor_process_intent(
         options.run_id.as_str(),
         auditor_id.as_str(),

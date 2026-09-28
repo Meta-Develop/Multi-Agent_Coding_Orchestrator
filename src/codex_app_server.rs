@@ -435,6 +435,7 @@ pub(crate) struct AppServerLimits {
     pub(crate) max_messages: usize,
     pub(crate) turn_timeout: Duration,
     pub(crate) approval_timeout: Duration,
+    pub(crate) token_grant: Option<u64>,
 }
 
 impl Default for AppServerLimits {
@@ -446,12 +447,18 @@ impl Default for AppServerLimits {
             max_messages: 8_192,
             turn_timeout: Duration::from_secs(300),
             approval_timeout: Duration::from_secs(30),
+            token_grant: None,
         }
     }
 }
 
 impl AppServerLimits {
     fn validate(self) -> Result<Self, AppServerError> {
+        if self.token_grant == Some(0) {
+            return Err(AppServerError::InvalidConfiguration {
+                message: "app-server token grant must be positive".to_string(),
+            });
+        }
         if self.max_line_bytes == 0 || self.max_line_bytes > HARD_MAX_LINE_BYTES {
             return Err(AppServerError::InvalidConfiguration {
                 message: "app-server line bound is zero or exceeds the hard ceiling".to_string(),
@@ -661,6 +668,7 @@ pub(crate) enum CommandExecutionObservation {
     },
     Incomplete {
         item_id: String,
+        started: Option<CommandExecutionSnapshot>,
         reason: CommandExecutionObservationIssue,
     },
 }
@@ -762,9 +770,10 @@ fn correlate_command_observation(
 
     let incomplete = |reason| CommandExecutionObservation::Incomplete {
         item_id: item_id.to_string(),
+        started: started.clone(),
         reason,
     };
-    let Some(started) = started else {
+    let Some(started) = started.as_ref() else {
         return incomplete(Issue::MissingOrInvalidStartedFields);
     };
     let Some(completed) = completed else {
@@ -784,7 +793,7 @@ fn correlate_command_observation(
     }
     CommandExecutionObservation::Complete {
         item_id: item_id.to_string(),
-        started,
+        started: started.clone(),
         completed,
     }
 }
@@ -794,6 +803,7 @@ pub(crate) struct AppServerOutcome {
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) status: TurnTerminalStatus,
+    pub(crate) protocol_error: Option<String>,
     /// Settings returned by the correlated `thread/start` response. Ephemeral
     /// threads write no rollout, so these are the provider-owned provenance.
     pub(crate) resolved_model: String,
@@ -1008,6 +1018,8 @@ pub(crate) struct AppServerTokenUsage {
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub(crate) enum AppServerError {
+    #[error("app-server token grant exhausted: observed {observed} >= grant {grant}; already-inflight usage may overshoot")]
+    TokenBudgetExceeded { grant: u64, observed: u64 },
     #[error("{message}")]
     InvalidConfiguration { message: String },
     #[error("{message}")]
@@ -1323,6 +1335,7 @@ impl ProtocolState {
     }
 }
 
+#[cfg(test)]
 pub(crate) fn run_app_server_turn<T, C>(
     transport: &mut T,
     turn: &AppServerTurn,
@@ -1339,6 +1352,12 @@ where
 
 pub(crate) type WorkerRequestCallback<'a> = dyn FnMut(&Value) -> Result<Value, String> + 'a;
 
+pub(crate) struct AppServerObservation<'a> {
+    pub partial: &'a mut Option<AppServerOutcome>,
+    pub budget_exhausted: &'a mut dyn FnMut(),
+}
+
+#[cfg(test)]
 pub(crate) fn run_app_server_turn_with_worker_requests<T, C>(
     transport: &mut T,
     turn: &AppServerTurn,
@@ -1351,6 +1370,62 @@ where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
+    run_app_server_turn_with_worker_requests_observed(
+        transport,
+        turn,
+        limits,
+        reviewer,
+        worker_requests,
+        cancelled,
+        AppServerObservation {
+            partial: &mut None,
+            budget_exhausted: &mut || {},
+        },
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn run_app_server_turn_observed<T, C>(
+    transport: &mut T,
+    turn: &AppServerTurn,
+    limits: AppServerLimits,
+    reviewer: &mut dyn ApprovalReviewer,
+    cancelled: C,
+    partial: &mut Option<AppServerOutcome>,
+    budget_exhausted: &mut dyn FnMut(),
+) -> Result<AppServerOutcome, AppServerError>
+where
+    T: JsonLineTransport,
+    C: Fn() -> bool,
+{
+    run_app_server_turn_with_worker_requests_observed(
+        transport,
+        turn,
+        limits,
+        reviewer,
+        None,
+        cancelled,
+        AppServerObservation {
+            partial,
+            budget_exhausted,
+        },
+    )
+}
+
+pub(crate) fn run_app_server_turn_with_worker_requests_observed<T, C>(
+    transport: &mut T,
+    turn: &AppServerTurn,
+    limits: AppServerLimits,
+    reviewer: &mut dyn ApprovalReviewer,
+    worker_requests: Option<&mut WorkerRequestCallback<'_>>,
+    cancelled: C,
+    observation: AppServerObservation<'_>,
+) -> Result<AppServerOutcome, AppServerError>
+where
+    T: JsonLineTransport,
+    C: Fn() -> bool,
+{
+    *observation.partial = None;
     turn.validate()?;
     let limits = limits.validate()?;
     let mut state = ProtocolState::new(limits)?;
@@ -1481,6 +1556,33 @@ where
         .and_then(Value::as_str)
         .map(str::to_string);
 
+    // Preserve authenticated identity even if turn/start never acknowledges a turn ID.
+    *observation.partial = Some(AppServerOutcome {
+        thread_id: thread_id.clone(),
+        turn_id: String::new(),
+        status: TurnTerminalStatus::Failed,
+        protocol_error: Some("app-server turn startup incomplete".to_string()),
+        resolved_model: resolved_model.clone(),
+        resolved_effort: resolved_effort.clone(),
+        token_usage: None,
+        reroute_message: None,
+        completed_items: 0,
+        item_outcomes: Vec::new(),
+        command_execution_evidence: CommandExecutionEvidence {
+            thread_id: thread_id.clone(),
+            turn_id: String::new(),
+            turn_status: TurnTerminalStatus::Failed,
+            observations: Vec::new(),
+        },
+        refused_ceiling_expansions: 0,
+        gate_denials: Vec::new(),
+        final_message: None,
+        auto_reviews: Vec::new(),
+        duplex_fallback_required: true,
+        messages_received: state.messages_received,
+        bytes_received: state.bytes_received,
+    });
+
     let turn_start_id = state.allocate_request_id()?;
     let mut lifecycle = ThreadLifecycleNotices::default();
     let mut turn_params = Map::from_iter([
@@ -1544,10 +1646,13 @@ where
         reviewer,
         worker_requests,
         &cancelled,
+        observation,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
-            state.interrupt(transport, &thread_id, &turn_id);
+            if !matches!(error, AppServerError::TokenBudgetExceeded { .. }) {
+                state.interrupt(transport, &thread_id, &turn_id);
+            }
             Err(error)
         }
     }
@@ -1822,6 +1927,7 @@ fn drive_turn<T, C>(
     reviewer: &mut dyn ApprovalReviewer,
     mut worker_requests: Option<&mut WorkerRequestCallback<'_>>,
     cancelled: &C,
+    observation: AppServerObservation<'_>,
 ) -> Result<AppServerOutcome, AppServerError>
 where
     T: JsonLineTransport,
@@ -1868,10 +1974,28 @@ where
     let mut turn_started_seen = false;
     let mut account_rate_limit_notices = 0usize;
     let mut token_usage = None;
+    let mut cache_write_tokens = 0;
     let mut reroute_message = None;
 
-    loop {
-        let message = state.receive(transport, "turn", cancelled)?;
+    let mut budget_failure = None;
+    let result = (|| loop {
+        let message = state.receive(transport, "turn", &|| {
+            budget_failure.is_none() && cancelled()
+        })?;
+        // Drain observations only; no further approval, correction or steering calls.
+        if budget_failure.is_some()
+            && !matches!(
+                message.get("method").and_then(Value::as_str),
+                Some(
+                    "thread/tokenUsage/updated"
+                        | "item/started"
+                        | "item/completed"
+                        | "turn/completed"
+                )
+            )
+        {
+            continue;
+        }
         let object = message
             .as_object()
             .ok_or_else(|| AppServerError::Malformed {
@@ -1994,28 +2118,26 @@ where
                     "item type",
                 )?;
                 validate_identifier(item_id, "item id", 256)?;
-                if completed_items.contains(item_id)
-                    || active_items
-                        .insert(
-                            item_id.to_string(),
-                            ActiveItem {
-                                item_type: item_type.to_string(),
-                                command_snapshot: state.command_snapshot.take(),
-                                raw: message.pointer("/params/item").cloned().ok_or_else(|| {
-                                    AppServerError::Malformed {
-                                        phase: "item/started",
-                                        message: "item payload is missing".to_string(),
-                                    }
-                                })?,
-                            },
-                        )
-                        .is_some()
-                {
+                if completed_items.contains(item_id) || active_items.contains_key(item_id) {
                     return Err(AppServerError::Duplicate {
                         phase: "item/started",
                         message: "item lifecycle started more than once".to_string(),
                     });
                 }
+                let raw = message.pointer("/params/item").cloned().ok_or_else(|| {
+                    AppServerError::Malformed {
+                        phase: "item/started",
+                        message: "item payload is missing".to_string(),
+                    }
+                })?;
+                active_items.insert(
+                    item_id.to_string(),
+                    ActiveItem {
+                        item_type: item_type.to_string(),
+                        command_snapshot: state.command_snapshot.take(),
+                        raw,
+                    },
+                );
             }
             "item/commandExecution/requestApproval" | "item/fileChange/requestApproval" => {
                 validate_turn_correlation(params, thread_id, turn_id, "approval")?;
@@ -2514,7 +2636,7 @@ where
                 )?;
                 let active_item =
                     active_items
-                        .remove(item_id)
+                        .get(item_id)
                         .ok_or_else(|| AppServerError::Unexpected {
                             phase: "item/completed",
                             message: "item completed without an active lifecycle".to_string(),
@@ -2526,7 +2648,7 @@ where
                     });
                 }
                 if item_type == "dynamicToolCall" {
-                    let serviced = serviced_worker_requests.remove(item_id).ok_or_else(|| {
+                    let serviced = serviced_worker_requests.get(item_id).ok_or_else(|| {
                         AppServerError::Unexpected {
                             phase: "worker request",
                             message:
@@ -2555,7 +2677,7 @@ where
                         });
                     }
                 }
-                if !completed_items.insert(item_id.to_string()) {
+                if completed_items.contains(item_id) {
                     return Err(AppServerError::Duplicate {
                         phase: "item/completed",
                         message: "item completed more than once".to_string(),
@@ -2611,10 +2733,14 @@ where
                 if item_type == "commandExecution" {
                     command_observations.push(correlate_command_observation(
                         item_id,
-                        active_item.command_snapshot,
+                        active_item.command_snapshot.clone(),
                         state.command_snapshot.take(),
                     ));
                 }
+                // Commit lifecycle removal only after all terminal validation succeeds.
+                active_items.remove(item_id);
+                serviced_worker_requests.remove(item_id);
+                completed_items.insert(item_id.to_string());
                 item_outcomes.push(ItemOutcome {
                     item_id: item_id.to_string(),
                     item_type: item_type.to_string(),
@@ -2668,26 +2794,30 @@ where
                             .iter()
                             .all(|item_id| adequate_review_targets.contains(item_id.as_str()))
                     };
+                if let Some(error) = budget_failure.clone() {
+                    return Err(error);
+                }
                 return Ok(AppServerOutcome {
                     thread_id: thread_id.to_string(),
                     turn_id: turn_id.to_string(),
                     status,
-                    resolved_model,
-                    resolved_effort,
+                    protocol_error: None,
+                    resolved_model: resolved_model.clone(),
+                    resolved_effort: resolved_effort.clone(),
                     token_usage,
-                    reroute_message,
+                    reroute_message: reroute_message.clone(),
                     completed_items: completed_items.len(),
-                    item_outcomes,
+                    item_outcomes: item_outcomes.clone(),
                     command_execution_evidence: CommandExecutionEvidence {
                         thread_id: thread_id.to_string(),
                         turn_id: turn_id.to_string(),
                         turn_status: status,
-                        observations: command_observations,
+                        observations: command_observations.clone(),
                     },
                     refused_ceiling_expansions,
-                    gate_denials,
-                    final_message,
-                    auto_reviews,
+                    gate_denials: gate_denials.clone(),
+                    final_message: final_message.clone(),
+                    auto_reviews: auto_reviews.clone(),
                     duplex_fallback_required,
                     messages_received: state.messages_received,
                     bytes_received: state.bytes_received,
@@ -2721,18 +2851,55 @@ where
                     cached_input_tokens: counter("cachedInputTokens")?,
                     reasoning_output_tokens: counter("reasoningOutputTokens")?,
                 };
-                if token_usage.is_some_and(|previous: AppServerTokenUsage| {
-                    current.input_tokens < previous.input_tokens
-                        || current.output_tokens < previous.output_tokens
-                        || current.cached_input_tokens < previous.cached_input_tokens
-                        || current.reasoning_output_tokens < previous.reasoning_output_tokens
-                }) {
+                let observed = current
+                    .input_tokens
+                    .checked_add(current.output_tokens)
+                    .ok_or_else(|| AppServerError::Malformed {
+                        phase: "token usage",
+                        message: "token total overflow".to_string(),
+                    })?;
+                let current_cache_write = match total.get("cacheWriteInputTokens") {
+                    Some(_) => counter("cacheWriteInputTokens")?,
+                    None => 0,
+                };
+                if observed != counter("totalTokens")?
+                    || current.cached_input_tokens > current.input_tokens
+                    || current.reasoning_output_tokens > current.output_tokens
+                    || current_cache_write > current.input_tokens
+                {
+                    return Err(AppServerError::Malformed {
+                        phase: "token usage",
+                        message: "inconsistent token counters".to_string(),
+                    });
+                }
+                if current_cache_write < cache_write_tokens
+                    || token_usage.is_some_and(|previous: AppServerTokenUsage| {
+                        current.input_tokens < previous.input_tokens
+                            || current.output_tokens < previous.output_tokens
+                            || current.cached_input_tokens < previous.cached_input_tokens
+                            || current.reasoning_output_tokens < previous.reasoning_output_tokens
+                    })
+                {
                     return Err(AppServerError::Unexpected {
                         phase: "token usage",
                         message: "cumulative token usage moved backwards".to_string(),
                     });
                 }
+                // Commit only after the complete notice has passed every validation.
+                cache_write_tokens = current_cache_write;
                 token_usage = Some(current);
+                if budget_failure.is_none() {
+                    if let Some(grant) = state.limits.token_grant.filter(|grant| observed >= *grant)
+                    {
+                        budget_failure =
+                            Some(AppServerError::TokenBudgetExceeded { grant, observed });
+                        (observation.budget_exhausted)();
+                        state.interrupt(transport, thread_id, turn_id);
+                        // Bounded best-effort drain, not a provider spending guarantee.
+                        state.deadline =
+                            state.deadline.min(Instant::now() + Duration::from_secs(1));
+                    }
+                }
             }
             method if is_bounded_progress_notification(method) => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn progress")?;
@@ -2752,7 +2919,48 @@ where
                 });
             }
         }
+    })();
+    let result = match budget_failure {
+        Some(error) => Err(error),
+        None => result,
+    };
+    if let Err(error) = &result {
+        for (id, item) in active_items {
+            if item.item_type == "commandExecution" {
+                command_observations.push(correlate_command_observation(
+                    &id,
+                    item.command_snapshot,
+                    None,
+                ));
+            }
+        }
+        *observation.partial = Some(AppServerOutcome {
+            thread_id: thread_id.to_string(),
+            turn_id: turn_id.to_string(),
+            status: TurnTerminalStatus::Failed,
+            protocol_error: Some(error.to_string()),
+            resolved_model,
+            resolved_effort,
+            token_usage,
+            reroute_message,
+            completed_items: completed_items.len(),
+            item_outcomes,
+            command_execution_evidence: CommandExecutionEvidence {
+                thread_id: thread_id.to_string(),
+                turn_id: turn_id.to_string(),
+                turn_status: TurnTerminalStatus::Failed,
+                observations: command_observations,
+            },
+            refused_ceiling_expansions,
+            gate_denials,
+            final_message: None,
+            auto_reviews,
+            duplex_fallback_required: true,
+            messages_received: state.messages_received,
+            bytes_received: state.bytes_received,
+        });
     }
+    result
 }
 
 fn parse_approval_request(
@@ -3821,6 +4029,236 @@ mod tests {
     }
 
     #[test]
+    fn live_budget_interrupts_and_drains_latest_snapshot_without_new_calls() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.pop().unwrap();
+        messages.extend([
+            token_usage_notice(210_000, 10_000),
+            json!({"id": 77, "method": "item/commandExecution/requestApproval", "params": {}}),
+            token_usage_notice(230_000, 12_000),
+            terminal,
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let mut partial = None;
+        let mut stopped = false;
+        let error = run_app_server_turn_observed(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits {
+                token_grant: Some(220_000),
+                ..AppServerLimits::default()
+            },
+            &mut |_: ApprovalRequest| panic!("must not approve after breach"),
+            || false,
+            &mut partial,
+            &mut || stopped = true,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            AppServerError::TokenBudgetExceeded {
+                grant: 220_000,
+                observed: 220_000
+            }
+        );
+        assert!(stopped);
+        let partial = partial.unwrap();
+        assert_eq!(partial.token_usage.unwrap().input_tokens, 230_000);
+        assert_eq!(partial.status, TurnTerminalStatus::Failed);
+        assert!(!partial.command_execution_evidence.observations.is_empty());
+        assert!(partial.final_message.is_none());
+        let interrupt = transport
+            .sent
+            .iter()
+            .position(|v| v["method"] == "turn/interrupt")
+            .unwrap();
+        assert_eq!(interrupt + 1, transport.sent.len());
+    }
+
+    #[test]
+    fn live_budget_allows_ordinary_37k_turn_above_16k_admission_estimate() {
+        use crate::supervise_budget::{
+            BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+        };
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(BudgetReservationRequest {
+                role: crate::supervise::AgentRole::Researcher,
+                tokens: 16_384,
+                cost_usd: Some(1.0),
+            })
+            .unwrap()
+        else {
+            panic!("admission")
+        };
+        let grant = ledger.live_token_grant(reservation.id).unwrap().unwrap();
+        assert_eq!(grant.tokens(), 220_000);
+        let mut messages = command_observation_messages();
+        messages.insert(messages.len() - 1, token_usage_notice(35_000, 2_000));
+        let outcome = run_app_server_turn(
+            &mut FakeTransport::from_values(messages),
+            &test_turn(),
+            AppServerLimits {
+                token_grant: Some(grant.tokens()),
+                ..AppServerLimits::default()
+            },
+            &mut |_: ApprovalRequest| panic!("no approval"),
+            || false,
+        )
+        .unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+    }
+
+    #[test]
+    fn partial_usage_survives_cancellation_protocol_loss_and_invalid_notices() {
+        let mut prefix = command_observation_messages();
+        prefix.pop();
+        prefix.push(token_usage_notice(35_000, 2_000));
+        let mut foreign = token_usage_notice(40_000, 2_000);
+        foreign["params"]["turnId"] = json!("foreign");
+        let mut overflow = token_usage_notice(40_000, 2_000);
+        overflow["params"]["tokenUsage"]["total"]["inputTokens"] = json!(u64::MAX);
+        let mut invalids = vec![
+            None,
+            Some(foreign),
+            Some(token_usage_notice(1, 1)),
+            Some(overflow),
+        ];
+        for (field, value) in [
+            ("cachedInputTokens", json!(40_001)),
+            ("reasoningOutputTokens", json!(2_001)),
+            ("totalTokens", json!(1)),
+            ("cacheWriteInputTokens", json!("invalid")),
+            ("cacheWriteInputTokens", Value::Null),
+        ] {
+            let mut invalid = token_usage_notice(40_000, 2_000);
+            invalid["params"]["tokenUsage"]["total"][field] = value;
+            invalids.push(Some(invalid));
+        }
+        for invalid in invalids {
+            let mut messages = prefix.clone();
+            messages.extend(invalid);
+            let mut transport = FakeTransport::from_values(messages);
+            let mut partial = None;
+            assert!(run_app_server_turn_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval"),
+                || false,
+                &mut partial,
+                &mut || {}
+            )
+            .is_err());
+            let partial = partial.unwrap();
+            assert_eq!(partial.token_usage.unwrap().input_tokens, 35_000);
+            assert_eq!(partial.resolved_model, "gpt-5.6-sol");
+            assert!(!partial.command_execution_evidence.observations.is_empty());
+            assert!(sent_interrupt(&transport));
+        }
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport::from_values(prefix.clone());
+        transport.reads = Some(reads.clone());
+        let mut partial = None;
+        assert!(matches!(
+            run_app_server_turn_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval"),
+                || reads.load(Ordering::SeqCst) >= prefix.len(),
+                &mut partial,
+                &mut || {}
+            ),
+            Err(AppServerError::Cancelled { .. })
+        ));
+        assert_eq!(partial.unwrap().token_usage.unwrap().input_tokens, 35_000);
+    }
+
+    #[test]
+    fn malformed_command_lifecycle_retains_original_authenticated_start() {
+        let valid = command_observation_messages();
+        let expected = observed_command_snapshot(&serde_json::to_vec(&valid[4]).unwrap()).unwrap();
+        let mut nonterminal = valid[5].clone();
+        nonterminal["params"]["item"]["status"] = json!("inProgress");
+        let mut missing_status = valid[5].clone();
+        missing_status["params"]["item"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let mut duplicate = valid[4].clone();
+        duplicate["params"]["item"]["command"] = json!("tampered replacement");
+        for invalid in [nonterminal, missing_status, duplicate] {
+            let mut messages = valid[..5].to_vec();
+            messages.push(invalid);
+            let mut transport = FakeTransport::from_values(messages);
+            let mut partial = None;
+            assert!(run_app_server_turn_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval"),
+                || false,
+                &mut partial,
+                &mut || {},
+            )
+            .is_err());
+            let partial = partial.unwrap();
+            assert_eq!(partial.status, TurnTerminalStatus::Failed);
+            assert!(partial.final_message.is_none());
+            assert!(
+                matches!(partial.command_execution_evidence.observations.as_slice(),
+                [CommandExecutionObservation::Incomplete { item_id, started: Some(started), .. }]
+                    if item_id == "command-1" && started == &expected)
+            );
+        }
+    }
+
+    #[test]
+    fn partial_usage_survives_timeout_after_valid_notices() {
+        struct TimeoutAfterMessages(FakeTransport);
+        impl JsonLineTransport for TimeoutAfterMessages {
+            fn send(&mut self, line: &[u8]) -> Result<(), String> {
+                self.0.send(line)
+            }
+            fn receive(
+                &mut self,
+                wait: Duration,
+                max: usize,
+                out: &mut Vec<u8>,
+            ) -> Result<TransportRead, String> {
+                self.0.force_timeout = self.0.incoming.is_empty();
+                self.0.receive(wait, max, out)
+            }
+        }
+        let mut messages = command_observation_messages();
+        messages.pop();
+        messages.push(token_usage_notice(35_000, 2_000));
+        let mut transport = TimeoutAfterMessages(FakeTransport::from_values(messages));
+        let mut partial = None;
+        assert!(matches!(
+            run_app_server_turn_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits {
+                    turn_timeout: Duration::from_millis(50),
+                    ..AppServerLimits::default()
+                },
+                &mut |_: ApprovalRequest| panic!("no approval"),
+                || false,
+                &mut partial,
+                &mut || {}
+            ),
+            Err(AppServerError::Timeout { .. })
+        ));
+        assert_eq!(partial.unwrap().token_usage.unwrap().input_tokens, 35_000);
+    }
+
+    #[test]
     fn app_server_usage_uses_final_correlated_cumulative_snapshot() {
         let mut messages = command_observation_messages();
         let terminal = messages.len() - 1;
@@ -4271,12 +4709,14 @@ mod tests {
         ] {
             let mut messages = command_observation_messages();
             messages[index]["params"]["item"][field] = value;
+            let started = observed_command_snapshot(&serde_json::to_vec(&messages[4]).unwrap());
             let outcome = run_command_observation_messages(messages)
                 .expect("inconsistent evidence is nonfatal");
             assert_eq!(
                 outcome.command_execution_evidence.observations,
                 vec![CommandExecutionObservation::Incomplete {
                     item_id: "command-1".to_string(),
+                    started,
                     reason
                 }]
             );
@@ -5617,6 +6057,7 @@ mod tests {
         let status_text = serde_json::to_string(&status_body).expect("status json");
         let mut messages = base_messages();
         messages.extend([
+            token_usage_notice(35_000, 2_000),
             dynamic_tool_started("call-submit", WORKER_REQUEST_TOOL, &submit),
             dynamic_tool_call(
                 json!("rpc-submit"),
@@ -5643,7 +6084,10 @@ mod tests {
         let outcome = run_app_server_turn_with_worker_requests(
             &mut transport,
             &test_turn(),
-            AppServerLimits::default(),
+            AppServerLimits {
+                token_grant: Some(220_000),
+                ..AppServerLimits::default()
+            },
             &mut |_: ApprovalRequest| panic!("worker request is not an approval"),
             Some(&mut move |arguments| {
                 record
@@ -5660,6 +6104,8 @@ mod tests {
         )
         .expect("worker request transcript");
         assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.token_usage.unwrap().input_tokens, 35_000);
+        assert_eq!(outcome.token_usage.unwrap().output_tokens, 2_000);
         assert_eq!(
             thread_start_message(&transport)["params"]["dynamicTools"],
             json!([worker_request_tool_spec()])
@@ -5682,6 +6128,98 @@ mod tests {
             ]
         );
         assert!(!sent_interrupt(&transport));
+    }
+
+    #[test]
+    fn worker_requests_preserve_partial_custody_and_stop_dispatch_at_budget_breach() {
+        for breach in [false, true] {
+            let arguments = worker_arguments("submit_worker_request");
+            let mut messages = command_observation_messages();
+            messages.pop(); // Keep the command start authentic and incomplete.
+            messages.pop();
+            let expected_command = messages.last().unwrap()["params"]["item"]["command"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            messages.extend([
+                if breach {
+                    token_usage_notice(210_000, 10_000)
+                } else {
+                    token_usage_notice(35_000, 2_000)
+                },
+                dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+                dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+            ]);
+            if breach {
+                messages.extend([
+                    token_usage_notice(230_000, 12_000),
+                    turn_completed_message(),
+                ]);
+            }
+            let mut transport = FakeTransport::from_values(messages);
+            let mut partial = None;
+            let mut stopped = false;
+            let mut calls = 0;
+            let error = run_app_server_turn_with_worker_requests_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits {
+                    token_grant: Some(220_000),
+                    ..AppServerLimits::default()
+                },
+                &mut |_: ApprovalRequest| panic!("no approval authority"),
+                Some(&mut |_: &Value| {
+                    calls += 1;
+                    Err("managed worker request refused".to_string())
+                }),
+                || false,
+                AppServerObservation {
+                    partial: &mut partial,
+                    budget_exhausted: &mut || stopped = true,
+                },
+            )
+            .unwrap_err();
+            if breach {
+                assert_eq!(
+                    error,
+                    AppServerError::TokenBudgetExceeded {
+                        grant: 220_000,
+                        observed: 220_000,
+                    }
+                );
+                assert_eq!(calls, 0, "no worker dispatch after the budget stop");
+            } else {
+                assert!(matches!(
+                    error,
+                    AppServerError::Remote {
+                        phase: "worker request",
+                        ..
+                    }
+                ));
+                assert_eq!(calls, 1);
+            }
+            assert_eq!(stopped, breach);
+            assert!(tool_successes(&transport).is_empty());
+            assert!(sent_interrupt(&transport));
+            let partial = partial.unwrap();
+            assert_eq!(partial.thread_id, "thread-1");
+            assert_eq!(partial.turn_id, "turn-1");
+            assert_eq!(partial.resolved_model, "gpt-5.6-sol");
+            assert_eq!(partial.resolved_effort.as_deref(), Some("xhigh"));
+            assert_eq!(partial.status, TurnTerminalStatus::Failed);
+            assert!(partial.protocol_error.is_some());
+            assert!(partial.final_message.is_none());
+            let usage = partial.token_usage.unwrap();
+            assert_eq!(
+                usage.input_tokens + usage.output_tokens,
+                if breach { 242_000 } else { 37_000 }
+            );
+            assert!(matches!(
+                partial.command_execution_evidence.observations.as_slice(),
+                [CommandExecutionObservation::Incomplete { item_id, started: Some(started), .. }]
+                    if item_id == "command-1" && started.command == expected_command
+            ));
+        }
     }
 
     #[test]

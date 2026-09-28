@@ -105,6 +105,16 @@ pub(super) fn exercise<'budget>(
                 .as_ref()
                 .expect("unquiescent parent returned a run");
             assert!(run.process_tree.is_none());
+            assert_eq!(
+                fs::read(
+                    context
+                        .run_dir
+                        .join(&capture.prepared.attempt_artifacts.raw_stdout_relative)
+                )?,
+                run.stdout_bytes(),
+                "held raw evidence can be preserved without authorizing scratch cleanup"
+            );
+            assert!(incoming_scratch.is_dir() && capture_scratch.is_dir());
             assert!(capture
                 .diagnostics
                 .iter()

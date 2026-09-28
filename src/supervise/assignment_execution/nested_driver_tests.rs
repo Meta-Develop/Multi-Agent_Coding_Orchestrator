@@ -137,14 +137,46 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             ..Default::default()
         },
     )?;
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let metadata = AssignmentMetadata::new();
+    let consultant = SupervisorConsultantPlan::default();
+    // Only this case exercises completion-checkpoint failure. Bind the existing
+    // authenticated writer before preparation creates non-resumable scratches.
+    let mut checkpoint = if case == "managed-cycle-retained-checkpoint-error" {
+        Some(SupervisorCheckpointWriter::create(
+            &repo,
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &current_head_oid(&repo)?,
+                normalized_supervisor_plan_sha256(
+                    &plan,
+                    &consultant,
+                    &metadata,
+                    &SupervisorPlanMetadata {
+                        assignment_schedule: schedule.clone(),
+                        ..Default::default()
+                    },
+                )?,
+                1,
+                &plan,
+                writer.resume_binding()?,
+                ledger.report()?,
+            ),
+        )?)
+    } else {
+        None
+    };
     let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
     let mut kpis = AutonomyKpiCollector::default();
     let artifacts = Mutex::new(SharedSupervisorArtifacts {
         writer: &mut writer,
         journal: &mut journal,
         autonomy_kpis: &mut kpis,
-        checkpoint: None,
+        checkpoint: checkpoint.as_mut(),
     });
+    if case == "managed-cycle-retained-checkpoint-error" {
+        record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
+    }
     let budget_config = SupervisorBudgetConfig {
         role_token_reservations: BTreeMap::from([
             (AgentRole::ChildOrchestrator, 2),
@@ -152,9 +184,6 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         ]),
         ..Default::default()
     };
-    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
-    let metadata = AssignmentMetadata::new();
-    let consultant = SupervisorConsultantPlan::default();
     let guide = SupervisorFieldGuidePrompt::empty()?;
     let catalog =
         RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
