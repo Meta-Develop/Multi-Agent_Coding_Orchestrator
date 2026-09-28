@@ -529,14 +529,8 @@ pub(super) fn execute_nested_worker_attempt(
                 &run, &command, runtime,
             ));
         let settlement = settlement?;
-        if let Some(usage) = settlement.reliable_usage() {
-            outcome.usage_samples.push(RoleUsageSample {
-                runtime,
-                role: AgentRole::Worker,
-                lens_id: None,
-                model: command.model.clone(),
-                usage,
-            });
+        if let Some(sample) = settlement.role_sample(AgentRole::Worker, None) {
+            outcome.usage_samples.push(sample);
         } else if settlement.is_degraded() {
             outcome.usage_incomplete = true;
         }

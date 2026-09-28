@@ -1876,10 +1876,85 @@ impl ExternalAgentRun {
             .as_ref()
     }
 
+    /// Private identity evidence captured by the parent, never restored from a report.
+    pub(crate) fn authenticated_codex_evidence(&self) -> Option<&CodexParentEvidence> {
+        self.authenticated_app_server_evidence().or(self
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref())
+    }
+
+    pub(crate) fn authenticated_app_server_usage_complete(&self) -> bool {
+        self.stdout.run_metadata.codex_app_server_usage_complete
+    }
+
+    pub(crate) fn authenticated_codex_usage_complete(&self) -> bool {
+        if self.authenticated_app_server_evidence().is_some() {
+            self.authenticated_app_server_usage_complete()
+        } else {
+            self.stdout.run_metadata.codex_cli_usage_complete
+                && self.stdout.run_metadata.codex_cli_usage.is_some()
+        }
+    }
+
+    /// Invocation-wide tokens from the same private capture as the identity.
+    /// CLI final-turn usage is not the aggregate of a multi-turn invocation.
+    pub(crate) fn authenticated_codex_usage(&self) -> Option<Usage> {
+        if self.authenticated_app_server_evidence().is_some() {
+            return self.authenticated_codex_partial_usage();
+        }
+        self.stdout.run_metadata.codex_cli_usage
+    }
+
+    /// A valid single turn is a lower bound, never a complete CLI aggregate.
+    pub(crate) fn authenticated_codex_partial_usage(&self) -> Option<Usage> {
+        if let Some(evidence) = self.authenticated_codex_evidence() {
+            let CodexParentTurnUsage::Known {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                reasoning_output_tokens,
+            } = evidence.turn_usage
+            else {
+                return None;
+            };
+            if cached_input_tokens > input_tokens || reasoning_output_tokens > output_tokens {
+                return None;
+            }
+            let input_tokens = usize::try_from(input_tokens).ok()?;
+            let output_tokens = usize::try_from(output_tokens).ok()?;
+            return Some(Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens.checked_add(output_tokens)?,
+            });
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_cli_parent_evidence_for_test(&mut self, stdout: &[u8]) {
+        self.stdout.run_metadata.codex_cli_parent_evidence = self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_cli_usage = codex_usage_from_jsonl(stdout).ok().flatten();
+        self.stdout.run_metadata.codex_cli_usage_complete = self.publishable
+            && self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none();
+    }
+
     #[cfg(test)]
     pub(crate) fn retain_app_server_parent_evidence_for_test(&mut self) {
         self.stdout.run_metadata.codex_app_server_parent_evidence =
             self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_app_server_usage_complete = self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none()
+            && self
+                .codex_command_execution_evidence()
+                .is_some_and(|evidence| {
+                    evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+                });
     }
 
     fn retain_codex_command_execution_evidence(
@@ -2192,6 +2267,10 @@ struct ExternalAgentRunMetadata {
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
+    codex_app_server_usage_complete: bool,
+    codex_cli_parent_evidence: Option<CodexParentEvidence>,
+    codex_cli_usage: Option<Usage>,
+    codex_cli_usage_complete: bool,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -5030,15 +5109,24 @@ fn record_completed_app_server_target(
         report.stdout.run_metadata.codex_app_server_parent_evidence = Some(evidence.clone());
         report.codex_parent_evidence = Some(evidence);
     }
+    // Capture token completion before an unavailable identity blocks acceptance.
+    report.stdout.run_metadata.codex_app_server_usage_complete = report.exit_code == Some(0)
+        && !report.timed_out
+        && report.error.is_none()
+        && report
+            .codex_command_execution_evidence()
+            .is_some_and(|evidence| {
+                evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+            });
     if report
         .authenticated_app_server_evidence()
-        .is_none_or(|evidence| evidence.resolution_status != "complete")
+        .is_none_or(|evidence| evidence.resolution_status != "complete" || evidence.model_mismatch)
         || report.stdout.raw_capture_truncated()
     {
         report.error = append_external_error(
             report.error.take(),
             Some(
-                "Codex app-server identity/usage resolution or raw capture is incomplete"
+                "Codex app-server identity/usage resolution or raw capture is incomplete, or the observed model mismatches the requested model"
                     .to_string(),
             ),
         );
@@ -5140,8 +5228,11 @@ fn record_completed_target(
                 requested_effort: context.spec.reasoning_effort.as_deref(),
             };
             let stdout = (!output.stdout.is_truncated()).then(|| output.stdout.as_bytes());
-            report.codex_parent_evidence =
-                Some(codex_parent_evidence_from_run(&inputs, stdout, codex_home));
+            let evidence = codex_parent_evidence_from_run(&inputs, stdout, codex_home);
+            report.stdout.run_metadata.codex_cli_parent_evidence = Some(evidence.clone());
+            report.stdout.run_metadata.codex_cli_usage =
+                stdout.and_then(|bytes| codex_usage_from_jsonl(bytes).ok().flatten());
+            report.codex_parent_evidence = Some(evidence);
         }
     }
     report.error = append_external_error(
@@ -5248,6 +5339,23 @@ fn record_completed_target(
             .grok_acp_parent_evidence
             .as_ref()
             .is_some_and(|evidence| evidence.permission_escalation_refused);
+    report.stdout.run_metadata.codex_cli_usage_complete = report.publishable;
+    if report.codex_command_execution_evidence().is_none()
+        && report
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.model_mismatch || report.stdout.run_metadata.codex_cli_usage.is_none()
+            })
+    {
+        report.publishable = false;
+        report.error = append_external_error(
+            report.error.take(),
+            Some("Codex observed model mismatches the requested model or invocation usage is incomplete".to_string()),
+        );
+    }
 }
 
 fn capture_redacted_staged_output(

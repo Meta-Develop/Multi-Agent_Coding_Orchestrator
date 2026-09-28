@@ -145,6 +145,7 @@ struct DispatchBudgetReservation<'a> {
     ledger: &'a RunBudgetLedger,
     reservation: BudgetReservation,
     pricing: Option<ModelPricing>,
+    model_pricing: BTreeMap<String, ModelPricing>,
     state: DispatchBudgetReservationState,
 }
 
@@ -156,24 +157,36 @@ enum DispatchUsageReliability {
     NotStarted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DispatchUsageSettlement {
     observed_usage: Option<Usage>,
     reliability: DispatchUsageReliability,
+    model: Option<String>,
+    cost_usd: Option<f64>,
 }
 
 impl DispatchUsageSettlement {
-    fn reliable_usage(self) -> Option<Usage> {
+    fn reliable_usage(&self) -> Option<Usage> {
         (self.reliability == DispatchUsageReliability::Reliable)
             .then_some(self.observed_usage)
             .flatten()
     }
 
-    fn is_degraded(self) -> bool {
+    fn is_degraded(&self) -> bool {
         matches!(
             self.reliability,
             DispatchUsageReliability::Estimated | DispatchUsageReliability::Missing
         )
+    }
+
+    fn role_sample(&self, role: AgentRole, lens_id: Option<String>) -> Option<RoleUsageSample> {
+        self.reliable_usage().map(|usage| RoleUsageSample {
+            role,
+            lens_id,
+            model: self.model.clone(),
+            usage,
+            cost_usd: self.cost_usd,
+        })
     }
 }
 
@@ -234,36 +247,56 @@ impl DispatchBudgetReservation<'_> {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
         let usage = complete_external_codex_usage(run, command);
-        // Requested-model pricing is not evidence of the price of an unknown/rerouted model.
-        let pricing = if run.codex_command_execution_evidence().is_some() {
-            run.authenticated_app_server_evidence()
-                .filter(|evidence| {
-                    evidence.observed_model.known().is_some()
-                        && evidence.observed_model.known() == command.model.as_deref()
-                        && evidence.server_rerouted_model.is_none()
-                })
-                .and(self.pricing)
+        // One parent-owned allocation feeds both the ledger and every role/lens report.
+        // A reroute notice cannot allocate cumulative turn usage between models.
+        let model = if launch_runtime == SupervisorRuntime::Codex {
+            run.authenticated_codex_evidence()
+                .filter(|evidence| evidence.requested_model == command.model)
+                .filter(|_| usage.is_some() && run.authenticated_codex_usage() == usage)
+                .and_then(|evidence| evidence.usage_model())
+                .map(str::to_owned)
+        } else {
+            command.model.clone()
+        };
+        let pricing = if launch_runtime == SupervisorRuntime::Codex {
+            model.as_deref().and_then(|model| {
+                crate::llm::provider::resolve_model_pricing(&self.model_pricing, model)
+                    .filter(|resolved| {
+                        resolved.provenance
+                            == crate::llm::provider::ModelPricingProvenance::PlanOverride
+                    })
+                    .map(|resolved| resolved.pricing)
+            })
         } else {
             self.pricing
+        };
+        let cost_usd = usage
+            .and_then(|usage| pricing.map(|pricing| pricing.cost_usd(usage)))
+            .filter(|cost| cost.is_finite());
+        // Identity acceptance is deliberately separate from complete token accounting.
+        // This does not relax external_process_completed or any publication gate.
+        let token_process_completed = if run.authenticated_codex_evidence().is_some() {
+            run.authenticated_codex_usage_complete()
+        } else {
+            external_process_completed(run, launch_runtime)
         };
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
-                    if external_process_completed(run, launch_runtime)
+                    if token_process_completed
                         && external_safety_verified(run, launch_runtime)
                         && !run.stdout.raw_capture_truncated()
                         && (run.codex_command_execution_evidence().is_none()
                             || run.authenticated_app_server_evidence().is_some_and(|evidence| {
-                                evidence.resolution_status == "complete"
+                                run.codex_command_execution_evidence().is_some_and(|commands|
+                                    commands.turn_status == crate::external_agent::codex_app_server::TurnTerminalStatus::Completed)
                                     && run.codex_parent_evidence.as_ref() == Some(evidence)
                             })) =>
                 {
                     (
                         UsageMeasurement::Reliable {
                             tokens: usage.total_tokens,
-                            cost_usd: pricing
-                                .map(|pricing| pricing.cost_usd(usage))
-                                .filter(|cost| cost.is_finite()),
+                            cost_usd,
                         },
                         DispatchUsageReliability::Reliable,
                     )
@@ -271,9 +304,7 @@ impl DispatchBudgetReservation<'_> {
                 Some(usage) => (
                     UsageMeasurement::Estimated {
                         tokens: usage.total_tokens,
-                        cost_usd: pricing
-                            .map(|pricing| pricing.cost_usd(usage))
-                            .filter(|cost| cost.is_finite()),
+                        cost_usd,
                     },
                     DispatchUsageReliability::Estimated,
                 ),
@@ -289,6 +320,8 @@ impl DispatchBudgetReservation<'_> {
             DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability,
+                model,
+                cost_usd,
             }
         } else {
             self.ledger
@@ -297,6 +330,8 @@ impl DispatchBudgetReservation<'_> {
             DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability: DispatchUsageReliability::NotStarted,
+                model: None,
+                cost_usd: None,
             }
         };
         self.state = DispatchBudgetReservationState::Settled;
@@ -896,13 +931,13 @@ impl ReportStatus for AuditorReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RoleUsageSample {
-    runtime: SupervisorRuntime,
     role: AgentRole,
     lens_id: Option<String>,
     model: Option<String>,
     usage: Usage,
+    cost_usd: Option<f64>,
 }
 
 struct RoleUsageAggregation {

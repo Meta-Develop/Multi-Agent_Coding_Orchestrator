@@ -4089,7 +4089,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     *model = "auditor-model".to_string();
     let samples = vec![
         RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: Some(0.0036),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4100,7 +4100,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: Some(0.0018),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4111,7 +4111,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: Some(0.0009),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4122,7 +4122,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: Some(0.00045),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4211,6 +4211,20 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     assert_eq!(lens_total_cost_usd, lens_reports[0].cost_usd);
 
     plan.model_pricing.clear();
+    let retained = role_usage_report(&plan, samples.clone())
+        .expect("retain settled costs after plan pricing changes");
+    assert_eq!(retained.total_cost_usd, cost);
+    assert_eq!(retained.lens_total_cost_usd, lens_total_cost_usd);
+    for (role, report) in &by_role {
+        assert_eq!(retained.reports[role].cost_usd, report.cost_usd);
+    }
+    let unpriced_samples = samples
+        .into_iter()
+        .map(|mut sample| {
+            sample.cost_usd = None;
+            sample
+        })
+        .collect();
     let RoleUsageAggregation {
         reports: unpriced,
         lens_reports: unpriced_lenses,
@@ -4218,7 +4232,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         total_cost_usd: unpriced_cost,
         lens_total_usage: unpriced_lens_total,
         lens_total_cost_usd: unpriced_lens_cost,
-    } = role_usage_report(&plan, samples).expect("aggregate unpriced process usage");
+    } = role_usage_report(&plan, unpriced_samples).expect("aggregate unpriced process usage");
     assert_eq!(unpriced_total, total);
     assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
     assert!(unpriced_cost.is_none());
@@ -4275,14 +4289,14 @@ fn process_role_usage_aggregation_prices_direct_workers() {
         &plan,
         vec![
             RoleUsageSample {
-                runtime: SupervisorRuntime::Codex,
+                cost_usd: Some(plan.model_pricing["worker-primary"].cost_usd(first_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-primary".to_string()),
                 usage: first_usage,
             },
             RoleUsageSample {
-                runtime: SupervisorRuntime::Codex,
+                cost_usd: Some(plan.model_pricing["worker-fallback"].cost_usd(second_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-fallback".to_string()),
@@ -4358,14 +4372,14 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
         &plan,
         vec![
             RoleUsageSample {
-                runtime: SupervisorRuntime::Codex,
+                cost_usd: Some(plan.model_pricing["auditor-initial"].cost_usd(rejected_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-initial".to_string()),
                 usage: rejected_usage,
             },
             RoleUsageSample {
-                runtime: SupervisorRuntime::Codex,
+                cost_usd: Some(plan.model_pricing["auditor-active"].cost_usd(accepted_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-active".to_string()),
@@ -4421,22 +4435,22 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
     assert_eq!(persisted.review_lens_usage[1].model, "auditor-initial");
     assert_eq!(persisted.review_lens_total_usage, Some(expected_total));
 
-    let missing_model_error = match role_usage_report(
+    let missing_model = role_usage_report(
         &plan,
         vec![RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: None,
             role: AgentRole::Auditor,
             lens_id: Some(plan.review_lenses[0].id.clone()),
             model: None,
             usage: Usage::default(),
         }],
-    ) {
-        Ok(_) => panic!("lens usage without model attribution must fail closed"),
-        Err(error) => error,
-    };
-    assert!(missing_model_error
-        .to_string()
-        .contains("omitted the dispatched model attribution"));
+    )
+    .expect("unknown identity retains tokens without allocating cost");
+    assert_eq!(missing_model.lens_reports[0].model, "unknown");
+    assert_eq!(missing_model.lens_reports[0].usage, Some(Usage::default()));
+    assert!(missing_model.lens_reports[0].cost_usd.is_none());
+    assert!(missing_model.lens_reports[0].unavailable_reason.is_some());
+    assert!(missing_model.total_cost_usd.is_none());
 }
 
 #[test]
@@ -4491,7 +4505,7 @@ fn nested_process_usage_has_no_synthetic_worker_totals() {
     let nested = role_usage_report(
         &nested_plan,
         vec![RoleUsageSample {
-            runtime: SupervisorRuntime::Codex,
+            cost_usd: None,
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),

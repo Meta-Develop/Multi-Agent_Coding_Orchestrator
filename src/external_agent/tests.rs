@@ -9076,6 +9076,26 @@ fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()
 }
 
 #[test]
+fn codex_usage_parser_rejects_component_and_combined_total_overflow() {
+    let max = usize::MAX;
+    for (first, second, reason) in [
+        ((max - 1, 1), (max - 1, 1), "input"),
+        ((1, max - 1), (1, max - 1), "output"),
+        ((max - 1, 0), (0, 2), "total"),
+        ((max, 1), (0, 0), "total"),
+    ] {
+        let stream = [first, second].into_iter().map(|(input, output)| {
+            format!(r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0,"reasoning_output_tokens":0}}}}"#)
+        }).collect::<Vec<_>>().join("\n");
+        let error =
+            codex_usage_from_jsonl(stream.as_bytes()).expect_err("overflow must fail closed");
+        assert!(error
+            .to_string()
+            .contains(&format!("aggregate {reason} token count overflowed")));
+    }
+}
+
+#[test]
 fn codex_usage_parser_sums_only_valid_completed_turns() -> Result<()> {
     let usage = codex_usage_from_jsonl(
         br#"{"type":"thread.started","thread_id":"thread-a"}
