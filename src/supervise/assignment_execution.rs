@@ -2076,13 +2076,6 @@ fn prepare_child_attempt<'a>(
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
-    let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
-        crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
-            attempt_prompt,
-        )?
-    } else {
-        attempt_prompt
-    };
     let source_inputs = assignment_metadata
         .source_inputs
         .get(&assignment.id)
@@ -2096,6 +2089,15 @@ fn prepare_child_attempt<'a>(
             &source_inputs,
         )?;
         format!("{attempt_prompt}\n\nOperator-declared read-only source inputs (relative to this managed workspace):\n{}\nInspect these exact files. Hash/visibility receipts prove preparation only, not source inspection or acceptance. Do not infer access to any external path from prose.\n", serde_json::to_string_pretty(&source_inputs)?)
+    };
+    // The messaging verifier requires this static appendix at the exact end of
+    // the manifested prompt, after source context and any retry instructions.
+    let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
+        crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
+            attempt_prompt,
+        )?
+    } else {
+        attempt_prompt
     };
     measurements.record_final_launch_prompt_bytes(&attempt_prompt)?;
     let prompt_relative = dirs.relative(&attempt_artifacts.prompt_path)?;
@@ -6258,6 +6260,222 @@ mod decomposition_tests {
     }
 
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    fn verify_prepared_researcher_messaging_prompt(with_source_inputs: bool) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo)?;
+        let contents = "# Research source\nRead this tracked source without modifying it.\n";
+        fs::write(repo.join("README.md"), contents)?;
+        commit_fixture_repository(&repo);
+        drop(crate::artifacts::repository_auth_writer(&repo)?);
+        let mut plan_value = serde_json::json!({
+            "task": "Read the assigned source and report cited findings without changes.",
+            "max_depth": 2, "max_child_assignments": 1, "max_child_retries": 0,
+            "max_gate_corrections": 0, "child_timeout_seconds": 10,
+            "semantic_coordination": "off",
+            "role_models": {
+                "researcher": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+            },
+            "assignments": [{
+                "id": "researcher-prompt-order", "phase": "execution", "runtime": "codex",
+                "role": "researcher", "role_category": "read_only_researcher",
+                "assigned_paths": ["README.md"], "worker_assignments": [],
+                "task": "Inspect README.md. No writes or delegation."
+            }]
+        });
+        if with_source_inputs {
+            plan_value["assignments"][0]["source_inputs"] = serde_json::json!([{
+                "path": "README.md",
+                "sha256": crate::artifacts::state_auth::sha256_hex(contents.as_bytes())
+            }]);
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&plan_value.to_string())?;
+        let plan = &loaded.plan;
+        let assignment = &plan.assignments[0];
+        let budget_config = SupervisorBudgetConfig::default();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("researcher-prompt-order")?,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "researcher-prompt-order".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "researcher-prompt-order-test",
+        )?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            plan,
+            &assignment_schedule,
+        );
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+        let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id, None);
+        assert!(
+            journal.is_some(),
+            "preparation requires an observable journal"
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = unused_external_runner;
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan,
+            requested_plan: plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &loaded.consultant,
+            assignment_metadata: &loaded.assignment_metadata,
+            assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::Verified,
+            worktree_creation: SupervisorWorktreeCreation::VerifiedTestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation: ProcessCancellation::new(),
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => bail!("researcher preflight refused"),
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas)?;
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")?;
+        let mut prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+            None,
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => bail!("researcher preparation refused"),
+        };
+        assert_eq!(prepared.command.workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(
+            prepared.command.researcher_source_inputs.len(),
+            usize::from(with_source_inputs)
+        );
+        let before_binding = fs::read(&prepared.command.prompt)?;
+        let prompt = std::str::from_utf8(&before_binding)?;
+        assert_eq!(
+            prompt.contains("Operator-declared read-only source inputs"),
+            with_source_inputs
+        );
+        if with_source_inputs {
+            assert!(prompt.contains(&crate::artifacts::state_auth::sha256_hex(
+                contents.as_bytes()
+            )));
+            assert!(
+                prompt
+                    .find("Operator-declared read-only source inputs")
+                    .unwrap()
+                    < prompt
+                        .rfind("## Assignment messaging (loopback IPC)")
+                        .unwrap()
+            );
+        }
+        let measurements_path = run_dir.join(prompt_measurements_relative(
+            &dirs.relative(&prepared.command.prompt)?,
+        ));
+        let measurements: PromptMeasurementsArtifact =
+            serde_json::from_slice(&fs::read(measurements_path)?)?;
+        assert_eq!(measurements.prompts[0].full_bytes, before_binding.len());
+        // Use the production binder and its strict EOF verifier, not a rendered
+        // imitation. Stop before dispatch: no external process or provider runs.
+        let _server = bind_assignment_messaging_for_external_child_launch(
+            &context,
+            &assignment.id,
+            &mut prepared.command,
+        )?;
+        prepared
+            .command
+            .verify_assignment_messaging_protocol_instructions()?;
+        assert_eq!(fs::read(&prepared.command.prompt)?, before_binding);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_researcher_without_source_inputs_preserves_messaging_appendix() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(false)
+    }
 
     fn initialize_child_dispatch_messaging_session(
         writer: &mut ArtifactRunWriter,
