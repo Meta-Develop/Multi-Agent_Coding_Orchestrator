@@ -342,6 +342,10 @@ pub(super) enum BudgetError {
     CostOverflow,
     #[error("budget ledger state is inconsistent")]
     InconsistentState,
+    #[error("live-grant budget admission wait expired")]
+    AdmissionWaitExpired,
+    #[error("live-grant budget admission was cancelled")]
+    AdmissionCancelled,
     #[error("budget ledger lock is poisoned")]
     Poisoned,
     #[error("workspace rolling budget ledger is unavailable or corrupt: {0}")]
@@ -364,7 +368,45 @@ pub(super) struct RunBudgetLedger {
     started_at: Instant,
     session_id: String,
     inner: Arc<Mutex<LedgerState>>,
+    changed: Arc<std::sync::Condvar>,
     rolling: Option<Arc<Mutex<AttachedRollingBudget>>>,
+}
+
+/// Parent-owned live grant. It cannot be supplied by a plan or child artifact.
+#[derive(Debug, Clone)]
+pub(crate) struct LiveTokenGrant {
+    ledger: RunBudgetLedger,
+    reservation: BudgetReservationId,
+    tokens: u64,
+}
+
+impl PartialEq for LiveTokenGrant {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.ledger.inner, &other.ledger.inner)
+            && self.reservation == other.reservation
+            && self.tokens == other.tokens
+    }
+}
+impl Eq for LiveTokenGrant {}
+
+impl LiveTokenGrant {
+    pub(crate) fn tokens(&self) -> u64 {
+        self.tokens
+    }
+    pub(crate) fn stopped(&self) -> bool {
+        self.ledger.lock_state().map_or(true, |state| {
+            state.force_stop || !state.active.contains_key(&self.reservation)
+        })
+    }
+    pub(crate) fn exhaust(&self) {
+        if let Ok(mut state) = self.ledger.lock_state() {
+            state.force_stop = true;
+            state
+                .persistent_reasons
+                .insert(BudgetReason::HardTokenCeilingReached);
+            self.ledger.changed.notify_all();
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -380,6 +422,7 @@ struct AttachedRollingBudget {
 struct LedgerState {
     next_reservation_id: u64,
     active: BTreeMap<BudgetReservationId, BudgetReservation>,
+    live_grants: BTreeMap<BudgetReservationId, usize>,
     consumed_tokens: usize,
     consumed_cost_usd: f64,
     reserved_tokens: usize,
@@ -397,6 +440,7 @@ impl Default for LedgerState {
         Self {
             next_reservation_id: 1,
             active: BTreeMap::new(),
+            live_grants: BTreeMap::new(),
             consumed_tokens: 0,
             consumed_cost_usd: 0.0,
             reserved_tokens: 0,
@@ -508,6 +552,7 @@ impl RunBudgetLedger {
             session_id: random_identifier()
                 .map_err(|error| BudgetError::SessionIdentityUnavailable(format!("{error:#}")))?,
             inner: Arc::new(Mutex::new(LedgerState::default())),
+            changed: Arc::new(std::sync::Condvar::new()),
             rolling: None,
         };
         ledger.attach_rolling_budget()?;
@@ -604,11 +649,92 @@ impl RunBudgetLedger {
         Ok(ledger)
     }
 
-    /// Atomically checks the current commitments and reserves budget before dispatch.
+    /// Immediate admission seam for deterministic ledger tests.
+    #[cfg(test)]
     pub(super) fn reserve(&self, request: BudgetReservationRequest) -> Result<BudgetAdmission> {
         validate_reservation_request(&request)?;
         let mut state = self.lock_state()?;
-        let current_report = self.report_for_state(&state)?;
+        self.reserve_locked(&mut state, request)
+    }
+
+    /// Only live execution grants justify waiting. Original estimates, cost ceilings,
+    /// uncertainty and a latched breach still refuse immediately. The condition and
+    /// reservation share one lock, so a competing grant cannot turn a retry into a
+    /// false permanent refusal. Cancellation is checked on bounded wakeups.
+    pub(super) fn reserve_waiting_for_live_grants(
+        &self,
+        request: BudgetReservationRequest,
+        timeout: Duration,
+        mut cancelled: impl FnMut() -> bool,
+    ) -> Result<BudgetAdmission> {
+        validate_reservation_request(&request)?;
+        let started = Instant::now();
+        let mut state = self.lock_state()?;
+        loop {
+            if cancelled() {
+                return Err(BudgetError::AdmissionCancelled);
+            }
+            if !self.request_waits_for_live_grants(&state, &request)? {
+                return self.reserve_locked(&mut state, request);
+            }
+            let remaining = timeout
+                .checked_sub(started.elapsed())
+                .filter(|remaining| !remaining.is_zero())
+                .ok_or(BudgetError::AdmissionWaitExpired)?;
+            state = self
+                .changed
+                .wait_timeout(state, remaining.min(Duration::from_millis(50)))
+                .map_err(|_| BudgetError::Poisoned)?
+                .0;
+        }
+    }
+
+    fn request_waits_for_live_grants(
+        &self,
+        state: &LedgerState,
+        request: &BudgetReservationRequest,
+    ) -> Result<bool> {
+        let fits = |state: &LedgerState| -> Result<bool> {
+            let report = self.report_for_state(state)?;
+            let projected = state
+                .consumed_tokens
+                .checked_add(state.reserved_tokens)
+                .and_then(|tokens| tokens.checked_add(request.tokens))
+                .ok_or(BudgetError::TokenOverflow)?;
+            let cost_fits = match (self.limits.hard_cost_usd, request.cost_usd) {
+                (Some(limit), Some(cost)) => !cost_exceeds(
+                    checked_cost_add(
+                        checked_cost_add(state.consumed_cost_usd, state.reserved_cost_usd)?,
+                        cost,
+                    )?,
+                    limit,
+                ),
+                (Some(_), None) => false,
+                (None, _) => true,
+            };
+            Ok(report.new_dispatch_allowed
+                && self
+                    .limits
+                    .hard_tokens
+                    .is_none_or(|limit| projected <= limit)
+                && cost_fits)
+        };
+        if state.force_stop
+            || state.live_grants.is_empty()
+            || (request.cost_usd.is_none() && self.limits.has_cost_ceiling())
+            || fits(state)?
+        {
+            return Ok(false);
+        }
+        fits(&self.without_live_grant_extras(state)?)
+    }
+
+    fn reserve_locked(
+        &self,
+        state: &mut LedgerState,
+        request: BudgetReservationRequest,
+    ) -> Result<BudgetAdmission> {
+        let current_report = self.report_for_state(state)?;
         if !current_report.new_dispatch_allowed {
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::NewDispatchStopped,
@@ -621,6 +747,7 @@ impl RunBudgetLedger {
             next.persistent_reasons.insert(BudgetReason::MissingPricing);
             let report = self.report_for_state(&next)?;
             *state = next;
+            self.changed.notify_all();
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::MissingCostEstimate,
                 report,
@@ -645,6 +772,7 @@ impl RunBudgetLedger {
                 .insert(BudgetReason::HardTokenCeilingReached);
             let report = self.report_for_state(&next)?;
             *state = next;
+            self.changed.notify_all();
             return Ok(BudgetAdmission::Refused {
                 refusal: BudgetAdmissionRefusal::HardTokenCeiling {
                     limit,
@@ -668,6 +796,7 @@ impl RunBudgetLedger {
                     .insert(BudgetReason::HardCostCeilingReached);
                 let report = self.report_for_state(&next)?;
                 *state = next;
+                self.changed.notify_all();
                 return Ok(BudgetAdmission::Refused {
                     refusal: BudgetAdmissionRefusal::HardCostCeiling {
                         limit_usd,
@@ -679,7 +808,7 @@ impl RunBudgetLedger {
             }
         }
 
-        if let Some(refusal) = self.rolling_admission_refusal(&state, &request)? {
+        if let Some(refusal) = self.rolling_admission_refusal(state, &request)? {
             let mut next = state.clone();
             next.force_stop = true;
             match &refusal {
@@ -698,6 +827,7 @@ impl RunBudgetLedger {
             }
             let report = self.report_for_state(&next)?;
             *state = next;
+            self.changed.notify_all();
             return Ok(BudgetAdmission::Refused { refusal, report });
         }
 
@@ -718,10 +848,79 @@ impl RunBudgetLedger {
         let report = self.report_for_state(&next)?;
         self.persist_rolling_reservation(&reservation)?;
         *state = next;
+        self.changed.notify_all();
         Ok(BudgetAdmission::Admitted {
             reservation,
             report,
         })
+    }
+
+    /// A stop latch also applies to admitted children that have not invoked a provider yet.
+    pub(super) fn dispatch_stopped(&self) -> bool {
+        self.lock_state().map_or(true, |state| state.force_stop)
+    }
+
+    /// Admission estimates are not execution caps. Allocate the uncommitted hard
+    /// balance equally across pending reservations, in addition to their estimates.
+    /// Issued grants are immutable and disjoint. A lone child gets the full balance;
+    /// later admissions wait/refuse while that balance is held, never overlap it.
+    pub(crate) fn live_token_grant(
+        &self,
+        id: BudgetReservationId,
+    ) -> Result<Option<LiveTokenGrant>> {
+        let mut state = self.lock_state()?;
+        let reservation = state
+            .active
+            .get(&id)
+            .cloned()
+            .ok_or(BudgetError::UnknownReservation(id.get()))?;
+        let Some(hard) = self.limits.hard_tokens else {
+            return Ok(None);
+        };
+        let tokens = if let Some(tokens) = state.live_grants.get(&id) {
+            *tokens
+        } else {
+            let committed = state
+                .consumed_tokens
+                .checked_add(state.reserved_tokens)
+                .ok_or(BudgetError::TokenOverflow)?;
+            let available = hard
+                .checked_sub(committed)
+                .ok_or(BudgetError::InconsistentState)?;
+            let pending = state
+                .active
+                .len()
+                .checked_sub(state.live_grants.len())
+                .filter(|count| *count > 0)
+                .ok_or(BudgetError::InconsistentState)?;
+            let extra = available / pending;
+            let tokens = reservation
+                .tokens
+                .checked_add(extra)
+                .ok_or(BudgetError::TokenOverflow)?;
+            let mut next = state.clone();
+            next.reserved_tokens = next
+                .reserved_tokens
+                .checked_add(extra)
+                .ok_or(BudgetError::TokenOverflow)?;
+            let role = next
+                .roles
+                .get_mut(&reservation.role)
+                .ok_or(BudgetError::InconsistentState)?;
+            role.reserved_tokens = role
+                .reserved_tokens
+                .checked_add(extra)
+                .ok_or(BudgetError::TokenOverflow)?;
+            next.live_grants.insert(id, tokens);
+            *state = next;
+            self.changed.notify_all();
+            tokens
+        };
+        Ok(Some(LiveTokenGrant {
+            ledger: self.clone(),
+            reservation: id,
+            tokens: u64::try_from(tokens).map_err(|_| BudgetError::TokenOverflow)?,
+        }))
     }
 
     /// Replaces an active reservation with conservative consumed usage in one transaction.
@@ -825,6 +1024,7 @@ impl RunBudgetLedger {
         }
         let report = self.report_for_state(&next)?;
         *state = next;
+        self.changed.notify_all();
         Ok(BudgetReconciliation {
             reservation,
             charged: BudgetAmount {
@@ -852,6 +1052,7 @@ impl RunBudgetLedger {
         }
         let report = self.report_for_state(&next)?;
         *state = next;
+        self.changed.notify_all();
         Ok(BudgetRelease {
             reservation,
             report,
@@ -861,6 +1062,44 @@ impl RunBudgetLedger {
     pub(super) fn report(&self) -> Result<RunBudgetReport> {
         let state = self.lock_state()?;
         self.report_for_state(&state)
+    }
+
+    /// Distinguish temporarily held execution capacity from a terminal budget stop.
+    /// The second value permits waiting only: it never authorizes a reservation or
+    /// changes the report. Keep every other ceiling and uncertainty gate in force.
+    pub(super) fn concurrent_admission_report(&self) -> Result<(RunBudgetReport, bool)> {
+        let state = self.lock_state()?;
+        let report = self.report_for_state(&state)?;
+        if report.new_dispatch_allowed || state.force_stop || state.live_grants.is_empty() {
+            return Ok((report, false));
+        }
+        let wait = self
+            .report_for_state(&self.without_live_grant_extras(&state)?)?
+            .new_dispatch_allowed;
+        Ok((report, wait))
+    }
+
+    fn without_live_grant_extras(&self, state: &LedgerState) -> Result<LedgerState> {
+        let mut without_grant_extras = state.clone();
+        for (id, tokens) in &state.live_grants {
+            let reservation = state.active.get(id).ok_or(BudgetError::InconsistentState)?;
+            let extra = tokens
+                .checked_sub(reservation.tokens)
+                .ok_or(BudgetError::InconsistentState)?;
+            without_grant_extras.reserved_tokens = without_grant_extras
+                .reserved_tokens
+                .checked_sub(extra)
+                .ok_or(BudgetError::InconsistentState)?;
+            let role = without_grant_extras
+                .roles
+                .get_mut(&reservation.role)
+                .ok_or(BudgetError::InconsistentState)?;
+            role.reserved_tokens = role
+                .reserved_tokens
+                .checked_sub(extra)
+                .ok_or(BudgetError::InconsistentState)?;
+        }
+        Ok(without_grant_extras)
     }
 
     fn report_for_state(&self, state: &LedgerState) -> Result<RunBudgetReport> {
@@ -1241,9 +1480,10 @@ fn remove_reservation(
         .active
         .remove(&id)
         .ok_or(BudgetError::UnknownReservation(id.get()))?;
+    let held_tokens = state.live_grants.remove(&id).unwrap_or(reservation.tokens);
     state.reserved_tokens = state
         .reserved_tokens
-        .checked_sub(reservation.tokens)
+        .checked_sub(held_tokens)
         .ok_or(BudgetError::InconsistentState)?;
     match reservation.cost_usd {
         Some(cost_usd) => {
@@ -1262,7 +1502,7 @@ fn remove_reservation(
         .ok_or(BudgetError::InconsistentState)?;
     role.reserved_tokens = role
         .reserved_tokens
-        .checked_sub(reservation.tokens)
+        .checked_sub(held_tokens)
         .ok_or(BudgetError::InconsistentState)?;
     match reservation.cost_usd {
         Some(cost_usd) => {
@@ -1616,6 +1856,207 @@ mod tests {
                 panic!("expected admitted reservation, got {refusal:?}")
             }
         }
+    }
+
+    #[test]
+    fn live_grant_admission_wait_has_finite_deadline_and_cancellation() {
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let child = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        let grant = ledger.live_token_grant(child.id).unwrap().unwrap();
+        assert!(matches!(
+            ledger.reserve_waiting_for_live_grants(
+                request(1_000, Some(0.1)),
+                Duration::ZERO,
+                || false,
+            ),
+            Err(BudgetError::AdmissionWaitExpired)
+        ));
+        assert!(matches!(
+            ledger.reserve_waiting_for_live_grants(
+                request(1_000, Some(0.1)),
+                Duration::from_secs(1),
+                || true,
+            ),
+            Err(BudgetError::AdmissionCancelled)
+        ));
+        assert!(!grant.stopped());
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 220_000);
+        ledger.release(child.id).unwrap();
+        // No grant holder exists: permanent refusals must never enter the wait.
+        let ledger = RunBudgetLedger::new(token_limits(50, 100)).unwrap();
+        admitted_reservation(ledger.reserve(request(60, Some(0.1))).unwrap());
+        assert!(matches!(
+            ledger
+                .reserve_waiting_for_live_grants(request(41, Some(0.1)), Duration::ZERO, || false,)
+                .unwrap(),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardTokenCeiling { .. },
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn live_grant_admission_wait_wakes_for_settlement_and_terminal_stop() {
+        for breach in [false, true] {
+            let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+            let child = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+            let grant = ledger.live_token_grant(child.id).unwrap().unwrap();
+            let waiting_ledger = ledger.clone();
+            let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let waiter = std::thread::spawn(move || {
+                let mut checks = 0;
+                let result = waiting_ledger.reserve_waiting_for_live_grants(
+                    BudgetReservationRequest {
+                        role: AgentRole::Auditor,
+                        tokens: 1_000,
+                        cost_usd: Some(0.1),
+                    },
+                    Duration::from_secs(2),
+                    || {
+                        checks += 1;
+                        if checks == 2 {
+                            waiting_tx.send(()).unwrap();
+                        }
+                        false
+                    },
+                );
+                done_tx.send(result).unwrap();
+            });
+            waiting_rx
+                .recv_timeout(Duration::from_secs(1))
+                .expect("entered grant wait");
+            assert!(!grant.stopped());
+            if breach {
+                grant.exhaust();
+            } else {
+                ledger
+                    .reconcile(
+                        child.id,
+                        UsageMeasurement::Reliable {
+                            tokens: 37_000,
+                            cost_usd: Some(0.1),
+                        },
+                    )
+                    .unwrap();
+            }
+            let admission = done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("finite grant wait")
+                .unwrap();
+            waiter.join().unwrap();
+            if breach {
+                assert!(matches!(
+                    admission,
+                    BudgetAdmission::Refused {
+                        refusal: BudgetAdmissionRefusal::NewDispatchStopped,
+                        ..
+                    }
+                ));
+            } else {
+                let review = admitted_reservation(admission);
+                assert_eq!(review.role, AgentRole::Auditor);
+                assert_eq!(ledger.report().unwrap().consumed.tokens, 37_000);
+                ledger.release(review.id).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn live_grant_releases_unused_balance_without_changing_admission_estimate() {
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let first = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        let grant = ledger.live_token_grant(first.id).unwrap().unwrap();
+        assert_eq!(grant.tokens(), 220_000);
+        let (report, wait) = ledger.concurrent_admission_report().unwrap();
+        assert!(!report.new_dispatch_allowed);
+        assert!(wait);
+        assert!(!grant.stopped());
+        let settled = ledger
+            .reconcile(
+                first.id,
+                UsageMeasurement::Reliable {
+                    tokens: 37_000,
+                    cost_usd: Some(0.5),
+                },
+            )
+            .unwrap();
+        assert_eq!(settled.reservation.tokens, 16_384);
+        assert_eq!(settled.charged.tokens, 37_000);
+        assert!(grant.stopped());
+        let next = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        assert_eq!(
+            ledger.live_token_grant(next.id).unwrap().unwrap().tokens(),
+            183_000
+        );
+    }
+
+    #[test]
+    fn live_grant_wait_does_not_override_cost_or_original_reservation_ceiling() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            hard_cost_usd: Some(1.0),
+            ..Default::default()
+        })
+        .unwrap();
+        let reservation = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        ledger.live_token_grant(reservation.id).unwrap().unwrap();
+        let (report, wait) = ledger.concurrent_admission_report().unwrap();
+        assert!(!report.new_dispatch_allowed);
+        assert!(!wait, "held tokens must not mask a reached cost ceiling");
+
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let reservation =
+            admitted_reservation(ledger.reserve(request(220_000, Some(1.0))).unwrap());
+        ledger.live_token_grant(reservation.id).unwrap().unwrap();
+        assert!(!ledger.concurrent_admission_report().unwrap().1);
+    }
+
+    #[test]
+    fn live_grants_are_disjoint_latch_stop_and_settle_partial_once() {
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let first = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        let second = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        let a = ledger.live_token_grant(first.id).unwrap().unwrap();
+        let b = ledger.live_token_grant(second.id).unwrap().unwrap();
+        assert_eq!((a.tokens(), b.tokens()), (110_000, 110_000));
+        assert_eq!(ledger.live_token_grant(first.id).unwrap().unwrap(), a);
+        assert!(!a.stopped());
+        assert!(!b.stopped());
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 220_000);
+        assert!(matches!(
+            ledger.reserve(request(1, Some(0.0))).unwrap(),
+            BudgetAdmission::Refused { .. }
+        ));
+        assert!(
+            !a.stopped(),
+            "temporary grant exhaustion must not cancel its holder"
+        );
+        a.exhaust();
+        assert!(!ledger.concurrent_admission_report().unwrap().1);
+        assert!(ledger.dispatch_stopped());
+        assert!(b.stopped());
+        ledger
+            .reconcile(
+                first.id,
+                UsageMeasurement::Estimated {
+                    tokens: 1296475,
+                    cost_usd: None,
+                },
+            )
+            .unwrap();
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 1296475);
+        assert_eq!(report.reserved.tokens, 110_000);
+        assert!(!report.usage_complete);
+        assert!(report.consumed.cost_usd.is_none());
+        assert!(!report.new_dispatch_allowed);
+        assert!(ledger
+            .reconcile(first.id, UsageMeasurement::Missing)
+            .is_err());
+        ledger.release(second.id).unwrap();
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 0);
     }
 
     #[test]

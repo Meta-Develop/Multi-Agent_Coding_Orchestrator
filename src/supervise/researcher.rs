@@ -652,6 +652,7 @@ mod tests {
         let mut incomplete = transcript.clone();
         incomplete.observations.push(Observation::Incomplete {
             item_id: "item-2".to_string(),
+            started: None,
             reason: crate::external_agent::codex_app_server::CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
         });
         assert!(verify_researcher_command_evidence(&report, Some(&incomplete)).is_err());
