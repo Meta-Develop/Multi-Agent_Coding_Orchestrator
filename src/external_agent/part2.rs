@@ -6369,7 +6369,22 @@ pub(crate) fn codex_usage_from_jsonl(bytes: &[u8]) -> Result<Option<Usage>> {
                 .context("Codex output token count does not fit this platform")?,
             total_tokens: 0,
         };
-        aggregate = aggregate.saturating_add(usage);
+        let input_tokens = aggregate
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .context("Codex aggregate input token count overflowed")?;
+        let output_tokens = aggregate
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .context("Codex aggregate output token count overflowed")?;
+        let total_tokens = input_tokens
+            .checked_add(output_tokens)
+            .context("Codex aggregate total token count overflowed")?;
+        aggregate = Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        };
         observed = true;
     }
     Ok(observed.then_some(aggregate))

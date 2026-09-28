@@ -95,6 +95,7 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
                 ledger,
                 reservation,
                 pricing,
+                model_pricing: plan.model_pricing.clone(),
                 state: DispatchBudgetReservationState::Reserved(runtime),
             },
         )),

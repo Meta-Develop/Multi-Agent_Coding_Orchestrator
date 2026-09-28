@@ -3065,15 +3065,10 @@ fn dispatch_and_capture_child_attempt<'a>(
     };
     let environment_blocked = external_run.environment_blocked();
     let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
-    match usage_settlement.reliable_usage() {
-        Some(usage) => {
-            outcome.usage_samples.push(RoleUsageSample {
-                runtime: launch_runtime,
-                role: assignment.role,
-                lens_id: None,
-                model: command.model.clone(),
-                usage,
-            });
+    match usage_settlement.role_sample(assignment.role, None) {
+        Some(sample) => {
+            let usage = sample.usage;
+            outcome.usage_samples.push(sample);
             record_and_persist_live_invocation(
                 artifacts,
                 LiveInvocationObservation {
@@ -4631,15 +4626,10 @@ fn dispatch_and_collect_parent_auditor(
         .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
         auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
-    match usage_settlement.reliable_usage() {
-        Some(usage) => {
-            outcome.usage_samples.push(RoleUsageSample {
-                runtime: launch_runtime,
-                role: AgentRole::Auditor,
-                lens_id: Some(lens.id.clone()),
-                model: auditor_command.model.clone(),
-                usage,
-            });
+    match usage_settlement.role_sample(AgentRole::Auditor, Some(lens.id.clone())) {
+        Some(sample) => {
+            let usage = sample.usage;
+            outcome.usage_samples.push(sample);
             record_and_persist_live_invocation(
                 artifacts,
                 LiveInvocationObservation {
@@ -11278,7 +11268,7 @@ done
             assert_eq!(spawn_payload["runtime"], "codex");
             assert_eq!(spawn_payload["request_binding"], request.request_binding);
             usage_samples.push(RoleUsageSample {
-                runtime: SupervisorRuntime::Codex,
+                cost_usd: None,
                 role: AgentRole::Auditor,
                 lens_id: Some(lens.id.clone()),
                 model: command.model.clone(),
