@@ -5971,14 +5971,16 @@ fn codex_supervisor_argv(
     controls: &ProtectedWorktreeControls,
     service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
-    let researcher = spec
-        .agent_lifecycle
-        .as_ref()
-        .is_some_and(|identity| identity.role == "researcher");
+    let terminal_role = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+        matches!(
+            identity.role.as_str(),
+            "worker" | "researcher" | "auditor" | "gate_classifier"
+        )
+    });
     let mut argv = codex_hardened_argv_with_service_tier(
         spec,
         controls,
-        if researcher {
+        if terminal_role {
             CodexMultiAgentMode::Disabled
         } else {
             CodexMultiAgentMode::Enabled
@@ -5986,7 +5988,7 @@ fn codex_supervisor_argv(
         service_tier,
     );
     argv.extend([
-        OsString::from(if researcher { "--disable" } else { "--enable" }),
+        OsString::from(if terminal_role { "--disable" } else { "--enable" }),
         OsString::from("goals"),
         OsString::from("--json"),
         OsString::from("--output-last-message"),

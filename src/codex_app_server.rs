@@ -481,6 +481,7 @@ pub(crate) struct AppServerTurn {
     pub(crate) permission_profile: String,
     pub(crate) prompt: String,
     pub(crate) model: Option<String>,
+    pub(crate) output_schema: Option<Value>,
 }
 
 impl AppServerTurn {
@@ -790,6 +791,15 @@ pub(crate) struct AppServerOutcome {
     pub(crate) thread_id: String,
     pub(crate) turn_id: String,
     pub(crate) status: TurnTerminalStatus,
+    /// Settings returned by the correlated `thread/start` response. Ephemeral
+    /// threads write no rollout, so these are the provider-owned provenance.
+    pub(crate) resolved_model: String,
+    pub(crate) resolved_effort: Option<String>,
+    /// Final cumulative token snapshot for this fresh ephemeral thread. A missing
+    /// notification stays unknown; it must never become a zero-cost turn.
+    pub(crate) token_usage: Option<AppServerTokenUsage>,
+    /// Exact bounded error-item notice, retained only for a model reroute.
+    pub(crate) reroute_message: Option<String>,
     pub(crate) completed_items: usize,
     pub(crate) item_outcomes: Vec<ItemOutcome>,
     pub(crate) command_execution_evidence: CommandExecutionEvidence,
@@ -800,6 +810,197 @@ pub(crate) struct AppServerOutcome {
     pub(crate) duplex_fallback_required: bool,
     pub(crate) messages_received: usize,
     pub(crate) bytes_received: usize,
+}
+
+// Parse original notification bytes so duplicate usage/correlation keys cannot
+// be hidden by serde_json::Value's last-key-wins representation.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TokenUsageNotification {
+    method: String,
+    params: TokenUsageParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TokenUsageParams {
+    thread_id: String,
+    turn_id: String,
+    token_usage: TokenUsageWire,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TokenUsageWire {
+    last: TokenUsageBreakdownWire,
+    total: TokenUsageBreakdownWire,
+    model_context_window: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TokenUsageBreakdownWire {
+    input_tokens: u64,
+    output_tokens: u64,
+    cached_input_tokens: u64,
+    reasoning_output_tokens: u64,
+    total_tokens: u64,
+    #[serde(default)]
+    cache_write_input_tokens: u64,
+}
+
+// Validate the original response before using settings from Value: duplicate
+// model, effort, thread ID, result, or response ID keys must not be hidden.
+#[derive(serde::Deserialize)]
+struct ThreadStartSettingsResponse {
+    id: Value,
+    result: ThreadStartSettingsResult,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThreadStartSettingsResult {
+    thread: ThreadStartSettingsThread,
+    model: String,
+    reasoning_effort: Option<String>,
+    #[serde(flatten)]
+    _other: Map<String, Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct ThreadStartSettingsThread {
+    id: String,
+    #[serde(flatten)]
+    _other: Map<String, Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct RerouteItemNotification {
+    method: String,
+    params: RerouteItemParams,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RerouteItemParams {
+    thread_id: String,
+    turn_id: String,
+    item: RerouteItem,
+}
+
+#[derive(serde::Deserialize)]
+struct RerouteItem {
+    id: String,
+    #[serde(rename = "type")]
+    item_type: String,
+    status: String,
+    message: String,
+    #[serde(flatten)]
+    _other: Map<String, Value>,
+}
+
+fn valid_reroute_item_notification(line: &[u8]) -> bool {
+    let Ok(notice) = serde_json::from_slice::<RerouteItemNotification>(line) else {
+        return false;
+    };
+    notice.method == "item/completed"
+        && !notice.params.thread_id.is_empty()
+        && !notice.params.turn_id.is_empty()
+        && !notice.params.item.id.is_empty()
+        && notice.params.item.item_type == "error"
+        && !notice.params.item.status.is_empty()
+        && notice.params.item.message.starts_with("model rerouted: ")
+}
+
+// Original bytes, not serde_json::Value. Last-key-wins must not hide a duplicate
+// id, type, status, or message by changing the reroute dispatch predicate.
+// Absent status and message stay valid; unknown item fields stay ignored.
+#[derive(serde::Deserialize)]
+struct CompletedItemNotification {
+    #[serde(rename = "method")]
+    _method: String,
+    #[serde(rename = "params")]
+    _params: CompletedItemParams,
+}
+
+#[derive(serde::Deserialize)]
+struct CompletedItemParams {
+    #[serde(rename = "threadId")]
+    _thread_id: String,
+    #[serde(rename = "turnId")]
+    _turn_id: String,
+    #[serde(rename = "item")]
+    _item: CompletedItemIdentity,
+}
+
+#[derive(serde::Deserialize)]
+struct CompletedItemIdentity {
+    #[serde(rename = "id")]
+    _id: String,
+    #[serde(rename = "type")]
+    _item_type: String,
+    #[serde(default, rename = "status")]
+    _status: Option<Value>,
+    #[serde(default, rename = "message")]
+    _message: Option<Value>,
+}
+
+fn valid_completed_item_notification(line: &[u8]) -> bool {
+    serde_json::from_slice::<CompletedItemNotification>(line).is_ok()
+}
+
+fn valid_thread_start_settings_response(line: &[u8]) -> bool {
+    let Ok(response) = serde_json::from_slice::<ThreadStartSettingsResponse>(line) else {
+        return false;
+    };
+    response.id.is_number()
+        && validate_identifier(&response.result.thread.id, "thread id", 256).is_ok()
+        && validate_identifier(&response.result.model, "resolved model", 256).is_ok()
+        && response
+            .result
+            .reasoning_effort
+            .as_ref()
+            .is_none_or(|effort| validate_identifier(effort, "resolved effort", 64).is_ok())
+}
+
+fn valid_token_usage_notification(line: &[u8]) -> bool {
+    let Ok(notification) = serde_json::from_slice::<TokenUsageNotification>(line) else {
+        return false;
+    };
+    let valid_breakdown = |usage: &TokenUsageBreakdownWire| {
+        usage.cached_input_tokens <= usage.input_tokens
+            && usage.reasoning_output_tokens <= usage.output_tokens
+            && usage.input_tokens.checked_add(usage.output_tokens) == Some(usage.total_tokens)
+            && usage.cache_write_input_tokens <= usage.input_tokens
+    };
+    let last = &notification.params.token_usage.last;
+    let total = &notification.params.token_usage.total;
+    notification.method == "thread/tokenUsage/updated"
+        && !notification.params.thread_id.is_empty()
+        && !notification.params.turn_id.is_empty()
+        && notification.emitted_at_ms.is_none_or(|time| time >= 0)
+        && notification
+            .params
+            .token_usage
+            .model_context_window
+            .is_none_or(|window| window > 0)
+        && valid_breakdown(last)
+        && valid_breakdown(total)
+        && total.input_tokens >= last.input_tokens
+        && total.output_tokens >= last.output_tokens
+        && total.cached_input_tokens >= last.cached_input_tokens
+        && total.reasoning_output_tokens >= last.reasoning_output_tokens
+        && total.cache_write_input_tokens >= last.cache_write_input_tokens
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AppServerTokenUsage {
+    pub(crate) input_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) cached_input_tokens: u64,
+    pub(crate) reasoning_output_tokens: u64,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
@@ -998,6 +1199,18 @@ impl ProtocolState {
                     message: format!("invalid JSON: {error}"),
                 })?;
             if phase == "thread/start"
+                && message.get("id").and_then(Value::as_u64) == self.next_request_id.checked_sub(1)
+                && message.get("error").is_none()
+                && message.get("result").is_some()
+                && !valid_thread_start_settings_response(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "thread/start settings response is malformed or has duplicate fields"
+                        .to_string(),
+                });
+            }
+            if phase == "thread/start"
                 && is_startup_information(&message)
                 && !valid_startup_information(&line)
             {
@@ -1034,6 +1247,41 @@ impl ProtocolState {
                 return Err(AppServerError::Malformed {
                     phase,
                     message: "account rate-limit notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str)
+                    == Some("thread/tokenUsage/updated")
+                && !valid_token_usage_notification(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "token usage notification is malformed or has duplicate fields"
+                        .to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str) == Some("item/completed")
+                && !valid_completed_item_notification(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "item completion is malformed or has duplicate fields".to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str) == Some("item/completed")
+                && message.pointer("/params/item/type").and_then(Value::as_str) == Some("error")
+                && message
+                    .pointer("/params/item/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.starts_with("model rerouted: "))
+                && !valid_reroute_item_notification(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "model reroute notification is malformed or has duplicate fields"
                         .to_string(),
                 });
             }
@@ -1116,6 +1364,14 @@ where
     )?;
     state.send(transport, &json!({"method": "initialized"}))?;
 
+    // An empty environment selection disables execution access. Select only the
+    // local environment; the fixed permission profile and outer systemd scope
+    // still constrain filesystem writes and network access.
+    let local_environment = json!({
+        "environmentId": "local",
+        "cwd": turn.cwd,
+        "runtimeWorkspaceRoots": [turn.cwd],
+    });
     let thread_start_id = state.allocate_request_id()?;
     let mut thread_params = Map::from_iter([
         ("cwd".to_string(), Value::from(turn.cwd.clone())),
@@ -1131,7 +1387,10 @@ where
         ("ephemeral".to_string(), Value::from(true)),
         ("experimentalRawEvents".to_string(), Value::from(false)),
         ("dynamicTools".to_string(), Value::Array(Vec::new())),
-        ("environments".to_string(), Value::Array(Vec::new())),
+        (
+            "environments".to_string(),
+            Value::Array(vec![local_environment.clone()]),
+        ),
     ]);
     if let Some(model) = &turn.model {
         thread_params.insert("model".to_string(), Value::from(model.clone()));
@@ -1183,22 +1442,43 @@ where
         "thread id",
     )?
     .to_string();
+    let resolved_model = required_text(
+        &thread_response,
+        &["result", "model"],
+        "thread/start",
+        "resolved model",
+    )?
+    .to_string();
+    let resolved_effort = thread_response
+        .pointer("/result/reasoningEffort")
+        .and_then(Value::as_str)
+        .map(str::to_string);
 
     let turn_start_id = state.allocate_request_id()?;
     let mut lifecycle = ThreadLifecycleNotices::default();
+    let mut turn_params = Map::from_iter([
+        ("threadId".to_string(), Value::from(thread_id.clone())),
+        (
+            "input".to_string(),
+            json!([{"type": "text", "text": turn.prompt, "text_elements": []}]),
+        ),
+        ("approvalPolicy".to_string(), Value::from("on-request")),
+        ("approvalsReviewer".to_string(), Value::from("user")),
+        (
+            "permissions".to_string(),
+            Value::from(turn.permission_profile.clone()),
+        ),
+        ("environments".to_string(), json!([local_environment])),
+    ]);
+    if let Some(schema) = &turn.output_schema {
+        turn_params.insert("outputSchema".to_string(), schema.clone());
+    }
     state.send(
         transport,
         &json!({
             "id": turn_start_id.to_value(),
             "method": "turn/start",
-            "params": {
-                "threadId": thread_id,
-                "input": [{"type": "text", "text": turn.prompt, "text_elements": []}],
-                "approvalPolicy": "on-request",
-                "approvalsReviewer": "user",
-                "permissions": turn.permission_profile,
-                "environments": []
-            }
+            "params": turn_params,
         }),
     )?;
     let turn_response = wait_for_response(
@@ -1223,9 +1503,14 @@ where
         "turn/start",
     )?;
 
-    match drive_turn(
-        &mut state, transport, &thread_id, &turn_id, lifecycle, reviewer, &cancelled,
-    ) {
+    let active_turn = ActiveTurnContext {
+        thread_id: thread_id.clone(),
+        turn_id: turn_id.clone(),
+        resolved_model,
+        resolved_effort,
+        lifecycle,
+    };
+    match drive_turn(&mut state, transport, active_turn, reviewer, &cancelled) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
             state.interrupt(transport, &thread_id, &turn_id);
@@ -1368,12 +1653,18 @@ where
     Ok(message)
 }
 
+struct ActiveTurnContext {
+    thread_id: String,
+    turn_id: String,
+    resolved_model: String,
+    resolved_effort: Option<String>,
+    lifecycle: ThreadLifecycleNotices,
+}
+
 fn drive_turn<T, C>(
     state: &mut ProtocolState,
     transport: &mut T,
-    thread_id: &str,
-    turn_id: &str,
-    mut lifecycle: ThreadLifecycleNotices,
+    active_turn: ActiveTurnContext,
     reviewer: &mut dyn ApprovalReviewer,
     cancelled: &C,
 ) -> Result<AppServerOutcome, AppServerError>
@@ -1381,6 +1672,15 @@ where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
+    let ActiveTurnContext {
+        thread_id,
+        turn_id,
+        resolved_model,
+        resolved_effort,
+        mut lifecycle,
+    } = active_turn;
+    let thread_id = thread_id.as_str();
+    let turn_id = turn_id.as_str();
     #[derive(Debug)]
     struct ActiveItem {
         item_type: String,
@@ -1411,6 +1711,8 @@ where
     let mut refused_ceiling_expansions = 0usize;
     let mut turn_started_seen = false;
     let mut account_rate_limit_notices = 0usize;
+    let mut token_usage = None;
+    let mut reroute_message = None;
 
     loop {
         let message = state.receive(transport, "turn", cancelled)?;
@@ -1950,6 +2252,24 @@ where
                         OUTPUT_AGENT_MESSAGE_MAX_BYTES,
                     )?;
                 }
+                if item_type == "error"
+                    && message
+                        .pointer("/params/item/message")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.starts_with("model rerouted: "))
+                {
+                    if reroute_message.is_some() {
+                        return Err(AppServerError::Duplicate {
+                            phase: "model reroute",
+                            message: "more than one model reroute notice".to_string(),
+                        });
+                    }
+                    reroute_message = optional_bounded_text(
+                        message.pointer("/params/item/message"),
+                        "model reroute message",
+                        1024,
+                    )?;
+                }
                 if item_type == "commandExecution" {
                     command_observations.push(correlate_command_observation(
                         item_id,
@@ -2014,6 +2334,10 @@ where
                     thread_id: thread_id.to_string(),
                     turn_id: turn_id.to_string(),
                     status,
+                    resolved_model,
+                    resolved_effort,
+                    token_usage,
+                    reroute_message,
                     completed_items: completed_items.len(),
                     item_outcomes,
                     command_execution_evidence: CommandExecutionEvidence {
@@ -2036,6 +2360,41 @@ where
                     phase: "turn",
                     message: bounded_json_summary(&Value::Object(params.clone())),
                 });
+            }
+            "thread/tokenUsage/updated" => {
+                validate_turn_correlation(params, thread_id, turn_id, "token usage")?;
+                let total = required_object(
+                    &message,
+                    &["params", "tokenUsage", "total"],
+                    "token usage",
+                    "cumulative token usage",
+                )?;
+                let counter = |name: &str| {
+                    total.get(name).and_then(Value::as_u64).ok_or_else(|| {
+                        AppServerError::Malformed {
+                            phase: "token usage",
+                            message: format!("{name} is missing or is not a nonnegative integer"),
+                        }
+                    })
+                };
+                let current = AppServerTokenUsage {
+                    input_tokens: counter("inputTokens")?,
+                    output_tokens: counter("outputTokens")?,
+                    cached_input_tokens: counter("cachedInputTokens")?,
+                    reasoning_output_tokens: counter("reasoningOutputTokens")?,
+                };
+                if token_usage.is_some_and(|previous: AppServerTokenUsage| {
+                    current.input_tokens < previous.input_tokens
+                        || current.output_tokens < previous.output_tokens
+                        || current.cached_input_tokens < previous.cached_input_tokens
+                        || current.reasoning_output_tokens < previous.reasoning_output_tokens
+                }) {
+                    return Err(AppServerError::Unexpected {
+                        phase: "token usage",
+                        message: "cumulative token usage moved backwards".to_string(),
+                    });
+                }
+                token_usage = Some(current);
             }
             method if is_bounded_progress_notification(method) => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn progress")?;
@@ -2281,8 +2640,7 @@ fn validate_turn_correlation(
 fn is_bounded_progress_notification(method: &str) -> bool {
     matches!(
         method,
-        "thread/tokenUsage/updated"
-            | "turn/diff/updated"
+        "turn/diff/updated"
             | "turn/plan/updated"
             | "item/agentMessage/delta"
             | "item/plan/delta"
@@ -2477,6 +2835,8 @@ mod tests {
                 "id": 2,
                 "result": {
                     "thread": {"id": "thread-1"},
+                    "model": "gpt-5.6-sol",
+                    "reasoningEffort": "xhigh",
                     "approvalPolicy": "on-request",
                     "approvalsReviewer": "user",
                     "activePermissionProfile": {"id": "maco_external_codex"},
@@ -2503,6 +2863,7 @@ mod tests {
             permission_profile: "maco_external_codex".to_string(),
             prompt: "perform the bounded task".to_string(),
             model: None,
+            output_schema: None,
         }
     }
 
@@ -2528,9 +2889,12 @@ mod tests {
         let mut transport = FakeTransport::from_values(messages_with_startup_information(
             captured_startup_information(),
         ));
+        let mut turn = test_turn();
+        turn.output_schema =
+            Some(json!({"type": "object", "properties": {"status": {"type": "string"}}}));
         let outcome = run_app_server_turn(
             &mut transport,
-            &test_turn(),
+            &turn,
             AppServerLimits::default(),
             &mut |_: ApprovalRequest| panic!("informational prelude is not an approval"),
             || false,
@@ -2545,8 +2909,26 @@ mod tests {
         assert_eq!(transport.sent.len(), 4);
         assert_eq!(transport.sent[2]["method"], "thread/start");
         assert_eq!(transport.sent[2]["id"], 2);
+        let expected_environment = json!({
+            "environmentId": "local",
+            "cwd": "/workspace",
+            "runtimeWorkspaceRoots": ["/workspace"],
+        });
+        assert_eq!(
+            transport.sent[2]["params"]["environments"],
+            json!([expected_environment])
+        );
         assert_eq!(transport.sent[3]["method"], "turn/start");
         assert_eq!(transport.sent[3]["id"], 3);
+        assert_eq!(
+            transport.sent[3]["params"]["outputSchema"],
+            turn.output_schema
+                .expect("bounded structured output schema")
+        );
+        assert_eq!(
+            transport.sent[3]["params"]["environments"],
+            transport.sent[2]["params"]["environments"]
+        );
     }
 
     #[test]
@@ -2998,8 +3380,8 @@ mod tests {
                 ..AppServerLimits::default()
             },
             AppServerLimits {
-                max_line_bytes: 512,
-                max_total_bytes: 512,
+                max_line_bytes: 1024,
+                max_total_bytes: 1024,
                 ..AppServerLimits::default()
             },
         ] {
@@ -3081,6 +3463,296 @@ mod tests {
             &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
             || false,
         )
+    }
+
+    fn token_usage_notice(input: u64, output: u64) -> Value {
+        let breakdown = json!({
+            "inputTokens": input,
+            "outputTokens": output,
+            "cachedInputTokens": 0,
+            "reasoningOutputTokens": 0,
+            "totalTokens": input + output
+        });
+        json!({
+            "method": "thread/tokenUsage/updated",
+            "params": {
+                "threadId": "thread-1", "turnId": "turn-1",
+                "tokenUsage": {"last": breakdown, "total": breakdown, "modelContextWindow": null}
+            }
+        })
+    }
+
+    #[test]
+    fn app_server_usage_uses_final_correlated_cumulative_snapshot() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.len() - 1;
+        messages.insert(terminal, token_usage_notice(10, 4));
+        messages.insert(terminal + 1, token_usage_notice(25, 7));
+        let outcome = run_command_observation_messages(messages).expect("valid usage stream");
+        assert_eq!(outcome.resolved_model, "gpt-5.6-sol");
+        assert_eq!(outcome.resolved_effort.as_deref(), Some("xhigh"));
+        assert_eq!(
+            outcome.token_usage,
+            Some(AppServerTokenUsage {
+                input_tokens: 25,
+                output_tokens: 7,
+                cached_input_tokens: 0,
+                reasoning_output_tokens: 0,
+            })
+        );
+        assert!(
+            run_command_observation_messages(command_observation_messages())
+                .expect("turn without usage still completes")
+                .token_usage
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn app_server_usage_rejects_wrong_turn_regression_and_duplicate_original_keys() {
+        let mut wrong = command_observation_messages();
+        let terminal = wrong.len() - 1;
+        let mut notice = token_usage_notice(10, 4);
+        notice["params"]["turnId"] = json!("other-turn");
+        wrong.insert(terminal, notice);
+        assert!(matches!(
+            run_command_observation_messages(wrong),
+            Err(AppServerError::Unexpected {
+                phase: "token usage",
+                ..
+            })
+        ));
+
+        let mut wrong_thread = command_observation_messages();
+        let terminal = wrong_thread.len() - 1;
+        let mut notice = token_usage_notice(10, 4);
+        notice["params"]["threadId"] = json!("other-thread");
+        wrong_thread.insert(terminal, notice);
+        assert!(matches!(
+            run_command_observation_messages(wrong_thread),
+            Err(AppServerError::Unexpected {
+                phase: "token usage",
+                ..
+            })
+        ));
+
+        let mut malformed = command_observation_messages();
+        let terminal = malformed.len() - 1;
+        let mut notice = token_usage_notice(10, 4);
+        notice["params"]["tokenUsage"]["total"]["inputTokens"] = json!(-1);
+        malformed.insert(terminal, notice);
+        assert!(matches!(
+            run_command_observation_messages(malformed),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+
+        let mut inconsistent = command_observation_messages();
+        let terminal = inconsistent.len() - 1;
+        let mut notice = token_usage_notice(10, 4);
+        notice["params"]["tokenUsage"]["total"]["totalTokens"] = json!(1);
+        inconsistent.insert(terminal, notice);
+        assert!(matches!(
+            run_command_observation_messages(inconsistent),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+
+        let mut backwards = command_observation_messages();
+        let terminal = backwards.len() - 1;
+        backwards.insert(terminal, token_usage_notice(10, 4));
+        backwards.insert(terminal + 1, token_usage_notice(9, 4));
+        assert!(matches!(
+            run_command_observation_messages(backwards),
+            Err(AppServerError::Unexpected {
+                phase: "token usage",
+                ..
+            })
+        ));
+
+        let duplicate = br#"{"method":"thread/tokenUsage/updated","params":{"threadId":"thread-1","turnId":"turn-1","turnId":"other-turn","tokenUsage":{"last":{"inputTokens":10,"outputTokens":4,"cachedInputTokens":0,"reasoningOutputTokens":0,"totalTokens":14},"total":{"inputTokens":10,"outputTokens":4,"cachedInputTokens":0,"reasoningOutputTokens":0,"totalTokens":14},"modelContextWindow":null}}"#;
+        assert!(!valid_token_usage_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        // FakeTransport consumes its reversed queue with pop(); index 0 is the
+        // terminal notification, so index 1 places this before completion.
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+    }
+
+    #[test]
+    fn app_server_rejects_duplicate_provider_start_settings_in_original_response() {
+        let duplicate = br#"{"id":2,"result":{"thread":{"id":"thread-1"},"model":"gpt-5.6-sol","model":"gpt-5.6-luna","reasoningEffort":"xhigh","approvalPolicy":"on-request","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":"/workspace"}}"#;
+        assert!(!valid_thread_start_settings_response(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        let response_index = transport.incoming.len() - 2;
+        transport.incoming[response_index] = ReaderEvent::Line(duplicate.to_vec());
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed {
+                phase: "thread/start",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn app_server_rejects_control_characters_in_provider_start_settings() {
+        let valid = json!({
+            "id": 2,
+            "result": {
+                "thread": {"id": "thread-1"},
+                "model": "gpt-5.6-sol",
+                "reasoningEffort": "xhigh"
+            }
+        });
+        for pointer in [
+            "/result/thread/id",
+            "/result/model",
+            "/result/reasoningEffort",
+        ] {
+            let mut malformed = valid.clone();
+            *malformed.pointer_mut(pointer).expect("provider field") = json!("forged\nfield");
+            assert!(!valid_thread_start_settings_response(
+                &serde_json::to_vec(&malformed).expect("JSON response")
+            ));
+        }
+    }
+
+    #[test]
+    fn app_server_preserves_one_bounded_model_reroute_notice() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.len() - 1;
+        messages.insert(
+            terminal,
+            json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"inProgress"}}}),
+        );
+        messages.insert(
+            terminal + 1,
+            json!({"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-terra (capacity)"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("correlated reroute item");
+        assert_eq!(
+            outcome.reroute_message.as_deref(),
+            Some("model rerouted: gpt-5.6-sol -> gpt-5.6-terra (capacity)")
+        );
+    }
+
+    #[test]
+    fn app_server_rejects_duplicate_reroute_fields_in_original_notification() {
+        let duplicate = br#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-luna","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-terra"}}}"#;
+        assert!(!valid_reroute_item_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        transport.incoming.insert(
+            2,
+            ReaderEvent::Line(
+                json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"inProgress"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+    }
+
+    #[test]
+    fn app_server_rejects_earlier_reroute_message_hidden_by_later_text() {
+        let duplicate = br#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-luna","message":"capacity changed"}}}"#;
+        assert!(!valid_completed_item_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        transport.incoming.insert(
+            2,
+            ReaderEvent::Line(
+                json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","status":"inProgress"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+    }
+
+    #[test]
+    fn app_server_accepts_ordinary_non_reroute_error_item() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.len() - 1;
+        messages.insert(
+            terminal,
+            json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"error-1","type":"error","status":"inProgress"}}}),
+        );
+        messages.insert(
+            terminal + 1,
+            json!({"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"error-1","type":"error","status":"completed","message":"sandbox denied the command"}}}),
+        );
+        let outcome = run_command_observation_messages(messages).expect("ordinary error item");
+        assert_eq!(outcome.reroute_message, None);
+        assert!(outcome.item_outcomes.iter().any(|item| {
+            item.item_id == "error-1" && item.item_type == "error" && item.status == "completed"
+        }));
+    }
+
+    #[test]
+    fn app_server_rejects_duplicate_completed_item_type_in_original_bytes() {
+        let duplicate = br#"{"method":"item/completed","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"error","type":"agentMessage","status":"completed","message":"model rerouted: gpt-5.6-sol -> gpt-5.6-terra"}}}"#;
+        assert!(!valid_completed_item_notification(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        transport.incoming.insert(
+            2,
+            ReaderEvent::Line(
+                json!({"method":"item/started","params":{"threadId":"thread-1","turnId":"turn-1","item":{"id":"reroute-1","type":"agentMessage"}}})
+                    .to_string()
+                    .into_bytes(),
+            ),
+        );
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
     }
 
     #[test]
@@ -3302,8 +3974,24 @@ mod tests {
                     AppServerLimits::default(),
                     &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
                     || false,
-                )
-                .expect("ambiguous observation does not break legacy protocol behavior");
+                );
+                let completed_identity = index == 5
+                    && matches!(
+                        key,
+                        "id" | "type" | "status" | "threadId" | "turnId" | "method"
+                    );
+                if completed_identity {
+                    assert!(
+                        matches!(
+                            outcome,
+                            Err(AppServerError::Malformed { phase: "turn", .. })
+                        ),
+                        "duplicate {key} at {index}"
+                    );
+                    continue;
+                }
+                let outcome =
+                    outcome.expect("ambiguous observation does not break legacy protocol behavior");
                 assert!(
                     matches!(
                         outcome.command_execution_evidence.observations[0],

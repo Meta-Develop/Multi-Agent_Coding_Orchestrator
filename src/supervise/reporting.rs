@@ -1951,6 +1951,32 @@ pub(super) fn complete_external_codex_usage(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
 ) -> Option<Usage> {
+    // Only the live app-server driver retains this private, correlated turn
+    // transcript. CLI exec can emit more than one turn.completed event; its
+    // JSONL accounting below must continue to sum those per-turn samples.
+    if let Some(evidence) = run
+        .codex_command_execution_evidence()
+        .and(run.codex_parent_evidence.as_ref())
+    {
+        if evidence.resolution_status
+            == crate::external_agent::CodexParentResolutionStatus::Complete.label()
+        {
+            if let crate::external_agent::CodexParentTurnUsage::Known {
+                input_tokens,
+                output_tokens,
+                ..
+            } = &evidence.turn_usage
+            {
+                let input_tokens = usize::try_from(*input_tokens).ok()?;
+                let output_tokens = usize::try_from(*output_tokens).ok()?;
+                return Some(Usage {
+                    input_tokens,
+                    output_tokens,
+                    total_tokens: input_tokens.checked_add(output_tokens)?,
+                });
+            }
+        }
+    }
     const MAX_USAGE_CAPTURE_BYTES: usize = 8 * 1024 * 1024;
     match read_bounded_regular_file_nofollow(&command.json_log, MAX_USAGE_CAPTURE_BYTES) {
         Ok(bytes) if bytes.len() < MAX_USAGE_CAPTURE_BYTES => {

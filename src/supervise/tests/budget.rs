@@ -1324,6 +1324,108 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     ));
 }
 
+#[test]
+fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
+    use crate::external_agent::codex_app_server::{CommandExecutionEvidence, TurnTerminalStatus};
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+    };
+
+    let temp = tempfile::tempdir().expect("app-server usage fixture");
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("missing-cli-capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    let mut run = injected_verified_run_without_journals(&command);
+    run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+        thread_id: "correlated-thread".to_string(),
+        turn_id: "correlated-turn".to_string(),
+        turn_status: TurnTerminalStatus::Completed,
+        observations: Vec::new(),
+    });
+    run.codex_parent_evidence = Some(CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("correlated-thread".to_string()),
+        requested_model: Some("gpt-5.6-sol".to_string()),
+        requested_effort: Some("xhigh".to_string()),
+        rollout_model: CodexParentResolvedField::Unknown,
+        rollout_effort: CodexParentResolvedField::Unknown,
+        observed_model: CodexParentResolvedField::Known("gpt-5.6-sol".to_string()),
+        observed_effort: CodexParentResolvedField::Known("xhigh".to_string()),
+        server_rerouted_model: None,
+        model_mismatch: false,
+        turn_usage: CodexParentTurnUsage::Known {
+            input_tokens: 25,
+            output_tokens: 7,
+            cached_input_tokens: 3,
+            reasoning_output_tokens: 2,
+        },
+        resolution_status: "complete".to_string(),
+    });
+    assert_eq!(
+        complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
+        Some(32)
+    );
+    run.codex_parent_evidence
+        .as_mut()
+        .expect("parent evidence")
+        .resolution_status = "jsonl_invalid".to_string();
+    assert!(complete_external_codex_usage(&run, &command).is_none());
+}
+
+#[test]
+fn cli_usage_keeps_aggregating_each_turn_even_with_parent_provenance() {
+    let temp = tempfile::tempdir().expect("CLI usage fixture");
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    fs::write(
+        &command.json_log,
+        "{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":25,\"output_tokens\":7}}\n",
+    )
+    .expect("two-turn CLI capture");
+    let mut run = injected_verified_run_without_journals(&command);
+    run.codex_parent_evidence = Some(crate::external_agent::CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("cli-thread".to_string()),
+        requested_model: Some("gpt-5.6-sol".to_string()),
+        requested_effort: Some("xhigh".to_string()),
+        rollout_model: crate::external_agent::CodexParentResolvedField::Known(
+            "gpt-5.6-sol".to_string(),
+        ),
+        rollout_effort: crate::external_agent::CodexParentResolvedField::Known("xhigh".to_string()),
+        observed_model: crate::external_agent::CodexParentResolvedField::Known(
+            "gpt-5.6-sol".to_string(),
+        ),
+        observed_effort: crate::external_agent::CodexParentResolvedField::Known(
+            "xhigh".to_string(),
+        ),
+        server_rerouted_model: None,
+        model_mismatch: false,
+        turn_usage: crate::external_agent::CodexParentTurnUsage::Known {
+            input_tokens: 25,
+            output_tokens: 7,
+            cached_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        },
+        resolution_status: "complete".to_string(),
+    });
+    assert!(run.codex_command_execution_evidence().is_none());
+    assert_eq!(
+        complete_external_codex_usage(&run, &command).map(|usage| usage.total_tokens),
+        Some(46)
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_loss() {
