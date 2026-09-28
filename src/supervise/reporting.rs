@@ -1955,6 +1955,7 @@ pub(super) fn external_process_completed(
                     && !run.stdout.raw_capture_truncated()
                     && run.codex_parent_evidence.as_ref() == Some(evidence)
             })
+        && run.codex_auditor_effort_qualified()
         && external_safety_verified(run, runtime)
 }
 

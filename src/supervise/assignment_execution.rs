@@ -4416,13 +4416,6 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
-    if auditor_command.uses_live_app_server_budget() {
-        auditor_command.bind_live_token_grant(
-            auditor_budget_reservation
-                .ledger
-                .live_token_grant(auditor_budget_reservation.reservation.id)?,
-        );
-    }
     let grant = admit_parent_auditor_process_intent(
         options.run_id.as_str(),
         auditor_id.as_str(),
@@ -4465,6 +4458,32 @@ struct ParentAuditorDispatchFrame<'a> {
     auditor_attempt: usize,
     review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
     dated_plan_pricing: &'a BTreeMap<String, ModelPricing>,
+}
+
+// A grant authenticates the exact launch, including the final duration. Parent
+// validation may shorten that duration after preparation; bind only afterward.
+fn finalize_parent_auditor_budget(
+    command: &mut ExternalAgentCommand,
+    reservation: &DispatchBudgetReservation<'_>,
+    authority: Option<&held_out::ParentValidationAuthority>,
+    cancellation: &ProcessCancellation,
+    auditor_id: &str,
+) -> Result<()> {
+    if let Some(authority) = authority {
+        command.timeout = command
+            .timeout
+            .min(authority.admit(auditor_id, cancellation)?);
+    }
+    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget()
+    {
+        command.bind_live_token_grant(
+            reservation
+                .ledger
+                .live_token_grant(reservation.reservation.id)?,
+        );
+    }
+    Ok(())
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -4529,22 +4548,23 @@ fn dispatch_and_collect_parent_auditor(
         lifecycle_event_payload("running", Some(auditor_attempt), None),
     )?;
 
-    if let Some(authority) = &context.assignment_metadata.parent_validation {
-        match authority.admit(&auditor_id, cancellation) {
-            Ok(remaining) => auditor_command.timeout = auditor_command.timeout.min(remaining),
-            Err(error) => {
-                drop(auditor_incoming_root);
-                drop(auditor_capture_root);
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    discard_invocation_scratches(
-                        writer,
-                        &auditor_incoming_scratch,
-                        &auditor_capture_scratch,
-                    )
-                })?;
-                return Err(error);
-            }
-        }
+    if let Err(error) = finalize_parent_auditor_budget(
+        &mut auditor_command,
+        &auditor_budget_reservation,
+        context.assignment_metadata.parent_validation.as_ref(),
+        cancellation,
+        &auditor_id,
+    ) {
+        drop(auditor_incoming_root);
+        drop(auditor_capture_root);
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            discard_invocation_scratches(
+                writer,
+                &auditor_incoming_scratch,
+                &auditor_capture_scratch,
+            )
+        })?;
+        return Err(error);
     }
     let auditor_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
@@ -6069,6 +6089,173 @@ mod decomposition_tests {
     #[cfg(target_os = "linux")]
     use std::time::Instant;
     use std::{ffi::OsString, sync::MutexGuard};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_auditor_final_deadline_binding_and_prelaunch_refund() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        let writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+            temp.path(),
+            RunArtifactFamily::Supervise,
+            RunId::new("auditor-deadline")?,
+            "test",
+        )?));
+        let binding = held_out::HeldOutRunBinding {
+            manifest_sha256: "a".repeat(64),
+            profile_sha256: "b".repeat(64),
+            profile_id: "profile".into(),
+            repetition: 0,
+            experiment_run_id: "experiment".into(),
+            supervisor_run_id: "auditor-deadline".into(),
+            assignment_id: "child-a".into(),
+            baseline_head: "c".repeat(40),
+            baseline_tree: "d".repeat(40),
+        };
+        for expired in [false, true] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            })?;
+            let BudgetAdmission::Admitted { reservation, .. } =
+                ledger.reserve(BudgetReservationRequest {
+                    role: AgentRole::Auditor,
+                    tokens: 16_384,
+                    cost_usd: None,
+                })?
+            else {
+                panic!("admission");
+            };
+            let held = DispatchBudgetReservation {
+                ledger: &ledger,
+                reservation,
+                pricing: None,
+                model_pricing: BTreeMap::new(),
+                state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex),
+            };
+            let authority = held_out::ParentValidationAuthority::new(
+                binding.clone(),
+                Vec::new(),
+                Instant::now()
+                    + if expired {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                1,
+                Arc::clone(&writer),
+            );
+            let mut command = ExternalAgentCommand::codex(
+                "codex",
+                temp.path(),
+                "prompt",
+                "events",
+                "output",
+                Duration::from_secs(240),
+            )
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_agent_lifecycle(temp.path(), "auditor", "auditor-deadline", "lens-0");
+            assert!(command.live_token_grant_for_test().is_none());
+            let result = finalize_parent_auditor_budget(
+                &mut command,
+                &held,
+                Some(&authority),
+                &ProcessCancellation::new(),
+                "lens-0",
+            );
+            if expired {
+                assert!(result.is_err());
+                assert_eq!(authority.dispatches()?, 0);
+                assert!(command.live_token_grant_for_test().is_none());
+            } else {
+                result?;
+                assert!(
+                    command.timeout > Duration::ZERO && command.timeout <= Duration::from_secs(30)
+                );
+                assert_eq!(authority.dispatches()?, 1);
+                // This accessor verifies the complete bound launch, including its clamped timeout.
+                assert_eq!(
+                    command.live_token_grant_for_test().unwrap().tokens(),
+                    220_000
+                );
+            }
+            // The real dispatch helper has not marked invocation; either failure or abandonment
+            // must release the reservation without inventing provider usage.
+            drop(held);
+            let report = ledger.report()?;
+            assert_eq!(report.consumed.tokens, 0);
+            assert_eq!(report.reserved.tokens, 0);
+            assert_eq!(report.active_reservations, 0);
+            assert!(report.usage_complete);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_auditor_non_codex_reservations_preserve_concurrent_admission() -> Result<()> {
+        for runtime in [
+            SupervisorRuntime::Fake,
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(100),
+                ..Default::default()
+            })?;
+            let request = BudgetReservationRequest {
+                role: AgentRole::Auditor,
+                tokens: 50,
+                cost_usd: None,
+            };
+            let BudgetAdmission::Admitted { reservation, .. } = ledger.reserve(request.clone())?
+            else {
+                panic!("first admission");
+            };
+            let held = DispatchBudgetReservation {
+                ledger: &ledger,
+                reservation,
+                pricing: None,
+                model_pricing: BTreeMap::new(),
+                state: DispatchBudgetReservationState::Reserved(runtime),
+            };
+            // Fake uses a Codex-shaped command. The selected reservation runtime, not its
+            // shape/model label, decides whether this launch holds the live hard balance.
+            let mut command = ExternalAgentCommand::codex(
+                "codex",
+                ".",
+                "prompt",
+                "events",
+                "output",
+                Duration::from_secs(240),
+            )
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_agent_lifecycle(".", "auditor", "runtime-boundary", "lens-0");
+            assert!(command.uses_live_app_server_budget());
+            finalize_parent_auditor_budget(
+                &mut command,
+                &held,
+                None,
+                &ProcessCancellation::new(),
+                "lens-0",
+            )?;
+            assert!(command.live_token_grant_for_test().is_none(), "{runtime:?}");
+            let BudgetAdmission::Admitted {
+                reservation: other, ..
+            } = ledger.reserve(request)?
+            else {
+                panic!("{runtime:?} deprived a concurrent reservation");
+            };
+            assert_eq!(ledger.report()?.reserved.tokens, 100);
+            ledger.release(other.id)?;
+            drop(held);
+            assert_eq!(ledger.report()?.active_reservations, 0);
+            assert_eq!(ledger.report()?.consumed.tokens, 0);
+        }
+        Ok(())
+    }
 
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 

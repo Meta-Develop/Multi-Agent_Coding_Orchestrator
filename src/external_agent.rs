@@ -312,7 +312,7 @@ struct BoundLiveTokenGrant {
 
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
-        should_use_read_only_researcher_app_server(self, ExternalExecutionRuntime::Verified)
+        should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
     }
 
@@ -1911,6 +1911,37 @@ impl ExternalAgentRun {
         }
     }
 
+    pub(crate) fn codex_auditor_effort_qualified(&self) -> bool {
+        !self.stdout.run_metadata.codex_auditor_effort_required
+            || self
+                .authenticated_app_server_evidence()
+                .is_some_and(|evidence| {
+                    codex_app_server::observed_effort_meets(
+                        evidence.requested_effort.as_deref(),
+                        evidence.observed_effort.known(),
+                    )
+                })
+    }
+
+    fn qualify_codex_auditor_effort(&mut self, spec: &ExternalAgentCommand) {
+        self.stdout.run_metadata.codex_auditor_effort_required = spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == AgentRole::Auditor.as_str());
+        if !self.codex_auditor_effort_qualified() {
+            self.publishable = false;
+            self.error = append_external_error(
+                self.error.take(),
+                Some("observed Auditor effort does not meet the selected requirement".to_string()),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualify_codex_auditor_effort_for_test(&mut self, spec: &ExternalAgentCommand) {
+        self.qualify_codex_auditor_effort(spec);
+    }
+
     /// Invocation-wide tokens from the same private capture as the identity.
     /// CLI final-turn usage is not the aggregate of a multi-turn invocation.
     pub(crate) fn authenticated_codex_usage(&self) -> Option<Usage> {
@@ -2035,7 +2066,7 @@ impl ExternalAgentRun {
     }
 
     pub fn succeeded(&self) -> bool {
-        self.safely_executed() && self.publishable
+        self.safely_executed() && self.publishable && self.codex_auditor_effort_qualified()
     }
 
     pub(crate) fn simulation_succeeded(&self) -> bool {
@@ -2301,6 +2332,8 @@ struct ExternalAgentRunMetadata {
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
     codex_app_server_usage_complete: bool,
+    /// Parent launch role only; never serialized or restored from public reports.
+    codex_auditor_effort_required: bool,
     codex_cli_parent_evidence: Option<CodexParentEvidence>,
     codex_cli_usage: Option<Usage>,
     codex_cli_usage_complete: bool,
@@ -2876,8 +2909,8 @@ fn run_external_agent_runtime(
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
     let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
-    let read_only_researcher_app_server = should_use_read_only_researcher_app_server(spec, runtime);
-    let app_server_required = duplex_review_required || read_only_researcher_app_server;
+    let read_only_terminal_app_server = should_use_read_only_terminal_app_server(spec, runtime);
+    let app_server_required = duplex_review_required || read_only_terminal_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -2947,13 +2980,12 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
-    if read_only_researcher_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex
-    {
+    if read_only_terminal_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex {
         return failed_external_environment_run(
             spec, started, command_display(&resolved_program, &[]), false,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(external_sandbox_requirement(spec.invocation)),
-            "read-only Researcher app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
+            "read-only terminal Codex app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
         );
     }
     let program_identity = match external_program_identity(&resolved_program) {
@@ -3916,8 +3948,8 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        let process = if read_only_researcher_app_server {
-            run_read_only_researcher_app_server_process(process_spec, cancellation, spec, prompt)
+        let process = if read_only_terminal_app_server {
+            run_read_only_terminal_app_server_process(process_spec, cancellation, spec, prompt)
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -4216,7 +4248,7 @@ fn run_external_agent_runtime(
     report
 }
 
-fn should_use_read_only_researcher_app_server(
+fn should_use_read_only_terminal_app_server(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
 ) -> bool {
@@ -4227,7 +4259,7 @@ fn should_use_read_only_researcher_app_server(
         && spec
             .agent_lifecycle
             .as_ref()
-            .is_some_and(|identity| identity.role == AgentRole::Researcher.as_str())
+            .is_some_and(|identity| matches!(identity.role.as_str(), "researcher" | "auditor"))
 }
 
 fn should_use_duplex_review(
@@ -4577,7 +4609,7 @@ fn fail_app_server_outcome(outcome: &mut codex_app_server::AppServerOutcome, err
     outcome.final_message = None;
 }
 
-fn run_read_only_researcher_app_server_process(
+fn run_read_only_terminal_app_server_process(
     process_spec: ProcessSpec,
     cancellation: &ProcessCancellation,
     spec: &ExternalAgentCommand,
@@ -4588,12 +4620,17 @@ fn run_read_only_researcher_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: spec
+            .agent_lifecycle
+            .as_ref()
+            .filter(|identity| identity.role == AgentRole::Auditor.as_str())
+            .map(|_| spec.reasoning_effort.clone().unwrap_or_default()),
         output_schema: load_codex_app_server_output_schema(spec)?,
     };
     let cancellation = cancellation.child_scope();
     run_process_interactive(process_spec, &cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
-        // Read-only research has no approval authority, even if a hosted reviewer exists.
+        // Read-only terminal roles have no approval authority, even if a hosted reviewer exists.
         let mut approval_requested = false;
         let mut reviewer = |_: codex_app_server::ApprovalRequest| {
             approval_requested = true;
@@ -4607,7 +4644,7 @@ fn run_read_only_researcher_app_server_process(
             &cancellation,
         )?;
         if let Err(error) =
-            validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)
+            validate_read_only_terminal_app_server_outcome(&outcome, approval_requested)
         {
             fail_app_server_outcome(&mut outcome, error);
         }
@@ -4650,14 +4687,14 @@ fn load_codex_app_server_output_schema(
     Ok(Some(schema))
 }
 
-fn validate_read_only_researcher_app_server_outcome(
+fn validate_read_only_terminal_app_server_outcome(
     outcome: &codex_app_server::AppServerOutcome,
     approval_requested: bool,
 ) -> Result<(), String> {
     // The shared driver currently cancels immediately. Retain this independent guard so a
     // later Completed turn after an empty permission grant can never erase the refusal.
     if approval_requested || outcome.refused_ceiling_expansions != 0 {
-        return Err("read-only Researcher app-server refused an approval request".to_string());
+        return Err("read-only terminal Codex app-server refused an approval request".to_string());
     }
     if outcome.status != codex_app_server::TurnTerminalStatus::Completed
         || outcome
@@ -4666,7 +4703,7 @@ fn validate_read_only_researcher_app_server_outcome(
             .any(|item| item.item_type == "fileChange")
     {
         return Err(
-            "read-only Researcher app-server refused a non-completed turn or file change"
+            "read-only terminal Codex app-server refused a non-completed turn or file change"
                 .to_string(),
         );
     }
@@ -4694,6 +4731,7 @@ fn run_duplex_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: None,
         output_schema: match load_codex_app_server_output_schema(spec) {
             Ok(schema) => schema,
             Err(error) => {
@@ -5126,6 +5164,7 @@ fn record_completed_app_server_target(
     credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
+    let launch_spec = context.spec;
     let protocol = interactive.interaction;
     let parent_evidence = output_staging.codex_home.as_ref().map(|codex_home| {
         let inputs = CodexParentEvidenceInputs {
@@ -5193,6 +5232,7 @@ fn record_completed_app_server_target(
             .is_some_and(|evidence| {
                 evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
             });
+    report.qualify_codex_auditor_effort(launch_spec);
     if report
         .authenticated_app_server_evidence()
         .is_none_or(|evidence| evidence.resolution_status != "complete" || evidence.model_mismatch)
