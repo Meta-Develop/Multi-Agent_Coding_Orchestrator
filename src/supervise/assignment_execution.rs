@@ -1162,7 +1162,7 @@ fn prepare_assignment_execution<'a>(
                     artifacts,
                     &effective_assignment,
                     &requested_plan.assignments,
-                    repo,
+                    (repo, context.assignment_metadata),
                     options.runtime,
                     *execution_runtime,
                     *worktree_creation,
