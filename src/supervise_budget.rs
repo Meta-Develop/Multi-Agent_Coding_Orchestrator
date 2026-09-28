@@ -660,7 +660,9 @@ impl RunBudgetLedger {
     /// Only live execution grants justify waiting. Original estimates, cost ceilings,
     /// uncertainty and a latched breach still refuse immediately. The condition and
     /// reservation share one lock, so a competing grant cannot turn a retry into a
-    /// false permanent refusal. Cancellation is checked on bounded wakeups.
+    /// false permanent refusal. Cancellation interrupts grant waits; immediate
+    /// accounting admission/refusal remains available when finalizing completed
+    /// work. Process launch retains its independent cancellation gate.
     pub(super) fn reserve_waiting_for_live_grants(
         &self,
         request: BudgetReservationRequest,
@@ -670,7 +672,12 @@ impl RunBudgetLedger {
         validate_reservation_request(&request)?;
         let started = Instant::now();
         let mut state = self.lock_state()?;
+        if !self.request_waits_for_live_grants(&state, &request)? {
+            return self.reserve_locked(&mut state, request);
+        }
         loop {
+            // Once waiting starts, cancellation wins even if a concurrent
+            // settlement makes capacity available before this wakeup.
             if cancelled() {
                 return Err(BudgetError::AdmissionCancelled);
             }
@@ -1856,6 +1863,94 @@ mod tests {
                 panic!("expected admitted reservation, got {refusal:?}")
             }
         }
+    }
+
+    #[test]
+    fn cancelled_wait_token_preserves_immediate_budget_admission_and_refusal() {
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let review = admitted_reservation(
+            ledger
+                .reserve_waiting_for_live_grants(
+                    BudgetReservationRequest {
+                        role: AgentRole::Auditor,
+                        tokens: 1_000,
+                        cost_usd: Some(0.1),
+                    },
+                    Duration::ZERO,
+                    || true,
+                )
+                .unwrap(),
+        );
+        assert_eq!(review.role, AgentRole::Auditor);
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 1_000);
+        ledger.release(review.id).unwrap();
+        assert_eq!(ledger.report().unwrap().active_reservations, 0);
+        assert!(matches!(
+            ledger
+                .reserve_waiting_for_live_grants(
+                    request(220_001, Some(0.1)),
+                    Duration::ZERO,
+                    || true,
+                )
+                .unwrap(),
+            BudgetAdmission::Refused {
+                refusal: BudgetAdmissionRefusal::HardTokenCeiling { .. },
+                ..
+            }
+        ));
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 0);
+    }
+
+    #[test]
+    fn cancelled_live_grant_wait_cannot_admit_after_settlement() {
+        let ledger = RunBudgetLedger::new(token_limits(100_000, 220_000)).unwrap();
+        let child = admitted_reservation(ledger.reserve(request(16_384, Some(1.0))).unwrap());
+        let grant = ledger.live_token_grant(child.id).unwrap().unwrap();
+        let cancelled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let waiting_ledger = ledger.clone();
+        let waiting_cancelled = Arc::clone(&cancelled);
+        let (waiting_tx, waiting_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let mut checks = 0;
+            let result = waiting_ledger.reserve_waiting_for_live_grants(
+                request(1_000, Some(0.1)),
+                Duration::from_secs(2),
+                || {
+                    checks += 1;
+                    if checks == 2 {
+                        waiting_tx.send(()).unwrap();
+                    }
+                    waiting_cancelled.load(std::sync::atomic::Ordering::SeqCst)
+                },
+            );
+            done_tx.send(result).unwrap();
+        });
+        waiting_rx
+            .recv_timeout(Duration::from_secs(1))
+            .expect("entered grant wait");
+        assert!(!grant.stopped());
+        cancelled.store(true, std::sync::atomic::Ordering::SeqCst);
+        ledger
+            .reconcile(
+                child.id,
+                UsageMeasurement::Reliable {
+                    tokens: 37_000,
+                    cost_usd: Some(0.1),
+                },
+            )
+            .unwrap();
+        assert!(matches!(
+            done_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("cancelled grant wait terminates"),
+            Err(BudgetError::AdmissionCancelled)
+        ));
+        waiter.join().unwrap();
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 37_000);
+        assert_eq!(report.reserved.tokens, 0);
+        assert_eq!(report.active_reservations, 0);
     }
 
     #[test]
