@@ -7,6 +7,7 @@
 
 mod capabilities;
 pub mod cursor;
+pub mod gemini;
 pub mod grok;
 pub(crate) mod grok_acp;
 pub mod hosted_callback;
