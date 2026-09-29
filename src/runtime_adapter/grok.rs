@@ -542,11 +542,106 @@ impl GrokNativeUsage {
     }
 }
 
+/// Parent-capture observation, deliberately not Serde. The native cache buckets
+/// remain distinct; only the allocation consumed by the generic ledger combines
+/// them into input tokens. This does not attest a provider model, effort or cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrokNativeUsageObservation {
+    native: GrokNativeUsage,
+    terminal_complete: bool,
+}
+
+impl GrokNativeUsageObservation {
+    pub(crate) fn allocation(&self) -> (crate::llm::provider::Usage, bool) {
+        let native = &self.native;
+        // u128 accommodates all four disjoint u64 counters without overflow.
+        // An absent cache bucket is not asserted to be zero: this is a floor.
+        let input_floor = u128::from(native.input_tokens)
+            + u128::from(native.cache_read_input_tokens.unwrap_or(0))
+            + u128::from(native.cache_creation_input_tokens.unwrap_or(0));
+        let output = u128::from(native.output_tokens);
+        let floor = input_floor + output;
+        let total = native.total_tokens.map(u128::from);
+        let total_consistent = total.is_some_and(|total| {
+            total >= floor
+                && (native.cache_read_input_tokens.is_none()
+                    || native.cache_creation_input_tokens.is_none()
+                    || total == floor)
+        });
+        let observed = total.filter(|_| total_consistent).unwrap_or(floor);
+        let fits = usize::try_from(observed).is_ok();
+        // Unrepresentable totals cannot be complete. Retain a representable
+        // lower bound so overflow cannot refund already observed native spend.
+        let bounded = usize::try_from(observed).unwrap_or(usize::MAX);
+        let bounded_output =
+            usize::try_from(output.min(bounded as u128)).expect("bounded output fits usize");
+        let usage = crate::llm::provider::Usage {
+            input_tokens: bounded - bounded_output,
+            output_tokens: bounded_output,
+            total_tokens: bounded,
+        };
+        let complete = self.terminal_complete
+            && total_consistent
+            && fits
+            && native
+                .reasoning_tokens
+                .is_none_or(|reasoning| reasoning <= native.output_tokens);
+        (usage, complete)
+    }
+}
+
+/// Retain the first valid native terminal snapshot from a bounded parent-held
+/// stream. Trailing damage, a second terminal, or raw truncation cannot replace
+/// that snapshot or make it complete. ACP and Codex-shaped events are not usage.
+pub(crate) fn observe_grok_native_usage(
+    bytes: &[u8],
+    raw_truncated: bool,
+) -> Option<GrokNativeUsageObservation> {
+    let mut end = 0usize;
+    for line in bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(GROK_EVENT_STREAM_MAX_EVENTS)
+    {
+        end = end.checked_add(line.len())?;
+        if end > GROK_EVENT_STREAM_MAX_BYTES
+            || !line.ends_with(b"\n")
+            || line.len() - 1 > GROK_EVENT_LINE_MAX_BYTES
+        {
+            return None;
+        }
+        let raw: RawGrokStreamEvent = serde_json::from_slice(line).ok()?;
+        if raw.event_type == "error" {
+            return None;
+        }
+        if raw.event_type != "end" {
+            continue;
+        }
+        // Reuse the full protocol validator, including event ordering, field
+        // placement, terminal metadata and all prefix/line limits.
+        parse_grok_event_stream(&bytes[..end]).ok()?;
+        let usage = raw.usage?;
+        return Some(GrokNativeUsageObservation {
+            native: GrokNativeUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                total_tokens: usage.total_tokens,
+            },
+            terminal_complete: !raw_truncated
+                && end == bytes.len()
+                && raw.usage_is_incomplete != Some(true),
+        });
+    }
+    None
+}
+
 /// Honest adapter-boundary spend status for a bounded Grok stream.
 ///
 /// Native `end` events may omit spend entirely, mark it incomplete, or carry
-/// exact token fields. MACO does not convert those fields into Codex events or
-/// `Usage` counts; the capability matrix remains `UsageReporting::None`.
+/// exact token fields. This public protocol status is not private settlement
+/// custody; the capability matrix remains `UsageReporting::None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrokUsageStatus {
     NotProcessObservable,
@@ -944,6 +1039,132 @@ fn grok_end_usage_status(
             reasoning_tokens: usage.reasoning_tokens,
             total_tokens: usage.total_tokens,
         }),
+    }
+}
+
+#[cfg(test)]
+mod native_budget_observation_tests {
+    use super::*;
+
+    fn stream(usage: Value, incomplete: bool) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "type": "end", "stopReason": "stop", "sessionId": "session",
+            "requestId": "request", "usage": usage, "usage_is_incomplete": incomplete,
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn native() -> Value {
+        serde_json::json!({"input_tokens":12,"output_tokens":5,
+            "cache_read_input_tokens":4,"cache_creation_input_tokens":3,
+            "reasoning_tokens":2,"total_tokens":24})
+    }
+
+    #[test]
+    fn native_budget_preserves_disjoint_cache_buckets_and_reasoning_subset() {
+        let observed = observe_grok_native_usage(&stream(native(), false), false).unwrap();
+        assert_eq!(observed.native.input_tokens(), 12);
+        assert_eq!(observed.native.cache_read_input_tokens(), Some(4));
+        assert_eq!(observed.native.cache_creation_input_tokens(), Some(3));
+        assert_eq!(observed.native.reasoning_tokens(), Some(2));
+        let (usage, complete) = observed.allocation();
+        assert!(complete);
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (19, 5, 24)
+        );
+    }
+
+    #[test]
+    fn native_budget_absence_and_incomplete_counts_do_not_invent_completeness() {
+        assert!(observe_grok_native_usage(&stream(Value::Null, false), false).is_none());
+        let mut no_total = native();
+        no_total.as_object_mut().unwrap().remove("total_tokens");
+        for bytes in [stream(no_total, false), stream(native(), true)] {
+            let observed = observe_grok_native_usage(&bytes, false).unwrap();
+            assert_eq!(observed.allocation().0.total_tokens, 24);
+            assert!(!observed.allocation().1);
+        }
+        let bytes = stream(
+            serde_json::json!({"input_tokens":12,"output_tokens":5,"total_tokens":24}),
+            false,
+        );
+        let observed = observe_grok_native_usage(&bytes, false).unwrap();
+        assert_eq!(observed.native.cache_read_input_tokens(), None);
+        assert_eq!(observed.native.cache_creation_input_tokens(), None);
+        assert_eq!(observed.allocation().0.input_tokens, 19);
+        assert!(
+            observed.allocation().1,
+            "explicit native total includes the unclassified cache tokens"
+        );
+    }
+
+    #[test]
+    fn native_budget_conflicts_and_overflow_keep_only_incomplete_lower_bounds() {
+        for (field, value) in [
+            ("total_tokens", 23u64),
+            ("total_tokens", 25),
+            ("reasoning_tokens", 6),
+        ] {
+            let mut usage = native();
+            usage[field] = value.into();
+            let (allocation, complete) = observe_grok_native_usage(&stream(usage, false), false)
+                .unwrap()
+                .allocation();
+            assert_eq!(allocation.total_tokens, 24);
+            assert!(!complete);
+        }
+        let mut usage = native();
+        usage["input_tokens"] = u64::MAX.into();
+        let observed = observe_grok_native_usage(&stream(usage, false), false).unwrap();
+        assert_eq!(observed.allocation().0.total_tokens, usize::MAX);
+        assert!(!observed.allocation().1);
+    }
+
+    #[test]
+    fn native_budget_trailing_damage_and_truncation_cannot_replace_first_snapshot() {
+        let original = stream(native(), false);
+        let mut duplicate = original.clone();
+        duplicate.extend(stream(
+            serde_json::json!({"input_tokens":1,"output_tokens":0,"total_tokens":1}),
+            false,
+        ));
+        let mut damaged = original.clone();
+        damaged.extend_from_slice(b"broken");
+        for (bytes, truncated) in [
+            (original.clone(), true),
+            (duplicate, false),
+            (damaged, false),
+        ] {
+            let (usage, complete) = observe_grok_native_usage(&bytes, truncated)
+                .unwrap()
+                .allocation();
+            assert_eq!(usage.total_tokens, 24);
+            assert!(!complete);
+        }
+        assert!(observe_grok_native_usage(&original[..original.len() - 1], false).is_none());
+    }
+
+    #[test]
+    fn native_budget_rejects_malformed_foreign_and_unbounded_observations() {
+        for bytes in [
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5}}\n".as_slice(),
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"cost\":1}}\n",
+            b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":1,\"input_tokens\":2,\"output_tokens\":3}}\n",
+        ] {
+            assert!(observe_grok_native_usage(bytes, false).is_none());
+        }
+        for bad in [serde_json::json!(-1), serde_json::json!("12"), Value::Null] {
+            let mut usage = native();
+            usage["input_tokens"] = bad;
+            assert!(observe_grok_native_usage(&stream(usage, false), false).is_none());
+        }
+        let mut bytes = vec![b' '; GROK_EVENT_LINE_MAX_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend(stream(native(), false));
+        assert!(observe_grok_native_usage(&bytes, false).is_none());
     }
 }
 
