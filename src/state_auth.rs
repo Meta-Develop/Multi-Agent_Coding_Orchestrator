@@ -977,13 +977,45 @@ mod tests {
         assert_ne!(left, right);
     }
 
+    fn production_source_before_tests(source: &str) -> Option<&str> {
+        let mut offset = 0;
+        let mut test_attribute_offset = None;
+        for line in source.split_inclusive('\n') {
+            let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+            let line_without_ending = line_without_newline
+                .strip_suffix('\r')
+                .unwrap_or(line_without_newline);
+            if let Some(boundary) = test_attribute_offset.take() {
+                if line_without_ending == "mod tests {" {
+                    return Some(&source[..boundary]);
+                }
+            }
+            if line_without_ending == "#[cfg(test)]" {
+                test_attribute_offset = Some(offset);
+            }
+            offset += line.len();
+        }
+        None
+    }
+
+    #[test]
+    fn production_test_boundary_accepts_lf_and_crlf() {
+        let lf = "pub(crate) struct RepositoryAuthenticator;\n#[cfg(test)]\nmod tests {\n}\n";
+        let crlf = lf.replace('\n', "\r\n");
+        assert_eq!(
+            production_source_before_tests(lf),
+            Some("pub(crate) struct RepositoryAuthenticator;\n")
+        );
+        assert_eq!(
+            production_source_before_tests(&crlf),
+            Some("pub(crate) struct RepositoryAuthenticator;\r\n")
+        );
+    }
+
     #[test]
     fn secret_authenticator_api_remains_opaque() {
         let source = include_str!("state_auth.rs");
-        let production = source
-            .split("\n#[cfg(test)]\nmod tests")
-            .next()
-            .expect("production auth source");
+        let production = production_source_before_tests(source).expect("production auth source");
         let declaration = production
             .find("pub(crate) struct RepositoryAuthenticator")
             .expect("authenticator declaration");
