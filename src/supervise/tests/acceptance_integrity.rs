@@ -1,5 +1,228 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
+fn managed_parent_collection<'a>(
+    assignment: &'a OrchestratorAssignment,
+    metadata: &'a AssignmentMetadata,
+    report_path: &'a Path,
+    external_run: &'a ExternalAgentRun,
+    external_command: &'a ExternalAgentCommand,
+    worktree_path: &'a Path,
+    child_base_head: &'a git2::Oid,
+    journals: &'a WorkerExecutionJournalEvidenceSet,
+    observed_changed_paths: Option<&'a [PathBuf]>,
+) -> ChildReportCollectionContext<'a> {
+    ChildReportCollectionContext {
+        assignment,
+        assignment_metadata: metadata,
+        report_path,
+        external_run,
+        external_command,
+        worktree_path,
+        child_base_head,
+        worker_journals: journals,
+        evidence_only_source: None,
+        observed_changed_paths,
+    }
+}
+
+fn injected_repository_head(repo_path: &Path) -> git2::Oid {
+    git2::Repository::open(repo_path)
+        .expect("open injected repository")
+        .head()
+        .expect("injected repository HEAD")
+        .target()
+        .expect("injected repository HEAD oid")
+}
+
+fn asserted_review_lens_aggregate() -> ReviewLensAggregate {
+    serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "policy": ReviewAggregationPolicy::AllMustAccept,
+        "decision": "accept",
+        "required_accepts": 1,
+        "validated_accepts": 1,
+        "rejected_lenses": 0,
+        "procedural_failures": 0,
+        "required_coverage": {"worker_ids": [], "paths": []},
+        "lens_verdicts": []
+    }))
+    .expect("review lens aggregate fixture")
+}
+
+#[test]
+fn managed_parent_report_rejects_asserted_codex_parent_evidence() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
+    assert!(!assignment.worker_assignments.is_empty());
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-codex-evidence.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new()));
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let mut asserted = injected_child_report(&assignment);
+    asserted.accepted = true;
+    asserted.rejected = false;
+    asserted.status = ReviewStatus::Succeeded;
+    let mut record = command_record_from_external(&external_run, &command);
+    record.codex_parent_evidence = Some(forged_codex_parent_evidence());
+    asserted.commands_run.push(record);
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, _) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: asserted,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(finding_messages(&report)
+        .contains("child report attempted to self-assert parent-process Codex model, effort, and usage evidence"));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.codex_parent_evidence.is_none()));
+}
+
+#[test]
+fn managed_parent_report_rejects_self_supplied_audit_and_aggregate_evidence() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-audit-aggregate.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new()));
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let mut asserted = injected_child_report(&assignment);
+    asserted.accepted = true;
+    asserted.rejected = false;
+    asserted.status = ReviewStatus::Succeeded;
+    let auditor = injected_auditor_report(&assignment, &asserted);
+    asserted.audit_reports.push(auditor);
+    asserted.review_lens_aggregate = Some(asserted_review_lens_aggregate());
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, _) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: asserted,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert!(report.audit_reports.is_empty());
+    assert!(report.review_lens_aggregate.is_none());
+    let messages = finding_messages(&report);
+    assert!(
+        messages.contains("child report attempted to self-assert supervisor-owned audit reports")
+    );
+    assert!(messages.contains(
+        "child report attempted to self-assert a supervisor-owned review-lens aggregate"
+    ));
+}
+
+#[test]
+fn managed_parent_parsed_error_or_wrong_role_cannot_become_accepted() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-parse-error.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals = injected_worker_journal_evidence(WorkerExecutionJournalStatus::Missing);
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, problems) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Err(anyhow!("managed parent parser rejected the continuation")),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(problems.iter().any(|problem| {
+        problem.contains("required assignment report is missing or invalid")
+            && problem.contains("managed parent parser rejected the continuation")
+    }));
+
+    let mut wrong_role = injected_assignment(true);
+    wrong_role.role = AgentRole::Worker;
+    let mut success = injected_child_report(&assignment);
+    success.accepted = true;
+    success.rejected = false;
+    success.status = ReviewStatus::Succeeded;
+    success.role = AgentRole::Worker;
+    let wrong_context = managed_parent_collection(
+        &wrong_role,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, problems) = collect_managed_parent_report_for_runtime(
+        wrong_context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: success,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(problems.iter().any(|problem| {
+        problem.contains("required assignment report is missing or invalid")
+            && problem.contains("restricted to a Codex child orchestrator")
+    }));
+    assert!(!finding_messages(&report).contains("Codex model, effort, and usage evidence"));
+}
+
 #[test]
 #[cfg(unix)]
 fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_sentinels() {

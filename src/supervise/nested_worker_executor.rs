@@ -461,6 +461,7 @@ pub(super) fn execute_nested_worker_attempt(
         }
         admission.revalidate(&authority, worker_id, &command)?;
         permit.revalidate(preflight, parent_attempt)?;
+        super::runtime_executables::validate_launch(&command)?;
         reservation.mark_invoked_for_runtime(runtime)?;
         invoked = true;
         let mut review_journal = SupervisorPreActionJournalSink {

@@ -327,9 +327,45 @@ pub(super) fn assignment_attempt_report_role(role: AgentRole, evidence_only: boo
     }
 }
 
+enum ChildReportSource {
+    CapturedBytes,
+    ManagedParentParsed(Box<Result<ParsedReport<OrchestratorReviewReport>>>),
+}
+
 pub(super) fn collect_child_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report_from_source(context, runtime, ChildReportSource::CapturedBytes)
+}
+
+pub(super) fn collect_managed_parent_report_for_runtime(
+    context: ChildReportCollectionContext<'_>,
+    runtime: SupervisorRuntime,
+    parsed: Result<ParsedReport<OrchestratorReviewReport>>,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report_from_source(
+        context,
+        runtime,
+        ChildReportSource::ManagedParentParsed(Box::new(parsed)),
+    )
+}
+
+fn managed_parent_continuation_admitted(
+    assignment: &OrchestratorAssignment,
+    runtime: SupervisorRuntime,
+    evidence_only: bool,
+) -> bool {
+    assignment.role == AgentRole::ChildOrchestrator
+        && !assignment.worker_assignments.is_empty()
+        && runtime == SupervisorRuntime::Codex
+        && !evidence_only
+}
+
+fn collect_child_report_from_source(
+    context: ChildReportCollectionContext<'_>,
+    runtime: SupervisorRuntime,
+    source: ChildReportSource,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let ChildReportCollectionContext {
         assignment,
@@ -360,23 +396,47 @@ pub(super) fn collect_child_report_for_runtime(
         assignment_attempt_report_role(assignment.role, evidence_only_source.is_some());
     let direct_worker = report_role == AgentRole::Worker
         && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker);
+    let managed_parent_admitted = matches!(source, ChildReportSource::ManagedParentParsed(_))
+        && managed_parent_continuation_admitted(
+            assignment,
+            runtime,
+            evidence_only_source.is_some(),
+        );
     let mut report_shape_problems = Vec::new();
-    let parsed_report = if direct_worker {
-        read_direct_worker_report(external_run.output_last_message(), report_path).map(|parsed| {
-            let mut worker = parsed.report;
-            reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
-            reject_worker_asserted_grok_acp_parent_evidence(report_path, &mut worker);
-            reject_worker_asserted_codex_parent_evidence(report_path, &mut worker);
-            reject_worker_asserted_fixed_version_probe_evidence(report_path, &mut worker);
-            ParsedReport {
-                report: direct_worker_report_envelope(worker),
-                recovered: parsed.recovered,
+    let parsed_report = match source {
+        ChildReportSource::CapturedBytes => {
+            if direct_worker {
+                read_direct_worker_report(external_run.output_last_message(), report_path).map(
+                    |parsed| {
+                        let mut worker = parsed.report;
+                        reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
+                        reject_worker_asserted_grok_acp_parent_evidence(report_path, &mut worker);
+                        reject_worker_asserted_codex_parent_evidence(report_path, &mut worker);
+                        reject_worker_asserted_fixed_version_probe_evidence(
+                            report_path,
+                            &mut worker,
+                        );
+                        ParsedReport {
+                            report: direct_worker_report_envelope(worker),
+                            recovered: parsed.recovered,
+                        }
+                    },
+                )
+            } else if assignment.role == AgentRole::Researcher {
+                read_researcher_report(external_run.output_last_message(), report_path)
+            } else {
+                read_child_report(external_run.output_last_message(), report_path)
             }
-        })
-    } else if assignment.role == AgentRole::Researcher {
-        read_researcher_report(external_run.output_last_message(), report_path)
-    } else {
-        read_child_report(external_run.output_last_message(), report_path)
+        }
+        ChildReportSource::ManagedParentParsed(parsed) => {
+            if managed_parent_admitted {
+                *parsed
+            } else {
+                Err(anyhow!(
+                    "managed parent continuation is restricted to a Codex child orchestrator with authored workers and no evidence-only source"
+                ))
+            }
+        }
     };
     let mut report = match parsed_report {
         Ok(parsed) => {
@@ -474,6 +534,18 @@ pub(super) fn collect_child_report_for_runtime(
             message:
                 "child report attempted to self-assert a supervisor-owned review-lens aggregate"
                     .to_string(),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
+    if managed_parent_admitted && !report.audit_reports.is_empty() {
+        report.audit_reports.clear();
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "child report attempted to self-assert supervisor-owned audit reports"
+                .to_string(),
             paths: vec![report_path.to_path_buf()],
         });
     }
