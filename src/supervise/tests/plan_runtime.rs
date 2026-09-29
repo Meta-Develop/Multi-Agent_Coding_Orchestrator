@@ -2781,23 +2781,155 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
         .expect("construct selector-backed Codex catalog with a deterministic runner-up");
     let mut child_commands = Vec::new();
+    let mut observed_turns = Vec::new();
+    let mut child_report = injected_child_report(&assignment);
+    let mut worker_report = child_report
+        .worker_reports
+        .first()
+        .expect("authored worker report")
+        .clone();
     let mut runner = |command: &ExternalAgentCommand| {
+        use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
         let name = command
             .output_last_message
             .file_name()
             .and_then(OsStr::to_str)
             .expect("UTF-8 output name");
+        let role = command
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str());
         if name.contains("review-auditor") {
+            observed_turns.push("review-auditor");
             write_injected_json(
                 &command.output_last_message,
-                &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                &injected_auditor_report(&assignment, &child_report),
             );
-        } else {
-            child_commands.push(command.clone());
-            write_injected_assignment_report(command, &assignment);
+            write_injected_usage(command, 8, 3);
+            return injected_verified_run(command);
         }
+        if command.codex_managed_worker_requests_enabled() {
+            observed_turns.push("initial-parent");
+            assert_eq!(role, Some("child_orchestrator"));
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadOnly
+            );
+            assert!(command.codex_native_delegation_is_disabled());
+            assert!(!command.codex_managed_readonly_continuation_enabled());
+            let launch = command
+                .assignment_messaging_launch()
+                .expect("managed parent inbox launch");
+            let env: BTreeMap<_, _> = launch
+                .environment_for(run_id.as_str(), assignment.id.as_str())
+                .expect("sealed parent launch environment")
+                .into_iter()
+                .collect();
+            let mut stream = TcpStream::connect(&env[ENV_MESSAGE_ENDPOINT])
+                .expect("connect managed parent inbox");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request write");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request read");
+            writeln!(
+                stream,
+                "{}",
+                json!({"bearer": env[ENV_MESSAGE_TOKEN], "request": {
+                    "operation": "submit_worker_request",
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }})
+            )
+            .expect("submit authored worker request");
+            stream.flush().expect("flush authored worker request");
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .expect("read worker-request admission");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).expect("decode admission")
+                    ["ok"],
+                true
+            );
+            let yield_turn = json!({
+                "version": 1,
+                "outcome": "yield_workers",
+                "run_id": run_id.as_str(),
+                "parent_id": assignment.id,
+                "parent_attempt": 1,
+                "requests": [{
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }]
+            });
+            write_injected_json(&command.output_last_message, &yield_turn);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            run.output_last_message =
+                Some(serde_json::to_vec(&yield_turn).expect("encode parent yield"));
+            child_commands.push(command.clone());
+            return run;
+        }
+        if role == Some("worker") {
+            observed_turns.push("worker");
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadWrite
+            );
+            assert_eq!(worker_report.id, "worker-a");
+            let active_claims = SyncStore::open(&repo_path)
+                .expect("open active selector claims")
+                .snapshot()
+                .expect("snapshot active selector claims");
+            assert_eq!(active_claims.len(), 1);
+            assert_eq!(active_claims[0].agent_id, assignment.id);
+            assert_eq!(active_claims[0].paths, assignment.assigned_paths);
+            let claim_token = active_claims[0].token.get();
+            worker_report.claim_token = Some(claim_token);
+            worker_report.semantic_intent_token = None;
+            child_report.claim_token = Some(claim_token);
+            child_report.semantic_intent_token = None;
+            child_report.worker_reports = vec![worker_report.clone()];
+            write_injected_json(&command.output_last_message, &worker_report);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            return run;
+        }
+        observed_turns.push("final-parent");
+        assert_eq!(role, Some("child_orchestrator"));
+        assert_eq!(
+            command.workspace_access,
+            crate::process_runner::WorkspaceAccess::ReadOnly
+        );
+        assert!(command.codex_native_delegation_is_disabled());
+        assert!(command.codex_managed_readonly_continuation_enabled());
+        assert!(!command.codex_managed_worker_requests_enabled());
+        assert!(command.assignment_messaging_launch().is_none());
+        let final_turn = json!({
+            "version": 1,
+            "run_id": run_id.as_str(),
+            "parent_id": assignment.id,
+            "source_parent_attempt": 1,
+            "parent_attempt": 2,
+            "completed_worker_ids": [worker_report.id.clone()],
+            "turn": {"outcome": "final_report", "report": &child_report}
+        });
+        write_injected_json(&command.output_last_message, &final_turn);
         write_injected_usage(command, 8, 3);
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        run.stdout.target_launch_attempted = true;
+        run.output_last_message =
+            Some(serde_json::to_vec(&final_turn).expect("encode final parent"));
+        run
     };
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
@@ -2811,6 +2943,10 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     .expect("run verified selector-backed supervise dispatch");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(
+        observed_turns,
+        ["initial-parent", "worker", "final-parent", "review-auditor"]
+    );
     assert_eq!(child_commands.len(), 1);
     let economics = report
         .role_economics_profile

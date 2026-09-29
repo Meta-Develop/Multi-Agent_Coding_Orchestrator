@@ -1,3 +1,6 @@
+use super::messaging_bridge::worker_requests::frozen::{
+    FrozenWorkerInbox, WorkerInboxEndpoint, WorkerInboxShutdown, WorkerInboxTurn,
+};
 use super::*;
 #[path = "nested_worker.rs"]
 mod nested_worker;
@@ -13,6 +16,14 @@ mod parent_turn_yield;
 #[allow(dead_code)]
 #[path = "bound_parent_turn.rs"]
 mod bound_parent_turn;
+// Staged continuation binding; controller is the next leaf.
+#[allow(dead_code)]
+mod parent_continuation_binding;
+// Staged continuation response; controller is the next leaf.
+#[allow(dead_code)]
+mod managed_parent_controller;
+#[allow(dead_code)]
+mod parent_continuation_response;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
@@ -1827,6 +1838,12 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
     }
 }
 
+enum ChildAttemptPurpose<'a, 'e> {
+    Ordinary,
+    ManagedParentInitial,
+    ManagedParentContinuation(&'a ParentContinuationLaunch<'e>),
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -1842,6 +1859,81 @@ fn prepare_child_attempt<'a>(
     auditor_schema_path: &Path,
     continuation: Option<&ParentContinuationLaunch<'_>>,
 ) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+    let purpose = match continuation {
+        None => ChildAttemptPurpose::Ordinary,
+        Some(launch) => ChildAttemptPurpose::ManagedParentContinuation(launch),
+    };
+    prepare_child_attempt_with_purpose(
+        context,
+        outcome,
+        budget_policy,
+        preflight,
+        journal_parent_id,
+        attempt,
+        max_attempts,
+        retry_feedback,
+        schema_path,
+        worker_schema_path,
+        auditor_schema_path,
+        purpose,
+    )
+}
+
+#[allow(dead_code)] // Controller consumes this once the initial parent route is activated.
+#[allow(clippy::too_many_arguments)]
+fn prepare_managed_parent_initial_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    budget_policy: &AssignmentBudgetPolicy,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    max_attempts: usize,
+    retry_feedback: &Option<ChildAttemptCorrection>,
+    schema_path: &Path,
+    worker_schema_path: &Path,
+    auditor_schema_path: &Path,
+) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+    prepare_child_attempt_with_purpose(
+        context,
+        outcome,
+        budget_policy,
+        preflight,
+        journal_parent_id,
+        attempt,
+        max_attempts,
+        retry_feedback,
+        schema_path,
+        worker_schema_path,
+        auditor_schema_path,
+        ChildAttemptPurpose::ManagedParentInitial,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_child_attempt_with_purpose<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    budget_policy: &AssignmentBudgetPolicy,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    max_attempts: usize,
+    retry_feedback: &Option<ChildAttemptCorrection>,
+    schema_path: &Path,
+    worker_schema_path: &Path,
+    auditor_schema_path: &Path,
+    purpose: ChildAttemptPurpose<'_, '_>,
+) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+    let continuation = match purpose {
+        ChildAttemptPurpose::ManagedParentContinuation(launch) => Some(launch),
+        ChildAttemptPurpose::Ordinary | ChildAttemptPurpose::ManagedParentInitial => None,
+    };
+    let managed_parent = matches!(
+        purpose,
+        ChildAttemptPurpose::ManagedParentInitial
+            | ChildAttemptPurpose::ManagedParentContinuation(_)
+    );
     let AssignmentExecutionContext {
         index,
         concurrent_mode,
@@ -1872,6 +1964,25 @@ fn prepare_child_attempt<'a>(
         if assignment_launch_runtime(assignment, options, budget_policy) != SupervisorRuntime::Codex
         {
             bail!("continuation preparation requires the verified Codex runtime");
+        }
+    }
+    if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+        if context.execution_runtime != SupervisorExecutionRuntime::Verified
+            || context.execution_target.is_some()
+            || context.evidence_only_reaudit.is_some()
+            || attempt != 1
+            || assignment.role != AgentRole::ChildOrchestrator
+            || assignment.phase != AssignmentPhase::Execution
+            || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+            || assignment.worker_assignments.is_empty()
+        {
+            bail!(
+                "managed parent initial preparation requires a verified execution-phase delegating ChildOrchestrator with authored workers on attempt 1 and no execution target or evidence-only reaudit"
+            );
+        }
+        if assignment_launch_runtime(assignment, options, budget_policy) != SupervisorRuntime::Codex
+        {
+            bail!("managed parent initial preparation requires the verified Codex runtime");
         }
     }
     if let Some(expected) = context.worktree_creation.expected_source_head() {
@@ -1907,7 +2018,7 @@ fn prepare_child_attempt<'a>(
         return Ok(AssignmentExecutionDisposition::Complete);
     }
     let (incoming_name, capture_name) =
-        invocation_scratch_names(*index, attempt, false, *concurrent_mode);
+        invocation_scratch_names(*index, attempt, false, *concurrent_mode || managed_parent);
     let incoming_path = run_dir.join(&incoming_name);
     let capture_path = run_dir.join(&capture_name);
     let attempt_artifacts = child_attempt_artifacts(
@@ -1916,7 +2027,7 @@ fn prepare_child_attempt<'a>(
         &capture_path,
         &assignment.id,
         attempt,
-        max_attempts > 1 || continuation.is_some(),
+        max_attempts > 1 || managed_parent,
     );
     let corrective_retry_used = retry_feedback.is_some();
     let budget_plan = budget_policy.apply(plan);
@@ -1925,7 +2036,7 @@ fn prepare_child_attempt<'a>(
     }
     let launch_runtime = assignment_launch_runtime(assignment, options, budget_policy);
     let nested_worker_runtime = nested_worker_launch_runtime(launch_runtime, budget_policy);
-    let resolved_prompt_plan = (evidence_only_reaudit.is_none() && continuation.is_none())
+    let resolved_prompt_plan = (evidence_only_reaudit.is_none() && !managed_parent)
         .then(|| {
             runtime_resolved_prompt_plan(
                 &budget_plan,
@@ -1936,20 +2047,31 @@ fn prepare_child_attempt<'a>(
             )
         })
         .transpose()?;
-    let continuation_schema = continuation
-        .map(|contract| {
-            let relative = PathBuf::from("schemas").join(format!(
-                "{}-continuation-{attempt}.schema.json",
-                assignment.id
-            ));
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                super::schema_artifacts::write_parent_continuation_schemas(
-                    writer, &relative, contract,
-                )
-            })?;
-            Ok::<_, anyhow::Error>(run_dir.join(relative))
-        })
-        .transpose()?;
+    let continuation_schema = if let Some(contract) = continuation {
+        let relative = PathBuf::from("schemas").join(format!(
+            "{}-continuation-{attempt}.schema.json",
+            assignment.id
+        ));
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            super::schema_artifacts::write_parent_continuation_schemas(writer, &relative, contract)
+        })?;
+        Ok::<_, anyhow::Error>(Some(run_dir.join(relative)))
+    } else if managed_parent {
+        let relative = PathBuf::from("schemas")
+            .join(format!("{}-initial-{attempt}.schema.json", assignment.id));
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            super::schema_artifacts::write_parent_initial_yield_schemas(
+                writer,
+                &relative,
+                options.run_id.as_str(),
+                assignment,
+                attempt,
+            )
+        })?;
+        Ok(Some(run_dir.join(relative)))
+    } else {
+        Ok(None)
+    }?;
     let RenderedPromptWithMeasurements {
         prompt,
         mut measurements,
@@ -1974,6 +2096,30 @@ fn prepare_child_attempt<'a>(
                 },
             },
             contract,
+            field_guide,
+        )?
+    } else if managed_parent {
+        super::prompts::render_managed_parent_initial_prompt(
+            ChildOrchestratorPromptContext {
+                plan: &budget_plan,
+                execution_target: None,
+                assignment,
+                run_dir,
+                worktree,
+                report_path: &attempt_artifacts.report_path,
+                schema_path: continuation_schema
+                    .as_deref()
+                    .context("missing managed parent initial schema")?,
+                worker_schema_path,
+                auditor_schema_path,
+                consultant,
+                claim_context: ChildPromptClaimContext {
+                    claim: &preflight.claim,
+                    semantic_intent_token: preflight.semantic_token,
+                },
+            },
+            options.run_id.as_str(),
+            attempt,
             field_guide,
         )?
     } else if let Some(source) = evidence_only_reaudit {
@@ -2054,7 +2200,7 @@ fn prepare_child_attempt<'a>(
         for worker in assignment
             .worker_assignments
             .iter()
-            .filter(|_| continuation.is_none())
+            .filter(|_| !managed_parent)
         {
             record_field_guide_prompt_injection_strict(
                 artifacts,
@@ -2066,7 +2212,7 @@ fn prepare_child_attempt<'a>(
                 attempt,
             )?;
         }
-        if continuation.is_none() {
+        if !managed_parent {
             record_field_guide_prompt_injection_strict(
                 artifacts,
                 &format!("{}-review-auditor", assignment.id),
@@ -2099,7 +2245,13 @@ fn prepare_child_attempt<'a>(
     };
     // The messaging verifier requires this static appendix at the exact end of
     // the manifested prompt, after source context and any retry instructions.
-    let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
+    let attempt_prompt = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+        crate::external_agent::render_prompt_with_managed_worker_request_tool_appendix(
+            attempt_prompt,
+        )?
+    } else if matches!(purpose, ChildAttemptPurpose::ManagedParentContinuation(_)) {
+        attempt_prompt
+    } else if launch_runtime_binds_assignment_messaging(launch_runtime) {
         crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
             attempt_prompt,
         )?
@@ -2154,7 +2306,7 @@ fn prepare_child_attempt<'a>(
         )?,
     };
     command = bind_runtime_output_schema(command, launch_runtime, &direct_report_schema_path)?;
-    let mut read_only_schemas = if continuation.is_some() {
+    let mut read_only_schemas = if managed_parent {
         vec![direct_report_schema_path.as_path()]
     } else {
         vec![schema_path, worker_schema_path, auditor_schema_path]
@@ -2178,7 +2330,7 @@ fn prepare_child_attempt<'a>(
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
     command = if assignment.role == AgentRole::Researcher {
         configure_researcher_command(command, launch_runtime)?
-    } else if evidence_only_reaudit.is_some() || continuation.is_some() {
+    } else if evidence_only_reaudit.is_some() || managed_parent {
         configure_read_only_auditor_command(command)?
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
@@ -2187,6 +2339,14 @@ fn prepare_child_attempt<'a>(
         command = command.with_read_only_input_file(worktree.path.join(&input.path));
     }
     command.researcher_source_inputs = source_inputs;
+    if managed_parent {
+        command = command.with_codex_native_delegation_disabled();
+        command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+            command.with_codex_managed_worker_requests()
+        } else {
+            command.with_codex_managed_readonly_continuation()
+        };
+    }
     command = command.with_writable_launch_target(match execution_target {
         Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
             crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
@@ -2255,7 +2415,7 @@ fn prepare_child_attempt<'a>(
         })?;
         bail!("descriptor-held invocation scratch roots changed during setup");
     }
-    if evidence_only_reaudit.is_none() && continuation.is_none() {
+    if evidence_only_reaudit.is_none() && !managed_parent {
         let journal_paths = match precreate_worker_execution_journals(assignment, &incoming_scratch)
         {
             Ok(paths) => paths,
@@ -2515,9 +2675,58 @@ struct CollectedChildAttempt<'a> {
     _command: ExternalAgentCommand,
 }
 
+/// Borrowed parent-turn facts the yield and serial Worker path already trust.
+/// Owners stay outside this view: a collected attempt or an inspected attached
+/// capture. Child JSON does not populate it, and it is not a final report.
+#[derive(Clone, Copy)]
+struct ParentTurnObservation<'capture> {
+    external_run: &'capture ExternalAgentRun,
+    command: &'capture ExternalAgentCommand,
+    model_provenance: &'capture CompletedLaunchModelProvenance,
+    primary_integrity_changes: &'capture PrimaryIntegrityChanges,
+    primary_after: &'capture PrimaryWorktreeSnapshot,
+    sandbox_denials: &'capture [SandboxDenialEvidence],
+    pre_action_refusals: &'capture [GateDenial],
+    external_side_effect_state: Option<&'capture ExternalSideEffectState>,
+    environment_blocked: bool,
+    attempt_containment_verified: bool,
+}
+
+impl<'capture> ParentTurnObservation<'capture> {
+    fn from_collected(parent: &'capture CollectedChildAttempt<'_>) -> Self {
+        Self {
+            external_run: &parent.external_run,
+            command: &parent._command,
+            model_provenance: &parent.model_provenance,
+            primary_integrity_changes: &parent.primary_changes,
+            primary_after: &parent._primary_after,
+            sandbox_denials: &parent.sandbox_denials,
+            pre_action_refusals: &parent.pre_action_refusals,
+            external_side_effect_state: parent.external_side_effect_state.as_ref(),
+            environment_blocked: parent.environment_blocked,
+            attempt_containment_verified: parent.attempt_containment_verified,
+        }
+    }
+
+    fn from_inspected(parent: &'capture InspectedAttachedParent<'_>) -> Self {
+        Self {
+            external_run: &parent.external_run,
+            command: &parent.prepared.command,
+            model_provenance: &parent.prepared.model_provenance,
+            primary_integrity_changes: &parent.primary_integrity_changes,
+            primary_after: &parent.primary_after,
+            sandbox_denials: &parent.sandbox_denials,
+            pre_action_refusals: &parent.pre_action_refusals,
+            external_side_effect_state: parent.external_side_effect_state.as_ref(),
+            environment_blocked: parent.environment_blocked,
+            attempt_containment_verified: parent.attempt_containment_verified,
+        }
+    }
+}
+
 /// Internal readiness only: the scheduler/IPC does not construct this driver yet.
-/// A collected supervisor result, never a child report, proves the parent turn
-/// ended. The one-shot permit serializes nested execution even with separate
+/// The observation is supervisor-owned capture state, never a child report.
+/// The one-shot permit serializes nested execution even with separate
 /// outcomes. Shared preflight lets the non-cloneable frozen turn keep its lease
 /// borrow and journal lock; neither that evidence nor shared preflight authorizes
 /// dispatch. The driver owns the permit and exclusively borrows the outcome.
@@ -2527,9 +2736,22 @@ struct NestedWorkerSerialDriver<'turn, 'context, 'writer, 'resources> {
     preflight: &'turn AssignmentExecutionPreflight<'resources>,
     permit: NestedTurnExecutionPermit<'turn, 'resources>,
     outcome: &'turn mut AssignmentExecutionOutcome,
-    parent: &'turn CollectedChildAttempt<'context>,
+    parent: ParentTurnObservation<'turn>,
     parent_attempt: usize,
     parent_admission: AssignmentCommandAdmission,
+}
+
+fn admit_parent_turn_command(
+    authority: AssignmentAttemptAuthority<'_>,
+    subject_id: &str,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+) -> Result<AssignmentCommandAdmission> {
+    if command.workspace_access == WorkspaceAccess::ReadOnly {
+        authority.admit_managed_parent_read_only(subject_id, command, runtime)
+    } else {
+        authority.admit(subject_id, command, runtime)
+    }
 }
 
 #[allow(dead_code)]
@@ -2543,6 +2765,38 @@ impl<'turn, 'context, 'writer, 'resources>
         parent_attempt: usize,
         parent: &'turn CollectedChildAttempt<'context>,
     ) -> Result<Self> {
+        Self::from_observation(
+            context,
+            preflight,
+            outcome,
+            parent_attempt,
+            ParentTurnObservation::from_collected(parent),
+        )
+    }
+
+    fn from_inspected_parent(
+        context: &'turn AssignmentExecutionContext<'context, 'writer>,
+        preflight: &'turn AssignmentExecutionPreflight<'resources>,
+        outcome: &'turn mut AssignmentExecutionOutcome,
+        parent_attempt: usize,
+        parent: &'turn InspectedAttachedParent<'_>,
+    ) -> Result<Self> {
+        Self::from_observation(
+            context,
+            preflight,
+            outcome,
+            parent_attempt,
+            ParentTurnObservation::from_inspected(parent),
+        )
+    }
+
+    fn from_observation(
+        context: &'turn AssignmentExecutionContext<'context, 'writer>,
+        preflight: &'turn AssignmentExecutionPreflight<'resources>,
+        outcome: &'turn mut AssignmentExecutionOutcome,
+        parent_attempt: usize,
+        parent: ParentTurnObservation<'turn>,
+    ) -> Result<Self> {
         let permit = preflight.issue_nested_turn(parent_attempt)?;
         if context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
@@ -2552,13 +2806,13 @@ impl<'turn, 'context, 'writer, 'resources>
         {
             bail!("nested serial handoff requires a verified managed Codex parent attempt");
         }
-        Self::verify_parent_quiescence(parent, preflight)?;
-        let parent_admission =
-            AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?.admit(
-                &preflight.assignment.id,
-                &parent._command,
-                parent.model_provenance.launch_runtime,
-            )?;
+        Self::verify_parent_quiescence(&parent, preflight)?;
+        let parent_admission = admit_parent_turn_command(
+            AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?,
+            &preflight.assignment.id,
+            parent.command,
+            parent.model_provenance.launch_runtime,
+        )?;
         Ok(Self {
             context,
             preflight,
@@ -2571,10 +2825,10 @@ impl<'turn, 'context, 'writer, 'resources>
     }
 
     fn verify_parent_quiescence(
-        parent: &CollectedChildAttempt<'_>,
+        parent: &ParentTurnObservation<'_>,
         preflight: &AssignmentExecutionPreflight<'_>,
     ) -> Result<()> {
-        let run = &parent.external_run;
+        let run = parent.external_run;
         // scratch_quiescence_verified alone also accepts a never-started target.
         // Require live runner evidence of a completed, contained parent process.
         // The held capture is not serialized: restored public reports cannot
@@ -2585,8 +2839,8 @@ impl<'turn, 'context, 'writer, 'resources>
             || !external_process_completed(run, parent.model_provenance.launch_runtime)
             || !parent.attempt_containment_verified
             || run.cwd != preflight.worktree.path
-            || !parent.primary_changes.is_empty()
-            || parent._primary_after.inspection_problem().is_some()
+            || !parent.primary_integrity_changes.is_empty()
+            || parent.primary_after.inspection_problem().is_some()
             || !parent.sandbox_denials.is_empty()
             || !parent.pre_action_refusals.is_empty()
             || parent.external_side_effect_state.is_some()
@@ -2603,7 +2857,7 @@ impl<'turn, 'context, 'writer, 'resources>
         worker_id: &str,
         current_budget_policy: &AssignmentBudgetPolicy,
     ) -> Result<nested_worker_executor::NestedWorkerAttemptEvidence> {
-        Self::verify_parent_quiescence(self.parent, self.preflight)?;
+        Self::verify_parent_quiescence(&self.parent, self.preflight)?;
         self.parent_admission.revalidate(
             &AssignmentAttemptAuthority::from_preflight(
                 self.context,
@@ -2611,7 +2865,7 @@ impl<'turn, 'context, 'writer, 'resources>
                 self.parent_attempt,
             )?,
             &self.preflight.assignment.id,
-            &self.parent._command,
+            self.parent.command,
         )?;
         // Reborrow the existing context with this turn's policy. The initial
         // assignment policy may be stale after retry/runtime/model reselection.
@@ -2803,6 +3057,27 @@ fn bind_assignment_messaging_for_external_child_launch(
     *command = command.clone().with_assignment_messaging(server.launch());
     command.verify_assignment_messaging_protocol_instructions()?;
     Ok(server)
+}
+
+fn bind_assignment_messaging_unless_managed_readonly<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    task_id: &str,
+    command: &mut ExternalAgentCommand,
+) -> Result<Option<crate::messaging::transport::AssignmentMessagingServer>> {
+    if command.codex_managed_readonly_continuation_enabled()
+        || command.codex_managed_worker_requests_enabled()
+    {
+        if command.codex_managed_worker_requests_enabled()
+            && command.assignment_messaging_launch().is_none()
+        {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
+        command.verify_assignment_messaging_protocol_instructions()?;
+        return Ok(None);
+    }
+    Ok(Some(bind_assignment_messaging_for_external_child_launch(
+        context, task_id, command,
+    )?))
 }
 
 impl ManagedChildMaterializationGate {
@@ -3002,7 +3277,7 @@ fn dispatch_and_capture_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
                 context,
                 &assignment.id,
                 &mut command,
@@ -3057,7 +3332,7 @@ fn dispatch_and_capture_child_attempt<'a>(
                 return Err(error);
             }
             record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_for_external_child_launch(
+            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
                 context,
                 &assignment.id,
                 &mut command,
@@ -3085,70 +3360,98 @@ fn dispatch_and_capture_child_attempt<'a>(
             )
         }
     };
-    record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt)?;
-    let external_run = match external_run_result {
-        Ok(run) => run,
-        Err(error) => {
-            budget_reservation.settle_not_started()?;
-            drop(incoming_output_root);
-            drop(capture_output_root);
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-            })?;
-            return Err(error).context("failed to produce deterministic child output");
+    // Retain returned continuation bytes before checkpoints, settlement diagnostics,
+    // or envelope validation can return early. This does not authorize or clean scratch.
+    let returned_evidence = match &external_run_result {
+        Ok(run) if command.codex_managed_readonly_continuation_enabled() => {
+            let imported = preserve_returned_parent_evidence(
+                context,
+                &attempt_artifacts,
+                &command,
+                launch_runtime,
+                run,
+            );
+            if !run.scratch_quiescence_verified() {
+                // All capture, scratch and reservation owners remain in this frame.
+                // As with an attached initial parent, do not detach a possibly live writer.
+                eprintln!(
+                    "fatal: managed continuation returned without verified scratch quiescence; evidence import: {imported:?}"
+                );
+                std::process::abort();
+            }
+            imported
         }
+        _ => Ok(()),
     };
-    let environment_blocked = external_run.environment_blocked();
-    let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
-    match usage_settlement.role_sample(assignment.role, None) {
-        Some(sample) => {
-            let usage = sample.usage;
-            outcome.usage_samples.push(sample);
-            record_and_persist_live_invocation(
-                artifacts,
-                LiveInvocationObservation {
-                    run_id: options.run_id.as_str(),
-                    assignment_id: &assignment.id,
-                    attempt,
-                    role: assignment.role,
-                    runtime: launch_runtime,
-                    model: command.model.as_deref(),
-                    effort: command.reasoning_effort.as_deref(),
-                    worktree_id: &worktree.name,
-                    usage: Some(&usage),
-                    duration_ms: Some(external_run.duration_ms),
-                    started_at_unix_millis: live_invocation_started_millis(
-                        external_run.duration_ms,
-                    ),
-                },
-            )?;
+    // A completion checkpoint failure must not replace observed usage with the
+    // reservation's Missing-on-drop fallback. Retain it until settlement is attempted.
+    let completion_checkpoint =
+        record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt);
+    let captured_result = (|| {
+        let external_run = match external_run_result {
+            Ok(run) => run,
+            Err(error) => {
+                budget_reservation.settle_not_started()?;
+                drop(incoming_output_root);
+                drop(capture_output_root);
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                })?;
+                return Err(error).context("failed to produce deterministic child output");
+            }
+        };
+        let environment_blocked = external_run.environment_blocked();
+        let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
+        match usage_settlement.role_sample(assignment.role, None) {
+            Some(sample) => {
+                let usage = sample.usage;
+                outcome.usage_samples.push(sample);
+                record_and_persist_live_invocation(
+                    artifacts,
+                    LiveInvocationObservation {
+                        run_id: options.run_id.as_str(),
+                        assignment_id: &assignment.id,
+                        attempt,
+                        role: assignment.role,
+                        runtime: launch_runtime,
+                        model: command.model.as_deref(),
+                        effort: command.reasoning_effort.as_deref(),
+                        worktree_id: &worktree.name,
+                        usage: Some(&usage),
+                        duration_ms: Some(external_run.duration_ms),
+                        started_at_unix_millis: live_invocation_started_millis(
+                            external_run.duration_ms,
+                        ),
+                    },
+                )?;
+            }
+            None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+            None => {}
         }
-        None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
-        None => {}
-    }
-    drop(incoming_output_root);
-    drop(capture_output_root);
-    let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
-    record_shared_orchestration_event(
-        artifacts,
-        &assignment.id,
-        Some(journal_parent_id),
-        assignment_journal_role,
-        OrchestrationEventKind::Status,
-        lifecycle_event_payload(
-            if external_process_completed(&external_run, launch_runtime) {
-                "completed"
-            } else {
-                "failed"
-            },
-            Some(attempt),
-            child_thread_id.as_deref(),
-        ),
-    )?;
-    let attempt_containment_verified = external_containment_verified(&external_run, launch_runtime);
-    if !attempt_containment_verified {
-        outcome.external_containment_failed = true;
-        outcome.findings.push(Finding {
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+        record_shared_orchestration_event(
+            artifacts,
+            &assignment.id,
+            Some(journal_parent_id),
+            assignment_journal_role,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload(
+                if external_process_completed(&external_run, launch_runtime) {
+                    "completed"
+                } else {
+                    "failed"
+                },
+                Some(attempt),
+                child_thread_id.as_deref(),
+            ),
+        )?;
+        let attempt_containment_verified =
+            external_containment_verified(&external_run, launch_runtime);
+        if !attempt_containment_verified {
+            outcome.external_containment_failed = true;
+            outcome.findings.push(Finding {
             severity: FindingSeverity::Error,
             message: format!(
                 "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
@@ -3158,29 +3461,938 @@ fn dispatch_and_capture_child_attempt<'a>(
             ),
             paths: vec![attempt_artifacts.raw_report_relative.clone()],
         });
+        }
+        outcome
+            .command_records
+            .push(command_record_from_external_for_runtime(
+                &external_run,
+                &command,
+                launch_runtime,
+            ));
+        Ok(CapturedChildAttempt {
+            attempt_artifacts,
+            corrective_retry_used,
+            model_provenance,
+            external_run,
+            command,
+            primary_before,
+            primary_scope_before,
+            incoming_scratch,
+            capture_scratch,
+            budget_reservation,
+            launch_runtime,
+            environment_blocked,
+            attempt_containment_verified,
+        })
+    })();
+    let captured_result = match (captured_result, completion_checkpoint) {
+        (result, Ok(())) => result,
+        (Ok(_capture), Err(error)) => Err(error),
+        (Err(error), Err(checkpoint_error)) => Err(error).context(format!(
+            "child post-return dispatch checkpoint also failed: {checkpoint_error:#}"
+        )),
+    };
+    match (captured_result, returned_evidence) {
+        (result, Ok(())) => result,
+        (Ok(_capture), Err(error)) => Err(error),
+        (Err(error), Err(import_error)) => Err(error).context(format!(
+            "managed parent returned evidence import also failed: {import_error:#}"
+        )),
+    }
+}
+
+// Copy only descriptor-held observations into private artifacts. Do not read the
+// response path, validate its report, discard scratch, or settle usage here.
+fn preserve_returned_parent_evidence(
+    context: &AssignmentExecutionContext<'_, '_>,
+    artifacts: &ChildAttemptArtifacts,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    run: &ExternalAgentRun,
+) -> Result<()> {
+    with_supervisor_artifacts(context.artifacts, |writer, _| {
+        let bytes = run.stdout_bytes();
+        if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+            bail!("descriptor-held parent stdout exceeds its configured byte limit");
+        }
+        writer.write_bytes(
+            &artifacts.raw_stdout_relative,
+            bytes,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        write_artifact_json(
+            writer,
+            &artifacts.command_record_relative,
+            &command_record_from_external_for_runtime(run, command, runtime),
+            MAX_SUPERVISOR_REPORT_BYTES,
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        Ok(())
+    })
+    .context("managed parent returned evidence import failed")
+}
+
+const MAX_ATTACHED_PARENT_DIAGNOSTICS: usize = 16;
+const MAX_ATTACHED_PARENT_DIAGNOSTIC_CHARS: usize = 1024;
+
+/// Attached-parent dispatch owners. This is not an ordinary capture: nothing converts it
+/// into [`CapturedChildAttempt`], and quiescence text here does not authorize nested dispatch.
+/// The endpoint turn already borrows the preflight lease and claim. This helper does not borrow
+/// a new lease and does not itself keep that preflight alive; the production caller must.
+#[allow(dead_code)]
+struct AttachedParentCapture<'budget, 'turn> {
+    prepared: PreparedChildAttempt<'budget>,
+    endpoint: WorkerInboxShutdown<'turn>,
+    external_run: Option<ExternalAgentRun>,
+    diagnostics: Vec<String>,
+}
+
+#[allow(dead_code)]
+fn push_attached_parent_diagnostic(diagnostics: &mut Vec<String>, message: impl Into<String>) {
+    if diagnostics.len() >= MAX_ATTACHED_PARENT_DIAGNOSTICS {
+        return;
+    }
+    let mut message = message.into();
+    if message.chars().count() > MAX_ATTACHED_PARENT_DIAGNOSTIC_CHARS {
+        message = message
+            .chars()
+            .take(MAX_ATTACHED_PARENT_DIAGNOSTIC_CHARS)
+            .collect();
+    }
+    diagnostics.push(message);
+}
+
+#[allow(dead_code)]
+fn attached_parent_runner_panic_diagnostic(payload: &(dyn std::any::Any + Send)) -> String {
+    let detail = if let Some(message) = payload.downcast_ref::<&str>() {
+        (*message).to_string()
+    } else if let Some(message) = payload.downcast_ref::<String>() {
+        message.clone()
+    } else {
+        "unspecified panic payload".to_string()
+    };
+    format!("attached parent runner panicked: {detail}")
+}
+
+/// Pre-invocation only. A reservation already marked invoked must stay in the capture.
+#[allow(dead_code)]
+fn abandon_unstarted_attached_parent<'a>(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    prepared: PreparedChildAttempt<'a>,
+) -> Result<()> {
+    let PreparedChildAttempt {
+        incoming_scratch,
+        capture_scratch,
+        incoming_output_root,
+        capture_output_root,
+        mut budget_reservation,
+        ..
+    } = prepared;
+    budget_reservation.settle_not_started()?;
+    drop(incoming_output_root);
+    drop(capture_output_root);
+    with_supervisor_artifacts(artifacts, |writer, _| {
+        discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+    })?;
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn require_attached_parent_dispatch<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    prepared: &PreparedChildAttempt<'a>,
+) -> Result<()> {
+    if context.execution_runtime != SupervisorExecutionRuntime::Verified
+        || context.execution_target.is_some()
+        || context.evidence_only_reaudit.is_some()
+        || preflight.assignment.role != AgentRole::ChildOrchestrator
+        || preflight.assignment.phase != AssignmentPhase::Execution
+        || preflight.assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+        || prepared.launch_runtime != SupervisorRuntime::Codex
+        || prepared.model_provenance.launch_runtime != SupervisorRuntime::Codex
+        || preflight.assignment.worker_assignments.is_empty()
+    {
+        bail!(
+            "attached parent dispatch requires verified Codex execution of a delegating child orchestrator in the execution phase with authored worker assignments and no execution target or evidence-only reaudit"
+        );
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn note_attached_endpoint_shutdown(
+    diagnostics: &mut Vec<String>,
+    shutdown: &WorkerInboxShutdown<'_>,
+    run_directory: &Path,
+    launch: Option<&crate::messaging::transport::AssignmentMessagingLaunch>,
+) {
+    if let WorkerInboxShutdown::Rejected(rejected) = shutdown {
+        push_attached_parent_diagnostic(
+            diagnostics,
+            format!(
+                "attached parent inbox shutdown rejected: {}",
+                rejected.reason()
+            ),
+        );
+    }
+    let Some(launch) = launch else {
+        push_attached_parent_diagnostic(
+            diagnostics,
+            "attached parent command is missing the inbox endpoint launch",
+        );
+        return;
+    };
+    let verified = match shutdown {
+        WorkerInboxShutdown::Frozen(frozen) => frozen.verify_parent_launch(run_directory, launch),
+        WorkerInboxShutdown::Rejected(rejected) => {
+            rejected.verify_parent_launch(run_directory, launch)
+        }
+    };
+    if let Err(error) = verified {
+        push_attached_parent_diagnostic(
+            diagnostics,
+            format!("attached parent inbox launch verification failed: {error:#}"),
+        );
+    }
+}
+
+#[allow(dead_code)]
+fn attached_parent_quiescence_refusal(
+    run: &ExternalAgentRun,
+    launch_runtime: SupervisorRuntime,
+    worktree: &Path,
+) -> Option<String> {
+    let mut reasons = Vec::new();
+    if !run.stdout.target_launch_attempted {
+        reasons.push("target launch was not attempted");
+    }
+    if !run.scratch_quiescence_verified() {
+        reasons.push("scratch quiescence was not verified");
+    }
+    if !external_process_completed(run, launch_runtime) {
+        reasons.push("external process did not complete");
+    }
+    if !external_containment_verified(run, launch_runtime) {
+        reasons.push("external containment was not verified");
+    }
+    if run.cwd != worktree {
+        reasons.push("cwd is not the assignment worktree");
+    }
+    if reasons.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "attached parent quiescence refused: {}",
+            reasons.join("; ")
+        ))
+    }
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn observe_returned_attached_parent_run<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    assignment_journal_role: OrchestrationRole,
+    prepared: &mut PreparedChildAttempt<'a>,
+    external_run: &ExternalAgentRun,
+    diagnostics: &mut Vec<String>,
+) {
+    let assignment = &preflight.assignment;
+    if let Err(error) =
+        record_dispatch_checkpoint(context.artifacts, false, true, &assignment.id, attempt)
+    {
+        push_attached_parent_diagnostic(
+            diagnostics,
+            format!("attached parent post-return dispatch checkpoint failed: {error:#}"),
+        );
+    }
+    match prepared
+        .budget_reservation
+        .settle_bound_runtime(external_run, &prepared.command)
+    {
+        Ok(usage_settlement) => match usage_settlement.role_sample(assignment.role, None) {
+            Some(sample) => {
+                let usage = sample.usage;
+                let observed_model = sample.model.clone();
+                outcome.usage_samples.push(sample);
+                if let Err(error) = record_and_persist_live_invocation(
+                    context.artifacts,
+                    LiveInvocationObservation {
+                        run_id: context.options.run_id.as_str(),
+                        assignment_id: &assignment.id,
+                        attempt,
+                        role: assignment.role,
+                        runtime: prepared.launch_runtime,
+                        model: observed_model.as_deref(),
+                        effort: prepared.command.reasoning_effort.as_deref(),
+                        worktree_id: &preflight.worktree.name,
+                        usage: Some(&usage),
+                        duration_ms: Some(external_run.duration_ms),
+                        started_at_unix_millis: live_invocation_started_millis(
+                            external_run.duration_ms,
+                        ),
+                    },
+                ) {
+                    outcome.usage_incomplete = true;
+                    push_attached_parent_diagnostic(
+                        diagnostics,
+                        format!("attached parent live invocation persistence failed: {error:#}"),
+                    );
+                }
+            }
+            None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+            None => {}
+        },
+        Err(error) => {
+            outcome.usage_incomplete = true;
+            push_attached_parent_diagnostic(
+                diagnostics,
+                format!("attached parent usage settlement failed: {error:#}"),
+            );
+        }
+    }
+    let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+    if let Err(error) = record_shared_orchestration_event(
+        context.artifacts,
+        &assignment.id,
+        Some(journal_parent_id),
+        assignment_journal_role,
+        OrchestrationEventKind::Status,
+        lifecycle_event_payload(
+            if external_process_completed(external_run, prepared.launch_runtime) {
+                "completed"
+            } else {
+                "failed"
+            },
+            Some(attempt),
+            child_thread_id.as_deref(),
+        ),
+    ) {
+        push_attached_parent_diagnostic(
+            diagnostics,
+            format!("attached parent lifecycle event failed: {error:#}"),
+        );
+    }
+    if !external_containment_verified(external_run, prepared.launch_runtime) {
+        outcome.external_containment_failed = true;
+        outcome.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
+                assignment.id,
+                (external_run.process_tree, external_run.side_effects),
+                prepared.attempt_artifacts.raw_report_relative.display()
+            ),
+            paths: vec![prepared.attempt_artifacts.raw_report_relative.clone()],
+        });
     }
     outcome
         .command_records
         .push(command_record_from_external_for_runtime(
-            &external_run,
-            &command,
-            launch_runtime,
+            external_run,
+            &prepared.command,
+            prepared.launch_runtime,
         ));
-    Ok(CapturedChildAttempt {
-        attempt_artifacts,
-        corrective_retry_used,
-        model_provenance,
+    if let Some(refusal) = attached_parent_quiescence_refusal(
         external_run,
-        command,
-        primary_before,
-        primary_scope_before,
-        incoming_scratch,
-        capture_scratch,
-        budget_reservation,
-        launch_runtime,
-        environment_blocked,
-        attempt_containment_verified,
+        prepared.launch_runtime,
+        &preflight.worktree.path,
+    ) {
+        push_attached_parent_diagnostic(diagnostics, refusal);
+    }
+}
+
+#[allow(dead_code, clippy::too_many_arguments)]
+fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
+    context: &AssignmentExecutionContext<'budget, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    mut prepared: PreparedChildAttempt<'budget>,
+    endpoint: WorkerInboxEndpoint<'turn>,
+) -> Result<AttachedParentCapture<'budget, 'turn>> {
+    if let Err(error) = require_attached_parent_dispatch(context, preflight, &prepared) {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+    let cancellation = preflight.managed_process_cancellation.cancellation();
+    let assignment = &preflight.assignment;
+    if let Some(admission) = &prepared.command_admission {
+        let result = AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)
+            .and_then(|authority| {
+                admission.revalidate(&authority, &assignment.id, &prepared.command)
+            });
+        if let Err(error) = result {
+            abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+            return Err(error);
+        }
+    }
+    if let Some(expected) = context.worktree_creation.expected_source_head() {
+        match current_head_oid(&preflight.worktree.path) {
+            Ok(observed) if observed == expected => {}
+            Ok(observed) => {
+                abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+                refuse_source_head_execution_base(
+                    outcome,
+                    context.artifacts,
+                    assignment,
+                    journal_parent_id,
+                    expected,
+                    observed,
+                )?;
+                bail!(
+                    "source_head_not_execution_base: authenticated PR head differs from the leased child HEAD immediately before invocation"
+                );
+            }
+            Err(error) => {
+                abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+                return Err(error);
+            }
+        }
+    }
+    let assignment_journal_role = match direct_assignment_orchestration_role(assignment.role) {
+        Ok(role) => role,
+        Err(error) => {
+            abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+            return Err(error);
+        }
+    };
+    let journaled = (|| -> Result<()> {
+        record_shared_orchestration_event(
+            context.artifacts,
+            &assignment.id,
+            Some(journal_parent_id),
+            assignment_journal_role,
+            OrchestrationEventKind::Spawn,
+            record_supervision_spawn_payload_with_category(
+                &assignment.id,
+                journal_parent_id,
+                assignment_journal_role,
+                assignment.role,
+                assignment.category_override(),
+                write_boundary_refs(&assignment.assigned_paths),
+                &assignment_scope_ref(&assignment.id),
+                json!({
+                    "attempt": attempt,
+                    "corrective_retry": prepared.corrective_retry_used,
+                    "runtime": prepared.launch_runtime,
+                    "model": prepared.command.model.as_deref(),
+                    "mechanical_duty": direct_worker_mechanical_duty(
+                        assignment,
+                        context.assignment_metadata,
+                    )
+                    .map(MechanicalTerminalDuty::as_str),
+                }),
+            )?,
+        )?;
+        if attempt == 1 {
+            let (owner_role, owner_legacy_role) =
+                if journal_parent_id == context.options.run_id.as_str() {
+                    (OrchestrationRole::Supervisor, "supervisor")
+                } else {
+                    (OrchestrationRole::Orchestrator, "child_orchestrator")
+                };
+            record_shared_gate_ownership(
+                context.artifacts,
+                journal_parent_id,
+                None,
+                owner_role,
+                GateOwnershipRecord::assign(
+                    &assignment.id,
+                    journal_parent_id,
+                    owner_role,
+                    owner_legacy_role,
+                    "initial_parent_gate",
+                )?,
+            )?;
+        }
+        record_shared_orchestration_event(
+            context.artifacts,
+            &assignment.id,
+            Some(journal_parent_id),
+            OrchestrationRole::Orchestrator,
+            OrchestrationEventKind::Status,
+            lifecycle_event_payload("running", Some(attempt), None),
+        )?;
+        Ok(())
+    })();
+    if let Err(error) = journaled {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+    if let Some(authority) = &context.assignment_metadata.parent_validation {
+        match authority.admit(&assignment.id, cancellation) {
+            Ok(remaining) => prepared.command.timeout = prepared.command.timeout.min(remaining),
+            Err(error) => {
+                abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+                return Err(error);
+            }
+        }
+    }
+    let messaging_bound = (|| -> Result<()> {
+        let launch = endpoint.launch();
+        let command = prepared
+            .command
+            .clone()
+            .with_assignment_messaging(launch.clone());
+        command.verify_assignment_messaging_protocol_instructions()?;
+        if command.assignment_messaging_launch() != Some(&launch) {
+            bail!("parent command did not use this frozen inbox endpoint");
+        }
+        launch.environment_for(context.options.run_id.as_str(), &assignment.id)?;
+        prepared.command = command;
+        Ok(())
+    })();
+    if let Err(error) = messaging_bound {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+    if let Err(error) = super::runtime_executables::validate_launch(&prepared.command) {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+    if let Err(error) =
+        record_dispatch_checkpoint(context.artifacts, false, false, &assignment.id, attempt)
+    {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+    if let Err(error) = prepared
+        .budget_reservation
+        .mark_invoked_for_runtime(prepared.launch_runtime)
+    {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        return Err(error);
+    }
+
+    let external_runner = context.external_runner;
+    let artifacts = context.artifacts;
+    let run_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let review_context = if requires_hosted_pre_action_review(&prepared.command) {
+            prepared.pre_action_review_context.as_ref()
+        } else {
+            None
+        };
+        if let Some(review_context) = review_context.as_ref() {
+            let mut review_journal = SupervisorPreActionJournalSink {
+                artifacts,
+                node: &assignment.id,
+                parent: Some(journal_parent_id),
+            };
+            external_runner(
+                &prepared.command,
+                cancellation,
+                Some(ExternalPreActionReviewRuntime {
+                    context: review_context,
+                    journal: &mut review_journal,
+                }),
+            )
+        } else {
+            external_runner(&prepared.command, cancellation, None)
+        }
+    }));
+    let shutdown = endpoint.shutdown_retaining();
+    let mut diagnostics = Vec::new();
+    note_attached_endpoint_shutdown(
+        &mut diagnostics,
+        &shutdown,
+        context.run_dir,
+        prepared.command.assignment_messaging_launch(),
+    );
+    let external_run = match run_result {
+        Ok(run) => {
+            if let Err(error) = preserve_returned_parent_evidence(
+                context,
+                &prepared.attempt_artifacts,
+                &prepared.command,
+                prepared.launch_runtime,
+                &run,
+            ) {
+                // Inspection refuses diagnostics, but settlement still runs exactly once.
+                push_attached_parent_diagnostic(&mut diagnostics, format!("{error:#}"));
+            }
+            observe_returned_attached_parent_run(
+                context,
+                outcome,
+                preflight,
+                journal_parent_id,
+                attempt,
+                assignment_journal_role,
+                &mut prepared,
+                &run,
+                &mut diagnostics,
+            );
+            Some(run)
+        }
+        Err(payload) => {
+            outcome.usage_incomplete = true;
+            outcome.external_containment_failed = true;
+            push_attached_parent_diagnostic(
+                &mut diagnostics,
+                attached_parent_runner_panic_diagnostic(payload.as_ref()),
+            );
+            None
+        }
+    };
+    Ok(AttachedParentCapture {
+        prepared,
+        endpoint: shutdown,
+        external_run,
+        diagnostics,
     })
+}
+
+/// Supervisor-observed attached parent. This is still not an ordinary collection:
+/// it owns the prepared attempt and returned run, not a review report or journal import.
+#[allow(dead_code)]
+struct InspectedAttachedParent<'budget> {
+    prepared: PreparedChildAttempt<'budget>,
+    external_run: ExternalAgentRun,
+    primary_after: PrimaryWorktreeSnapshot,
+    primary_integrity_changes: PrimaryIntegrityChanges,
+    sandbox_denials: Vec<SandboxDenialEvidence>,
+    pre_action_refusals: Vec<GateDenial>,
+    external_side_effect_state: Option<ExternalSideEffectState>,
+    environment_blocked: bool,
+    attempt_containment_verified: bool,
+}
+
+/// Ready evidence keeps the original frozen inbox. Refusal keeps the original capture.
+#[allow(dead_code)]
+enum AttachedParentInspection<'budget, 'turn> {
+    Ready {
+        parent: Box<InspectedAttachedParent<'budget>>,
+        frozen: Box<FrozenWorkerInbox<'turn>>,
+    },
+    Refused(Box<AttachedParentCapture<'budget, 'turn>>),
+}
+
+fn refuse_attached_parent_inspection<'budget, 'turn>(
+    mut capture: AttachedParentCapture<'budget, 'turn>,
+    diagnostic: impl Into<String>,
+) -> AttachedParentInspection<'budget, 'turn> {
+    push_attached_parent_diagnostic(&mut capture.diagnostics, diagnostic);
+    AttachedParentInspection::Refused(Box::new(capture))
+}
+
+fn attached_parent_inspection_snapshot<'budget, 'turn>(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    capture: &AttachedParentCapture<'budget, 'turn>,
+) -> Result<PrimaryWorktreeSnapshot, String> {
+    if !capture.diagnostics.is_empty() {
+        return Err("attached parent inspection refused existing capture diagnostics".to_string());
+    }
+    let Some(run) = capture.external_run.as_ref() else {
+        return Err("attached parent inspection refused a missing returned run".to_string());
+    };
+    let WorkerInboxShutdown::Frozen(frozen) = &capture.endpoint else {
+        return Err("attached parent inspection refused a rejected inbox endpoint".to_string());
+    };
+    let Some(launch) = capture.prepared.command.assignment_messaging_launch() else {
+        return Err(
+            "attached parent inspection refused a missing inbox endpoint launch".to_string(),
+        );
+    };
+    if let Err(error) = frozen.verify_parent_launch(context.run_dir, launch) {
+        return Err(format!(
+            "attached parent inspection refused inbox launch verification: {error:#}"
+        ));
+    }
+    if let Some(refusal) = attached_parent_quiescence_refusal(
+        run,
+        capture.prepared.model_provenance.launch_runtime,
+        &preflight.worktree.path,
+    ) {
+        return Err(refusal);
+    }
+    if run.output_last_message().is_none() {
+        return Err(
+            "attached parent inspection refused missing descriptor-captured output".to_string(),
+        );
+    }
+    if run.environment_blocked() {
+        return Err("attached parent inspection refused an environment block".to_string());
+    }
+    if !run.sandbox_denials().is_empty() {
+        return Err("attached parent inspection refused sandbox denials".to_string());
+    }
+    if !run.gate_denials().is_empty() {
+        return Err("attached parent inspection refused gate denials".to_string());
+    }
+    if run.external_side_effect_state().is_some() {
+        return Err("attached parent inspection refused external side effects".to_string());
+    }
+    match primary_worktree_snapshot(context.repo, context.execution_runtime) {
+        Ok(snapshot) if snapshot.inspection_problem().is_some() => {
+            Err("attached parent inspection refused an incomplete primary snapshot".to_string())
+        }
+        Ok(snapshot) => Ok(snapshot),
+        Err(error) => Err(format!(
+            "attached parent inspection failed to capture the primary snapshot: {error:#}"
+        )),
+    }
+}
+
+/// Inspect a retained attached capture. Refusal always returns that capture.
+/// Success moves the prepared attempt, returned run, and frozen inbox; it does
+/// not collect an ordinary report or materialize Git.
+#[allow(dead_code)]
+fn inspect_attached_parent_capture<'budget, 'turn>(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    capture: AttachedParentCapture<'budget, 'turn>,
+) -> AttachedParentInspection<'budget, 'turn> {
+    let primary_after = match attached_parent_inspection_snapshot(context, preflight, &capture) {
+        Ok(snapshot) => snapshot,
+        Err(diagnostic) => return refuse_attached_parent_inspection(capture, diagnostic),
+    };
+    let primary_integrity_changes =
+        primary_integrity_changes(&capture.prepared.primary_before, &primary_after);
+    if !primary_integrity_changes.is_empty() {
+        return refuse_attached_parent_inspection(
+            capture,
+            "attached parent inspection refused primary integrity changes",
+        );
+    }
+    let AttachedParentCapture {
+        prepared,
+        endpoint,
+        external_run,
+        diagnostics: _,
+    } = capture;
+    let external_run = match external_run {
+        Some(run) => run,
+        None => unreachable!("missing returned run already refused"),
+    };
+    let WorkerInboxShutdown::Frozen(frozen) = endpoint else {
+        unreachable!("rejected inbox endpoint is refused before the capture is moved");
+    };
+    let sandbox_denials = external_run.sandbox_denials().to_vec();
+    let (pre_action_refusals, _other_gate_denials): (Vec<_>, Vec<_>) = external_run
+        .gate_denials()
+        .iter()
+        .cloned()
+        .partition(is_child_pre_action_refusal);
+    let external_side_effect_state = external_run.external_side_effect_state();
+    let environment_blocked = external_run.environment_blocked();
+    let attempt_containment_verified =
+        external_containment_verified(&external_run, prepared.model_provenance.launch_runtime);
+    AttachedParentInspection::Ready {
+        parent: Box::new(InspectedAttachedParent {
+            prepared,
+            external_run,
+            primary_after,
+            primary_integrity_changes,
+            sandbox_denials,
+            pre_action_refusals,
+            external_side_effect_state,
+            environment_blocked,
+            attempt_containment_verified,
+        }),
+        frozen,
+    }
+}
+
+/// Trusted journals and the pre-materialization candidate are cloned or borrowed
+/// data. The completed-evidence owner stays borrowed by `expected_candidate`.
+struct ManagedParentCollection {
+    parsed: ParsedReport<OrchestratorReviewReport>,
+    journals: WorkerExecutionJournalEvidenceSet,
+    expected_candidate: PrimaryWorktreeSnapshot,
+    /// Set only after bound worker evidence revalidates. Never taken from parent JSON.
+    authorizes_materialization: bool,
+}
+
+/// Validated final parent held until initial evidence import succeeds.
+/// Construction stays inside preparation; this value is not deserialized.
+struct PreparedManagedParentFinal<'budget> {
+    captured: CapturedChildAttempt<'budget>,
+    collection: ManagedParentCollection,
+}
+
+fn revalidate_managed_parent_final<'evidence>(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    continuation: &ParentContinuationLaunch<'_>,
+    completed: &'evidence bound_parent_turn::BoundNestedWorkerEvidence<'_, '_>,
+    source_attempt: usize,
+    current: &WorkerInboxTurn<'_>,
+) -> Result<(
+    super::messaging_bridge::worker_requests::frozen::FrozenWorkerInboxView<'evidence>,
+    &'evidence [bound_parent_turn::BoundWorkerResult],
+)> {
+    let next_attempt = continuation.binding().3;
+    continuation.revalidate(context, preflight, next_attempt)?;
+    completed.revalidate(context, preflight, source_attempt, current)
+}
+
+fn require_managed_parent_final_capture(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: &CapturedChildAttempt<'_>,
+) -> Result<()> {
+    let command = &captured.command;
+    if preflight.assignment.role != AgentRole::ChildOrchestrator
+        || captured.launch_runtime != SupervisorRuntime::Codex
+        || captured.model_provenance.launch_runtime != SupervisorRuntime::Codex
+        || command.workspace_access != WorkspaceAccess::ReadOnly
+        || !command.codex_native_delegation_is_disabled()
+    {
+        bail!(
+            "managed parent final collection requires a read-only Codex child_orchestrator command with native delegation disabled"
+        );
+    }
+    if let Some(refusal) = attached_parent_quiescence_refusal(
+        &captured.external_run,
+        captured.launch_runtime,
+        &preflight.worktree.path,
+    ) {
+        bail!(refusal);
+    }
+    if captured.environment_blocked
+        || captured.external_run.environment_blocked()
+        || !captured.external_run.sandbox_denials().is_empty()
+        || !captured.external_run.gate_denials().is_empty()
+        || captured.external_run.external_side_effect_state().is_some()
+    {
+        bail!(
+            "managed parent final collection refused gate, sandbox, environment, or external-effect evidence"
+        );
+    }
+    let primary_after = primary_worktree_snapshot(context.repo, context.execution_runtime)?;
+    if !primary_integrity_changes(&captured.primary_before, &primary_after).is_empty() {
+        bail!("managed parent final collection refused primary integrity changes");
+    }
+    Ok(())
+}
+
+fn require_exact_completed_worker_reports(
+    parsed: &ParsedReport<OrchestratorReviewReport>,
+    workers: &[bound_parent_turn::BoundWorkerResult],
+    assignment: &OrchestratorAssignment,
+) -> Result<()> {
+    if !parsed.report.audit_reports.is_empty() || parsed.report.review_lens_aggregate.is_some() {
+        bail!(
+            "managed parent final report must not include audit_reports or review_lens_aggregate"
+        );
+    }
+    if parsed.report.worker_reports.len() != workers.len() {
+        bail!("managed parent final report worker_reports differ from completed worker evidence");
+    }
+    let mut ids = BTreeSet::new();
+    for (supplied, worker) in parsed.report.worker_reports.iter().zip(workers) {
+        if supplied != worker.evidence().report() || !ids.insert(supplied.id.as_str()) {
+            bail!(
+                "managed parent final report worker_reports differ from completed worker evidence"
+            );
+        }
+    }
+    let authored = assignment
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if ids != authored {
+        bail!("managed parent final report must represent all and only authored worker ids");
+    }
+    Ok(())
+}
+
+fn merge_completed_worker_journals(
+    workers: &[bound_parent_turn::BoundWorkerResult],
+) -> Result<WorkerExecutionJournalEvidenceSet> {
+    let mut merged = WorkerExecutionJournalEvidenceSet::default();
+    for worker in workers {
+        let evidence = worker.evidence();
+        let journals = evidence.journals();
+        let worker_id = evidence.report().id.as_str();
+        if journals.len() != 1 || !journals.contains_key(worker_id) {
+            bail!("bound worker journal evidence is not the exact completed worker journal");
+        }
+        let journal = journals
+            .get(worker_id)
+            .context("bound worker journal disappeared")?
+            .clone();
+        if merged.insert(worker_id.to_string(), journal).is_some() {
+            bail!("bound worker journal ids are not unique");
+        }
+    }
+    Ok(merged)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_managed_parent_final_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: CapturedChildAttempt<'a>,
+    continuation: &ParentContinuationLaunch<'_>,
+    completed: &bound_parent_turn::BoundNestedWorkerEvidence<'_, '_>,
+    source_attempt: usize,
+    current: &WorkerInboxTurn<'_>,
+) -> Result<PreparedManagedParentFinal<'a>> {
+    let (parsed, journals) = {
+        let (_view, workers) = revalidate_managed_parent_final(
+            context,
+            preflight,
+            continuation,
+            completed,
+            source_attempt,
+            current,
+        )?;
+        require_managed_parent_final_capture(context, preflight, &captured)?;
+        let parsed = parent_continuation_response::read_parent_continuation_final_report(
+            captured.external_run.output_last_message(),
+            &captured.attempt_artifacts.raw_report_relative,
+            continuation,
+        )?;
+        require_exact_completed_worker_reports(&parsed, workers, &preflight.assignment)?;
+        let journals = merge_completed_worker_journals(workers)?;
+        (parsed, journals)
+    };
+    let (_view, workers) = revalidate_managed_parent_final(
+        context,
+        preflight,
+        continuation,
+        completed,
+        source_attempt,
+        current,
+    )?;
+    let expected_candidate = workers
+        .last()
+        .context("managed parent final collection has no completed worker candidate")?
+        .candidate_snapshots()
+        .1
+        .clone();
+    Ok(PreparedManagedParentFinal {
+        captured,
+        collection: ManagedParentCollection {
+            parsed,
+            journals,
+            expected_candidate,
+            authorizes_materialization: true,
+        },
+    })
+}
+
+fn collect_prepared_managed_parent_final<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    prepared: PreparedManagedParentFinal<'a>,
+) -> Result<CollectedChildAttempt<'a>> {
+    collect_captured_child_attempt(
+        context,
+        outcome,
+        preflight,
+        prepared.captured,
+        Some(prepared.collection),
+    )
 }
 
 // This is the sole ordinary-report path. Keep schema validation, evidence import,
@@ -3190,6 +4402,16 @@ fn collect_ordinary_child_attempt<'a>(
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
     captured: CapturedChildAttempt<'a>,
+) -> Result<CollectedChildAttempt<'a>> {
+    collect_captured_child_attempt(context, outcome, preflight, captured, None)
+}
+
+fn collect_captured_child_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: CapturedChildAttempt<'a>,
+    managed_parent: Option<ManagedParentCollection>,
 ) -> Result<CollectedChildAttempt<'a>> {
     let AssignmentExecutionContext {
         assignment_metadata,
@@ -3201,6 +4423,16 @@ fn collect_ordinary_child_attempt<'a>(
     } = context;
     let assignment = &preflight.assignment;
     let worktree = &preflight.worktree;
+    let (parsed, managed_journals, expected_candidate, authorizes_materialization) =
+        match managed_parent {
+            Some(managed) => (
+                Some(managed.parsed),
+                Some(managed.journals),
+                Some(managed.expected_candidate),
+                managed.authorizes_materialization,
+            ),
+            None => (None, None, None, false),
+        };
     let CapturedChildAttempt {
         attempt_artifacts,
         corrective_retry_used,
@@ -3216,17 +4448,32 @@ fn collect_ordinary_child_attempt<'a>(
         environment_blocked,
         attempt_containment_verified,
     } = captured;
-    let raw_report_validated = direct_assignment_report_is_valid(
-        assignment_attempt_report_role(assignment.role, context.evidence_only_reaudit.is_some()),
-        external_run.output_last_message(),
-        &attempt_artifacts.raw_report_relative,
-    )?;
-    let worker_journal_result = with_supervisor_artifacts(artifacts, |writer, journal| {
-        let evidence =
-            import_worker_execution_journals(writer, assignment, &incoming_scratch, &external_run)?;
-        record_worker_journal_events(journal, writer, assignment, &evidence);
-        Ok(evidence)
-    });
+    let raw_report_validated = if parsed.is_some() {
+        true
+    } else {
+        direct_assignment_report_is_valid(
+            assignment_attempt_report_role(
+                assignment.role,
+                context.evidence_only_reaudit.is_some(),
+            ),
+            external_run.output_last_message(),
+            &attempt_artifacts.raw_report_relative,
+        )?
+    };
+    let worker_journal_result = if let Some(journals) = managed_journals {
+        Ok(journals)
+    } else {
+        with_supervisor_artifacts(artifacts, |writer, journal| {
+            let evidence = import_worker_execution_journals(
+                writer,
+                assignment,
+                &incoming_scratch,
+                &external_run,
+            )?;
+            record_worker_journal_events(journal, writer, assignment, &evidence);
+            Ok(evidence)
+        })
+    };
     let attempt_import_result = with_supervisor_artifacts(artifacts, |writer, _| {
         import_external_attempt_evidence(
             writer,
@@ -3286,21 +4533,27 @@ fn collect_ordinary_child_attempt<'a>(
         outcome.pre_action_review_metrics.push(metrics.clone());
     }
     let external_side_effect_state = external_run.external_side_effect_state();
-    let (mut attempt_report, report_shape_problems) = collect_child_report_for_runtime(
-        ChildReportCollectionContext {
-            assignment,
-            assignment_metadata,
-            report_path: &attempt_artifacts.raw_report_relative,
-            external_run: &external_run,
-            external_command: &command,
-            worktree_path: &worktree.path,
-            child_base_head: &preflight.child_base_head,
-            worker_journals: &worker_journal_evidence,
-            evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
-            observed_changed_paths: observed_primary_scope_changes.as_deref(),
-        },
-        launch_runtime,
-    );
+    let report_collection = ChildReportCollectionContext {
+        assignment,
+        assignment_metadata,
+        report_path: &attempt_artifacts.raw_report_relative,
+        external_run: &external_run,
+        external_command: &command,
+        worktree_path: &worktree.path,
+        child_base_head: &preflight.child_base_head,
+        worker_journals: &worker_journal_evidence,
+        evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
+        observed_changed_paths: observed_primary_scope_changes.as_deref(),
+    };
+    let (mut attempt_report, report_shape_problems) = if let Some(parsed) = parsed {
+        super::acceptance::collect_managed_parent_report_for_runtime(
+            report_collection,
+            launch_runtime,
+            Ok(parsed),
+        )
+    } else {
+        collect_child_report_for_runtime(report_collection, launch_runtime)
+    };
     let materialization_gate = ManagedChildMaterializationGate {
         codex_supervisor: options.runtime == SupervisorRuntime::Codex,
         verified_execution: *execution_runtime == SupervisorExecutionRuntime::Verified,
@@ -3309,7 +4562,11 @@ fn collect_ordinary_child_attempt<'a>(
         publishable: external_run.publishable,
         structured_report_valid: raw_report_validated,
         report_succeeded: !report_failed(&attempt_report),
-        writable_workspace: command.workspace_access == WorkspaceAccess::ReadWrite,
+        writable_workspace: if authorizes_materialization {
+            true
+        } else {
+            command.workspace_access == WorkspaceAccess::ReadWrite
+        },
         isolated_managed_child: preflight.primary_scope_baseline.is_none(),
         primary_integrity_verified: primary_changes.is_empty(),
         sandbox_denials_absent: sandbox_denials.is_empty(),
@@ -3332,6 +4589,15 @@ fn collect_ordinary_child_attempt<'a>(
             .as_ref()
             .context("verified managed child Git materialization has no write lease")?;
         Some((|| {
+            if let Some(expected) = expected_candidate {
+                let observed = primary_worktree_snapshot(&worktree.path, *execution_runtime)
+                    .context(
+                        "failed to inspect the managed parent worktree before materialization",
+                    )?;
+                if observed.inspection_problem().is_some() || observed != expected {
+                    bail!("managed worktree snapshot differs from the completed worker candidate");
+                }
+            }
             let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
                 repo,
                 assignment,
@@ -5433,6 +6699,17 @@ fn execute_supervisor_assignment_inner(
     };
     let journal_parent_id = preflight.journal_parent_id;
     let assignment = &preflight.assignment;
+    // Chosen once from the initial resolved runtime. Retries must not reselect
+    // this assignment onto Native after a managed parent cycle has started.
+    let managed_parent_cycle = context.execution_runtime == SupervisorExecutionRuntime::Verified
+        && context.execution_target.is_none()
+        && context.evidence_only_reaudit.is_none()
+        && assignment.role == AgentRole::ChildOrchestrator
+        && assignment.phase == AssignmentPhase::Execution
+        && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+        && !assignment.worker_assignments.is_empty()
+        && assignment_launch_runtime(assignment, options, &context.budget_policy)
+            == SupervisorRuntime::Codex;
     let final_report_name = format!("{}.json", assignment.id);
     let final_report_relative = PathBuf::from("reports").join(&final_report_name);
     let final_report_path = dirs.reports.join(&final_report_name);
@@ -5481,34 +6758,66 @@ fn execute_supervisor_assignment_inner(
                 )?;
                 outcome.selection_decisions.extend(decisions);
             }
-            let prepared = match prepare_child_attempt(
-                context,
-                outcome,
-                &active_budget_policy,
-                &preflight,
-                journal_parent_id,
-                attempt,
-                max_attempts,
-                &retry_feedback,
-                &schema_path,
-                &worker_schema_path,
-                &auditor_schema_path,
-                None,
-            )? {
+            let prepared = match if managed_parent_cycle {
+                prepare_managed_parent_initial_attempt(
+                    context,
+                    outcome,
+                    &active_budget_policy,
+                    &preflight,
+                    journal_parent_id,
+                    attempt,
+                    max_attempts,
+                    &retry_feedback,
+                    &schema_path,
+                    &worker_schema_path,
+                    &auditor_schema_path,
+                )
+            } else {
+                prepare_child_attempt(
+                    context,
+                    outcome,
+                    &active_budget_policy,
+                    &preflight,
+                    journal_parent_id,
+                    attempt,
+                    max_attempts,
+                    &retry_feedback,
+                    &schema_path,
+                    &worker_schema_path,
+                    &auditor_schema_path,
+                    None,
+                )
+            }? {
                 AssignmentExecutionDisposition::Continue(prepared) => prepared,
                 AssignmentExecutionDisposition::Complete => return Ok(()),
             };
             let attempted_launch_model_provenance = prepared.model_provenance.clone();
             let requested_effort = prepared.command.reasoning_effort.clone();
             let account_observe = active_budget_policy.account_observe_environment_decision();
-            let collected = match dispatch_and_collect_child_attempt(
-                context,
-                outcome,
-                &preflight,
-                journal_parent_id,
-                attempt,
-                prepared,
-            ) {
+            let collected = match if managed_parent_cycle {
+                managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
+                    context,
+                    outcome,
+                    &preflight,
+                    journal_parent_id,
+                    attempt,
+                    prepared,
+                    &active_budget_policy,
+                    max_attempts,
+                    &schema_path,
+                    &worker_schema_path,
+                    &auditor_schema_path,
+                )
+            } else {
+                dispatch_and_collect_child_attempt(
+                    context,
+                    outcome,
+                    &preflight,
+                    journal_parent_id,
+                    attempt,
+                    prepared,
+                )
+            } {
                 Ok(collected) => collected,
                 Err(error) => {
                     record_child_attempt_outcome_with_account_observe(
@@ -14300,5 +15609,13 @@ mod messaging_ipc_tests;
 mod nested_driver_tests;
 
 #[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/attached_parent_capture_tests.rs"]
+mod attached_parent_capture_tests;
+
+#[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/bound_parent_turn_tests.rs"]
 mod bound_parent_turn_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/managed_parent_controller_tests.rs"]
+mod managed_parent_controller_tests;
