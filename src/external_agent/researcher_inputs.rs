@@ -7,6 +7,7 @@ const MAX_SOURCE_INPUTS: usize = 8;
 #[cfg(test)]
 thread_local! {
     static TEST_EMPTY_SOURCE_READER: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    static TEST_SKIP_INNER_SOURCE_SANDBOX: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -162,7 +163,21 @@ pub(super) fn prepare_source_inputs(
             .fixed_version_probe_evidence
             .clone(),
     };
-    let result = probe_source_inputs(spec, profile, timeout, cancellation, &mut evidence);
+    let started = Instant::now();
+    let result = probe_source_inputs(spec, profile, timeout, cancellation, &mut evidence).and_then(
+        |(receipts, snapshots)| {
+            probe_source_inputs_in_inner_sandbox(
+                spec,
+                profile,
+                timeout.saturating_sub(started.elapsed()),
+                cancellation,
+                &receipts,
+                &snapshots,
+                &mut evidence,
+            )?;
+            Ok((receipts, snapshots))
+        },
+    );
     retain_environment_preflight_process_evidence(report, &evidence);
     // This private witness also covers later preparation/bookkeeping refusals.
     // The target-launch boundary must discard it before attempting any release.
@@ -182,6 +197,110 @@ pub(super) fn prepare_source_inputs(
         }
         Err(error) => Err(error),
     }
+}
+
+fn probe_source_inputs_in_inner_sandbox(
+    spec: &ExternalAgentCommand,
+    profile: Option<&SideEffectConfinementProfile>,
+    timeout: Duration,
+    cancellation: &ProcessCancellation,
+    receipts: &[ResearcherInputReceipt],
+    snapshots: &[crate::process_runner::ReadOnlyInputSnapshot],
+    evidence: &mut EnvironmentPreflightProcessEvidence,
+) -> Result<()> {
+    if receipts.is_empty() {
+        return Ok(());
+    }
+    #[cfg(test)]
+    if TEST_SKIP_INNER_SOURCE_SANDBOX.with(|flag| flag.replace(false)) {
+        return Ok(());
+    }
+    let profile = profile.context("inner source input visibility requires verified containment")?;
+    let program = resolve_external_program(&spec.program, &spec.cwd)
+        .context("selected Codex sandbox helper could not be resolved")?;
+    let trusted = external_program_trust_for_resolved_executable(spec, &program)
+        == ExternalProgramTrust::TrustedSystemCodex;
+    #[cfg(test)]
+    let trusted = trusted || pinned_test_sandbox_program(&program)?;
+    if !trusted {
+        bail!("inner source input visibility requires the selected TrustedSystemCodex executable");
+    }
+    validate_external_program_identity(&program, false)
+        .context("selected Codex sandbox helper identity was rejected")?;
+    let controls = protected_worktree_controls(spec)?;
+    let permissions = codex_filesystem_permissions(spec, &controls);
+    let reader = ["/usr/bin/cat", "/bin/cat", "/run/current-system/sw/bin/cat"]
+        .into_iter()
+        .map(Path::new)
+        .find(|path| path.is_file())
+        .context("trusted inner source-input reader is unavailable")?;
+    let reader = fs::canonicalize(reader)?;
+    validate_external_program_identity(&reader, false)?;
+    let started = Instant::now();
+    for receipt in receipts {
+        let args = vec![
+            OsString::from("sandbox"),
+            OsString::from("--permission-profile"),
+            OsString::from("maco_external_codex"),
+            OsString::from("--cd"),
+            spec.cwd.as_os_str().to_os_string(),
+            OsString::from("-c"),
+            OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+            OsString::from("-c"),
+            OsString::from(&permissions),
+            OsString::from("--"),
+            reader.as_os_str().to_os_string(),
+            OsString::from("--"),
+            receipt.path.as_os_str().to_os_string(),
+        ];
+        let mut probe = ProcessSpec::direct(
+            "Researcher source input inner sandbox visibility",
+            &program,
+            &args,
+            &spec.cwd,
+            MAX_PROMPT_BYTES + 1,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+        .with_private_runtime_home(true)
+        .with_private_runtime_codex_home(true)
+        .with_side_effect_confinement(profile.clone())
+        .with_timeout(Some(timeout.saturating_sub(started.elapsed())));
+        probe.read_only_input_snapshots = snapshots.to_vec();
+        let output = match run_process_cancellable(probe, cancellation) {
+            Ok(output) => {
+                evidence.record_output(&output);
+                output
+            }
+            Err(error) => {
+                evidence.record_error(&error);
+                return Err(error.into());
+            }
+        };
+        if !output.safety_sensitive_succeeded()
+            || output.stdout.as_bytes().len() != receipt.bytes
+            || sha256_hex(output.stdout.as_bytes()) != receipt.sha256
+        {
+            bail!(
+                "declared source input is not readable with its bound hash in the actual inner Codex sandbox: {}",
+                receipt.path.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn pinned_test_sandbox_program(program: &Path) -> Result<bool> {
+    let Some(expected) = env::var_os("MACO_TEST_CODEX_SANDBOX_PROGRAM") else {
+        return Ok(false);
+    };
+    let expected = fs::canonicalize(expected)?;
+    if expected != program {
+        return Ok(false);
+    }
+    Ok(sha256_hex(&fs::read(program)?)
+        == "2b3edc9cdfd1717fba3dbc92817205a8a2c7511d459e456d4817eeff6f78ed7a")
 }
 
 fn probe_source_inputs(
@@ -278,6 +397,8 @@ pub(super) fn revalidate_source_inputs(
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use anyhow::ensure;
 
     const SOURCE: &[u8] = b"diff --git a/src/budget.rs b/src/budget.rs\n--- a/src/budget.rs\n+++ b/src/budget.rs\n@@ -1 +1 @@\n-total.saturating_add(next)\n+total.checked_add(next).ok_or(BudgetOverflow)?\n";
 
@@ -378,6 +499,7 @@ pub(crate) mod tests {
             );
             retain_environment_preflight_process_evidence(&mut report, &evidence);
         }
+        TEST_SKIP_INNER_SOURCE_SANDBOX.with(|flag| flag.set(true));
         prepare_source_inputs(
             command,
             Some(&profile),
@@ -585,6 +707,7 @@ pub(crate) mod tests {
         );
         evidence.fixed_version_probe_evidence = Some(version.clone());
         retain_environment_preflight_process_evidence(&mut report, &evidence);
+        TEST_SKIP_INNER_SOURCE_SANDBOX.with(|flag| flag.set(true));
         prepare_source_inputs(
             &command,
             Some(&profile),
@@ -671,6 +794,197 @@ pub(crate) mod tests {
         assert_eq!(output.stdout.as_bytes(), SOURCE);
 
         assert!(!command.json_log.exists());
+        Ok(())
+    }
+
+    /// Run explicitly with --ignored in the pinned Linux qualification lane.
+    /// This invokes only `codex sandbox`, never exec/app-server or a provider.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires the pinned providerless Codex 0.144.4 sandbox and delegated Linux containment"]
+    fn source_inputs_pinned_inner_sandbox_preserves_unlinked_snapshot_and_denials() -> Result<()> {
+        let sandbox_program = PathBuf::from(
+            env::var_os("MACO_TEST_CODEX_SANDBOX_PROGRAM")
+                .context("explicit pinned sandbox program is required; no PATH fallback")?,
+        );
+        validate_external_program_identity(&sandbox_program, false)?;
+        let metadata = fs::metadata(&sandbox_program)?;
+        ensure!(
+            metadata.len() <= 512 * 1024 * 1024,
+            "sandbox executable exceeds qualification bound"
+        );
+        ensure!(
+            sha256_hex(&fs::read(&sandbox_program)?)
+                == "2b3edc9cdfd1717fba3dbc92817205a8a2c7511d459e456d4817eeff6f78ed7a",
+            "sandbox executable is not the admitted 0.144.4 pin"
+        );
+        let (root, mut command) = fixture()?;
+        git2::Repository::init(&command.cwd)?;
+        for control in [".maco", ".maco-cache", ".codex", ".agents"] {
+            fs::create_dir(command.cwd.join(control))?;
+        }
+        let incoming = root.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        command.output_last_message = incoming.join("report.json");
+        command.program = sandbox_program.clone();
+        let source = command.cwd.join("src/runtime_adapter/source.rs");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::write(&source, SOURCE)?;
+        let schemas = root.path().join("private-schemas");
+        fs::create_dir(&schemas)?;
+        let schema = schemas.join("schema.json");
+        let schema_sibling = schemas.join("sibling.json");
+        fs::write(&schema, b"{\"type\":\"object\"}\n")?;
+        fs::write(&schema_sibling, b"hidden sibling bytes")?;
+        command.read_only_input_files = vec![source.clone(), schema.clone()];
+        command.researcher_source_inputs = vec![ResearcherSourceInput {
+            path: "src/runtime_adapter/source.rs".into(),
+            sha256: sha256_hex(SOURCE),
+        }];
+        let hidden = command.cwd.join("hidden-packets");
+        fs::create_dir(&hidden)?;
+        fs::write(hidden.join("secret"), b"hidden unit-test bytes")?;
+        command.hidden_roots.push(hidden.clone());
+        let receipts = validate_command(&command)?;
+        let snapshots = vec![crate::process_runner::ReadOnlyInputSnapshot::capture(
+            &source,
+            &receipts[0].sha256,
+        )?];
+        let controls = protected_worktree_controls(&command)?;
+        let permissions = codex_filesystem_permissions(&command, &controls);
+        let mut legacy = command.clone();
+        legacy.researcher_source_inputs.clear();
+        let legacy_permissions = codex_filesystem_permissions(&legacy, &controls);
+        let profile = external_side_effect_profile(
+            &command,
+            &sandbox_program,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        TEST_SKIP_INNER_SOURCE_SANDBOX.with(|flag| flag.set(false));
+        let mut production_report = failed_external_run(
+            &command,
+            Instant::now(),
+            Vec::new(),
+            false,
+            "providerless inner preflight".into(),
+        );
+        prepare_source_inputs(
+            &command,
+            Some(&profile),
+            Duration::from_secs(30),
+            &ProcessCancellation::new(),
+            &mut production_report,
+        )?;
+        ensure!(!production_report.stdout.target_launch_attempted);
+        ensure!(!command.json_log.exists());
+        // All checks run inside the actual inner namespace after the outer
+        // runner has unlinked the private backing file. Only source bytes reach
+        // stdout; a broken nested mount cannot pass via the direct-cat probe.
+        let script = r#"set -eu; test "$(/usr/bin/stat -c %h -- "$1")" = 0; /usr/bin/cat -- "$1"; if (printf forbidden >> "$1") 2>/dev/null; then exit 90; fi; /usr/bin/cat -- "$2" >/dev/null; if /usr/bin/cat -- "$3" >/dev/null 2>&1; then exit 91; fi; if /usr/bin/cat -- "$4" >/dev/null 2>&1; then exit 92; fi; if (printf forbidden > "$5") 2>/dev/null; then exit 93; fi"#;
+        for stage in ["legacy-rebind", "original", "mutated", "replaced"] {
+            match stage {
+                "mutated" => fs::write(&source, b"unverified same-inode mutation")?,
+                "replaced" => {
+                    fs::rename(&source, command.cwd.join("replaced-original"))?;
+                    fs::write(&source, b"unverified replacement inode")?;
+                }
+                _ => {}
+            }
+            let args = vec![
+                OsString::from("sandbox"),
+                OsString::from("--permission-profile"),
+                OsString::from("maco_external_codex"),
+                OsString::from("--cd"),
+                command.cwd.as_os_str().to_os_string(),
+                OsString::from("-c"),
+                OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+                OsString::from("-c"),
+                OsString::from(if stage == "legacy-rebind" {
+                    &legacy_permissions
+                } else {
+                    &permissions
+                }),
+                OsString::from("--"),
+                OsString::from("/bin/sh"),
+                OsString::from("-c"),
+                OsString::from(script),
+                OsString::from("source-input-inner-boundary"),
+                source.as_os_str().to_os_string(),
+                schema.as_os_str().to_os_string(),
+                schema_sibling.as_os_str().to_os_string(),
+                hidden.join("secret").into_os_string(),
+                command.cwd.join("write-forbidden").into_os_string(),
+            ];
+            let mut target = ProcessSpec::direct(
+                "providerless source input inner sandbox",
+                &sandbox_program,
+                &args,
+                &command.cwd,
+                8192,
+            )
+            .with_stdin(StdinMode::Null)
+            .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+            .with_private_runtime_home(true)
+            .with_private_runtime_codex_home(true)
+            .with_side_effect_confinement(profile.clone())
+            .with_timeout(Some(Duration::from_secs(30)));
+            target.read_only_input_snapshots = snapshots.clone();
+            let output = run_process_cancellable(target, &ProcessCancellation::new())?;
+            if stage == "legacy-rebind" {
+                ensure!(
+                    output.safety_evidence_verified(),
+                    "legacy refusal must unwind safely: {output:?}"
+                );
+                ensure!(output.status.is_some_and(|status| !status.success()));
+                let stderr = String::from_utf8_lossy(output.stderr.as_bytes());
+                ensure!(
+                    stderr.contains("Can't bind mount")
+                        && stderr.contains("No such file or directory"),
+                    "legacy case did not reproduce the admitted defect: {stderr}"
+                );
+                println!("INNER_SANDBOX_STAGE legacy-rebind=enoent");
+                continue;
+            }
+            ensure!(
+                output.safety_sensitive_succeeded(),
+                "{stage} nested sandbox failed: {output:?}"
+            );
+            ensure!(
+                output.stdout.as_bytes() == SOURCE,
+                "{stage} did not read immutable source bytes"
+            );
+            ensure!(sha256_hex(output.stdout.as_bytes()) == receipts[0].sha256);
+            println!("INNER_SANDBOX_STAGE {stage}=immutable-read-and-denials");
+        }
+        ensure!(
+            fs::read(&source)? == b"unverified replacement inode",
+            "inner command wrote the original path"
+        );
+        ensure!(
+            !command.cwd.join("write-forbidden").exists(),
+            "inner command wrote the read-only workspace"
+        );
+        ensure!(
+            fs::read(&schema)? == b"{\"type\":\"object\"}\n",
+            "inner command changed the exact schema"
+        );
+        ensure!(
+            fs::read(&schema_sibling)? == b"hidden sibling bytes",
+            "inner command changed the schema sibling"
+        );
+        ensure!(
+            fs::read(hidden.join("secret"))? == b"hidden unit-test bytes",
+            "inner command changed hidden bytes"
+        );
+        println!(
+            "INNER_SANDBOX_BOUNDARY_RECEIPT source_unlinked=true writes_denied=true \
+             hidden_denied=true outside_exact_readable=true outside_sibling_denied=true"
+        );
+        ensure!(
+            !command.json_log.exists(),
+            "no provider run or report was created"
+        );
         Ok(())
     }
 }
