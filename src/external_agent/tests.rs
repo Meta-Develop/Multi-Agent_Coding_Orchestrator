@@ -3762,6 +3762,79 @@ fn exact_read_only_inputs_are_files_in_both_layers_without_parent_visibility() -
 
 #[cfg(unix)]
 #[test]
+fn immutable_researcher_input_omits_only_redundant_inner_workspace_file_rule() -> Result<()> {
+    let (root, mut command) = researcher_inputs::tests::fixture()?;
+    git2::Repository::init(&command.cwd)?;
+    create_mandatory_control_roots(&command.cwd)?;
+    let incoming = root.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    command.output_last_message = incoming.join("report.json");
+    let nested = command.cwd.join("src/runtime_adapter/source.rs");
+    fs::create_dir_all(nested.parent().unwrap())?;
+    fs::write(&nested, b"immutable source\n")?;
+    let schema = root.path().join("schema.json");
+    fs::write(&schema, b"{}\n")?;
+    command.read_only_input_files = vec![nested.clone(), schema.clone()];
+    command.researcher_source_inputs = vec![researcher_inputs::ResearcherSourceInput {
+        path: "src/runtime_adapter/source.rs".into(),
+        sha256: sha256_hex(b"immutable source\n"),
+    }];
+    researcher_inputs::validate_command(&command)?;
+    let controls = protected_worktree_controls(&command)?;
+    let rendered = codex_filesystem_permissions(&command, &controls);
+    let rule = |path: &Path| format!("{}=\"read\"", toml_basic_string(path.to_str().unwrap()));
+    assert!(rendered.contains("\":workspace_roots\"={\".\"=\"read\"}"));
+    assert!(!rendered.contains(&rule(&nested)));
+    assert!(rendered.contains(&rule(&schema)));
+    assert!(
+        !rendered.contains(&rule(root.path())),
+        "no new ancestor grant"
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        Path::new("/usr/bin/cat"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(
+        profile.visible_read_only_files().contains(&nested),
+        "outer exact-file binding remains"
+    );
+
+    for variant in [
+        "undeclared",
+        "writable",
+        "other-role",
+        "malformed-hash",
+        "mismatched-hash",
+    ] {
+        let mut changed = command.clone();
+        match variant {
+            "undeclared" => changed.researcher_source_inputs.clear(),
+            "writable" => changed.workspace_access = WorkspaceAccess::ReadWrite,
+            "other-role" => changed.agent_lifecycle.as_mut().unwrap().role = "auditor".into(),
+            "malformed-hash" => changed.researcher_source_inputs[0].sha256 = "invalid".into(),
+            "mismatched-hash" => changed.researcher_source_inputs[0].sha256 = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            codex_filesystem_permissions(&changed, &controls).contains(&rule(&nested)),
+            "{variant}"
+        );
+    }
+    let mut hidden = command.clone();
+    hidden
+        .hidden_roots
+        .push(nested.parent().unwrap().to_path_buf());
+    assert!(protected_worktree_controls(&hidden).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, _common, _child_git_dir) =
