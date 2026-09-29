@@ -2096,6 +2096,11 @@ fn budget_reliability_uses_bound_adapter_runtime_completion() {
     let mut run = injected_verified_run_without_journals(&command);
     run.program_trust = ExternalProgramTrust::ExplicitCustom;
     run.codex_permissions = None;
+    let native_capture = crate::process_runner::CapturedBytes::from_bytes_for_test(
+        b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"reasoning_tokens\":0,\"total_tokens\":10}}\n"
+            .to_vec(),
+    );
+    run.retain_grok_native_usage_for_test(&command, &native_capture, true);
 
     let settlement = reservation
         .settle(&run, SupervisorRuntime::Grok, &command)

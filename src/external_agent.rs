@@ -1911,6 +1911,60 @@ impl ExternalAgentRun {
         }
     }
 
+    /// Only the bound native subprocess capture can supply Grok token accounting.
+    /// Public evidence, JSONL files and deserialized reports cannot recreate it.
+    pub(crate) fn authenticated_grok_usage(
+        &self,
+        command: &ExternalAgentCommand,
+    ) -> Option<(Usage, bool)> {
+        let capture = self.stdout.run_metadata.grok_native_usage.as_ref()?;
+        if capture.command != *command {
+            return None;
+        }
+        let (usage, complete) = capture.observation.allocation();
+        Some((usage, complete && capture.process_completed))
+    }
+
+    fn retain_grok_native_usage(
+        &mut self,
+        command: &ExternalAgentCommand,
+        runtime: ExternalExecutionRuntime,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        if runtime != ExternalExecutionRuntime::Verified
+            || command.invocation != ExternalAgentInvocation::Grok
+            || grok_acp_stdio_protocol_selected(command)
+        {
+            return;
+        }
+        self.stdout.run_metadata.grok_native_usage =
+            crate::runtime_adapter::grok::observe_grok_native_usage(
+                stdout.as_bytes(),
+                stdout.is_truncated(),
+            )
+            .map(|observation| GrokNativeUsageCapture {
+                command: command.clone(),
+                observation,
+                process_completed,
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_grok_native_usage_for_test(
+        &mut self,
+        command: &ExternalAgentCommand,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        self.retain_grok_native_usage(
+            command,
+            ExternalExecutionRuntime::Verified,
+            stdout,
+            process_completed,
+        );
+    }
+
     pub(crate) fn codex_auditor_effort_qualified(&self) -> bool {
         !self.stdout.run_metadata.codex_auditor_effort_required
             || self
@@ -2337,7 +2391,120 @@ struct ExternalAgentRunMetadata {
     codex_cli_parent_evidence: Option<CodexParentEvidence>,
     codex_cli_usage: Option<Usage>,
     codex_cli_usage_complete: bool,
+    grok_native_usage: Option<GrokNativeUsageCapture>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
+}
+
+/// Full command binding and original native counters are private process custody,
+/// not public report assertions. No Serialize/Deserialize implementation.
+#[derive(Clone, PartialEq, Eq)]
+struct GrokNativeUsageCapture {
+    command: ExternalAgentCommand,
+    observation: crate::runtime_adapter::grok::GrokNativeUsageObservation,
+    process_completed: bool,
+}
+
+#[cfg(test)]
+mod grok_native_custody_tests {
+    use super::*;
+
+    fn command() -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "grok",
+            ".",
+            "prompt",
+            "log",
+            "report",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            crate::runtime_adapter::RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(crate::runtime_adapter::RuntimeId::Grok),
+        )
+    }
+
+    fn capture() -> CapturedBytes {
+        CapturedBytes::from_bytes_for_test(
+            b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":3,\"total_tokens\":24}}\n".to_vec(),
+        )
+    }
+
+    #[test]
+    fn grok_native_custody_survives_redaction_but_not_wire_roundtrip_or_command_drift() {
+        let command = command();
+        let mut run =
+            refused_external_run_before_launch(&command, "test materialization failure".into());
+        run.retain_grok_native_usage_for_test(&command, &capture(), true);
+        replace_report_stdout(&mut run, CapturedOutput::default());
+        assert_eq!(
+            run.authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            24
+        );
+        assert!(!run.publishable, "accounting cannot promote publication");
+        assert!(run.error.is_some());
+        let restored: ExternalAgentRun =
+            serde_json::from_slice(&serde_json::to_vec(&run).unwrap()).unwrap();
+        assert!(restored.authenticated_grok_usage(&command).is_none());
+        let mut rebound = command.clone();
+        rebound.json_log = "other-log".into();
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.model = Some("different-request".into());
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.timeout += Duration::from_secs(1);
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_refuses_simulation_acp_and_foreign_invocations() {
+        let command = command();
+        let mut run = refused_external_run_before_launch(&command, "test".into());
+        run.retain_grok_native_usage(
+            &command,
+            ExternalExecutionRuntime::NonpublishableSimulation,
+            &capture(),
+            true,
+        );
+        assert!(run.authenticated_grok_usage(&command).is_none());
+        let mut acp = command.clone();
+        acp.runtime_adapter
+            .as_mut()
+            .unwrap()
+            .grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+        run.retain_grok_native_usage_for_test(&acp, &capture(), true);
+        assert!(run.authenticated_grok_usage(&acp).is_none());
+        let mut codex = command.clone();
+        codex.invocation = ExternalAgentInvocation::CodexSupervisor;
+        run.retain_grok_native_usage_for_test(&codex, &capture(), true);
+        assert!(run.authenticated_grok_usage(&codex).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_retains_cancelled_and_truncated_floors_without_completion() {
+        let command = command();
+        for (capture, process_completed) in [
+            (capture(), false),
+            (
+                CapturedBytes::from_bytes_with_truncation_for_test(
+                    capture().as_bytes().to_vec(),
+                    true,
+                ),
+                true,
+            ),
+        ] {
+            let mut run =
+                refused_external_run_before_launch(&command, "cancelled or truncated".into());
+            run.retain_grok_native_usage_for_test(&command, &capture, process_completed);
+            let (usage, complete) = run.authenticated_grok_usage(&command).unwrap();
+            assert_eq!(usage.total_tokens, 24);
+            assert!(!complete);
+            assert!(!run.publishable);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -4100,6 +4267,18 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
+            // Bind the original supervisor command, not target_spec's private
+            // staging destination. Retain spend before any fallible materialization.
+            report.retain_grok_native_usage(
+                spec,
+                runtime,
+                &output.stdout,
+                !output.timed_out
+                    && output.status.is_some_and(|status| status.success())
+                    && output.process_error.is_none()
+                    && output.stdin_error.is_none()
+                    && output.safety_evidence_verified(),
+            );
             match output_staging.completion_handles() {
                 Ok(staging) => record_completed_target(
                     &mut report,
@@ -4144,6 +4323,7 @@ fn run_external_agent_runtime(
                 sandbox_denials.push(denial);
             }
             if let Some(evidence) = error.cancellation_evidence() {
+                report.retain_grok_native_usage(spec, runtime, &evidence.stdout, false);
                 sandbox_denials.extend(sandbox_denials_from_codex_jsonl(
                     &protected_controls,
                     evidence.stdout.as_bytes(),

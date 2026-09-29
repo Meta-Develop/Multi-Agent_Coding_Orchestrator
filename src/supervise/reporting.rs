@@ -1959,6 +1959,21 @@ pub(super) fn external_process_completed(
         && external_safety_verified(run, runtime)
 }
 
+pub(super) fn external_usage_for_runtime(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+) -> Option<Usage> {
+    if runtime == SupervisorRuntime::Grok {
+        // Never parse mutable logs/public reports as Grok spend, including
+        // Codex-shaped counters or ACP cost ticks masquerading as tokens.
+        run.authenticated_grok_usage(command)
+            .map(|(usage, _)| usage)
+    } else {
+        complete_external_codex_usage(run, command)
+    }
+}
+
 pub(super) fn complete_external_codex_usage(
     run: &ExternalAgentRun,
     command: &ExternalAgentCommand,
