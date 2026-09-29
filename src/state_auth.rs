@@ -1000,8 +1000,7 @@ mod tests {
 
     #[test]
     fn production_test_boundary_accepts_lf_and_crlf() {
-        let lf =
-            "pub(crate) struct RepositoryAuthenticator;\n#[cfg(test)]\nmod tests {\n}\n";
+        let lf = "pub(crate) struct RepositoryAuthenticator;\n#[cfg(test)]\nmod tests {\n}\n";
         let crlf = lf.replace('\n', "\r\n");
         assert_eq!(
             production_source_before_tests(lf),
@@ -1016,8 +1015,7 @@ mod tests {
     #[test]
     fn secret_authenticator_api_remains_opaque() {
         let source = include_str!("state_auth.rs");
-        let production =
-            production_source_before_tests(source).expect("production auth source");
+        let production = production_source_before_tests(source).expect("production auth source");
         let declaration = production
             .find("pub(crate) struct RepositoryAuthenticator")
             .expect("authenticator declaration");
