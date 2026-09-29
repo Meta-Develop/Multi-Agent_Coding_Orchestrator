@@ -598,14 +598,23 @@ fn bind_selected_runtime_launch(
             )
         })?;
     }
-    let is_writable_grok_terminal_worker = assignment.phase == AssignmentPhase::Execution
+    let is_writable_native_terminal_worker = assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if launch_runtime == SupervisorRuntime::Grok && !is_writable_grok_terminal_worker {
+    if matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::ClaudeCode
+    ) && !is_writable_native_terminal_worker
+    {
+        let requirement = if launch_runtime == SupervisorRuntime::ClaudeCode {
+            crate::external_agent::WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
+        } else {
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+        };
         bail!(
             "{}: assignment '{}' must be an execution-phase, explicitly bound non-delegating terminal Worker with no nested assignments",
-            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            requirement,
             assignment.id
         );
     }
@@ -675,28 +684,36 @@ fn bind_selected_runtime_launch(
     })
 }
 
-fn bind_selected_grok_execution_workspace(
+fn bind_selected_native_execution_workspace(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
     launch_runtime: SupervisorRuntime,
     managed_worktree: &Path,
     writable_execution: bool,
 ) -> Result<ExternalAgentCommand> {
-    if launch_runtime != SupervisorRuntime::Grok {
+    if !matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::ClaudeCode
+    ) {
         return Ok(command);
     }
-    let is_writable_grok_terminal_worker = writable_execution
+    let is_writable_terminal_worker = writable_execution
         && assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if !is_writable_grok_terminal_worker
+    let terminal_worker_requirement = if launch_runtime == SupervisorRuntime::ClaudeCode {
+        crate::external_agent::WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
+    } else {
+        crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+    };
+    if !is_writable_terminal_worker
         || command.writable_launch_target
             != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
     {
         bail!(
-            "{}: assignment '{}' selected Grok launch is not exactly bound to its writable managed child worktree",
-            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            "{}: assignment '{}' selected native launch is not exactly bound to its writable managed child worktree",
+            terminal_worker_requirement,
             assignment.id
         );
     }
@@ -705,13 +722,14 @@ fn bind_selected_grok_execution_workspace(
     let command = command.with_writable_runtime_selection(
         &assignment.id,
         launch_runtime,
-        is_writable_grok_terminal_worker,
+        is_writable_terminal_worker,
     )?;
     command
         .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
         .with_context(|| {
             format!(
-                "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                "writable {} assignment '{}' did not prove its exact selected launch contract",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.id
             )
         })?;
@@ -761,7 +779,7 @@ pub(super) fn bind_selected_assignment_launch_with_duty_for_test(
         &launch_catalog,
         mechanical_duty,
     )?;
-    let command = bind_selected_grok_execution_workspace(
+    let command = bind_selected_native_execution_workspace(
         bound_launch.command,
         assignment,
         launch_runtime,
@@ -2186,7 +2204,7 @@ fn prepare_child_attempt<'a>(
         }
         None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
     });
-    command = bind_selected_grok_execution_workspace(
+    command = bind_selected_native_execution_workspace(
         command,
         assignment,
         launch_runtime,
@@ -2373,6 +2391,17 @@ fn prepare_child_attempt<'a>(
                 )
             })?;
         }
+    }
+    if command.uses_live_claude_managed_worker_budget() {
+        let live_token_grant = budget_reservation
+            .ledger
+            .live_token_grant(budget_reservation.reservation.id)?;
+        command
+            .bind_claude_managed_reservation(
+                budget_reservation.reservation.id.get(),
+                live_token_grant,
+            )
+            .map_err(anyhow::Error::msg)?;
     }
     if let Some(signal) = &context.admission_commit {
         signal.notify();
@@ -10919,7 +10948,7 @@ done
         )?;
         command.cwd = primary.clone();
         command.workspace_access = WorkspaceAccess::ReadOnly;
-        let command = bind_selected_grok_execution_workspace(
+        let command = bind_selected_native_execution_workspace(
             command,
             &assignment,
             runtime,
@@ -11819,6 +11848,87 @@ done
         assert_eq!(codex.requests, 0);
         assert_eq!(cursor.tokens, 10);
         assert_eq!(cursor.requests, 1);
+        Ok(())
+    }
+
+    #[test]
+    fn claude_settlement_uses_private_raw_counters_and_never_reservation_pricing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let plan = worker_plan("requested-claude-label");
+        let budget = SupervisorBudgetConfig::default();
+        let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        let command = quota_usage_command(temp.path())
+            .with_runtime_adapter(
+                SupervisorRuntime::ClaudeCode,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(
+                    SupervisorRuntime::ClaudeCode,
+                ),
+            )
+            .with_model_selection(
+                Some("requested-claude-label".to_string()),
+                Some("high".to_string()),
+            );
+        let stream = [
+            json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"observed-claude-model","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+            json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"observed-claude-model"}}),
+            json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"done","modelUsage":{"observed-claude-model":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::ClaudeCode),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected Claude budget refusal: {refusal:?}")
+            }
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::ClaudeCode)?;
+        let mut run = injected_verified_run(&command);
+        run.set_claude_native_stream_for_test(&stream, false, false);
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert_eq!(settlement.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            Some(25)
+        );
+        assert_eq!(settlement.model.as_deref(), Some("observed-claude-model"));
+        assert_eq!(settlement.cost_usd, None);
+        assert!(settlement.reliable_usage().is_none());
+
+        let mut partial_reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::ClaudeCode),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected partial Claude budget refusal: {refusal:?}")
+            }
+        };
+        partial_reservation.mark_invoked_for_runtime(SupervisorRuntime::ClaudeCode)?;
+        let mut interrupted = injected_verified_run(&command);
+        interrupted.set_claude_native_stream_for_test(&stream, false, true);
+        let partial = partial_reservation.settle_bound_runtime(&interrupted, &command)?;
+        assert_eq!(partial.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(
+            partial.observed_usage.map(|usage| usage.total_tokens),
+            Some(25)
+        );
+        assert_eq!(partial.cost_usd, None);
         Ok(())
     }
 

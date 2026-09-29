@@ -2919,6 +2919,85 @@ fn ordinary_external_codex_exact_path_properties_reject_drift() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn external_claude_network_properties_require_private_loopback_and_unix_only() {
+    let mut properties = BTreeMap::from([
+        (
+            "RestrictAddressFamilies".to_string(),
+            "AF_INET AF_UNIX".to_string(),
+        ),
+        ("PrivateNetwork".to_string(), "yes".to_string()),
+    ]);
+    verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .expect("exact ExternalClaude private relay network properties");
+
+    properties.insert("PrivateNetwork".to_string(), "no".to_string());
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .is_err());
+    properties.insert("PrivateNetwork".to_string(), "yes".to_string());
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_INET AF_INET6 AF_UNIX".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn space_containing_claude_policy_root_uses_and_verifies_systemd_v255_quoting() {
+    let claude_policy = Path::new("/mnt/c/Program Files/ClaudeCode");
+    assert_eq!(
+        systemd_path_property("InaccessiblePaths=", claude_policy, false),
+        OsString::from("--property=InaccessiblePaths=\"/mnt/c/Program Files/ClaudeCode\""),
+    );
+    assert_eq!(
+        systemd_path_property("InaccessiblePaths=", claude_policy, true),
+        OsString::from("--property=InaccessiblePaths=\"-/mnt/c/Program Files/ClaudeCode\""),
+    );
+
+    let expected = BTreeSet::from([
+        PathBuf::from("/etc/claude-code"),
+        claude_policy.to_path_buf(),
+    ]);
+    let systemctl_show = "/etc/claude-code \"/mnt/c/Program Files/ClaudeCode\"";
+    verify_exact_property_paths("InaccessiblePaths", systemctl_show, &expected)
+        .expect("systemd v255 shell_maybe_quote output");
+    require_property_path("InaccessiblePaths", systemctl_show, claude_policy)
+        .expect("quoted Claude WSL policy root");
+
+    for malformed in [
+        "\"/mnt/c/Program Files/ClaudeCode",
+        "\"/mnt/c/Program Files/ClaudeCode\"suffix",
+        "\"/mnt/c/Program\\nFiles/ClaudeCode\"",
+        "/etc/claude-code /mnt/c/Program\tFiles/ClaudeCode",
+    ] {
+        assert!(
+            verify_exact_property_paths("InaccessiblePaths", malformed, &expected).is_err(),
+            "malformed/control property must fail closed: {malformed:?}"
+        );
+    }
+
+    for unsupported in [
+        Path::new("/mnt/c/Program\tFiles/ClaudeCode"),
+        Path::new("/mnt/c/Program\nFiles/ClaudeCode"),
+        Path::new("/mnt/c/Program:Files/ClaudeCode"),
+        Path::new("/mnt/c/Program\\Files/ClaudeCode"),
+    ] {
+        assert!(validate_systemd_hidden_root_syntax(unsupported, "hidden root").is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn joined_property_paths(paths: &BTreeSet<PathBuf>) -> String {
     paths
         .iter()
@@ -3446,6 +3525,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     for kind in [
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::ExternalClaude,
         SideEffectConfinementProfileKind::ExternalGrok,
         SideEffectConfinementProfileKind::TrustedCompatibility,
     ] {
@@ -3492,6 +3572,9 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
             }
             SideEffectConfinementProfileKind::ExternalGrok => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
+            }
+            SideEffectConfinementProfileKind::ExternalClaude => {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET"
             }
             SideEffectConfinementProfileKind::ExternalCodex => {
                 unreachable!("ExternalCodex is checked separately")

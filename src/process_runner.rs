@@ -1,5 +1,20 @@
 mod input_snapshot;
 pub(crate) use input_snapshot::ReadOnlyInputSnapshot;
+#[cfg(target_os = "linux")]
+mod claude;
+#[cfg(target_os = "linux")]
+pub(crate) use claude::CLAUDE_CHILD_LOOPBACK_BASE_URL;
+
+pub(crate) fn maybe_run_claude_helper_from_args() -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        claude::maybe_run_helper_from_args()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,7 +29,7 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -799,6 +814,7 @@ pub enum SideEffectConfinementProfileKind {
     StrictOfflineWorkspace,
     TrustedFixedNetwork,
     ExternalCodex,
+    ExternalClaude,
     ExternalGrok,
     TrustedCompatibility,
 }
@@ -1381,6 +1397,173 @@ pub struct ExternalCodexProfile {
     config: WorkspaceSandboxConfig,
 }
 
+/// Outer Linux profile for a managed Claude launch. The native CLI sees only its private
+/// loopback namespace; a package-internal helper forwards that loopback to one parent-owned Unix
+/// socket while retaining the ordinary workspace and policy-path boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeContainmentOwnerIdentity {
+    pub(crate) unit: String,
+    pub(crate) cgroup: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ClaudeContainmentOwnerBinding(Arc<OnceLock<ClaudeContainmentOwnerIdentity>>);
+
+impl ClaudeContainmentOwnerBinding {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn bind(&self, identity: ClaudeContainmentOwnerIdentity) -> std::io::Result<()> {
+        if let Some(current) = self.0.get() {
+            return if current == &identity {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "Claude containment owner binding changed after preparation",
+                ))
+            };
+        }
+        self.0.set(identity).map_err(|_| {
+            std::io::Error::other("Claude containment owner binding raced during preparation")
+        })
+    }
+
+    pub(crate) fn identity(&self) -> Option<&ClaudeContainmentOwnerIdentity> {
+        self.0.get()
+    }
+}
+
+impl fmt::Debug for ClaudeContainmentOwnerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeContainmentOwnerBinding")
+            .field("bound", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ClaudeContainmentOwnerBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ClaudeContainmentOwnerBinding {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExternalClaudeProfile {
+    config: WorkspaceSandboxConfig,
+    parent_relay_socket: PathBuf,
+    deadline_unix_millis: u64,
+    helper_registration_nonce: String,
+    containment_owner: ClaudeContainmentOwnerBinding,
+}
+
+impl fmt::Debug for ExternalClaudeProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalClaudeProfile")
+            .field("config", &self.config)
+            .field("parent_relay_socket", &self.parent_relay_socket)
+            .field("deadline_unix_millis", &self.deadline_unix_millis)
+            .field("helper_registration_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ExternalClaudeProfile {
+    pub(crate) fn read_only(
+        workspace_root: impl Into<PathBuf>,
+        parent_relay_socket: impl Into<PathBuf>,
+        deadline_unix_millis: u64,
+        helper_registration_nonce: impl Into<String>,
+        containment_owner: ClaudeContainmentOwnerBinding,
+    ) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+            parent_relay_socket: parent_relay_socket.into(),
+            deadline_unix_millis,
+            helper_registration_nonce: helper_registration_nonce.into(),
+            containment_owner,
+        }
+    }
+
+    pub(crate) fn read_write(
+        workspace_root: impl Into<PathBuf>,
+        parent_relay_socket: impl Into<PathBuf>,
+        deadline_unix_millis: u64,
+        helper_registration_nonce: impl Into<String>,
+        containment_owner: ClaudeContainmentOwnerBinding,
+    ) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+            parent_relay_socket: parent_relay_socket.into(),
+            deadline_unix_millis,
+            helper_registration_nonce: helper_registration_nonce.into(),
+            containment_owner,
+        }
+    }
+
+    pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_file(file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_write_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_codex_writable_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    fn parent_relay_socket(&self) -> &Path {
+        &self.parent_relay_socket
+    }
+
+    const fn deadline_unix_millis(&self) -> u64 {
+        self.deadline_unix_millis
+    }
+
+    fn helper_registration_nonce(&self) -> &str {
+        &self.helper_registration_nonce
+    }
+
+    fn containment_owner(&self) -> &ClaudeContainmentOwnerBinding {
+        &self.containment_owner
+    }
+}
+
 impl ExternalCodexProfile {
     pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
         Self {
@@ -1594,6 +1777,7 @@ pub enum SideEffectConfinementProfile {
     StrictOfflineWorkspace(StrictOfflineWorkspaceProfile),
     TrustedFixedNetwork(TrustedFixedNetworkProfile),
     ExternalCodex(ExternalCodexProfile),
+    ExternalClaude(ExternalClaudeProfile),
     ExternalGrok(ExternalGrokProfile),
     /// Explicit legacy compatibility. Results are never publishable.
     TrustedCompatibility,
@@ -1607,6 +1791,7 @@ impl SideEffectConfinementProfile {
             }
             Self::TrustedFixedNetwork(_) => SideEffectConfinementProfileKind::TrustedFixedNetwork,
             Self::ExternalCodex(_) => SideEffectConfinementProfileKind::ExternalCodex,
+            Self::ExternalClaude(_) => SideEffectConfinementProfileKind::ExternalClaude,
             Self::ExternalGrok(_) => SideEffectConfinementProfileKind::ExternalGrok,
             Self::TrustedCompatibility => SideEffectConfinementProfileKind::TrustedCompatibility,
         }
@@ -1617,8 +1802,17 @@ impl SideEffectConfinementProfile {
             Self::StrictOfflineWorkspace(profile) => Some(&profile.config),
             Self::TrustedFixedNetwork(profile) => Some(&profile.config),
             Self::ExternalCodex(profile) => Some(&profile.config),
+            Self::ExternalClaude(profile) => Some(&profile.config),
             Self::ExternalGrok(profile) => Some(&profile.config),
             Self::TrustedCompatibility => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn external_claude(&self) -> Option<&ExternalClaudeProfile> {
+        match self {
+            Self::ExternalClaude(profile) => Some(profile),
+            _ => None,
         }
     }
 }
@@ -3027,6 +3221,72 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             "private runtime GROK_HOME requires private HOME and strict ExternalGrok confinement",
         ));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(profile) = spec.side_effects.external_claude() {
+        if spec.containment != ContainmentPolicy::Required || !spec.private_runtime_home {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude requires private HOME and strict containment",
+            ));
+        }
+        if profile.helper_registration_nonce().len() != 64
+            || !profile
+                .helper_registration_nonce()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude helper registration nonce is malformed",
+            ));
+        }
+        let carries_relay_endpoint = match &spec.environment {
+            EnvironmentMode::ClearAndSet(environment)
+            | EnvironmentMode::InheritAndSet(environment) => {
+                environment.contains_key("ANTHROPIC_BASE_URL")
+            }
+            EnvironmentMode::Inherit => false,
+        };
+        if carries_relay_endpoint && spec.pinned_direct.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude provider relay requires a pinned direct executable",
+            ));
+        }
+        validate_bounded_path(profile.parent_relay_socket(), "Claude parent relay socket")?;
+        let parent = profile.parent_relay_socket().parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Claude parent relay socket has no parent directory",
+            )
+        })?;
+        if !profile.parent_relay_socket().is_absolute()
+            || !profile
+                .config
+                .visible_read_only_roots
+                .iter()
+                .any(|root| parent == root)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Claude parent relay socket is outside its exact read-only relay directory",
+            ));
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(parent)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Claude parent relay directory is not private to the launch owner",
+            ));
+        }
+    }
     if let Some(request) = &spec.nested_usage {
         if request.parent_span_id.is_empty()
             || request.parent_span_id.len() > MAX_PROCESS_LABEL_BYTES
@@ -4261,6 +4521,36 @@ pub(crate) fn external_codex_systemd_properties_for_test(
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
     let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
         io::Error::other("external Codex test profile did not resolve a systemd sandbox")
+    })?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    Ok(command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn external_claude_systemd_properties_for_test(
+    profile: ExternalClaudeProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "external Claude systemd profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8 * 1024,
+    )
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalClaude(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
+        io::Error::other("external Claude test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
     apply_systemd_sandbox_properties(

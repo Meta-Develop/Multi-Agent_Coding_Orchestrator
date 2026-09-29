@@ -1271,8 +1271,11 @@ struct SandboxMountRegion {
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
     fn read_only_file_source(&self, target: &Path) -> PathBuf {
-        self.read_only_input_snapshots.iter().find(|pin| pin.path == target)
-            .map(input_snapshot::MountedInputSnapshot::source).unwrap_or_else(|| target.to_path_buf())
+        self.read_only_input_snapshots
+            .iter()
+            .find(|pin| pin.path == target)
+            .map(input_snapshot::MountedInputSnapshot::source)
+            .unwrap_or_else(|| target.to_path_buf())
     }
 
     fn exact_writable_file_parents(&self) -> BTreeSet<PathBuf> {
@@ -1332,8 +1335,7 @@ impl ResolvedSystemdSandbox {
             (Path::new("/run/user"), "ProtectHome=tmpfs"),
         ]
         .into_iter()
-        .find(|(root, _)| program.starts_with(root))
-        else {
+        .find(|(root, _)| program.starts_with(root)) else {
             return Ok(());
         };
         if self.explicitly_binds_program(program) {
@@ -1820,10 +1822,7 @@ fn inspect_sandbox_entry(path: &Path, root: &Path) -> std::io::Result<Option<fs:
 /// [`inspect_sandbox_entry`]: a child directory removed after it was listed yields
 /// `Ok(None)`; the scan root and every other error stay fail-closed.
 #[cfg(target_os = "linux")]
-fn enumerate_sandbox_directory(
-    path: &Path,
-    root: &Path,
-) -> std::io::Result<Option<fs::ReadDir>> {
+fn enumerate_sandbox_directory(path: &Path, root: &Path) -> std::io::Result<Option<fs::ReadDir>> {
     match fs::read_dir(path) {
         Ok(entries) => Ok(Some(entries)),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && path != root => Ok(None),
@@ -2624,9 +2623,15 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     }
 
     if spec.read_only_input_snapshots.len() > 8 {
-        return Err(std::io::Error::other("source input snapshot bound exceeded"));
+        return Err(std::io::Error::other(
+            "source input snapshot bound exceeded",
+        ));
     }
-    let read_only_input_snapshots = spec.read_only_input_snapshots.iter().map(ReadOnlyInputSnapshot::materialize).collect::<io::Result<Vec<_>>>()?;
+    let read_only_input_snapshots = spec
+        .read_only_input_snapshots
+        .iter()
+        .map(ReadOnlyInputSnapshot::materialize)
+        .collect::<io::Result<Vec<_>>>()?;
     let mut snapshot_paths = BTreeSet::new();
     for snapshot in &read_only_input_snapshots {
         if config.workspace_access != WorkspaceAccess::ReadOnly
@@ -2634,10 +2639,16 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
             || !snapshot.path.starts_with(&workspace_root)
             || !snapshot_paths.insert(&snapshot.path)
         {
-            return Err(std::io::Error::other("source snapshot lacks an exact read-only workspace capability"));
+            return Err(std::io::Error::other(
+                "source snapshot lacks an exact read-only workspace capability",
+            ));
         }
         snapshot.verify()?;
-        let check = mount_checks.iter_mut().find(|check| check.path == snapshot.path && check.access == SandboxMountAccess::ReadOnly)
+        let check = mount_checks
+            .iter_mut()
+            .find(|check| {
+                check.path == snapshot.path && check.access == SandboxMountAccess::ReadOnly
+            })
             .ok_or_else(|| std::io::Error::other("source snapshot has no verified mount check"))?;
         (check.device, check.inode) = snapshot.identity()?;
     }
@@ -2699,16 +2710,16 @@ fn canonical_sandbox_directory(path: &Path, label: &str) -> std::io::Result<Path
 
 #[cfg(target_os = "linux")]
 fn resolve_hidden_root(path: &Path, label: &str) -> std::io::Result<(PathBuf, bool)> {
-    match canonical_sandbox_directory(path, label) {
+    match canonical_hidden_root(path, label) {
         Ok(canonical) => {
             let optional = hidden_root_mask_is_optional(&canonical, true);
             Ok((canonical, optional))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            let normalized = normalized_absolute_sandbox_path(path, label)?;
+            let normalized = normalized_hidden_root_path(path, label)?;
             reject_symlink_ancestors_until_missing(&normalized, label)?;
             match fs::symlink_metadata(&normalized) {
-                Ok(_) => canonical_sandbox_directory(&normalized, label).map(|canonical| {
+                Ok(_) => canonical_hidden_root(&normalized, label).map(|canonical| {
                     let optional = hidden_root_mask_is_optional(&canonical, true);
                     (canonical, optional)
                 }),
@@ -2749,8 +2760,28 @@ fn hidden_root_mask_is_optional(root: &Path, host_path_exists: bool) -> bool {
 }
 
 #[cfg(target_os = "linux")]
-fn normalized_absolute_sandbox_path(path: &Path, label: &str) -> std::io::Result<PathBuf> {
-    validate_systemd_path_syntax(path, label)?;
+fn canonical_hidden_root(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_hidden_root_syntax(path, label)?;
+    reject_symlink_ancestors(path, label)?;
+    let canonical = fs::canonicalize(path).map_err(|error| {
+        std::io::Error::new(
+            error.kind(),
+            format!("failed to canonicalize {label} {}: {error}", path.display()),
+        )
+    })?;
+    if !canonical.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("{label} {} is not a directory", canonical.display()),
+        ));
+    }
+    validate_systemd_hidden_root_syntax(&canonical, label)?;
+    Ok(canonical)
+}
+
+#[cfg(target_os = "linux")]
+fn normalized_hidden_root_path(path: &Path, label: &str) -> std::io::Result<PathBuf> {
+    validate_systemd_hidden_root_syntax(path, label)?;
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -2772,7 +2803,7 @@ fn normalized_absolute_sandbox_path(path: &Path, label: &str) -> std::io::Result
             std::path::Component::Normal(component) => normalized.push(component),
         }
     }
-    validate_systemd_path_syntax(&normalized, label)?;
+    validate_systemd_hidden_root_syntax(&normalized, label)?;
     Ok(normalized)
 }
 
@@ -2844,6 +2875,27 @@ fn validate_systemd_path_syntax(path: &Path, label: &str) -> std::io::Result<()>
             std::io::ErrorKind::InvalidInput,
             format!(
                 "{label} contains whitespace or systemd path-list syntax that cannot be verified exactly: {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_systemd_hidden_root_syntax(path: &Path, label: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    if path
+        .as_os_str()
+        .as_bytes()
+        .iter()
+        .any(|byte| byte.is_ascii_control() || matches!(*byte, b':' | b'\\'))
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{label} contains control or systemd path-list syntax that cannot be verified exactly: {}",
                 path.display()
             ),
         ));
@@ -3089,6 +3141,14 @@ fn apply_systemd_sandbox_properties(
             "--property=RestrictAddressFamilies=AF_UNIX",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat socket socketpair socketcall",
         ]);
+    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalClaude {
+        command.args([
+            "--property=PrivateNetwork=yes",
+            // The contained relay helper owns one child-loopback listener and reaches only the
+            // parent-owned Unix socket. No host interface exists in this namespace.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET",
+            "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
+        ]);
     } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
         command.args([
             "--property=PrivateNetwork=no",
@@ -3161,7 +3221,8 @@ fn apply_systemd_sandbox_properties(
         } else {
             systemd_path_binding_property("BindReadOnlyPaths=", &source, file)
         };
-        command.arg(binding)
+        command
+            .arg(binding)
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
     }
     for root in &sandbox.visible_read_write_roots {
@@ -3247,7 +3308,12 @@ fn verify_systemd_sandbox_properties(
         require_effective_property(properties, name, |value| value == expected, expected)?;
     }
     for name in ["CapabilityBoundingSet", "AmbientCapabilities"] {
-        require_effective_property(properties, name, |value| value.is_empty(), "no capabilities")?;
+        require_effective_property(
+            properties,
+            name,
+            |value| value.is_empty(),
+            "no capabilities",
+        )?;
     }
     verify_system_call_error_number(property_value(properties, "SystemCallErrorNumber")?)?;
     require_effective_property(
@@ -3413,6 +3479,7 @@ fn verify_exact_systemd_path_properties(
         sandbox.kind,
         SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalClaude
             | SideEffectConfinementProfileKind::ExternalGrok
     ) && !sandbox.isolated_host_view
     {
@@ -3553,6 +3620,7 @@ fn verify_systemd_network_properties(
         SideEffectConfinementProfileKind::ExternalCodex => {
             BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6", "AF_NETLINK"])
         }
+        SideEffectConfinementProfileKind::ExternalClaude => BTreeSet::from(["AF_UNIX", "AF_INET"]),
         SideEffectConfinementProfileKind::ExternalGrok => {
             BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
         }
@@ -3570,7 +3638,11 @@ fn verify_systemd_network_properties(
             ),
         ));
     }
-    if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
+    if matches!(
+        kind,
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            | SideEffectConfinementProfileKind::ExternalClaude
+    ) {
         require_effective_property(properties, "PrivateNetwork", |value| value == "yes", "yes")?;
     } else {
         require_effective_property(properties, "PrivateNetwork", |value| value == "no", "no")?;
@@ -3783,11 +3855,13 @@ fn require_property_path(name: &str, value: &str, path: &Path) -> std::io::Resul
             format!("{name} path is not valid UTF-8: {}", path.display()),
         )
     })?;
-    let matches = value.split_whitespace().any(|entry| {
-        let entry = entry.strip_prefix('-').unwrap_or(entry);
-        let source = entry.split(':').next().unwrap_or(entry);
-        source == path
-    });
+    let matches = parse_systemd_string_array_property(name, value)?
+        .iter()
+        .any(|entry| {
+            let entry = entry.strip_prefix('-').unwrap_or(entry);
+            let source = entry.split(':').next().unwrap_or(entry);
+            source == path
+        });
     if matches {
         Ok(())
     } else {
@@ -3840,10 +3914,10 @@ fn verify_exact_property_paths(
     value: &str,
     expected: &BTreeSet<PathBuf>,
 ) -> std::io::Result<()> {
-    let actual = value
-        .split_whitespace()
+    let actual = parse_systemd_string_array_property(name, value)?
+        .into_iter()
         .map(|entry| {
-            let entry = entry.strip_prefix('-').unwrap_or(entry);
+            let entry = entry.strip_prefix('-').unwrap_or(&entry);
             PathBuf::from(entry.split(':').next().unwrap_or(entry))
         })
         .collect::<BTreeSet<_>>();
@@ -3857,6 +3931,92 @@ fn verify_exact_property_paths(
             ),
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_systemd_string_array_property(name: &str, value: &str) -> std::io::Result<Vec<String>> {
+    // systemctl v255 prints D-Bus `as` values with shell_maybe_quote(), one item at a time.
+    // Mount bindings use a different raw tuple printer and intentionally stay on the strict
+    // whitespace-free parse_property_bindings() path above.
+    fn invalid(name: &str, message: &str) -> std::io::Error {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("effective {name} used malformed systemctl string-array quoting: {message}"),
+        )
+    }
+
+    let bytes = value.as_bytes();
+    let mut entries = Vec::new();
+    let mut offset = 0;
+    while offset < bytes.len() {
+        while offset < bytes.len() && bytes[offset].is_ascii_whitespace() {
+            offset += 1;
+        }
+        if offset == bytes.len() {
+            break;
+        }
+
+        let mut entry = Vec::new();
+        if bytes[offset] == b'"' {
+            offset += 1;
+            let mut closed = false;
+            while offset < bytes.len() {
+                match bytes[offset] {
+                    b'"' => {
+                        offset += 1;
+                        closed = true;
+                        break;
+                    }
+                    b'\\' => {
+                        offset += 1;
+                        let escaped = *bytes
+                            .get(offset)
+                            .ok_or_else(|| invalid(name, "trailing escape"))?;
+                        if !matches!(escaped, b'\\' | b'"' | b'$' | b'`') {
+                            return Err(invalid(name, "unsupported escape"));
+                        }
+                        entry.push(escaped);
+                        offset += 1;
+                    }
+                    byte if byte.is_ascii_control() => {
+                        return Err(invalid(name, "control byte in quoted item"));
+                    }
+                    byte => {
+                        entry.push(byte);
+                        offset += 1;
+                    }
+                }
+            }
+            if !closed {
+                return Err(invalid(name, "unterminated quoted item"));
+            }
+            if offset < bytes.len() && !bytes[offset].is_ascii_whitespace() {
+                return Err(invalid(name, "quoted item followed by non-whitespace"));
+            }
+        } else {
+            while offset < bytes.len() && !bytes[offset].is_ascii_whitespace() {
+                match bytes[offset] {
+                    b'"' | b'\'' | b'\\' => {
+                        return Err(invalid(name, "unexpected quote or escape in unquoted item"));
+                    }
+                    byte if byte.is_ascii_control() => {
+                        return Err(invalid(name, "control byte in unquoted item"));
+                    }
+                    byte => {
+                        entry.push(byte);
+                        offset += 1;
+                    }
+                }
+            }
+        }
+        let entry =
+            String::from_utf8(entry).map_err(|_| invalid(name, "item was not valid UTF-8"))?;
+        if entry.is_empty() {
+            return Err(invalid(name, "empty path item"));
+        }
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 #[cfg(target_os = "linux")]

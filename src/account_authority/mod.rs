@@ -8,12 +8,16 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod authority_socket_config;
 #[cfg(target_os = "linux")]
+pub(crate) mod claude;
+#[cfg(target_os = "linux")]
 pub(crate) mod grok;
 #[cfg(target_os = "linux")]
 pub(crate) mod socket_client;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const GROK_CLI_PROVIDER_ID: &str = "grok-cli";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const CLAUDE_CODE_PROVIDER_ID: &str = "claude-code";
 
 /// Non-secret selected binding recorded on MACO execution evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -37,6 +41,56 @@ pub(crate) struct FrozenGrokSelectedBinding {
     pub account_id: String,
     pub account_incarnation: String,
     pub selection_revision: u64,
+}
+
+/// Frozen selected Claude binding admitted for selector observation and launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct FrozenClaudeSelectedBinding {
+    pub authority_id: Option<String>,
+    pub provider_id: String,
+    pub account_id: String,
+    pub account_incarnation: String,
+    pub selection_revision: u64,
+}
+
+impl FrozenClaudeSelectedBinding {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_selected_binding(
+        authority_id: Option<String>,
+        binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
+    ) -> Self {
+        Self {
+            authority_id,
+            provider_id: binding.provider_id.clone(),
+            account_id: binding.account_id.clone(),
+            account_incarnation: binding.account_incarnation.clone(),
+            selection_revision: binding.selection_revision,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn to_selected_binding(
+        &self,
+    ) -> coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+        coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+            provider_id: self.provider_id.clone(),
+            account_id: self.account_id.clone(),
+            account_incarnation: self.account_incarnation.clone(),
+            selection_revision: self.selection_revision,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn matches_selected_binding(
+        &self,
+        binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
+    ) -> bool {
+        self.provider_id == binding.provider_id
+            && self.account_id == binding.account_id
+            && self.account_incarnation == binding.account_incarnation
+            && self.selection_revision == binding.selection_revision
+    }
 }
 
 impl FrozenGrokSelectedBinding {
@@ -104,6 +158,10 @@ static FROZEN_GROK_SELECTION: Mutex<Option<FrozenGrokSelectedBinding>> = Mutex::
 static GROK_RUN_ACCOUNT_BINDINGS: Mutex<BTreeMap<String, FrozenGrokSelectedBinding>> =
     Mutex::new(BTreeMap::new());
 
+/// Production-contract store of admitted Claude bindings keyed by supervisor run id.
+static CLAUDE_RUN_ACCOUNT_BINDINGS: Mutex<BTreeMap<String, FrozenClaudeSelectedBinding>> =
+    Mutex::new(BTreeMap::new());
+
 /// Record or clear the Grok binding admitted from selector observation for one run.
 #[cfg(target_os = "linux")]
 pub(crate) fn record_observed_grok_selection(
@@ -122,6 +180,66 @@ pub(crate) fn record_observed_grok_selection(
         admit_grok_run_account_binding(run_id, frozen.clone());
     }
     frozen
+}
+
+/// Record or clear the Claude binding admitted from selector observation for one run.
+#[cfg(target_os = "linux")]
+pub(crate) fn record_observed_claude_selection(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+) -> Option<FrozenClaudeSelectedBinding> {
+    if provider_id != CLAUDE_CODE_PROVIDER_ID {
+        return None;
+    }
+    let frozen = binding
+        .map(|binding| FrozenClaudeSelectedBinding::from_selected_binding(authority_id, binding));
+    if let Some(run_id) = run_id {
+        admit_claude_run_account_binding(run_id, frozen.clone());
+    }
+    frozen
+}
+
+pub(crate) fn admit_claude_run_account_binding(
+    run_id: &str,
+    frozen: Option<FrozenClaudeSelectedBinding>,
+) -> Option<FrozenClaudeSelectedBinding> {
+    let mut slots = CLAUDE_RUN_ACCOUNT_BINDINGS
+        .lock()
+        .expect("Claude run account binding lock");
+    match frozen {
+        Some(frozen) => {
+            slots.insert(run_id.to_string(), frozen.clone());
+            Some(frozen)
+        }
+        None => {
+            slots.remove(run_id);
+            None
+        }
+    }
+}
+
+pub(crate) fn claude_run_account_binding(run_id: &str) -> Option<FrozenClaudeSelectedBinding> {
+    CLAUDE_RUN_ACCOUNT_BINDINGS
+        .lock()
+        .expect("Claude run account binding lock")
+        .get(run_id)
+        .cloned()
+}
+
+pub(crate) fn require_carried_claude_launch_binding(
+    carried: Option<&FrozenClaudeSelectedBinding>,
+    cam_socket_configured: bool,
+) -> Result<Option<&FrozenClaudeSelectedBinding>> {
+    carried.map(Some).ok_or_else(|| {
+        let message = if cam_socket_configured {
+            "no frozen Claude selection binding from Coding Agent Manager authority socket observation"
+        } else {
+            "no frozen Claude selection binding from Coding Agent Manager registry observation"
+        };
+        anyhow!(message)
+    })
 }
 
 /// Admit or clear the immutable Grok binding for one supervisor run id.
@@ -219,6 +337,8 @@ impl Drop for FrozenGrokSelectionGuard {
 }
 
 pub(crate) use authority_socket_config::configured_cam_authority_socket;
+#[cfg(target_os = "linux")]
+pub(crate) use claude::ClaudeLaunchAuthority;
 #[cfg(target_os = "linux")]
 pub(crate) use grok::GrokLaunchAuthority;
 #[cfg(all(test, target_os = "linux"))]

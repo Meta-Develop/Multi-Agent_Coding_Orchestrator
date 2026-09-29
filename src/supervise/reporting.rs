@@ -1948,6 +1948,10 @@ pub(super) fn external_process_completed(
             || run.authenticated_codex_evidence().is_none_or(|evidence| {
                 !evidence.model_mismatch && run.authenticated_codex_usage().is_some()
             }))
+        && (runtime != SupervisorRuntime::ClaudeCode
+            || (run.authenticated_claude_usage_complete()
+                && run.authenticated_claude_model().is_some()
+                && !run.stdout.raw_capture_truncated()))
         && run
             .authenticated_app_server_evidence()
             .is_none_or(|evidence| {
@@ -2497,5 +2501,81 @@ mod grok_stream_usage_evidence {
             value["grok_stream_usage_evidence"]["status"],
             serde_json::json!("native")
         );
+    }
+
+    #[test]
+    fn claude_completion_refuses_private_evidence_without_whole_call_witness() {
+        let command = ExternalAgentCommand::codex(
+            "claude",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            RuntimeId::ClaudeCode,
+            RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+        );
+        let mut external_run = ExternalAgentRun {
+            command: vec!["claude".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            )),
+            side_effects: Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            )),
+            publishable: true,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: Some(b"done".to_vec()),
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
+        };
+        let stream = [
+            serde_json::json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"observed-claude-model","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+            serde_json::json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"observed-claude-model"}}),
+            serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"done","modelUsage":{"observed-claude-model":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+        external_run.set_claude_native_stream_for_test(&stream, false, false);
+        assert!(!external_process_completed(
+            &external_run,
+            SupervisorRuntime::ClaudeCode
+        ));
+        assert!(external_run
+            .authenticated_claude_usage_lower_bound()
+            .is_some());
+
+        let restored: ExternalAgentRun = serde_json::from_value(
+            serde_json::to_value(&external_run).expect("serialize live Claude run"),
+        )
+        .expect("deserialize public Claude run");
+        assert!(!external_process_completed(
+            &restored,
+            SupervisorRuntime::ClaudeCode
+        ));
+
+        external_run.set_claude_native_stream_for_test(&stream, false, true);
+        assert!(!external_process_completed(
+            &external_run,
+            SupervisorRuntime::ClaudeCode
+        ));
     }
 }

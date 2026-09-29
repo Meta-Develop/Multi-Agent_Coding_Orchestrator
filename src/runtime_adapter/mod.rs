@@ -6,6 +6,7 @@
 //! runtime selection a vendor enum again.
 
 mod capabilities;
+pub(crate) mod claude;
 pub mod cursor;
 pub mod gemini;
 pub mod grok;
@@ -518,17 +519,9 @@ impl RuntimeAdapterConfig {
                 true,
             ),
             AdapterId::ClaudeCode => (
-                vec![
-                    "-p".into(),
-                    "--output-format".into(),
-                    "json".into(),
-                    "--model".into(),
-                    "{model}".into(),
-                    "--effort".into(),
-                    "{effort}".into(),
-                ],
-                // claude --print writes the JSON envelope to stdout; there is no
-                // --output file flag and no --cwd flag. Prompt text is fed on stdin.
+                claude::immutable_argument_template(),
+                // The pinned fresh bare Worker emits raw stream-json on stdout.
+                // Prompt text is fed on stdin and cwd remains process-owned.
                 OutputCaptureMode::Stdout,
                 true,
             ),
@@ -546,8 +539,13 @@ impl RuntimeAdapterConfig {
             ),
             AdapterId::Codex | AdapterId::Fake => (Vec::new(), OutputCaptureMode::default(), false),
         };
+        let binary = if adapter == AdapterId::ClaudeCode {
+            claude::CLAUDE_NATIVE_EXECUTABLE
+        } else {
+            adapter.default_binary()
+        };
         Self {
-            binary: Some(PathBuf::from(adapter.default_binary())),
+            binary: Some(PathBuf::from(binary)),
             argument_template: template,
             env_passthrough: Vec::new(),
             working_dir_flag: None,
@@ -590,10 +588,14 @@ impl RuntimeAdapterConfig {
         lookup: impl Fn(&str) -> Result<String, env::VarError>,
     ) -> Result<Self> {
         let mut config = Self::load_adapter_environment(adapter, &lookup);
-        if adapter == AdapterId::Grok {
-            config.grok_interaction_protocol =
-                grok_interaction_protocol_from_operator_env(&lookup)?;
-            config.restore_immutable_grok_descriptor();
+        match adapter {
+            AdapterId::Grok => {
+                config.grok_interaction_protocol =
+                    grok_interaction_protocol_from_operator_env(&lookup)?;
+                config.restore_immutable_grok_descriptor();
+            }
+            AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            _ => {}
         }
         Ok(config)
     }
@@ -631,14 +633,16 @@ impl RuntimeAdapterConfig {
         if let Ok(stdin) = lookup(&format!("{prefix}_STDIN_PROMPT")) {
             config.feed_prompt_on_stdin = matches!(stdin.as_str(), "1" | "true" | "stdin");
         }
-        if adapter == AdapterId::Grok {
-            config.restore_immutable_grok_descriptor();
+        match adapter {
+            AdapterId::Grok => config.restore_immutable_grok_descriptor(),
+            AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            _ => {}
         }
         config
     }
 
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
-        if adapter == AdapterId::Grok {
+        if matches!(adapter, AdapterId::Grok | AdapterId::ClaudeCode) {
             return;
         }
         self.argument_template = args.split_whitespace().map(str::to_string).collect();
@@ -656,6 +660,24 @@ impl RuntimeAdapterConfig {
         self.working_dir_flag = None;
         self.output_capture = OutputCaptureMode::Stdout;
         self.feed_prompt_on_stdin = false;
+    }
+
+    fn restore_immutable_claude_descriptor(&mut self) {
+        self.binary = Some(PathBuf::from(claude::CLAUDE_NATIVE_EXECUTABLE));
+        self.argument_template = claude::immutable_argument_template();
+        self.env_passthrough.clear();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = true;
+    }
+
+    /// Prove one exact fresh bare Claude managed-Worker invocation. This does
+    /// not alter the static Claude capability row or admit primary writes.
+    pub(crate) fn claude_managed_launch_contract(
+        &self,
+        context: &LaunchContext<'_>,
+    ) -> Option<claude::ClaudeManagedLaunchContract> {
+        claude::prove_managed_launch(self, context)
     }
 
     pub const fn grok_interaction_protocol(&self) -> GrokInteractionProtocol {
@@ -1110,7 +1132,7 @@ fn denied_passthrough_env_reason(name: &str) -> Option<&'static str> {
         | "RUSTC_WORKSPACE_WRAPPER"
         | "GIT_EXEC_PATH"
         | "GIT_TEMPLATE_DIR" => Some("shell-startup or interpreter code-loading hook"),
-        "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
+        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
             Some("credential name tracked by the redactor")
         }
         _ => None,
@@ -1759,26 +1781,21 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_match_print_json_and_feed_prompt_on_stdin() -> Result<()> {
+    fn claude_defaults_match_contained_native_worker_and_feed_prompt_on_stdin() -> Result<()> {
         let adapter = ClaudeCodeAdapter::from_environment();
         assert_eq!(adapter.adapter_id(), AdapterId::ClaudeCode);
         assert_eq!(adapter.capabilities(), RuntimeCapabilities::CLAUDE_CODE);
         assert!(!adapter.capabilities().admits_writable_release());
         let config = adapter.config();
-        assert_eq!(config.binary_path(), Path::new("claude"));
+        assert_eq!(
+            config.binary_path(),
+            Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+        );
         assert_eq!(config.output_capture, OutputCaptureMode::Stdout);
         assert!(config.feed_prompt_on_stdin);
         assert_eq!(
             config.argument_template,
-            [
-                "-p",
-                "--output-format",
-                "json",
-                "--model",
-                "{model}",
-                "--effort",
-                "{effort}",
-            ]
+            claude::immutable_argument_template()
         );
 
         let spec = config.render(&launch_context(
@@ -1793,7 +1810,18 @@ mod tests {
             [
                 "-p",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--bare",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--tools",
+                "Read,Glob,Grep,Edit,Write",
+                "--allowedTools",
+                "Read,Glob,Grep,Edit,Write",
                 "--model",
                 "sonnet",
                 "--effort",
@@ -1804,6 +1832,21 @@ mod tests {
             .argv
             .iter()
             .any(|arg| arg == "--output" || arg == "--cwd"));
+        for forbidden in [
+            "--resume",
+            "--continue",
+            "--add-dir",
+            "--plugin-dir",
+            "--permission-mode",
+            "Agent",
+            "Task",
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(!spec.argv.iter().any(|argument| argument == forbidden));
+        }
+        assert!(config.env_passthrough.is_empty());
         Ok(())
     }
 
@@ -2235,7 +2278,11 @@ mod tests {
             assert_eq!(adapter.capabilities(), id.capabilities());
             assert_eq!(
                 adapter.config().binary_path(),
-                Path::new(id.default_binary())
+                if id == AdapterId::ClaudeCode {
+                    Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+                } else {
+                    Path::new(id.default_binary())
+                }
             );
             assert!(
                 !adapter.capabilities().admits_writable_release(),
@@ -2252,7 +2299,14 @@ mod tests {
     fn shared_conformance_suite_covers_every_known_adapter() -> Result<()> {
         for adapter in AdapterId::ALL {
             let config = RuntimeAdapterConfig::defaults_for(adapter);
-            assert_eq!(config.binary_path(), Path::new(adapter.default_binary()));
+            assert_eq!(
+                config.binary_path(),
+                if adapter == AdapterId::ClaudeCode {
+                    Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+                } else {
+                    Path::new(adapter.default_binary())
+                }
+            );
             assert!(
                 adapter.capabilities().writable_refusal().is_some(),
                 "{adapter} must refuse primary-writable release until a hosted All-callback exists"
@@ -2283,7 +2337,14 @@ mod tests {
                 Path::new("/tmp/work"),
                 Path::new("out.txt"),
             ))?;
-            assert_eq!(spec.program, PathBuf::from(adapter.default_binary()));
+            assert_eq!(
+                spec.program,
+                PathBuf::from(if adapter == AdapterId::ClaudeCode {
+                    claude::CLAUDE_NATIVE_EXECUTABLE
+                } else {
+                    adapter.default_binary()
+                })
+            );
             assert_eq!(spec.cwd, PathBuf::from("/tmp/work"));
         }
         Ok(())
@@ -2371,6 +2432,14 @@ mod tests {
             &[
                 "--print",
                 "--output-format",
+                "--verbose",
+                "--include-partial-messages",
+                "--bare",
+                "--setting-sources",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--tools",
+                "--allowedTools",
                 "--model",
                 "--effort",
                 "--resume",
@@ -2455,7 +2524,7 @@ mod tests {
             return;
         }
         assert_claude_help_contract(
-            &require_installed_cli_help("claude"),
+            &require_installed_cli_help(claude::CLAUDE_NATIVE_EXECUTABLE),
             "installed claude help",
         );
     }

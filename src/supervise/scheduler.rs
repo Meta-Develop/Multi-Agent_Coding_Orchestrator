@@ -4133,13 +4133,25 @@ fn account_observation_for_launch_runtime(
                     crate::account_authority::record_observed_grok_selection(
                         run_id,
                         provider_id,
-                        Some(observed.authority_id),
+                        Some(observed.authority_id.clone()),
+                        Some(&observed.observation.binding),
+                    );
+                    crate::account_authority::record_observed_claude_selection(
+                        run_id,
+                        provider_id,
+                        Some(observed.authority_id.clone()),
                         Some(&observed.observation.binding),
                     );
                     Some(observed.observation)
                 }
                 None => {
                     crate::account_authority::record_observed_grok_selection(
+                        run_id,
+                        provider_id,
+                        None,
+                        None,
+                    );
+                    crate::account_authority::record_observed_claude_selection(
                         run_id,
                         provider_id,
                         None,
@@ -4175,6 +4187,55 @@ fn freeze_observed_grok_from_registry(
         observation.map(|_| authority_id_for(registry.metadata_path())),
         observation.map(|observation| &observation.binding),
     );
+    crate::account_authority::record_observed_claude_selection(
+        run_id,
+        provider_id,
+        observation.map(|_| authority_id_for(registry.metadata_path())),
+        observation.map(|observation| &observation.binding),
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_selected_claude_launch_binding(run_id: Option<&str>) -> Result<()> {
+    const PROVIDER: &str = crate::account_authority::CLAUDE_CODE_PROVIDER_ID;
+    if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+        let selected = crate::account_authority::selected_binding_via_authority_socket(
+            &socket_path,
+            PROVIDER,
+        )?;
+        match selected {
+            Some((authority_id, binding)) => {
+                crate::account_authority::record_observed_claude_selection(
+                    run_id,
+                    PROVIDER,
+                    Some(authority_id),
+                    Some(&binding),
+                );
+            }
+            None => {
+                crate::account_authority::record_observed_claude_selection(
+                    run_id, PROVIDER, None, None,
+                );
+            }
+        }
+        return Ok(());
+    }
+    let data_dir = project_dirs()
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .context("Coding Agent Manager data directory is unavailable")?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+    let binding = registry
+        .selected_binding(PROVIDER)
+        .context("failed to read selected Coding Agent Manager Claude account")?;
+    crate::account_authority::record_observed_claude_selection(
+        run_id,
+        PROVIDER,
+        binding
+            .as_ref()
+            .map(|_| authority_id_for(registry.metadata_path())),
+        binding.as_ref(),
+    );
+    Ok(())
 }
 
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
@@ -4227,6 +4288,14 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             )?;
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
+                #[cfg(target_os = "linux")]
+                if plan
+                    .assignments
+                    .iter()
+                    .any(|assignment| assignment.runtime == Some(SupervisorRuntime::ClaudeCode))
+                {
+                    freeze_selected_claude_launch_binding(current_run.map(RunId::as_str))?;
+                }
             }
             Ok(resolution)
         }

@@ -889,6 +889,7 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
             program_identity: &identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
     Ok((report, workspace, temp))
@@ -4458,7 +4459,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         inode: 2,
         bytes: auth_bytes,
     };
-    let redactor = CredentialRedactor::from_runtime(&environment, Some(&auth))?;
+    let redactor = CredentialRedactor::from_runtime(&environment, Some(&auth), None)?;
     let output = format!(
         "raw={environment_secret} escaped={} auth={auth_secret}",
         serde_json::to_string(environment_secret)?
@@ -4494,7 +4495,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: oversized_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth), None)
             .expect_err("oversized redaction pattern set must fail closed")
             .to_string()
             .contains("fixed count or aggregate-byte safety bound")
@@ -4511,7 +4512,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: short_auth_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&short_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&short_auth), None)
             .expect_err("short credential-bearing auth value must fail closed")
             .to_string()
             .contains("shorter than the safe redaction bound")
@@ -4528,7 +4529,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: opaque_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&opaque_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&opaque_auth), None)
             .expect_err("opaque oversized auth must fail closed")
             .to_string()
             .contains("not valid JSON for bounded redaction")
@@ -4554,6 +4555,7 @@ fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<(
     let secret = "private-staging-secret-value-31";
     let redactor = CredentialRedactor::from_runtime(
         &BTreeMap::from([("OPENAI_API_KEY".to_string(), secret.to_string())]),
+        None,
         None,
     )?;
 
@@ -6674,6 +6676,7 @@ fn record_verified_acp_publication(
             program_identity: &program_identity,
             grok_acp_parent_evidence: Some(evidence),
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
     Ok(report)
@@ -7405,6 +7408,353 @@ fn writable_grok_confinement(
             side_effect_confinement,
         },
     }
+}
+
+fn selected_writable_claude_command(temp: &Path) -> Result<ExternalAgentCommand> {
+    let workspace = temp.join("claude-worker");
+    let incoming = temp.join("incoming");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&incoming)?;
+    let program = PathBuf::from(crate::runtime_adapter::claude::CLAUDE_NATIVE_EXECUTABLE);
+    let prompt = temp.join("prompt.md");
+    fs::write(&prompt, b"bounded Claude task\n")?;
+    ExternalAgentCommand::codex(
+        &program,
+        &workspace,
+        &prompt,
+        temp.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    )
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_writable_runtime_selection("claude-worker", RuntimeId::ClaudeCode, true)
+    .map(|command| {
+        command.with_claude_run_account_binding(Some(FrozenClaudeSelectedBinding {
+            authority_id: Some("test-claude-authority".to_string()),
+            provider_id: crate::account_authority::CLAUDE_CODE_PROVIDER_ID.to_string(),
+            account_id: "test-claude-account".to_string(),
+            account_incarnation: "test-claude-incarnation".to_string(),
+            selection_revision: 1,
+        }))
+    })
+}
+
+fn writable_claude_confinement() -> WorktreeWritableAdmission {
+    WorktreeWritableAdmission {
+        version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+        assignment_id: "claude-worker".to_string(),
+        attempt: 1,
+        target: WritableLaunchTarget::ManagedChildWorktree,
+        worktree: ManagedWorktreeAdmission {
+            kind: ManagedWorktreeAdmissionKind::ManagedDisposable,
+            worktree_id: "claude-worker".to_string(),
+        },
+        claims: HeldPathClaimsAdmission {
+            state: HeldPathClaimsAdmissionState::Held,
+            token: 11,
+            paths: vec![PathBuf::from("bounded-result.txt")],
+        },
+        native_sandbox: NativeSandboxAdmission {
+            runtime: RuntimeId::ClaudeCode,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            side_effect_confinement: SideEffectConfinement::Verified,
+        },
+    }
+}
+
+fn exact_claude_native_stream() -> Vec<u8> {
+    [
+        serde_json::json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+        serde_json::json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"claude-sonnet-4-6"}}),
+        serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"native final","modelUsage":{"claude-sonnet-4-6":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+    ]
+    .into_iter()
+    .map(|value| serde_json::to_string(&value).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+    .into_bytes()
+}
+
+#[test]
+fn writable_claude_qualification_is_invocation_bound_and_refuses_drift_and_primary() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let arbitrary_program = temp.path().join("operator-claude");
+    fs::write(&arbitrary_program, b"operator-supplied-executable")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&arbitrary_program, fs::Permissions::from_mode(0o700))?;
+    }
+    let arbitrary = ExternalAgentCommand::codex(
+        &arbitrary_program,
+        temp.path(),
+        temp.path().join("arbitrary-prompt"),
+        temp.path().join("arbitrary-events"),
+        temp.path().join("arbitrary-output"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    );
+    assert!(arbitrary
+        .with_writable_runtime_selection("claude-worker", RuntimeId::ClaudeCode, true)
+        .unwrap_err()
+        .to_string()
+        .contains(WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED));
+
+    let _identity = inject_admitted_claude_identity_for_test();
+    let selected = selected_writable_claude_command(temp.path())?;
+    assert_eq!(
+        selected.current_claude_writable_contract()?.auth_mode(),
+        ClaudeAuthMode::BareApiKey
+    );
+    let admitted = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_claude_confinement());
+    assert!(admitted
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)?
+        .admits_worktree_writable());
+    let ledger =
+        crate::supervise_budget::RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_tokens: Some(50_000),
+            ..Default::default()
+        })?;
+    let crate::supervise_budget::BudgetAdmission::Admitted { reservation, .. } =
+        ledger.reserve(crate::supervise_budget::BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Worker,
+            tokens: 10_000,
+            cost_usd: Some(5.0),
+        })?
+    else {
+        bail!("Claude reservation fixture was refused")
+    };
+    let mut reservation_bound = admitted.clone();
+    reservation_bound
+        .bind_claude_managed_reservation(
+            reservation.id.get(),
+            ledger.live_token_grant(reservation.id)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+    let oauth_argv = runtime_adapter_argv(&reservation_bound)?;
+    assert!(!oauth_argv
+        .iter()
+        .any(|argument| argument == OsStr::new("--bare")));
+    assert!(reservation_bound
+        .verified_claude_managed_reservation()
+        .map_err(anyhow::Error::msg)?
+        .is_some());
+    reservation_bound.timeout = reservation_bound
+        .timeout
+        .saturating_add(Duration::from_secs(1));
+    assert!(reservation_bound
+        .verified_claude_managed_reservation()
+        .is_err());
+
+    let no_hard_ledger =
+        crate::supervise_budget::RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_cost_usd: Some(10.0),
+            ..Default::default()
+        })?;
+    let crate::supervise_budget::BudgetAdmission::Admitted {
+        reservation: no_hard_reservation,
+        ..
+    } = no_hard_ledger.reserve(crate::supervise_budget::BudgetReservationRequest {
+        role: crate::supervise::AgentRole::Worker,
+        tokens: 10_000,
+        cost_usd: Some(5.0),
+    })?
+    else {
+        bail!("Claude no-hard-token reservation fixture was refused")
+    };
+    let mut no_hard_bound = admitted.clone();
+    let no_hard_grant = no_hard_ledger.live_token_grant(no_hard_reservation.id)?;
+    assert!(no_hard_grant.is_none());
+    no_hard_bound
+        .bind_claude_managed_reservation(no_hard_reservation.id.get(), no_hard_grant)
+        .map_err(anyhow::Error::msg)?;
+    assert!(no_hard_bound
+        .verified_claude_managed_reservation()
+        .map_err(anyhow::Error::msg)?
+        .is_none());
+
+    let mut missing_account_binding = admitted.clone().with_claude_run_account_binding(None);
+    assert!(missing_account_binding
+        .bind_claude_managed_reservation(no_hard_reservation.id.get(), None)
+        .unwrap_err()
+        .contains("no frozen selected CAM account binding"));
+
+    let mut argv_drift = admitted.clone();
+    argv_drift
+        .runtime_adapter
+        .as_mut()
+        .unwrap()
+        .argument_template
+        .push("--resume".to_string());
+    assert!(argv_drift
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)
+        .unwrap_err()
+        .to_string()
+        .contains(WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE));
+
+    let mut arbitrary_program = admitted.clone();
+    arbitrary_program.program = temp.path().join("operator-claude");
+    fs::write(&arbitrary_program.program, b"operator-supplied-executable")?;
+    assert!(arbitrary_program
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)
+        .is_err());
+
+    let primary = selected.with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    assert!(primary
+        .selected_writable_capabilities(RuntimeId::ClaudeCode, Some("claude-worker"))
+        .is_err());
+    assert_eq!(
+        RuntimeId::ClaudeCode
+            .capabilities()
+            .blocking_pre_action_callback,
+        crate::runtime_adapter::BlockingPreActionCallback::None
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_does_not_deserialize(
+) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let _identity = inject_admitted_claude_identity_for_test();
+    let command = selected_writable_claude_command(temp.path())?;
+    let stream = exact_claude_native_stream();
+    assert_eq!(
+        runtime_adapter_captured_output(&command, &stream, b"generic stderr", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"native final".to_vec())
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&command, &stream, b"generic stderr", false)?,
+        RuntimeAdapterCapturedOutput::Unavailable
+    );
+    let evidence = crate::runtime_adapter::claude::collect_native_stream(&stream, false);
+    assert!(!evidence.complete());
+    assert!(evidence.usage_lower_bound().is_some());
+    let mut run = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["claude".to_string()],
+        false,
+        "fixture".to_string(),
+    );
+    run.stdout.run_metadata.claude_native_evidence = Some(evidence);
+    assert_eq!(run.authenticated_claude_model(), Some("claude-sonnet-4-6"));
+    let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
+    assert!(restored.authenticated_claude_native_evidence().is_none());
+    assert!(restored.authenticated_claude_usage().is_none());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_profile_masks_native_and_wsl_managed_policy_before_target_start() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let incoming = temp.path().join("incoming");
+    let managed_root = temp.path().join("managed-claude-root");
+    let child_config_home = temp.path().join("child-claude-config");
+    let relay_directory = temp.path().join("claude-relay");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&incoming)?;
+    fs::create_dir_all(&managed_root)?;
+    fs::create_dir_all(&child_config_home)?;
+    fs::create_dir_all(&relay_directory)?;
+    fs::set_permissions(&relay_directory, fs::Permissions::from_mode(0o700))?;
+    let parent_relay_socket = relay_directory.join("relay.sock");
+    let program = fs::canonicalize("/bin/true")?;
+    let command = ExternalAgentCommand::codex(
+        &program,
+        &workspace,
+        temp.path().join("prompt"),
+        temp.path().join("events"),
+        incoming.join("report"),
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    );
+    let properties = selected_claude_systemd_properties_for_test(
+        &command,
+        &child_config_home,
+        &managed_root,
+        &parent_relay_socket,
+        1,
+    )?;
+    let child_config_home = fs::canonicalize(child_config_home)?;
+    let managed_root = fs::canonicalize(managed_root)?;
+    assert!(properties
+        .iter()
+        .any(|property| property == "--property=PrivateNetwork=yes"));
+    assert!(properties
+        .iter()
+        .any(|property| { property == "--property=RestrictAddressFamilies=AF_UNIX AF_INET" }));
+    assert!(properties.iter().any(|property| {
+        property == &format!("--property=BindPaths={}", child_config_home.display())
+            || property == &format!("--property=BindPaths=\"{}\"", child_config_home.display())
+    }));
+    assert!(properties.iter().any(|property| {
+        property == &format!("--property=InaccessiblePaths={}", managed_root.display())
+            || property
+                == &format!(
+                    "--property=InaccessiblePaths=\"{}\"",
+                    managed_root.display()
+                )
+    }));
+    assert!(!properties.iter().any(|property| {
+        property == &format!("--property=BindPaths={}", managed_root.display())
+            || property == &format!("--property=BindPaths=\"{}\"", managed_root.display())
+    }));
+    for root in CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS {
+        let required = format!("--property=InaccessiblePaths={root}");
+        let optional = format!("--property=InaccessiblePaths=-{root}");
+        let quoted_required = format!("--property=InaccessiblePaths=\"{root}\"");
+        let quoted_optional = format!("--property=InaccessiblePaths=\"-{root}\"");
+        assert!(
+            properties.iter().any(|property| property == &required
+                || property == &optional
+                || property == &quoted_required
+                || property == &quoted_optional),
+            "missing mandatory Claude policy mask for {root}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_bare_auth_accepts_only_the_api_key_source() {
+    let oauth_only = BTreeMap::from([(
+        "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "oauth-is-not-bare-api-authority".to_string(),
+    )]);
+    assert!(!claude_bare_api_key_present(&oauth_only));
+    let api_key = BTreeMap::from([(
+        "ANTHROPIC_API_KEY".to_string(),
+        "fixture-api-key-with-bounded-length".to_string(),
+    )]);
+    assert!(claude_bare_api_key_present(&api_key));
 }
 
 #[test]
@@ -8255,6 +8605,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 program_identity: &program_identity,
                 grok_acp_parent_evidence: None,
                 grok_acp_launch_schema_identity: None,
+                claude_broker_witness: None,
             },
         );
         Ok(report)
@@ -8822,6 +9173,7 @@ fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Res
     let mut environment = allowed_env(
         ExternalAgentInvocation::Grok,
         ExternalProgramTrust::ExplicitCustom,
+        false,
     );
     insert_admitted_grok_home_environment(&mut environment, &credentials)?;
     assert_eq!(
@@ -8982,6 +9334,7 @@ fn grok_missing_symlinked_and_replaced_auth_fail_typed_without_disclosure() -> R
             "GROK_HOME".to_string(),
             sensitive_home.display().to_string(),
         )]),
+        None,
         None,
     )?;
     let redacted_release_error = redactor.redact_string(&format!("{release_gate_error}"));
@@ -9378,6 +9731,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
             program_identity: &program_identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
 
@@ -9647,6 +10001,7 @@ fn explicit_custom_environment_never_receives_provider_credentials() {
     let environment = allowed_env(
         ExternalAgentInvocation::CodexSupervisor,
         ExternalProgramTrust::ExplicitCustom,
+        false,
     );
     for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
         assert!(
@@ -12465,7 +12820,7 @@ fn assignment_messaging_token_is_redacted_from_runtime_output() -> Result<()> {
     let token = environment
         .get(MACO_MESSAGE_TOKEN_ENV)
         .context("assignment messaging token env")?;
-    let redactor = CredentialRedactor::from_runtime(&environment, None)?;
+    let redactor = CredentialRedactor::from_runtime(&environment, None, None)?;
     let redacted = redactor.redact_string(&format!("seen token={token}"));
     assert!(!redacted.contains(token.as_str()));
     assert!(redacted.contains("[REDACTED]"));

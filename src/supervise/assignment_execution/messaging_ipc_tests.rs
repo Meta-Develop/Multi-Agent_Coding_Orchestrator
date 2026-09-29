@@ -769,7 +769,7 @@ fn build_admitted_grok_worker_command(
     command.workspace_access = WorkspaceAccess::ReadOnly;
     let command =
         bind_runtime_output_schema(command, SupervisorRuntime::Grok, paths.worker_schema_path)?;
-    let command = bind_selected_grok_execution_workspace(
+    let command = bind_selected_native_execution_workspace(
         command,
         assignment.assignment,
         runtime,

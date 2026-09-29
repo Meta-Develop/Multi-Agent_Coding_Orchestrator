@@ -154,7 +154,10 @@ fn fixed_version_probe_streams(
     environment: &BTreeMap<String, String>,
     codex_auth: Option<&ValidatedCodexAuth>,
     credential_redactor: Option<&CredentialRedactor>,
-) -> (EnvironmentFixedVersionProbeStream, EnvironmentFixedVersionProbeStream) {
+) -> (
+    EnvironmentFixedVersionProbeStream,
+    EnvironmentFixedVersionProbeStream,
+) {
     let redact = |redactor: &CredentialRedactor| {
         (
             bounded_redacted_probe_stream(
@@ -172,7 +175,7 @@ fn fixed_version_probe_streams(
     if let Some(redactor) = credential_redactor {
         return redact(redactor);
     }
-    match CredentialRedactor::from_runtime(environment, codex_auth) {
+    match CredentialRedactor::from_runtime(environment, codex_auth, None) {
         Ok(redactor) => redact(&redactor),
         Err(_) => (
             withheld_fixed_version_probe_stream(),
@@ -189,22 +192,17 @@ fn record_fixed_version_probe_output(
     credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) {
-    let (stdout, stderr) = fixed_version_probe_streams(
-        output,
-        environment,
-        codex_auth,
-        credential_redactor,
-    );
-    process_evidence.fixed_version_probe_evidence =
-        Some(EnvironmentFixedVersionProbeEvidence {
-            executable,
-            exit_code: output.status.and_then(|status| status.code()),
-            timed_out: output.timed_out,
-            stdout,
-            stderr,
-            process_tree: output.process_tree,
-            side_effects: output.side_effects,
-        });
+    let (stdout, stderr) =
+        fixed_version_probe_streams(output, environment, codex_auth, credential_redactor);
+    process_evidence.fixed_version_probe_evidence = Some(EnvironmentFixedVersionProbeEvidence {
+        executable,
+        exit_code: output.status.and_then(|status| status.code()),
+        timed_out: output.timed_out,
+        stdout,
+        stderr,
+        process_tree: output.process_tree,
+        side_effects: output.side_effects,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -402,6 +400,8 @@ fn credential_present(
     environment: &BTreeMap<String, String>,
 ) -> bool {
     match credential {
+        EnvironmentCredential::AnthropicApiKey => environment.contains_key("ANTHROPIC_API_KEY"),
+        EnvironmentCredential::ClaudeManagedOAuth => false,
         EnvironmentCredential::OpenAiApiKey => environment.contains_key("OPENAI_API_KEY"),
         EnvironmentCredential::CodexApiKey => environment.contains_key("CODEX_API_KEY"),
         EnvironmentCredential::CodexAccessToken => environment.contains_key("CODEX_ACCESS_TOKEN"),
@@ -424,6 +424,8 @@ fn configuration_present(
 
 const fn credential_name(credential: EnvironmentCredential) -> &'static str {
     match credential {
+        EnvironmentCredential::AnthropicApiKey => "ANTHROPIC_API_KEY",
+        EnvironmentCredential::ClaudeManagedOAuth => "selected CAM Claude OAuth account",
         EnvironmentCredential::OpenAiApiKey => "OPENAI_API_KEY",
         EnvironmentCredential::CodexApiKey => "CODEX_API_KEY",
         EnvironmentCredential::CodexAccessToken => "CODEX_ACCESS_TOKEN",
@@ -442,11 +444,11 @@ const fn external_sandbox_requirement(
 ) -> EnvironmentRequirement {
     let capability = match invocation {
         ExternalAgentInvocation::Grok => EnvironmentSandboxCapability::VerifiedExternalGrok,
+        ExternalAgentInvocation::ClaudeCode => EnvironmentSandboxCapability::VerifiedExternalClaude,
         ExternalAgentInvocation::CodexSupervisor
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::ClaudeConsultant
         | ExternalAgentInvocation::Cursor
-        | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => EnvironmentSandboxCapability::VerifiedExternalCodex,
     };
     EnvironmentRequirement::sandbox(capability)
@@ -511,7 +513,20 @@ fn insert_admitted_grok_home_environment(
 }
 
 fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, key: &str) -> bool {
-    invocation != ExternalAgentInvocation::Grok || !matches!(key, "HOME" | "GROK_HOME")
+    match invocation {
+        ExternalAgentInvocation::Grok => !matches!(key, "HOME" | "GROK_HOME"),
+        ExternalAgentInvocation::ClaudeCode => !matches!(
+            key,
+            "HOME"
+                | "CLAUDE_CONFIG_DIR"
+                | "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "ANTHROPIC_API_KEY"
+                | "ANTHROPIC_AUTH_TOKEN"
+                | "ANTHROPIC_BASE_URL"
+        ),
+        _ => true,
+    }
 }
 
 pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
@@ -798,6 +813,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static INJECTED_ADMITTED_CLAUDE_IDENTITY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct InjectedAdmittedClaudeIdentityGuard;
+
+#[cfg(test)]
+impl Drop for InjectedAdmittedClaudeIdentityGuard {
+    fn drop(&mut self) {
+        INJECTED_ADMITTED_CLAUDE_IDENTITY.with(|injected| injected.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_admitted_claude_identity_for_test() -> InjectedAdmittedClaudeIdentityGuard {
+    INJECTED_ADMITTED_CLAUDE_IDENTITY.with(|injected| {
+        assert!(!injected.replace(true), "nested Claude identity injection");
+    });
+    InjectedAdmittedClaudeIdentityGuard
 }
 
 #[cfg(test)]
@@ -830,7 +865,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     if program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
         return Ok(None);
     }
-    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone()) else {
+    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone())
+    else {
         return Ok(None);
     };
     let canonical = fs::canonicalize(&path)
@@ -839,7 +875,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     Ok(Some(canonical))
 }
 
-pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure> {
+pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure>
+{
     Box::new(EnvironmentFailure::runtime_model_catalog(format!(
         "Codex runtime model catalog acquisition failed: cause={}",
         CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable
@@ -917,7 +954,9 @@ fn prepare_codex_runtime_model_catalog_process(
                     (sealed_program.to_path_buf(), Some(grant))
                 } else {
                     let resolved_program = resolve_external_program(program, resolver_search_base)
-                        .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+                        .context(
+                            CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed,
+                        )?;
                     let grant = grant
                         .seal_independently_verified_canonical_binding(&resolved_program)
                         .map_err(|error| {
@@ -970,6 +1009,7 @@ fn prepare_codex_runtime_model_catalog_process(
         .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
             ExternalAgentInvocation::CodexSupervisor,
             ExternalProgramTrust::TrustedSystemCodex,
+            false,
         )))
         .with_stdin(StdinMode::Null)
         .with_timeout(Some(timeout))
@@ -1002,9 +1042,7 @@ fn bind_catalog_preflight_grant(
     };
     let sealed_expected_parent = grant
         .consume_for_process_binding(program, &process_spec.current_dir, args, expected_origin)
-        .map_err(|error| {
-            anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
-        })?;
+        .map_err(|error| anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error)))?;
     let expected_confinement = SideEffectConfinementProfile::ExternalCodex(
         ExternalCodexProfile::read_only(&sealed_expected_parent),
     );
@@ -1038,8 +1076,8 @@ fn execute_prepared_codex_runtime_model_catalog(
         return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
     }
     auth_result?;
-    let output =
-        process_result.map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
+    let output = process_result
+        .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
     if !output.safety_sensitive_succeeded() {
         return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
     }
@@ -1287,7 +1325,8 @@ fn external_program_trust_for_resolved_executable(
     if matches!(
         spec.invocation,
         ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
-    ) && spec.program.is_absolute() {
+    ) && spec.program.is_absolute()
+    {
         match resolve_trusted_system_codex_executable_for_catalog(&spec.cwd) {
             Ok(trusted) if trusted == resolved_program => {
                 return ExternalProgramTrust::TrustedSystemCodex;
@@ -1489,6 +1528,7 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
 struct ExternalProgramIdentity {
     length: u64,
     modified: Option<std::time::SystemTime>,
+    sha256: String,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -1505,15 +1545,45 @@ impl ExternalProgramIdentity {
         #[cfg(unix)]
         {
             format!(
-                "dev={};ino={};len={};mtime_ns={modified}",
-                self.device, self.inode, self.length
+                "dev={};ino={};len={};mtime_ns={modified};sha256={}",
+                self.device, self.inode, self.length, self.sha256
             )
         }
         #[cfg(not(unix))]
         {
-            format!("len={};mtime_ns={modified}", self.length)
+            format!(
+                "len={};mtime_ns={modified};sha256={}",
+                self.length, self.sha256
+            )
         }
     }
+}
+
+fn external_program_sha256(path: &Path) -> Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to open executable bytes {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read executable bytes {}", path.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn resolve_claude_native_program_identity(program: &Path, cwd: &Path) -> Result<(PathBuf, String)> {
+    #[cfg(test)]
+    if program == Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+        && INJECTED_ADMITTED_CLAUDE_IDENTITY.with(std::cell::Cell::get)
+    {
+        return Ok((
+            PathBuf::from(claude::CLAUDE_NATIVE_EXECUTABLE),
+            claude::CLAUDE_NATIVE_SHA256.to_string(),
+        ));
+    }
+    let resolved = resolve_external_program(program, cwd)
+        .context("failed to resolve Claude executable for immutable byte binding")?;
+    let digest = external_program_sha256(&resolved)?;
+    Ok((resolved, digest))
 }
 
 fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
@@ -1522,12 +1592,14 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("external executable identity is not a regular file");
     }
+    let sha256 = external_program_sha256(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         Ok(ExternalProgramIdentity {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            sha256,
             device: metadata.dev(),
             inode: metadata.ino(),
         })
@@ -1537,6 +1609,7 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
         Ok(ExternalProgramIdentity {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            sha256,
         })
     }
 }
@@ -1795,7 +1868,10 @@ pub(crate) fn materialize_managed_child_git_commit(
 
     run_managed_child_git_command(
         &boundary,
-        vec![OsString::from("read-tree"), OsString::from(captured_base.to_string())],
+        vec![
+            OsString::from("read-tree"),
+            OsString::from(captured_base.to_string()),
+        ],
         StdinMode::Null,
         "initialize managed child materialization index",
     )?;
@@ -2037,9 +2113,7 @@ fn managed_child_tree_edge_paths(
     Ok(paths)
 }
 
-fn require_managed_child_clean_unstaged_worktree(
-    boundary: &ManagedChildGitBoundary,
-) -> Result<()> {
+fn require_managed_child_clean_unstaged_worktree(boundary: &ManagedChildGitBoundary) -> Result<()> {
     let unstaged = run_managed_child_git_command_allow_status(
         boundary,
         vec![
@@ -4870,42 +4944,104 @@ fn materialize_control_exception_file(
         .open(workspace.join(relative))
 }
 
+pub(crate) const CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS: [&str; 5] = [
+    "/etc/claude-code",
+    "/mnt/c/Program Files/ClaudeCode",
+    "/mnt/c/ProgramData/ClaudeCode",
+    "/mnt/c/Users/konn",
+    "/mnt/d/home",
+];
+
 enum ExternalProviderProfile {
     Codex(ExternalCodexProfile),
+    Claude(ExternalClaudeProfile),
     Grok(ExternalGrokProfile),
 }
 
+#[derive(Clone, Copy, Default)]
+struct ClaudeProfileBinding<'a> {
+    child_config_home: Option<&'a Path>,
+    managed_data_root: Option<&'a Path>,
+    parent_socket: Option<&'a Path>,
+    deadline_unix_millis: Option<u64>,
+    helper_registration_nonce: Option<&'a str>,
+    containment_owner: Option<&'a ClaudeContainmentOwnerBinding>,
+}
+
 impl ExternalProviderProfile {
-    fn for_command(spec: &ExternalAgentCommand) -> Result<Self> {
-        Ok(match (
-            spec.invocation,
-            spec.workspace_access,
-            spec.writable_runtime_selection.as_ref(),
-        ) {
-            (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
-                ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
-            ),
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
-                Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
-            }
-            // Direct profile unit tests exercise lower-level Grok inputs. Production writable
-            // Grok reaches this point only after the external boundary has required supervisor
-            // selection and confinement evidence.
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
-                Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadOnly, _) => {
-                Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadWrite, _) => {
-                Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
-            }
-        })
+    fn for_command(spec: &ExternalAgentCommand, claude: ClaudeProfileBinding<'_>) -> Result<Self> {
+        Ok(
+            match (
+                spec.invocation,
+                spec.workspace_access,
+                spec.writable_runtime_selection.as_ref(),
+            ) {
+                (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
+                    ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
+                ),
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
+                    Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
+                }
+                // Direct profile unit tests exercise lower-level Grok inputs. Production writable
+                // Grok reaches this point only after the external boundary has required supervisor
+                // selection and confinement evidence.
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
+                    Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
+                }
+                (ExternalAgentInvocation::ClaudeCode, WorkspaceAccess::ReadOnly, _)
+                    if spec.uses_live_claude_managed_worker_budget() =>
+                {
+                    Self::Claude(ExternalClaudeProfile::read_only(
+                        &spec.cwd,
+                        claude
+                            .parent_socket
+                            .context("managed Claude launch has no parent relay socket binding")?,
+                        claude
+                            .deadline_unix_millis
+                            .context("managed Claude launch has no relay deadline binding")?,
+                        claude
+                            .helper_registration_nonce
+                            .context("managed Claude launch has no helper registration binding")?,
+                        claude
+                            .containment_owner
+                            .context("managed Claude launch has no containment owner binding")?
+                            .clone(),
+                    ))
+                }
+                (ExternalAgentInvocation::ClaudeCode, WorkspaceAccess::ReadWrite, _)
+                    if spec.uses_live_claude_managed_worker_budget() =>
+                {
+                    Self::Claude(ExternalClaudeProfile::read_write(
+                        &spec.cwd,
+                        claude
+                            .parent_socket
+                            .context("managed Claude launch has no parent relay socket binding")?,
+                        claude
+                            .deadline_unix_millis
+                            .context("managed Claude launch has no relay deadline binding")?,
+                        claude
+                            .helper_registration_nonce
+                            .context("managed Claude launch has no helper registration binding")?,
+                        claude
+                            .containment_owner
+                            .context("managed Claude launch has no containment owner binding")?
+                            .clone(),
+                    ))
+                }
+                (_, WorkspaceAccess::ReadOnly, _) => {
+                    Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
+                }
+                (_, WorkspaceAccess::ReadWrite, _) => {
+                    Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
+                }
+            },
+        )
     }
 
     fn with_visible_read_only_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_only_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_root(root.into())),
         }
     }
@@ -4913,6 +5049,7 @@ impl ExternalProviderProfile {
     fn with_visible_read_only_file(self, file: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_only_file(file.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_file(file.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_file(file.into())),
         }
     }
@@ -4920,6 +5057,9 @@ impl ExternalProviderProfile {
     fn with_visible_read_write_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_root(root.into())),
+            Self::Claude(profile) => {
+                Self::Claude(profile.with_visible_read_write_root(root.into()))
+            }
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_write_root(root.into())),
         }
     }
@@ -4927,6 +5067,9 @@ impl ExternalProviderProfile {
     fn with_visible_read_write_file(self, file: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_file(file.into())),
+            Self::Claude(profile) => {
+                Self::Claude(profile.with_visible_read_write_file(file.into()))
+            }
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_write_file(file.into())),
         }
     }
@@ -4941,6 +5084,9 @@ impl ExternalProviderProfile {
             Self::Codex(profile) => profile
                 .with_visible_read_write_file_capability(file.into(), held_file)
                 .map(Self::Codex),
+            Self::Claude(profile) => profile
+                .with_visible_read_write_file_capability(file.into(), held_file)
+                .map(Self::Claude),
             Self::Grok(profile) => profile
                 .with_visible_read_write_file_capability(file.into(), held_file)
                 .map(Self::Grok),
@@ -4950,6 +5096,7 @@ impl ExternalProviderProfile {
     fn with_writable_artifact_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_writable_artifact_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_writable_artifact_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile),
         }
     }
@@ -4957,6 +5104,7 @@ impl ExternalProviderProfile {
     fn with_hidden_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_hidden_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_hidden_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_hidden_root(root.into())),
         }
     }
@@ -4964,16 +5112,34 @@ impl ExternalProviderProfile {
     fn finish(self) -> SideEffectConfinementProfile {
         match self {
             Self::Codex(profile) => SideEffectConfinementProfile::ExternalCodex(profile),
+            Self::Claude(profile) => SideEffectConfinementProfile::ExternalClaude(profile),
             Self::Grok(profile) => SideEffectConfinementProfile::ExternalGrok(profile),
         }
     }
 }
 
+#[cfg(test)]
 fn external_side_effect_profile(
     spec: &ExternalAgentCommand,
     program: &Path,
     program_trust: ExternalProgramTrust,
     protected_controls: &ProtectedWorktreeControls,
+) -> Result<SideEffectConfinementProfile> {
+    external_side_effect_profile_with_claude_relay(
+        spec,
+        program,
+        program_trust,
+        protected_controls,
+        ClaudeProfileBinding::default(),
+    )
+}
+
+fn external_side_effect_profile_with_claude_relay(
+    spec: &ExternalAgentCommand,
+    program: &Path,
+    program_trust: ExternalProgramTrust,
+    protected_controls: &ProtectedWorktreeControls,
+    claude: ClaudeProfileBinding<'_>,
 ) -> Result<SideEffectConfinementProfile> {
     if program_trust != ExternalProgramTrust::TrustedSystemCodex
         && !spec.invocation.is_adapter_subprocess()
@@ -4997,7 +5163,7 @@ fn external_side_effect_profile(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => {
-            let mut profile = ExternalProviderProfile::for_command(spec)?;
+            let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
             }
@@ -5122,6 +5288,29 @@ fn external_side_effect_profile(
             if spec.invocation != ExternalAgentInvocation::Grok {
                 profile = profile.with_writable_artifact_root(artifact_root);
             }
+            if spec.invocation == ExternalAgentInvocation::ClaudeCode {
+                // Pinned bare mode still loads managed policy. Mask both native Linux policy and
+                // the Windows policy roots consulted by the pinned WSL path before target start.
+                for root in CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS {
+                    profile = profile.with_hidden_root(root);
+                }
+                if spec.uses_live_claude_managed_worker_budget() {
+                    let child_config_home = claude
+                        .child_config_home
+                        .context("managed Claude OAuth launch has no isolated child config home")?;
+                    let managed_data_root = claude
+                        .managed_data_root
+                        .context("managed Claude OAuth launch has no selected CAM data root")?;
+                    let relay_parent = claude
+                        .parent_socket
+                        .and_then(Path::parent)
+                        .context("managed Claude launch has no private relay directory")?;
+                    profile = profile
+                        .with_visible_read_write_root(child_config_home)
+                        .with_visible_read_only_root(relay_parent)
+                        .with_hidden_root(managed_data_root);
+                }
+            }
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
             }
@@ -5171,6 +5360,51 @@ pub(crate) fn selected_grok_profile_projection_for_test(
         workspace_access,
         systemd_properties,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn selected_claude_systemd_properties_for_test(
+    spec: &ExternalAgentCommand,
+    child_config_home: &Path,
+    managed_data_root: &Path,
+    parent_relay_socket: &Path,
+    deadline_unix_millis: u64,
+) -> Result<Vec<String>> {
+    let output_parent = required_parent(&spec.output_last_message)?;
+    let controls = ProtectedWorktreeControls {
+        writable_artifact_root: Some(fs::canonicalize(output_parent)?),
+        ..ProtectedWorktreeControls::default()
+    };
+    let profile = external_side_effect_profile_with_claude_relay(
+        spec,
+        &spec.program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+        ClaudeProfileBinding {
+            child_config_home: Some(child_config_home),
+            managed_data_root: Some(managed_data_root),
+            parent_socket: Some(parent_relay_socket),
+            deadline_unix_millis: Some(deadline_unix_millis),
+            helper_registration_nonce: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+            containment_owner: None,
+        },
+    )?;
+    let SideEffectConfinementProfile::ExternalClaude(profile) = profile else {
+        bail!("selected managed Claude command did not produce an ExternalClaude profile");
+    };
+    crate::process_runner::external_claude_systemd_properties_for_test(
+        profile,
+        &spec.program,
+        &spec.cwd,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+fn claude_bare_api_key_present(environment: &BTreeMap<String, String>) -> bool {
+    credential_present(EnvironmentCredential::AnthropicApiKey, environment)
 }
 
 fn sandbox_denials_from_codex_jsonl(
@@ -5630,7 +5864,7 @@ impl ValidatedCodexAuth {
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct CredentialRedactor {
     patterns: Vec<Vec<u8>>,
 }
@@ -5644,13 +5878,27 @@ impl std::fmt::Debug for CredentialRedactor {
     }
 }
 
+impl Drop for CredentialRedactor {
+    fn drop(&mut self) {
+        for pattern in &mut self.patterns {
+            pattern.fill(0);
+        }
+    }
+}
+
 impl CredentialRedactor {
     fn from_runtime(
         environment: &BTreeMap<String, String>,
         codex_auth: Option<&ValidatedCodexAuth>,
+        claude_oauth: Option<&[u8]>,
     ) -> Result<Self> {
         let mut patterns = Vec::new();
-        for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+        ] {
             if let Some(value) = environment.get(key) {
                 add_credential_pattern(&mut patterns, value.as_bytes())?;
                 if let Ok(quoted) = serde_json::to_string(value) {
@@ -5698,6 +5946,9 @@ impl CredentialRedactor {
                     "oversized Codex auth material did not expose any bounded redaction patterns"
                 );
             }
+        }
+        if let Some(oauth) = claude_oauth {
+            add_credential_pattern(&mut patterns, oauth)?;
         }
         patterns.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         Ok(Self { patterns })
@@ -5916,12 +6167,10 @@ fn command_argv_with_controls_and_service_tier_input(
 
 pub(crate) fn grok_acp_stdio_protocol_selected(spec: &ExternalAgentCommand) -> bool {
     spec.invocation == ExternalAgentInvocation::Grok
-        && spec
-            .runtime_adapter
-            .as_ref()
-            .is_some_and(|config| {
-                config.grok_interaction_protocol() == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
-            })
+        && spec.runtime_adapter.as_ref().is_some_and(|config| {
+            config.grok_interaction_protocol()
+                == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+        })
 }
 
 fn external_agent_stdin_mode(
@@ -5962,7 +6211,22 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
     if spec.invocation == ExternalAgentInvocation::Grok {
         config.render_grok_os_argv(&context, spec.output_schema.as_deref())
     } else {
-        config.render_os_argv(&context)
+        let mut argv = config.render_os_argv(&context)?;
+        if spec.invocation == ExternalAgentInvocation::ClaudeCode
+            && spec
+                .claude_reservation_binding
+                .as_ref()
+                .is_some_and(|bound| {
+                    bound.claude_managed_launch.auth_mode == ClaudeAuthMode::ManagedOAuth
+                })
+        {
+            let bare = argv
+                .iter()
+                .position(|argument| argument == OsStr::new("--bare"))
+                .context("managed Claude OAuth argv omitted the pinned --bare transition point")?;
+            argv.remove(bare);
+        }
+        Ok(argv)
     }
 }
 
@@ -5988,7 +6252,11 @@ fn codex_supervisor_argv(
         service_tier,
     );
     argv.extend([
-        OsString::from(if terminal_role { "--disable" } else { "--enable" }),
+        OsString::from(if terminal_role {
+            "--disable"
+        } else {
+            "--enable"
+        }),
         OsString::from("goals"),
         OsString::from("--json"),
         OsString::from("--output-last-message"),
@@ -6019,12 +6287,7 @@ fn codex_hardened_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
-    codex_hardened_argv_with_service_tier(
-        spec,
-        controls,
-        CodexMultiAgentMode::Disabled,
-        None,
-    )
+    codex_hardened_argv_with_service_tier(spec, controls, CodexMultiAgentMode::Disabled, None)
 }
 
 fn codex_hardened_argv_with_service_tier(
@@ -6401,6 +6664,7 @@ fn claude_consultant_argv() -> Vec<OsString> {
 fn allowed_env(
     invocation: ExternalAgentInvocation,
     program_trust: ExternalProgramTrust,
+    allow_claude_bare_api_key: bool,
 ) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([
         ("LANG".to_string(), "C.UTF-8".to_string()),
@@ -6422,6 +6686,18 @@ fn allowed_env(
                 }
             }
         }
+    }
+    if invocation == ExternalAgentInvocation::ClaudeCode {
+        if allow_claude_bare_api_key {
+            if let Ok(value) = env::var("ANTHROPIC_API_KEY") {
+                if (MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+                    && !value.contains(['\n', '\r', '\0'])
+                {
+                    environment.insert("ANTHROPIC_API_KEY".to_string(), value);
+                }
+            }
+        }
+        environment.insert("DISABLE_COMPACT".to_string(), "1".to_string());
     }
     environment.insert("PATH".to_string(), TRUSTED_PATH.to_string());
     let trusted_ca = Path::new("/etc/ssl/certs/ca-bundle.crt");
@@ -6720,7 +6996,10 @@ mod fixed_version_probe_redaction_tests {
             inode: 3,
             bytes: oversized_bytes,
         };
-        assert!(CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth)).is_err());
+        assert!(
+            CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth), None)
+                .is_err()
+        );
 
         #[cfg(unix)]
         let status = {
@@ -6734,7 +7013,9 @@ mod fixed_version_probe_redaction_tests {
             status,
             duration: Duration::from_millis(1),
             timed_out: false,
-            process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
             side_effects: SideEffectConfinementEvidence::Verified(
                 SideEffectConfinementProfileKind::ExternalCodex,
             ),

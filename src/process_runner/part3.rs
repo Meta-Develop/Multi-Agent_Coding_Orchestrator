@@ -104,21 +104,36 @@ fn verify_effective_namespace_restriction(
 
 #[cfg(target_os = "linux")]
 fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
     let mut property = OsString::from("--property=");
     property.push(name);
-    if optional {
-        property.push("-");
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&b' ') {
+        let mut quoted = Vec::with_capacity(path_bytes.len() + if optional { 3 } else { 2 });
+        quoted.push(b'"');
+        if optional {
+            quoted.push(b'-');
+        }
+        for byte in path_bytes {
+            if matches!(*byte, b'"' | b'\\') {
+                quoted.push(b'\\');
+            }
+            quoted.push(*byte);
+        }
+        quoted.push(b'"');
+        property.push(OsString::from_vec(quoted));
+    } else {
+        if optional {
+            property.push("-");
+        }
+        property.push(path.as_os_str());
     }
-    property.push(path.as_os_str());
     property
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_path_binding_property(
-    name: &str,
-    source: &Path,
-    destination: &Path,
-) -> OsString {
+fn systemd_path_binding_property(name: &str, source: &Path, destination: &Path) -> OsString {
     let mut property = systemd_path_property(name, source, false);
     property.push(":");
     property.push(destination.as_os_str());
@@ -169,6 +184,7 @@ struct SystemdUnit {
     stat_program: PathBuf,
     findmnt_program: PathBuf,
     name: String,
+    cgroup_membership: String,
     cgroup_path: PathBuf,
     runtime_dir: PathBuf,
     client_runtime: PathBuf,
@@ -436,6 +452,11 @@ impl SystemdUnit {
         let name = format!("maco-process-{runner_pid}-{sequence}.service");
         #[cfg(test)]
         record_systemd_unit_name_for_test(&name);
+        let cgroup_membership = manager_cgroup
+            .join("app.slice")
+            .join(&name)
+            .to_string_lossy()
+            .into_owned();
         let cgroup_path = manager_path.join("app.slice").join(&name);
         let runtime_dir = client_runtime
             .clone()
@@ -459,6 +480,7 @@ impl SystemdUnit {
             stat_program,
             findmnt_program,
             name,
+            cgroup_membership,
             cgroup_path,
             runtime_dir,
             client_runtime,
@@ -490,6 +512,14 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
+        if let Some(profile) = spec.side_effects.external_claude() {
+            profile
+                .containment_owner()
+                .bind(ClaudeContainmentOwnerIdentity {
+                    unit: self.name.clone(),
+                    cgroup: self.cgroup_membership.clone(),
+                })?;
+        }
         if let Some(home) = spec.staged_codex_home.as_deref() {
             validate_systemd_path_syntax(home, "staged Codex home")?;
             if !home.is_absolute() {
@@ -517,9 +547,9 @@ impl SystemdUnit {
         };
         let mut private_runtime_files = spec.private_runtime_files.clone();
         if spec.staged_codex_home.is_none()
-            && private_runtime_files.iter().any(|file| {
-                file.destination == PrivateRuntimeFileDestination::StagedCodexHome
-            })
+            && private_runtime_files
+                .iter()
+                .any(|file| file.destination == PrivateRuntimeFileDestination::StagedCodexHome)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -558,8 +588,7 @@ impl SystemdUnit {
             target_environment
         });
         let mut sandbox = resolve_systemd_sandbox(spec)?;
-        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref())
-        {
+        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref()) {
             sandbox.validate_staged_codex_home(home)?;
         }
         let target_current_dir = sandbox
@@ -710,8 +739,19 @@ impl SystemdUnit {
             }
         }
         if let Some((helper, digest)) = pinned_launch {
+            command.arg(helper);
+            if let Some(profile) = spec.side_effects.external_claude() {
+                // SAFETY: geteuid has no preconditions and does not access Rust memory.
+                let effective_uid = unsafe { libc::geteuid() };
+                command
+                    .arg(claude::HIDDEN_CLAUDE_RELAY_ARGUMENT)
+                    .arg(profile.parent_relay_socket())
+                    .arg(profile.deadline_unix_millis().to_string())
+                    .arg(effective_uid.to_string())
+                    .arg(&self.name)
+                    .arg(profile.helper_registration_nonce());
+            }
             command
-                .arg(helper)
                 .arg(HIDDEN_PINNED_EXEC_ARGUMENT)
                 .arg(self.runtime_dir.join(PINNED_EXEC_DESCRIPTOR_NAME))
                 .arg(digest);
@@ -1590,10 +1630,7 @@ fn environment_with_private_runtime_home(
             home.to_str().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "staged Codex home is not valid UTF-8: {}",
-                        home.display()
-                    ),
+                    format!("staged Codex home is not valid UTF-8: {}", home.display()),
                 )
             })
         })

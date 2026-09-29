@@ -1,4 +1,6 @@
-use crate::account_authority::{FrozenGrokSelectedBinding, ManagedGrokAccountSelectionEvidence};
+use crate::account_authority::{
+    FrozenClaudeSelectedBinding, FrozenGrokSelectedBinding, ManagedGrokAccountSelectionEvidence,
+};
 use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV};
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
@@ -20,16 +22,23 @@ use crate::pre_action_review::{
 };
 use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable, run_process_interactive,
-    CapturedBytes, ContainmentBackend, EnvironmentMode, ExternalCodexProfile, ExternalGrokProfile,
-    InteractiveProcessOutput, ProcessCancellation, ProcessCommand, ProcessOutput, ProcessRunError,
-    ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
+    CapturedBytes, ClaudeContainmentOwnerBinding, ContainmentBackend, EnvironmentMode,
+    ExternalClaudeProfile, ExternalCodexProfile, ExternalGrokProfile, InteractiveProcessOutput,
+    ProcessCancellation, ProcessCommand, ProcessOutput, ProcessRunError, ProcessSpec,
+    ProcessTreeEvidence, SideEffectConfinementEvidence, SideEffectConfinementProfile,
     SideEffectConfinementProfileKind, StdinMode, StreamCapture, StrictOfflineWorkspaceProfile,
     WorkspaceAccess,
 };
 use crate::protected_path::{DeclaredPathCoordinate, ProtectedPathSpec};
 #[cfg(target_os = "linux")]
+use crate::runtime_adapter::claude::ClaudeManagedRelay;
+#[cfg(target_os = "linux")]
 use crate::runtime_adapter::grok::GrokCredentialSource;
 use crate::runtime_adapter::{
+    claude::{
+        self, ClaudeAuthMode, ClaudeBrokerBinding, ClaudeManagedLaunchContract,
+        ClaudeNativeEvidence, ClaudeTransportAuthMode, ClaudeWholeCallWitness,
+    },
     grok::{
         grok_acp_parent_evidence_from_execution, GrokAcpParentEvidence, GrokAcpParentResolvedField,
         GrokStreamUsageEvidence,
@@ -268,6 +277,9 @@ pub struct ExternalAgentCommand {
     /// model, effort, executable, cwd, invocation, or adapter-config change fails closed.
     writable_runtime_selection: Option<WritableRuntimeSelectionEvidence>,
     live_token_grant: Option<BoundLiveTokenGrant>,
+    /// Parent-private reservation identity and exact Claude launch snapshot. This exists even
+    /// when the ledger has no hard-token ceiling and therefore issues no live token grant.
+    claude_reservation_binding: Option<BoundClaudeReservationBinding>,
     /// Opaque MACO-owned proof that the selected command, held claims, disposable worktree, and
     /// verified native confinement were authenticated together immediately before launch.
     worktree_writable_confinement: Option<WorktreeWritableConfinementProof>,
@@ -291,6 +303,9 @@ pub struct ExternalAgentCommand {
     /// the selected account from process-global observation state.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
+    /// Immutable Claude account binding admitted for this run.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    claude_run_account_binding: Option<FrozenClaudeSelectedBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -310,10 +325,43 @@ struct BoundLiveTokenGrant {
     input_files: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundClaudeManagedLaunch {
+    auth_mode: ClaudeAuthMode,
+    adapter_config: RuntimeAdapterConfig,
+    selected_launch: WritableRuntimeSelectionEvidence,
+    confinement: WorktreeWritableConfinementProof,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct BoundClaudeReservationBinding {
+    reservation_id: u64,
+    live_token_grant: Option<crate::supervise_budget::LiveTokenGrant>,
+    invocation: ExternalAgentInvocation,
+    program: PathBuf,
+    cwd: PathBuf,
+    prompt: PathBuf,
+    model: Option<String>,
+    effort: Option<String>,
+    timeout: Duration,
+    workspace_access: WorkspaceAccess,
+    launch_target: WritableLaunchTarget,
+    lifecycle: Option<ExternalAgentLifecycleIdentity>,
+    source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
+    input_files: Vec<PathBuf>,
+    claude_managed_launch: BoundClaudeManagedLaunch,
+}
+
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
         should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
+    }
+
+    pub(crate) fn uses_live_claude_managed_worker_budget(&self) -> bool {
+        self.invocation == ExternalAgentInvocation::ClaudeCode
+            && self.workspace_access == WorkspaceAccess::ReadWrite
+            && self.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
     }
 
     pub(crate) fn bind_live_token_grant(
@@ -335,6 +383,69 @@ impl ExternalAgentCommand {
             source_inputs: self.researcher_source_inputs.clone(),
             input_files: self.read_only_input_files.clone(),
         });
+    }
+
+    pub(crate) fn bind_claude_managed_reservation(
+        &mut self,
+        reservation_id: u64,
+        live_token_grant: Option<crate::supervise_budget::LiveTokenGrant>,
+    ) -> Result<(), String> {
+        if !self.uses_live_claude_managed_worker_budget() {
+            return Err("Claude reservation binding was requested for a different launch".into());
+        }
+        let config = self
+            .runtime_adapter
+            .clone()
+            .ok_or_else(|| "Claude managed-Worker adapter binding is missing".to_string())?;
+        let contract = config
+            .claude_managed_launch_contract(&LaunchContext {
+                prompt: &self.prompt,
+                model: self.model.as_deref(),
+                effort: self.reasoning_effort.as_deref(),
+                cwd: &self.cwd,
+                output: &self.output_last_message,
+            })
+            .ok_or_else(|| "Claude managed-Worker native launch contract is invalid".to_string())?;
+        if self.claude_run_account_binding.is_none() {
+            return Err(
+                "Claude managed-Worker OAuth launch has no frozen selected CAM account binding"
+                    .to_string(),
+            );
+        }
+        let selected_launch = self
+            .writable_runtime_selection
+            .clone()
+            .ok_or_else(|| "Claude managed-Worker selection binding is missing".to_string())?;
+        let confinement = self
+            .worktree_writable_confinement
+            .clone()
+            .ok_or_else(|| "Claude managed-Worker confinement binding is missing".to_string())?;
+        self.claude_reservation_binding = Some(BoundClaudeReservationBinding {
+            reservation_id,
+            live_token_grant,
+            invocation: self.invocation,
+            program: self.program.clone(),
+            cwd: self.cwd.clone(),
+            prompt: self.prompt.clone(),
+            model: self.model.clone(),
+            effort: self.reasoning_effort.clone(),
+            timeout: self.timeout,
+            workspace_access: self.workspace_access,
+            launch_target: self.writable_launch_target,
+            lifecycle: self.agent_lifecycle.clone(),
+            source_inputs: self.researcher_source_inputs.clone(),
+            input_files: self.read_only_input_files.clone(),
+            claude_managed_launch: BoundClaudeManagedLaunch {
+                auth_mode: match contract.auth_mode() {
+                    ClaudeAuthMode::BareApiKey => ClaudeAuthMode::ManagedOAuth,
+                    ClaudeAuthMode::ManagedOAuth => ClaudeAuthMode::ManagedOAuth,
+                },
+                adapter_config: config,
+                selected_launch,
+                confinement,
+            },
+        });
+        Ok(())
     }
 
     #[cfg(test)]
@@ -370,6 +481,80 @@ impl ExternalAgentCommand {
             return Err("live token grant was stopped or released".to_string());
         }
         Ok(Some(&bound.grant))
+    }
+
+    fn verified_claude_managed_reservation(
+        &self,
+    ) -> Result<Option<&crate::supervise_budget::LiveTokenGrant>, String> {
+        if !self.uses_live_claude_managed_worker_budget() {
+            return Ok(None);
+        }
+        let bound = self.claude_reservation_binding.as_ref().ok_or_else(|| {
+            "Claude managed-Worker reservation identity binding is missing".to_string()
+        })?;
+        if bound.reservation_id == 0
+            || bound.invocation != self.invocation
+            || bound.program != self.program
+            || bound.cwd != self.cwd
+            || bound.prompt != self.prompt
+            || bound.model != self.model
+            || bound.effort != self.reasoning_effort
+            || bound.timeout != self.timeout
+            || bound.workspace_access != self.workspace_access
+            || bound.launch_target != self.writable_launch_target
+            || bound.lifecycle != self.agent_lifecycle
+            || bound.source_inputs != self.researcher_source_inputs
+            || bound.input_files != self.read_only_input_files
+        {
+            return Err(
+                "Claude managed-Worker reservation/deadline launch binding changed".to_string(),
+            );
+        }
+        let held = &bound.claude_managed_launch;
+        let config = self
+            .runtime_adapter
+            .as_ref()
+            .ok_or_else(|| "Claude managed-Worker adapter binding disappeared".to_string())?;
+        let contract = config
+            .claude_managed_launch_contract(&LaunchContext {
+                prompt: &self.prompt,
+                model: self.model.as_deref(),
+                effort: self.reasoning_effort.as_deref(),
+                cwd: &self.cwd,
+                output: &self.output_last_message,
+            })
+            .ok_or_else(|| "Claude managed-Worker native launch contract changed".to_string())?;
+        let expected_auth_mode = match contract.auth_mode() {
+            ClaudeAuthMode::BareApiKey if self.claude_run_account_binding.is_some() => {
+                ClaudeAuthMode::ManagedOAuth
+            }
+            mode => mode,
+        };
+        if held.auth_mode != expected_auth_mode
+            || &held.adapter_config != config
+            || self.writable_runtime_selection.as_ref() != Some(&held.selected_launch)
+            || self.worktree_writable_confinement.as_ref() != Some(&held.confinement)
+        {
+            return Err(
+                "Claude managed-Worker claim/auth/reservation/deadline binding changed".to_string(),
+            );
+        }
+        if bound
+            .live_token_grant
+            .as_ref()
+            .is_some_and(crate::supervise_budget::LiveTokenGrant::stopped)
+        {
+            return Err("Claude managed-Worker live token grant was stopped or released".into());
+        }
+        Ok(bound.live_token_grant.as_ref())
+    }
+
+    fn claude_managed_binding(&self) -> Result<(u64, ClaudeAuthMode), String> {
+        self.verified_claude_managed_reservation()?;
+        let bound = self.claude_reservation_binding.as_ref().ok_or_else(|| {
+            "Claude managed-Worker reservation identity binding is missing".to_string()
+        })?;
+        Ok((bound.reservation_id, bound.claude_managed_launch.auth_mode))
     }
 }
 
@@ -433,6 +618,20 @@ pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_STALE: &str =
     "writable_grok_confinement_proof_stale";
 pub(crate) const WRITABLE_GROK_CONFINEMENT_UNVERIFIED: &str =
     "writable_grok_confinement_unverified";
+pub(crate) const WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED: &str =
+    "writable_claude_terminal_worker_required";
+pub(crate) const WRITABLE_CLAUDE_SELECTION_EVIDENCE_MISSING: &str =
+    "writable_claude_selection_evidence_missing";
+pub(crate) const WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE: &str =
+    "writable_claude_selection_evidence_stale";
+pub(crate) const WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED: &str =
+    "writable_claude_adapter_configuration_unverified";
+pub(crate) const WRITABLE_CLAUDE_CONFINEMENT_PROOF_MISSING: &str =
+    "writable_claude_confinement_proof_missing";
+pub(crate) const WRITABLE_CLAUDE_CONFINEMENT_PROOF_STALE: &str =
+    "writable_claude_confinement_proof_stale";
+pub(crate) const WRITABLE_CLAUDE_CONFINEMENT_UNVERIFIED: &str =
+    "writable_claude_confinement_unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WritableRuntimeSelectionEvidence {
@@ -447,6 +646,7 @@ struct WritableRuntimeSelectionEvidence {
     reasoning_effort: Option<String>,
     adapter_config: Option<RuntimeAdapterConfig>,
     output_schema: Option<PathBuf>,
+    program_sha256: Option<String>,
 }
 
 impl WritableRuntimeSelectionEvidence {
@@ -454,8 +654,23 @@ impl WritableRuntimeSelectionEvidence {
         assignment_id: impl Into<String>,
         runtime: RuntimeId,
         command: &ExternalAgentCommand,
-    ) -> Self {
-        Self {
+    ) -> Result<Self> {
+        let program_sha256 = if runtime == RuntimeId::ClaudeCode {
+            let (resolved, digest) =
+                resolve_claude_native_program_identity(&command.program, &command.cwd)?;
+            if !claude::admitted_native_executable(&resolved, &digest) {
+                bail!(
+                    "{WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Claude requires admitted native {} executable {} with SHA-256 {}",
+                    claude::CLAUDE_NATIVE_VERSION,
+                    claude::CLAUDE_NATIVE_EXECUTABLE,
+                    claude::CLAUDE_NATIVE_SHA256
+                );
+            }
+            Some(digest)
+        } else {
+            None
+        };
+        Ok(Self {
             assignment_id: assignment_id.into(),
             runtime,
             invocation: command.invocation,
@@ -467,7 +682,8 @@ impl WritableRuntimeSelectionEvidence {
             reasoning_effort: command.reasoning_effort.clone(),
             adapter_config: command.runtime_adapter.clone(),
             output_schema: command.output_schema.clone(),
-        }
+            program_sha256,
+        })
     }
 
     fn matches_command(&self, command: &ExternalAgentCommand, runtime: RuntimeId) -> bool {
@@ -783,6 +999,8 @@ impl EnvironmentExecutable {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentCredential {
+    AnthropicApiKey,
+    ClaudeManagedOAuth,
     CodexAccessToken,
     CodexApiKey,
     OpenAiApiKey,
@@ -806,6 +1024,7 @@ pub enum EnvironmentNetworkAccess {
 #[serde(rename_all = "snake_case")]
 pub enum EnvironmentSandboxCapability {
     VerifiedExternalCodex,
+    VerifiedExternalClaude,
     VerifiedExternalGrok,
 }
 
@@ -1201,6 +1420,7 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
+            claude_reservation_binding: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1210,6 +1430,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            claude_run_account_binding: None,
         }
     }
 
@@ -1246,6 +1467,7 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
+            claude_reservation_binding: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1255,6 +1477,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            claude_run_account_binding: None,
         }
     }
 
@@ -1291,6 +1514,7 @@ impl ExternalAgentCommand {
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
+            claude_reservation_binding: None,
             worktree_writable_confinement: None,
             assignment_process_launch_kind: None,
             assignment_process_launch_grant: None,
@@ -1300,6 +1524,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            claude_run_account_binding: None,
         }
     }
 
@@ -1364,7 +1589,8 @@ impl ExternalAgentCommand {
         self
     }
 
-    /// Bind the supervisor-resolved identity used for writable Grok admission.
+    /// Bind the supervisor-resolved identity used for invocation-qualified
+    /// writable native-runtime admission.
     ///
     /// This is deliberately crate-private and snapshots the already rendered command rather than
     /// accepting provider-controlled evidence. Both writable consumers compare the snapshot with
@@ -1375,21 +1601,36 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
         non_delegating_terminal_worker: bool,
     ) -> Result<Self> {
-        if runtime != RuntimeId::Grok || !non_delegating_terminal_worker {
+        if !matches!(runtime, RuntimeId::Grok | RuntimeId::ClaudeCode)
+            || !non_delegating_terminal_worker
+        {
+            let reason = if runtime == RuntimeId::ClaudeCode {
+                WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
+            } else {
+                WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+            };
             bail!(
-                "{WRITABLE_GROK_TERMINAL_WORKER_REQUIRED}: writable Grok requires an explicitly bound non-delegating terminal Worker"
+                "{reason}: writable native runtime requires an explicitly bound non-delegating terminal Worker"
             );
         }
-        if self.invocation != ExternalAgentInvocation::Grok {
-            bail!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: selected Grok runtime does not match the executable invocation"
-            );
+        let expected_invocation = match runtime {
+            RuntimeId::Grok => ExternalAgentInvocation::Grok,
+            RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
+            _ => unreachable!("filtered above"),
+        };
+        if self.invocation != expected_invocation {
+            let reason = if runtime == RuntimeId::ClaudeCode {
+                WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE
+            } else {
+                WRITABLE_GROK_SELECTION_EVIDENCE_STALE
+            };
+            bail!("{reason}: selected native runtime does not match the executable invocation");
         }
         self.writable_runtime_selection = Some(WritableRuntimeSelectionEvidence::from_command(
             assignment_id,
             runtime,
             &self,
-        ));
+        )?);
         self.worktree_writable_confinement = None;
         Ok(self)
     }
@@ -1480,6 +1721,54 @@ impl ExternalAgentCommand {
             })
     }
 
+    fn current_claude_writable_contract(&self) -> Result<ClaudeManagedLaunchContract> {
+        if self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
+            bail!(
+                "writable_claude_managed_worktree_required: writable Claude is restricted to a managed child worktree"
+            );
+        }
+        if self.workspace_access != WorkspaceAccess::ReadWrite {
+            bail!(
+                "{WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE}: writable Claude workspace no longer matches its supervisor-selected evidence"
+            );
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_CLAUDE_SELECTION_EVIDENCE_MISSING}: writable Claude has no supervisor-selected launch evidence"
+            )
+        })?;
+        if !selected.matches_command(self, RuntimeId::ClaudeCode) {
+            bail!(
+                "{WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE}: writable Claude launch no longer matches its supervisor-selected evidence"
+            );
+        }
+        let config = self.runtime_adapter.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Claude has no adapter configuration"
+            )
+        })?;
+        if self.invocation != ExternalAgentInvocation::ClaudeCode
+            || config.binary_path() != self.program.as_path()
+        {
+            bail!(
+                "{WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Claude adapter executable is not bound to the selected program"
+            );
+        }
+        config
+            .claude_managed_launch_contract(&LaunchContext {
+                prompt: &self.prompt,
+                model: self.model.as_deref(),
+                effort: self.reasoning_effort.as_deref(),
+                cwd: &self.cwd,
+                output: &self.output_last_message,
+            })
+            .with_context(|| {
+                format!(
+                    "{WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Claude adapter contract is not the exact fresh bare managed-Worker contract"
+                )
+            })
+    }
+
     fn selected_grok_writable_workspace(&self) -> Result<&Path> {
         if self.workspace_access != WorkspaceAccess::ReadWrite {
             bail!(
@@ -1496,26 +1785,34 @@ impl ExternalAgentCommand {
     }
 
     /// Concrete capabilities used by the supervisor while creating MACO-owned confinement
-    /// evidence. Static capabilities remain authoritative for every non-Grok runtime.
+    /// evidence. Static capabilities remain authoritative for every other runtime.
     pub(crate) fn selected_writable_capabilities(
         &self,
         runtime: RuntimeId,
         expected_assignment_id: Option<&str>,
     ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
-        if runtime != RuntimeId::Grok {
-            return Ok(runtime.capabilities());
-        }
-        let contract = self.current_grok_writable_contract()?;
+        let capabilities = match runtime {
+            RuntimeId::Grok => self.current_grok_writable_contract()?.capabilities(),
+            RuntimeId::ClaudeCode => self.current_claude_writable_contract()?.capabilities(),
+            _ => return Ok(runtime.capabilities()),
+        };
         if expected_assignment_id.is_some_and(|expected| {
             self.writable_runtime_selection
                 .as_ref()
-                .is_none_or(|selected| selected.assignment_id != expected)
+                .is_none_or(|selected| {
+                    selected.assignment_id != expected
+                        || selected.runtime != runtime
+                        || !selected.matches_command(self, runtime)
+                })
         }) {
-            bail!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok selection evidence belongs to a different assignment"
-            );
+            let reason = if runtime == RuntimeId::ClaudeCode {
+                WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE
+            } else {
+                WRITABLE_GROK_SELECTION_EVIDENCE_STALE
+            };
+            bail!("{reason}: writable native selection evidence is stale or belongs to a different assignment");
         }
-        Ok(contract.capabilities())
+        Ok(capabilities)
     }
 
     /// Concrete capabilities used at the external process boundary. Writable Grok must carry the
@@ -1525,24 +1822,43 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
     ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
         let capabilities = self.selected_writable_capabilities(runtime, None)?;
-        if runtime != RuntimeId::Grok {
+        if !matches!(runtime, RuntimeId::Grok | RuntimeId::ClaudeCode) {
             return Ok(capabilities);
         }
         let selected = self.writable_runtime_selection.as_ref().with_context(|| {
-            format!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification"
-            )
+            if runtime == RuntimeId::ClaudeCode {
+                format!("{WRITABLE_CLAUDE_SELECTION_EVIDENCE_MISSING}: writable Claude selection evidence disappeared before confinement verification")
+            } else {
+                format!("{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification")
+            }
         })?;
         let proof = self.worktree_writable_confinement.as_ref().with_context(|| {
-            format!(
-                "{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof"
-            )
+            if runtime == RuntimeId::ClaudeCode {
+                format!("{WRITABLE_CLAUDE_CONFINEMENT_PROOF_MISSING}: writable Claude has no MACO-owned managed-worktree confinement proof")
+            } else {
+                format!("{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof")
+            }
         })?;
         if proof.selected_launch.as_ref() != Some(selected) || !proof.command.matches_command(self)
         {
-            bail!(
-                "{WRITABLE_GROK_CONFINEMENT_PROOF_STALE}: writable Grok confinement proof does not bind the current selected launch"
-            );
+            let reason = if runtime == RuntimeId::ClaudeCode {
+                WRITABLE_CLAUDE_CONFINEMENT_PROOF_STALE
+            } else {
+                WRITABLE_GROK_CONFINEMENT_PROOF_STALE
+            };
+            bail!("{reason}: writable native confinement proof does not bind the current selected launch");
+        }
+        if runtime == RuntimeId::ClaudeCode {
+            let (resolved, current_digest) =
+                resolve_claude_native_program_identity(&self.program, &self.cwd)
+                    .context("failed to re-resolve Claude executable before confinement release")?;
+            if !claude::admitted_native_executable(&resolved, &current_digest)
+                || selected.program_sha256.as_deref() != Some(current_digest.as_str())
+            {
+                bail!(
+                    "{WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE}: writable Claude executable bytes changed after selection"
+                );
+            }
         }
         let admission = &proof.admission;
         if admission.version != WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION
@@ -1551,14 +1867,17 @@ impl ExternalAgentCommand {
             || admission.worktree.kind != ManagedWorktreeAdmissionKind::ManagedDisposable
             || admission.worktree.worktree_id != selected.assignment_id
             || admission.claims.state != HeldPathClaimsAdmissionState::Held
-            || admission.native_sandbox.runtime != RuntimeId::Grok
+            || admission.native_sandbox.runtime != runtime
             || admission.native_sandbox.workspace_access != WorkspaceAccess::ReadWrite
             || admission.native_sandbox.side_effect_confinement != SideEffectConfinement::Verified
             || self.workspace_access != WorkspaceAccess::ReadWrite
         {
-            bail!(
-                "{WRITABLE_GROK_CONFINEMENT_UNVERIFIED}: writable Grok confinement proof does not authenticate the current bounded managed-worktree launch"
-            );
+            let reason = if runtime == RuntimeId::ClaudeCode {
+                WRITABLE_CLAUDE_CONFINEMENT_UNVERIFIED
+            } else {
+                WRITABLE_GROK_CONFINEMENT_UNVERIFIED
+            };
+            bail!("{reason}: writable native confinement proof does not authenticate the current bounded managed-worktree launch");
         }
         Ok(capabilities)
     }
@@ -1581,6 +1900,12 @@ impl ExternalAgentCommand {
         {
             self.grok_run_account_binding =
                 crate::account_authority::grok_run_account_binding(&run_id);
+        }
+        if self.invocation == ExternalAgentInvocation::ClaudeCode
+            && self.claude_run_account_binding.is_none()
+        {
+            self.claude_run_account_binding =
+                crate::account_authority::claude_run_account_binding(&run_id);
         }
         self.agent_lifecycle = Some(ExternalAgentLifecycleIdentity {
             registry_repo: registry_repo.into(),
@@ -1671,6 +1996,16 @@ impl ExternalAgentCommand {
         binding: Option<FrozenGrokSelectedBinding>,
     ) -> Self {
         self.grok_run_account_binding = binding;
+        self
+    }
+
+    #[cfg(test)]
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    pub(crate) fn with_claude_run_account_binding(
+        mut self,
+        binding: Option<FrozenClaudeSelectedBinding>,
+    ) -> Self {
+        self.claude_run_account_binding = binding;
         self
     }
 
@@ -1949,6 +2284,46 @@ impl ExternalAgentRun {
             return self.authenticated_codex_partial_usage();
         }
         self.stdout.run_metadata.codex_cli_usage
+    }
+
+    /// Parent-private Claude raw native stream evidence. Public report fields,
+    /// JSON logs, and deserialized runs cannot mint this custody.
+    pub(crate) fn authenticated_claude_native_evidence(&self) -> Option<&ClaudeNativeEvidence> {
+        self.stdout.run_metadata.claude_native_evidence.as_ref()
+    }
+
+    pub(crate) fn authenticated_claude_usage_complete(&self) -> bool {
+        self.authenticated_claude_native_evidence()
+            .is_some_and(ClaudeNativeEvidence::complete)
+    }
+
+    pub(crate) fn authenticated_claude_usage(&self) -> Option<Usage> {
+        self.authenticated_claude_native_evidence()
+            .and_then(ClaudeNativeEvidence::complete_usage)
+    }
+
+    pub(crate) fn authenticated_claude_usage_lower_bound(&self) -> Option<Usage> {
+        self.authenticated_claude_native_evidence()
+            .and_then(ClaudeNativeEvidence::usage_lower_bound)
+    }
+
+    pub(crate) fn authenticated_claude_model(&self) -> Option<&str> {
+        self.authenticated_claude_native_evidence()
+            .and_then(ClaudeNativeEvidence::observed_model)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_claude_native_stream_for_test(
+        &mut self,
+        stream: &[u8],
+        truncated: bool,
+        interrupted: bool,
+    ) {
+        let mut evidence = crate::runtime_adapter::claude::collect_native_stream(stream, truncated);
+        if interrupted {
+            evidence.mark_interrupted();
+        }
+        self.stdout.run_metadata.claude_native_evidence = Some(evidence);
     }
 
     /// A valid single turn is a lower bound, never a complete CLI aggregate.
@@ -2337,6 +2712,9 @@ struct ExternalAgentRunMetadata {
     codex_cli_parent_evidence: Option<CodexParentEvidence>,
     codex_cli_usage: Option<Usage>,
     codex_cli_usage_complete: bool,
+    /// Raw Claude stream-derived identity and usage held only by the parent
+    /// that owned stdout. Serialization and public logs cannot restore it.
+    claude_native_evidence: Option<ClaudeNativeEvidence>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
 }
 
@@ -2513,6 +2891,14 @@ struct GrokVerifiedAccountSession {
 }
 
 #[cfg(target_os = "linux")]
+struct ClaudeVerifiedAccountSession {
+    authority: crate::account_authority::ClaudeLaunchAuthority,
+    deadline_unix_millis: u64,
+    helper_registration_nonce: String,
+    containment_owner: ClaudeContainmentOwnerBinding,
+}
+
+#[cfg(target_os = "linux")]
 fn prepare_verified_grok_account_session(
     spec: &ExternalAgentCommand,
 ) -> Result<GrokVerifiedAccountSession> {
@@ -2537,6 +2923,59 @@ fn prepare_verified_grok_account_session(
         authority,
         credentials,
     })
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_verified_claude_account_session(
+    spec: &ExternalAgentCommand,
+    remaining: Duration,
+) -> Result<ClaudeVerifiedAccountSession> {
+    let deadline_unix_millis = unix_deadline_millis(remaining)?;
+    let frozen = spec.claude_run_account_binding.as_ref();
+    let authority = crate::account_authority::claude::acquire_claude_launch_authority(
+        frozen,
+        deadline_unix_millis,
+    )?;
+    if let Some(frozen) = frozen {
+        let evidence = authority.selection_evidence();
+        if evidence.provider_id != frozen.provider_id
+            || evidence.account_id != frozen.account_id
+            || evidence.account_incarnation != frozen.account_incarnation
+            || evidence.selection_revision != frozen.selection_revision
+            || (frozen.authority_id.is_some() && evidence.authority_id != frozen.authority_id)
+        {
+            bail!("managed Claude selection does not match the frozen selected binding");
+        }
+    }
+    Ok(ClaudeVerifiedAccountSession {
+        authority,
+        deadline_unix_millis,
+        helper_registration_nonce: private_parent_nonce()?,
+        containment_owner: ClaudeContainmentOwnerBinding::new(),
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn unix_deadline_millis(remaining: Duration) -> Result<u64> {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .context("system clock precedes the Unix epoch")?;
+    let deadline = now
+        .checked_add(remaining)
+        .context("Claude launch deadline overflowed")?;
+    u64::try_from(deadline.as_millis()).context("Claude launch deadline does not fit u64")
+}
+
+#[cfg(target_os = "linux")]
+fn private_parent_nonce() -> Result<String> {
+    let mut bytes = [0u8; 32];
+    OpenOptions::new()
+        .read(true)
+        .open("/dev/urandom")
+        .context("failed to open the kernel random source for Claude relay binding")?
+        .read_exact(&mut bytes)
+        .context("failed to read the Claude relay parent nonce")?;
+    Ok(sha256_hex(&bytes))
 }
 
 pub fn run_external_agent(spec: &ExternalAgentCommand) -> ExternalAgentRun {
@@ -2829,7 +3268,12 @@ fn run_external_agent_runtime(
     mut review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
 ) -> ExternalAgentRun {
     let started = Instant::now();
-    if let Err(error) = spec.verified_live_token_grant() {
+    let reservation_check = if spec.uses_live_claude_managed_worker_budget() {
+        spec.verified_claude_managed_reservation()
+    } else {
+        spec.verified_live_token_grant()
+    };
+    if let Err(error) = reservation_check {
         return failed_external_run(
             spec,
             started,
@@ -2867,26 +3311,37 @@ fn run_external_agent_runtime(
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if let Some(adapter) = spec.invocation.adapter_id() {
-            let capabilities = if adapter == AdapterId::Grok
-                && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
-            {
-                match spec.verified_writable_capabilities(RuntimeId::Grok) {
-                    Ok(capabilities) => capabilities,
-                    Err(error) => {
-                        return failed_external_environment_run(
-                            spec,
-                            started,
-                            command_display(&spec.program, &[]),
-                            false,
-                            EnvironmentFailureCategory::SandboxUnavailable,
-                            Some(external_sandbox_requirement(spec.invocation)),
-                            format!("writable grok failed closed before launch: {error:#}"),
-                        );
-                    }
-                }
-            } else {
-                adapter.capabilities()
+            let managed_native_runtime = match adapter {
+                AdapterId::Grok => Some(RuntimeId::Grok),
+                AdapterId::ClaudeCode => Some(RuntimeId::ClaudeCode),
+                _ => None,
             };
+            let capabilities =
+                if spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree {
+                    match managed_native_runtime
+                        .map(|runtime| spec.verified_writable_capabilities(runtime))
+                        .transpose()
+                    {
+                        Ok(Some(capabilities)) => capabilities,
+                        Ok(None) => adapter.capabilities(),
+                        Err(error) => {
+                            return failed_external_environment_run(
+                                spec,
+                                started,
+                                command_display(&spec.program, &[]),
+                                false,
+                                EnvironmentFailureCategory::SandboxUnavailable,
+                                Some(external_sandbox_requirement(spec.invocation)),
+                                format!(
+                                    "writable {} failed closed before launch: {error:#}",
+                                    adapter.as_str()
+                                ),
+                            );
+                        }
+                    }
+                } else {
+                    adapter.capabilities()
+                };
             if let Some(capability) =
                 capabilities.writable_launch_refusal(spec.writable_launch_target)
             {
@@ -3427,15 +3882,107 @@ fn run_external_agent_runtime(
     #[cfg(not(target_os = "linux"))]
     let grok_credentials: Option<&AdmittedGrokCredentials> = None;
 
+    #[cfg(target_os = "linux")]
+    let mut claude_session = if runtime == ExternalExecutionRuntime::Verified
+        && spec.uses_live_claude_managed_worker_budget()
+    {
+        match prepare_verified_claude_account_session(
+            spec,
+            spec.timeout.saturating_sub(started.elapsed()),
+        ) {
+            Ok(session) => Some(session),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::MissingCredential,
+                    Some(EnvironmentRequirement::credential(
+                        EnvironmentCredential::ClaudeManagedOAuth,
+                    )),
+                    format!("managed Claude OAuth authority failed closed: {error:#}"),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut claude_session: Option<()> = None;
+    if runtime == ExternalExecutionRuntime::Verified
+        && spec.uses_live_claude_managed_worker_budget()
+        && !cfg!(target_os = "linux")
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(external_sandbox_requirement(spec.invocation)),
+            "managed Claude OAuth relay requires Linux".to_string(),
+        );
+        return report;
+    }
+
+    #[cfg(target_os = "linux")]
+    let claude_relay_directory = if claude_session.is_some() {
+        match tempfile::Builder::new()
+            .prefix("maco-claude-parent-relay-")
+            .tempdir()
+        {
+            Ok(directory) => Some(directory),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("managed Claude parent relay directory failed: {error}"),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(target_os = "linux")]
+    let claude_parent_socket = claude_relay_directory
+        .as_ref()
+        .map(|directory| directory.path().join("relay.sock"));
+    #[cfg(not(target_os = "linux"))]
+    let claude_parent_socket: Option<PathBuf> = None;
+    #[cfg(target_os = "linux")]
+    let claude_deadline_unix_millis = claude_session
+        .as_ref()
+        .map(|session| session.deadline_unix_millis);
+    #[cfg(not(target_os = "linux"))]
+    let claude_deadline_unix_millis: Option<u64> = None;
+
     let side_effect_profile = if runtime == ExternalExecutionRuntime::Verified
         && (program_trust == ExternalProgramTrust::TrustedSystemCodex
             || spec.invocation.is_adapter_subprocess())
     {
-        match external_side_effect_profile(
+        match external_side_effect_profile_with_claude_relay(
             &target_spec,
             &resolved_program,
             program_trust,
             &target_controls,
+            ClaudeProfileBinding {
+                #[cfg(target_os = "linux")]
+                child_config_home: claude_session
+                    .as_ref()
+                    .map(|session| session.authority.child_config_home()),
+                #[cfg(target_os = "linux")]
+                managed_data_root: claude_session
+                    .as_ref()
+                    .map(|session| session.authority.managed_data_root()),
+                #[cfg(target_os = "linux")]
+                helper_registration_nonce: claude_session
+                    .as_ref()
+                    .map(|session| session.helper_registration_nonce.as_str()),
+                containment_owner: claude_session
+                    .as_ref()
+                    .map(|session| &session.containment_owner),
+                parent_socket: claude_parent_socket.as_deref(),
+                deadline_unix_millis: claude_deadline_unix_millis,
+            },
         ) {
             Ok(profile) => Some(profile),
             Err(error) => {
@@ -3512,7 +4059,11 @@ fn run_external_agent_runtime(
         }
         (None, profile) => profile,
     };
-    let mut external_environment = allowed_env(spec.invocation, program_trust);
+    let mut external_environment = allowed_env(
+        spec.invocation,
+        program_trust,
+        !spec.uses_live_claude_managed_worker_budget(),
+    );
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
             if !runtime_environment_passthrough_allowed(spec.invocation, key) {
@@ -3532,6 +4083,27 @@ fn run_external_agent_runtime(
             record_grok_credential_environment_failure(&mut report, &error);
             return report;
         }
+        session
+            .authority
+            .apply_launch_environment(&mut external_environment);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(session) = claude_session.as_mut() {
+        if let Err(error) = session.authority.verify_binding_unchanged() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::MissingCredential,
+                Some(EnvironmentRequirement::credential(
+                    EnvironmentCredential::ClaudeManagedOAuth,
+                )),
+                format!("managed Claude OAuth authority changed before child release: {error:#}"),
+            );
+            return report;
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(session) = claude_session.as_ref() {
         session
             .authority
             .apply_launch_environment(&mut external_environment);
@@ -3572,18 +4144,54 @@ fn run_external_agent_runtime(
         &mut external_environment,
         spec.cam_authority_socket_pin.as_deref(),
     );
-    let credential_redactor =
-        match CredentialRedactor::from_runtime(&external_environment, codex_auth.as_ref()) {
-            Ok(redactor) => redactor,
+    #[cfg(target_os = "linux")]
+    let claude_oauth_redaction = match claude_session.as_ref() {
+        Some(session) => match session.authority.oauth_grant_bytes() {
+            Ok(bytes) => Some(bytes),
             Err(error) => {
                 report.duration_ms = duration_millis(started.elapsed());
                 record_external_error(
                     &mut report,
-                    format!("failed to prepare bounded credential redaction: {error:#}"),
+                    format!("managed Claude OAuth redaction binding failed: {error:#}"),
                 );
                 return report;
             }
-        };
+        },
+        None => None,
+    };
+    #[cfg(not(target_os = "linux"))]
+    let claude_oauth_redaction: Option<&[u8]> = None;
+    let credential_redactor = match CredentialRedactor::from_runtime(
+        &external_environment,
+        codex_auth.as_ref(),
+        claude_oauth_redaction,
+    ) {
+        Ok(redactor) => redactor,
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("failed to prepare bounded credential redaction: {error:#}"),
+            );
+            return report;
+        }
+    };
+    if runtime == ExternalExecutionRuntime::Verified
+        && spec.uses_live_claude_managed_worker_budget()
+        && claude_session.is_none()
+    {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_environment_failure(
+            &mut report,
+            EnvironmentFailureCategory::MissingCredential,
+            Some(EnvironmentRequirement::credential(
+                EnvironmentCredential::ClaudeManagedOAuth,
+            )),
+            "managed Claude worker requires a selected CAM OAuth account before provider release"
+                .to_string(),
+        );
+        return report;
+    }
     if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
@@ -3795,6 +4403,109 @@ fn run_external_agent_runtime(
             return report;
         }
     };
+    #[cfg(target_os = "linux")]
+    let mut claude_relay = if let Some(session) = claude_session.as_mut() {
+        let (reservation_id, auth_mode) = match target_spec.claude_managed_binding() {
+            Ok(binding) => binding,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(&mut report, error);
+                return report;
+            }
+        };
+        if auth_mode != ClaudeAuthMode::ManagedOAuth {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                "managed Claude account was paired with the bare API-key route".to_string(),
+            );
+            return report;
+        }
+        let launch_digest = sha256_hex(
+            format!(
+                "{}\n{}\n{}\n{}",
+                program_identity.display(),
+                argv_digest,
+                target_spec.cwd.display(),
+                reservation_id
+            )
+            .as_bytes(),
+        );
+        let binding = match ClaudeBrokerBinding::new(
+            match private_parent_nonce() {
+                Ok(nonce) => nonce,
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(&mut report, format!("{error:#}"));
+                    return report;
+                }
+            },
+            launch_digest,
+            session.authority.account_binding_string(),
+            reservation_id,
+            session.deadline_unix_millis,
+            ClaudeTransportAuthMode::OAuthBearer,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(&mut report, error);
+                return report;
+            }
+        };
+        let upstream_oauth_grant = match session.authority.take_oauth_grant() {
+            Ok(grant) => grant,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(&mut report, format!("{error:#}"));
+                return report;
+            }
+        };
+        let child_oauth_grant = match session.authority.take_child_oauth_grant() {
+            Ok(grant) => grant,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(&mut report, format!("{error:#}"));
+                return report;
+            }
+        };
+        let Some(parent_socket) = claude_parent_socket.as_deref() else {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                "managed Claude parent relay socket binding was unavailable".to_string(),
+            );
+            return report;
+        };
+        match ClaudeManagedRelay::start(
+            binding,
+            child_oauth_grant,
+            upstream_oauth_grant,
+            session.helper_registration_nonce.clone(),
+            session.containment_owner.clone(),
+            parent_socket,
+        ) {
+            Ok(relay) => {
+                external_environment.insert(
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    relay.base_url().to_string(),
+                );
+                Some(relay)
+            }
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("managed Claude parent relay failed to start: {error}"),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(target_os = "linux"))]
+    let mut claude_relay: Option<()> = None;
     let process_spec = ProcessSpec::direct(
         "external agent",
         &resolved_program,
@@ -3904,6 +4615,23 @@ fn run_external_agent_runtime(
             return report;
         }
     }
+    #[cfg(target_os = "linux")]
+    if let Some(session) = claude_session.as_mut() {
+        if let Err(error) = session.authority.verify_binding_unchanged() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::MissingCredential,
+                Some(EnvironmentRequirement::credential(
+                    EnvironmentCredential::ClaudeManagedOAuth,
+                )),
+                format!(
+                    "managed Claude account/credential source changed before target release: {error:#}"
+                ),
+            );
+            return report;
+        }
+    }
 
     if let Err(error) = researcher_inputs::revalidate_source_inputs(
         &target_spec,
@@ -3915,6 +4643,27 @@ fn run_external_agent_runtime(
             format!("Researcher source input changed before target release: {error:#}"),
         );
         return report;
+    }
+
+    if target_spec.uses_live_claude_managed_worker_budget() {
+        if let Err(error) = target_spec.verified_writable_capabilities(RuntimeId::ClaudeCode) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!(
+                    "Claude managed-Worker executable/claim confinement changed before target release: {error:#}"
+                ),
+            );
+            return report;
+        }
+        if let Err(error) = target_spec.verified_claude_managed_reservation() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("Claude managed-Worker reservation stopped before target release: {error}"),
+            );
+            return report;
+        }
     }
 
     // Preflight evidence describes only the bounded probes. Once the main target is released it
@@ -3936,9 +4685,12 @@ fn run_external_agent_runtime(
         program_identity: &program_identity,
         grok_acp_parent_evidence: None,
         grok_acp_launch_schema_identity: None,
+        claude_broker_witness: None,
     };
     let mut retained_gate_denials = Vec::new();
     let mut retained_review_metrics = None;
+    let mut failed_claude_broker_witness: Option<(ClaudeWholeCallWitness, ClaudeBrokerBinding)> =
+        None;
     let process_result = if app_server_required {
         let Some(prompt) = app_server_prompt else {
             report.duration_ms = duration_millis(started.elapsed());
@@ -3988,6 +4740,134 @@ fn run_external_agent_runtime(
                 Ok(())
             }
             Err(error) => Err(error),
+        }
+    } else if target_spec.uses_live_claude_managed_worker_budget() {
+        match run_process_cancellable(process_spec, cancellation) {
+            Ok(output) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let relay = claude_relay
+                        .take()
+                        .expect("managed Claude launch prepared its parent relay");
+                    let expected_binding = relay.binding().clone();
+                    let child_exit_observed = output.status.is_some();
+                    let interrupted = output.timed_out
+                        || output.process_error.is_some()
+                        || output.stdin_error.is_some()
+                        || cancellation.is_cancelled();
+                    match relay.finish(child_exit_observed, interrupted) {
+                        Ok(finish) => {
+                            let mut witness = finish.witness;
+                            if let Some(error) = finish.error {
+                                record_external_error(
+                                    &mut report,
+                                    format!("managed Claude parent relay drain failed: {error}"),
+                                );
+                            }
+                            let source_unchanged = claude_session
+                                .as_mut()
+                                .expect("managed Claude launch retained its account lease")
+                                .authority
+                                .verify_binding_unchanged()
+                                .map(|()| true)
+                                .unwrap_or_else(|error| {
+                                    record_external_error(
+                                        &mut report,
+                                        format!(
+                                            "managed Claude account/credential source changed before relay drain: {error:#}"
+                                        ),
+                                    );
+                                    false
+                                });
+                            if !source_unchanged {
+                                witness.mark_interrupted();
+                            }
+                            match output_staging.completion_handles() {
+                                Ok(staging) => record_completed_target(
+                                    &mut report,
+                                    output,
+                                    staging,
+                                    &mut output_reservation,
+                                    &mut json_log_reservation,
+                                    &credential_redactor,
+                                    CompletedTargetContext {
+                                        claude_broker_witness: Some((&witness, &expected_binding)),
+                                        ..completed_context
+                                    },
+                                ),
+                                Err(error) => {
+                                    report.error = append_external_error(
+                                        report.error.take(),
+                                        Some(format!(
+                                            "private external-agent output staging became unavailable: {error:#}"
+                                        )),
+                                    );
+                                    report.publishable = false;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            record_external_error(
+                                &mut report,
+                                format!("managed Claude parent relay did not seal: {error}"),
+                            );
+                            match output_staging.completion_handles() {
+                                Ok(staging) => record_completed_target(
+                                    &mut report,
+                                    output,
+                                    staging,
+                                    &mut output_reservation,
+                                    &mut json_log_reservation,
+                                    &credential_redactor,
+                                    completed_context,
+                                ),
+                                Err(staging_error) => record_external_error(
+                                    &mut report,
+                                    format!(
+                                        "private external-agent output staging became unavailable: {staging_error:#}"
+                                    ),
+                                ),
+                            }
+                        }
+                    }
+                }
+                Ok(())
+            }
+            Err(error) => {
+                #[cfg(target_os = "linux")]
+                if let Some(relay) = claude_relay.take() {
+                    let expected_binding = relay.binding().clone();
+                    match relay.finish(false, true) {
+                        Ok(finish) => {
+                            if let Some(relay_error) = finish.error {
+                                record_external_error(
+                                    &mut report,
+                                    format!(
+                                        "managed Claude parent relay drain failed: {relay_error}"
+                                    ),
+                                );
+                            }
+                            failed_claude_broker_witness = Some((finish.witness, expected_binding));
+                        }
+                        Err(relay_error) => record_external_error(
+                            &mut report,
+                            format!("managed Claude parent relay did not seal: {relay_error}"),
+                        ),
+                    }
+                }
+                #[cfg(target_os = "linux")]
+                if let Some(session) = claude_session.as_mut() {
+                    if let Err(revalidation_error) = session.authority.verify_binding_unchanged() {
+                        record_external_error(
+                            &mut report,
+                            format!(
+                                "managed Claude account/credential source changed before failed relay release: {revalidation_error:#}"
+                            ),
+                        );
+                    }
+                }
+                Err(error)
+            }
         }
     } else if grok_acp_stdio_protocol_selected(&target_spec) {
         let Some(prompt) = grok_acp_prompt else {
@@ -4069,6 +4949,7 @@ fn run_external_agent_runtime(
                             program_identity: &program_identity,
                             grok_acp_parent_evidence: parent_evidence.as_ref(),
                             grok_acp_launch_schema_identity: launch_schema.as_ref(),
+                            claude_broker_witness: None,
                         },
                     ),
                     Err(error) => {
@@ -4167,6 +5048,17 @@ fn run_external_agent_runtime(
                     summarize_redacted_output(&evidence.stdout, &credential_redactor),
                 );
                 report.stdout.target_launch_attempted = true;
+                if target_spec.invocation == ExternalAgentInvocation::ClaudeCode {
+                    let mut claude = crate::runtime_adapter::claude::collect_native_stream(
+                        evidence.stdout.as_bytes(),
+                        evidence.stdout.is_truncated(),
+                    );
+                    if let Some((witness, binding)) = &failed_claude_broker_witness {
+                        claude.attach_whole_call_witness(witness, binding);
+                    }
+                    claude.mark_interrupted();
+                    report.stdout.run_metadata.claude_native_evidence = Some(claude);
+                }
                 report.stderr = summarize_redacted_output(&evidence.stderr, &credential_redactor);
             }
             deduplicate_sandbox_denials(&mut sandbox_denials);
@@ -4909,6 +5801,7 @@ struct CompletedTargetContext<'a> {
     program_identity: &'a ExternalProgramIdentity,
     grok_acp_parent_evidence: Option<&'a GrokAcpParentEvidence>,
     grok_acp_launch_schema_identity: Option<&'a GrokAcpBoundOutputSchema>,
+    claude_broker_witness: Option<(&'a ClaudeWholeCallWitness, &'a ClaudeBrokerBinding)>,
 }
 
 struct GrokAcpInteractiveOutcome {
@@ -5087,11 +5980,28 @@ fn grok_bounded_stdout_usage_evidence(stdout: &CapturedBytes) -> GrokStreamUsage
     }
 }
 
+#[cfg(test)]
 fn runtime_adapter_captured_output(
     spec: &ExternalAgentCommand,
     stdout: &[u8],
     stderr: &[u8],
     target_completed_successfully: bool,
+) -> Result<RuntimeAdapterCapturedOutput> {
+    runtime_adapter_captured_output_with_claude_evidence(
+        spec,
+        stdout,
+        stderr,
+        target_completed_successfully,
+        None,
+    )
+}
+
+fn runtime_adapter_captured_output_with_claude_evidence(
+    spec: &ExternalAgentCommand,
+    stdout: &[u8],
+    stderr: &[u8],
+    target_completed_successfully: bool,
+    claude_evidence: Option<&ClaudeNativeEvidence>,
 ) -> Result<RuntimeAdapterCapturedOutput> {
     if spec.invocation == ExternalAgentInvocation::Grok {
         if grok_acp_stdio_protocol_selected(spec) {
@@ -5128,6 +6038,25 @@ fn runtime_adapter_captured_output(
         return Ok(RuntimeAdapterCapturedOutput::Captured(
             stream.response_text().as_bytes().to_vec(),
         ));
+    }
+
+    if spec.invocation == ExternalAgentInvocation::ClaudeCode {
+        if !target_completed_successfully {
+            return Ok(RuntimeAdapterCapturedOutput::Unavailable);
+        }
+        let parsed;
+        let evidence = match claude_evidence {
+            Some(evidence) => evidence,
+            None => {
+                parsed = crate::runtime_adapter::claude::collect_native_stream(stdout, false);
+                &parsed
+            }
+        };
+        let result = evidence
+            .result_text
+            .as_ref()
+            .context("Claude native stream is missing the terminal result text")?;
+        return Ok(RuntimeAdapterCapturedOutput::Captured(result.clone()));
     }
 
     let Some(config) = &spec.runtime_adapter else {
@@ -5287,6 +6216,23 @@ fn record_completed_target(
         && output.status.is_some_and(|status| status.success())
         && output.process_error.is_none()
         && output.stdin_error.is_none();
+    let mut claude_native_evidence =
+        (context.spec.invocation == ExternalAgentInvocation::ClaudeCode).then(|| {
+            crate::runtime_adapter::claude::collect_native_stream(
+                output.stdout.as_bytes(),
+                output.stdout.is_truncated(),
+            )
+        });
+    if let (Some(evidence), Some((witness, binding))) =
+        (&mut claude_native_evidence, context.claude_broker_witness)
+    {
+        evidence.attach_whole_call_witness(witness, binding);
+    }
+    if !target_completed_successfully {
+        if let Some(evidence) = &mut claude_native_evidence {
+            evidence.mark_interrupted();
+        }
+    }
     let mut sandbox_denials =
         sandbox_denials_from_codex_jsonl(context.protected_controls, output.stdout.as_bytes());
     deduplicate_sandbox_denials(&mut sandbox_denials);
@@ -5324,6 +6270,7 @@ fn record_completed_target(
         summarize_redacted_output(&output.stdout, credential_redactor),
     );
     report.stdout.target_launch_attempted = true;
+    report.stdout.run_metadata.claude_native_evidence = claude_native_evidence.clone();
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
     if let Some(evidence) = context.grok_acp_parent_evidence {
@@ -5370,11 +6317,24 @@ fn record_completed_target(
         };
         report.error = append_external_error(report.error.take(), Some(status_error));
     }
-    let staged_output_available = match runtime_adapter_captured_output(
+    if claude_native_evidence
+        .as_ref()
+        .is_some_and(|evidence| !evidence.complete())
+    {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(
+                "Claude native identity and usage coverage is incomplete for this invocation"
+                    .to_string(),
+            ),
+        );
+    }
+    let staged_output_available = match runtime_adapter_captured_output_with_claude_evidence(
         context.spec,
         output.stdout.as_bytes(),
         output.stderr.as_bytes(),
         target_completed_successfully,
+        claude_native_evidence.as_ref(),
     ) {
         Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput) => true,
         Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
@@ -6568,6 +7528,12 @@ fn evaluate_environment_requirement(
                     side_effect_profile,
                     SideEffectConfinementProfile::ExternalGrok(_)
                 );
+            let verified_parent_relayed_claude = verified_confinement
+                == Some(SideEffectConfinementProfileKind::ExternalClaude)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalClaude(_)
+                );
             if *access == EnvironmentNetworkAccess::Disabled && enforced_offline {
                 (
                     EnvironmentPreflightResult {
@@ -6580,7 +7546,9 @@ fn evaluate_environment_requirement(
                     None,
                     false,
                 )
-            } else if *access == EnvironmentNetworkAccess::Enabled && verified_networked_grok {
+            } else if *access == EnvironmentNetworkAccess::Enabled
+                && (verified_networked_grok || verified_parent_relayed_claude)
+            {
                 (
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
@@ -6631,6 +7599,9 @@ fn evaluate_environment_requirement(
             let required_profile = match capability {
                 EnvironmentSandboxCapability::VerifiedExternalCodex => {
                     SideEffectConfinementProfileKind::ExternalCodex
+                }
+                EnvironmentSandboxCapability::VerifiedExternalClaude => {
+                    SideEffectConfinementProfileKind::ExternalClaude
                 }
                 EnvironmentSandboxCapability::VerifiedExternalGrok => {
                     SideEffectConfinementProfileKind::ExternalGrok

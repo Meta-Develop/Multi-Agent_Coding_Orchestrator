@@ -76,7 +76,10 @@ struct BudgetAdmissionTestHookGuard(String);
 #[cfg(test)]
 impl Drop for BudgetAdmissionTestHookGuard {
     fn drop(&mut self) {
-        budget_admission_test_hooks().lock().unwrap().remove(&self.0);
+        budget_admission_test_hooks()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
     }
 }
 
@@ -246,39 +249,49 @@ impl DispatchBudgetReservation<'_> {
         let DispatchBudgetReservationState::Invoked(launch_runtime) = self.state else {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
-        let usage = complete_external_codex_usage(run, command);
+        let usage = if launch_runtime == SupervisorRuntime::ClaudeCode {
+            run.authenticated_claude_usage()
+                .or_else(|| run.authenticated_claude_usage_lower_bound())
+        } else {
+            complete_external_codex_usage(run, command)
+        };
         // One parent-owned allocation feeds both the ledger and every role/lens report.
         // A reroute notice cannot allocate cumulative turn usage between models.
-        let model = if launch_runtime == SupervisorRuntime::Codex {
-            run.authenticated_codex_evidence()
+        let model = match launch_runtime {
+            SupervisorRuntime::Codex => run
+                .authenticated_codex_evidence()
                 .filter(|evidence| evidence.requested_model == command.model)
                 .filter(|_| usage.is_some() && run.authenticated_codex_usage() == usage)
                 .and_then(|evidence| evidence.usage_model())
-                .map(str::to_owned)
-        } else {
-            command.model.clone()
+                .map(str::to_owned),
+            SupervisorRuntime::ClaudeCode => run.authenticated_claude_model().map(str::to_owned),
+            _ => command.model.clone(),
         };
-        let pricing = if launch_runtime == SupervisorRuntime::Codex {
-            model.as_deref().and_then(|model| {
+        let pricing = match launch_runtime {
+            SupervisorRuntime::Codex => model.as_deref().and_then(|model| {
                 crate::llm::provider::resolve_model_pricing(&self.model_pricing, model)
                     .filter(|resolved| {
                         resolved.provenance
                             == crate::llm::provider::ModelPricingProvenance::PlanOverride
                     })
                     .map(|resolved| resolved.pricing)
-            })
-        } else {
-            self.pricing
+            }),
+            // The reservation price is a conservative pre-dispatch estimate. The native Claude
+            // stream does not attest provider pricing, so actual money remains unknown.
+            SupervisorRuntime::ClaudeCode => None,
+            _ => self.pricing,
         };
         let cost_usd = usage
             .and_then(|usage| pricing.map(|pricing| pricing.cost_usd(usage)))
             .filter(|cost| cost.is_finite());
         // Identity acceptance is deliberately separate from complete token accounting.
         // This does not relax external_process_completed or any publication gate.
-        let token_process_completed = if run.authenticated_codex_evidence().is_some() {
-            run.authenticated_codex_usage_complete()
-        } else {
-            external_process_completed(run, launch_runtime)
+        let token_process_completed = match launch_runtime {
+            SupervisorRuntime::ClaudeCode => run.authenticated_claude_usage_complete(),
+            _ if run.authenticated_codex_evidence().is_some() => {
+                run.authenticated_codex_usage_complete()
+            }
+            _ => external_process_completed(run, launch_runtime),
         };
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
