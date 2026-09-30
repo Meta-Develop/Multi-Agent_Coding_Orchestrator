@@ -317,7 +317,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         &plan,
         &budget_config,
         &budget_ledger,
-        AgentRole::Worker,
+        (AgentRole::Worker, first_launch_runtime),
         &first_command,
     )
     .expect("reserve first assignment budget")
@@ -424,7 +424,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         &second_plan,
         &budget_config,
         &budget_ledger,
-        AgentRole::Worker,
+        (AgentRole::Worker, second_launch_runtime),
         &second_command,
     )
     .expect("reserve second assignment budget")
@@ -2781,23 +2781,155 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
         .expect("construct selector-backed Codex catalog with a deterministic runner-up");
     let mut child_commands = Vec::new();
+    let mut observed_turns = Vec::new();
+    let mut child_report = injected_child_report(&assignment);
+    let mut worker_report = child_report
+        .worker_reports
+        .first()
+        .expect("authored worker report")
+        .clone();
     let mut runner = |command: &ExternalAgentCommand| {
+        use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
         let name = command
             .output_last_message
             .file_name()
             .and_then(OsStr::to_str)
             .expect("UTF-8 output name");
+        let role = command
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str());
         if name.contains("review-auditor") {
+            observed_turns.push("review-auditor");
             write_injected_json(
                 &command.output_last_message,
-                &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                &injected_auditor_report(&assignment, &child_report),
             );
-        } else {
-            child_commands.push(command.clone());
-            write_injected_assignment_report(command, &assignment);
+            write_injected_usage(command, 8, 3);
+            return injected_verified_run(command);
         }
+        if command.codex_managed_worker_requests_enabled() {
+            observed_turns.push("initial-parent");
+            assert_eq!(role, Some("child_orchestrator"));
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadOnly
+            );
+            assert!(command.codex_native_delegation_is_disabled());
+            assert!(!command.codex_managed_readonly_continuation_enabled());
+            let launch = command
+                .assignment_messaging_launch()
+                .expect("managed parent inbox launch");
+            let env: BTreeMap<_, _> = launch
+                .environment_for(run_id.as_str(), assignment.id.as_str())
+                .expect("sealed parent launch environment")
+                .into_iter()
+                .collect();
+            let mut stream = TcpStream::connect(&env[ENV_MESSAGE_ENDPOINT])
+                .expect("connect managed parent inbox");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request write");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request read");
+            writeln!(
+                stream,
+                "{}",
+                json!({"bearer": env[ENV_MESSAGE_TOKEN], "request": {
+                    "operation": "submit_worker_request",
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }})
+            )
+            .expect("submit authored worker request");
+            stream.flush().expect("flush authored worker request");
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .expect("read worker-request admission");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).expect("decode admission")
+                    ["ok"],
+                true
+            );
+            let yield_turn = json!({
+                "version": 1,
+                "outcome": "yield_workers",
+                "run_id": run_id.as_str(),
+                "parent_id": assignment.id,
+                "parent_attempt": 1,
+                "requests": [{
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }]
+            });
+            write_injected_json(&command.output_last_message, &yield_turn);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            run.output_last_message =
+                Some(serde_json::to_vec(&yield_turn).expect("encode parent yield"));
+            child_commands.push(command.clone());
+            return run;
+        }
+        if role == Some("worker") {
+            observed_turns.push("worker");
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadWrite
+            );
+            assert_eq!(worker_report.id, "worker-a");
+            let active_claims = SyncStore::open(&repo_path)
+                .expect("open active selector claims")
+                .snapshot()
+                .expect("snapshot active selector claims");
+            assert_eq!(active_claims.len(), 1);
+            assert_eq!(active_claims[0].agent_id, assignment.id);
+            assert_eq!(active_claims[0].paths, assignment.assigned_paths);
+            let claim_token = active_claims[0].token.get();
+            worker_report.claim_token = Some(claim_token);
+            worker_report.semantic_intent_token = None;
+            child_report.claim_token = Some(claim_token);
+            child_report.semantic_intent_token = None;
+            child_report.worker_reports = vec![worker_report.clone()];
+            write_injected_json(&command.output_last_message, &worker_report);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            return run;
+        }
+        observed_turns.push("final-parent");
+        assert_eq!(role, Some("child_orchestrator"));
+        assert_eq!(
+            command.workspace_access,
+            crate::process_runner::WorkspaceAccess::ReadOnly
+        );
+        assert!(command.codex_native_delegation_is_disabled());
+        assert!(command.codex_managed_readonly_continuation_enabled());
+        assert!(!command.codex_managed_worker_requests_enabled());
+        assert!(command.assignment_messaging_launch().is_none());
+        let final_turn = json!({
+            "version": 1,
+            "run_id": run_id.as_str(),
+            "parent_id": assignment.id,
+            "source_parent_attempt": 1,
+            "parent_attempt": 2,
+            "completed_worker_ids": [worker_report.id.clone()],
+            "turn": {"outcome": "final_report", "report": &child_report}
+        });
+        write_injected_json(&command.output_last_message, &final_turn);
         write_injected_usage(command, 8, 3);
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        run.stdout.target_launch_attempted = true;
+        run.output_last_message =
+            Some(serde_json::to_vec(&final_turn).expect("encode final parent"));
+        run
     };
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
@@ -2811,6 +2943,10 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     .expect("run verified selector-backed supervise dispatch");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(
+        observed_turns,
+        ["initial-parent", "worker", "final-parent", "review-auditor"]
+    );
     assert_eq!(child_commands.len(), 1);
     let economics = report
         .role_economics_profile
@@ -4089,6 +4225,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     *model = "auditor-model".to_string();
     let samples = vec![
         RoleUsageSample {
+            cost_usd: Some(0.0036),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4099,6 +4236,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.0018),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4109,6 +4247,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.0009),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4119,6 +4258,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.00045),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4207,6 +4347,20 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     assert_eq!(lens_total_cost_usd, lens_reports[0].cost_usd);
 
     plan.model_pricing.clear();
+    let retained = role_usage_report(&plan, samples.clone())
+        .expect("retain settled costs after plan pricing changes");
+    assert_eq!(retained.total_cost_usd, cost);
+    assert_eq!(retained.lens_total_cost_usd, lens_total_cost_usd);
+    for (role, report) in &by_role {
+        assert_eq!(retained.reports[role].cost_usd, report.cost_usd);
+    }
+    let unpriced_samples = samples
+        .into_iter()
+        .map(|mut sample| {
+            sample.cost_usd = None;
+            sample
+        })
+        .collect();
     let RoleUsageAggregation {
         reports: unpriced,
         lens_reports: unpriced_lenses,
@@ -4214,7 +4368,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         total_cost_usd: unpriced_cost,
         lens_total_usage: unpriced_lens_total,
         lens_total_cost_usd: unpriced_lens_cost,
-    } = role_usage_report(&plan, samples).expect("aggregate unpriced process usage");
+    } = role_usage_report(&plan, unpriced_samples).expect("aggregate unpriced process usage");
     assert_eq!(unpriced_total, total);
     assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
     assert!(unpriced_cost.is_none());
@@ -4271,12 +4425,14 @@ fn process_role_usage_aggregation_prices_direct_workers() {
         &plan,
         vec![
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["worker-primary"].cost_usd(first_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-primary".to_string()),
                 usage: first_usage,
             },
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["worker-fallback"].cost_usd(second_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-fallback".to_string()),
@@ -4352,12 +4508,14 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
         &plan,
         vec![
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["auditor-initial"].cost_usd(rejected_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-initial".to_string()),
                 usage: rejected_usage,
             },
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["auditor-active"].cost_usd(accepted_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-active".to_string()),
@@ -4413,21 +4571,22 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
     assert_eq!(persisted.review_lens_usage[1].model, "auditor-initial");
     assert_eq!(persisted.review_lens_total_usage, Some(expected_total));
 
-    let missing_model_error = match role_usage_report(
+    let missing_model = role_usage_report(
         &plan,
         vec![RoleUsageSample {
+            cost_usd: None,
             role: AgentRole::Auditor,
             lens_id: Some(plan.review_lenses[0].id.clone()),
             model: None,
             usage: Usage::default(),
         }],
-    ) {
-        Ok(_) => panic!("lens usage without model attribution must fail closed"),
-        Err(error) => error,
-    };
-    assert!(missing_model_error
-        .to_string()
-        .contains("omitted the dispatched model attribution"));
+    )
+    .expect("unknown identity retains tokens without allocating cost");
+    assert_eq!(missing_model.lens_reports[0].model, "unknown");
+    assert_eq!(missing_model.lens_reports[0].usage, Some(Usage::default()));
+    assert!(missing_model.lens_reports[0].cost_usd.is_none());
+    assert!(missing_model.lens_reports[0].unavailable_reason.is_some());
+    assert!(missing_model.total_cost_usd.is_none());
 }
 
 #[test]
@@ -4482,6 +4641,7 @@ fn nested_process_usage_has_no_synthetic_worker_totals() {
     let nested = role_usage_report(
         &nested_plan,
         vec![RoleUsageSample {
+            cost_usd: None,
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4599,7 +4759,21 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             write_injected_assignment_report(command, &assignment);
             write_injected_usage(command, 50, 10);
         }
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        if name.contains("review-auditor") {
+            let observed_model = if name.contains("lens-0") {
+                "model-alpha"
+            } else {
+                "model-beta"
+            };
+            retain_priced_single_turn_fixture(
+                &mut run,
+                command,
+                observed_model,
+                &fs::read(&command.json_log).expect("complete lens capture"),
+            );
+        }
+        run
     };
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
         plan,

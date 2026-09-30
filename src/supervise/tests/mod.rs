@@ -861,6 +861,50 @@ pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalA
     run
 }
 
+// Opt-in synthetic parent capture for explicitly priced, single-turn fixtures.
+// The generic injected runner deliberately retains no observed model identity.
+fn retain_priced_single_turn_fixture(
+    run: &mut ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    observed_model: &str,
+    complete_capture: &[u8],
+) {
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField as Field, CodexParentTurnUsage,
+    };
+    assert_eq!(command.model.as_deref(), Some(observed_model));
+    assert!(!run.stdout.raw_capture_truncated());
+    let usage = codex_usage_from_jsonl(complete_capture)
+        .expect("valid complete priced fixture capture")
+        .expect("priced fixture has observed usage");
+    let completed_turns = complete_capture
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn.completed"))
+        .count();
+    assert_eq!(completed_turns, 1, "single-turn fixture required");
+    run.codex_parent_evidence = Some(CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("priced-fixture-thread".to_string()),
+        requested_model: command.model.clone(),
+        requested_effort: command.reasoning_effort.clone(),
+        rollout_model: Field::Known(observed_model.to_string()),
+        rollout_effort: Field::Unknown,
+        observed_model: Field::Known(observed_model.to_string()),
+        observed_effort: Field::Unknown,
+        server_rerouted_model: None,
+        model_mismatch: false,
+        turn_usage: CodexParentTurnUsage::Known {
+            input_tokens: u64::try_from(usage.input_tokens).expect("fixture input count fits"),
+            output_tokens: u64::try_from(usage.output_tokens).expect("fixture output count fits"),
+            cached_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        },
+        resolution_status: "complete".to_string(),
+    });
+    run.retain_cli_parent_evidence_for_test(complete_capture);
+}
+
 fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
     if command.workspace_access != WorkspaceAccess::ReadWrite
         || command.writable_launch_target

@@ -1028,6 +1028,22 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
+        SuperviseSubcommand::JournalAppend(args) => {
+            supervise::append_precreated_worker_execution_journal(
+                &args.journal,
+                &crate::safe_state::FileIdentity {
+                    device: args.device,
+                    file: args.inode,
+                },
+                &supervise::WorkerExecutionJournalEntry {
+                    command: args.command,
+                    cwd: args.cwd,
+                    start_timestamp: args.start_timestamp,
+                    end_timestamp: args.end_timestamp,
+                    changed_paths: args.changed_paths,
+                },
+            )
+        }
         SuperviseSubcommand::Plan(args) => {
             let PlanSuperviseArgs {
                 task_file,
@@ -1183,7 +1199,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .map(|path| supervise::bind_operator_prior_data(&resolved_repo, path))
                     .transpose()?
             };
-            let options = SupervisorRunOptions {
+            let supplied_runtime_bin = args.runtime_bin.clone();
+            let mut options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
@@ -1207,6 +1224,37 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     owner: "maco-supervise".to_string(),
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
+            };
+            let additional_runtime_bins = args
+                .additional_runtime_bin
+                .iter()
+                .map(|binding| (binding.runtime, binding.executable.clone()))
+                .collect::<Vec<_>>();
+            let _runtime_executable_guard = if resume_existing {
+                supervise::bind_frozen_runtime_executables_for_run(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    supplied_runtime_bin.as_deref(),
+                    &additional_runtime_bins,
+                )?
+                .map(|(guard, primary)| {
+                    options.codex_bin = primary;
+                    guard
+                })
+            } else if additional_runtime_bins.is_empty() {
+                None
+            } else {
+                let primary = supplied_runtime_bin
+                    .as_deref()
+                    .context("--additional-runtime-bin requires an explicit --runtime-bin")?;
+                Some(supervise::bind_explicit_runtime_executables(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    primary,
+                    &additional_runtime_bins,
+                )?)
             };
             let outcome = (|| {
                 let report = match (goal_spec, resume_existing) {
@@ -1323,6 +1371,8 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
+    /// Serialize one record into an exact precreated Worker journal; never create or replace it.
+    JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
     /// Run a supervisor plan with child orchestrators for a selected runtime.
@@ -1338,6 +1388,30 @@ enum SuperviseSubcommand {
     Collect(CollectSuperviseArgs),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct WorkerJournalAppendArgs {
+    /// Exact delegated journal path.
+    #[arg(long)]
+    journal: PathBuf,
+    /// Device and inode of the parent's precreated journal, not a new path lookup.
+    #[arg(long)]
+    device: u64,
+    #[arg(long)]
+    inode: u64,
+    #[arg(long)]
+    cwd: PathBuf,
+    #[arg(long)]
+    start_timestamp: String,
+    #[arg(long)]
+    end_timestamp: String,
+    /// Canonical repository-relative changed path; repeat for multiple paths.
+    #[arg(long = "changed-path")]
+    changed_paths: Vec<PathBuf>,
+    /// Original command argv, including the entire apply_patch payload as one argument.
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1654,6 +1728,14 @@ struct RunSuperviseArgs {
     /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
+    /// Additional exact executable for a distinct runtime in this supervise run.
+    /// Requires an absolute primary --runtime-bin as well.
+    #[arg(
+        long = "additional-runtime-bin",
+        value_name = "RUNTIME=ABSOLUTE_EXECUTABLE",
+        value_parser = parse_additional_runtime_bin
+    )]
+    additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
@@ -4799,6 +4881,162 @@ fn expect_supervise_command(command: Command) -> SuperviseCommand {
 #[cfg(test)]
 mod cli_integration_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::fs;
+
+    #[cfg(target_os = "linux")]
+    fn invoke_worker_journal_append(
+        journal: &Path,
+        identity: &crate::safe_state::FileIdentity,
+        patch: &str,
+        changed_path: &str,
+    ) -> Result<()> {
+        let args = vec![
+            "maco".to_string(),
+            "supervise".to_string(),
+            "journal-append".to_string(),
+            "--journal".to_string(),
+            journal.to_str().unwrap().to_string(),
+            "--device".to_string(),
+            identity.device.to_string(),
+            "--inode".to_string(),
+            identity.file.to_string(),
+            "--cwd".to_string(),
+            "/worktree".to_string(),
+            "--start-timestamp".to_string(),
+            "2026-09-30T00:00:00Z".to_string(),
+            "--end-timestamp".to_string(),
+            "2026-09-30T00:00:01Z".to_string(),
+            "--changed-path".to_string(),
+            changed_path.to_string(),
+            "--".to_string(),
+            "apply_patch".to_string(),
+            patch.to_string(),
+        ];
+        Cli::try_parse_from(args)?.run()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn precreated_journal(path: &Path) -> crate::safe_state::FileIdentity {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        crate::safe_state::FileIdentity {
+            device: metadata.dev(),
+            file: metadata.ino(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_preserves_quotes_backslashes_and_patch_newlines() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let patch = "*** Begin Patch\n*** Update File: src/duration.py\n@@\n-\"\"\"old\"\"\"\n+\"\"\"quoted \\\"text\\\" and \\path\"\"\"\n*** End Patch\n";
+        invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
+        invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        for line in std::str::from_utf8(&bytes).unwrap().lines() {
+            let record: supervise::WorkerExecutionJournalEntry =
+                serde_json::from_str(line).unwrap();
+            assert_eq!(record.command, vec!["apply_patch", patch]);
+            assert_eq!(record.changed_paths, vec![PathBuf::from("src/duration.py")]);
+            assert_eq!(record.cwd, PathBuf::from("/worktree"));
+            assert_eq!(record.start_timestamp, "2026-09-30T00:00:00Z");
+            assert_eq!(record.end_timestamp, "2026-09-30T00:00:01Z");
+        }
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (identity.device, identity.file)
+        );
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_refuses_wrong_missing_and_symlink_identity() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let other = root.join("other.jsonl");
+        precreated_journal(&other);
+        let patch = "*** Begin Patch\n*** Update File: p\n+x\n*** End Patch";
+        assert!(invoke_worker_journal_append(&other, &identity, patch, "p").is_err());
+        let missing = root.join("missing.jsonl");
+        assert!(invoke_worker_journal_append(&missing, &identity, patch, "p").is_err());
+        assert!(!missing.exists());
+        let alias = root.join("alias.jsonl");
+        symlink(&path, &alias).unwrap();
+        assert!(invoke_worker_journal_append(&alias, &identity, patch, "p").is_err());
+        let ancestor = root.join("alias-dir");
+        symlink(&root, &ancestor).unwrap();
+        assert!(invoke_worker_journal_append(
+            &ancestor.join("worker.jsonl"),
+            &identity,
+            patch,
+            "p"
+        )
+        .is_err());
+        fs::hard_link(&path, root.join("hardlink.jsonl")).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, patch, "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        assert!(fs::read(&other).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_preserves_validation_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let error = invoke_worker_journal_append(&path, &identity, " \n ", "p").unwrap_err();
+        assert!(error.to_string().contains("omitted the patch payload"));
+        let error =
+            invoke_worker_journal_append(&path, &identity, "patch", "../escape").unwrap_err();
+        assert!(error.to_string().contains("invalid changed_paths"));
+        assert!(fs::read(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_refuses_unsafe_mode_locked_file_and_capture_overflow() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let locked = fs::File::open(&path).unwrap();
+        // SAFETY: the test owns a live descriptor and uses no pointer arguments.
+        assert_eq!(
+            unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        drop(locked);
+        let original = vec![b' '; 1024 * 1024];
+        fs::write(&path, &original).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
 
     #[test]
     fn held_out_provider_routing_preserves_legacy_fake_opt_in() {
@@ -5184,6 +5422,48 @@ mod cli_integration_tests {
         ]);
         assert_eq!(from_goal.runtime, Some(supervise::SupervisorRuntime::Grok));
         assert_eq!(from_goal.from_goal, Some(PathBuf::from("goal.md")));
+    }
+
+    #[test]
+    fn supervise_run_parses_bounded_additional_runtime_bindings() {
+        let args = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--runtime",
+            "codex",
+            "--runtime-bin",
+            "/opt/codex",
+            "--additional-runtime-bin",
+            "grok=/opt/grok",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(args.additional_runtime_bin.len(), 1);
+        assert_eq!(
+            args.additional_runtime_bin[0].runtime,
+            supervise::SupervisorRuntime::Grok
+        );
+        assert_eq!(
+            args.additional_runtime_bin[0].executable,
+            PathBuf::from("/opt/grok")
+        );
+        assert!(Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--additional-runtime-bin",
+            "unknown=/opt/agent",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ])
+        .is_err());
     }
 
     #[test]

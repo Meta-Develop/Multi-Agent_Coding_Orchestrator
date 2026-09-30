@@ -68,6 +68,7 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 mod grok_steering;
+pub(crate) mod researcher_inputs;
 
 use codex_parent_evidence::{
     codex_parent_evidence_from_app_server_run, codex_parent_evidence_from_run,
@@ -230,6 +231,7 @@ pub struct ExternalAgentCommand {
     pub output_schema: Option<PathBuf>,
     /// Exact bounded regular files exposed read-only without exposing their parent directories.
     pub read_only_input_files: Vec<PathBuf>,
+    pub(crate) researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     /// Typed precreated worker journals bound to the original incoming report root.
     pub worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     pub timeout: Duration,
@@ -289,6 +291,24 @@ pub struct ExternalAgentCommand {
     /// the selected account from process-global observation state.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
+    /// Opt-in disable of Codex native multi_agent and goals. Not serialized.
+    /// Does not change role identity, permissions, adapter, model, or effort.
+    codex_native_delegation_disabled: bool,
+    /// Sealed opt-in for the verified managed read-only Codex parent app-server.
+    /// Ordinary children, researchers, and workers stay off this route.
+    codex_managed_readonly_route: CodexManagedReadonlyRoute,
+}
+
+/// Which verified managed read-only Codex app-server path this command requested.
+/// Inconsistent combinations fail closed at launch instead of falling back to the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CodexManagedReadonlyRoute {
+    #[default]
+    Off,
+    /// Initial parent: dynamic `maco_worker_request` tool forwarded to the sealed inbox.
+    InitialWorkerRequests,
+    /// Continuation: same read-only app-server, no dynamic tool and no fresh inbox.
+    Continuation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -299,16 +319,241 @@ struct BoundLiveTokenGrant {
     cwd: PathBuf,
     prompt: PathBuf,
     model: Option<String>,
+    model_provider: Option<String>,
     effort: Option<String>,
     timeout: Duration,
     workspace_access: WorkspaceAccess,
     launch_target: WritableLaunchTarget,
     lifecycle: Option<ExternalAgentLifecycleIdentity>,
+    source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
+    input_files: Vec<PathBuf>,
+    confinement: WorktreeConfinementSnapshot,
+    native_delegation_disabled: bool,
+    managed_readonly_route: CodexManagedReadonlyRoute,
+    process_kind: Option<AssignmentProcessLaunchKind>,
+    process_attempt: Option<usize>,
+    process_duty: Option<String>,
+}
+
+#[cfg(target_os = "linux")]
+struct BoundWorkerJournalAppend {
+    helper_path: PathBuf,
+    helper_file: fs::File,
+    helper_identity: ExternalProgramIdentity,
+    helper_sha256: String,
+    journal: ExactWritableArtifactFile,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundWorkerJournalAppend {
+    fn revalidate(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.helper_file.metadata()?;
+        let path_metadata = fs::symlink_metadata(&self.helper_path)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if !path_metadata.is_file()
+            || metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+            || metadata.mode() != path_metadata.mode()
+            || metadata.uid() != path_metadata.uid()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o6000 != 0
+            || metadata.mode() & 0o111 == 0
+            || fs::canonicalize(&self.helper_path)? != self.helper_path
+            || external_program_identity(&self.helper_path)? != self.helper_identity
+            || worker_journal_appender_sha256(&self.helper_file)? != self.helper_sha256
+        {
+            bail!("current MACO journal appender executable bytes or identity changed");
+        }
+        let held = exact_writable_artifact_identity(&self.journal.held_file.metadata()?)?;
+        let path = exact_writable_artifact_identity(&fs::symlink_metadata(&self.journal.path)?)?;
+        validate_exact_writable_artifact_identity(held)?;
+        if held != self.journal.identity || path != held {
+            bail!("precreated worker journal held descriptor/path binding changed");
+        }
+        Ok(())
+    }
+
+    fn command_prefix(&self) -> Result<Vec<String>> {
+        let text = |path: &Path| {
+            path.to_str()
+                .map(str::to_owned)
+                .context("worker journal append command requires a UTF-8 path")
+        };
+        Ok(vec![
+            text(&self.helper_path)?,
+            "supervise".to_string(),
+            "journal-append".to_string(),
+            "--journal".to_string(),
+            text(&self.journal.path)?,
+            "--device".to_string(),
+            self.journal.identity.device.to_string(),
+            "--inode".to_string(),
+            self.journal.identity.inode.to_string(),
+        ])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_journal_appender_sha256(file: &fs::File) -> Result<String> {
+    use std::os::unix::fs::FileExt;
+    // The only production input is the kernel-selected running MACO image,
+    // never a caller-selected file. This one-shot read uses temporary memory
+    // proportional to its exact bytes; it is not a streaming digest.
+    let length = file.metadata()?.len();
+    if length == 0 {
+        bail!("current MACO journal appender image is empty");
+    }
+    let mut bytes = vec![0_u8; usize::try_from(length)?];
+    file.read_exact_at(&mut bytes, 0)?;
+    if !bytes.starts_with(b"\x7fELF") {
+        bail!("current MACO journal appender must be the running native executable");
+    }
+    Ok(sha256_hex(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn bind_worker_journal_append_operation(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    runtime: ExternalExecutionRuntime,
+    trust: ExternalProgramTrust,
+    prompt: &mut Vec<u8>,
+    profile: &mut Option<SideEffectConfinementProfile>,
+    argv: &mut [OsString],
+) -> Result<Option<BoundWorkerJournalAppend>> {
+    // No new route, program selection, delegation, or workspace authority.
+    if runtime != ExternalExecutionRuntime::Verified
+        || trust != ExternalProgramTrust::TrustedSystemCodex
+        || spec.invocation != ExternalAgentInvocation::CodexSupervisor
+        || spec.workspace_access != WorkspaceAccess::ReadWrite
+        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|id| id.role != "worker")
+        || spec.worker_journal_artifacts.is_empty()
+    {
+        return Ok(None);
+    }
+    refuse_assignment_process_launch_before_preflight(spec)?;
+    if spec.assignment_process_launch_kind != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        || spec.codex_managed_readonly_route_active()
+        || spec.worker_journal_artifacts.len() != 1
+        || controls.exact_writable_artifact_files.len() != 1
+    {
+        bail!("worker journal appender requires the exact journal-bound assignment child");
+    }
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .context("worker lifecycle identity missing")?;
+    let declared = &spec.worker_journal_artifacts[0];
+    let journal = &controls.exact_writable_artifact_files[0];
+    if identity.task_id != declared.worker_id
+        || journal.worker_id != declared.worker_id
+        || journal.path != declared.path
+        || journal.path
+            != declared
+                .incoming_root
+                .join("worker-journals")
+                .join(format!("{}.jsonl", identity.task_id))
+    {
+        bail!("worker journal appender subject/path differs from the held launch contract");
+    }
+    let Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) = profile.as_ref() else {
+        bail!("worker journal appender requires the existing ExternalCodex containment");
+    };
+    for feature in ["multi_agent", "goals"] {
+        if !argv
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new("--disable") && pair[1] == OsStr::new(feature))
+            || argv
+                .windows(2)
+                .any(|pair| pair[0] == OsStr::new("--enable") && pair[1] == OsStr::new(feature))
+        {
+            bail!("worker journal appender requires native delegation to remain disabled");
+        }
+    }
+    let original_permissions = OsString::from(codex_filesystem_permissions(spec, controls));
+    let positions = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == &original_permissions).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() != 1 || positions[0] == 0 || argv[positions[0] - 1] != OsStr::new("-c") {
+        bail!("worker journal appender requires the exact existing inner filesystem rule");
+    }
+    let helper_path = env::current_exe().context("current MACO executable is unavailable")?;
+    let helper_path = normalized_absolute_path(&helper_path, "current MACO journal appender")?;
+    // Read only the kernel-selected running image, never a caller-supplied program.
+    let helper_file = fs::File::open("/proc/self/exe")?;
+    let helper_identity = external_program_identity(&helper_path)?;
+    let helper_sha256 = worker_journal_appender_sha256(&helper_file)?;
+    let binding = BoundWorkerJournalAppend {
+        helper_path,
+        helper_file,
+        helper_identity,
+        helper_sha256,
+        journal: journal.clone(),
+    };
+    binding.revalidate()?;
+    let hidden_roots = spec
+        .hidden_roots
+        .iter()
+        .map(|path| normalized_absolute_path(path, "hidden root"))
+        .collect::<Result<Vec<_>>>()?;
+    let overlaps = |path: &Path| {
+        binding.helper_path.starts_with(path) || path.starts_with(&binding.helper_path)
+    };
+    if overlaps(&spec.cwd)
+        || overlaps(&declared.incoming_root)
+        || hidden_roots.iter().any(|path| overlaps(path))
+        || controls.iter().any(|control| overlaps(&control.absolute))
+        || controls.managed_git.as_ref().is_some_and(|git| {
+            std::iter::once(&git.worktree_git_dir)
+                .chain(&git.common_read_only_roots)
+                .chain(&git.common_read_only_files)
+                .any(|path| overlaps(path))
+        })
+    {
+        bail!("worker journal appender overlaps a workspace, private, or protected path");
+    }
+    let prefix = serde_json::to_string(&binding.command_prefix()?)?;
+    let appendix = format!(
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd, --start-timestamp, --end-timestamp, repeated --changed-path, then -- and the original command argv. Preserve the entire apply_patch payload as one argument. Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError; do not execute the action or repair the journal. The appender is record transport, not an action to recursively journal. Its arguments confer no launch, claim, or evidence authority.\n",
+        binding.helper_sha256,
+    );
+    if prompt
+        .len()
+        .checked_add(appendix.len())
+        .filter(|len| *len <= MAX_PROMPT_BYTES)
+        .is_none()
+    {
+        bail!("worker journal append operation exceeds the existing prompt byte limit");
+    }
+    // The outer helper mount alone does not expose it inside Codex's :minimal
+    // read sandbox. Add only this exact read rule; preserve every other argv.
+    let mut inner_controls = controls.clone();
+    inner_controls
+        .exact_read_only_input_files
+        .push(binding.helper_path.clone());
+    argv[positions[0]] = OsString::from(codex_filesystem_permissions(spec, &inner_controls));
+    *profile = Some(SideEffectConfinementProfile::ExternalCodex(
+        codex_profile
+            .clone()
+            .with_visible_read_only_file(&binding.helper_path),
+    ));
+    prompt.extend_from_slice(appendix.as_bytes());
+    Ok(Some(binding))
 }
 
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
-        should_use_read_only_researcher_app_server(self, ExternalExecutionRuntime::Verified)
+        should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
+            || managed_worker_app_server_shape(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
     }
 
@@ -323,11 +568,20 @@ impl ExternalAgentCommand {
             cwd: self.cwd.clone(),
             prompt: self.prompt.clone(),
             model: self.model.clone(),
+            model_provider: self.model_provider.clone(),
             effort: self.reasoning_effort.clone(),
             timeout: self.timeout,
             workspace_access: self.workspace_access,
             launch_target: self.writable_launch_target,
             lifecycle: self.agent_lifecycle.clone(),
+            source_inputs: self.researcher_source_inputs.clone(),
+            input_files: self.read_only_input_files.clone(),
+            confinement: WorktreeConfinementSnapshot::from_command(self),
+            native_delegation_disabled: self.codex_native_delegation_disabled,
+            managed_readonly_route: self.codex_managed_readonly_route,
+            process_kind: self.assignment_process_launch_kind,
+            process_attempt: self.assignment_process_launch_attempt,
+            process_duty: self.assignment_process_launch_duty.clone(),
         });
     }
 
@@ -350,11 +604,20 @@ impl ExternalAgentCommand {
             || bound.cwd != self.cwd
             || bound.prompt != self.prompt
             || bound.model != self.model
+            || bound.model_provider != self.model_provider
             || bound.effort != self.reasoning_effort
             || bound.timeout != self.timeout
             || bound.workspace_access != self.workspace_access
             || bound.launch_target != self.writable_launch_target
             || bound.lifecycle != self.agent_lifecycle
+            || bound.source_inputs != self.researcher_source_inputs
+            || bound.input_files != self.read_only_input_files
+            || !bound.confinement.matches_command(self)
+            || bound.native_delegation_disabled != self.codex_native_delegation_disabled
+            || bound.managed_readonly_route != self.codex_managed_readonly_route
+            || bound.process_kind != self.assignment_process_launch_kind
+            || bound.process_attempt != self.assignment_process_launch_attempt
+            || bound.process_duty != self.assignment_process_launch_duty
         {
             return Err("live token grant launch binding changed".to_string());
         }
@@ -362,6 +625,364 @@ impl ExternalAgentCommand {
             return Err("live token grant was stopped or released".to_string());
         }
         Ok(Some(&bound.grant))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod worker_journal_append_binding_tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    pub(super) fn fixture() -> (
+        tempfile::TempDir,
+        ExternalAgentCommand,
+        ProtectedWorktreeControls,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let incoming = root.join("incoming");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir_all(incoming.join("worker-journals")).unwrap();
+        let path = incoming.join("worker-journals/worker.jsonl");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let identity = exact_writable_artifact_identity(&file.metadata().unwrap()).unwrap();
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "run",
+            "worker",
+            1,
+            Path::new("codex"),
+            None,
+            "worker-duty",
+        )
+        .unwrap();
+        let spec = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            root.join("prompt.md"),
+            root.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(30),
+        )
+        .with_agent_lifecycle(&root, "worker", "run", "worker")
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+        .with_worker_journal_artifact("worker", &incoming, &path);
+        let controls = ProtectedWorktreeControls {
+            exact_writable_artifact_files: vec![ExactWritableArtifactFile {
+                worker_id: "worker".to_string(),
+                path,
+                held_file: std::sync::Arc::new(file),
+                identity,
+            }],
+            writable_artifact_root: Some(incoming),
+            ..ProtectedWorktreeControls::default()
+        };
+        (temp, spec, controls)
+    }
+
+    pub(super) fn profile(spec: &ExternalAgentCommand) -> Option<SideEffectConfinementProfile> {
+        Some(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_write(&spec.cwd)
+                .with_hidden_root(spec.cwd.join(".maco"))
+                .with_visible_read_only_file(spec.cwd.join(".gitignore")),
+        ))
+    }
+
+    #[test]
+    fn worker_append_production_binding_preserves_native_flags_and_mounts_only_current_executable()
+    {
+        let (_temp, spec, controls) = fixture();
+        let original_profile = profile(&spec);
+        let mut mounted = original_profile.clone();
+        let mut prompt = b"original prompt".to_vec();
+        let original_argv = codex_supervisor_argv(&spec, &controls, None);
+        let mut argv = original_argv.clone();
+        let original_digest = argv_digest(&argv).unwrap();
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(binding.helper_path, env::current_exe().unwrap());
+        assert_eq!(
+            binding.helper_sha256,
+            sha256_hex(&fs::read(&binding.helper_path).unwrap())
+        );
+        let prefix = binding.command_prefix().unwrap();
+        assert_eq!(
+            prefix,
+            vec![
+                binding.helper_path.to_str().unwrap().to_string(),
+                "supervise".to_string(),
+                "journal-append".to_string(),
+                "--journal".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .path
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                "--device".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .identity
+                    .device
+                    .to_string(),
+                "--inode".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .identity
+                    .inode
+                    .to_string(),
+            ]
+        );
+        let Some(SideEffectConfinementProfile::ExternalCodex(original)) = original_profile else {
+            panic!("Codex profile expected");
+        };
+        assert_eq!(
+            mounted,
+            Some(SideEffectConfinementProfile::ExternalCodex(
+                original.with_visible_read_only_file(&binding.helper_path),
+            ))
+        );
+        let before_permissions = OsString::from(codex_filesystem_permissions(&spec, &controls));
+        let mut expected_controls = controls.clone();
+        expected_controls
+            .exact_read_only_input_files
+            .push(binding.helper_path.clone());
+        let after_permissions =
+            OsString::from(codex_filesystem_permissions(&spec, &expected_controls));
+        for (before, after) in original_argv.iter().zip(&argv) {
+            assert_eq!(
+                after,
+                if before == &before_permissions {
+                    &after_permissions
+                } else {
+                    before
+                }
+            );
+        }
+        assert_eq!(argv.len(), original_argv.len());
+        assert_ne!(argv_digest(&argv).unwrap(), original_digest);
+        assert!(after_permissions.to_str().unwrap().contains(&format!(
+            "{}=\"read\"",
+            toml_basic_string(binding.helper_path.to_str().unwrap())
+        )));
+        let prompt = std::str::from_utf8(&prompt).unwrap();
+        assert!(prompt.starts_with("original prompt"));
+        assert!(prompt.contains(&serde_json::to_string(&prefix).unwrap()));
+        assert!(prompt.contains(&binding.helper_sha256));
+        assert!(controls.exact_read_only_input_files.is_empty());
+        binding.revalidate().unwrap();
+        assert!(fs::read(&binding.journal.path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_append_binding_refuses_changed_identity_flags_and_profile_without_side_effects() {
+        let (_temp, mut spec, mut controls) = fixture();
+        let mut prompt = b"original".to_vec();
+        let mut mounted = profile(&spec);
+        let original_profile = mounted.clone();
+        let mut argv = codex_supervisor_argv(&spec, &controls, None);
+        let original_argv = argv.clone();
+        spec.worker_journal_artifacts[0].worker_id = "foreign".to_string();
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        spec.worker_journal_artifacts[0].worker_id = "worker".to_string();
+        let flag = argv
+            .windows(2)
+            .position(|pair| pair[1] == OsStr::new("multi_agent"))
+            .unwrap();
+        argv[flag] = OsString::from("--enable");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        argv.push(OsString::from("--enable"));
+        argv.push(OsString::from("goals"));
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        let permissions = OsString::from(codex_filesystem_permissions(&spec, &controls));
+        let rule = argv
+            .iter()
+            .position(|argument| argument == &permissions)
+            .unwrap();
+        argv[rule] = OsString::from("permissions.maco_external_codex.filesystem={}");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        argv[rule - 1] = OsString::from("--model");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        mounted = None;
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        mounted = original_profile.clone();
+        let artifact = controls.exact_writable_artifact_files.remove(0);
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        controls.exact_writable_artifact_files.push(artifact);
+        assert_eq!(prompt.as_slice(), b"original");
+        assert_eq!(mounted, original_profile);
+        assert_eq!(argv, original_argv);
+        spec.hidden_roots
+            .push(env::current_exe().unwrap().parent().unwrap().to_path_buf());
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .err()
+        .expect("hidden helper must be refused")
+        .to_string()
+        .contains("private, or protected path"));
+        spec.hidden_roots.clear();
+        assert_eq!(prompt.as_slice(), b"original");
+        assert_eq!(mounted, original_profile);
+        assert_eq!(argv, original_argv);
+        let mut binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .unwrap()
+        .unwrap();
+        let digest = binding.helper_sha256.clone();
+        binding.helper_sha256 = "0".repeat(64);
+        assert!(binding.revalidate().is_err());
+        binding.helper_sha256 = digest;
+        fs::rename(
+            &binding.journal.path,
+            binding.journal.path.with_extension("original"),
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&binding.journal.path)
+            .unwrap();
+        assert!(binding
+            .revalidate()
+            .unwrap_err()
+            .to_string()
+            .contains("held descriptor/path binding changed"));
+    }
+
+    #[test]
+    fn worker_append_binding_leaves_other_runtime_role_and_target_shapes_unchanged() {
+        let (_temp, spec, controls) = fixture();
+        let mut variants = Vec::new();
+        let mut other = spec.clone();
+        other.invocation = ExternalAgentInvocation::Grok;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.workspace_access = WorkspaceAccess::ReadOnly;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.writable_launch_target = WritableLaunchTarget::PrimaryWorktree;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.agent_lifecycle.as_mut().unwrap().role = "child_orchestrator".to_string();
+        variants.push(other);
+        let mut other = spec.clone();
+        other.worker_journal_artifacts.clear();
+        variants.push(other);
+        for variant in variants {
+            let mut mounted = profile(&variant);
+            let original_profile = mounted.clone();
+            let mut prompt = b"original".to_vec();
+            let mut argv = codex_supervisor_argv(&variant, &controls, None);
+            let original_argv = argv.clone();
+            assert!(bind_worker_journal_append_operation(
+                &variant,
+                &controls,
+                ExternalExecutionRuntime::Verified,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &mut prompt,
+                &mut mounted,
+                &mut argv,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(prompt.as_slice(), b"original");
+            assert_eq!(mounted, original_profile);
+            assert_eq!(argv, original_argv);
+        }
     }
 }
 
@@ -407,6 +1028,39 @@ pub(crate) fn render_prompt_with_assignment_messaging_protocol_appendix(
 
 fn prompt_includes_assignment_messaging_protocol_appendix(prompt: &[u8]) -> bool {
     prompt.ends_with(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes())
+}
+
+const MANAGED_WORKER_REQUEST_TOOL_APPENDIX: &str = r#"
+
+## Managed worker requests (parent dynamic tool)
+
+Verifier acceptance for this appendix is only the exact managed initial parent mode: Codex supervisor, read-only workspace, managed child worktree, native delegation disabled, verified execution, lifecycle role child_orchestrator, and the sealed parent inbox endpoint held by the supervisor. Invoke the dynamic tool named maco_worker_request. Yield only requests that this tool acknowledges. Do not use a shell, socket, or network connection.
+
+Tool arguments contain operation and the fields for that operation. Do not include run_id, task_id, a bearer token, an endpoint, or any path.
+- operation submit_worker_request requires request_id and worker_id
+- operation worker_request_status requires request_id
+
+"#;
+
+pub(crate) fn render_prompt_with_managed_worker_request_tool_appendix(
+    prompt: String,
+) -> Result<String> {
+    let combined_len = prompt
+        .len()
+        .saturating_add(MANAGED_WORKER_REQUEST_TOOL_APPENDIX.len());
+    if combined_len > MAX_PROMPT_BYTES {
+        bail!(
+            "managed worker-request tool appendix would exceed the bounded prompt size ({} bytes)",
+            combined_len
+        );
+    }
+    let mut rendered = prompt;
+    rendered.push_str(MANAGED_WORKER_REQUEST_TOOL_APPENDIX);
+    Ok(rendered)
+}
+
+fn prompt_includes_managed_worker_request_tool_appendix(prompt: &[u8]) -> bool {
+    prompt.ends_with(MANAGED_WORKER_REQUEST_TOOL_APPENDIX.as_bytes())
 }
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
@@ -490,6 +1144,7 @@ struct WorktreeConfinementSnapshot {
     output_last_message: PathBuf,
     output_schema: Option<PathBuf>,
     read_only_input_files: Vec<PathBuf>,
+    researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     workspace_access: WorkspaceAccess,
     hidden_roots: Vec<PathBuf>,
@@ -505,6 +1160,7 @@ impl WorktreeConfinementSnapshot {
             output_last_message: command.output_last_message.clone(),
             output_schema: command.output_schema.clone(),
             read_only_input_files: command.read_only_input_files.clone(),
+            researcher_source_inputs: command.researcher_source_inputs.clone(),
             worker_journal_artifacts: command.worker_journal_artifacts.clone(),
             workspace_access: command.workspace_access,
             hidden_roots: command.hidden_roots.clone(),
@@ -1175,6 +1831,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
@@ -1199,6 +1856,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1219,6 +1878,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -1243,6 +1903,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1263,6 +1925,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -1287,6 +1950,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1586,6 +2251,46 @@ impl ExternalAgentCommand {
         self
     }
 
+    /// Disable Codex native multi_agent and goals for this command only.
+    /// Grants no authority or role change and has no re-enable counterpart.
+    pub(crate) fn with_codex_native_delegation_disabled(mut self) -> Self {
+        self.codex_native_delegation_disabled = true;
+        self
+    }
+
+    /// Reads the existing private Codex native-delegation disable flag.
+    /// This is not a setter and does not re-enable delegation.
+    pub(crate) fn codex_native_delegation_is_disabled(&self) -> bool {
+        self.codex_native_delegation_disabled
+    }
+
+    /// Opt this command into the initial managed parent dynamic worker-request tool.
+    /// Callers must already have admitted the exact read-only ChildOrchestrator shape.
+    /// A later continuation opt-in replaces this; launch rejects a shape that does not match.
+    pub(crate) fn with_codex_managed_worker_requests(mut self) -> Self {
+        self.codex_managed_readonly_route = CodexManagedReadonlyRoute::InitialWorkerRequests;
+        self
+    }
+
+    /// Opt this command into the managed parent continuation app-server.
+    /// The dynamic worker tool stays absent and this does not open an inbox endpoint.
+    pub(crate) fn with_codex_managed_readonly_continuation(mut self) -> Self {
+        self.codex_managed_readonly_route = CodexManagedReadonlyRoute::Continuation;
+        self
+    }
+
+    pub(crate) fn codex_managed_worker_requests_enabled(&self) -> bool {
+        self.codex_managed_readonly_route == CodexManagedReadonlyRoute::InitialWorkerRequests
+    }
+
+    pub(crate) fn codex_managed_readonly_continuation_enabled(&self) -> bool {
+        self.codex_managed_readonly_route == CodexManagedReadonlyRoute::Continuation
+    }
+
+    fn codex_managed_readonly_route_active(&self) -> bool {
+        self.codex_managed_readonly_route != CodexManagedReadonlyRoute::Off
+    }
+
     pub fn with_worktree_control_exception(mut self, relative: impl Into<PathBuf>) -> Self {
         self.worktree_control_exceptions.push(relative.into());
         self
@@ -1671,25 +2376,66 @@ impl ExternalAgentCommand {
         self.assignment_messaging_launch.as_ref()
     }
 
-    /// Ensures the launch prompt already contains the static messaging appendix.
+    /// Ensures the launch prompt matches the messaging capability this command actually has.
     pub(crate) fn verify_assignment_messaging_protocol_instructions(&self) -> Result<()> {
-        if self.assignment_messaging_launch.is_none() {
-            return Ok(());
-        }
-        let existing = read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES)
-            .with_context(|| {
-                format!(
-                    "failed to read manifested launch prompt for assignment messaging verification: {}",
+        match self.codex_managed_readonly_route {
+            CodexManagedReadonlyRoute::Off => {
+                if self.assignment_messaging_launch.is_none() {
+                    return Ok(());
+                }
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+                    return Ok(());
+                }
+                bail!(
+                    "manifested launch prompt is missing assignment messaging protocol appendix at {}",
                     self.prompt.display()
-                )
-            })?;
-        if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
-            return Ok(());
+                );
+            }
+            CodexManagedReadonlyRoute::InitialWorkerRequests => {
+                if self.assignment_messaging_launch.is_none() {
+                    bail!(
+                        "managed initial Codex parent is missing its sealed inbox endpoint at {}",
+                        self.prompt.display()
+                    );
+                }
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+                    bail!(
+                        "managed initial Codex parent prompt must use the dynamic worker-request tool appendix, not loopback IPC, at {}",
+                        self.prompt.display()
+                    );
+                }
+                if prompt_includes_managed_worker_request_tool_appendix(&existing) {
+                    return Ok(());
+                }
+                bail!(
+                    "manifested launch prompt is missing the managed worker-request tool appendix at {}",
+                    self.prompt.display()
+                );
+            }
+            CodexManagedReadonlyRoute::Continuation => {
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_managed_worker_request_tool_appendix(&existing)
+                    || prompt_includes_assignment_messaging_protocol_appendix(&existing)
+                {
+                    bail!(
+                        "managed continuation prompt must not grant worker-request or loopback messaging instructions at {}",
+                        self.prompt.display()
+                    );
+                }
+                Ok(())
+            }
         }
-        bail!(
-            "manifested launch prompt is missing assignment messaging protocol appendix at {}",
-            self.prompt.display()
-        );
+    }
+
+    fn read_manifested_launch_prompt(&self) -> Result<Vec<u8>> {
+        read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES).with_context(|| {
+            format!(
+                "failed to read manifested launch prompt for assignment messaging verification: {}",
+                self.prompt.display()
+            )
+        })
     }
 }
 
@@ -1876,10 +2622,170 @@ impl ExternalAgentRun {
             .as_ref()
     }
 
+    /// Private identity evidence captured by the parent, never restored from a report.
+    pub(crate) fn authenticated_codex_evidence(&self) -> Option<&CodexParentEvidence> {
+        self.authenticated_app_server_evidence().or(self
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref())
+    }
+
+    pub(crate) fn authenticated_app_server_usage_complete(&self) -> bool {
+        self.stdout.run_metadata.codex_app_server_usage_complete
+    }
+
+    pub(crate) fn authenticated_codex_usage_complete(&self) -> bool {
+        if self.authenticated_app_server_evidence().is_some() {
+            self.authenticated_app_server_usage_complete()
+        } else {
+            self.stdout.run_metadata.codex_cli_usage_complete
+                && self.stdout.run_metadata.codex_cli_usage.is_some()
+        }
+    }
+
+    /// Only the bound native subprocess capture can supply Grok token accounting.
+    /// Public evidence, JSONL files and deserialized reports cannot recreate it.
+    pub(crate) fn authenticated_grok_usage(
+        &self,
+        command: &ExternalAgentCommand,
+    ) -> Option<(Usage, bool)> {
+        let capture = self.stdout.run_metadata.grok_native_usage.as_ref()?;
+        if capture.command != *command {
+            return None;
+        }
+        let (usage, complete) = capture.observation.allocation();
+        Some((usage, complete && capture.process_completed))
+    }
+
+    fn retain_grok_native_usage(
+        &mut self,
+        command: &ExternalAgentCommand,
+        runtime: ExternalExecutionRuntime,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        if runtime != ExternalExecutionRuntime::Verified
+            || command.invocation != ExternalAgentInvocation::Grok
+            || grok_acp_stdio_protocol_selected(command)
+        {
+            return;
+        }
+        self.stdout.run_metadata.grok_native_usage =
+            crate::runtime_adapter::grok::observe_grok_native_usage(
+                stdout.as_bytes(),
+                stdout.is_truncated(),
+            )
+            .map(|observation| GrokNativeUsageCapture {
+                command: command.clone(),
+                observation,
+                process_completed,
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_grok_native_usage_for_test(
+        &mut self,
+        command: &ExternalAgentCommand,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        self.retain_grok_native_usage(
+            command,
+            ExternalExecutionRuntime::Verified,
+            stdout,
+            process_completed,
+        );
+    }
+
+    pub(crate) fn codex_auditor_effort_qualified(&self) -> bool {
+        !self.stdout.run_metadata.codex_auditor_effort_required
+            || self
+                .authenticated_app_server_evidence()
+                .is_some_and(|evidence| {
+                    codex_app_server::observed_effort_meets(
+                        evidence.requested_effort.as_deref(),
+                        evidence.observed_effort.known(),
+                    )
+                })
+    }
+
+    fn qualify_codex_auditor_effort(&mut self, spec: &ExternalAgentCommand) {
+        self.stdout.run_metadata.codex_auditor_effort_required = spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == AgentRole::Auditor.as_str());
+        if !self.codex_auditor_effort_qualified() {
+            self.publishable = false;
+            self.error = append_external_error(
+                self.error.take(),
+                Some("observed Auditor effort does not meet the selected requirement".to_string()),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualify_codex_auditor_effort_for_test(&mut self, spec: &ExternalAgentCommand) {
+        self.qualify_codex_auditor_effort(spec);
+    }
+
+    /// Invocation-wide tokens from the same private capture as the identity.
+    /// CLI final-turn usage is not the aggregate of a multi-turn invocation.
+    pub(crate) fn authenticated_codex_usage(&self) -> Option<Usage> {
+        if self.authenticated_app_server_evidence().is_some() {
+            return self.authenticated_codex_partial_usage();
+        }
+        self.stdout.run_metadata.codex_cli_usage
+    }
+
+    /// A valid single turn is a lower bound, never a complete CLI aggregate.
+    pub(crate) fn authenticated_codex_partial_usage(&self) -> Option<Usage> {
+        if let Some(evidence) = self.authenticated_codex_evidence() {
+            let CodexParentTurnUsage::Known {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                reasoning_output_tokens,
+            } = evidence.turn_usage
+            else {
+                return None;
+            };
+            if cached_input_tokens > input_tokens || reasoning_output_tokens > output_tokens {
+                return None;
+            }
+            let input_tokens = usize::try_from(input_tokens).ok()?;
+            let output_tokens = usize::try_from(output_tokens).ok()?;
+            return Some(Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens.checked_add(output_tokens)?,
+            });
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_cli_parent_evidence_for_test(&mut self, stdout: &[u8]) {
+        self.stdout.run_metadata.codex_cli_parent_evidence = self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_cli_usage = codex_usage_from_jsonl(stdout).ok().flatten();
+        self.stdout.run_metadata.codex_cli_usage_complete = self.publishable
+            && self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none();
+    }
+
     #[cfg(test)]
     pub(crate) fn retain_app_server_parent_evidence_for_test(&mut self) {
         self.stdout.run_metadata.codex_app_server_parent_evidence =
             self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_app_server_usage_complete = self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none()
+            && self
+                .codex_command_execution_evidence()
+                .is_some_and(|evidence| {
+                    evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+                });
     }
 
     fn retain_codex_command_execution_evidence(
@@ -1947,7 +2853,7 @@ impl ExternalAgentRun {
     }
 
     pub fn succeeded(&self) -> bool {
-        self.safely_executed() && self.publishable
+        self.safely_executed() && self.publishable && self.codex_auditor_effort_qualified()
     }
 
     pub(crate) fn simulation_succeeded(&self) -> bool {
@@ -1967,6 +2873,17 @@ impl ExternalAgentRun {
     /// Scratch output may be discarded only when the main target was never
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
+    pub(crate) fn source_probe_confirmed_no_provider_release(&self) -> bool {
+        self.stdout
+            .run_metadata
+            .local_source_probe_refusal_quiescent
+            && !self.stdout.target_launch_attempted
+            && self
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified
+    }
+
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
         if self.stdout.target_launch_attempted {
             return self
@@ -2015,6 +2932,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_preflight_results: &'a Vec<EnvironmentPreflightResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    researcher_input_receipts: &'a Vec<researcher_inputs::ResearcherInputReceipt>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_failures: &'a Vec<EnvironmentFailure>,
     environment_preflight_process_started: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2058,6 +2977,8 @@ struct ExternalAgentRunWireOwned {
     codex_permissions: Option<CodexPermissionEvidence>,
     #[serde(default)]
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
+    #[serde(default)]
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     #[serde(default)]
     environment_failures: Vec<EnvironmentFailure>,
     #[serde(default = "default_environment_preflight_process_started")]
@@ -2105,6 +3026,7 @@ impl Serialize for ExternalAgentRun {
             program_trust: self.program_trust,
             codex_permissions: &self.codex_permissions,
             environment_preflight_results: &self.stdout.run_metadata.environment_preflight_results,
+            researcher_input_receipts: &self.stdout.run_metadata.researcher_input_receipts,
             environment_failures: &self.stdout.run_metadata.environment_failures,
             environment_preflight_process_started: self
                 .stdout
@@ -2140,6 +3062,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             canonicalize_sandbox_denials(wire.sandbox_denials).map_err(serde::de::Error::custom)?;
         let mut stdout = wire.stdout;
         stdout.run_metadata.environment_preflight_results = wire.environment_preflight_results;
+        stdout.run_metadata.researcher_input_receipts = wire.researcher_input_receipts;
         stdout.run_metadata.environment_failures = wire.environment_failures;
         stdout.run_metadata.environment_preflight_process_started =
             wire.environment_preflight_process_started;
@@ -2175,6 +3098,9 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
+    read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
+    local_source_probe_refusal_quiescent: bool,
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
@@ -2192,7 +3118,126 @@ struct ExternalAgentRunMetadata {
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
+    codex_app_server_usage_complete: bool,
+    /// Parent launch role only; never serialized or restored from public reports.
+    codex_auditor_effort_required: bool,
+    codex_cli_parent_evidence: Option<CodexParentEvidence>,
+    codex_cli_usage: Option<Usage>,
+    codex_cli_usage_complete: bool,
+    grok_native_usage: Option<GrokNativeUsageCapture>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
+}
+
+/// Full command binding and original native counters are private process custody,
+/// not public report assertions. No Serialize/Deserialize implementation.
+#[derive(Clone, PartialEq, Eq)]
+struct GrokNativeUsageCapture {
+    command: ExternalAgentCommand,
+    observation: crate::runtime_adapter::grok::GrokNativeUsageObservation,
+    process_completed: bool,
+}
+
+#[cfg(test)]
+mod grok_native_custody_tests {
+    use super::*;
+
+    fn command() -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "grok",
+            ".",
+            "prompt",
+            "log",
+            "report",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            crate::runtime_adapter::RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(crate::runtime_adapter::RuntimeId::Grok),
+        )
+    }
+
+    fn capture() -> CapturedBytes {
+        CapturedBytes::from_bytes_for_test(
+            b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":3,\"total_tokens\":24}}\n".to_vec(),
+        )
+    }
+
+    #[test]
+    fn grok_native_custody_survives_redaction_but_not_wire_roundtrip_or_command_drift() {
+        let command = command();
+        let mut run =
+            refused_external_run_before_launch(&command, "test materialization failure".into());
+        run.retain_grok_native_usage_for_test(&command, &capture(), true);
+        replace_report_stdout(&mut run, CapturedOutput::default());
+        assert_eq!(
+            run.authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            24
+        );
+        assert!(!run.publishable, "accounting cannot promote publication");
+        assert!(run.error.is_some());
+        let restored: ExternalAgentRun =
+            serde_json::from_slice(&serde_json::to_vec(&run).unwrap()).unwrap();
+        assert!(restored.authenticated_grok_usage(&command).is_none());
+        let mut rebound = command.clone();
+        rebound.json_log = "other-log".into();
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.model = Some("different-request".into());
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.timeout += Duration::from_secs(1);
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_refuses_simulation_acp_and_foreign_invocations() {
+        let command = command();
+        let mut run = refused_external_run_before_launch(&command, "test".into());
+        run.retain_grok_native_usage(
+            &command,
+            ExternalExecutionRuntime::NonpublishableSimulation,
+            &capture(),
+            true,
+        );
+        assert!(run.authenticated_grok_usage(&command).is_none());
+        let mut acp = command.clone();
+        acp.runtime_adapter
+            .as_mut()
+            .unwrap()
+            .grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+        run.retain_grok_native_usage_for_test(&acp, &capture(), true);
+        assert!(run.authenticated_grok_usage(&acp).is_none());
+        let mut codex = command.clone();
+        codex.invocation = ExternalAgentInvocation::CodexSupervisor;
+        run.retain_grok_native_usage_for_test(&codex, &capture(), true);
+        assert!(run.authenticated_grok_usage(&codex).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_retains_cancelled_and_truncated_floors_without_completion() {
+        let command = command();
+        for (capture, process_completed) in [
+            (capture(), false),
+            (
+                CapturedBytes::from_bytes_with_truncation_for_test(
+                    capture().as_bytes().to_vec(),
+                    true,
+                ),
+                true,
+            ),
+        ] {
+            let mut run =
+                refused_external_run_before_launch(&command, "cancelled or truncated".into());
+            run.retain_grok_native_usage_for_test(&command, &capture, process_completed);
+            let (usage, complete) = run.authenticated_grok_usage(&command).unwrap();
+            assert_eq!(usage.total_tokens, 24);
+            assert!(!complete);
+            assert!(!run.publishable);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2702,6 +3747,15 @@ fn run_external_agent_runtime(
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
+    if let Err(error) = researcher_inputs::validate_command(spec) {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            format!("Researcher source input preparation refused: {error:#}"),
+        );
+    }
     if let Err(error) = refuse_assignment_process_launch_before_preflight(spec) {
         return failed_external_run(
             spec,
@@ -2755,8 +3809,40 @@ fn run_external_agent_runtime(
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
     let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
-    let read_only_researcher_app_server = should_use_read_only_researcher_app_server(spec, runtime);
-    let app_server_required = duplex_review_required || read_only_researcher_app_server;
+    let managed_readonly_app_server = match classify_managed_readonly_app_server(spec, runtime) {
+        Ok(route) => route,
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                error,
+            );
+        }
+    };
+    let read_only_terminal_app_server = managed_readonly_app_server.is_none()
+        && should_use_read_only_terminal_app_server(spec, runtime);
+    let read_only_codex_app_server =
+        read_only_terminal_app_server || managed_readonly_app_server.is_some();
+    let managed_worker_app_server = match classify_managed_worker_app_server(spec, runtime) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                error,
+            );
+        }
+    };
+    let app_server_required =
+        duplex_review_required || read_only_codex_app_server || managed_worker_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -2826,13 +3912,33 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
-    if read_only_researcher_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex
+    if (read_only_codex_app_server || managed_worker_app_server)
+        && program_trust != ExternalProgramTrust::TrustedSystemCodex
     {
+        let route = if read_only_terminal_app_server {
+            "read-only terminal Codex app-server"
+        } else if managed_worker_app_server {
+            "managed writable Worker Codex app-server"
+        } else {
+            "managed read-only Codex app-server"
+        };
         return failed_external_environment_run(
             spec, started, command_display(&resolved_program, &[]), false,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(external_sandbox_requirement(spec.invocation)),
-            "read-only Researcher app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
+            format!("{route} requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence"),
+        );
+    }
+    if let Err(error) = validate_managed_readonly_execute_binding(spec, managed_readonly_app_server)
+    {
+        return failed_external_environment_run(
+            spec,
+            started,
+            command_display(&resolved_program, &[]),
+            false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(external_sandbox_requirement(spec.invocation)),
+            error,
         );
     }
     let program_identity = match external_program_identity(&resolved_program) {
@@ -3167,21 +4273,6 @@ fn run_external_agent_runtime(
             );
             return report;
         }
-    };
-    let app_server_prompt = if app_server_required {
-        match String::from_utf8(prompt.clone()) {
-            Ok(prompt) => Some(prompt),
-            Err(_) => {
-                report.duration_ms = duration_millis(started.elapsed());
-                record_external_error(
-                    &mut report,
-                    "Codex app-server prompt is not valid UTF-8".to_string(),
-                );
-                return report;
-            }
-        }
-    } else {
-        None
     };
     let grok_acp_prompt = if grok_acp_stdio_protocol_selected(&target_spec) {
         match String::from_utf8(prompt.clone()) {
@@ -3523,17 +4614,19 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        if let Err(error) = validate_duplex_app_server_version(version) {
-            report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
-                &mut report,
-                EnvironmentFailureCategory::VersionMismatch,
-                Some(codex_environment_requirement()),
-                error.to_string(),
-            );
-            return report;
-        }
-        argv = codex_app_server_argv(&target_spec, &target_controls);
+        argv = match audited_codex_app_server_argv(&target_spec, &target_controls, version) {
+            Ok(argv) => argv,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::VersionMismatch,
+                    Some(codex_environment_requirement()),
+                    error.to_string(),
+                );
+                return report;
+            }
+        };
         report.command = command_display(&resolved_program, &argv);
         bound_argv_digest = match argv_digest(&argv) {
             Ok(digest) => Some(digest),
@@ -3547,6 +4640,60 @@ fn run_external_agent_runtime(
             }
         };
     }
+    #[cfg(target_os = "linux")]
+    let (prompt, side_effect_profile, worker_journal_append) = {
+        let mut prompt = prompt;
+        let mut profile = side_effect_profile;
+        let binding = match bind_worker_journal_append_operation(
+            &target_spec,
+            &target_controls,
+            runtime,
+            program_trust,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("worker journal append binding refused: {error:#}"),
+                );
+                return report;
+            }
+        };
+        if binding.is_some() {
+            bound_argv_digest = match argv_digest(&argv) {
+                Ok(digest) => Some(digest),
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(
+                        &mut report,
+                        format!("worker journal argv binding failed: {error:#}"),
+                    );
+                    return report;
+                }
+            };
+            report.command = command_display(&resolved_program, &argv);
+        }
+        (prompt, profile, binding)
+    };
+    let app_server_prompt = if app_server_required {
+        match String::from_utf8(prompt.clone()) {
+            Ok(prompt) => Some(prompt),
+            Err(_) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    "Codex app-server prompt is not valid UTF-8".to_string(),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
     let Some(argv_digest) = bound_argv_digest else {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(
@@ -3589,6 +4736,20 @@ fn run_external_agent_runtime(
             );
             return report;
         }
+    }
+    if let Err(error) = researcher_inputs::prepare_source_inputs(
+        &target_spec,
+        side_effect_profile.as_ref(),
+        spec.timeout.saturating_sub(started.elapsed()),
+        cancellation,
+        &mut report,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input preflight refused: {error:#}"),
+        );
+        return report;
     }
     let mut json_log_reservation = match reserve_external_output(&spec.json_log) {
         Ok(reservation) => reservation,
@@ -3707,12 +4868,33 @@ fn run_external_agent_runtime(
         }
     };
 
+    process_spec.read_only_input_snapshots =
+        report.stdout.run_metadata.read_only_input_snapshots.clone();
+
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(
             &mut report,
             "external agent was cancelled before target start".to_string(),
         );
+        return report;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(binding) = &worker_journal_append {
+        if let Err(error) = binding.revalidate() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("worker journal append binding changed before release: {error:#}"),
+            );
+            return report;
+        }
+    }
+
+    if let Err(error) = spec.verified_live_token_grant() {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(&mut report, error);
         return report;
     }
 
@@ -3735,11 +4917,27 @@ fn run_external_agent_runtime(
         }
     }
 
+    if let Err(error) = researcher_inputs::revalidate_source_inputs(
+        &target_spec,
+        &report.stdout.run_metadata.researcher_input_receipts,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input changed before target release: {error:#}"),
+        );
+        return report;
+    }
+
     // Preflight evidence describes only the bounded probes. Once the main target is released it
     // must earn fresh process-tree and side-effect evidence of its own; otherwise a target wait
     // or cancellation failure could appear quiescent because an earlier probe was clean.
     report.process_tree = None;
     report.side_effects = None;
+    report
+        .stdout
+        .run_metadata
+        .local_source_probe_refusal_quiescent = false;
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
@@ -3762,8 +4960,10 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        let process = if read_only_researcher_app_server {
-            run_read_only_researcher_app_server_process(process_spec, cancellation, spec, prompt)
+        let process = if read_only_codex_app_server {
+            run_read_only_terminal_app_server_process(process_spec, cancellation, spec, prompt)
+        } else if managed_worker_app_server {
+            run_managed_worker_app_server_process(process_spec, cancellation, spec, prompt)
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -3914,6 +5114,18 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
+            // Bind the original supervisor command, not target_spec's private
+            // staging destination. Retain spend before any fallible materialization.
+            report.retain_grok_native_usage(
+                spec,
+                runtime,
+                &output.stdout,
+                !output.timed_out
+                    && output.status.is_some_and(|status| status.success())
+                    && output.process_error.is_none()
+                    && output.stdin_error.is_none()
+                    && output.safety_evidence_verified(),
+            );
             match output_staging.completion_handles() {
                 Ok(staging) => record_completed_target(
                     &mut report,
@@ -3958,6 +5170,7 @@ fn run_external_agent_runtime(
                 sandbox_denials.push(denial);
             }
             if let Some(evidence) = error.cancellation_evidence() {
+                report.retain_grok_native_usage(spec, runtime, &evidence.stdout, false);
                 sandbox_denials.extend(sandbox_denials_from_codex_jsonl(
                     &protected_controls,
                     evidence.stdout.as_bytes(),
@@ -4062,7 +5275,7 @@ fn run_external_agent_runtime(
     report
 }
 
-fn should_use_read_only_researcher_app_server(
+fn should_use_read_only_terminal_app_server(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
 ) -> bool {
@@ -4073,7 +5286,140 @@ fn should_use_read_only_researcher_app_server(
         && spec
             .agent_lifecycle
             .as_ref()
-            .is_some_and(|identity| identity.role == AgentRole::Researcher.as_str())
+            .is_some_and(|identity| matches!(identity.role.as_str(), "researcher" | "auditor"))
+}
+
+fn managed_worker_app_server_shape(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> bool {
+    cfg!(target_os = "linux")
+        && runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+        && spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == "worker")
+}
+
+fn classify_managed_worker_app_server(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> Result<bool, String> {
+    if !managed_worker_app_server_shape(spec, runtime) {
+        return Ok(false);
+    }
+    // A malformed selected Worker is a refusal, never an unobserved exec fallback.
+    if !spec.codex_native_delegation_disabled
+        || spec.codex_managed_readonly_route_active()
+        || spec.assignment_process_launch_kind != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        || spec.worker_journal_artifacts.len() != 1
+    {
+        return Err("managed writable Worker app-server requires native delegation disabled, private AssignmentChild authority and one bound journal".to_string());
+    }
+    refuse_assignment_process_launch_before_preflight(spec)
+        .map_err(assignment_process_launch_refusal)?;
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .ok_or_else(|| "Worker lifecycle is missing".to_string())?;
+    if identity.run_id.is_empty()
+        || identity.task_id.is_empty()
+        || spec.worker_journal_artifacts[0].worker_id != identity.task_id
+    {
+        return Err(
+            "managed writable Worker app-server journal subject differs from its launch"
+                .to_string(),
+        );
+    }
+    spec.verified_live_token_grant()?;
+    Ok(true)
+}
+
+fn classify_managed_readonly_app_server(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> Result<Option<CodexManagedReadonlyRoute>, String> {
+    if spec.codex_managed_readonly_route == CodexManagedReadonlyRoute::Off {
+        return Ok(None);
+    }
+    if let Some(problem) = managed_readonly_shape_problem(spec) {
+        return Err(format!(
+            "managed read-only Codex app-server opt-in refused: {problem}"
+        ));
+    }
+    if !(cfg!(target_os = "linux") && runtime == ExternalExecutionRuntime::Verified) {
+        return Err(
+            "managed read-only Codex app-server requires a verified Linux TrustedSystemCodex route"
+                .to_string(),
+        );
+    }
+    Ok(Some(spec.codex_managed_readonly_route))
+}
+
+fn managed_readonly_shape_problem(spec: &ExternalAgentCommand) -> Option<&'static str> {
+    if spec.invocation != ExternalAgentInvocation::CodexSupervisor {
+        return Some("invocation must be CodexSupervisor");
+    }
+    if spec.workspace_access != WorkspaceAccess::ReadOnly {
+        return Some("workspace must be read-only");
+    }
+    if spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
+        return Some("launch target must be the managed child worktree");
+    }
+    if !spec.codex_native_delegation_disabled {
+        return Some("native delegation must be disabled");
+    }
+    let role_matches = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+        identity.role == AgentRole::ChildOrchestrator.as_str() && !identity.run_id.is_empty()
+    });
+    if !role_matches {
+        return Some("lifecycle role must be child_orchestrator");
+    }
+    None
+}
+
+fn validate_managed_readonly_execute_binding(
+    spec: &ExternalAgentCommand,
+    route: Option<CodexManagedReadonlyRoute>,
+) -> Result<(), String> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+    let Some(identity) = spec.agent_lifecycle.as_ref() else {
+        return Err("managed read-only Codex app-server is missing lifecycle identity".to_string());
+    };
+    match route {
+        CodexManagedReadonlyRoute::Off => Ok(()),
+        CodexManagedReadonlyRoute::InitialWorkerRequests => {
+            let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+                return Err(
+                    "managed initial Codex parent is missing its sealed inbox endpoint".to_string(),
+                );
+            };
+            launch
+                .environment_for(&identity.run_id, &identity.task_id)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!(
+                        "managed initial Codex parent sealed endpoint binding refused: {error:#}"
+                    )
+                })
+        }
+        CodexManagedReadonlyRoute::Continuation => {
+            if let Some(launch) = spec.assignment_messaging_launch.as_ref() {
+                launch
+                    .environment_for(&identity.run_id, &identity.task_id)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("managed continuation sealed endpoint binding refused: {error:#}")
+                    })?;
+            }
+            Ok(())
+        }
+    }
 }
 
 fn should_use_duplex_review(
@@ -4115,6 +5461,15 @@ fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn audited_codex_app_server_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    version: EnvironmentVersion,
+) -> Result<Vec<OsString>> {
+    validate_duplex_app_server_version(version)?;
+    Ok(codex_app_server_argv(spec, controls))
 }
 
 struct DuplexApprovalReviewer<'a> {
@@ -4380,13 +5735,14 @@ fn run_observed_app_server_turn<T: codex_app_server::JsonLineTransport>(
     turn: &codex_app_server::AppServerTurn,
     spec: &ExternalAgentCommand,
     reviewer: &mut dyn codex_app_server::ApprovalReviewer,
+    worker_requests: Option<&mut codex_app_server::WorkerRequestCallback<'_>>,
     cancellation: &ProcessCancellation,
 ) -> Result<codex_app_server::AppServerOutcome, String> {
     let grant = spec
         .verified_live_token_grant()
         .inspect_err(|_| cancellation.cancel())?;
     let mut partial = None;
-    let result = codex_app_server::run_app_server_turn_observed(
+    let result = codex_app_server::run_app_server_turn_with_worker_requests_observed(
         transport,
         turn,
         codex_app_server::AppServerLimits {
@@ -4395,12 +5751,15 @@ fn run_observed_app_server_turn<T: codex_app_server::JsonLineTransport>(
             ..codex_app_server::AppServerLimits::default()
         },
         reviewer,
+        worker_requests,
         || cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped()),
-        &mut partial,
-        &mut || {
-            if let Some(grant) = grant {
-                grant.exhaust();
-            }
+        codex_app_server::AppServerObservation {
+            partial: &mut partial,
+            budget_exhausted: &mut || {
+                if let Some(grant) = grant {
+                    grant.exhaust();
+                }
+            },
         },
     );
     match result {
@@ -4423,7 +5782,7 @@ fn fail_app_server_outcome(outcome: &mut codex_app_server::AppServerOutcome, err
     outcome.final_message = None;
 }
 
-fn run_read_only_researcher_app_server_process(
+fn run_read_only_terminal_app_server_process(
     process_spec: ProcessSpec,
     cancellation: &ProcessCancellation,
     spec: &ExternalAgentCommand,
@@ -4434,32 +5793,114 @@ fn run_read_only_researcher_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: spec
+            .agent_lifecycle
+            .as_ref()
+            .filter(|identity| identity.role == AgentRole::Auditor.as_str())
+            .map(|_| spec.reasoning_effort.clone().unwrap_or_default()),
         output_schema: load_codex_app_server_output_schema(spec)?,
     };
     let cancellation = cancellation.child_scope();
     run_process_interactive(process_spec, &cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
-        // Read-only research has no approval authority, even if a hosted reviewer exists.
+        // Read-only terminal roles have no approval authority, even if a hosted reviewer exists.
         let mut approval_requested = false;
         let mut reviewer = |_: codex_app_server::ApprovalRequest| {
             approval_requested = true;
             Ok(codex_app_server::ApprovalReview::cancel(None))
         };
-        let mut outcome = run_observed_app_server_turn(
-            &mut transport,
-            &turn,
-            spec,
-            &mut reviewer,
-            &cancellation,
-        )?;
+        let mut outcome = if spec.codex_managed_worker_requests_enabled() {
+            let launch = spec.assignment_messaging_launch.as_ref().ok_or_else(|| {
+                "managed initial Codex parent is missing its sealed inbox endpoint".to_string()
+            })?;
+            let identity = spec.agent_lifecycle.as_ref().ok_or_else(|| {
+                "managed initial Codex parent is missing lifecycle identity".to_string()
+            })?;
+            let grant = spec
+                .verified_live_token_grant()
+                .inspect_err(|_| cancellation.cancel())?;
+            let run_id = identity.run_id.as_str();
+            let task_id = identity.task_id.as_str();
+            let mut forward = |request: &serde_json::Value| {
+                launch
+                    .forward_worker_request(run_id, task_id, request, &|| {
+                        cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped())
+                    })
+                    .map_err(|error| error.to_string())
+            };
+            run_observed_app_server_turn(
+                &mut transport,
+                &turn,
+                spec,
+                &mut reviewer,
+                Some(&mut forward),
+                &cancellation,
+            )
+        } else {
+            run_observed_app_server_turn(
+                &mut transport,
+                &turn,
+                spec,
+                &mut reviewer,
+                None,
+                &cancellation,
+            )
+        }?;
         if let Err(error) =
-            validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)
+            validate_read_only_terminal_app_server_outcome(&outcome, approval_requested)
         {
             fail_app_server_outcome(&mut outcome, error);
         }
         // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
         // the existing verified outer profile remains enforced, and every approval cancels.
         Ok(outcome)
+    })
+}
+
+fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTransport>(
+    transport: &mut T,
+    turn: &codex_app_server::AppServerTurn,
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> Result<codex_app_server::AppServerOutcome, String> {
+    let mut approval_requested = false;
+    let mut reviewer = |_: codex_app_server::ApprovalRequest| {
+        approval_requested = true;
+        Ok(codex_app_server::ApprovalReview::cancel(None))
+    };
+    // No dynamic Worker tool or callback. Native in-scope edits use the unchanged
+    // workspace-write profile; approval and permission expansion always cancel.
+    let mut outcome =
+        run_observed_app_server_turn(transport, turn, spec, &mut reviewer, None, cancellation)?;
+    if approval_requested || outcome.refused_ceiling_expansions != 0 {
+        cancellation.cancel();
+        fail_app_server_outcome(
+            &mut outcome,
+            "managed writable Worker app-server refused an approval or permission expansion"
+                .to_string(),
+        );
+    }
+    Ok(outcome)
+}
+
+fn run_managed_worker_app_server_process(
+    process_spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    spec: &ExternalAgentCommand,
+    prompt: String,
+) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
+    let turn = codex_app_server::AppServerTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        permission_profile: "maco_external_codex".to_string(),
+        prompt,
+        model: spec.model.clone(),
+        minimum_effort: None,
+        output_schema: load_codex_app_server_output_schema(spec)?,
+    };
+    let cancellation = cancellation.child_scope();
+    run_process_interactive(process_spec, &cancellation, |session| {
+        let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
+        run_managed_worker_app_server_turn(&mut transport, &turn, spec, &cancellation)
     })
 }
 
@@ -4496,14 +5937,14 @@ fn load_codex_app_server_output_schema(
     Ok(Some(schema))
 }
 
-fn validate_read_only_researcher_app_server_outcome(
+fn validate_read_only_terminal_app_server_outcome(
     outcome: &codex_app_server::AppServerOutcome,
     approval_requested: bool,
 ) -> Result<(), String> {
     // The shared driver currently cancels immediately. Retain this independent guard so a
     // later Completed turn after an empty permission grant can never erase the refusal.
     if approval_requested || outcome.refused_ceiling_expansions != 0 {
-        return Err("read-only Researcher app-server refused an approval request".to_string());
+        return Err("read-only terminal Codex app-server refused an approval request".to_string());
     }
     if outcome.status != codex_app_server::TurnTerminalStatus::Completed
         || outcome
@@ -4512,7 +5953,7 @@ fn validate_read_only_researcher_app_server_outcome(
             .any(|item| item.item_type == "fileChange")
     {
         return Err(
-            "read-only Researcher app-server refused a non-completed turn or file change"
+            "read-only terminal Codex app-server refused a non-completed turn or file change"
                 .to_string(),
         );
     }
@@ -4540,6 +5981,7 @@ fn run_duplex_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: None,
         output_schema: match load_codex_app_server_output_schema(spec) {
             Ok(schema) => schema,
             Err(error) => {
@@ -4559,6 +6001,7 @@ fn run_duplex_app_server_process(
             &turn,
             spec,
             &mut reviewer,
+            None,
             &cancellation,
         )?;
         if outcome.protocol_error.is_some() {
@@ -4972,6 +6415,7 @@ fn record_completed_app_server_target(
     credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
+    let launch_spec = context.spec;
     let protocol = interactive.interaction;
     let parent_evidence = output_staging.codex_home.as_ref().map(|codex_home| {
         let inputs = CodexParentEvidenceInputs {
@@ -5030,15 +6474,25 @@ fn record_completed_app_server_target(
         report.stdout.run_metadata.codex_app_server_parent_evidence = Some(evidence.clone());
         report.codex_parent_evidence = Some(evidence);
     }
+    // Capture token completion before an unavailable identity blocks acceptance.
+    report.stdout.run_metadata.codex_app_server_usage_complete = report.exit_code == Some(0)
+        && !report.timed_out
+        && report.error.is_none()
+        && report
+            .codex_command_execution_evidence()
+            .is_some_and(|evidence| {
+                evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+            });
+    report.qualify_codex_auditor_effort(launch_spec);
     if report
         .authenticated_app_server_evidence()
-        .is_none_or(|evidence| evidence.resolution_status != "complete")
+        .is_none_or(|evidence| evidence.resolution_status != "complete" || evidence.model_mismatch)
         || report.stdout.raw_capture_truncated()
     {
         report.error = append_external_error(
             report.error.take(),
             Some(
-                "Codex app-server identity/usage resolution or raw capture is incomplete"
+                "Codex app-server identity/usage resolution or raw capture is incomplete, or the observed model mismatches the requested model"
                     .to_string(),
             ),
         );
@@ -5140,8 +6594,11 @@ fn record_completed_target(
                 requested_effort: context.spec.reasoning_effort.as_deref(),
             };
             let stdout = (!output.stdout.is_truncated()).then(|| output.stdout.as_bytes());
-            report.codex_parent_evidence =
-                Some(codex_parent_evidence_from_run(&inputs, stdout, codex_home));
+            let evidence = codex_parent_evidence_from_run(&inputs, stdout, codex_home);
+            report.stdout.run_metadata.codex_cli_parent_evidence = Some(evidence.clone());
+            report.stdout.run_metadata.codex_cli_usage =
+                stdout.and_then(|bytes| codex_usage_from_jsonl(bytes).ok().flatten());
+            report.codex_parent_evidence = Some(evidence);
         }
     }
     report.error = append_external_error(
@@ -5248,6 +6705,19 @@ fn record_completed_target(
             .grok_acp_parent_evidence
             .as_ref()
             .is_some_and(|evidence| evidence.permission_escalation_refused);
+    report.stdout.run_metadata.codex_cli_usage_complete = report.publishable;
+    if report.codex_command_execution_evidence().is_none()
+        && report
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.model_mismatch || report.stdout.run_metadata.codex_cli_usage.is_none()
+            })
+    {
+        report.publishable = false;
+    }
 }
 
 fn capture_redacted_staged_output(
@@ -6527,5 +7997,7 @@ mod preflight_quiescence_regression {
     }
 }
 
+#[cfg(test)]
+mod managed_readonly_route_tests;
 #[cfg(test)]
 mod tests;

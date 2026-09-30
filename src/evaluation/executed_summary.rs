@@ -1246,6 +1246,32 @@ mod tests {
     }
 
     #[test]
+    fn pricing_guard_unknown_cost_cannot_enter_monetary_pareto_frontier() {
+        let manifest = observation_manifest();
+        let manifest_sha256 = sha256_hex(&serde_json::to_vec(&manifest).expect("manifest"));
+        let mut runs = vec![
+            observed_run(&manifest.profiles[0], &manifest_sha256, 0.01, "worker-low"),
+            observed_run(&manifest.profiles[1], &manifest_sha256, 0.03, "worker-high"),
+        ];
+        // Unknown cost must refuse the monetary comparison independently of
+        // the fixture's other acceptance gates; this is not live review proof.
+        runs[0].measurements.as_mut().unwrap().total_cost_usd = None;
+        let summary = summarize_executed_observation_runs(&manifest, &manifest_sha256, &runs)
+            .expect("summary with unknown cost");
+        assert!(summary.profile_summaries[0]
+            .aggregate_reported_cost_usd
+            .is_none());
+        assert!(summary.profile_summaries[0]
+            .mean_reported_cost_usd
+            .is_none());
+        assert_eq!(
+            summary.pareto_conclusion.status,
+            ExecutedObservationParetoStatus::RefusedIncompleteReportedCost
+        );
+        assert!(summary.pareto_frontier.is_empty());
+    }
+
+    #[test]
     fn unavailable_measurements_without_digest_do_not_abort_summarize() {
         let mut manifest = observation_manifest();
         manifest.profiles.truncate(1);

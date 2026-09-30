@@ -76,7 +76,10 @@ struct BudgetAdmissionTestHookGuard(String);
 #[cfg(test)]
 impl Drop for BudgetAdmissionTestHookGuard {
     fn drop(&mut self) {
-        budget_admission_test_hooks().lock().unwrap().remove(&self.0);
+        budget_admission_test_hooks()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
     }
 }
 
@@ -136,7 +139,7 @@ enum DispatchBudgetAdmission<'a> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DispatchBudgetReservationState {
-    Reserved,
+    Reserved(SupervisorRuntime),
     Invoked(SupervisorRuntime),
     Settled,
 }
@@ -145,6 +148,7 @@ struct DispatchBudgetReservation<'a> {
     ledger: &'a RunBudgetLedger,
     reservation: BudgetReservation,
     pricing: Option<ModelPricing>,
+    model_pricing: BTreeMap<String, ModelPricing>,
     state: DispatchBudgetReservationState,
 }
 
@@ -156,24 +160,36 @@ enum DispatchUsageReliability {
     NotStarted,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DispatchUsageSettlement {
     observed_usage: Option<Usage>,
     reliability: DispatchUsageReliability,
+    model: Option<String>,
+    cost_usd: Option<f64>,
 }
 
 impl DispatchUsageSettlement {
-    fn reliable_usage(self) -> Option<Usage> {
+    fn reliable_usage(&self) -> Option<Usage> {
         (self.reliability == DispatchUsageReliability::Reliable)
             .then_some(self.observed_usage)
             .flatten()
     }
 
-    fn is_degraded(self) -> bool {
+    fn is_degraded(&self) -> bool {
         matches!(
             self.reliability,
             DispatchUsageReliability::Estimated | DispatchUsageReliability::Missing
         )
+    }
+
+    fn role_sample(&self, role: AgentRole, lens_id: Option<String>) -> Option<RoleUsageSample> {
+        self.reliable_usage().map(|usage| RoleUsageSample {
+            role,
+            lens_id,
+            model: self.model.clone(),
+            usage,
+            cost_usd: self.cost_usd,
+        })
     }
 }
 
@@ -189,8 +205,8 @@ fn set_dispatch_pre_runner_fault(role: AgentRole) {
 
 impl DispatchBudgetReservation<'_> {
     fn mark_invoked_for_runtime(&mut self, launch_runtime: SupervisorRuntime) -> Result<()> {
-        if self.state != DispatchBudgetReservationState::Reserved {
-            bail!("budget reservation was invoked outside its reserved state");
+        if self.state != DispatchBudgetReservationState::Reserved(launch_runtime) {
+            bail!("budget reservation was invoked outside its reserved runtime or state");
         }
         if self.ledger.dispatch_stopped() {
             bail!("run budget stopped before provider invocation");
@@ -233,37 +249,65 @@ impl DispatchBudgetReservation<'_> {
         let DispatchBudgetReservationState::Invoked(launch_runtime) = self.state else {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
-        let usage = complete_external_codex_usage(run, command);
-        // Requested-model pricing is not evidence of the price of an unknown/rerouted model.
-        let pricing = if run.codex_command_execution_evidence().is_some() {
-            run.authenticated_app_server_evidence()
-                .filter(|evidence| {
-                    evidence.observed_model.known().is_some()
-                        && evidence.observed_model.known() == command.model.as_deref()
-                        && evidence.server_rerouted_model.is_none()
-                })
-                .and(self.pricing)
+        let usage = external_usage_for_runtime(run, command, launch_runtime);
+        // One parent-owned allocation feeds both the ledger and every role/lens report.
+        // A reroute notice cannot allocate cumulative turn usage between models.
+        let model = if launch_runtime == SupervisorRuntime::Codex {
+            run.authenticated_codex_evidence()
+                .filter(|evidence| evidence.requested_model == command.model)
+                .filter(|_| usage.is_some() && run.authenticated_codex_usage() == usage)
+                .and_then(|evidence| evidence.usage_model())
+                .map(str::to_owned)
+        } else if launch_runtime == SupervisorRuntime::Grok {
+            // Native headless usage does not attest the provider's actual model.
+            None
+        } else {
+            command.model.clone()
+        };
+        let pricing = if launch_runtime == SupervisorRuntime::Codex {
+            model.as_deref().and_then(|model| {
+                crate::llm::provider::resolve_model_pricing(&self.model_pricing, model)
+                    .filter(|resolved| {
+                        resolved.provenance
+                            == crate::llm::provider::ModelPricingProvenance::PlanOverride
+                    })
+                    .map(|resolved| resolved.pricing)
+            })
+        } else if launch_runtime == SupervisorRuntime::Grok {
+            None
         } else {
             self.pricing
+        };
+        let cost_usd = usage
+            .and_then(|usage| pricing.map(|pricing| pricing.cost_usd(usage)))
+            .filter(|cost| cost.is_finite());
+        // Identity acceptance is deliberately separate from complete token accounting.
+        // This does not relax external_process_completed or any publication gate.
+        let token_process_completed = if launch_runtime == SupervisorRuntime::Grok {
+            run.authenticated_grok_usage(command)
+                .is_some_and(|(_, complete)| complete)
+        } else if run.authenticated_codex_evidence().is_some() {
+            run.authenticated_codex_usage_complete()
+        } else {
+            external_process_completed(run, launch_runtime)
         };
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
-                    if external_process_completed(run, launch_runtime)
+                    if token_process_completed
                         && external_safety_verified(run, launch_runtime)
                         && !run.stdout.raw_capture_truncated()
                         && (run.codex_command_execution_evidence().is_none()
                             || run.authenticated_app_server_evidence().is_some_and(|evidence| {
-                                evidence.resolution_status == "complete"
+                                run.codex_command_execution_evidence().is_some_and(|commands|
+                                    commands.turn_status == crate::external_agent::codex_app_server::TurnTerminalStatus::Completed)
                                     && run.codex_parent_evidence.as_ref() == Some(evidence)
                             })) =>
                 {
                     (
                         UsageMeasurement::Reliable {
                             tokens: usage.total_tokens,
-                            cost_usd: pricing
-                                .map(|pricing| pricing.cost_usd(usage))
-                                .filter(|cost| cost.is_finite()),
+                            cost_usd,
                         },
                         DispatchUsageReliability::Reliable,
                     )
@@ -271,9 +315,7 @@ impl DispatchBudgetReservation<'_> {
                 Some(usage) => (
                     UsageMeasurement::Estimated {
                         tokens: usage.total_tokens,
-                        cost_usd: pricing
-                            .map(|pricing| pricing.cost_usd(usage))
-                            .filter(|cost| cost.is_finite()),
+                        cost_usd,
                     },
                     DispatchUsageReliability::Estimated,
                 ),
@@ -289,6 +331,8 @@ impl DispatchBudgetReservation<'_> {
             DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability,
+                model,
+                cost_usd,
             }
         } else {
             self.ledger
@@ -297,6 +341,8 @@ impl DispatchBudgetReservation<'_> {
             DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability: DispatchUsageReliability::NotStarted,
+                model: None,
+                cost_usd: None,
             }
         };
         self.state = DispatchBudgetReservationState::Settled;
@@ -321,7 +367,7 @@ impl DispatchBudgetReservation<'_> {
 impl Drop for DispatchBudgetReservation<'_> {
     fn drop(&mut self) {
         let result = match self.state {
-            DispatchBudgetReservationState::Reserved => {
+            DispatchBudgetReservationState::Reserved(_) => {
                 self.ledger.release(self.reservation.id).map(|_| ())
             }
             DispatchBudgetReservationState::Invoked(launch_runtime) => self
@@ -896,12 +942,13 @@ impl ReportStatus for AuditorReport {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct RoleUsageSample {
     role: AgentRole,
     lens_id: Option<String>,
     model: Option<String>,
     usage: Usage,
+    cost_usd: Option<f64>,
 }
 
 struct RoleUsageAggregation {
@@ -949,4 +996,263 @@ impl RunDirs {
 struct PathOwner {
     id: String,
     path: PathBuf,
+}
+
+#[cfg(test)]
+mod grok_native_settlement_tests {
+    use super::*;
+    use crate::process_runner::{
+        CapturedBytes, ContainmentBackend, SideEffectConfinementProfileKind,
+    };
+    use crate::runtime_adapter::RuntimeAdapterConfig;
+
+    fn command(root: &Path) -> ExternalAgentCommand {
+        let mut command = ExternalAgentCommand::codex(
+            "grok",
+            root,
+            root.join("prompt"),
+            root.join("log"),
+            root.join("report"),
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            SupervisorRuntime::Grok,
+            RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+        );
+        command.model = Some("requested-only-model".into());
+        command
+    }
+
+    fn capture() -> CapturedBytes {
+        CapturedBytes::from_bytes_for_test(b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":3,\"reasoning_tokens\":2,\"total_tokens\":24}}\n".to_vec())
+    }
+
+    fn native_run(command: &ExternalAgentCommand, complete: bool) -> ExternalAgentRun {
+        let mut run = deterministic_fake_run(command, Vec::new());
+        // Explicit per-case parent-capture injection; no generic fixture gains custody.
+        run.stdout.text = String::from_utf8(capture().as_bytes().to_vec()).unwrap();
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok,
+        ));
+        run.publishable = true;
+        run.retain_grok_native_usage_for_test(command, &capture(), complete);
+        run
+    }
+
+    fn reserve(ledger: &RunBudgetLedger) -> DispatchBudgetReservation<'_> {
+        let reservation = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::Worker,
+                tokens: 10,
+                cost_usd: Some(0.01),
+            })
+            .unwrap()
+            .reservation()
+            .expect("admitted")
+            .clone();
+        DispatchBudgetReservation {
+            ledger,
+            reservation,
+            pricing: Some(ModelPricing {
+                input_usd_per_million_tokens: 7.0,
+                output_usd_per_million_tokens: 7.0,
+            }),
+            model_pricing: BTreeMap::new(),
+            state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Grok),
+        }
+    }
+
+    fn ledger(cost: Option<f64>) -> RunBudgetLedger {
+        RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_tokens: Some(100),
+            hard_cost_usd: cost,
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    #[test]
+    fn grok_native_settlement_reaches_same_reservation_role_and_total_without_model_price() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = command(temp.path());
+        let mut run = native_run(&command, true);
+        // Public output/log replacement cannot erase or replace private counters.
+        std::fs::write(
+            &command.json_log,
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":1,\"output_tokens\":1}}\n",
+        )
+        .unwrap();
+        run.stdout.text = "altered public summary".into();
+        run.grok_stream_usage_evidence =
+            Some(crate::runtime_adapter::grok::GrokStreamUsageEvidence::NotProcessObservable);
+        let ledger = ledger(None);
+        let mut reservation = reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Reliable);
+        assert_eq!(
+            settled.observed_usage,
+            Some(Usage {
+                input_tokens: 19,
+                output_tokens: 5,
+                total_tokens: 24
+            })
+        );
+        assert_eq!(settled.model, None);
+        assert_eq!(settled.cost_usd, None);
+        assert!(
+            reservation.settle_bound_runtime(&run, &command).is_err(),
+            "settle once"
+        );
+        let budget = ledger.report().unwrap();
+        assert_eq!(budget.consumed.tokens, 24);
+        assert_eq!(budget.consumed.cost_usd, None);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert!(budget.usage_complete && budget.new_dispatch_allowed);
+        let plan: SupervisorPlan = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(plan.review_lenses.len(), 3);
+        let report = role_usage_report(
+            &plan,
+            vec![settled.role_sample(AgentRole::Worker, None).unwrap()],
+        )
+        .unwrap();
+        assert_eq!(report.total_usage, settled.observed_usage);
+        assert_eq!(report.total_cost_usd, None);
+        assert_eq!(
+            report.reports[&AgentRole::Worker].usage,
+            settled.observed_usage
+        );
+        assert!(report.reports[&AgentRole::Worker].models.is_empty());
+        assert!(report.lens_reports.iter().all(|lens| lens.usage.is_none()));
+        drop(reserve(&ledger));
+        assert_eq!(
+            ledger.report().unwrap().reserved.tokens,
+            0,
+            "ordinary second admission and RAII refund"
+        );
+    }
+
+    #[test]
+    fn grok_native_settlement_unknown_usd_stops_next_invocation() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = command(temp.path());
+        let run = native_run(&command, true);
+        let ledger = ledger(Some(1.0));
+        let mut reservation = reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(
+            settled.cost_usd, None,
+            "requested model's reservation price is not observed cost"
+        );
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 24);
+        assert!(report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+        assert!(matches!(
+            ledger
+                .reserve(BudgetReservationRequest {
+                    role: AgentRole::Worker,
+                    tokens: 1,
+                    cost_usd: Some(0.0)
+                })
+                .unwrap(),
+            BudgetAdmission::Refused { .. }
+        ));
+    }
+
+    #[test]
+    fn grok_native_settlement_cancelled_partial_is_charged_without_acceptance_or_price() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = command(temp.path());
+        let mut run = native_run(&command, false);
+        run.error = Some("supervisor cancellation".into());
+        run.publishable = false;
+        let ledger = ledger(None);
+        let mut reservation = reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(settled.observed_usage.unwrap().total_tokens, 24);
+        assert_eq!(settled.cost_usd, None);
+        assert!(settled.role_sample(AgentRole::Worker, None).is_none());
+        assert!(!external_process_completed(&run, SupervisorRuntime::Grok));
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 24);
+        assert_eq!(report.reserved.tokens, 0);
+        assert!(
+            !report.usage_complete,
+            "incomplete spend cannot qualify usage"
+        );
+        assert!(!report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn grok_native_settlement_public_log_or_wire_cannot_mint_private_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = command(temp.path());
+        let original = native_run(&command, true);
+        std::fs::write(
+            &command.json_log,
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3}}\n",
+        )
+        .unwrap();
+        let restored: ExternalAgentRun =
+            serde_json::from_slice(&serde_json::to_vec(&original).unwrap()).unwrap();
+        assert!(external_process_completed(
+            &restored,
+            SupervisorRuntime::Grok
+        ));
+        assert!(external_usage_for_runtime(&restored, &command, SupervisorRuntime::Grok).is_none());
+        let ledger = ledger(None);
+        let mut reservation = reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+            .unwrap();
+        let settled = reservation
+            .settle_bound_runtime(&restored, &command)
+            .unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Missing);
+        assert_eq!(settled.observed_usage, None);
+        let report = ledger.report().unwrap();
+        assert_eq!(
+            report.consumed.tokens, 10,
+            "conservative admission charge, not forged log tokens"
+        );
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn grok_native_reservation_preserves_runtime_binding_refund_and_drop_charge() {
+        let ledger = ledger(None);
+        {
+            let mut reservation = reserve(&ledger);
+            assert!(reservation
+                .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+                .is_err());
+            reservation.settle_not_started().unwrap();
+        }
+        assert_eq!(ledger.report().unwrap().consumed.tokens, 0);
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 0);
+        {
+            let mut reservation = reserve(&ledger);
+            reservation
+                .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+                .unwrap();
+        }
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 10);
+        assert_eq!(report.reserved.tokens, 0);
+        assert!(!report.usage_complete);
+    }
 }
