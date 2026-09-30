@@ -328,6 +328,221 @@ struct BoundLiveTokenGrant {
     input_files: Vec<PathBuf>,
 }
 
+#[cfg(target_os = "linux")]
+struct BoundWorkerJournalAppend {
+    helper_path: PathBuf,
+    helper_file: fs::File,
+    helper_identity: ExternalProgramIdentity,
+    helper_sha256: String,
+    journal: ExactWritableArtifactFile,
+}
+
+#[cfg(target_os = "linux")]
+impl BoundWorkerJournalAppend {
+    fn revalidate(&self) -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = self.helper_file.metadata()?;
+        let path_metadata = fs::symlink_metadata(&self.helper_path)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        if !path_metadata.is_file()
+            || metadata.dev() != path_metadata.dev()
+            || metadata.ino() != path_metadata.ino()
+            || metadata.mode() != path_metadata.mode()
+            || metadata.uid() != path_metadata.uid()
+            || (metadata.uid() != 0 && metadata.uid() != uid)
+            || metadata.mode() & 0o022 != 0
+            || metadata.mode() & 0o6000 != 0
+            || metadata.mode() & 0o111 == 0
+            || fs::canonicalize(&self.helper_path)? != self.helper_path
+            || external_program_identity(&self.helper_path)? != self.helper_identity
+            || worker_journal_appender_sha256(&self.helper_file)? != self.helper_sha256
+        {
+            bail!("current MACO journal appender executable bytes or identity changed");
+        }
+        let held = exact_writable_artifact_identity(&self.journal.held_file.metadata()?)?;
+        let path = exact_writable_artifact_identity(&fs::symlink_metadata(&self.journal.path)?)?;
+        validate_exact_writable_artifact_identity(held)?;
+        if held != self.journal.identity || path != held {
+            bail!("precreated worker journal held descriptor/path binding changed");
+        }
+        Ok(())
+    }
+
+    fn command_prefix(&self) -> Result<Vec<String>> {
+        let text = |path: &Path| {
+            path.to_str()
+                .map(str::to_owned)
+                .context("worker journal append command requires a UTF-8 path")
+        };
+        Ok(vec![
+            text(&self.helper_path)?,
+            "supervise".to_string(),
+            "journal-append".to_string(),
+            "--journal".to_string(),
+            text(&self.journal.path)?,
+            "--device".to_string(),
+            self.journal.identity.device.to_string(),
+            "--inode".to_string(),
+            self.journal.identity.inode.to_string(),
+        ])
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn worker_journal_appender_sha256(file: &fs::File) -> Result<String> {
+    use std::os::unix::fs::FileExt;
+    // The only production input is the kernel-selected running MACO image,
+    // never a caller-selected file. This one-shot read uses temporary memory
+    // proportional to its exact bytes; it is not a streaming digest.
+    let length = file.metadata()?.len();
+    if length == 0 {
+        bail!("current MACO journal appender image is empty");
+    }
+    let mut bytes = vec![0_u8; usize::try_from(length)?];
+    file.read_exact_at(&mut bytes, 0)?;
+    if !bytes.starts_with(b"\x7fELF") {
+        bail!("current MACO journal appender must be the running native executable");
+    }
+    Ok(sha256_hex(&bytes))
+}
+
+#[cfg(target_os = "linux")]
+fn bind_worker_journal_append_operation(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    runtime: ExternalExecutionRuntime,
+    trust: ExternalProgramTrust,
+    prompt: &mut Vec<u8>,
+    profile: &mut Option<SideEffectConfinementProfile>,
+    argv: &mut [OsString],
+) -> Result<Option<BoundWorkerJournalAppend>> {
+    // No new route, program selection, delegation, or workspace authority.
+    if runtime != ExternalExecutionRuntime::Verified
+        || trust != ExternalProgramTrust::TrustedSystemCodex
+        || spec.invocation != ExternalAgentInvocation::CodexSupervisor
+        || spec.workspace_access != WorkspaceAccess::ReadWrite
+        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|id| id.role != "worker")
+        || spec.worker_journal_artifacts.is_empty()
+    {
+        return Ok(None);
+    }
+    refuse_assignment_process_launch_before_preflight(spec)?;
+    if spec.assignment_process_launch_kind != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        || spec.codex_managed_readonly_route_active()
+        || spec.worker_journal_artifacts.len() != 1
+        || controls.exact_writable_artifact_files.len() != 1
+    {
+        bail!("worker journal appender requires the exact journal-bound assignment child");
+    }
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .context("worker lifecycle identity missing")?;
+    let declared = &spec.worker_journal_artifacts[0];
+    let journal = &controls.exact_writable_artifact_files[0];
+    if identity.task_id != declared.worker_id
+        || journal.worker_id != declared.worker_id
+        || journal.path != declared.path
+        || journal.path
+            != declared
+                .incoming_root
+                .join("worker-journals")
+                .join(format!("{}.jsonl", identity.task_id))
+    {
+        bail!("worker journal appender subject/path differs from the held launch contract");
+    }
+    let Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) = profile.as_ref() else {
+        bail!("worker journal appender requires the existing ExternalCodex containment");
+    };
+    for feature in ["multi_agent", "goals"] {
+        if !argv
+            .windows(2)
+            .any(|pair| pair[0] == OsStr::new("--disable") && pair[1] == OsStr::new(feature))
+            || argv
+                .windows(2)
+                .any(|pair| pair[0] == OsStr::new("--enable") && pair[1] == OsStr::new(feature))
+        {
+            bail!("worker journal appender requires native delegation to remain disabled");
+        }
+    }
+    let original_permissions = OsString::from(codex_filesystem_permissions(spec, controls));
+    let positions = argv
+        .iter()
+        .enumerate()
+        .filter_map(|(index, argument)| (argument == &original_permissions).then_some(index))
+        .collect::<Vec<_>>();
+    if positions.len() != 1 || positions[0] == 0 || argv[positions[0] - 1] != OsStr::new("-c") {
+        bail!("worker journal appender requires the exact existing inner filesystem rule");
+    }
+    let helper_path = env::current_exe().context("current MACO executable is unavailable")?;
+    let helper_path = normalized_absolute_path(&helper_path, "current MACO journal appender")?;
+    // Read only the kernel-selected running image, never a caller-supplied program.
+    let helper_file = fs::File::open("/proc/self/exe")?;
+    let helper_identity = external_program_identity(&helper_path)?;
+    let helper_sha256 = worker_journal_appender_sha256(&helper_file)?;
+    let binding = BoundWorkerJournalAppend {
+        helper_path,
+        helper_file,
+        helper_identity,
+        helper_sha256,
+        journal: journal.clone(),
+    };
+    binding.revalidate()?;
+    let hidden_roots = spec
+        .hidden_roots
+        .iter()
+        .map(|path| normalized_absolute_path(path, "hidden root"))
+        .collect::<Result<Vec<_>>>()?;
+    let overlaps = |path: &Path| {
+        binding.helper_path.starts_with(path) || path.starts_with(&binding.helper_path)
+    };
+    if overlaps(&spec.cwd)
+        || overlaps(&declared.incoming_root)
+        || hidden_roots.iter().any(|path| overlaps(path))
+        || controls.iter().any(|control| overlaps(&control.absolute))
+        || controls.managed_git.as_ref().is_some_and(|git| {
+            std::iter::once(&git.worktree_git_dir)
+                .chain(&git.common_read_only_roots)
+                .chain(&git.common_read_only_files)
+                .any(|path| overlaps(path))
+        })
+    {
+        bail!("worker journal appender overlaps a workspace, private, or protected path");
+    }
+    let prefix = serde_json::to_string(&binding.command_prefix()?)?;
+    let appendix = format!(
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd, --start-timestamp, --end-timestamp, repeated --changed-path, then -- and the original command argv. Preserve the entire apply_patch payload as one argument. Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError; do not execute the action or repair the journal. The appender is record transport, not an action to recursively journal. Its arguments confer no launch, claim, or evidence authority.\n",
+        binding.helper_sha256,
+    );
+    if prompt
+        .len()
+        .checked_add(appendix.len())
+        .filter(|len| *len <= MAX_PROMPT_BYTES)
+        .is_none()
+    {
+        bail!("worker journal append operation exceeds the existing prompt byte limit");
+    }
+    // The outer helper mount alone does not expose it inside Codex's :minimal
+    // read sandbox. Add only this exact read rule; preserve every other argv.
+    let mut inner_controls = controls.clone();
+    inner_controls
+        .exact_read_only_input_files
+        .push(binding.helper_path.clone());
+    argv[positions[0]] = OsString::from(codex_filesystem_permissions(spec, &inner_controls));
+    *profile = Some(SideEffectConfinementProfile::ExternalCodex(
+        codex_profile
+            .clone()
+            .with_visible_read_only_file(&binding.helper_path),
+    ));
+    prompt.extend_from_slice(appendix.as_bytes());
+    Ok(Some(binding))
+}
+
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
         should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
@@ -388,6 +603,364 @@ impl ExternalAgentCommand {
             return Err("live token grant was stopped or released".to_string());
         }
         Ok(Some(&bound.grant))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod worker_journal_append_binding_tests {
+    use super::*;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    fn fixture() -> (
+        tempfile::TempDir,
+        ExternalAgentCommand,
+        ProtectedWorktreeControls,
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let workspace = root.join("workspace");
+        let incoming = root.join("incoming");
+        fs::create_dir(&workspace).unwrap();
+        fs::create_dir_all(incoming.join("worker-journals")).unwrap();
+        let path = incoming.join("worker-journals/worker.jsonl");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)
+            .unwrap();
+        let identity = exact_writable_artifact_identity(&file.metadata().unwrap()).unwrap();
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "run",
+            "worker",
+            1,
+            Path::new("codex"),
+            None,
+            "worker-duty",
+        )
+        .unwrap();
+        let spec = ExternalAgentCommand::codex(
+            "codex",
+            &workspace,
+            root.join("prompt.md"),
+            root.join("events.jsonl"),
+            incoming.join("report.json"),
+            Duration::from_secs(30),
+        )
+        .with_agent_lifecycle(&root, "worker", "run", "worker")
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+        .with_worker_journal_artifact("worker", &incoming, &path);
+        let controls = ProtectedWorktreeControls {
+            exact_writable_artifact_files: vec![ExactWritableArtifactFile {
+                worker_id: "worker".to_string(),
+                path,
+                held_file: std::sync::Arc::new(file),
+                identity,
+            }],
+            writable_artifact_root: Some(incoming),
+            ..ProtectedWorktreeControls::default()
+        };
+        (temp, spec, controls)
+    }
+
+    fn profile(spec: &ExternalAgentCommand) -> Option<SideEffectConfinementProfile> {
+        Some(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_write(&spec.cwd)
+                .with_hidden_root(spec.cwd.join(".maco"))
+                .with_visible_read_only_file(spec.cwd.join(".gitignore")),
+        ))
+    }
+
+    #[test]
+    fn worker_append_production_binding_preserves_native_flags_and_mounts_only_current_executable()
+    {
+        let (_temp, spec, controls) = fixture();
+        let original_profile = profile(&spec);
+        let mut mounted = original_profile.clone();
+        let mut prompt = b"original prompt".to_vec();
+        let original_argv = codex_supervisor_argv(&spec, &controls, None);
+        let mut argv = original_argv.clone();
+        let original_digest = argv_digest(&argv).unwrap();
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(binding.helper_path, env::current_exe().unwrap());
+        assert_eq!(
+            binding.helper_sha256,
+            sha256_hex(&fs::read(&binding.helper_path).unwrap())
+        );
+        let prefix = binding.command_prefix().unwrap();
+        assert_eq!(
+            prefix,
+            vec![
+                binding.helper_path.to_str().unwrap().to_string(),
+                "supervise".to_string(),
+                "journal-append".to_string(),
+                "--journal".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .path
+                    .to_str()
+                    .unwrap()
+                    .to_string(),
+                "--device".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .identity
+                    .device
+                    .to_string(),
+                "--inode".to_string(),
+                controls.exact_writable_artifact_files[0]
+                    .identity
+                    .inode
+                    .to_string(),
+            ]
+        );
+        let Some(SideEffectConfinementProfile::ExternalCodex(original)) = original_profile else {
+            panic!("Codex profile expected");
+        };
+        assert_eq!(
+            mounted,
+            Some(SideEffectConfinementProfile::ExternalCodex(
+                original.with_visible_read_only_file(&binding.helper_path),
+            ))
+        );
+        let before_permissions = OsString::from(codex_filesystem_permissions(&spec, &controls));
+        let mut expected_controls = controls.clone();
+        expected_controls
+            .exact_read_only_input_files
+            .push(binding.helper_path.clone());
+        let after_permissions =
+            OsString::from(codex_filesystem_permissions(&spec, &expected_controls));
+        for (before, after) in original_argv.iter().zip(&argv) {
+            assert_eq!(
+                after,
+                if before == &before_permissions {
+                    &after_permissions
+                } else {
+                    before
+                }
+            );
+        }
+        assert_eq!(argv.len(), original_argv.len());
+        assert_ne!(argv_digest(&argv).unwrap(), original_digest);
+        assert!(after_permissions.to_str().unwrap().contains(&format!(
+            "{}=\"read\"",
+            toml_basic_string(binding.helper_path.to_str().unwrap())
+        )));
+        let prompt = std::str::from_utf8(&prompt).unwrap();
+        assert!(prompt.starts_with("original prompt"));
+        assert!(prompt.contains(&serde_json::to_string(&prefix).unwrap()));
+        assert!(prompt.contains(&binding.helper_sha256));
+        assert!(controls.exact_read_only_input_files.is_empty());
+        binding.revalidate().unwrap();
+        assert!(fs::read(&binding.journal.path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_append_binding_refuses_changed_identity_flags_and_profile_without_side_effects() {
+        let (_temp, mut spec, mut controls) = fixture();
+        let mut prompt = b"original".to_vec();
+        let mut mounted = profile(&spec);
+        let original_profile = mounted.clone();
+        let mut argv = codex_supervisor_argv(&spec, &controls, None);
+        let original_argv = argv.clone();
+        spec.worker_journal_artifacts[0].worker_id = "foreign".to_string();
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        spec.worker_journal_artifacts[0].worker_id = "worker".to_string();
+        let flag = argv
+            .windows(2)
+            .position(|pair| pair[1] == OsStr::new("multi_agent"))
+            .unwrap();
+        argv[flag] = OsString::from("--enable");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        argv.push(OsString::from("--enable"));
+        argv.push(OsString::from("goals"));
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        let permissions = OsString::from(codex_filesystem_permissions(&spec, &controls));
+        let rule = argv
+            .iter()
+            .position(|argument| argument == &permissions)
+            .unwrap();
+        argv[rule] = OsString::from("permissions.maco_external_codex.filesystem={}");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        argv[rule - 1] = OsString::from("--model");
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        argv = original_argv.clone();
+        mounted = None;
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        mounted = original_profile.clone();
+        let artifact = controls.exact_writable_artifact_files.remove(0);
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .is_err());
+        controls.exact_writable_artifact_files.push(artifact);
+        assert_eq!(prompt.as_slice(), b"original");
+        assert_eq!(mounted, original_profile);
+        assert_eq!(argv, original_argv);
+        spec.hidden_roots
+            .push(env::current_exe().unwrap().parent().unwrap().to_path_buf());
+        assert!(bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .err()
+        .expect("hidden helper must be refused")
+        .to_string()
+        .contains("private, or protected path"));
+        spec.hidden_roots.clear();
+        assert_eq!(prompt.as_slice(), b"original");
+        assert_eq!(mounted, original_profile);
+        assert_eq!(argv, original_argv);
+        let mut binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut mounted,
+            &mut argv,
+        )
+        .unwrap()
+        .unwrap();
+        let digest = binding.helper_sha256.clone();
+        binding.helper_sha256 = "0".repeat(64);
+        assert!(binding.revalidate().is_err());
+        binding.helper_sha256 = digest;
+        fs::rename(
+            &binding.journal.path,
+            binding.journal.path.with_extension("original"),
+        )
+        .unwrap();
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&binding.journal.path)
+            .unwrap();
+        assert!(binding
+            .revalidate()
+            .unwrap_err()
+            .to_string()
+            .contains("held descriptor/path binding changed"));
+    }
+
+    #[test]
+    fn worker_append_binding_leaves_other_runtime_role_and_target_shapes_unchanged() {
+        let (_temp, spec, controls) = fixture();
+        let mut variants = Vec::new();
+        let mut other = spec.clone();
+        other.invocation = ExternalAgentInvocation::Grok;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.workspace_access = WorkspaceAccess::ReadOnly;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.writable_launch_target = WritableLaunchTarget::PrimaryWorktree;
+        variants.push(other);
+        let mut other = spec.clone();
+        other.agent_lifecycle.as_mut().unwrap().role = "child_orchestrator".to_string();
+        variants.push(other);
+        let mut other = spec.clone();
+        other.worker_journal_artifacts.clear();
+        variants.push(other);
+        for variant in variants {
+            let mut mounted = profile(&variant);
+            let original_profile = mounted.clone();
+            let mut prompt = b"original".to_vec();
+            let mut argv = codex_supervisor_argv(&variant, &controls, None);
+            let original_argv = argv.clone();
+            assert!(bind_worker_journal_append_operation(
+                &variant,
+                &controls,
+                ExternalExecutionRuntime::Verified,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &mut prompt,
+                &mut mounted,
+                &mut argv,
+            )
+            .unwrap()
+            .is_none());
+            assert_eq!(prompt.as_slice(), b"original");
+            assert_eq!(mounted, original_profile);
+            assert_eq!(argv, original_argv);
+        }
     }
 }
 
@@ -3851,6 +4424,45 @@ fn run_external_agent_runtime(
         }
         (None, profile) => profile,
     };
+    #[cfg(target_os = "linux")]
+    let (prompt, side_effect_profile, worker_journal_append) = {
+        let mut prompt = prompt;
+        let mut profile = side_effect_profile;
+        let binding = match bind_worker_journal_append_operation(
+            &target_spec,
+            &target_controls,
+            runtime,
+            program_trust,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("worker journal append binding refused: {error:#}"),
+                );
+                return report;
+            }
+        };
+        if binding.is_some() {
+            bound_argv_digest = match argv_digest(&argv) {
+                Ok(digest) => Some(digest),
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(
+                        &mut report,
+                        format!("worker journal argv binding failed: {error:#}"),
+                    );
+                    return report;
+                }
+            };
+            report.command = command_display(&resolved_program, &argv);
+        }
+        (prompt, profile, binding)
+    };
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
@@ -4223,6 +4835,18 @@ fn run_external_agent_runtime(
             "external agent was cancelled before target start".to_string(),
         );
         return report;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(binding) = &worker_journal_append {
+        if let Err(error) = binding.revalidate() {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("worker journal append binding changed before release: {error:#}"),
+            );
+            return report;
+        }
     }
 
     if let Some(grant) = sealed_assignment_process_grant {

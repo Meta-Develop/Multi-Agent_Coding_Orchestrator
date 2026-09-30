@@ -338,6 +338,7 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+pub(crate) use reporting::append_precreated_worker_execution_journal;
 use reporting::*;
 
 #[cfg(test)]
@@ -4126,12 +4127,12 @@ enum WorkerExecutionJournalStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerExecutionJournalEntry {
-    command: Vec<String>,
-    cwd: PathBuf,
-    start_timestamp: String,
-    end_timestamp: String,
-    changed_paths: Vec<PathBuf>,
+pub(crate) struct WorkerExecutionJournalEntry {
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) start_timestamp: String,
+    pub(crate) end_timestamp: String,
+    pub(crate) changed_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
