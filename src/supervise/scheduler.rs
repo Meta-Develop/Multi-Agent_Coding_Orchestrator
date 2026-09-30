@@ -18,8 +18,10 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::observe_selected_account;
 
 mod preclaim;
+#[cfg(test)]
+use preclaim::evaluate_preclaim_viability;
 use preclaim::{
-    evaluate_preclaim_viability, parked_preclaim_outcome, persist_preclaim_decision,
+    evaluate_preclaim_with_metadata, parked_preclaim_outcome, persist_preclaim_decision,
     preclaim_assignment, PreclaimDecision, PreclaimRunEvidence,
 };
 
@@ -1706,22 +1708,25 @@ fn scheduler_preclaim_evidence(
             context.worktree_creation,
         ),
     )
+    .with_assignment_metadata(context.assignment_metadata)
 }
 
 pub(super) fn recheck_narrowed_assignment_preclaim(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     assignment: &OrchestratorAssignment,
     requested_assignments: &[OrchestratorAssignment],
-    repo: &Path,
+    repo_and_metadata: (&Path, &AssignmentMetadata),
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
 ) -> Result<Option<AssignmentExecutionOutcome>> {
+    let (repo, assignment_metadata) = repo_and_metadata;
     let evidence = PreclaimRunEvidence::acquire(
         repo,
         runtime,
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation),
-    );
+    )
+    .with_assignment_metadata(assignment_metadata);
     let decision = preclaim_assignment(artifacts, assignment, requested_assignments, &evidence)?;
     if decision.allows_path_claim() {
         Ok(None)
@@ -2078,6 +2083,7 @@ fn run_concurrent_assignment_schedule(
                     let concurrency = progress.concurrency.clone();
                     let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
                     let prior_binding = super::prior_input::captured_binding();
+                    let runtime_binding = super::runtime_executables::captured_binding();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
                         #[cfg(test)]
                         let _test_completion = BudgetAdmissionTestCompletion {
@@ -2087,6 +2093,8 @@ fn run_concurrent_assignment_schedule(
                         };
                         let _prior_binding_guard =
                             super::prior_input::install_captured(prior_binding);
+                        let _runtime_binding_guard =
+                            super::runtime_executables::install_captured(runtime_binding);
                         let _completion = CompletionSignal {
                             index,
                             sender: completion_sender,
@@ -3527,6 +3535,7 @@ fn evaluate_supervisor_preclaims(
     plan: &SupervisorPlan,
     requested_plan: &SupervisorPlan,
     repo: &Path,
+    assignment_metadata: &AssignmentMetadata,
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> Vec<PreclaimDecision> {
@@ -3535,13 +3544,14 @@ fn evaluate_supervisor_preclaims(
         .iter()
         .map(|assignment| {
             let risk = evidence.risk_for(&assignment.assigned_paths);
-            evaluate_preclaim_viability(
+            evaluate_preclaim_with_metadata(
                 assignment,
                 &requested_plan.assignments,
                 evidence.repo_map.as_ref(),
                 risk.as_ref(),
                 evidence.runtime,
                 execution_runtime,
+                assignment_metadata,
             )
         })
         .collect()
@@ -3780,6 +3790,7 @@ fn prepare_supervisor_run(
     }
     let repo = discover_repo_root(&options.repo)?;
     super::prior_input::require_binding_repo(&repo)?;
+    super::runtime_executables::require_binding_repo_run(&repo, &options.run_id)?;
     let requested_plan = plan.clone();
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
@@ -3833,8 +3844,14 @@ fn prepare_supervisor_run(
     // later preparation failure still leaves durable gate evidence.
     let preclaim_runtime =
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
-    let preclaim_decisions =
-        evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
+    let preclaim_decisions = evaluate_supervisor_preclaims(
+        &plan,
+        &requested_plan,
+        &repo,
+        &assignment_metadata,
+        runtime,
+        preclaim_runtime,
+    );
     persist_prepared_preclaim_decisions(
         &repo,
         &options.run_id,
@@ -3844,6 +3861,7 @@ fn prepare_supervisor_run(
         &preclaim_decisions,
     )?;
     super::prior_input::archive_current(&mut artifact_writer, &repo)?;
+    super::runtime_executables::archive_current(&mut artifact_writer, &repo, &options.run_id)?;
     let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,

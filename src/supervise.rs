@@ -299,8 +299,13 @@ pub use accepted_task_cost::AcceptedTaskCostRollup;
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
+mod runtime_executables;
 use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
+pub(crate) use runtime_executables::{
+    bind_new as bind_explicit_runtime_executables,
+    bind_resume as bind_frozen_runtime_executables_for_run,
+};
 
 mod messaging_bridge;
 
@@ -333,6 +338,7 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+pub(crate) use reporting::append_precreated_worker_execution_journal;
 use reporting::*;
 
 #[cfg(test)]
@@ -1873,6 +1879,8 @@ struct AssignmentMetadata {
     parent_validation: Option<held_out::ParentValidationAuthority>,
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    source_inputs:
+        BTreeMap<String, Vec<crate::external_agent::researcher_inputs::ResearcherSourceInput>>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -1921,6 +1929,7 @@ impl AssignmentMetadata {
 
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
+        self.source_inputs.retain(|owner, _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.direct_mechanical_duties
@@ -1934,6 +1943,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             workers,
             parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
+            source_inputs: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }
@@ -4117,12 +4127,12 @@ enum WorkerExecutionJournalStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerExecutionJournalEntry {
-    command: Vec<String>,
-    cwd: PathBuf,
-    start_timestamp: String,
-    end_timestamp: String,
-    changed_paths: Vec<PathBuf>,
+pub(crate) struct WorkerExecutionJournalEntry {
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) start_timestamp: String,
+    pub(crate) end_timestamp: String,
+    pub(crate) changed_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

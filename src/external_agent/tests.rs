@@ -504,35 +504,41 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     .with_workspace_access(WorkspaceAccess::ReadOnly)
     .with_agent_lifecycle("/registry", "researcher", "research-run", "research-task");
     let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified);
     assert_eq!(selected, cfg!(target_os = "linux"));
     assert!(!should_use_duplex_review(
         &spec,
         ExternalExecutionRuntime::Verified,
         true
     ));
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &spec,
         ExternalExecutionRuntime::NonpublishableSimulation
     ));
-    for role in ["worker", "auditor", "child_orchestrator", "Researcher"] {
+    let mut auditor = spec.clone();
+    auditor.agent_lifecycle.as_mut().unwrap().role = "auditor".to_string();
+    assert_eq!(
+        should_use_read_only_terminal_app_server(&auditor, ExternalExecutionRuntime::Verified),
+        cfg!(target_os = "linux")
+    );
+    for role in ["worker", "child_orchestrator", "Researcher", "Auditor"] {
         let mut other = spec.clone();
         other.agent_lifecycle.as_mut().unwrap().role = role.to_string();
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
     }
     let mut other = spec.clone();
     other.agent_lifecycle = None;
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
     other = spec
         .clone()
         .with_workspace_access(WorkspaceAccess::ReadWrite);
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
@@ -542,7 +548,7 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     ] {
         other = spec.clone();
         other.invocation = invocation;
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
@@ -597,36 +603,38 @@ fn read_only_researcher_app_server_refuses_custom_version_claim_before_launch() 
         ),
     )?;
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
-    let spec = ExternalAgentCommand::codex(
-        &shim,
-        temp.path(),
-        temp.path().join("prompt.md"),
-        temp.path().join("events.jsonl"),
-        temp.path().join("report.json"),
-        Duration::from_secs(5),
-    )
-    .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(temp.path(), "researcher", "custom-run", "custom-task");
-    assert!(should_use_read_only_researcher_app_server(
-        &spec,
-        ExternalExecutionRuntime::Verified
-    ));
-    assert_eq!(
-        external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
-        ExternalProgramTrust::ExplicitCustom
-    );
-    let report = run_external_agent(&spec);
-    assert!(
-        report.error.as_deref().is_some_and(
-            |error| error.contains("requires a verified TrustedSystemCodex executable")
-        ),
-        "{report:?}"
-    );
-    assert!(report.environment_blocked());
-    assert!(!report.stdout.target_launch_attempted);
-    assert!(!marker.exists());
-    assert!(report.codex_command_execution_evidence().is_none());
-    assert!(!report.publishable);
+    for role in ["researcher", "auditor"] {
+        let spec = ExternalAgentCommand::codex(
+            &shim,
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("events.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(5),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_agent_lifecycle(temp.path(), role, "custom-run", "custom-task");
+        assert!(should_use_read_only_terminal_app_server(
+            &spec,
+            ExternalExecutionRuntime::Verified
+        ));
+        assert_eq!(
+            external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
+            ExternalProgramTrust::ExplicitCustom
+        );
+        let report = run_external_agent(&spec);
+        assert!(
+            report.error.as_deref().is_some_and(
+                |error| error.contains("requires a verified TrustedSystemCodex executable")
+            ),
+            "{report:?}"
+        );
+        assert!(report.environment_blocked());
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(!marker.exists());
+        assert!(report.codex_command_execution_evidence().is_none());
+        assert!(!report.publishable);
+    }
     Ok(())
 }
 
@@ -659,15 +667,15 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
         messages_received: 1,
         bytes_received: 1,
     };
-    assert!(validate_read_only_researcher_app_server_outcome(&outcome, false).is_ok());
+    assert!(validate_read_only_terminal_app_server_outcome(&outcome, false).is_ok());
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, true)
+        validate_read_only_terminal_app_server_outcome(&outcome, true)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
     // No fileChange item and no gate-denial payload are needed to keep a permission refusal.
     outcome.refused_ceiling_expansions = 1;
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, false)
+        validate_read_only_terminal_app_server_outcome(&outcome, false)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
 }
@@ -676,8 +684,18 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
 fn contained_read_only_researcher_app_server(
     mode: &str,
 ) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
-    use std::os::unix::fs::PermissionsExt;
+    contained_read_only_terminal_app_server(mode, "researcher", None)
+}
 
+#[cfg(target_os = "linux")]
+fn contained_read_only_terminal_app_server(
+    mode: &str,
+    role: &str,
+    grant: Option<crate::supervise_budget::LiveTokenGrant>,
+) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let worker = role == "worker";
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
@@ -703,8 +721,12 @@ import json, pathlib, sys
 mode, workspace, argv = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3:]
 assert argv[:3] == ["app-server", "--stdio", "--strict-config"]
 permissions = next(x for x in argv if x.startswith("permissions.maco_external_codex.filesystem="))
-assert '\":workspace_roots\"={\".\"=\"read\"}' in permissions
-assert '\":workspace_roots\"={\".\"=\"write\"}' not in permissions
+worker = mode.startswith("worker-")
+assert ('\":workspace_roots\"={\".\"=\"write\"}' if worker else '\":workspace_roots\"={\".\"=\"read\"}') in permissions
+if not worker:
+    assert '\":workspace_roots\"={\".\"=\"write\"}' not in permissions
+for feature in ("multi_agent", "goals"):
+    assert any(argv[i:i+2] == ["--disable", feature] for i in range(len(argv)-1))
 assert 'permissions.maco_external_codex.network={enabled=false}' in argv
 def receive():
     line = sys.stdin.readline()
@@ -722,19 +744,22 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
-    "model":"gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else "xhigh",
+    "model":"gpt-5.6-astra" if mode == "model-mismatch" else "gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else ("high" if mode == "low-effort" else "xhigh"),
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
 turn = receive()
 assert turn["method"] == "turn/start"
+if worker:
+    assert start["params"]["dynamicTools"] == []
+    assert "journal-append" in turn["params"]["input"][0]["text"]
 send({"id":turn["id"], "result":{"turn":{"id":"research-turn", "status":"inProgress"}}})
 send({"method":"turn/started", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"inProgress"}}})
 def item_event(method, item):
     send({"method":method, "params":{"threadId":"research-thread", "turnId":"research-turn", "item":item}})
 item = {"id":"read-command", "type":"commandExecution", "command":"cat README.md",
         "cwd":str(workspace), "status":"inProgress", "exitCode":None}
-if mode in ("file-approval", "write"):
+if mode in ("file-approval", "write") or worker:
     item = {"id":"write-item", "type":"fileChange", "status":"inProgress"}
 item_event("item/started", item)
 if mode.endswith("approval"):
@@ -752,7 +777,10 @@ if mode.endswith("approval"):
     else:
         assert response["result"]["decision"] == "cancel"
         sys.exit(0)
-if mode == "write":
+if worker:
+    (workspace / "README.md").write_text("permitted native Worker edit\n")
+    item["status"] = "completed"
+elif mode == "write":
     try:
         (workspace / "README.md").write_text("unauthorized write")
     except OSError:
@@ -768,6 +796,12 @@ usage = {"inputTokens":35000, "outputTokens":2000, "cachedInputTokens":30000,
          "reasoningOutputTokens":1000, "totalTokens":37000}
 send({"method":"thread/tokenUsage/updated", "params":{"threadId":"research-thread",
       "turnId":"research-turn", "tokenUsage":{"last":usage, "total":usage, "modelContextWindow":None}}})
+if mode in ("budget", "worker-budget"):
+    interrupt = receive()
+    assert interrupt["method"] == "turn/interrupt"
+    assert interrupt["params"]["threadId"] == "research-thread"
+    send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"interrupted"}}})
+    sys.exit(0)
 if mode == "partial":
     send({"method":"unexpected/protocol/error", "params":{}})
     sys.exit(0)
@@ -776,7 +810,7 @@ item_event("item/completed", {"id":"answer", "type":"agentMessage", "text":'{"su
 send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"completed"}}})
 "#,
     )?;
-    let spec = ExternalAgentCommand::codex(
+    let mut spec = ExternalAgentCommand::codex(
         &python,
         &workspace,
         workspace.join("prompt.md"),
@@ -785,9 +819,49 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
         Duration::from_secs(15),
     )
     .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(&workspace, "researcher", "research-run", "research-task");
-    let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+    .with_agent_lifecycle(&workspace, role, "research-run", "research-task")
+    .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("xhigh".to_string()));
+    if worker {
+        let journal = incoming.join("worker-journals/research-task.jsonl");
+        fs::create_dir(incoming.join("worker-journals"))?;
+        fs::set_permissions(
+            incoming.join("worker-journals"),
+            fs::Permissions::from_mode(0o700),
+        )?;
+        for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+            let path = incoming.join("worker-journals").join(name);
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&journal)?;
+        // Only the intent carrier is Codex. The lower-level transport fixture
+        // remains Python/Custom and cannot pass production executable trust.
+        let authority = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "research-run",
+            "research-task",
+            1,
+            Path::new("codex"),
+            Some("gpt-5.6-sol"),
+            "worker-duty",
+        )?;
+        spec = spec
+            .with_workspace_access(WorkspaceAccess::ReadWrite)
+            .with_codex_native_delegation_disabled()
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, authority)
+            .with_worker_journal_artifact("research-task", &incoming, &journal);
+    }
+    spec.bind_live_token_grant(grant);
+    let selected = if worker {
+        classify_managed_worker_app_server(&spec, ExternalExecutionRuntime::Verified)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified)
+    };
     assert!(selected);
     assert!(!should_use_duplex_review(
         &spec,
@@ -799,7 +873,36 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
     staging.stage_codex_home()?;
     let mut controls = protected_worktree_controls(&spec)?;
     controls.writable_artifact_root = Some(staging.root_path().to_path_buf());
-    let argv = codex_app_server_argv(&spec, &controls);
+    let mut argv =
+        audited_codex_app_server_argv(&spec, &controls, EnvironmentVersion::new(0, 144, 4))?;
+    let mut effective_prompt = b"read the fixture".to_vec();
+    let mut worker_profile = if worker {
+        Some(external_side_effect_profile(
+            &spec,
+            &python,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?)
+    } else {
+        None
+    };
+    // The protocol fixture is synthetic; it does not qualify Python as Codex.
+    let helper = if worker {
+        bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut effective_prompt,
+            &mut worker_profile,
+            &mut argv,
+        )?
+    } else {
+        None
+    };
+    if let Some(helper) = &helper {
+        helper.revalidate()?;
+    }
     let digest = argv_digest(&argv)?;
     let identity = external_program_identity(&python)?;
     let args = [
@@ -823,16 +926,27 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
     .with_stdin(external_agent_stdin_mode(&spec, selected, Vec::new()))
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(spec.timeout))
-    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-        StrictOfflineWorkspaceProfile::read_only(&workspace)
-            .with_visible_read_only_root(python.parent().context("python parent")?),
-    ));
-    let interactive = run_read_only_researcher_app_server_process(
-        process_spec,
-        &ProcessCancellation::new(),
-        &spec,
-        "read the fixture".to_string(),
-    )?;
+    .with_side_effect_confinement(worker_profile.unwrap_or_else(|| {
+        SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_only(&workspace)
+                .with_visible_read_only_root(python.parent().expect("canonical python parent")),
+        )
+    }));
+    let interactive = if worker {
+        run_managed_worker_app_server_process(
+            process_spec,
+            &ProcessCancellation::new(),
+            &spec,
+            String::from_utf8(effective_prompt)?,
+        )?
+    } else {
+        run_read_only_terminal_app_server_process(
+            process_spec,
+            &ProcessCancellation::new(),
+            &spec,
+            String::from_utf8(effective_prompt)?,
+        )?
+    };
     assert!(
         interactive.process.safety_evidence_verified(),
         "{interactive:?}"
@@ -3737,6 +3851,79 @@ fn exact_read_only_inputs_are_files_in_both_layers_without_parent_visibility() -
 
 #[cfg(unix)]
 #[test]
+fn immutable_researcher_input_omits_only_redundant_inner_workspace_file_rule() -> Result<()> {
+    let (root, mut command) = researcher_inputs::tests::fixture()?;
+    git2::Repository::init(&command.cwd)?;
+    create_mandatory_control_roots(&command.cwd)?;
+    let incoming = root.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    command.output_last_message = incoming.join("report.json");
+    let nested = command.cwd.join("src/runtime_adapter/source.rs");
+    fs::create_dir_all(nested.parent().unwrap())?;
+    fs::write(&nested, b"immutable source\n")?;
+    let schema = root.path().join("schema.json");
+    fs::write(&schema, b"{}\n")?;
+    command.read_only_input_files = vec![nested.clone(), schema.clone()];
+    command.researcher_source_inputs = vec![researcher_inputs::ResearcherSourceInput {
+        path: "src/runtime_adapter/source.rs".into(),
+        sha256: sha256_hex(b"immutable source\n"),
+    }];
+    researcher_inputs::validate_command(&command)?;
+    let controls = protected_worktree_controls(&command)?;
+    let rendered = codex_filesystem_permissions(&command, &controls);
+    let rule = |path: &Path| format!("{}=\"read\"", toml_basic_string(path.to_str().unwrap()));
+    assert!(rendered.contains("\":workspace_roots\"={\".\"=\"read\"}"));
+    assert!(!rendered.contains(&rule(&nested)));
+    assert!(rendered.contains(&rule(&schema)));
+    assert!(
+        !rendered.contains(&rule(root.path())),
+        "no new ancestor grant"
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        Path::new("/usr/bin/cat"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(
+        profile.visible_read_only_files().contains(&nested),
+        "outer exact-file binding remains"
+    );
+
+    for variant in [
+        "undeclared",
+        "writable",
+        "other-role",
+        "malformed-hash",
+        "mismatched-hash",
+    ] {
+        let mut changed = command.clone();
+        match variant {
+            "undeclared" => changed.researcher_source_inputs.clear(),
+            "writable" => changed.workspace_access = WorkspaceAccess::ReadWrite,
+            "other-role" => changed.agent_lifecycle.as_mut().unwrap().role = "auditor".into(),
+            "malformed-hash" => changed.researcher_source_inputs[0].sha256 = "invalid".into(),
+            "mismatched-hash" => changed.researcher_source_inputs[0].sha256 = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            codex_filesystem_permissions(&changed, &controls).contains(&rule(&nested)),
+            "{variant}"
+        );
+    }
+    let mut hidden = command.clone();
+    hidden
+        .hidden_roots
+        .push(nested.parent().unwrap().to_path_buf());
+    assert!(protected_worktree_controls(&hidden).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, _common, _child_git_dir) =
@@ -5073,6 +5260,10 @@ done
             })
         );
         assert!(evidence.model_mismatch);
+        // Successful fixture transport is not qualified provider acceptance.
+        assert!(report.error.is_none());
+        assert!(!report.publishable);
+        assert!(!report.succeeded());
         Ok(())
     }
 
@@ -5900,6 +6091,99 @@ fn orchestration_lifecycle_roles_enable_multi_agent_goals_without_ephemeral() {
             "{role}"
         );
     }
+}
+
+#[test]
+fn opted_in_child_orchestrator_disables_native_delegation_and_keeps_role() {
+    let baseline = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle("/registry", "child_orchestrator", "run", "task");
+    let opted_in = baseline.clone().with_codex_native_delegation_disabled();
+    assert_eq!(
+        baseline
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+    assert_eq!(
+        opted_in
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+
+    let argv = |command: &ExternalAgentCommand| {
+        command_argv(command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let legacy = argv(&baseline);
+    let actual = argv(&opted_in);
+
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        0
+    );
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "goals"]));
+
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        1
+    );
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "goals"]));
 }
 
 #[test]
@@ -9073,6 +9357,26 @@ fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()
         SideEffectConfinementProfileKind::ExternalCodex
     );
     Ok(())
+}
+
+#[test]
+fn codex_usage_parser_rejects_component_and_combined_total_overflow() {
+    let max = usize::MAX;
+    for (first, second, reason) in [
+        ((max - 1, 1), (max - 1, 1), "input"),
+        ((1, max - 1), (1, max - 1), "output"),
+        ((max - 1, 0), (0, 2), "total"),
+        ((max, 1), (0, 0), "total"),
+    ] {
+        let stream = [first, second].into_iter().map(|(input, output)| {
+            format!(r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0,"reasoning_output_tokens":0}}}}"#)
+        }).collect::<Vec<_>>().join("\n");
+        let error =
+            codex_usage_from_jsonl(stream.as_bytes()).expect_err("overflow must fail closed");
+        assert!(error
+            .to_string()
+            .contains(&format!("aggregate {reason} token count overflowed")));
+    }
 }
 
 #[test]
@@ -12498,4 +12802,759 @@ fn live_token_grant_rejects_tampered_launch_identity() {
     );
     command.model = Some("tampered-model".to_string());
     assert!(command.verified_live_token_grant().is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_retains_private_identity_usage_and_refuses_bad_outcomes() -> Result<()>
+{
+    skip_without_containment!(ok);
+    for mode in [
+        "read",
+        "unknown-effort",
+        "low-effort",
+        "model-mismatch",
+        "truncated-capture",
+        "permission-approval",
+        "write",
+    ] {
+        let (run, workspace, _temp) =
+            contained_read_only_terminal_app_server(mode, "auditor", None)?;
+        assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md"))?,
+            "read-only fixture\n"
+        );
+        let held = run
+            .authenticated_app_server_evidence()
+            .context("private Auditor evidence")?;
+        if mode == "read" {
+            assert!(run.error.is_none(), "{run:?}");
+            assert_eq!(held.resolution_status, "complete");
+            assert_eq!(held.observed_model.known(), Some("gpt-5.6-sol"));
+            assert_eq!(held.observed_effort.known(), Some("xhigh"));
+            assert_eq!(
+                run.authenticated_codex_usage().unwrap().total_tokens,
+                37_000
+            );
+            assert!(matches!(
+                held.rollout_model,
+                CodexParentResolvedField::Unknown
+            ));
+            assert_eq!(
+                run.output_last_message(),
+                Some(b"{\"summary\":\"read-only fixture\"}".as_slice())
+            );
+        } else {
+            assert!(run.error.is_some(), "{mode}: {run:?}");
+            if mode == "low-effort" {
+                assert_eq!(held.observed_effort.known(), Some("high"));
+                assert!(!run.codex_auditor_effort_qualified());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+            if mode == "model-mismatch" {
+                assert!(held.model_mismatch);
+            }
+            if mode == "unknown-effort" {
+                assert!(held.observed_effort.known().is_none());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+        }
+        assert!(
+            !run.publishable,
+            "local transport cannot confer provider trust"
+        );
+        let decoded: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+        assert!(decoded.authenticated_app_server_evidence().is_none());
+        assert!(decoded.authenticated_codex_usage().is_none());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_interrupts_live_grant_and_retains_partial_usage() -> Result<()> {
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    skip_without_containment!(ok);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: Some(36_000),
+        ..Default::default()
+    })?;
+    let BudgetAdmission::Admitted { reservation, .. } =
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 16_384,
+            cost_usd: None,
+        })?
+    else {
+        panic!("admission");
+    };
+    let grant = ledger.live_token_grant(reservation.id)?.unwrap();
+    assert_eq!(grant.tokens(), 36_000);
+    let (run, _, _temp) =
+        contained_read_only_terminal_app_server("budget", "auditor", Some(grant.clone()))?;
+    assert!(grant.stopped());
+    assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+    assert!(!run.publishable);
+    assert!(
+        run.error.as_deref().is_some_and(
+            |error| error.contains("token grant exhausted: observed 37000 >= grant 36000")
+        ),
+        "{run:?}"
+    );
+    assert!(run.output_last_message().is_none_or(<[u8]>::is_empty));
+    assert!(matches!(
+        run.authenticated_app_server_evidence().unwrap().turn_usage,
+        CodexParentTurnUsage::Known {
+            input_tokens: 35_000,
+            output_tokens: 2_000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 1,
+            cost_usd: None,
+        })?,
+        BudgetAdmission::Refused { .. }
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod managed_worker_live_budget {
+    use super::*;
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    use std::collections::VecDeque;
+
+    // Byte transport only: every protocol and budget decision uses the production driver.
+    struct Transport {
+        incoming: VecDeque<Vec<u8>>,
+        sent: Vec<serde_json::Value>,
+        cancel_on_eof: Option<ProcessCancellation>,
+    }
+
+    impl Transport {
+        fn new(messages: Vec<serde_json::Value>) -> Self {
+            Self {
+                incoming: messages
+                    .into_iter()
+                    .map(|v| v.to_string().into_bytes())
+                    .collect(),
+                sent: Vec::new(),
+                cancel_on_eof: None,
+            }
+        }
+    }
+
+    impl codex_app_server::JsonLineTransport for Transport {
+        fn receive(
+            &mut self,
+            _: Duration,
+            max: usize,
+            bytes: &mut Vec<u8>,
+        ) -> Result<codex_app_server::TransportRead, String> {
+            bytes.clear();
+            match self.incoming.pop_front() {
+                Some(line) if line.len() <= max => {
+                    bytes.extend(line);
+                    Ok(codex_app_server::TransportRead::Line)
+                }
+                Some(_) => Err("bounded test line exceeded".to_string()),
+                None => {
+                    if let Some(cancellation) = self.cancel_on_eof.take() {
+                        cancellation.cancel();
+                        Ok(codex_app_server::TransportRead::Timeout)
+                    } else {
+                        Ok(codex_app_server::TransportRead::Eof)
+                    }
+                }
+            }
+        }
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            self.sent
+                .push(serde_json::from_slice(line).map_err(|error| error.to_string())?);
+            Ok(())
+        }
+    }
+
+    fn command() -> ExternalAgentCommand {
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "worker-run",
+            "worker",
+            1,
+            Path::new("codex"),
+            Some("gpt-5.6-sol"),
+            "worker-duty",
+        )
+        .unwrap();
+        ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/private/prompt",
+            "/private/events",
+            "/private/report",
+            Duration::from_secs(3),
+        )
+        .with_agent_lifecycle("/registry", "worker", "worker-run", "worker")
+        .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("high".to_string()))
+        .with_codex_native_delegation_disabled()
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+        .with_worker_journal_artifact(
+            "worker",
+            "/private",
+            "/private/worker-journals/worker.jsonl",
+        )
+    }
+
+    fn turn() -> codex_app_server::AppServerTurn {
+        codex_app_server::AppServerTurn {
+            cwd: "/workspace".into(),
+            permission_profile: "maco_external_codex".into(),
+            prompt: "effective Worker prompt including the bound helper appendix".into(),
+            model: Some("gpt-5.6-sol".into()),
+            minimum_effort: None,
+            output_schema: None,
+        }
+    }
+
+    fn prefix() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"id":1,"result":{}}),
+            serde_json::json!({"id":2,"result":{"thread":{"id":"worker-thread"},"model":"gpt-5.6-sol","reasoningEffort":"high","approvalPolicy":"on-request","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":"/workspace"}}),
+            serde_json::json!({"id":3,"result":{"turn":{"id":"worker-turn","status":"inProgress"}}}),
+            serde_json::json!({"method":"turn/started","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"inProgress"}}}),
+        ]
+    }
+
+    fn usage(input: u64, output: u64) -> serde_json::Value {
+        let counters = serde_json::json!({"inputTokens":input,"outputTokens":output,"cachedInputTokens":input / 2,"reasoningOutputTokens":output / 2,"totalTokens":input + output});
+        serde_json::json!({"method":"thread/tokenUsage/updated","params":{"threadId":"worker-thread","turnId":"worker-turn","tokenUsage":{"last":counters,"total":counters,"modelContextWindow":null}}})
+    }
+
+    fn observed_tokens(outcome: &codex_app_server::AppServerOutcome) -> Option<u64> {
+        outcome
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.input_tokens.checked_add(usage.output_tokens).unwrap())
+    }
+
+    fn terminal() -> serde_json::Value {
+        serde_json::json!({"method":"turn/completed","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"completed"}}})
+    }
+
+    fn complete_messages() -> Vec<serde_json::Value> {
+        let mut messages = prefix();
+        for (method, status) in [
+            ("item/started", "inProgress"),
+            ("item/completed", "completed"),
+        ] {
+            messages.push(serde_json::json!({"method":method,"params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"edit","type":"fileChange","status":status}}}));
+        }
+        messages.push(usage(35_000, 2_000));
+        messages.push(serde_json::json!({"method":"item/started","params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"report","type":"agentMessage"}}}));
+        messages.push(serde_json::json!({"method":"item/completed","params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"report","type":"agentMessage","text":"{\"summary\":\"native edit\"}"}}}));
+        messages.push(terminal());
+        messages
+    }
+
+    fn reserve(ledger: &RunBudgetLedger) -> crate::supervise_budget::BudgetReservation {
+        let BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(BudgetReservationRequest {
+                role: crate::supervise::AgentRole::Worker,
+                tokens: 16_384,
+                cost_usd: None,
+            })
+            .unwrap()
+        else {
+            panic!("Worker reservation")
+        };
+        reservation
+    }
+
+    #[test]
+    fn worker_selection_requires_private_authority_and_preserves_other_routes() {
+        let spec = command();
+        assert_eq!(
+            classify_managed_worker_app_server(&spec, ExternalExecutionRuntime::Verified),
+            Ok(true)
+        );
+        assert!(spec.uses_live_app_server_budget());
+        assert!(!should_use_duplex_review(
+            &spec,
+            ExternalExecutionRuntime::Verified,
+            true
+        ));
+        for shape in [
+            "readonly",
+            "primary",
+            "researcher",
+            "auditor",
+            "parent",
+            "other-runtime",
+        ] {
+            let mut other = spec.clone();
+            match shape {
+                "readonly" => other.workspace_access = WorkspaceAccess::ReadOnly,
+                "primary" => other.writable_launch_target = WritableLaunchTarget::PrimaryWorktree,
+                "other-runtime" => other.invocation = ExternalAgentInvocation::Grok,
+                role => other.agent_lifecycle.as_mut().unwrap().role = role.to_string(),
+            }
+            assert_eq!(
+                classify_managed_worker_app_server(&other, ExternalExecutionRuntime::Verified),
+                Ok(false),
+                "{shape}"
+            );
+        }
+        assert!(!classify_managed_worker_app_server(
+            &spec,
+            ExternalExecutionRuntime::NonpublishableSimulation
+        )
+        .unwrap());
+        assert!(
+            validate_universal_pre_action_coverage(WritableLaunchTarget::PrimaryWorktree).is_err()
+        );
+        for mutation in [
+            "native", "grant", "kind", "journal", "subject", "attempt", "dynamic",
+        ] {
+            let mut changed = spec.clone();
+            match mutation {
+                "native" => changed.codex_native_delegation_disabled = false,
+                "grant" => changed.assignment_process_launch_grant = None,
+                "kind" => changed.assignment_process_launch_kind = None,
+                "journal" => changed.worker_journal_artifacts.clear(),
+                "subject" => changed.worker_journal_artifacts[0].worker_id = "impostor".into(),
+                "attempt" => changed.assignment_process_launch_attempt = Some(2),
+                "dynamic" => {
+                    changed.codex_managed_readonly_route =
+                        CodexManagedReadonlyRoute::InitialWorkerRequests
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                classify_managed_worker_app_server(&changed, ExternalExecutionRuntime::Verified)
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let custom = temp.path().join("custom-codex");
+        fs::write(&custom, "#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&custom, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut custom_spec = spec;
+        custom_spec.program = custom;
+        let run = run_external_agent_runtime(
+            &custom_spec,
+            ExternalExecutionRuntime::Verified,
+            &ProcessCancellation::new(),
+            None,
+        );
+        assert!(!run.stdout.target_launch_attempted);
+        assert!(run
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("requires a verified TrustedSystemCodex executable"));
+    }
+
+    #[test]
+    fn worker_final_argv_prompt_digest_and_helper_survive_audited_preparation() -> Result<()> {
+        let (_temp, spec, controls) = worker_journal_append_binding_tests::fixture();
+        let spec = spec.with_codex_native_delegation_disabled();
+        assert!(audited_codex_app_server_argv(
+            &spec,
+            &controls,
+            EnvironmentVersion::new(0, 144, 3)
+        )
+        .is_err());
+        let mut argv =
+            audited_codex_app_server_argv(&spec, &controls, EnvironmentVersion::new(0, 144, 4))?;
+        let mut prompt = b"original effective prompt".to_vec();
+        let original_profile = external_side_effect_profile(
+            &spec,
+            Path::new("/nix/store/qwpfszqp550yvlwa6sdjwgh4qw3nhdk9-0.144.4-x86_64-unknown-linux-musl/bin/codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let mut profile = Some(original_profile.clone());
+        let unbound_digest = argv_digest(&argv)?;
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        )?
+        .context("actual Worker helper binding")?;
+        binding.revalidate()?;
+        for feature in ["multi_agent", "goals"] {
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair[0] == "--disable" && pair[1] == feature));
+            assert!(!argv
+                .windows(2)
+                .any(|pair| pair[0] == "--enable" && pair[1] == feature));
+        }
+        let permissions = argv
+            .iter()
+            .find(|arg| {
+                arg.to_string_lossy()
+                    .starts_with("permissions.maco_external_codex.filesystem=")
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(permissions.contains(&toml_basic_string(&binding.helper_path.to_string_lossy())));
+        assert!(permissions.contains(":workspace_roots\"={\".\"=\"write\"}"));
+        let journal = &controls.exact_writable_artifact_files[0];
+        let carrier = journal.path.parent().context("held journal carrier")?;
+        // Linux Codex grants the carrier, not a regular-file write root. The
+        // production outer profile keeps that directory read-only and mounts
+        // only the descriptor-held journal read-write.
+        assert!(permissions.contains(&format!(
+            "{}=\"write\"",
+            toml_basic_string(&carrier.to_string_lossy())
+        )));
+        assert_ne!(unbound_digest, argv_digest(&argv)?);
+        let effective_prompt = String::from_utf8(prompt)?;
+        assert!(effective_prompt.starts_with("original effective prompt"));
+        assert!(effective_prompt.contains(&serde_json::to_string(&binding.command_prefix()?)?));
+        assert!(effective_prompt.contains(&binding.helper_sha256));
+        let Some(SideEffectConfinementProfile::ExternalCodex(actual)) = profile else {
+            panic!("qualified outer profile")
+        };
+        let SideEffectConfinementProfile::ExternalCodex(original) = original_profile else {
+            panic!("original production profile")
+        };
+        assert!(actual
+            .visible_read_only_roots()
+            .contains(&carrier.to_path_buf()));
+        assert!(!actual
+            .visible_read_write_roots()
+            .contains(&carrier.to_path_buf()));
+        assert_eq!(
+            actual.visible_read_write_files(),
+            std::slice::from_ref(&journal.path)
+        );
+        assert_eq!(
+            actual,
+            original.with_visible_read_only_file(&binding.helper_path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_live_grant_rejects_changed_inputs_stopped_and_released_reservations() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let held = reserve(&ledger);
+        let mut spec = command();
+        spec.timeout = Duration::from_secs(1);
+        spec.bind_live_token_grant(ledger.live_token_grant(held.id).unwrap());
+        assert_eq!(
+            spec.verified_live_token_grant().unwrap().unwrap().tokens(),
+            220_000
+        );
+        for mutation in [
+            "timeout", "model", "native", "journal", "schema", "hidden", "attempt", "prompt",
+        ] {
+            let mut changed = spec.clone();
+            match mutation {
+                "timeout" => changed.timeout += Duration::from_secs(1),
+                "model" => changed.model = Some("changed".into()),
+                "native" => changed.codex_native_delegation_disabled = false,
+                "journal" => changed.worker_journal_artifacts[0].path = "/other".into(),
+                "schema" => changed.output_schema = Some("/other".into()),
+                "hidden" => changed.hidden_roots.push("/other".into()),
+                "attempt" => changed.assignment_process_launch_attempt = Some(2),
+                "prompt" => changed.prompt = "/other".into(),
+                _ => unreachable!(),
+            }
+            assert!(changed.verified_live_token_grant().is_err(), "{mutation}");
+        }
+        spec.verified_live_token_grant().unwrap().unwrap().exhaust();
+        assert!(spec.verified_live_token_grant().is_err());
+        ledger.release(held.id).unwrap();
+        assert!(spec.verified_live_token_grant().is_err());
+        assert_eq!(ledger.report().unwrap().consumed.tokens, 0);
+        let released_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let released = reserve(&released_ledger);
+        let mut released_spec = command();
+        released_spec.bind_live_token_grant(released_ledger.live_token_grant(released.id).unwrap());
+        released_ledger.release(released.id).unwrap();
+        assert!(released_spec.verified_live_token_grant().is_err());
+        let run = run_external_agent_runtime(
+            &released_spec,
+            ExternalExecutionRuntime::Verified,
+            &ProcessCancellation::new(),
+            None,
+        );
+        assert!(!run.stdout.target_launch_attempted);
+        assert!(run.authenticated_codex_usage().is_none());
+    }
+
+    #[test]
+    fn worker_handler_accepts_native_edit_without_hosted_review_or_dynamic_tools() {
+        let mut transport = Transport::new(complete_messages());
+        let outcome = run_managed_worker_app_server_turn(
+            &mut transport,
+            &turn(),
+            &command(),
+            &ProcessCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.status,
+            codex_app_server::TurnTerminalStatus::Completed
+        );
+        assert!(outcome
+            .item_outcomes
+            .iter()
+            .any(|item| item.item_type == "fileChange"));
+        assert_eq!(observed_tokens(&outcome).unwrap(), 37_000);
+        assert_eq!(
+            outcome.token_usage.as_ref().unwrap().cached_input_tokens,
+            17_500
+        );
+        assert_eq!(
+            outcome
+                .token_usage
+                .as_ref()
+                .unwrap()
+                .reasoning_output_tokens,
+            1_000
+        );
+        assert!(outcome.final_message.is_some());
+        assert!(outcome.auto_reviews.is_empty());
+        assert!(
+            outcome.duplex_fallback_required,
+            "native Worker completion does not manufacture All review coverage"
+        );
+        let start = transport
+            .sent
+            .iter()
+            .find(|v| v["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["dynamicTools"], serde_json::json!([]));
+        let sent_turn = transport
+            .sent
+            .iter()
+            .find(|v| v["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(sent_turn["params"]["input"][0]["text"], turn().prompt);
+        for mode in ["worker-complete", "worker-budget"] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(30_000),
+                ..Default::default()
+            })
+            .unwrap();
+            let held = reserve(&ledger);
+            let grant = (mode == "worker-budget")
+                .then(|| ledger.live_token_grant(held.id).unwrap().unwrap());
+            let (run, workspace, _temp) =
+                contained_read_only_terminal_app_server(mode, "worker", grant).unwrap();
+            assert!(run.scratch_quiescence_verified(), "{run:?}");
+            assert_eq!(
+                fs::read_to_string(workspace.join("README.md")).unwrap(),
+                "permitted native Worker edit\n"
+            );
+            assert_eq!(
+                run.authenticated_codex_partial_usage()
+                    .unwrap()
+                    .total_tokens,
+                37_000
+            );
+            if mode == "worker-budget" {
+                assert!(!run.publishable);
+                assert!(ledger.dispatch_stopped());
+                assert!(!run.authenticated_app_server_usage_complete());
+            } else {
+                assert!(run.error.is_none(), "{run:?}");
+                assert!(
+                    !run.publishable,
+                    "the synthetic executable never acquires provider trust"
+                );
+                assert!(run.authenticated_app_server_usage_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn worker_handler_cancels_approval_expansion_and_unsolicited_worker_requests() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/call",
+        ] {
+            let mut messages = prefix();
+            messages.push(usage(35_000, 2_000));
+            messages.push(serde_json::json!({"id":77,"method":method,"params":{"threadId":"worker-thread","turnId":"worker-turn","itemId":"edit","callId":"call-1","tool":"maco_worker_request","arguments":{},"command":"touch other","cwd":"/workspace","startedAtMs":1}}));
+            messages.push(terminal());
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            let outcome = run_managed_worker_app_server_turn(
+                &mut transport,
+                &turn(),
+                &command(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(cancellation.is_cancelled(), "{method}");
+            assert_eq!(
+                outcome.status,
+                codex_app_server::TurnTerminalStatus::Failed,
+                "{method}"
+            );
+            assert!(outcome.final_message.is_none());
+            assert_eq!(observed_tokens(&outcome).unwrap(), 37_000);
+            assert!(
+                transport
+                    .sent
+                    .iter()
+                    .any(|v| v["method"] == "turn/interrupt"),
+                "{method}"
+            );
+            assert!(!transport
+                .sent
+                .iter()
+                .any(|v| v["result"]["decision"] == "accept"));
+        }
+    }
+
+    #[test]
+    fn worker_handler_interrupts_equal_and_overshooting_grants_and_keeps_drain_floor() {
+        for first_input in [210_000, 211_000] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            })
+            .unwrap();
+            let held = reserve(&ledger);
+            let grant = ledger.live_token_grant(held.id).unwrap().unwrap();
+            let mut spec = command();
+            spec.bind_live_token_grant(Some(grant.clone()));
+            let mut messages = prefix();
+            messages.extend([
+                usage(first_input, 10_000),
+                serde_json::json!({"id":77,"method":"item/tool/call","params":{}}),
+                usage(230_000, 12_000),
+                terminal(),
+            ]);
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            let outcome =
+                run_managed_worker_app_server_turn(&mut transport, &turn(), &spec, &cancellation)
+                    .unwrap();
+            assert!(grant.stopped());
+            assert!(cancellation.is_cancelled());
+            assert_eq!(observed_tokens(&outcome).unwrap(), 242_000);
+            assert_eq!(outcome.status, codex_app_server::TurnTerminalStatus::Failed);
+            assert!(outcome
+                .protocol_error
+                .as_ref()
+                .unwrap()
+                .contains("token grant exhausted"));
+            let interrupt = transport
+                .sent
+                .iter()
+                .position(|v| v["method"] == "turn/interrupt")
+                .unwrap();
+            assert_eq!(
+                interrupt + 1,
+                transport.sent.len(),
+                "only observations drain after interrupt"
+            );
+            assert!(matches!(
+                ledger
+                    .reserve(BudgetReservationRequest {
+                        role: crate::supervise::AgentRole::Worker,
+                        tokens: 1,
+                        cost_usd: None
+                    })
+                    .unwrap(),
+                BudgetAdmission::Refused { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_handler_retains_partial_floor_and_missing_usage_on_protocol_failure() {
+        for failure in [
+            "eof",
+            "foreign",
+            "decreasing",
+            "malformed",
+            "duplicate",
+            "truncated",
+            "cancelled",
+            "missing",
+        ] {
+            let mut messages = prefix();
+            if failure != "missing" {
+                messages.push(usage(35_000, 2_000));
+            }
+            let mut invalid = usage(40_000, 2_000);
+            match failure {
+                "foreign" => {
+                    invalid["params"]["turnId"] = serde_json::json!("foreign");
+                    messages.push(invalid);
+                }
+                "decreasing" => messages.push(usage(1, 1)),
+                "malformed" => {
+                    invalid["params"]["tokenUsage"]["total"]["cachedInputTokens"] =
+                        serde_json::json!(50_000);
+                    messages.push(invalid);
+                }
+                "missing" => messages.push(terminal()),
+                _ => {}
+            }
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            if failure == "cancelled" {
+                transport.cancel_on_eof = Some(cancellation.clone());
+            }
+            if failure == "duplicate" {
+                let duplicated = usage(40_000, 2_000).to_string().replace(
+                    "\"inputTokens\":40000",
+                    "\"inputTokens\":40000,\"inputTokens\":1",
+                );
+                transport.incoming.push_back(duplicated.into_bytes());
+            }
+            if failure == "truncated" {
+                let mut truncated = usage(40_000, 2_000).to_string().into_bytes();
+                truncated.pop();
+                transport.incoming.push_back(truncated);
+            }
+            let outcome = run_managed_worker_app_server_turn(
+                &mut transport,
+                &turn(),
+                &command(),
+                &cancellation,
+            )
+            .unwrap();
+            if failure == "missing" {
+                assert!(outcome.token_usage.is_none(), "missing usage is never zero");
+            } else {
+                assert_eq!(observed_tokens(&outcome).unwrap(), 37_000, "{failure}");
+                assert_eq!(outcome.status, codex_app_server::TurnTerminalStatus::Failed);
+                assert!(cancellation.is_cancelled());
+                assert!(outcome.final_message.is_none());
+            }
+        }
+    }
 }

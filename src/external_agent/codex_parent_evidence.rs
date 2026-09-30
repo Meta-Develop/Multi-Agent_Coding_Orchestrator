@@ -58,6 +58,25 @@ pub struct CodexParentEvidence {
     pub resolution_status: String,
 }
 
+impl CodexParentEvidence {
+    /// Whole-turn allocation requires one resolved identity. A reroute target
+    /// alone does not say how the cumulative usage was split between models.
+    pub(crate) fn usage_model(&self) -> Option<&str> {
+        if self.resolution_status != "complete" || self.server_rerouted_model.is_some() {
+            return None;
+        }
+        let model = self.observed_model.known()?;
+        if self
+            .rollout_model
+            .known()
+            .is_some_and(|rollout| rollout != model)
+        {
+            return None;
+        }
+        Some(model)
+    }
+}
+
 /// Externally tagged: `{"known":"<value>"}` or the string `"unknown"` (the same wire shape
 /// as `GrokAcpParentResolvedField`).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,12 +457,16 @@ fn parse_exec_stream(stdout: &[u8]) -> Result<ExecStreamSummary, ()> {
                 if item.get("type").and_then(serde_json::Value::as_str) != Some("error") {
                     continue;
                 }
-                if let Some(reroute) = item
-                    .get("message")
-                    .and_then(serde_json::Value::as_str)
-                    .and_then(parse_reroute_message)
-                {
-                    summary.reroute = Some(reroute);
+                if let Some(message) = item.get("message").and_then(serde_json::Value::as_str) {
+                    if message.starts_with(CODEX_REROUTE_MESSAGE_PREFIX) {
+                        // A malformed or conflicting notice cannot silently restore the
+                        // rollout/requested model as the whole-turn billing identity.
+                        let reroute = parse_reroute_message(message).ok_or(())?;
+                        if summary.reroute.is_some() {
+                            return Err(());
+                        }
+                        summary.reroute = Some(reroute);
+                    }
                 }
             }
             _ => {}
@@ -886,6 +909,14 @@ mod tests {
         let evidence =
             codex_parent_evidence_from_app_server_run(&inputs, Some(&outcome), &codex_home);
         assert_eq!(evidence.resolution_status, "complete");
+        assert_eq!(evidence.usage_model(), Some("gpt-5.6-sol"));
+        outcome.resolved_model = "gpt-5.6-luna".to_string();
+        let fallback =
+            codex_parent_evidence_from_app_server_run(&inputs, Some(&outcome), &codex_home);
+        assert_eq!(fallback.usage_model(), Some("gpt-5.6-luna"));
+        assert!(fallback.model_mismatch);
+        assert_eq!(fallback.requested_model.as_deref(), Some("gpt-5.6-sol"));
+        outcome.resolved_model = "gpt-5.6-sol".to_string();
         assert_eq!(evidence.rollout_model, CodexParentResolvedField::Unknown);
         assert_eq!(evidence.rollout_effort, CodexParentResolvedField::Unknown);
         assert_eq!(
@@ -1189,6 +1220,10 @@ mod tests {
             rollout(),
         );
         assert_eq!(rerouted.resolution_status, "complete");
+        assert!(
+            rerouted.usage_model().is_none(),
+            "a reported target cannot allocate a split turn"
+        );
         assert_eq!(
             rerouted.rollout_model,
             CodexParentResolvedField::Known("gpt-5-codex".to_string())
@@ -1228,6 +1263,36 @@ mod tests {
                 reasoning_output_tokens: 0,
             }
         );
+    }
+
+    #[test]
+    fn model_attribution_cli_malformed_or_conflicting_reroutes_fail_closed() {
+        let complete = r#"{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}"#;
+        for notices in [
+            vec!["model rerouted: malformed"],
+            vec!["model rerouted: a -> b", "model rerouted: b -> c"],
+        ] {
+            let mut lines = vec![format!(
+                r#"{{"type":"thread.started","thread_id":"{THREAD}"}}"#
+            )];
+            lines.extend(notices.into_iter().map(|message| {
+                serde_json::json!({
+                    "type": "item.completed", "item": { "type": "error", "message": message }
+                })
+                .to_string()
+            }));
+            lines.push(complete.to_string());
+            let capture = lines.join("\n");
+            assert!(parse_exec_stream(capture.as_bytes()).is_err());
+            assert_eq!(
+                super::super::codex_usage_from_jsonl(capture.as_bytes())
+                    .unwrap()
+                    .unwrap()
+                    .total_tokens,
+                10,
+                "identity failure must not erase valid token counters"
+            );
+        }
     }
 
     #[test]

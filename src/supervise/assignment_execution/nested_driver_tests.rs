@@ -1,5 +1,5 @@
 use super::*;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
@@ -10,6 +10,11 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     fs::create_dir(repo.join("src"))?;
     fs::write(repo.join("src/lib.rs"), "pub fn selected() {}\n")?;
     let git = crate::git_repository::open(&repo)?;
+    if case.starts_with("managed-cycle-") {
+        let mut config = git.config()?;
+        config.set_str("user.name", "Fixture Owner")?;
+        config.set_str("user.email", "fixture@example.invalid")?;
+    }
     let mut index = git.index()?;
     index.add_path(Path::new("src/lib.rs"))?;
     index.write()?;
@@ -22,7 +27,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         "worker_assignments":[{"id":"worker", "role":"worker",
             "assigned_paths":["src/lib.rs"], "task":"worker task", "report_path":"worker.json"}]
     }))?;
-    if case.starts_with("continuation-") || case.starts_with("bound-") {
+    if case.starts_with("continuation-")
+        || case.starts_with("bound-")
+        || case.starts_with("managed-cycle-")
+    {
         let mut second = parent.worker_assignments[0].clone();
         second.id = "worker-two".into();
         second.report_path = Some("worker-two.json".into());
@@ -36,12 +44,12 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     worker_two.id = "worker-two".into();
     let plan: SupervisorPlan = serde_json::from_value(json!({
         "version":SUPERVISOR_SCHEMA_VERSION, "task":"nested driver fixture",
-        "max_depth":2, "max_child_assignments":1, "max_child_retries":0,
+        "max_depth":2, "max_child_assignments": if case.starts_with("managed-cycle-") { 2 } else { 1 }, "max_child_retries":0,
         "max_gate_corrections":0, "child_timeout_seconds":10,
         "semantic_coordination":"off", "assignments":[parent],
         "role_models":{
             "child_orchestrator":{"model":"gpt-5.6-sol", "reasoning_effort":"high"},
-            "worker":{"model":"gpt-5.6-sol", "reasoning_effort":"high"},
+            "worker":{"model":"gpt-5.6-sol", "reasoning_effort": if case.starts_with("managed-cycle-") { "xhigh" } else { "high" }},
             "auditor":{"model":"gpt-5.6-sol", "reasoning_effort":"high"}
         }
     }))?;
@@ -129,14 +137,46 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             ..Default::default()
         },
     )?;
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let metadata = AssignmentMetadata::new();
+    let consultant = SupervisorConsultantPlan::default();
+    // Only this case exercises completion-checkpoint failure. Bind the existing
+    // authenticated writer before preparation creates non-resumable scratches.
+    let mut checkpoint = if case == "managed-cycle-retained-checkpoint-error" {
+        Some(SupervisorCheckpointWriter::create(
+            &repo,
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &current_head_oid(&repo)?,
+                normalized_supervisor_plan_sha256(
+                    &plan,
+                    &consultant,
+                    &metadata,
+                    &SupervisorPlanMetadata {
+                        assignment_schedule: schedule.clone(),
+                        ..Default::default()
+                    },
+                )?,
+                1,
+                &plan,
+                writer.resume_binding()?,
+                ledger.report()?,
+            ),
+        )?)
+    } else {
+        None
+    };
     let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
     let mut kpis = AutonomyKpiCollector::default();
     let artifacts = Mutex::new(SharedSupervisorArtifacts {
         writer: &mut writer,
         journal: &mut journal,
         autonomy_kpis: &mut kpis,
-        checkpoint: None,
+        checkpoint: checkpoint.as_mut(),
     });
+    if case == "managed-cycle-retained-checkpoint-error" {
+        record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
+    }
     let budget_config = SupervisorBudgetConfig {
         role_token_reservations: BTreeMap::from([
             (AgentRole::ChildOrchestrator, 2),
@@ -144,14 +184,13 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         ]),
         ..Default::default()
     };
-    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
-    let metadata = AssignmentMetadata::new();
-    let consultant = SupervisorConsultantPlan::default();
     let guide = SupervisorFieldGuidePrompt::empty()?;
     let catalog =
         RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
     let parent_running = AtomicBool::new(false);
     let calls = Mutex::new(Vec::new());
+    let managed_parent_turns = AtomicUsize::new(0);
+    let captured_worker_reports = Mutex::new(Vec::<WorkerReport>::new());
     let runner = |command: &ExternalAgentCommand,
                   _: &ProcessCancellation,
                   _: Option<ExternalPreActionReviewRuntime<'_>>| {
@@ -172,14 +211,57 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             }
         };
         calls.lock().unwrap().push(subject.id.clone());
+        if case == "attached-capture-panic" && subject.id == "parent" {
+            panic!("attached parent runner panicked");
+        }
         assert_eq!(command.cwd, worktree.path);
         assert_eq!(sync_store.snapshot().unwrap(), vec![claim.clone()]);
         let mut simulated = command.clone();
         simulated.model = None;
-        let mut run =
-            deterministic_fake_child_run(&simulated, subject, &metadata, claim.token.get(), None)
-                .unwrap();
+        let mut fake_subject = subject.clone();
+        if case.starts_with("managed-cycle-") && subject.id == "parent" {
+            fake_subject.worker_assignments.clear();
+        }
+        if case.starts_with("managed-cycle-") && subject.id != "parent" {
+            assert_eq!(
+                command.workspace_access,
+                WorkspaceAccess::ReadWrite,
+                "managed-cycle worker launch must be read-write"
+            );
+            assert_eq!(
+                command.writable_launch_target,
+                crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
+                "managed-cycle worker launch must target the managed child worktree"
+            );
+            crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+                .expect(
+                    "managed-cycle worker fixture failed to prepare the private child Git boundary",
+                );
+        }
+        let mut run = deterministic_fake_child_run(
+            &simulated,
+            &fake_subject,
+            &metadata,
+            claim.token.get(),
+            None,
+        )
+        .unwrap();
+        let preserved_journals = run.worker_journal_artifacts().to_vec();
+        if case == "attached-capture-success"
+            || case == "attached-capture-errors"
+            || case.starts_with("managed-cycle-")
+        {
+            run.stdout = crate::external_agent::CapturedOutput::from_captured_bytes_for_test(
+                &crate::process_runner::CapturedBytes::from_bytes_for_test(
+                    b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}\n"
+                        .to_vec(),
+                ),
+            );
+        }
         run.stdout.target_launch_attempted = true;
+        if case.starts_with("managed-cycle-") {
+            run.replace_worker_journal_artifacts(preserved_journals);
+        }
         run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
             crate::process_runner::ContainmentBackend::SystemdUserService,
         ));
@@ -222,6 +304,96 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 )
                 .unwrap();
                 run.output_last_message = Some(serde_json::to_vec(&captured).unwrap());
+            }
+            if case.starts_with("managed-cycle-") {
+                assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+                assert!(command.codex_native_delegation_is_disabled());
+                assert_eq!(
+                    command
+                        .agent_lifecycle
+                        .as_ref()
+                        .map(|identity| identity.role.as_str()),
+                    Some("child_orchestrator")
+                );
+                let turn = managed_parent_turns.fetch_add(1, Ordering::SeqCst) + 1;
+                if turn == 1 {
+                    assert!(command.codex_managed_worker_requests_enabled());
+                    let launch = command
+                        .assignment_messaging_launch()
+                        .expect("managed parent inbox launch");
+                    if case == "managed-cycle-lost-reply" {
+                        super::managed_parent_controller_tests::submit_worker_request(
+                            launch,
+                            run_id.as_str(),
+                            "r1",
+                            "worker",
+                            false,
+                        )
+                        .unwrap();
+                    }
+                    if case != "managed-cycle-foreign-yield" {
+                        super::managed_parent_controller_tests::submit_worker_request(
+                            launch,
+                            run_id.as_str(),
+                            "r1",
+                            "worker",
+                            true,
+                        )
+                        .unwrap();
+                        super::managed_parent_controller_tests::submit_worker_request(
+                            launch,
+                            run_id.as_str(),
+                            "r2",
+                            "worker-two",
+                            true,
+                        )
+                        .unwrap();
+                    }
+                    let requests = if case == "managed-cycle-foreign-yield" {
+                        json!([{"request_id":"unacked-foreign","worker_id":"worker"}])
+                    } else {
+                        json!([
+                            {"request_id":"r1","worker_id":"worker"},
+                            {"request_id":"r2","worker_id":"worker-two"}
+                        ])
+                    };
+                    run.output_last_message = Some(
+                        serde_json::to_vec(&json!({
+                            "version":1, "outcome":"yield_workers",
+                            "run_id":run_id.as_str(), "parent_id":"parent", "parent_attempt":1,
+                            "requests": requests
+                        }))
+                        .unwrap(),
+                    );
+                } else {
+                    assert!(command.assignment_messaging_launch().is_none());
+                    assert!(command.codex_managed_readonly_continuation_enabled());
+                    assert!(!command.codex_managed_worker_requests_enabled());
+                    let reports = captured_worker_reports.lock().unwrap().clone();
+                    let completed_worker_ids: Vec<_> =
+                        reports.iter().map(|report| report.id.clone()).collect();
+                    let mut report: OrchestratorReviewReport =
+                        serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+                    report.worker_reports = reports;
+                    report.files_changed = vec!["src/lib.rs".into()];
+                    report.audit_reports.clear();
+                    report.review_lens_aggregate = None;
+                    if case == "managed-cycle-final-forgery" {
+                        report.worker_reports[0].id = "forged".into();
+                    }
+                    run.output_last_message = Some(
+                        serde_json::to_vec(&json!({
+                            "version":1,
+                            "run_id":run_id.as_str(),
+                            "parent_id":"parent",
+                            "source_parent_attempt":1,
+                            "parent_attempt":2,
+                            "completed_worker_ids": completed_worker_ids,
+                            "turn": {"outcome":"final_report", "report": report}
+                        }))
+                        .unwrap(),
+                    );
+                }
             }
             parent_running.store(false, Ordering::SeqCst);
         } else if case == "worker-uncertain" {
@@ -266,6 +438,45 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 "bound-evidence-cancel-during" => cancellation.cancel(),
                 _ => {}
             }
+        } else if case.starts_with("managed-cycle-") {
+            fs::write(
+                command.cwd.join("src/lib.rs"),
+                format!("// written by {}\n", subject.id),
+            )
+            .unwrap();
+            let mut report: WorkerReport =
+                serde_json::from_slice(run.output_last_message().unwrap()).unwrap();
+            report.files_changed = vec!["src/lib.rs".into()];
+            report.commands_run = vec![serde_json::from_value(json!({
+                "command":["fixture-edit"], "cwd":command.cwd, "exit_code":0,
+                "status":"succeeded", "timeout_seconds":1, "duration_ms":1, "timed_out":false
+            }))
+            .unwrap()];
+            run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+            let mut captures = run.worker_journal_artifacts().to_vec();
+            captures[0].status = crate::external_agent::WorkerJournalArtifactCaptureStatus::Loaded(
+                serde_json::to_vec(&json!({
+                    "command":["fixture-edit"], "cwd":command.cwd,
+                    "start_timestamp":"fixture-start", "end_timestamp":"fixture-end",
+                    "changed_paths":["src/lib.rs"]
+                }))
+                .unwrap(),
+            );
+            run.replace_worker_journal_artifacts(captures);
+            captured_worker_reports.lock().unwrap().push(report);
+            if case == "managed-cycle-cancel-after-first" && subject.id == "worker" {
+                cancellation.cancel();
+            }
+        }
+        if subject.id == "parent" && case == "attached-capture-errors" {
+            sync_store.release(claim.token).unwrap();
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                let _guard = artifacts.lock().unwrap();
+                panic!("poison supervisor artifacts");
+            }));
+        }
+        if subject.id == "parent" && case == "attached-capture-unquiescent" {
+            run.process_tree = None;
         }
         run
     };
@@ -308,6 +519,34 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         external_runner: &runner,
     };
     let mut outcome = AssignmentExecutionOutcome::default();
+    if case.starts_with("managed-cycle-") {
+        let prepared = match prepare_managed_parent_initial_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            run_id.as_str(),
+            1,
+            1,
+            &None,
+            &dirs.schemas.join("orchestrator-review-report.schema.json"),
+            &dirs.schemas.join("worker-report.schema.json"),
+            &dirs.schemas.join("auditor-report.schema.json"),
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("managed parent preparation unexpectedly completed")
+            }
+        };
+        return super::managed_parent_controller_tests::exercise(
+            case,
+            &context,
+            &preflight,
+            &mut outcome,
+            prepared,
+            &calls,
+        );
+    }
     let prepared = match prepare_child_attempt(
         &context,
         &mut outcome,
@@ -327,6 +566,17 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             bail!("parent preparation unexpectedly completed")
         }
     };
+    if case.starts_with("attached-capture-") {
+        let result = super::attached_parent_capture_tests::exercise(
+            case,
+            &context,
+            &preflight,
+            &mut outcome,
+            prepared,
+        );
+        assert_eq!(*calls.lock().unwrap(), ["parent"]);
+        return result;
+    }
     let mut collected = dispatch_and_collect_child_attempt(
         &context,
         &mut outcome,

@@ -1175,6 +1175,7 @@ fn cleanup_process_tree_backend(
 
 #[cfg(target_os = "linux")]
 struct ResolvedSystemdSandbox {
+    read_only_input_snapshots: Vec<input_snapshot::MountedInputSnapshot>,
     kind: SideEffectConfinementProfileKind,
     workspace_root: PathBuf,
     current_dir: PathBuf,
@@ -1269,6 +1270,11 @@ struct SandboxMountRegion {
 
 #[cfg(target_os = "linux")]
 impl ResolvedSystemdSandbox {
+    fn read_only_file_source(&self, target: &Path) -> PathBuf {
+        self.read_only_input_snapshots.iter().find(|pin| pin.path == target)
+            .map(input_snapshot::MountedInputSnapshot::source).unwrap_or_else(|| target.to_path_buf())
+    }
+
     fn exact_writable_file_parents(&self) -> BTreeSet<PathBuf> {
         external_codex_writable_file_parents(&self.external_codex_writable_file_capabilities)
     }
@@ -1490,6 +1496,9 @@ impl ResolvedSystemdSandbox {
     fn verify_path_identities(&self) -> std::io::Result<()> {
         use std::os::unix::fs::MetadataExt;
 
+        for snapshot in &self.read_only_input_snapshots {
+            snapshot.verify()?;
+        }
         for capability in &self.external_codex_writable_file_capabilities {
             capability.verify_path()?;
         }
@@ -2594,7 +2603,7 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         .iter()
         .map(|path| capture_sandbox_path_identity(path))
         .collect::<std::io::Result<Vec<_>>>()?;
-    let mount_checks = build_sandbox_mount_checks(SandboxMountPaths {
+    let mut mount_checks = build_sandbox_mount_checks(SandboxMountPaths {
         workspace_root: &workspace_root,
         workspace_access: config.workspace_access,
         visible_read_only_roots: &visible_read_only_roots,
@@ -2614,7 +2623,26 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         ));
     }
 
+    if spec.read_only_input_snapshots.len() > 8 {
+        return Err(std::io::Error::other("source input snapshot bound exceeded"));
+    }
+    let read_only_input_snapshots = spec.read_only_input_snapshots.iter().map(ReadOnlyInputSnapshot::materialize).collect::<io::Result<Vec<_>>>()?;
+    let mut snapshot_paths = BTreeSet::new();
+    for snapshot in &read_only_input_snapshots {
+        if config.workspace_access != WorkspaceAccess::ReadOnly
+            || !visible_read_only_files.contains(&snapshot.path)
+            || !snapshot.path.starts_with(&workspace_root)
+            || !snapshot_paths.insert(&snapshot.path)
+        {
+            return Err(std::io::Error::other("source snapshot lacks an exact read-only workspace capability"));
+        }
+        snapshot.verify()?;
+        let check = mount_checks.iter_mut().find(|check| check.path == snapshot.path && check.access == SandboxMountAccess::ReadOnly)
+            .ok_or_else(|| std::io::Error::other("source snapshot has no verified mount check"))?;
+        (check.device, check.inode) = snapshot.identity()?;
+    }
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots,
         kind: spec.side_effects.kind(),
         workspace_root,
         current_dir,
@@ -3127,8 +3155,13 @@ fn apply_systemd_sandbox_properties(
                 .arg(systemd_path_property("ReadOnlyPaths=", &target, false));
             continue;
         }
-        command
-            .arg(systemd_path_property("BindReadOnlyPaths=", file, false))
+        let source = sandbox.read_only_file_source(file);
+        let binding = if source == *file {
+            systemd_path_property("BindReadOnlyPaths=", file, false)
+        } else {
+            systemd_path_binding_property("BindReadOnlyPaths=", &source, file)
+        };
+        command.arg(binding)
             .arg(systemd_path_property("ReadOnlyPaths=", file, false));
     }
     for root in &sandbox.visible_read_write_roots {
@@ -3328,7 +3361,7 @@ fn verify_systemd_sandbox_properties(
         require_property_path(
             "BindReadOnlyPaths",
             property_value(properties, "BindReadOnlyPaths")?,
-            file,
+            &sandbox.read_only_file_source(file),
         )?;
         require_property_path(
             "ReadOnlyPaths",
@@ -3416,7 +3449,7 @@ fn verify_exact_systemd_path_properties(
         .collect::<BTreeSet<_>>();
     read_only_bindings.extend(sandbox.visible_read_only_files.iter().map(|file| {
         (
-            file.clone(),
+            sandbox.read_only_file_source(file),
             sandbox
                 .projected_external_grok_file_target(file, runtime_dir)
                 .unwrap_or_else(|| file.clone()),

@@ -307,49 +307,77 @@ fn observe_cursor_catalog_from_fixture(path: &Path) -> Result<AdvertisedCatalogS
 #[cfg(not(test))]
 fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatalogSet> {
     let observed_at_unix_millis = cursor_catalog_observation_time()?;
-    let (cursor, cursor_evidence_gap) =
-        match observe_live_cursor_catalog(repo, observed_at_unix_millis) {
+    let cursor_binding =
+        super::runtime_executables::catalog_program(repo, SupervisorRuntime::Cursor)?;
+    let (cursor, cursor_evidence_gap) = if cursor_binding.as_ref().is_some_and(Option::is_none) {
+        (None, None)
+    } else {
+        match observe_live_cursor_catalog(
+            repo,
+            observed_at_unix_millis,
+            cursor_binding
+                .as_ref()
+                .and_then(|program| program.as_deref()),
+        ) {
             Ok(observation) => (Some(observation), None),
-            Err(error) if cursor_catalog_optional_unavailability(&error) => (
-                None,
-                Some(CursorCatalogEvidenceGap::from_error(
-                    &error,
-                    observed_at_unix_millis,
-                )),
-            ),
+            Err(error)
+                if cursor_binding.is_none() && cursor_catalog_optional_unavailability(&error) =>
+            {
+                (
+                    None,
+                    Some(CursorCatalogEvidenceGap::from_error(
+                        &error,
+                        observed_at_unix_millis,
+                    )),
+                )
+            }
             Err(error) => {
                 return Err(error).context("live Cursor catalog observation failed closed");
             }
-        };
-    let grok_program = std::env::var_os("MACO_GROK_BIN");
-    #[cfg(target_os = "linux")]
-    let grok = match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
-        Some(authority) => {
-            authority.verify_binding_unchanged()?;
-            let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
-                authority.managed_grok_home(),
-            )?;
-            let observed = observe_optional_live_grok_catalog(
-                &runner,
-                repo,
-                observed_at_unix_millis,
-                grok_program.as_deref(),
-            )?;
-            authority.verify_binding_unchanged()?;
-            observed
         }
-        None if grok_program.is_none() => None,
-        None => bail!(
+    };
+    let grok_binding = super::runtime_executables::catalog_program(repo, SupervisorRuntime::Grok)?;
+    let grok_program = match &grok_binding {
+        Some(Some(path)) => Some(path.as_os_str().to_os_string()),
+        Some(None) => None,
+        None => std::env::var_os("MACO_GROK_BIN"),
+    };
+    #[cfg(target_os = "linux")]
+    let grok = if grok_binding.as_ref().is_some_and(Option::is_none) {
+        None
+    } else {
+        match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
+            Some(authority) => {
+                authority.verify_binding_unchanged()?;
+                let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
+                    authority.managed_grok_home(),
+                )?;
+                let observed = observe_optional_live_grok_catalog(
+                    &runner,
+                    repo,
+                    observed_at_unix_millis,
+                    grok_program.as_deref(),
+                )?;
+                authority.verify_binding_unchanged()?;
+                observed
+            }
+            None if grok_program.is_none() => None,
+            None => bail!(
             "live Grok catalog requires a complete Coding Agent Manager selected grok-cli account"
         ),
+        }
     };
     #[cfg(not(target_os = "linux"))]
-    let grok = observe_optional_live_grok_catalog(
-        &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
-        repo,
-        observed_at_unix_millis,
-        grok_program.as_deref(),
-    )?;
+    let grok = if grok_binding.as_ref().is_some_and(Option::is_none) {
+        None
+    } else {
+        observe_optional_live_grok_catalog(
+            &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
+            repo,
+            observed_at_unix_millis,
+            grok_program.as_deref(),
+        )?
+    };
     Ok(AdvertisedCatalogSet {
         cursor,
         grok,
@@ -410,9 +438,12 @@ fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> b
 fn observe_live_cursor_catalog(
     repo: &Path,
     observed_at_unix_millis: u64,
+    explicit_program: Option<&Path>,
 ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
     let mut spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new(repo);
-    if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
+    if let Some(program) = explicit_program {
+        spec = spec.with_program(program);
+    } else if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
         spec = spec.with_program(program);
     }
     spec = apply_cursor_catalog_env_setting(spec, std::env::var("MACO_CURSOR_ENV"))?;
@@ -955,7 +986,13 @@ pub(super) fn initialize_supervisor_selection_with_history(
     for role in roles {
         let configured = plan.role_models.get(&role);
         let debug_override = configured
-            .map(|selection| debug_override_for_role(role, runtime, selection))
+            .map(|selection| {
+                debug_override_for_role(
+                    role,
+                    authored_override_runtime(plan, role, runtime)?,
+                    selection,
+                )
+            })
             .transpose()?;
         let input = selection_input_for_role(SelectionInputForRoleArgs {
             role,
@@ -1543,6 +1580,33 @@ fn validate_custom_review_lenses_against_auditor_selection(
         }
     }
     Ok(())
+}
+
+fn authored_override_runtime(
+    plan: &SupervisorPlan,
+    role: AgentRole,
+    primary: SupervisorRuntime,
+) -> Result<SupervisorRuntime> {
+    // Nested `worker_assignments` do not declare a runtime, so they cannot
+    // move an explicit override off `primary`.
+    let selected = plan
+        .assignments
+        .iter()
+        .filter(|assignment| assignment.role == role)
+        .filter_map(|assignment| assignment.runtime)
+        .try_fold(None, |selected, authored| match selected {
+            None => Ok(Some(authored)),
+            Some(existing) if existing == authored => Ok(Some(existing)),
+            Some(existing) => {
+                bail!(
+                    "conflicting authored runtimes for role '{}': '{}' and '{}'",
+                    role.as_str(),
+                    runtime_name(existing),
+                    runtime_name(authored),
+                )
+            }
+        })?;
+    Ok(selected.unwrap_or(primary))
 }
 
 fn debug_override_for_role(
@@ -4961,6 +5025,44 @@ mod tests {
     }
 
     #[test]
+    fn authored_override_runtime_uses_explicit_worker_runtime_and_primary_for_unassigned_auditor(
+    ) -> Result<()> {
+        let mut plan = test_plan();
+        let mut worker = child_assignment("worker-a");
+        worker.role = AgentRole::Worker;
+        worker.runtime = Some(SupervisorRuntime::Grok);
+        plan.assignments = vec![worker];
+
+        assert_eq!(
+            authored_override_runtime(&plan, AgentRole::Worker, SupervisorRuntime::Codex)?,
+            SupervisorRuntime::Grok
+        );
+        assert_eq!(
+            authored_override_runtime(&plan, AgentRole::Auditor, SupervisorRuntime::Codex)?,
+            SupervisorRuntime::Codex
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn authored_override_runtime_rejects_conflicting_worker_runtimes() {
+        let mut plan = test_plan();
+        let mut grok = child_assignment("worker-grok");
+        grok.role = AgentRole::Worker;
+        grok.runtime = Some(SupervisorRuntime::Grok);
+        let mut codex = child_assignment("worker-codex");
+        codex.role = AgentRole::Worker;
+        codex.runtime = Some(SupervisorRuntime::Codex);
+        plan.assignments = vec![grok, codex];
+
+        let error = authored_override_runtime(&plan, AgentRole::Worker, SupervisorRuntime::Codex)
+            .expect_err("conflicting authored worker runtimes");
+        let message = error.to_string();
+        assert!(message.contains("conflicting authored runtimes"));
+        assert!(message.contains("worker"));
+    }
+
+    #[test]
     fn explicit_debug_override_requires_parseable_effort() -> Result<()> {
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
@@ -7347,6 +7449,91 @@ mod tests {
             .candidate_set
             .iter()
             .all(|evaluation| evaluation.candidate.model != grok_prior.model));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_primary_applies_explicit_worker_override_on_authored_grok_runtime() -> Result<()> {
+        // The built-in Grok prior is fixture evidence for catalog membership.
+        // It is not a qualification claim for any specific production model.
+        let catalog = codex_catalog()?;
+        let priors = selection::built_in_prior_dataset()?;
+        let grok_prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "grok")
+            .context("built-in Grok prior")?;
+        let observed = discover_grok_observation(&grok_listing(
+            &grok_prior.model,
+            &[&format!("  * {} (default)", grok_prior.model)],
+        ))?;
+        let advertised = advertised_with_grok(observed);
+        let mut automatic = test_plan();
+        let automatic_resolution = initialize_supervisor_selection(
+            &mut automatic,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+        )?;
+        let automatic_worker = automatic_resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("automatic worker decision")?;
+        let candidate = automatic_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate.runtime == "grok" && evaluation.eligible)
+            .context("eligible grok worker candidate")?
+            .candidate
+            .clone();
+
+        let mut plan = test_plan();
+        let mut worker_assignment = child_assignment("worker-a");
+        worker_assignment.role = AgentRole::Worker;
+        worker_assignment.runtime = Some(SupervisorRuntime::Grok);
+        plan.assignments = vec![worker_assignment];
+        plan.role_models.insert(
+            AgentRole::Worker,
+            role_selection(
+                candidate.model.clone(),
+                Some(selector_effort_as_str(candidate.effort)),
+            ),
+        );
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised.clone(),
+        )?;
+
+        assert!(resolution.selection_preflight_failure.is_none());
+        let worker = resolution
+            .decisions
+            .iter()
+            .find(|decision| decision.role == AgentRole::Worker)
+            .context("worker debug decision")?;
+        let debug_override = worker
+            .provenance
+            .debug_override
+            .as_ref()
+            .context("worker debug override provenance")?;
+        assert_eq!(debug_override.request.candidate.runtime, "grok");
+        assert!(matches!(
+            debug_override.disposition,
+            selection::DebugOverrideDisposition::Applied
+        ));
+        let choice = worker
+            .provenance
+            .choice
+            .as_ref()
+            .context("worker override choice")?;
+        assert_eq!(choice.candidate.runtime, "grok");
+        bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)?;
+        assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Grok));
         Ok(())
     }
 

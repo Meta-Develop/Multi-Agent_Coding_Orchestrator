@@ -154,7 +154,10 @@ fn fixed_version_probe_streams(
     environment: &BTreeMap<String, String>,
     codex_auth: Option<&ValidatedCodexAuth>,
     credential_redactor: Option<&CredentialRedactor>,
-) -> (EnvironmentFixedVersionProbeStream, EnvironmentFixedVersionProbeStream) {
+) -> (
+    EnvironmentFixedVersionProbeStream,
+    EnvironmentFixedVersionProbeStream,
+) {
     let redact = |redactor: &CredentialRedactor| {
         (
             bounded_redacted_probe_stream(
@@ -189,22 +192,17 @@ fn record_fixed_version_probe_output(
     credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) {
-    let (stdout, stderr) = fixed_version_probe_streams(
-        output,
-        environment,
-        codex_auth,
-        credential_redactor,
-    );
-    process_evidence.fixed_version_probe_evidence =
-        Some(EnvironmentFixedVersionProbeEvidence {
-            executable,
-            exit_code: output.status.and_then(|status| status.code()),
-            timed_out: output.timed_out,
-            stdout,
-            stderr,
-            process_tree: output.process_tree,
-            side_effects: output.side_effects,
-        });
+    let (stdout, stderr) =
+        fixed_version_probe_streams(output, environment, codex_auth, credential_redactor);
+    process_evidence.fixed_version_probe_evidence = Some(EnvironmentFixedVersionProbeEvidence {
+        executable,
+        exit_code: output.status.and_then(|status| status.code()),
+        timed_out: output.timed_out,
+        stdout,
+        stderr,
+        process_tree: output.process_tree,
+        side_effects: output.side_effects,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -519,6 +517,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     external_environment: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(());
     };
     let identity = spec
@@ -528,6 +529,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(());
+    }
     for (key, value) in pairs {
         external_environment.insert(key, value);
     }
@@ -543,6 +547,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
 
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(BTreeMap::new());
     };
     let identity = spec
@@ -552,6 +559,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(BTreeMap::new());
+    }
     let mut overlay = BTreeMap::new();
     for (key, value) in pairs {
         if key == ENV_MESSAGE_ENDPOINT || key == ENV_MESSAGE_TOKEN {
@@ -830,7 +840,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     if program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
         return Ok(None);
     }
-    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone()) else {
+    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone())
+    else {
         return Ok(None);
     };
     let canonical = fs::canonicalize(&path)
@@ -839,7 +850,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     Ok(Some(canonical))
 }
 
-pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure> {
+pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure>
+{
     Box::new(EnvironmentFailure::runtime_model_catalog(format!(
         "Codex runtime model catalog acquisition failed: cause={}",
         CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable
@@ -917,7 +929,9 @@ fn prepare_codex_runtime_model_catalog_process(
                     (sealed_program.to_path_buf(), Some(grant))
                 } else {
                     let resolved_program = resolve_external_program(program, resolver_search_base)
-                        .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+                        .context(
+                            CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed,
+                        )?;
                     let grant = grant
                         .seal_independently_verified_canonical_binding(&resolved_program)
                         .map_err(|error| {
@@ -1002,9 +1016,7 @@ fn bind_catalog_preflight_grant(
     };
     let sealed_expected_parent = grant
         .consume_for_process_binding(program, &process_spec.current_dir, args, expected_origin)
-        .map_err(|error| {
-            anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
-        })?;
+        .map_err(|error| anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error)))?;
     let expected_confinement = SideEffectConfinementProfile::ExternalCodex(
         ExternalCodexProfile::read_only(&sealed_expected_parent),
     );
@@ -1038,8 +1050,8 @@ fn execute_prepared_codex_runtime_model_catalog(
         return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
     }
     auth_result?;
-    let output =
-        process_result.map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
+    let output = process_result
+        .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
     if !output.safety_sensitive_succeeded() {
         return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
     }
@@ -1287,7 +1299,8 @@ fn external_program_trust_for_resolved_executable(
     if matches!(
         spec.invocation,
         ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
-    ) && spec.program.is_absolute() {
+    ) && spec.program.is_absolute()
+    {
         match resolve_trusted_system_codex_executable_for_catalog(&spec.cwd) {
             Ok(trusted) if trusted == resolved_program => {
                 return ExternalProgramTrust::TrustedSystemCodex;
@@ -1795,7 +1808,10 @@ pub(crate) fn materialize_managed_child_git_commit(
 
     run_managed_child_git_command(
         &boundary,
-        vec![OsString::from("read-tree"), OsString::from(captured_base.to_string())],
+        vec![
+            OsString::from("read-tree"),
+            OsString::from(captured_base.to_string()),
+        ],
         StdinMode::Null,
         "initialize managed child materialization index",
     )?;
@@ -2037,9 +2053,7 @@ fn managed_child_tree_edge_paths(
     Ok(paths)
 }
 
-fn require_managed_child_clean_unstaged_worktree(
-    boundary: &ManagedChildGitBoundary,
-) -> Result<()> {
+fn require_managed_child_clean_unstaged_worktree(boundary: &ManagedChildGitBoundary) -> Result<()> {
     let unstaged = run_managed_child_git_command_allow_status(
         boundary,
         vec![
@@ -4877,30 +4891,32 @@ enum ExternalProviderProfile {
 
 impl ExternalProviderProfile {
     fn for_command(spec: &ExternalAgentCommand) -> Result<Self> {
-        Ok(match (
-            spec.invocation,
-            spec.workspace_access,
-            spec.writable_runtime_selection.as_ref(),
-        ) {
-            (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
-                ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
-            ),
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
-                Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
-            }
-            // Direct profile unit tests exercise lower-level Grok inputs. Production writable
-            // Grok reaches this point only after the external boundary has required supervisor
-            // selection and confinement evidence.
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
-                Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadOnly, _) => {
-                Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadWrite, _) => {
-                Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
-            }
-        })
+        Ok(
+            match (
+                spec.invocation,
+                spec.workspace_access,
+                spec.writable_runtime_selection.as_ref(),
+            ) {
+                (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
+                    ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
+                ),
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
+                    Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
+                }
+                // Direct profile unit tests exercise lower-level Grok inputs. Production writable
+                // Grok reaches this point only after the external boundary has required supervisor
+                // selection and confinement evidence.
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
+                    Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
+                }
+                (_, WorkspaceAccess::ReadOnly, _) => {
+                    Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
+                }
+                (_, WorkspaceAccess::ReadWrite, _) => {
+                    Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
+                }
+            },
+        )
     }
 
     fn with_visible_read_only_root(self, root: impl Into<PathBuf>) -> Self {
@@ -5916,12 +5932,10 @@ fn command_argv_with_controls_and_service_tier_input(
 
 pub(crate) fn grok_acp_stdio_protocol_selected(spec: &ExternalAgentCommand) -> bool {
     spec.invocation == ExternalAgentInvocation::Grok
-        && spec
-            .runtime_adapter
-            .as_ref()
-            .is_some_and(|config| {
-                config.grok_interaction_protocol() == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
-            })
+        && spec.runtime_adapter.as_ref().is_some_and(|config| {
+            config.grok_interaction_protocol()
+                == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+        })
 }
 
 fn external_agent_stdin_mode(
@@ -5971,12 +5985,13 @@ fn codex_supervisor_argv(
     controls: &ProtectedWorktreeControls,
     service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
-    let terminal_role = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
-        matches!(
-            identity.role.as_str(),
-            "worker" | "researcher" | "auditor" | "gate_classifier"
-        )
-    });
+    let terminal_role = spec.codex_native_delegation_disabled
+        || spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.role.as_str(),
+                "worker" | "researcher" | "auditor" | "gate_classifier"
+            )
+        });
     let mut argv = codex_hardened_argv_with_service_tier(
         spec,
         controls,
@@ -5988,7 +6003,11 @@ fn codex_supervisor_argv(
         service_tier,
     );
     argv.extend([
-        OsString::from(if terminal_role { "--disable" } else { "--enable" }),
+        OsString::from(if terminal_role {
+            "--disable"
+        } else {
+            "--enable"
+        }),
         OsString::from("goals"),
         OsString::from("--json"),
         OsString::from("--output-last-message"),
@@ -6019,12 +6038,7 @@ fn codex_hardened_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
-    codex_hardened_argv_with_service_tier(
-        spec,
-        controls,
-        CodexMultiAgentMode::Disabled,
-        None,
-    )
+    codex_hardened_argv_with_service_tier(spec, controls, CodexMultiAgentMode::Disabled, None)
 }
 
 fn codex_hardened_argv_with_service_tier(
@@ -6155,6 +6169,7 @@ fn codex_app_server_argv(
         "computer_use",
         "image_generation",
         "multi_agent",
+        "goals",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));
@@ -6256,6 +6271,14 @@ fn codex_filesystem_permissions(
         }
     }
     for path in &controls.exact_read_only_input_files {
+        // The outer launch installs the declared source's immutable private
+        // snapshot and unlinks its backing name before releasing Codex. Rebinding
+        // that individual mount in the inner sandbox can fail with ENOENT. The
+        // identical read-only workspace grant already covers this descendant;
+        // retain the exact outer mount and every outside-workspace file rule.
+        if immutable_source_input_covered_by_read_only_workspace(spec, path) {
+            continue;
+        }
         if let Some(path) = path.to_str() {
             path_permissions.insert(path.to_string(), "read");
         }
@@ -6305,6 +6328,37 @@ fn codex_filesystem_permissions(
         "permissions.maco_external_codex.filesystem={{{}}}",
         entries.join(",")
     )
+}
+
+fn immutable_source_input_covered_by_read_only_workspace(
+    spec: &ExternalAgentCommand,
+    path: &Path,
+) -> bool {
+    if spec.workspace_access != WorkspaceAccess::ReadOnly
+        || spec.invocation != ExternalAgentInvocation::CodexSupervisor
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|identity| identity.role != "researcher")
+        || researcher_inputs::validate_command(spec).is_err()
+    {
+        return false;
+    }
+    let Ok(workspace) = fs::canonicalize(&spec.cwd) else {
+        return false;
+    };
+    // This only normalizes a redundant inner rule after the declaration, hash,
+    // no-follow identity and exact outer permission have all validated. The held
+    // snapshot preflight and its final launch revalidation remain mandatory.
+    path.starts_with(&workspace)
+        && spec
+            .read_only_input_files
+            .iter()
+            .any(|declared| declared == path)
+        && spec
+            .researcher_source_inputs
+            .iter()
+            .any(|input| workspace.join(&input.path) == path)
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -6369,7 +6423,22 @@ pub(crate) fn codex_usage_from_jsonl(bytes: &[u8]) -> Result<Option<Usage>> {
                 .context("Codex output token count does not fit this platform")?,
             total_tokens: 0,
         };
-        aggregate = aggregate.saturating_add(usage);
+        let input_tokens = aggregate
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .context("Codex aggregate input token count overflowed")?;
+        let output_tokens = aggregate
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .context("Codex aggregate output token count overflowed")?;
+        let total_tokens = input_tokens
+            .checked_add(output_tokens)
+            .context("Codex aggregate total token count overflowed")?;
+        aggregate = Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        };
         observed = true;
     }
     Ok(observed.then_some(aggregate))
@@ -6719,7 +6788,9 @@ mod fixed_version_probe_redaction_tests {
             status,
             duration: Duration::from_millis(1),
             timed_out: false,
-            process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
             side_effects: SideEffectConfinementEvidence::Verified(
                 SideEffectConfinementProfileKind::ExternalCodex,
             ),
