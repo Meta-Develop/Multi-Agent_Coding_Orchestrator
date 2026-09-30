@@ -536,7 +536,7 @@ struct CreateWorktreeArgs {
     /// Base revision used when creating a new branch. Defaults to HEAD.
     #[arg(long)]
     base: Option<String>,
-    /// Parent directory for agent worktrees.
+    /// Parent directory for agent worktrees. Defaults to <repo>/.worktrees.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// After creation, remove eligible older clean worktrees older than this many seconds.
@@ -567,7 +567,7 @@ struct GcWorktreeArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Parent directory for agent worktrees.
+    /// Parent directory for agent worktrees. Defaults to <repo>/.worktrees.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// List cleanup actions without removing anything.
@@ -607,7 +607,7 @@ struct GcWorktreeArgs {
 
 #[derive(Debug, Args)]
 struct SweepWorktreeArgs {
-    /// Workspace containing .maco/worktrees/<repo>/<lane> directories.
+    /// Repository or workspace containing <repo>/.worktrees or legacy .maco/worktrees/<repo> roots.
     #[arg(long)]
     workspace: PathBuf,
     /// Apply cleanup. Without this flag, the sweep is a dry-run.
@@ -662,7 +662,7 @@ struct LifecycleWorktreeArgs {
     /// Schedule the bounded O2-launch run-artifact retention profile.
     #[arg(long)]
     o2_launch_retention: bool,
-    /// Parent directory for agent worktrees.
+    /// Parent directory for agent worktrees. Defaults to <repo>/.worktrees.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// Remove only eligible clean worktrees older than this many seconds.

@@ -227,6 +227,13 @@ fn git_registered_worktree_names(
             }
         };
         if path.parent() == Some(worktree_root) {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("Git-registered worktree has a non-UTF-8 child name")?;
+            if normalize_agent_id(name)? != name {
+                bail!("Git-registered worktree has a noncanonical child name: {name}");
+            }
             names.insert(name.to_string());
         }
     }
@@ -254,12 +261,26 @@ fn git_registered_worktree_names_for_reconciliation(
         let worktree = repo.find_worktree(name).with_context(|| {
             format!("failed to inspect Git worktree '{name}' during startup reconciliation")
         })?;
-        let path = worktree.path();
-        let belongs_to_root = path.parent() == Some(worktree_root)
-            || fs::canonicalize(path)
-                .ok()
-                .is_some_and(|canonical| canonical.parent() == Some(worktree_root));
-        if belongs_to_root {
+        let path = match fs::canonicalize(worktree.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve Git worktree path {} during startup reconciliation",
+                        worktree.path().display()
+                    )
+                })
+            }
+        };
+        if path.parent() == Some(worktree_root) {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("Git-registered worktree has a non-UTF-8 child name")?;
+            if normalize_agent_id(name)? != name {
+                bail!("Git-registered worktree has a noncanonical child name: {name}");
+            }
             names.insert(name.to_string());
         }
     }
@@ -4107,6 +4128,13 @@ fn is_reserved_worktree_root_child(name: impl AsRef<OsStr>) -> bool {
 }
 
 fn default_worktree_root(repo: &Repository) -> PathBuf {
+    repo.workdir()
+        .unwrap_or_else(|| repo.path())
+        .join(".worktrees")
+}
+
+// Authenticate the pre-repository-local layout without changing creation defaults.
+fn legacy_workspace_worktree_root(repo: &Repository) -> PathBuf {
     let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
     let repo_name = repo_root
         .file_name()

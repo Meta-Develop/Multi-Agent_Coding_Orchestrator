@@ -2,6 +2,162 @@ use super::*;
 use git2::{Oid, Signature};
 use tempfile::TempDir;
 
+fn renamed_manual_worktree(temp: &TempDir) -> (PathBuf, PathBuf) {
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let root = default_worktree_root(&repo);
+    fs::create_dir_all(&root).expect("manual worktree root");
+    let renamed = root.join("manual-renamed");
+    // A renamed lane keeps its original Git metadata name.
+    repo.worktree("manual-original", &renamed, None)
+        .expect("create Git-only manual worktree with a different directory name");
+    (repo_path, renamed)
+}
+
+#[test]
+fn registered_manual_worktree_names_follow_renamed_directory() {
+    let temp = TempDir::new().expect("tempdir");
+    let (repo_path, lane) = renamed_manual_worktree(&temp);
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    assert_eq!(
+        fs::canonicalize(
+            repo.find_worktree("manual-original")
+                .expect("registration")
+                .path()
+        )
+        .expect("registered path"),
+        fs::canonicalize(&lane).expect("lane path")
+    );
+    let root = fs::canonicalize(lane.parent().expect("root")).expect("canonical root");
+    let expected = BTreeSet::from(["manual-renamed".to_string()]);
+    assert_eq!(
+        git_registered_worktree_names(&repo, &root).expect("GC names"),
+        expected
+    );
+    assert_eq!(
+        git_registered_worktree_names_for_reconciliation(&repo, &root)
+            .expect("reconciliation names"),
+        expected
+    );
+    let outside = fs::canonicalize(temp.path()).expect("outside root");
+    assert!(git_registered_worktree_names(&repo, &outside)
+        .expect("outside GC names")
+        .is_empty());
+    assert!(
+        git_registered_worktree_names_for_reconciliation(&repo, &outside)
+            .expect("outside reconciliation names")
+            .is_empty()
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn registered_manual_worktree_is_not_an_orphan_and_reconciliation_protects_it() {
+    let temp = TempDir::new().expect("tempdir");
+    let (repo_path, lane) = renamed_manual_worktree(&temp);
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let root = fs::canonicalize(lane.parent().expect("root")).expect("canonical root");
+    let gc = WorktreeManager::new(&repo_path)
+        .gc(gc_options(Some(root.clone()), true))
+        .expect("registered manual lane must not be an orphan");
+    assert_eq!(gc.orphan_removed_count, 0);
+    assert!(gc.entries.is_empty());
+    let reconciliation = reconcile_managed_worktree_lifecycle(&repo, Some(root), true, true, None)
+        .expect("registered manual lane needs no quarantine binding");
+    assert_eq!(reconciliation.quarantined_directory_count, 0);
+    assert_eq!(reconciliation.entries.len(), 1);
+    assert_eq!(reconciliation.entries[0].name, "manual-renamed");
+    assert_eq!(
+        reconciliation.entries[0].state,
+        WorktreeReconciliationState::Ambiguous
+    );
+    assert_eq!(
+        reconciliation.entries[0].action,
+        WorktreeReconciliationAction::Protected
+    );
+    assert!(lane.exists());
+}
+
+#[test]
+fn default_worktree_root_is_stable_and_repository_local() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo+name");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let expected = repo.workdir().expect("workdir").join(".worktrees");
+
+    assert_eq!(default_worktree_root(&repo), expected);
+    assert_eq!(
+        resolve_worktree_root(&repo, None).expect("default root"),
+        expected
+    );
+    assert_eq!(default_worktree_root(&repo), expected);
+    assert!(
+        !expected.exists(),
+        "resolving must not create or migrate state"
+    );
+    assert!(!temp.path().join(".maco").exists());
+}
+
+#[test]
+fn default_worktree_root_preserves_explicit_overrides() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let absolute = temp.path().join("custom-worktrees");
+    assert_eq!(
+        resolve_worktree_root(&repo, Some(absolute.clone())).expect("absolute override"),
+        absolute
+    );
+    assert_eq!(
+        resolve_worktree_root(&repo, Some(PathBuf::from("custom-worktrees")))
+            .expect("relative override"),
+        repo.workdir().expect("workdir").join("custom-worktrees")
+    );
+    assert!(!absolute.exists());
+    assert!(!default_worktree_root(&repo).exists());
+}
+
+#[test]
+fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() {
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo+name");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let workspace = fs::canonicalize(temp.path()).expect("workspace");
+    let legacy = workspace.join(".maco/worktrees/repo_name");
+    let local = default_worktree_root(&repo);
+    fs::create_dir_all(&legacy).expect("legacy root");
+    fs::create_dir_all(&local).expect("local root");
+    assert_eq!(
+        fs::canonicalize(legacy_workspace_worktree_root(&repo)).expect("canonical legacy root"),
+        legacy
+    );
+
+    for (root, kind) in [
+        (&legacy, WorktreeSweepRootKind::WorkspaceManaged),
+        (&local, WorktreeSweepRootKind::RepositoryLocal),
+    ] {
+        validate_primary_sweep_association(&workspace, root, &repo_path, &repo, None, kind)
+            .expect("exact layout must retain repository association");
+    }
+    for (root, kind) in [
+        (&local, WorktreeSweepRootKind::WorkspaceManaged),
+        (&legacy, WorktreeSweepRootKind::RepositoryLocal),
+    ] {
+        let failure =
+            validate_primary_sweep_association(&workspace, root, &repo_path, &repo, None, kind)
+                .expect_err("root kinds must not adopt the other layout");
+        assert_eq!(
+            failure.kind,
+            WorktreeSweepFailureKind::RepositoryAssociation
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn bounded_status_parsers_are_lossless_and_fail_closed() {
@@ -1594,11 +1750,15 @@ fn workspace_sweep_discovers_repository_local_worktree_root() {
     let repo = crate::git_repository::open(&repo_path).expect("open repo");
     commit_readme(&repo).expect("initial commit");
     let worktree_root = repo_path.join(".worktrees");
-    let created = create_gc_worktree(
-        &WorktreeManager::new(&repo_path),
-        "repo-local-lane",
-        &worktree_root,
-    );
+    let created = WorktreeManager::new(&repo_path)
+        .create_for_test(WorktreeCreateOptions {
+            agent_id: "repo-local-lane".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create in default repository-local root");
+    assert_eq!(created.path, worktree_root.join("repo-local-lane"));
 
     let report = sweep_workspace_worktrees(workspace_sweep_options(&repo_path, false))
         .expect("sweep repository-local root");

@@ -1661,14 +1661,14 @@ fn validate_primary_sweep_association(
         )
     })?;
     let expected_group_root = match root_kind {
-        WorktreeSweepRootKind::WorkspaceManaged => default_worktree_root(primary),
+        WorktreeSweepRootKind::WorkspaceManaged => legacy_workspace_worktree_root(primary),
         WorktreeSweepRootKind::RepositoryLocal => canonical_primary.join(".worktrees"),
     };
     let canonical_expected_root = fs::canonicalize(&expected_group_root).map_err(|error| {
         sweep_failure(
             WorktreeSweepFailureKind::RepositoryAssociation,
             anyhow::Error::new(error)
-                .context("failed to resolve primary repository default worktree root"),
+                .context("failed to resolve primary repository expected sweep root"),
         )
     })?;
     if canonical_group_root != canonical_expected_root {
