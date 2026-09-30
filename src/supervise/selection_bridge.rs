@@ -307,49 +307,77 @@ fn observe_cursor_catalog_from_fixture(path: &Path) -> Result<AdvertisedCatalogS
 #[cfg(not(test))]
 fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatalogSet> {
     let observed_at_unix_millis = cursor_catalog_observation_time()?;
-    let (cursor, cursor_evidence_gap) =
-        match observe_live_cursor_catalog(repo, observed_at_unix_millis) {
+    let cursor_binding =
+        super::runtime_executables::catalog_program(repo, SupervisorRuntime::Cursor)?;
+    let (cursor, cursor_evidence_gap) = if cursor_binding.as_ref().is_some_and(Option::is_none) {
+        (None, None)
+    } else {
+        match observe_live_cursor_catalog(
+            repo,
+            observed_at_unix_millis,
+            cursor_binding
+                .as_ref()
+                .and_then(|program| program.as_deref()),
+        ) {
             Ok(observation) => (Some(observation), None),
-            Err(error) if cursor_catalog_optional_unavailability(&error) => (
-                None,
-                Some(CursorCatalogEvidenceGap::from_error(
-                    &error,
-                    observed_at_unix_millis,
-                )),
-            ),
+            Err(error)
+                if cursor_binding.is_none() && cursor_catalog_optional_unavailability(&error) =>
+            {
+                (
+                    None,
+                    Some(CursorCatalogEvidenceGap::from_error(
+                        &error,
+                        observed_at_unix_millis,
+                    )),
+                )
+            }
             Err(error) => {
                 return Err(error).context("live Cursor catalog observation failed closed");
             }
-        };
-    let grok_program = std::env::var_os("MACO_GROK_BIN");
-    #[cfg(target_os = "linux")]
-    let grok = match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
-        Some(authority) => {
-            authority.verify_binding_unchanged()?;
-            let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
-                authority.managed_grok_home(),
-            )?;
-            let observed = observe_optional_live_grok_catalog(
-                &runner,
-                repo,
-                observed_at_unix_millis,
-                grok_program.as_deref(),
-            )?;
-            authority.verify_binding_unchanged()?;
-            observed
         }
-        None if grok_program.is_none() => None,
-        None => bail!(
+    };
+    let grok_binding = super::runtime_executables::catalog_program(repo, SupervisorRuntime::Grok)?;
+    let grok_program = match &grok_binding {
+        Some(Some(path)) => Some(path.as_os_str().to_os_string()),
+        Some(None) => None,
+        None => std::env::var_os("MACO_GROK_BIN"),
+    };
+    #[cfg(target_os = "linux")]
+    let grok = if grok_binding.as_ref().is_some_and(Option::is_none) {
+        None
+    } else {
+        match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
+            Some(authority) => {
+                authority.verify_binding_unchanged()?;
+                let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
+                    authority.managed_grok_home(),
+                )?;
+                let observed = observe_optional_live_grok_catalog(
+                    &runner,
+                    repo,
+                    observed_at_unix_millis,
+                    grok_program.as_deref(),
+                )?;
+                authority.verify_binding_unchanged()?;
+                observed
+            }
+            None if grok_program.is_none() => None,
+            None => bail!(
             "live Grok catalog requires a complete Coding Agent Manager selected grok-cli account"
         ),
+        }
     };
     #[cfg(not(target_os = "linux"))]
-    let grok = observe_optional_live_grok_catalog(
-        &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
-        repo,
-        observed_at_unix_millis,
-        grok_program.as_deref(),
-    )?;
+    let grok = if grok_binding.as_ref().is_some_and(Option::is_none) {
+        None
+    } else {
+        observe_optional_live_grok_catalog(
+            &crate::runtime_adapter::grok::ScreenedGrokCatalogCommandRunner,
+            repo,
+            observed_at_unix_millis,
+            grok_program.as_deref(),
+        )?
+    };
     Ok(AdvertisedCatalogSet {
         cursor,
         grok,
@@ -410,9 +438,12 @@ fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> b
 fn observe_live_cursor_catalog(
     repo: &Path,
     observed_at_unix_millis: u64,
+    explicit_program: Option<&Path>,
 ) -> Result<crate::runtime_adapter::cursor::CursorAdvertisedCatalogObservation> {
     let mut spec = crate::runtime_adapter::cursor::CursorCatalogCommandSpec::new(repo);
-    if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
+    if let Some(program) = explicit_program {
+        spec = spec.with_program(program);
+    } else if let Some(program) = std::env::var_os("MACO_CURSOR_BIN") {
         spec = spec.with_program(program);
     }
     spec = apply_cursor_catalog_env_setting(spec, std::env::var("MACO_CURSOR_ENV"))?;

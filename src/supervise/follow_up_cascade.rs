@@ -600,6 +600,11 @@ pub(super) fn run_generated_follow_up_cascade(
             budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,
             machine_global_retention: Some(retention.clone()),
         };
+        let _runtime_executable_guard = super::runtime_executables::bind_subordinate(
+            repo,
+            &supervisor_template.run_id,
+            &subordinate_run_id,
+        )?;
         let result = if graph_mode {
             let driver = lease_driver
                 .as_ref()

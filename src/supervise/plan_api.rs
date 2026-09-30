@@ -3146,6 +3146,10 @@ impl FrozenHeldOutRuntimeAllowlist {
             .map(|binding| binding.executable.as_path())
     }
 
+    pub(crate) fn bindings(&self) -> &[FrozenHeldOutRuntimeBinding] {
+        &self.bindings
+    }
+
     pub(crate) fn artifact_value(&self) -> Value {
         json!({
             "primary": {
@@ -3181,6 +3185,31 @@ pub(crate) fn freeze_held_out_runtime_allowlist(
     )];
     for (runtime, executable) in additional {
         refuse_held_out_production_runtime_executable_binding(*runtime, executable, options)?;
+        bindings.push((
+            *runtime,
+            assignment_execution::canonicalize_explicit_runtime_executable(executable)?,
+        ));
+    }
+    FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(bindings)
+}
+
+/// Freeze an ordinary supervise run's explicit executable allowlist without
+/// consulting the ambient runtime configuration. The caller must archive this
+/// value before dispatch and use it for every selected launch in the run.
+pub(crate) fn freeze_supervise_runtime_allowlist(
+    primary_runtime: SupervisorRuntime,
+    primary_executable: &Path,
+    additional: &[(SupervisorRuntime, PathBuf)],
+) -> Result<FrozenHeldOutRuntimeAllowlist> {
+    if primary_runtime == SupervisorRuntime::Fake {
+        bail!("explicit supervise runtime bindings refuse Fake as the primary runtime");
+    }
+    refuse_held_out_additional_runtime_bindings(primary_runtime, additional)?;
+    let mut bindings = vec![(
+        primary_runtime,
+        assignment_execution::canonicalize_explicit_runtime_executable(primary_executable)?,
+    )];
+    for (runtime, executable) in additional {
         bindings.push((
             *runtime,
             assignment_execution::canonicalize_explicit_runtime_executable(executable)?,
