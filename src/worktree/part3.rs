@@ -4454,17 +4454,7 @@ fn require_default_group_ignored(
     ] {
         environment.insert(key.to_string(), value.to_string());
     }
-    let args = [
-        OsString::from("--git-dir"),
-        git_dir.as_os_str().to_owned(),
-        OsString::from("--work-tree"),
-        workdir.as_os_str().to_owned(),
-        OsString::from("check-ignore"),
-        OsString::from("--no-index"),
-        OsString::from("--quiet"),
-        OsString::from("--"),
-        OsString::from(rule.trim_start_matches('/')),
-    ];
+    let args = default_group_ignore_args(git_dir, workdir, rule);
     runtime.verify()?;
     let output = run_process(
         ProcessSpec::direct(
@@ -4493,6 +4483,23 @@ fn require_default_group_ignored(
         );
     }
     runtime.verify()
+}
+
+fn default_group_ignore_args(git_dir: &Path, workdir: &Path, rule: &str) -> [OsString; 11] {
+    [
+        // Git otherwise prefixes relative paths with the private runtime cwd.
+        OsString::from("-C"),
+        workdir.as_os_str().to_owned(),
+        OsString::from("--git-dir"),
+        git_dir.as_os_str().to_owned(),
+        OsString::from("--work-tree"),
+        workdir.as_os_str().to_owned(),
+        OsString::from("check-ignore"),
+        OsString::from("--no-index"),
+        OsString::from("--quiet"),
+        OsString::from("--"),
+        OsString::from(rule.trim_start_matches('/')),
+    ]
 }
 
 #[cfg(test)]

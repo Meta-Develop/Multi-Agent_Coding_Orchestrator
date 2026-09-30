@@ -373,38 +373,43 @@ fn default_exclude_post_git_closing_fence_rejects_binding_races() {
 }
 
 #[test]
-fn default_exclude_gitignore_can_defeat_common_exclude() {
+fn default_exclude_gitignore_from_nested_runtime_anchors_paths_and_preserves_negation() {
     let temp = TempDir::new().unwrap();
     let workdir = temp.path().join("repo");
-    fs::create_dir(&workdir).unwrap();
+    let primary = Repository::init(&workdir).unwrap();
     fs::create_dir_all(workdir.join(".maco/worktrees/repo")).unwrap();
-    let preview = Repository::init(temp.path().join("preview")).unwrap();
+    let runtime = primary.commondir().join("maco/state/exclude-preview");
+    fs::create_dir_all(&runtime).unwrap();
+    let preview = Repository::init(runtime.join("git")).unwrap();
+    let rule = "/.maco/worktrees/repo/";
     fs::write(
         preview.commondir().join("info/exclude"),
         "/.maco/worktrees/repo/\n",
     )
     .unwrap();
-    preview.set_workdir(&workdir, false).unwrap();
-    assert!(preview
-        .status_should_ignore(Path::new(".maco/worktrees/repo/"))
-        .unwrap());
-    fs::write(workdir.join(".gitignore"), "!/.maco/worktrees/repo/\n").unwrap();
-    let status = std::process::Command::new("git")
-        .arg("--git-dir")
-        .arg(preview.commondir())
-        .arg("--work-tree")
-        .arg(&workdir)
-        .args([
-            "check-ignore",
-            "--no-index",
-            "--quiet",
-            "--",
-            ".maco/worktrees/repo/",
-        ])
-        .status()
-        .unwrap();
+    let check = |anchored: bool| {
+        let args = default_group_ignore_args(preview.commondir(), &workdir, rule);
+        std::process::Command::new("git")
+            .args(if anchored { &args[..] } else { &args[2..] })
+            .current_dir(&runtime)
+            .env_clear()
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .status()
+            .unwrap()
+    };
     assert_eq!(
-        status.code(),
+        check(false).code(),
+        Some(1),
+        "old cwd prefix reproduces visibility"
+    );
+    assert!(
+        check(true).success(),
+        "production args must anchor the exact group"
+    );
+    fs::write(workdir.join(".gitignore"), "!/.maco/worktrees/repo/\n").unwrap();
+    assert_eq!(
+        check(true).code(),
         Some(1),
         "native Git must honor the .gitignore negation"
     );
