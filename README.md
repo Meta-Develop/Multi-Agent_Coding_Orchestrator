@@ -1017,8 +1017,21 @@ alias behavior is not established as supported, so such roots should not be decl
 The mount policy is intentionally conservative and does not claim to detect every
 conceivable physical alias.
 
-Default linked worktrees are created outside the repository at
-`../.maco/worktrees/<repo-name>/<agent-id>`. Completed task branches can be
+Default linked worktrees are created inside the repository at the stable path
+`.maco/worktrees/<sanitized-repo-name>/<agent-id>`. This keeps generated lanes and
+their Cargo config in the existing runtime-owned area without exempting manual
+`.worktrees` content from primary integrity checks. An explicit `--worktree-root`
+still overrides the root. Implicit default creation registers only
+`/.maco/worktrees/<sanitized-repo-name>/` in checkout-local Git `info/exclude`
+before creating lanes. Conflicting operator negations and unadmitted local Git
+config indirection are refused without changing the exclude file. Explicit
+`--worktree-root` paths remain caller-controlled and receive no automatic ignore.
+Existing lanes are not moved or migrated: to keep creating lanes in the old
+layout, pass `--worktree-root ../.maco/worktrees/<repo-name>` with the original
+sanitized repository group name. Pass that same root to GC or lifecycle commands
+when selecting the old root explicitly. Without an explicit root, GC still
+considers authenticated registered lanes across roots, but searches for
+unregistered leftovers only under the new default. Completed task branches can be
 cleaned with `maco worktree gc`; branch refs remain available for later
 recreation, while dirty, claimed, or leased worktrees are left in place.
 
@@ -2346,10 +2359,11 @@ cargo run -- worktree sweep --workspace /exact/path/to/workspace \
   --apply --keep-targets
 ```
 
-The sweep discovers workspace-managed `.maco/worktrees/<repo>` roots through the
-same default-root function used by managed creation. It also recognizes the
-exact canonical `.worktrees` child of either the workspace repository itself or
-a direct repository child; custom per-creation roots have no persisted
+The sweep authenticates grouped roots at the exact creation default
+`<repo>/.maco/worktrees/<sanitized-repo-name>` and the legacy parent-workspace
+`<repo-parent>/.maco/worktrees/<sanitized-repo-name>` layout. It also recognizes
+the exact canonical manual `.worktrees` child of either the workspace repository
+itself or a direct repository child; custom per-creation roots have no persisted
 repository-level configuration to discover. The aggregate report identifies
 each root kind and distinguishes roots that were inspected from roots skipped
 before GC and roots whose GC attempt failed. `discovery_status` is
@@ -2362,11 +2376,11 @@ root does not stop later roots from being inspected. Retention flags and
 `--max-count` and `--max-total-bytes` are per-root limits and dirty worktrees or
 lanes with active leases or claims remain protected. Existing machine-global quarantine gates
 also remain in force; the sweep does not weaken them. A workspace-managed group
-is associated only when it is the exact result of the creation default-root
-function. In particular, `<repo>/.maco/worktrees` is not adopted as that
-repository's managed root because its creation default is
-`<repo-parent>/.maco/worktrees/<repo>`; sweep the parent workspace for that
-layout, or use the separately validated `<repo>/.worktrees` convention.
+is associated only with one of those exact grouped roots. A primary that is the
+workspace itself is admitted only for its exact new default group; the parent
+workspace still discovers legacy groups and each direct child's new default.
+`<repo>/.maco/worktrees` itself is not adopted as a lane root, and the sweep does
+not search deeper repository descendants.
 
 Repository-local dry-runs also preview healthy Git-registered lanes that predate
 the authenticated MACO worktree registry. A stale linked-worktree child cannot

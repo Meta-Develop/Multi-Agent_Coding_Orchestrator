@@ -2633,6 +2633,15 @@ impl WorktreeManager {
                 );
             }
         }
+        let default_exclude = if options.worktree_root.is_none() {
+            Some(ensure_default_worktree_exclude(
+                &repo,
+                &registry_store,
+                &registry_lock,
+            )?)
+        } else {
+            None
+        };
         let requested_root = options
             .worktree_root
             .unwrap_or_else(|| default_worktree_root(&repo));
@@ -2643,6 +2652,9 @@ impl WorktreeManager {
                 .context("worktree creation requires a non-bare repository")?
                 .join(requested_root)
         };
+        if let Some(exclude) = &default_exclude {
+            exclude.verify()?;
+        }
         let root = SafeRoot::open_or_create_managed(&requested_root)?;
         crate::lane_build::ensure_lane_build_configuration(root.path())?;
         let worktree_path = root.direct_child(&name)?;
@@ -4400,6 +4412,7 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
             .cmp(&right.group)
             .then_with(|| left.worktree_root.cmp(&right.worktree_root))
     });
+    roots.dedup_by(|left, right| left.worktree_root == right.worktree_root);
     let discovery_status = if roots.is_empty() {
         WorktreeSweepDiscoveryStatus::NoRootsDiscovered
     } else {

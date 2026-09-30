@@ -227,6 +227,13 @@ fn git_registered_worktree_names(
             }
         };
         if path.parent() == Some(worktree_root) {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("Git-registered worktree has a non-UTF-8 child name")?;
+            if normalize_agent_id(name)? != name {
+                bail!("Git-registered worktree has a noncanonical child name: {name}");
+            }
             names.insert(name.to_string());
         }
     }
@@ -254,12 +261,26 @@ fn git_registered_worktree_names_for_reconciliation(
         let worktree = repo.find_worktree(name).with_context(|| {
             format!("failed to inspect Git worktree '{name}' during startup reconciliation")
         })?;
-        let path = worktree.path();
-        let belongs_to_root = path.parent() == Some(worktree_root)
-            || fs::canonicalize(path)
-                .ok()
-                .is_some_and(|canonical| canonical.parent() == Some(worktree_root));
-        if belongs_to_root {
+        let path = match fs::canonicalize(worktree.path()) {
+            Ok(path) => path,
+            Err(error) if error.kind() == ErrorKind::NotFound => continue,
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "failed to resolve Git worktree path {} during startup reconciliation",
+                        worktree.path().display()
+                    )
+                })
+            }
+        };
+        if path.parent() == Some(worktree_root) {
+            let name = path
+                .file_name()
+                .and_then(OsStr::to_str)
+                .context("Git-registered worktree has a non-UTF-8 child name")?;
+            if normalize_agent_id(name)? != name {
+                bail!("Git-registered worktree has a noncanonical child name: {name}");
+            }
             names.insert(name.to_string());
         }
     }
@@ -4107,6 +4128,809 @@ fn is_reserved_worktree_root_child(name: impl AsRef<OsStr>) -> bool {
 }
 
 fn default_worktree_root(repo: &Repository) -> PathBuf {
+    let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_path_segment)
+        .unwrap_or_else(|| "repository".to_string());
+    repo_root.join(".maco").join("worktrees").join(repo_name)
+}
+
+fn default_worktree_exclude_rule(repo: &Repository) -> Result<String> {
+    let root = default_worktree_root(repo);
+    let name = root
+        .file_name()
+        .and_then(OsStr::to_str)
+        .context("default root is not UTF-8")?;
+    if name.is_empty()
+        || !name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!("default worktree group is not a literal Git ignore path");
+    }
+    Ok(format!("/.maco/worktrees/{name}/"))
+}
+
+fn append_default_worktree_exclude(prior: &[u8], rule: &str) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(prior).context("Git exclude file is not UTF-8")?;
+    if prior.contains(&0) || prior.len() as u64 > MAX_WORKTREE_GIT_TEXT_FILE_BYTES {
+        bail!("Git exclude file exceeds its bounded text contract");
+    }
+    if text.lines().any(|line| line == rule) {
+        return Ok(prior.to_vec());
+    }
+    let newline: &[u8] = if prior.windows(2).any(|bytes| bytes == b"\r\n") {
+        b"\r\n"
+    } else {
+        b"\n"
+    };
+    let mut next = prior.to_vec();
+    if !next.is_empty() && !next.ends_with(b"\n") {
+        next.extend_from_slice(newline);
+    }
+    next.extend_from_slice(rule.as_bytes());
+    next.extend_from_slice(newline);
+    if next.len() as u64 > MAX_WORKTREE_GIT_TEXT_FILE_BYTES {
+        bail!("default worktree exclusion exceeds the Git text file byte limit");
+    }
+    Ok(next)
+}
+
+// Count the prospective exclude along with the same bounded inputs used by
+// status. Do not admit an over-budget write and discover it only afterward.
+fn validate_default_exclude_text_budget(
+    binding: &RepositoryBindingGuard,
+    additional_bytes: usize,
+    deadline: Instant,
+) -> Result<()> {
+    ensure_worktree_status_deadline(deadline, "before default exclude budget recount")?;
+    let inputs = validate_bounded_git_text_inputs_bound(binding, deadline)?;
+    let mut total = inputs
+        .info_exclude
+        .as_ref()
+        .map_or(0, Vec::len)
+        .saturating_sub(MACO_STATUS_EXCLUDES.len()) as u64;
+    total = total
+        .checked_add(additional_bytes as u64)
+        .context("Git text byte count overflowed")?;
+    ensure_default_exclude_budget(total, deadline)?;
+    let inventory = BoundedTreeWalker::walk_bound_with_options_detailed(
+        binding.worktree_binding(),
+        BoundedTreeWalkLimits {
+            max_depth: 128,
+            max_entries: MAX_WORKTREE_STATUS_ENTRIES,
+            max_path_bytes: MAX_PERSISTED_PATH_BYTES,
+            max_total_path_bytes: MAX_WORKTREE_STATUS_OUTPUT_BYTES.saturating_mul(32),
+            max_duration: remaining_worktree_status_time(
+                deadline,
+                "before default exclude budget",
+            )?,
+            same_device: true,
+        },
+        crate::safe_state::BoundedTreeWalkOptions {
+            stop_at_nested_repositories: true,
+        },
+        |entry| {
+            if entry.relative_path == Path::new(".git")
+                || is_bounded_status_runtime_path(&entry.relative_path)
+            {
+                return Ok(BoundedTreeWalkAction::Skip);
+            }
+            if entry.kind == BoundedTreeEntryKind::Directory {
+                return Ok(BoundedTreeWalkAction::RecordAndDescend);
+            }
+            if matches!(
+                entry.relative_path.file_name().and_then(OsStr::to_str),
+                Some(".gitignore" | ".gitmodules")
+            ) {
+                if !entry.is_safe_regular_file() {
+                    bail!("unsafe Git text input");
+                }
+                return Ok(BoundedTreeWalkAction::Record);
+            }
+            Ok(BoundedTreeWalkAction::Skip)
+        },
+    )?;
+    for entry in inventory
+        .entries
+        .iter()
+        .filter(|entry| entry.kind == BoundedTreeEntryKind::RegularFile)
+    {
+        ensure_worktree_status_deadline(deadline, "during default exclude budget recount")?;
+        total += binding
+            .worktree_binding()
+            .read_relative(&entry.relative_path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?
+            .len() as u64;
+        ensure_default_exclude_budget(total, deadline)?;
+    }
+    for (common, relative) in [
+        (false, "config"),
+        (true, "config"),
+        (true, "config.worktree"),
+    ] {
+        ensure_worktree_status_deadline(deadline, "between default exclude config reads")?;
+        let bytes = if common {
+            binding.read_common_relative_optional(
+                Path::new(relative),
+                MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+            )?
+        } else {
+            binding
+                .read_git_relative_optional(Path::new(relative), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?
+        };
+        total += bytes.as_ref().map_or(0, Vec::len) as u64;
+        ensure_default_exclude_budget(total, deadline)?;
+    }
+    binding.verify_status_generation()
+}
+
+fn ensure_default_exclude_budget(total: u64, deadline: Instant) -> Result<()> {
+    ensure_worktree_status_deadline(deadline, "during default exclude budget recount")?;
+    if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
+        bail!("default worktree exclusion exceeds the Git text aggregate byte limit");
+    }
+    Ok(())
+}
+
+// Use Git's pattern engine without changing the operator's exclude file.
+// Test each common-exclude negation against an otherwise ignored exact group,
+// then test the prospective file against the actual worktree .gitignore inputs.
+fn validate_default_exclude_patterns(
+    preview: &SafeRoot,
+    workdir: &Path,
+    prior: &[u8],
+    next: &[u8],
+    rule: &str,
+    runtime: &SafeRoot,
+    deadline: Instant,
+) -> Result<()> {
+    let info = SafeRoot::open_existing(preview.path().join("info"))?;
+    let empty = runtime.reserve_direct_child_directory("empty-worktree")?;
+    let negations = default_exclude_negation_probe(prior, rule, deadline)?;
+    AtomicStateWriter::write_direct(&info, "exclude", &negations)?;
+    require_default_group_ignored(preview.path(), empty.path(), rule, runtime, deadline)
+        .context("operator Git exclude negation conflicts with the default worktree group")?;
+    AtomicStateWriter::write_direct(&info, "exclude", next)?;
+    require_default_group_ignored(preview.path(), workdir, rule, runtime, deadline)
+}
+
+fn default_exclude_negation_probe(prior: &[u8], rule: &str, deadline: Instant) -> Result<Vec<u8>> {
+    ensure_worktree_status_deadline(deadline, "before default exclude negation probe")?;
+    let mut probe = format!("{rule}\n").into_bytes();
+    for line in std::str::from_utf8(prior)?.lines() {
+        ensure_worktree_status_deadline(deadline, "during default exclude negation probe")?;
+        if line.starts_with('!') {
+            probe.extend_from_slice(line.as_bytes());
+            probe.push(b'\n');
+        }
+    }
+    if probe.len() as u64 > MAX_WORKTREE_GIT_TEXT_FILE_BYTES {
+        bail!("Git negation probe exceeds its text bound");
+    }
+    Ok(probe)
+}
+
+#[derive(Default)]
+struct DefaultExcludeLocalConfig {
+    ignore_case: Option<bool>,
+    worktree_config: Option<bool>,
+}
+
+// Admit only literal, single-line syntax before any layered config read.
+fn parse_default_exclude_local_config(bytes: &[u8]) -> Result<DefaultExcludeLocalConfig> {
+    if bytes.len() as u64 > MAX_WORKTREE_GIT_TEXT_FILE_BYTES || bytes.contains(&0) {
+        bail!("default exclusion Git config exceeds its bounded text contract");
+    }
+    let text = std::str::from_utf8(bytes).context("default exclusion Git config is not UTF-8")?;
+    let mut config = DefaultExcludeLocalConfig::default();
+    let mut section = String::new();
+    for raw in text.lines() {
+        let mut quoted = false;
+        let mut end = raw.len();
+        for (offset, ch) in raw.char_indices() {
+            match ch {
+                '\\' => bail!("Git config escapes and multiline continuations are not admitted for default exclusion"),
+                '"' => quoted = !quoted,
+                '#' | ';' if !quoted => { end = offset; break; },
+                _ => {},
+            }
+        }
+        if quoted {
+            bail!("unclosed Git config quote");
+        }
+        let line = raw[..end].trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.starts_with('[') {
+            let body = line
+                .strip_prefix('[')
+                .and_then(|line| line.strip_suffix(']'))
+                .context("unadmitted Git config section syntax")?
+                .trim();
+            let name_end = body
+                .find(|ch: char| ch.is_ascii_whitespace() || ch == '.')
+                .unwrap_or(body.len());
+            let name = &body[..name_end];
+            if name.is_empty() || !name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-') {
+                bail!("unadmitted Git config section name");
+            }
+            section = name.to_ascii_lowercase();
+            if matches!(section.as_str(), "include" | "includeif") {
+                bail!("Git config include indirection is not admitted for default exclusion");
+            }
+            let rest = body[name_end..].trim();
+            if !rest.is_empty() {
+                if matches!(section.as_str(), "core" | "extensions") {
+                    bail!("Git core/extensions subsections are not admitted for default exclusion");
+                }
+                if !(rest.len() >= 2
+                    && rest.starts_with('"')
+                    && rest.ends_with('"')
+                    && !rest[1..rest.len() - 1].contains('"'))
+                {
+                    bail!("unadmitted Git config subsection syntax");
+                }
+            }
+            continue;
+        }
+        if section.is_empty() {
+            bail!("Git config key has no admitted section");
+        }
+        let (key, value) = line
+            .split_once('=')
+            .map_or((line.trim(), None), |(key, value)| {
+                (key.trim(), Some(value.trim()))
+            });
+        if key.is_empty()
+            || !key.as_bytes()[0].is_ascii_alphabetic()
+            || !key.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+        {
+            bail!("unadmitted Git config key syntax");
+        }
+        if section == "core" && key.eq_ignore_ascii_case("excludesfile") {
+            bail!("Git core.excludesFile indirection is not admitted for default exclusion");
+        }
+        let slot = if section == "core" && key.eq_ignore_ascii_case("ignorecase") {
+            Some(&mut config.ignore_case)
+        } else if section == "extensions" && key.eq_ignore_ascii_case("worktreeconfig") {
+            Some(&mut config.worktree_config)
+        } else {
+            None
+        };
+        if let Some(slot) = slot {
+            if slot.is_some() {
+                bail!("duplicate Git config policy key");
+            }
+            let value = value.unwrap_or("true");
+            let value = value
+                .strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+                .unwrap_or(value);
+            *slot = Some(match value.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => true,
+                "false" | "no" | "off" | "0" => false,
+                _ => bail!("Git config policy boolean is not admitted"),
+            });
+        }
+    }
+    Ok(config)
+}
+
+fn admitted_default_exclude_ignorecase(common: &[u8], worktree: Option<&[u8]>) -> Result<bool> {
+    let common = parse_default_exclude_local_config(common)?;
+    let worktree = worktree
+        .map(parse_default_exclude_local_config)
+        .transpose()?;
+    if worktree.is_some() && common.worktree_config != Some(true) {
+        bail!("Git config.worktree is not admitted without extensions.worktreeConfig");
+    }
+    Ok(worktree
+        .and_then(|config| config.ignore_case)
+        .or(common.ignore_case)
+        .unwrap_or(false))
+}
+
+// libgit2 drops a negation that has no preceding positive pattern in the same
+// file. Native Git must decide the effective cross-file ignore precedence.
+fn require_default_group_ignored(
+    git_dir: &Path,
+    workdir: &Path,
+    rule: &str,
+    runtime: &SafeRoot,
+    deadline: Instant,
+) -> Result<()> {
+    let git = crate::merge::resolve_trusted_executable("git")?;
+    let mut environment = BTreeMap::new();
+    for (key, value) in [
+        ("GIT_CONFIG_NOSYSTEM", "1"),
+        ("GIT_CONFIG_GLOBAL", "/dev/null"),
+        ("GIT_OPTIONAL_LOCKS", "0"),
+        ("GIT_TERMINAL_PROMPT", "0"),
+        ("LANG", "C"),
+        ("LC_ALL", "C"),
+    ] {
+        environment.insert(key.to_string(), value.to_string());
+    }
+    let args = default_group_ignore_args(git_dir, workdir, rule);
+    runtime.verify()?;
+    let output = run_process(
+        ProcessSpec::direct(
+            "default worktree Git exclusion",
+            git,
+            args,
+            runtime.path(),
+            4096,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_stdin(StdinMode::Null)
+        .with_timeout(Some(
+            remaining_worktree_status_time(deadline, "before default exclude Git check")?
+                .min(WORKTREE_STATUS_COMMAND_TIMEOUT),
+        ))
+        .with_containment(ContainmentPolicy::TrustedBestEffort),
+    )?;
+    if output.timed_out || output.stdout.is_truncated() || output.stderr.is_truncated() {
+        bail!("default worktree Git exclusion exceeded its time/output bound");
+    }
+    require_bounded_git_process(&output, BoundedGitIsolation::Trusted)?;
+    if !output.status.is_some_and(|status| status.success()) {
+        bail!(
+            "operator Git ignore configuration leaves the default worktree group visible: {}",
+            output.stderr.summarize_chars(512).text
+        );
+    }
+    runtime.verify()
+}
+
+fn default_group_ignore_args(git_dir: &Path, workdir: &Path, rule: &str) -> [OsString; 11] {
+    [
+        // Git otherwise prefixes relative paths with the private runtime cwd.
+        OsString::from("-C"),
+        workdir.as_os_str().to_owned(),
+        OsString::from("--git-dir"),
+        git_dir.as_os_str().to_owned(),
+        OsString::from("--work-tree"),
+        workdir.as_os_str().to_owned(),
+        OsString::from("check-ignore"),
+        OsString::from("--no-index"),
+        OsString::from("--quiet"),
+        OsString::from("--"),
+        OsString::from(rule.trim_start_matches('/')),
+    ]
+}
+
+#[cfg(test)]
+fn reject_default_exclude_negations(
+    preview: &Repository,
+    prior: &[u8],
+    rule: &str,
+    deadline: Instant,
+) -> Result<()> {
+    ensure_worktree_status_deadline(deadline, "before Git pattern evaluation")?;
+    let relative = Path::new(
+        rule.strip_prefix('/')
+            .context("unanchored default exclude")?,
+    );
+    for line in std::str::from_utf8(prior)?
+        .lines()
+        .filter(|line| line.starts_with('!'))
+    {
+        ensure_worktree_status_deadline(deadline, "between Git pattern evaluations")?;
+        preview.clear_ignore_rules()?;
+        preview.add_ignore_rule(&format!("{rule}\n{line}\n"))?;
+        if !preview.status_should_ignore(relative)? {
+            bail!("operator Git exclude negation conflicts with the default worktree group");
+        }
+        ensure_worktree_status_deadline(deadline, "after Git pattern evaluation")?;
+    }
+    preview.clear_ignore_rules()?;
+    Ok(())
+}
+
+fn ensure_default_worktree_exclude(
+    repo: &Repository,
+    store: &ManagedWorktreeRegistryStore,
+    lock: &ManagedWorktreeRegistryLock,
+) -> Result<RegularFileBindingGuard> {
+    store.verify_lock(lock)?;
+    // Refuse indirection using authenticated, held metadata before libgit2 can
+    // open the repository and follow config includes.
+    let common = DirectoryBindingGuard::bind(&store.repository.common_dir)?;
+    if common.identity() != &store.repository.common_dir_identity
+        || common.path().parent() != Some(store.repository.repository_workdir.as_path())
+    {
+        bail!("default worktree exclusion requires the authenticated primary repository");
+    }
+    let config = RegularFileBindingGuard::bind(
+        common.path().join("config"),
+        MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+    )?;
+    let worktree_config_path = common.path().join("config.worktree");
+    let worktree_config = match fs::symlink_metadata(&worktree_config_path) {
+        Ok(_) => Some(RegularFileBindingGuard::bind(
+            &worktree_config_path,
+            MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+        )?),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to bind Git worktree config"),
+    };
+    let ignore_case = admitted_default_exclude_ignorecase(
+        config.contents(),
+        worktree_config
+            .as_ref()
+            .map(RegularFileBindingGuard::contents),
+    )?;
+    let verify_config = || -> Result<()> {
+        common.verify()?;
+        config.verify()?;
+        if let Some(config) = &worktree_config {
+            config.verify()?;
+        } else {
+            match fs::symlink_metadata(&worktree_config_path) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                _ => bail!("Git worktree config appeared during default exclusion"),
+            }
+        }
+        if common.read_relative(Path::new("config"), MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?
+            != config.contents()
+            || common
+                .read_relative_optional(
+                    Path::new("config.worktree"),
+                    MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+                )?
+                .as_deref()
+                != worktree_config
+                    .as_ref()
+                    .map(RegularFileBindingGuard::contents)
+        {
+            bail!("Git config changed during default exclusion");
+        }
+        Ok(())
+    };
+    verify_config()?;
+    let binding = RepositoryBindingGuard::bind(&store.repository.repository_workdir)?;
+    verify_config()?;
+    if managed_repository_binding(repo)? != store.repository
+        || binding.worktree.path() != store.repository.repository_workdir
+        || binding.worktree.identity() != &store.repository.repository_workdir_identity
+        || binding.common_dir.path() != common.path()
+        || binding.common_dir.identity() != common.identity()
+        || binding.git_dir.path() != binding.common_dir.path()
+    {
+        bail!("default worktree exclusion requires the authenticated primary repository");
+    }
+    let root_bindings = preflight_default_worktree_root(&binding, repo)?;
+    let ignore_files = bind_default_ignore_ancestors(&binding)?;
+    let ancestor_bytes = ignore_files
+        .iter()
+        .filter(|(path, _)| path != Path::new(".gitignore"))
+        .map(|(_, file)| file.as_ref().map_or(0, |file| file.contents().len()))
+        .sum::<usize>();
+    let info = SafeRoot::open_existing(binding.common_dir().join("info"))?;
+    let exclude = info.direct_child("exclude")?;
+    let old_metadata = match fs::symlink_metadata(&exclude) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == ErrorKind::NotFound => None,
+        Err(error) => return Err(error).context("failed to inspect common Git exclude"),
+    };
+    #[cfg(unix)]
+    if old_metadata
+        .as_ref()
+        .is_some_and(|metadata| metadata.uid() != unsafe { libc::geteuid() })
+    {
+        bail!("common Git exclude is not owned by the current operator");
+    }
+    let old = old_metadata
+        .as_ref()
+        .map(|_| RegularFileBindingGuard::bind(&exclude, MAX_WORKTREE_GIT_TEXT_FILE_BYTES))
+        .transpose()?;
+    #[cfg(unix)]
+    let old_metadata = old
+        .as_ref()
+        .map(|old| -> Result<fs::Metadata> {
+            let metadata = fs::symlink_metadata(&exclude)?;
+            old.verify()?;
+            #[cfg(unix)]
+            if metadata.uid() != unsafe { libc::geteuid() }
+                || metadata.permissions().mode() & 0o022 != 0
+            {
+                bail!("common Git exclude ownership or write permissions are unsafe");
+            }
+            Ok(metadata)
+        })
+        .transpose()?;
+    let prior = binding.read_common_relative_optional(
+        Path::new("info/exclude"),
+        MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+    )?;
+    if prior.as_deref() != old.as_ref().map(RegularFileBindingGuard::contents) {
+        bail!("common Git exclude changed while binding it");
+    }
+    let rule = default_worktree_exclude_rule(repo)?;
+    let next = append_default_worktree_exclude(prior.as_deref().unwrap_or_default(), &rule)?;
+    let deadline = Instant::now() + WORKTREE_GC_STATUS_TIMEOUT;
+    validate_default_exclude_text_budget(
+        &binding,
+        next.len()
+            .saturating_sub(prior.as_ref().map_or(0, Vec::len))
+            + ancestor_bytes,
+        deadline,
+    )?;
+    let scratch = store
+        .state_root
+        .reserve_random_direct_child_directory("maco-exclude-preview")?;
+    let result = (|| -> Result<RegularFileBindingGuard> {
+        let runtime = SafeRoot::open_existing(scratch.path())?;
+        let preview_directory = runtime.reserve_direct_child_directory("git")?;
+        let preview = SafeRoot::open_existing(preview_directory.path())?;
+        for child in ["objects", "refs", "info"] {
+            preview.reserve_direct_child_directory(child)?;
+        }
+        AtomicStateWriter::write_direct(
+            &preview,
+            "HEAD",
+            b"ref: refs/heads/maco-exclude-preview\n",
+        )?;
+        AtomicStateWriter::write_direct(
+            &preview,
+            "config",
+            format!(
+                "[core]\nrepositoryformatversion = 0\nbare = false\nignorecase = {ignore_case}\n"
+            )
+            .as_bytes(),
+        )?;
+        verify_config()?;
+        validate_default_exclude_patterns(
+            &preview,
+            binding.worktree(),
+            prior.as_deref().unwrap_or_default(),
+            &next,
+            &rule,
+            &runtime,
+            deadline,
+        )?;
+        let evidence = crate::secure_output::SecureOutputRoot::open_private(scratch.path())?;
+        let mut prior_slot = evidence.reserve(OsStr::new("prior-exclude"))?;
+        prior_slot.write_bytes_atomic(
+            prior.as_deref().unwrap_or_default(),
+            MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize,
+        )?;
+        let mut next_slot = evidence.reserve(OsStr::new("next-exclude"))?;
+        next_slot.write_bytes_atomic(&next, MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize)?;
+        let mut replaced = false;
+        let mut installed = None;
+        let mut fence = || -> Result<()> {
+            store.verify_lock(lock)?;
+            verify_config()?;
+            binding.verify()?;
+            info.verify()?;
+            verify_default_worktree_root(&root_bindings, &binding, repo)?;
+            verify_default_ignore_ancestors(&binding, &ignore_files)?;
+            if !replaced {
+                #[cfg(test)]
+                run_default_exclude_before_write_hook(&exclude);
+                if let Some(old) = &old {
+                    old.verify()?;
+                } else {
+                    info.ensure_direct_child_absent("exclude")?;
+                }
+                let observed = binding.read_common_relative_optional(
+                    Path::new("info/exclude"),
+                    MAX_WORKTREE_GIT_TEXT_FILE_BYTES,
+                )?;
+                if observed != prior
+                    || observed.as_deref().unwrap_or_default()
+                        != prior_slot.read_bounded(MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize)?
+                {
+                    bail!("operator Git exclude changed before replacement");
+                }
+                replaced = true;
+            } else {
+                let new =
+                    RegularFileBindingGuard::bind(&exclude, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
+                if new.contents()
+                    != next_slot.read_bounded(MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize)?
+                {
+                    bail!("common Git exclude changed after replacement");
+                }
+                #[cfg(unix)]
+                if prior.as_deref() != Some(next.as_slice()) {
+                    if let Some(metadata) = &old_metadata {
+                        info.bind_owned_direct_child(
+                            "exclude",
+                            new.identity(),
+                            crate::safe_state::DirectChildType::SingleLinkRegularFile,
+                        )?
+                        .set_permissions_fenced(&info, metadata.permissions().mode() & 0o7777)?;
+                    }
+                }
+                let new =
+                    RegularFileBindingGuard::bind(&exclude, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
+                if new.contents()
+                    != next_slot.read_bounded(MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize)?
+                {
+                    bail!("common Git exclude changed after replacement");
+                }
+                validate_default_exclude_text_budget(&binding, ancestor_bytes, deadline)?;
+                verify_config()?;
+                require_default_group_ignored(
+                    binding.common_dir(),
+                    binding.worktree(),
+                    &rule,
+                    &runtime,
+                    deadline,
+                )?;
+                #[cfg(test)]
+                run_default_exclude_after_git_hook(binding.worktree());
+                store.verify_lock(lock)?;
+                verify_config()?;
+                info.verify()?;
+                verify_default_worktree_root(&root_bindings, &binding, repo)?;
+                verify_default_ignore_ancestors(&binding, &ignore_files)?;
+                new.verify()?;
+                verify_config()?;
+                binding.verify()?;
+                installed = Some(new);
+            }
+            Ok(())
+        };
+        if prior.as_deref() == Some(next.as_slice()) {
+            fence()?;
+            fence()?;
+        } else {
+            AtomicStateWriter::write_direct_fenced(&info, "exclude", &next, &mut fence)?;
+        }
+        installed.context("missing default worktree exclude evidence")
+    })();
+    scratch.verify(&store.state_root)?;
+    if result.is_err() {
+        return result.with_context(|| {
+            format!(
+                "default exclusion refused; inspection evidence retained at {}",
+                scratch.path().display()
+            )
+        });
+    }
+    remove_direct_child_tree(
+        &store.state_root,
+        scratch.path().file_name().context("missing preview name")?,
+        Some(scratch.identity()),
+        TreeLinkPolicy::RejectLinksAndSpecialFiles,
+    )?;
+    result
+}
+
+// Opening every existing component separately proves ownership and prevents a
+// linked or foreign-owned default store from causing an exclude mutation.
+fn preflight_default_worktree_root(
+    binding: &RepositoryBindingGuard,
+    repo: &Repository,
+) -> Result<Vec<SafeRoot>> {
+    let root = default_worktree_root(repo);
+    let relative = root
+        .strip_prefix(binding.worktree())
+        .context("default worktree root escaped its repository")?;
+    let mut path = binding.worktree().to_path_buf();
+    let mut held = Vec::new();
+    #[cfg(target_os = "linux")]
+    let primary_mount = SafeRoot::open_existing(binding.worktree())?.linux_mount_id()?;
+    for component in relative.components() {
+        let std::path::Component::Normal(name) = component else {
+            bail!("unsafe default root component");
+        };
+        path.push(name);
+        match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let root = SafeRoot::open_existing(&path)?;
+                if root.identity().device != binding.worktree.identity().device {
+                    bail!("default root crosses the repository filesystem");
+                }
+                #[cfg(target_os = "linux")]
+                root.verify_linux_mount_id(primary_mount)?;
+                held.push(root);
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => break,
+            Err(error) => return Err(error).context("failed to preflight default worktree root"),
+        }
+    }
+    binding.verify_status_generation()?;
+    Ok(held)
+}
+
+fn verify_default_worktree_root(
+    held: &[SafeRoot],
+    binding: &RepositoryBindingGuard,
+    repo: &Repository,
+) -> Result<()> {
+    for root in held {
+        root.verify()?;
+    }
+    let rebound = preflight_default_worktree_root(binding, repo)?;
+    if rebound.len() != held.len()
+        || rebound
+            .iter()
+            .zip(held)
+            .any(|(a, b)| a.identity() != b.identity())
+    {
+        bail!("default worktree root changed before exclude mutation");
+    }
+    Ok(())
+}
+
+type DefaultIgnoreFiles = Vec<(PathBuf, Option<RegularFileBindingGuard>)>;
+
+fn bind_default_ignore_ancestors(binding: &RepositoryBindingGuard) -> Result<DefaultIgnoreFiles> {
+    [
+        ".gitignore",
+        ".maco/.gitignore",
+        ".maco/worktrees/.gitignore",
+    ]
+    .into_iter()
+    .map(|relative| {
+        let path = binding.worktree().join(relative);
+        let file = match fs::symlink_metadata(&path) {
+            Ok(_) => {
+                let file = RegularFileBindingGuard::bind(path, MAX_WORKTREE_GIT_TEXT_FILE_BYTES)?;
+                std::str::from_utf8(file.contents()).context("Git ignore file is not UTF-8")?;
+                Some(file)
+            }
+            Err(error) if error.kind() == ErrorKind::NotFound => None,
+            Err(error) => return Err(error).context("failed to bind default root ignore input"),
+        };
+        Ok((PathBuf::from(relative), file))
+    })
+    .collect()
+}
+
+fn verify_default_ignore_ancestors(
+    binding: &RepositoryBindingGuard,
+    files: &[(PathBuf, Option<RegularFileBindingGuard>)],
+) -> Result<()> {
+    for (relative, file) in files {
+        if let Some(file) = file {
+            file.verify()?;
+        } else {
+            match fs::symlink_metadata(binding.worktree().join(relative)) {
+                Err(error) if error.kind() == ErrorKind::NotFound => {}
+                _ => bail!("default root ignore input appeared during exclusion"),
+            }
+        }
+    }
+    binding.verify_status_generation()
+}
+
+#[cfg(test)]
+type DefaultExcludeBeforeWriteHook = Box<dyn FnOnce(&Path)>;
+
+#[cfg(test)]
+thread_local! {
+    static DEFAULT_EXCLUDE_BEFORE_WRITE_HOOK: std::cell::RefCell<Option<DefaultExcludeBeforeWriteHook>> = const { std::cell::RefCell::new(None) };
+    static DEFAULT_EXCLUDE_AFTER_GIT_HOOK: std::cell::RefCell<Option<DefaultExcludeBeforeWriteHook>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+fn run_default_exclude_before_write_hook(path: &Path) {
+    DEFAULT_EXCLUDE_BEFORE_WRITE_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+#[cfg(test)]
+fn run_default_exclude_after_git_hook(path: &Path) {
+    DEFAULT_EXCLUDE_AFTER_GIT_HOOK.with(|slot| {
+        if let Some(hook) = slot.borrow_mut().take() {
+            hook(path);
+        }
+    });
+}
+
+// Authenticate the pre-repository-local layout without changing creation defaults.
+fn legacy_workspace_worktree_root(repo: &Repository) -> PathBuf {
     let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
     let repo_name = repo_root
         .file_name()
