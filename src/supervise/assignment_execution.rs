@@ -1162,7 +1162,7 @@ fn prepare_assignment_execution<'a>(
                     artifacts,
                     &effective_assignment,
                     &requested_plan.assignments,
-                    repo,
+                    (repo, context.assignment_metadata),
                     options.runtime,
                     *execution_runtime,
                     *worktree_creation,
@@ -2076,6 +2076,22 @@ fn prepare_child_attempt<'a>(
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
     };
+    let source_inputs = assignment_metadata
+        .source_inputs
+        .get(&assignment.id)
+        .cloned()
+        .unwrap_or_default();
+    let attempt_prompt = if source_inputs.is_empty() {
+        attempt_prompt
+    } else {
+        crate::external_agent::researcher_inputs::validate_snapshot(
+            &worktree.path,
+            &source_inputs,
+        )?;
+        format!("{attempt_prompt}\n\nOperator-declared read-only source inputs (relative to this managed workspace):\n{}\nInspect these exact files. Hash/visibility receipts prove preparation only, not source inspection or acceptance. Do not infer access to any external path from prose.\n", serde_json::to_string_pretty(&source_inputs)?)
+    };
+    // The messaging verifier requires this static appendix at the exact end of
+    // the manifested prompt, after source context and any retry instructions.
     let attempt_prompt = if launch_runtime_binds_assignment_messaging(launch_runtime) {
         crate::external_agent::render_prompt_with_assignment_messaging_protocol_appendix(
             attempt_prompt,
@@ -2160,6 +2176,10 @@ fn prepare_child_attempt<'a>(
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
     };
+    for input in &source_inputs {
+        command = command.with_read_only_input_file(worktree.path.join(&input.path));
+    }
+    command.researcher_source_inputs = source_inputs;
     command = command.with_writable_launch_target(match execution_target {
         Some(SupervisorExecutionTarget::PrimaryWorktree { .. }) => {
             crate::runtime_adapter::WritableLaunchTarget::PrimaryWorktree
@@ -2262,7 +2282,7 @@ fn prepare_child_attempt<'a>(
         &budget_plan,
         budget_config,
         budget_ledger,
-        assignment.role,
+        (assignment.role, launch_runtime),
         &command,
         &context.cancellation,
     )? {
@@ -3065,14 +3085,10 @@ fn dispatch_and_capture_child_attempt<'a>(
     };
     let environment_blocked = external_run.environment_blocked();
     let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
-    match usage_settlement.reliable_usage() {
-        Some(usage) => {
-            outcome.usage_samples.push(RoleUsageSample {
-                role: assignment.role,
-                lens_id: None,
-                model: command.model.clone(),
-                usage,
-            });
+    match usage_settlement.role_sample(assignment.role, None) {
+        Some(sample) => {
+            let usage = sample.usage;
+            outcome.usage_samples.push(sample);
             record_and_persist_live_invocation(
                 artifacts,
                 LiveInvocationObservation {
@@ -4352,7 +4368,7 @@ fn prepare_parent_auditor<'a>(
         plan,
         budget_config,
         budget_ledger,
-        AgentRole::Auditor,
+        (AgentRole::Auditor, launch_runtime),
         &auditor_command,
         &context.cancellation,
     )? {
@@ -4402,13 +4418,6 @@ fn prepare_parent_auditor<'a>(
             return Ok(ParentAuditorPreparation::GateComplete { verdict });
         }
     };
-    if auditor_command.uses_live_app_server_budget() {
-        auditor_command.bind_live_token_grant(
-            auditor_budget_reservation
-                .ledger
-                .live_token_grant(auditor_budget_reservation.reservation.id)?,
-        );
-    }
     let grant = admit_parent_auditor_process_intent(
         options.run_id.as_str(),
         auditor_id.as_str(),
@@ -4451,6 +4460,32 @@ struct ParentAuditorDispatchFrame<'a> {
     auditor_attempt: usize,
     review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
     dated_plan_pricing: &'a BTreeMap<String, ModelPricing>,
+}
+
+// A grant authenticates the exact launch, including the final duration. Parent
+// validation may shorten that duration after preparation; bind only afterward.
+fn finalize_parent_auditor_budget(
+    command: &mut ExternalAgentCommand,
+    reservation: &DispatchBudgetReservation<'_>,
+    authority: Option<&held_out::ParentValidationAuthority>,
+    cancellation: &ProcessCancellation,
+    auditor_id: &str,
+) -> Result<()> {
+    if let Some(authority) = authority {
+        command.timeout = command
+            .timeout
+            .min(authority.admit(auditor_id, cancellation)?);
+    }
+    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget()
+    {
+        command.bind_live_token_grant(
+            reservation
+                .ledger
+                .live_token_grant(reservation.reservation.id)?,
+        );
+    }
+    Ok(())
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -4515,22 +4550,23 @@ fn dispatch_and_collect_parent_auditor(
         lifecycle_event_payload("running", Some(auditor_attempt), None),
     )?;
 
-    if let Some(authority) = &context.assignment_metadata.parent_validation {
-        match authority.admit(&auditor_id, cancellation) {
-            Ok(remaining) => auditor_command.timeout = auditor_command.timeout.min(remaining),
-            Err(error) => {
-                drop(auditor_incoming_root);
-                drop(auditor_capture_root);
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    discard_invocation_scratches(
-                        writer,
-                        &auditor_incoming_scratch,
-                        &auditor_capture_scratch,
-                    )
-                })?;
-                return Err(error);
-            }
-        }
+    if let Err(error) = finalize_parent_auditor_budget(
+        &mut auditor_command,
+        &auditor_budget_reservation,
+        context.assignment_metadata.parent_validation.as_ref(),
+        cancellation,
+        &auditor_id,
+    ) {
+        drop(auditor_incoming_root);
+        drop(auditor_capture_root);
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            discard_invocation_scratches(
+                writer,
+                &auditor_incoming_scratch,
+                &auditor_capture_scratch,
+            )
+        })?;
+        return Err(error);
     }
     let auditor_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
@@ -4630,14 +4666,10 @@ fn dispatch_and_collect_parent_auditor(
         .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
         auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
-    match usage_settlement.reliable_usage() {
-        Some(usage) => {
-            outcome.usage_samples.push(RoleUsageSample {
-                role: AgentRole::Auditor,
-                lens_id: Some(lens.id.clone()),
-                model: auditor_command.model.clone(),
-                usage,
-            });
+    match usage_settlement.role_sample(AgentRole::Auditor, Some(lens.id.clone())) {
+        Some(sample) => {
+            let usage = sample.usage;
+            outcome.usage_samples.push(sample);
             record_and_persist_live_invocation(
                 artifacts,
                 LiveInvocationObservation {
@@ -6060,7 +6092,390 @@ mod decomposition_tests {
     use std::time::Instant;
     use std::{ffi::OsString, sync::MutexGuard};
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_auditor_final_deadline_binding_and_prelaunch_refund() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
+        let writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+            temp.path(),
+            RunArtifactFamily::Supervise,
+            RunId::new("auditor-deadline")?,
+            "test",
+        )?));
+        let binding = held_out::HeldOutRunBinding {
+            manifest_sha256: "a".repeat(64),
+            profile_sha256: "b".repeat(64),
+            profile_id: "profile".into(),
+            repetition: 0,
+            experiment_run_id: "experiment".into(),
+            supervisor_run_id: "auditor-deadline".into(),
+            assignment_id: "child-a".into(),
+            baseline_head: "c".repeat(40),
+            baseline_tree: "d".repeat(40),
+        };
+        for expired in [false, true] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            })?;
+            let BudgetAdmission::Admitted { reservation, .. } =
+                ledger.reserve(BudgetReservationRequest {
+                    role: AgentRole::Auditor,
+                    tokens: 16_384,
+                    cost_usd: None,
+                })?
+            else {
+                panic!("admission");
+            };
+            let held = DispatchBudgetReservation {
+                ledger: &ledger,
+                reservation,
+                pricing: None,
+                model_pricing: BTreeMap::new(),
+                state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex),
+            };
+            let authority = held_out::ParentValidationAuthority::new(
+                binding.clone(),
+                Vec::new(),
+                Instant::now()
+                    + if expired {
+                        Duration::ZERO
+                    } else {
+                        Duration::from_secs(30)
+                    },
+                1,
+                Arc::clone(&writer),
+            );
+            let mut command = ExternalAgentCommand::codex(
+                "codex",
+                temp.path(),
+                "prompt",
+                "events",
+                "output",
+                Duration::from_secs(240),
+            )
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_agent_lifecycle(temp.path(), "auditor", "auditor-deadline", "lens-0");
+            assert!(command.live_token_grant_for_test().is_none());
+            let result = finalize_parent_auditor_budget(
+                &mut command,
+                &held,
+                Some(&authority),
+                &ProcessCancellation::new(),
+                "lens-0",
+            );
+            if expired {
+                assert!(result.is_err());
+                assert_eq!(authority.dispatches()?, 0);
+                assert!(command.live_token_grant_for_test().is_none());
+            } else {
+                result?;
+                assert!(
+                    command.timeout > Duration::ZERO && command.timeout <= Duration::from_secs(30)
+                );
+                assert_eq!(authority.dispatches()?, 1);
+                // This accessor verifies the complete bound launch, including its clamped timeout.
+                assert_eq!(
+                    command.live_token_grant_for_test().unwrap().tokens(),
+                    220_000
+                );
+            }
+            // The real dispatch helper has not marked invocation; either failure or abandonment
+            // must release the reservation without inventing provider usage.
+            drop(held);
+            let report = ledger.report()?;
+            assert_eq!(report.consumed.tokens, 0);
+            assert_eq!(report.reserved.tokens, 0);
+            assert_eq!(report.active_reservations, 0);
+            assert!(report.usage_complete);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn observed_auditor_non_codex_reservations_preserve_concurrent_admission() -> Result<()> {
+        for runtime in [
+            SupervisorRuntime::Fake,
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(100),
+                ..Default::default()
+            })?;
+            let request = BudgetReservationRequest {
+                role: AgentRole::Auditor,
+                tokens: 50,
+                cost_usd: None,
+            };
+            let BudgetAdmission::Admitted { reservation, .. } = ledger.reserve(request.clone())?
+            else {
+                panic!("first admission");
+            };
+            let held = DispatchBudgetReservation {
+                ledger: &ledger,
+                reservation,
+                pricing: None,
+                model_pricing: BTreeMap::new(),
+                state: DispatchBudgetReservationState::Reserved(runtime),
+            };
+            // Fake uses a Codex-shaped command. The selected reservation runtime, not its
+            // shape/model label, decides whether this launch holds the live hard balance.
+            let mut command = ExternalAgentCommand::codex(
+                "codex",
+                ".",
+                "prompt",
+                "events",
+                "output",
+                Duration::from_secs(240),
+            )
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_agent_lifecycle(".", "auditor", "runtime-boundary", "lens-0");
+            assert!(command.uses_live_app_server_budget());
+            finalize_parent_auditor_budget(
+                &mut command,
+                &held,
+                None,
+                &ProcessCancellation::new(),
+                "lens-0",
+            )?;
+            assert!(command.live_token_grant_for_test().is_none(), "{runtime:?}");
+            let BudgetAdmission::Admitted {
+                reservation: other, ..
+            } = ledger.reserve(request)?
+            else {
+                panic!("{runtime:?} deprived a concurrent reservation");
+            };
+            assert_eq!(ledger.report()?.reserved.tokens, 100);
+            ledger.release(other.id)?;
+            drop(held);
+            assert_eq!(ledger.report()?.active_reservations, 0);
+            assert_eq!(ledger.report()?.consumed.tokens, 0);
+        }
+        Ok(())
+    }
+
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(target_os = "linux")]
+    fn verify_prepared_researcher_messaging_prompt(with_source_inputs: bool) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = temp.path().join("repo");
+        Repository::init(&repo)?;
+        let contents = "# Research source\nRead this tracked source without modifying it.\n";
+        fs::write(repo.join("README.md"), contents)?;
+        commit_fixture_repository(&repo);
+        drop(crate::artifacts::repository_auth_writer(&repo)?);
+        let mut plan_value = serde_json::json!({
+            "task": "Read the assigned source and report cited findings without changes.",
+            "max_depth": 2, "max_child_assignments": 1, "max_child_retries": 0,
+            "max_gate_corrections": 0, "child_timeout_seconds": 10,
+            "semantic_coordination": "off",
+            "role_models": {
+                "researcher": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+            },
+            "assignments": [{
+                "id": "researcher-prompt-order", "phase": "execution", "runtime": "codex",
+                "role": "researcher", "role_category": "read_only_researcher",
+                "assigned_paths": ["README.md"], "worker_assignments": [],
+                "task": "Inspect README.md. No writes or delegation."
+            }]
+        });
+        if with_source_inputs {
+            plan_value["assignments"][0]["source_inputs"] = serde_json::json!([{
+                "path": "README.md",
+                "sha256": crate::artifacts::state_auth::sha256_hex(contents.as_bytes())
+            }]);
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&plan_value.to_string())?;
+        let plan = &loaded.plan;
+        let assignment = &plan.assignments[0];
+        let budget_config = SupervisorBudgetConfig::default();
+        let options = SupervisorRunOptions {
+            repo: repo.clone(),
+            plan_file: temp.path().join("plan.json"),
+            run_id: RunId::new("researcher-prompt-order")?,
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: Some(crate::machine_global::MachineGlobalRetentionBinding {
+                config: temp.path().join("unused-machine-global.json"),
+                root_id: "runtime".to_string(),
+                owner: "maco-supervise".to_string(),
+                correction_correlation_id: "researcher-prompt-order".to_string(),
+            }),
+        };
+        let mut artifact_writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            options.run_id.clone(),
+            "researcher-prompt-order-test",
+        )?;
+        let assignment_schedule = vec![AssignmentScheduleEntry {
+            assignment_id: assignment.id.clone(),
+            parent_assignment_id: None,
+            depth: 1,
+            flattened_index: 0,
+        }];
+        initialize_child_dispatch_messaging_session(
+            &mut artifact_writer,
+            plan,
+            &assignment_schedule,
+        );
+        let run_dir = artifact_writer.run_dir().to_path_buf();
+        let dirs = RunDirs::for_writer(&artifact_writer);
+        let manager = WorktreeManager::new(&repo);
+        let sync_store = SyncStore::open(&repo)?;
+        let semantic_store = SemanticIntentStore::open(&repo)?;
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        let runtime_model_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+        let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id, None);
+        assert!(
+            journal.is_some(),
+            "preparation requires an observable journal"
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut artifact_writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let runner = unused_external_runner;
+        let context = AssignmentExecutionContext {
+            index: 0,
+            concurrent_mode: false,
+            plan,
+            requested_plan: plan,
+            execution_target: None,
+            budget_config: &budget_config,
+            consultant: &loaded.consultant,
+            assignment_metadata: &loaded.assignment_metadata,
+            assignment,
+            evidence_only_reaudit: None,
+            options: &options,
+            repo: &repo,
+            run_dir: &run_dir,
+            dirs: &dirs,
+            execution_runtime: SupervisorExecutionRuntime::Verified,
+            worktree_creation: SupervisorWorktreeCreation::VerifiedTestOnly,
+            manager: &manager,
+            reused: false,
+            sync_store: &sync_store,
+            semantic_store: &semantic_store,
+            prepared_semantic_token: None,
+            prepared_semantic_findings: &[],
+            prepared_semantic_signals: &[],
+            prepared_semantic_failed: false,
+            assignment_schedule: &assignment_schedule,
+            field_guide: &field_guide,
+            serial_semantic_warn_intents: None,
+            semantic_block_order: None,
+            semantic_block_gate: None,
+            artifacts: &artifacts,
+            budget_ledger: &budget_ledger,
+            budget_policy: AssignmentBudgetPolicy::default(),
+            admission_commit: None,
+            runtime_model_catalog: &runtime_model_catalog,
+            cancellation: ProcessCancellation::new(),
+            external_runner: &runner,
+        };
+        let mut outcome = AssignmentExecutionOutcome {
+            gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+            ..AssignmentExecutionOutcome::default()
+        };
+        let preflight = match prepare_assignment_execution(&context, &mut outcome)? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => bail!("researcher preflight refused"),
+        };
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+        fs::create_dir_all(&dirs.schemas)?;
+        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")?;
+        let mut prepared = match prepare_child_attempt(
+            &context,
+            &mut outcome,
+            &context.budget_policy,
+            &preflight,
+            options.run_id.as_str(),
+            1,
+            1,
+            &None,
+            &schema_path,
+            &worker_schema_path,
+            &auditor_schema_path,
+            None,
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => bail!("researcher preparation refused"),
+        };
+        assert_eq!(prepared.command.workspace_access, WorkspaceAccess::ReadOnly);
+        assert_eq!(
+            prepared.command.researcher_source_inputs.len(),
+            usize::from(with_source_inputs)
+        );
+        let before_binding = fs::read(&prepared.command.prompt)?;
+        let prompt = std::str::from_utf8(&before_binding)?;
+        assert_eq!(
+            prompt.contains("Operator-declared read-only source inputs"),
+            with_source_inputs
+        );
+        if with_source_inputs {
+            assert!(prompt.contains(&crate::artifacts::state_auth::sha256_hex(
+                contents.as_bytes()
+            )));
+            assert!(
+                prompt
+                    .find("Operator-declared read-only source inputs")
+                    .unwrap()
+                    < prompt
+                        .rfind("## Assignment messaging (loopback IPC)")
+                        .unwrap()
+            );
+        }
+        let measurements_path = run_dir.join(prompt_measurements_relative(
+            &dirs.relative(&prepared.command.prompt)?,
+        ));
+        let measurements: PromptMeasurementsArtifact =
+            serde_json::from_slice(&fs::read(measurements_path)?)?;
+        assert_eq!(measurements.prompts[0].full_bytes, before_binding.len());
+        // Use the production binder and its strict EOF verifier, not a rendered
+        // imitation. Stop before dispatch: no external process or provider runs.
+        let _server = bind_assignment_messaging_for_external_child_launch(
+            &context,
+            &assignment.id,
+            &mut prepared.command,
+        )?;
+        prepared
+            .command
+            .verify_assignment_messaging_protocol_instructions()?;
+        assert_eq!(fs::read(&prepared.command.prompt)?, before_binding);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn prepared_researcher_without_source_inputs_preserves_messaging_appendix() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(false)
+    }
 
     fn initialize_child_dispatch_messaging_session(
         writer: &mut ArtifactRunWriter,
@@ -11276,6 +11691,7 @@ done
             assert_eq!(spawn_payload["runtime"], "codex");
             assert_eq!(spawn_payload["request_binding"], request.request_binding);
             usage_samples.push(RoleUsageSample {
+                cost_usd: None,
                 role: AgentRole::Auditor,
                 lens_id: Some(lens.id.clone()),
                 model: command.model.clone(),
@@ -11372,13 +11788,18 @@ done
         let plan = worker_plan("composer-2.5");
         let budget = SupervisorBudgetConfig::default();
         let command = quota_usage_command(temp.path());
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected cross-runtime budget refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected cross-runtime budget refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         write_injected_usage(&command, 7, 3);
         let run = injected_verified_run(&command);
@@ -11415,13 +11836,18 @@ done
         let expected_tokens = budget
             .reservation_tokens(AgentRole::Worker)
             .context("worker reservation tokens")?;
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &first, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected dropped-dispatch budget refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &first,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected dropped-dispatch budget refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         drop(reservation);
         assert_eq!(first.report()?.active_reservations, 0);
@@ -11451,13 +11877,18 @@ done
         let plan = worker_plan("composer-2.5");
         let budget = SupervisorBudgetConfig::default();
         let command = quota_usage_command(temp.path());
-        let mut reservation =
-            match reserve_dispatch_budget(&plan, &budget, &ledger, AgentRole::Worker, &command)? {
-                DispatchBudgetAdmission::Admitted(reservation) => reservation,
-                DispatchBudgetAdmission::Refused(refusal) => {
-                    bail!("unexpected settlement fixture refusal: {refusal:?}")
-                }
-            };
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::Cursor),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected settlement fixture refusal: {refusal:?}")
+            }
+        };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
         write_injected_usage(&command, 1, 1);
         let run = injected_verified_run(&command);

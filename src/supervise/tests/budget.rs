@@ -384,12 +384,21 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
 
 #[test]
 fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_launch() {
+    assert_unpriced_dispatch_refused("unpriced-model");
+}
+
+#[test]
+fn pricing_guard_placeholder_refuses_before_runner_invocation() {
+    assert_unpriced_dispatch_refused("gpt-5.6-sol");
+}
+
+fn assert_unpriced_dispatch_refused(model: &str) {
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     let selection = RoleModelSelection {
-        model: Some("unpriced-model".to_string()),
+        model: Some(model.to_string()),
         reasoning_effort: None,
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     };
@@ -1193,7 +1202,14 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
         write_injected_assignment_report(command, &child_a);
         write_injected_usage(command, 7, 3);
         set_dispatch_pre_runner_fault(AgentRole::Auditor);
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        retain_priced_single_turn_fixture(
+            &mut run,
+            command,
+            "priced-model",
+            &fs::read(&command.json_log).expect("complete child capture"),
+        );
+        run
     };
 
     let report = run_supervisor_plan_with_budget_and_runner(
@@ -1423,7 +1439,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve uncertain-start dispatch")
@@ -1480,7 +1496,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve unverified containment dispatch")
@@ -1520,7 +1536,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("later admission result"),
@@ -1550,7 +1566,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve truncated-capture dispatch")
@@ -1597,7 +1613,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("later admission result"),
@@ -1688,13 +1704,21 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
             ledger: &ledger,
             reservation,
             pricing: None,
+            model_pricing: BTreeMap::new(),
             state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
         };
         let settled = held.settle_bound_runtime(&incomplete, &command).unwrap();
-        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(
+            settled.reliability,
+            if raw_loss {
+                DispatchUsageReliability::Estimated
+            } else {
+                DispatchUsageReliability::Reliable
+            }
+        );
         let charged = ledger.report().unwrap();
         assert_eq!(charged.consumed.tokens, 37_000);
-        assert!(!charged.usage_complete);
+        assert_eq!(charged.usage_complete, !raw_loss);
         assert!(charged.consumed.cost_usd.is_none());
     }
 
@@ -1744,6 +1768,7 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
         ledger: &ledger,
         reservation,
         pricing: None,
+        model_pricing: BTreeMap::new(),
         state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
     };
     assert_eq!(
@@ -1876,6 +1901,14 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
             assert_eq!(run.stdout.text.chars().count(), 32 * 1024);
             assert_eq!(run.stdout_bytes(), transcript.as_bytes());
         }
+        if !run.stdout.raw_capture_truncated() {
+            retain_priced_single_turn_fixture(
+                &mut run,
+                &command,
+                "priced-model",
+                capture.stdout.as_bytes(),
+            );
+        }
         if !retain_log {
             fs::remove_file(&command.json_log).expect("exercise held stdout fallback");
         }
@@ -1883,7 +1916,7 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("reserve large-capture dispatch")
@@ -2046,7 +2079,7 @@ fn budget_reliability_uses_bound_adapter_runtime_completion() {
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Grok),
         &command,
     )
     .expect("reserve adapter dispatch")
@@ -2063,6 +2096,11 @@ fn budget_reliability_uses_bound_adapter_runtime_completion() {
     let mut run = injected_verified_run_without_journals(&command);
     run.program_trust = ExternalProgramTrust::ExplicitCustom;
     run.codex_permissions = None;
+    let native_capture = crate::process_runner::CapturedBytes::from_bytes_for_test(
+        b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"reasoning_tokens\":0,\"total_tokens\":10}}\n"
+            .to_vec(),
+    );
+    run.retain_grok_native_usage_for_test(&command, &native_capture, true);
 
     let settlement = reservation
         .settle(&run, SupervisorRuntime::Grok, &command)
@@ -2135,6 +2173,1121 @@ fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
         assert_eq!(
             run_budget.limits.hard_tokens, expected,
             "{name} effective hard token ceiling"
+        );
+    }
+}
+
+#[test]
+fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runtimes() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    for runtime in [
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna", "fake", "unknown-model"] {
+            // A model label never confers Fake launch authority.
+            assert!(pricing_for_runtime(&plan, model, runtime).is_none());
+        }
+    }
+    assert!(pricing_for_runtime(&plan, "unknown-model", SupervisorRuntime::Fake).is_none());
+}
+
+#[test]
+fn pricing_guard_reservation_runtime_cannot_drift_from_fake_to_real() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("gpt-5.6-sol".to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Fake),
+        &command,
+    )
+    .expect("Fake admission")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+    };
+    assert_eq!(ledger.report().unwrap().reserved.cost_usd, Some(0.0));
+    assert!(reservation
+        .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+        .is_err());
+    assert!(matches!(
+        reservation.state,
+        DispatchBudgetReservationState::Reserved(SupervisorRuntime::Fake)
+    ));
+    drop(reservation);
+    let report = ledger.report().unwrap();
+    assert_eq!(report.active_reservations, 0);
+    assert_eq!(report.consumed.tokens, 0);
+    assert_eq!(report.reserved.tokens, 0);
+    assert!(report.usage_complete);
+}
+
+#[test]
+fn pricing_guard_token_only_settlement_keeps_unknown_cost_and_complete_tokens() {
+    assert_pricing_guard_settlement(SupervisorRuntime::Codex, None, None);
+}
+
+#[test]
+fn pricing_guard_explicit_zero_and_nonzero_overrides_remain_priced() {
+    for rate in [0.0, 2.0] {
+        assert_pricing_guard_settlement(
+            SupervisorRuntime::Codex,
+            Some(rate),
+            Some(10.0 * rate / 1_000_000.0),
+        );
+    }
+}
+
+#[test]
+fn pricing_guard_fake_placeholder_simulation_remains_usable() {
+    assert_pricing_guard_settlement(SupervisorRuntime::Fake, None, Some(0.0));
+}
+
+fn assert_pricing_guard_settlement(
+    runtime: SupervisorRuntime,
+    rate: Option<f64>,
+    expected_cost: Option<f64>,
+) {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    if let Some(rate) = rate {
+        plan.model_pricing.insert(
+            "gpt-5.6-sol".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: rate,
+                output_usd_per_million_tokens: rate,
+            },
+        );
+        let resolved =
+            crate::llm::provider::resolve_model_pricing(&plan.model_pricing, "gpt-5.6-sol")
+                .unwrap();
+        assert_eq!(
+            resolved.provenance,
+            crate::llm::provider::ModelPricingProvenance::PlanOverride
+        );
+        // The persisted plan retains even an explicit zero override.
+        let persisted: SupervisorPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(persisted.model_pricing, plan.model_pricing);
+    }
+    let budget = injected_run_budget(None, Some(100), None, expected_cost.map(|_| 1.0), 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("gpt-5.6-sol".to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, runtime),
+        &command,
+    )
+    .expect("admission")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+    };
+    assert_eq!(
+        ledger.report().unwrap().reserved.cost_usd.is_some(),
+        expected_cost.is_some()
+    );
+    reservation
+        .mark_invoked_for_runtime(runtime)
+        .expect("bound invocation");
+    write_injected_usage(&command, 7, 3);
+    let mut run = if runtime == SupervisorRuntime::Fake {
+        deterministic_fake_run(&command, Vec::new())
+    } else {
+        injected_verified_run_without_journals(&command)
+    };
+    if runtime == SupervisorRuntime::Codex {
+        retain_attribution_fixture(&mut run, &command, Some("gpt-5.6-sol"), false, false);
+    }
+    let settlement = reservation
+        .settle_bound_runtime(&run, &command)
+        .expect("settlement");
+    assert_eq!(settlement.reliability, DispatchUsageReliability::Reliable);
+    let usage = settlement.reliable_usage().expect("complete tokens");
+    assert_eq!(usage.total_tokens, 10);
+    let report = ledger.report().unwrap();
+    assert_eq!(report.consumed.tokens, 10);
+    assert_eq!(report.consumed.cost_usd, expected_cost);
+    assert_eq!(report.roles[0].consumed.cost_usd, expected_cost);
+    assert_eq!(report.active_reservations, 0);
+    assert_eq!(report.reserved.tokens, 0);
+    assert!(report.usage_complete);
+    assert!(report.new_dispatch_allowed);
+    if expected_cost.is_none() {
+        assert!(report.reasons.contains(&BudgetReason::MissingActualCost));
+    }
+    // Settlement is single-use even when the observed cost is unknown or zero.
+    assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+    assert_eq!(ledger.report().unwrap().consumed.tokens, 10);
+    let aggregation = role_usage_report(
+        &plan,
+        vec![settlement
+            .role_sample(AgentRole::ChildOrchestrator, None)
+            .unwrap()],
+    )
+    .expect("role cost report");
+    assert_eq!(aggregation.total_usage, Some(usage));
+    assert_eq!(aggregation.total_cost_usd, expected_cost);
+    assert_eq!(
+        aggregation.reports[&AgentRole::ChildOrchestrator].cost_usd,
+        expected_cost
+    );
+    assert_eq!(
+        aggregation.reports[&AgentRole::Supervisor].cost_usd,
+        expected_cost
+    );
+}
+
+#[test]
+fn pricing_guard_real_usage_prevents_fake_zero_from_masking_unknown_role_and_lens_cost() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    let usage = Usage {
+        input_tokens: 7,
+        output_tokens: 3,
+        total_tokens: 10,
+    };
+    let mut samples = vec![RoleUsageSample {
+        cost_usd: Some(0.0),
+        role: AgentRole::Auditor,
+        lens_id: Some(plan.review_lenses[0].id.clone()),
+        model: Some("fake".to_string()),
+        usage,
+    }];
+    for role in [
+        AgentRole::Researcher,
+        AgentRole::Worker,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Auditor,
+    ] {
+        samples.push(RoleUsageSample {
+            cost_usd: None,
+            role,
+            lens_id: (role == AgentRole::Auditor).then(|| plan.review_lenses[0].id.clone()),
+            model: Some("fake".to_string()),
+            usage,
+        });
+    }
+    let report = role_usage_report(&plan, samples).expect("aggregate mixed runtime samples");
+    assert_eq!(report.total_usage.unwrap().total_tokens, 50);
+    assert!(report.total_cost_usd.is_none());
+    assert!(report.lens_total_cost_usd.is_none());
+    assert!(report
+        .lens_reports
+        .iter()
+        .all(|lens| lens.cost_usd.is_none()));
+    for role in [
+        AgentRole::Researcher,
+        AgentRole::Worker,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Auditor,
+        AgentRole::Supervisor,
+    ] {
+        assert!(report.reports[&role].cost_usd.is_none());
+        assert!(report.reports[&role].usage.is_some());
+    }
+}
+
+// Parent-capture seam: no agent-authored output supplies this private identity.
+fn retain_attribution_fixture(
+    run: &mut ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    observed: Option<&str>,
+    app_server: bool,
+    rerouted: bool,
+) {
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField as Field, CodexParentTurnUsage,
+        CodexServerRerouteEvidence,
+    };
+    run.codex_parent_evidence = Some(CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("attribution-thread".to_string()),
+        requested_model: command.model.clone(),
+        requested_effort: command.reasoning_effort.clone(),
+        rollout_model: if app_server {
+            Field::Unknown
+        } else {
+            observed
+                .map(|model| Field::Known(model.to_string()))
+                .unwrap_or(Field::Unknown)
+        },
+        rollout_effort: Field::Known("xhigh".to_string()),
+        observed_model: observed
+            .map(|model| Field::Known(model.to_string()))
+            .unwrap_or(Field::Unknown),
+        observed_effort: Field::Known("xhigh".to_string()),
+        server_rerouted_model: rerouted.then(|| CodexServerRerouteEvidence {
+            from: command.model.clone().unwrap(),
+            to: observed.unwrap().to_string(),
+        }),
+        model_mismatch: observed.is_some_and(|model| Some(model) != command.model.as_deref()),
+        turn_usage: CodexParentTurnUsage::Known {
+            input_tokens: 7,
+            output_tokens: 3,
+            cached_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        },
+        resolution_status: if observed.is_some() {
+            "complete"
+        } else {
+            "ambiguous"
+        }
+        .to_string(),
+    });
+    if app_server {
+        use crate::external_agent::codex_app_server::{
+            CommandExecutionEvidence, TurnTerminalStatus,
+        };
+        run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+            thread_id: "attribution-thread".to_string(),
+            turn_id: "turn".to_string(),
+            turn_status: TurnTerminalStatus::Completed,
+            observations: Vec::new(),
+        });
+        run.retain_app_server_parent_evidence_for_test();
+    } else {
+        run.retain_cli_parent_evidence_for_test(&fs::read(&command.json_log).unwrap());
+    }
+}
+
+#[test]
+fn model_attribution_settlement_and_all_role_reports_share_verified_allocation() {
+    for app_server in [false, true] {
+        for (observed, rerouted, expected_model, expected_cost) in [
+            (Some("model-a"), false, Some("model-a"), Some(0.00002)),
+            (Some("model-b"), false, Some("model-b"), Some(0.00007)),
+            (Some("unpriced"), false, Some("unpriced"), None),
+            (None, false, None, None),
+            (Some("model-b"), true, None, None),
+        ] {
+            for money_ceiling in [false, true] {
+                let mut plan = injected_plan(injected_assignment(false), 0);
+                for (model, rate) in [("model-a", 2.0), ("model-b", 7.0)] {
+                    plan.model_pricing.insert(
+                        model.to_string(),
+                        ModelPricing {
+                            input_usd_per_million_tokens: rate,
+                            output_usd_per_million_tokens: rate,
+                        },
+                    );
+                }
+                let budget = injected_run_budget(
+                    None,
+                    Some(1000),
+                    None,
+                    money_ceiling.then_some(1.0),
+                    50,
+                    50,
+                );
+                let temp = tempfile::tempdir().unwrap();
+                let mut command = ExternalAgentCommand::codex(
+                    "unused",
+                    temp.path(),
+                    temp.path().join("prompt"),
+                    temp.path().join("usage"),
+                    temp.path().join("report"),
+                    Duration::from_secs(1),
+                );
+                command.model = Some("model-a".to_string());
+                write_injected_usage(&command, 7, 3);
+                let mut run = injected_verified_run_without_journals(&command);
+                retain_attribution_fixture(&mut run, &command, observed, app_server, rerouted);
+                let original_evidence = run.codex_parent_evidence.clone();
+                for role in [
+                    AgentRole::ChildOrchestrator,
+                    AgentRole::Researcher,
+                    AgentRole::Worker,
+                    AgentRole::Auditor,
+                ] {
+                    let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+                    let mut role_budget = budget.clone();
+                    role_budget.role_token_reservations.insert(role, 50);
+                    let DispatchBudgetAdmission::Admitted(mut reservation) =
+                        reserve_dispatch_budget(
+                            &plan,
+                            &role_budget,
+                            &ledger,
+                            (role, SupervisorRuntime::Codex),
+                            &command,
+                        )
+                        .unwrap()
+                    else {
+                        panic!("admission")
+                    };
+                    reservation
+                        .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+                        .unwrap();
+                    let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+                    assert_eq!(settled.reliable_usage().unwrap().total_tokens, 10);
+                    assert_eq!(settled.model.as_deref(), expected_model);
+                    assert_eq!(settled.cost_usd, expected_cost);
+                    let charged = ledger.report().unwrap();
+                    assert_eq!(charged.consumed.tokens, 10);
+                    assert_eq!(charged.consumed.cost_usd, expected_cost);
+                    assert!(charged.usage_complete);
+                    assert_eq!(
+                        charged.new_dispatch_allowed,
+                        !money_ceiling || expected_cost.is_some()
+                    );
+                    assert_eq!(charged.active_reservations, 0);
+                    let lens_id =
+                        (role == AgentRole::Auditor).then(|| plan.review_lenses[0].id.clone());
+                    let sample = settled.role_sample(role, lens_id).unwrap();
+                    // Reporting must use the settled price snapshot, even if plan rates change.
+                    let mut later_plan = plan.clone();
+                    later_plan
+                        .model_pricing
+                        .values_mut()
+                        .for_each(|price| price.input_usd_per_million_tokens = 999.0);
+                    let report = role_usage_report(&later_plan, vec![sample]).unwrap();
+                    assert_eq!(report.total_cost_usd, charged.consumed.cost_usd);
+                    assert_eq!(report.total_usage.unwrap().total_tokens, 10);
+                    assert_eq!(
+                        report.reports[&role].models,
+                        expected_model
+                            .into_iter()
+                            .map(str::to_string)
+                            .collect::<Vec<_>>()
+                    );
+                    assert_eq!(
+                        report.reports[&AgentRole::Supervisor].cost_usd,
+                        expected_cost
+                    );
+                    if role == AgentRole::Auditor {
+                        let lens = report
+                            .lens_reports
+                            .iter()
+                            .find(|lens| lens.usage.is_some())
+                            .unwrap();
+                        assert_eq!(lens.cost_usd, expected_cost);
+                        assert_eq!(lens.model, expected_model.unwrap_or("unknown"));
+                        assert_eq!(lens.usage.unwrap().total_tokens, 10);
+                    }
+                }
+                assert_eq!(run.codex_parent_evidence, original_evidence);
+                if observed.is_none() && app_server
+                    || run.codex_parent_evidence.as_ref().unwrap().model_mismatch
+                {
+                    assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn model_attribution_public_identity_and_conflicting_allocation_cannot_restore_cost() {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "model-a", 2.0);
+    let temp = tempfile::tempdir().unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("usage"),
+        temp.path().join("report"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("model-a".to_string());
+    write_injected_usage(&command, 7, 3);
+    for conflicting in [false, true] {
+        let mut run = injected_verified_run_without_journals(&command);
+        retain_attribution_fixture(&mut run, &command, Some("model-a"), false, false);
+        if conflicting {
+            run.codex_parent_evidence.as_mut().unwrap().rollout_model =
+                crate::external_agent::CodexParentResolvedField::Known("model-b".to_string());
+            run.retain_cli_parent_evidence_for_test(&fs::read(&command.json_log).unwrap());
+        } else {
+            let public = run.codex_parent_evidence.clone();
+            run = injected_verified_run_without_journals(&command);
+            run.codex_parent_evidence = public;
+        }
+        let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+            &command,
+        )
+        .unwrap() else {
+            panic!("admission")
+        };
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+            .unwrap();
+        let settlement = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settlement.reliable_usage().unwrap().total_tokens, 10);
+        assert!(settlement.model.is_none());
+        assert!(settlement.cost_usd.is_none());
+        assert!(!ledger.report().unwrap().new_dispatch_allowed);
+    }
+}
+
+#[test]
+fn model_attribution_cli_invalid_aggregate_retains_unpriced_partial_lower_bound() {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "model-a", 7.0);
+    let budget = injected_run_budget(None, Some(100_000), None, Some(1.0), 50, 50);
+    let temp = tempfile::tempdir().unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("usage"),
+        temp.path().join("report"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("model-a".to_string());
+    for (overflow, log_tokens) in [(false, 37_000), (false, 2), (false, 40_000), (true, 0)] {
+        write_injected_usage(&command, 37_000, 0);
+        let mut run = injected_verified_run_without_journals(&command);
+        retain_attribution_fixture(&mut run, &command, Some("model-a"), false, false);
+        let lower_bound = if overflow {
+            usize::MAX
+        } else {
+            37_000.max(log_tokens)
+        };
+        let (input, output) = if overflow {
+            (usize::MAX - 1, 1)
+        } else {
+            (37_000, 0)
+        };
+        run.codex_parent_evidence.as_mut().unwrap().turn_usage =
+            crate::external_agent::CodexParentTurnUsage::Known {
+                input_tokens: u64::try_from(input).unwrap(),
+                output_tokens: u64::try_from(output).unwrap(),
+                cached_input_tokens: 0,
+                reasoning_output_tokens: 0,
+            };
+        let invalid_stream = if overflow {
+            let turn = format!(
+                r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"output_tokens":{output}}}}}"#
+            );
+            format!("{turn}\n{turn}\n")
+        } else {
+            "{truncated".to_string()
+        };
+        run.retain_cli_parent_evidence_for_test(invalid_stream.as_bytes());
+        if overflow {
+            fs::write(&command.json_log, &invalid_stream).unwrap();
+        } else {
+            run.stdout.truncated = true;
+            write_injected_usage(&command, log_tokens, 0);
+        }
+        assert!(run.authenticated_codex_usage().is_none());
+        assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+            &command,
+        )
+        .unwrap() else {
+            panic!("admission")
+        };
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.observed_usage.unwrap().total_tokens, lower_bound);
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        assert!(settled.cost_usd.is_none());
+        assert!(settled.model.is_none());
+        let charged = ledger.report().unwrap();
+        assert_eq!(charged.consumed.tokens, lower_bound);
+        assert!(!charged.usage_complete);
+        assert!(charged.consumed.cost_usd.is_none());
+        assert!(!charged.new_dispatch_allowed);
+        assert_eq!(charged.active_reservations, 0);
+    }
+}
+
+#[test]
+fn model_attribution_cli_multiple_turns_use_private_aggregate_for_ledger_and_roles() {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "model-a", 7.0);
+    let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+    let temp = tempfile::tempdir().unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("usage"),
+        temp.path().join("report"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("model-a".to_string());
+    let stdout = b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":25,\"output_tokens\":7}}\n";
+    fs::write(&command.json_log, stdout).unwrap();
+    let mut run = injected_verified_run_without_journals(&command);
+    retain_attribution_fixture(&mut run, &command, Some("model-a"), false, false);
+    // The public identity schema retains only the last turn. Neither economics
+    // nor settlement may confuse it with the private invocation-wide usage.
+    run.codex_parent_evidence.as_mut().unwrap().turn_usage =
+        crate::external_agent::CodexParentTurnUsage::Known {
+            input_tokens: 25,
+            output_tokens: 7,
+            cached_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        };
+    run.retain_cli_parent_evidence_for_test(stdout);
+    // A later writable log cannot replace the parent-held aggregate.
+    write_injected_usage(&command, 1, 1);
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (role, SupervisorRuntime::Codex),
+            &command,
+        )
+        .unwrap() else {
+            panic!("admission")
+        };
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(
+            settled.reliable_usage().unwrap(),
+            Usage {
+                input_tokens: 35,
+                output_tokens: 11,
+                total_tokens: 46
+            }
+        );
+        assert_eq!(settled.cost_usd, Some(0.000322));
+        let charged = ledger.report().unwrap();
+        assert_eq!(charged.consumed.tokens, 46);
+        assert_eq!(charged.consumed.cost_usd, settled.cost_usd);
+        assert!(charged.usage_complete);
+        assert_eq!(charged.active_reservations, 0);
+        let sample = settled
+            .role_sample(
+                role,
+                (role == AgentRole::Auditor).then(|| plan.review_lenses[0].id.clone()),
+            )
+            .unwrap();
+        let reports = role_usage_report(&plan, vec![sample]).unwrap();
+        assert_eq!(reports.total_usage.unwrap().total_tokens, 46);
+        assert_eq!(reports.total_cost_usd, settled.cost_usd);
+        if role == AgentRole::Auditor {
+            assert_eq!(reports.lens_total_cost_usd, settled.cost_usd);
+        }
+    }
+}
+
+#[test]
+fn model_attribution_child_and_auditor_paths_retain_tokens_without_accepting_unknown_identity() {
+    skip_without_containment!();
+    assert_attribution_pipeline_refuses_identity(None);
+}
+
+#[test]
+fn model_attribution_child_and_auditor_reject_priced_start_model_mismatch() {
+    skip_without_containment!();
+    assert_attribution_pipeline_refuses_identity(Some("fallback-model"));
+}
+
+fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
+    let _capability = install_budget_fixture_models();
+    for unknown_auditor in [false, true] {
+        // Known-cost identity refusals still require independent review of
+        // reported changes. Unknown cost stops budget admission first.
+        let expected_invocations = if observed.is_some() || unknown_auditor {
+            2
+        } else {
+            1
+        };
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 2.0);
+        plan.model_pricing.insert(
+            "fallback-model".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 7.0,
+                output_usd_per_million_tokens: 7.0,
+            },
+        );
+        let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+        let options = injected_options(&repo_path, temp.path(), "model-attribution-pipeline");
+        let mut invocations = 0;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations += 1;
+            assert!(
+                invocations <= expected_invocations,
+                "no dispatch beyond the single required parent review"
+            );
+            let auditor = command
+                .output_last_message
+                .to_string_lossy()
+                .contains("review-auditor");
+            if auditor {
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                );
+            } else {
+                write_injected_assignment_report(command, &assignment);
+            }
+            write_injected_usage(command, 7, 3);
+            let mut run = injected_verified_run(command);
+            if auditor == unknown_auditor {
+                retain_attribution_fixture(&mut run, command, observed, true, false);
+                // The transport held a complete usage notice, then identity resolution
+                // refused publication. Accounting must not erase the authentic tokens.
+                if observed.is_none() {
+                    run.publishable = false;
+                    run.error =
+                        Some("Codex app-server identity resolution is incomplete".to_string());
+                }
+                // A successfully completed transport with priced fallback identity must
+                // still fail the actual child/Auditor acceptance gate.
+                assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+            } else {
+                retain_attribution_fixture(&mut run, command, Some("priced-model"), false, false);
+            }
+            run
+        };
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .unwrap();
+        assert!(
+            !report.success,
+            "unknown or mismatched identity must not become acceptance"
+        );
+        assert!(!report.accepted);
+        assert!(!report.publishable);
+        assert_eq!(invocations, expected_invocations);
+        let charged = report.run_budget.as_ref().unwrap();
+        assert_eq!(charged.consumed.tokens, invocations * 10);
+        assert_eq!(charged.active_reservations, 0);
+        assert_eq!(charged.reserved.tokens, 0);
+        assert!(charged.usage_complete);
+        let rejected_cost = observed.map(|_| 0.00007);
+        let total_cost = rejected_cost.map(|cost| {
+            cost + if expected_invocations == 2 {
+                0.00002
+            } else {
+                0.0
+            }
+        });
+        assert_eq!(charged.consumed.cost_usd, total_cost);
+        assert_eq!(report.total_cost_usd, total_cost);
+        if observed.is_none() {
+            assert!(!charged.new_dispatch_allowed);
+        }
+        assert_eq!(report.total_usage.unwrap().total_tokens, invocations * 10);
+        let role = if unknown_auditor {
+            AgentRole::Auditor
+        } else {
+            AgentRole::ChildOrchestrator
+        };
+        assert_eq!(report.role_usage[&role].usage.unwrap().total_tokens, 10);
+        assert_eq!(
+            report.role_usage[&role].models,
+            observed.into_iter().map(str::to_string).collect::<Vec<_>>()
+        );
+        assert_eq!(report.role_usage[&role].cost_usd, rejected_cost);
+        if unknown_auditor {
+            let lens = report
+                .review_lens_usage
+                .iter()
+                .find(|lens| lens.usage.is_some())
+                .unwrap();
+            assert_eq!(lens.model, observed.unwrap_or("unknown"));
+            assert_eq!(lens.usage.unwrap().total_tokens, 10);
+            assert_eq!(lens.cost_usd, rejected_cost);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_source_inputs_local_refusal_settles_not_started_but_unknown_helper_is_conservative(
+) -> Result<()> {
+    use crate::external_agent::researcher_inputs::tests::{failed_local_probe, fixture};
+    for unknown_helper in [false, true] {
+        let (_root, mut command) = fixture()?;
+        command.model = Some("gpt-5.6-sol".into());
+        let plan = injected_plan(injected_assignment(false), 0);
+        let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
+        budget
+            .role_token_reservations
+            .insert(AgentRole::Researcher, 50);
+        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Researcher, SupervisorRuntime::Codex),
+            &command,
+        )?
+        else {
+            panic!("admission");
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Codex)?;
+        let run = failed_local_probe(&command, unknown_helper)?;
+        assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert!(settlement.observed_usage.is_none());
+        assert!(settlement.cost_usd.is_none());
+        let report = ledger.report()?;
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(report.reserved.tokens, 0);
+        if unknown_helper {
+            assert_eq!(settlement.reliability, DispatchUsageReliability::Missing);
+            assert_eq!(report.consumed.tokens, 50);
+            assert!(!report.new_dispatch_allowed);
+        } else {
+            assert_eq!(settlement.reliability, DispatchUsageReliability::NotStarted);
+            assert_eq!(report.consumed.tokens, 0);
+            assert!(report.new_dispatch_allowed);
+            assert!(settlement
+                .role_sample(AgentRole::Researcher, None)
+                .is_none());
+            // A public wire receipt never restores the private no-release proof.
+            let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
+            assert!(external_dispatch_may_have_started(
+                &restored,
+                SupervisorRuntime::Codex
+            ));
+        }
+        assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+        assert_eq!(
+            ledger.report()?.consumed.tokens,
+            if unknown_helper { 50 } else { 0 }
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_quiescent_prelaunch(
+) -> Result<()> {
+    use crate::external_agent::researcher_inputs::tests::{fixture, late_source_refusal};
+    for (mutation, unknown_helper) in [
+        ("changed", false),
+        ("missing", false),
+        ("rebound", false),
+        ("changed", true),
+    ] {
+        let (_root, mut command) = fixture()?;
+        command.model = Some("gpt-5.6-sol".into());
+        let plan = injected_plan(injected_assignment(false), 0);
+        let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
+        budget
+            .role_token_reservations
+            .insert(AgentRole::Researcher, 50);
+        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Researcher, SupervisorRuntime::Codex),
+            &command,
+        )?
+        else {
+            panic!("admission");
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::Codex)?;
+        let run = late_source_refusal(&command, mutation, unknown_helper)?;
+        assert!(run
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("source input changed before target release")));
+        assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+        assert!(!run.publishable);
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert!(settlement.observed_usage.is_none());
+        assert!(settlement.cost_usd.is_none());
+        assert!(settlement
+            .role_sample(AgentRole::Researcher, None)
+            .is_none());
+        assert_eq!(
+            settlement.reliability,
+            if unknown_helper {
+                DispatchUsageReliability::Missing
+            } else {
+                DispatchUsageReliability::NotStarted
+            }
+        );
+        let report = ledger.report()?;
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(report.reserved.tokens, 0);
+        assert_eq!(report.consumed.tokens, if unknown_helper { 50 } else { 0 });
+        assert_eq!(report.new_dispatch_allowed, !unknown_helper);
+        assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+        assert_eq!(ledger.report()?.consumed.tokens, report.consumed.tokens);
+        // Public serialization, including a forged witness key, cannot restore
+        // the private proof that only local quiescent probes have run.
+        let mut wire = serde_json::to_value(&run)?;
+        wire["local_source_probe_refusal_quiescent"] = serde_json::json!(true);
+        let restored: ExternalAgentRun = serde_json::from_value(wire)?;
+        assert!(!restored.source_probe_confirmed_no_provider_release());
+        assert!(external_dispatch_may_have_started(
+            &restored,
+            SupervisorRuntime::Codex
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.review_lenses = default_supervisor_review_lenses();
+    let lenses = plan.review_lenses.clone();
+    assert_eq!(lenses.len(), 3);
+    let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
+    let options = injected_options(&repo_path, temp.path(), "observed-auditor-lenses");
+    let mut commands = Vec::new();
+    let mut grants = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let auditor = command
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == "auditor");
+        if auditor {
+            let index = commands.len();
+            assert!(index < 3, "no extra review dispatch");
+            assert!(command.uses_live_app_server_budget());
+            let grant = command
+                .live_token_grant_for_test()
+                .expect("live Auditor grant");
+            assert_eq!(grant.tokens(), 220_000 - 10 * (index as u64 + 1));
+            assert!(grants
+                .iter()
+                .all(crate::supervise_budget::LiveTokenGrant::stopped));
+            grants.push(grant.clone());
+            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+            assert!(command.hidden_roots.contains(&repo_path));
+            assert_eq!(command.hidden_roots.len(), 2);
+            assert!(!command
+                .hidden_roots
+                .iter()
+                .any(|root| command.cwd.starts_with(root)));
+            assert!(command
+                .output_schema
+                .as_ref()
+                .unwrap()
+                .starts_with(&command.cwd));
+            let prompt = fs::read_to_string(&command.prompt).unwrap();
+            let scope = match lenses[index].information_scope {
+                ReviewInformationScope::FullChildTranscript => {
+                    "\"bounded_full_child_transcript\"".to_string()
+                }
+                scope => serde_json::to_string(&scope).unwrap(),
+            };
+            assert!(prompt.contains(&format!("\"scope\":{scope}")));
+            assert_eq!(
+                command.model.as_deref(),
+                Some(lenses[index].backend.model())
+            );
+            assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+            let mut audit =
+                injected_auditor_report(&assignment, &injected_child_report(&assignment));
+            audit.id = command
+                .output_last_message
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            write_injected_json(&command.output_last_message, &audit);
+            commands.push(command.clone());
+        } else {
+            write_injected_assignment_report(command, &assignment);
+        }
+        write_injected_usage(command, 7, 3);
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_budget_and_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        budget,
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("three-lens dispatch");
+    assert!(report.success, "{report:#?}");
+    assert!(report.accepted);
+    assert_eq!(commands.len(), 3);
+    assert_ne!(commands[0].cwd, commands[1].cwd);
+    assert_ne!(commands[1].cwd, commands[2].cwd);
+    assert!(grants
+        .iter()
+        .all(crate::supervise_budget::LiveTokenGrant::stopped));
+    let ledger = report.run_budget.unwrap();
+    assert_eq!(ledger.consumed.tokens, 40);
+    assert_eq!(ledger.reserved.tokens, 0);
+    assert_eq!(ledger.active_reservations, 0);
+    assert!(ledger.usage_complete);
+    assert!(
+        ledger.consumed.cost_usd.is_none(),
+        "synthetic CLI usage has no private model allocation"
+    );
+    assert_eq!(report.orchestrator_reports[0].audit_reports.len(), 3);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting() {
+    skip_without_containment!();
+    let _capability = install_budget_fixture_models();
+    for effort in [Some("xhigh"), Some("high"), None, Some("invented")] {
+        let (temp, repo_path) = injected_repository();
+        let assignment = injected_assignment(true);
+        let mut plan = injected_plan(assignment.clone(), 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 2.0);
+        let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
+        let options = injected_options(&repo_path, temp.path(), "observed-auditor-effort");
+        let mut invocations = 0;
+        let mut runner = |command: &ExternalAgentCommand| {
+            invocations += 1;
+            assert!(invocations <= 2, "no further dispatch after refusal");
+            let auditor = command
+                .agent_lifecycle
+                .as_ref()
+                .is_some_and(|identity| identity.role == "auditor");
+            if auditor {
+                assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                );
+            } else {
+                write_injected_assignment_report(command, &assignment);
+            }
+            write_injected_usage(command, 7, 3);
+            let mut run = injected_verified_run(command);
+            retain_attribution_fixture(&mut run, command, Some("priced-model"), true, false);
+            if auditor {
+                let evidence = run.codex_parent_evidence.as_mut().unwrap();
+                evidence.observed_effort = effort
+                    .map(|value| {
+                        crate::external_agent::CodexParentResolvedField::Known(value.to_string())
+                    })
+                    .unwrap_or(crate::external_agent::CodexParentResolvedField::Unknown);
+                if effort.is_none() {
+                    evidence.resolution_status = "ambiguous".to_string();
+                }
+                run.retain_app_server_parent_evidence_for_test();
+                run.qualify_codex_auditor_effort_for_test(command);
+                assert!(run.authenticated_codex_usage_complete());
+                assert_eq!(run.authenticated_codex_usage().unwrap().total_tokens, 10);
+                if effort == Some("high") {
+                    assert_eq!(
+                        run.authenticated_app_server_evidence()
+                            .unwrap()
+                            .resolution_status,
+                        "complete"
+                    );
+                    assert!(!run.succeeded());
+                    // Public success and observed-effort labels cannot override private custody.
+                    run.publishable = true;
+                    run.error = None;
+                    run.codex_parent_evidence.as_mut().unwrap().observed_effort =
+                        crate::external_agent::CodexParentResolvedField::Known("xhigh".to_string());
+                    assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+                    run.codex_parent_evidence = run.authenticated_app_server_evidence().cloned();
+                }
+                assert_eq!(
+                    external_process_completed(&run, SupervisorRuntime::Codex),
+                    effort == Some("xhigh")
+                );
+            }
+            run
+        };
+        let report = run_supervisor_plan_with_budget_and_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            budget,
+            options,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            &mut runner,
+        )
+        .unwrap();
+        assert_eq!(invocations, 2);
+        assert_eq!(
+            report.success,
+            effort == Some("xhigh"),
+            "{effort:?}: {report:#?}"
+        );
+        assert_eq!(report.accepted, effort == Some("xhigh"));
+        if effort != Some("xhigh") {
+            assert!(!report.publishable);
+        }
+        let child = &report.orchestrator_reports[0];
+        assert_eq!(child.audit_reports.len(), 1);
+        assert_eq!(child.audit_reports[0].accepted, effort == Some("xhigh"));
+        let aggregate = child.review_lens_aggregate.as_ref().unwrap();
+        assert_eq!(
+            aggregate.lens_verdicts[0].effective_verdict,
+            if effort == Some("xhigh") {
+                ReviewLensVerdictStatus::Accept
+            } else {
+                ReviewLensVerdictStatus::ProceduralFailure
+            }
+        );
+        let charged = report.run_budget.as_ref().unwrap();
+        assert_eq!(charged.consumed.tokens, 20);
+        assert_eq!(charged.reserved.tokens, 0);
+        assert_eq!(charged.active_reservations, 0);
+        assert!(charged.usage_complete);
+        let cost = effort.map(|_| 0.00004);
+        assert_eq!(charged.consumed.cost_usd, cost);
+        assert_eq!(report.total_cost_usd, cost);
+        assert_eq!(
+            report.role_usage[&AgentRole::Auditor]
+                .usage
+                .unwrap()
+                .total_tokens,
+            10
         );
     }
 }

@@ -488,7 +488,22 @@ pub(crate) struct AppServerTurn {
     pub(crate) permission_profile: String,
     pub(crate) prompt: String,
     pub(crate) model: Option<String>,
+    /// Selected Auditor requirement; other roles keep their existing qualification path.
+    pub(crate) minimum_effort: Option<String>,
     pub(crate) output_schema: Option<Value>,
+}
+
+pub(crate) fn observed_effort_meets(required: Option<&str>, observed: Option<&str>) -> bool {
+    let parse = |value: &str| {
+        serde_json::from_value::<crate::supervise::ReasoningEffort>(Value::String(
+            value.to_string(),
+        ))
+        .ok()
+    };
+    match (required.and_then(parse), observed.and_then(parse)) {
+        (Some(required), Some(observed)) => observed >= required,
+        _ => false,
+    }
 }
 
 impl AppServerTurn {
@@ -1518,6 +1533,20 @@ where
         messages_received: state.messages_received,
         bytes_received: state.bytes_received,
     });
+
+    if let Some(required) = &turn.minimum_effort {
+        if !observed_effort_meets(Some(required), resolved_effort.as_deref())
+            || turn
+                .model
+                .as_deref()
+                .is_some_and(|requested| requested != resolved_model)
+        {
+            return Err(AppServerError::Unexpected {
+                phase: "thread/start Auditor qualification",
+                message: "observed Auditor model/effort does not meet the selected requirement; turn/start withheld".to_string(),
+            });
+        }
+    }
 
     let turn_start_id = state.allocate_request_id()?;
     let mut lifecycle = ThreadLifecycleNotices::default();
@@ -3041,6 +3070,7 @@ mod tests {
             permission_profile: "maco_external_codex".to_string(),
             prompt: "perform the bounded task".to_string(),
             model: None,
+            minimum_effort: None,
             output_schema: None,
         }
     }
@@ -3058,6 +3088,54 @@ mod tests {
         let mut messages = command_observation_messages();
         messages.splice(1..1, prelude);
         messages
+    }
+
+    #[test]
+    fn observed_auditor_start_settings_refuse_downgrade_before_turn_start() {
+        for (observed, model, allowed) in [
+            (Some("xhigh"), "gpt-5.6-sol", true),
+            (Some("high"), "gpt-5.6-sol", false),
+            (None, "gpt-5.6-sol", false),
+            (Some("invented"), "gpt-5.6-sol", false),
+            (Some("xhigh"), "other-model", false),
+        ] {
+            let mut messages = command_observation_messages();
+            let start = messages
+                .iter_mut()
+                .find(|message| message["result"]["thread"].is_object())
+                .unwrap();
+            start["result"]["reasoningEffort"] = json!(observed);
+            start["result"]["model"] = json!(model);
+            let mut transport = FakeTransport::from_values(messages);
+            let mut turn = test_turn();
+            turn.model = Some("gpt-5.6-sol".to_string());
+            turn.minimum_effort = Some("xhigh".to_string());
+            let mut partial = None;
+            let result = run_app_server_turn_observed(
+                &mut transport,
+                &turn,
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval expected"),
+                || false,
+                &mut partial,
+                &mut || panic!("no budget exhaustion"),
+            );
+            assert_eq!(result.is_ok(), allowed, "{observed:?}/{model}: {result:?}");
+            assert_eq!(
+                transport
+                    .sent
+                    .iter()
+                    .any(|message| message["method"] == "turn/start"),
+                allowed
+            );
+            if !allowed {
+                let held = partial.expect("retain actual startup identity despite refusal");
+                assert_eq!(held.resolved_effort.as_deref(), observed);
+                assert_eq!(held.resolved_model, model);
+                assert!(held.token_usage.is_none(), "no invented provider tokens");
+                assert!(held.turn_id.is_empty());
+            }
+        }
     }
 
     #[test]

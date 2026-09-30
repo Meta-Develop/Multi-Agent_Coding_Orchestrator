@@ -2629,6 +2629,22 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        if let Some(raw_inputs) = raw_assignment.get("source_inputs") {
+            use crate::external_agent::researcher_inputs::{
+                validate_declarations, ResearcherSourceInput,
+            };
+            if assignment.role != AgentRole::Researcher {
+                bail!(
+                    "source_inputs are only supported on operator-authored Researcher assignments"
+                );
+            }
+            let inputs: Vec<ResearcherSourceInput> = serde_json::from_value(raw_inputs.clone())
+                .context("invalid Researcher source_inputs")?;
+            validate_declarations(&inputs)?;
+            metadata_by_worker
+                .source_inputs
+                .insert(assignment.id.clone(), inputs);
+        }
         if let Some(effort) = raw_assignment.get("reasoning_effort") {
             let effort =
                 serde_json::from_value::<ReasoningEffort>(effort.clone()).with_context(|| {
@@ -2656,6 +2672,9 @@ fn collect_assignment_metadata(
             .map(Vec::as_slice)
             .unwrap_or_default();
         for raw_worker in raw_workers {
+            if raw_worker.get("source_inputs").is_some() {
+                bail!("source_inputs cannot be delegated to nested Workers");
+            }
             let raw_worker_id = raw_worker
                 .get("id")
                 .and_then(Value::as_str)
@@ -2740,6 +2759,12 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        if let Some(inputs) = assignment_metadata.source_inputs.get(&assignment.id) {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment is not an object")?
+                .insert("source_inputs".to_string(), serde_json::to_value(inputs)?);
+        }
         if let Some(effort) = assignment_metadata.reasoning_effort(&assignment.id) {
             assignment_value
                 .as_object_mut()

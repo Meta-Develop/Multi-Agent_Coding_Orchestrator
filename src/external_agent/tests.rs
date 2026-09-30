@@ -504,35 +504,41 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     .with_workspace_access(WorkspaceAccess::ReadOnly)
     .with_agent_lifecycle("/registry", "researcher", "research-run", "research-task");
     let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified);
     assert_eq!(selected, cfg!(target_os = "linux"));
     assert!(!should_use_duplex_review(
         &spec,
         ExternalExecutionRuntime::Verified,
         true
     ));
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &spec,
         ExternalExecutionRuntime::NonpublishableSimulation
     ));
-    for role in ["worker", "auditor", "child_orchestrator", "Researcher"] {
+    let mut auditor = spec.clone();
+    auditor.agent_lifecycle.as_mut().unwrap().role = "auditor".to_string();
+    assert_eq!(
+        should_use_read_only_terminal_app_server(&auditor, ExternalExecutionRuntime::Verified),
+        cfg!(target_os = "linux")
+    );
+    for role in ["worker", "child_orchestrator", "Researcher", "Auditor"] {
         let mut other = spec.clone();
         other.agent_lifecycle.as_mut().unwrap().role = role.to_string();
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
     }
     let mut other = spec.clone();
     other.agent_lifecycle = None;
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
     other = spec
         .clone()
         .with_workspace_access(WorkspaceAccess::ReadWrite);
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
@@ -542,7 +548,7 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     ] {
         other = spec.clone();
         other.invocation = invocation;
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
@@ -597,36 +603,38 @@ fn read_only_researcher_app_server_refuses_custom_version_claim_before_launch() 
         ),
     )?;
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
-    let spec = ExternalAgentCommand::codex(
-        &shim,
-        temp.path(),
-        temp.path().join("prompt.md"),
-        temp.path().join("events.jsonl"),
-        temp.path().join("report.json"),
-        Duration::from_secs(5),
-    )
-    .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(temp.path(), "researcher", "custom-run", "custom-task");
-    assert!(should_use_read_only_researcher_app_server(
-        &spec,
-        ExternalExecutionRuntime::Verified
-    ));
-    assert_eq!(
-        external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
-        ExternalProgramTrust::ExplicitCustom
-    );
-    let report = run_external_agent(&spec);
-    assert!(
-        report.error.as_deref().is_some_and(
-            |error| error.contains("requires a verified TrustedSystemCodex executable")
-        ),
-        "{report:?}"
-    );
-    assert!(report.environment_blocked());
-    assert!(!report.stdout.target_launch_attempted);
-    assert!(!marker.exists());
-    assert!(report.codex_command_execution_evidence().is_none());
-    assert!(!report.publishable);
+    for role in ["researcher", "auditor"] {
+        let spec = ExternalAgentCommand::codex(
+            &shim,
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("events.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(5),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_agent_lifecycle(temp.path(), role, "custom-run", "custom-task");
+        assert!(should_use_read_only_terminal_app_server(
+            &spec,
+            ExternalExecutionRuntime::Verified
+        ));
+        assert_eq!(
+            external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
+            ExternalProgramTrust::ExplicitCustom
+        );
+        let report = run_external_agent(&spec);
+        assert!(
+            report.error.as_deref().is_some_and(
+                |error| error.contains("requires a verified TrustedSystemCodex executable")
+            ),
+            "{report:?}"
+        );
+        assert!(report.environment_blocked());
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(!marker.exists());
+        assert!(report.codex_command_execution_evidence().is_none());
+        assert!(!report.publishable);
+    }
     Ok(())
 }
 
@@ -659,15 +667,15 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
         messages_received: 1,
         bytes_received: 1,
     };
-    assert!(validate_read_only_researcher_app_server_outcome(&outcome, false).is_ok());
+    assert!(validate_read_only_terminal_app_server_outcome(&outcome, false).is_ok());
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, true)
+        validate_read_only_terminal_app_server_outcome(&outcome, true)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
     // No fileChange item and no gate-denial payload are needed to keep a permission refusal.
     outcome.refused_ceiling_expansions = 1;
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, false)
+        validate_read_only_terminal_app_server_outcome(&outcome, false)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
 }
@@ -675,6 +683,15 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
 #[cfg(target_os = "linux")]
 fn contained_read_only_researcher_app_server(
     mode: &str,
+) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
+    contained_read_only_terminal_app_server(mode, "researcher", None)
+}
+
+#[cfg(target_os = "linux")]
+fn contained_read_only_terminal_app_server(
+    mode: &str,
+    role: &str,
+    grant: Option<crate::supervise_budget::LiveTokenGrant>,
 ) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -722,7 +739,7 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
-    "model":"gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else "xhigh",
+    "model":"gpt-5.6-astra" if mode == "model-mismatch" else "gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else ("high" if mode == "low-effort" else "xhigh"),
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
@@ -768,6 +785,12 @@ usage = {"inputTokens":35000, "outputTokens":2000, "cachedInputTokens":30000,
          "reasoningOutputTokens":1000, "totalTokens":37000}
 send({"method":"thread/tokenUsage/updated", "params":{"threadId":"research-thread",
       "turnId":"research-turn", "tokenUsage":{"last":usage, "total":usage, "modelContextWindow":None}}})
+if mode == "budget":
+    interrupt = receive()
+    assert interrupt["method"] == "turn/interrupt"
+    assert interrupt["params"]["threadId"] == "research-thread"
+    send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"interrupted"}}})
+    sys.exit(0)
 if mode == "partial":
     send({"method":"unexpected/protocol/error", "params":{}})
     sys.exit(0)
@@ -776,7 +799,7 @@ item_event("item/completed", {"id":"answer", "type":"agentMessage", "text":'{"su
 send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"completed"}}})
 "#,
     )?;
-    let spec = ExternalAgentCommand::codex(
+    let mut spec = ExternalAgentCommand::codex(
         &python,
         &workspace,
         workspace.join("prompt.md"),
@@ -785,9 +808,11 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
         Duration::from_secs(15),
     )
     .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(&workspace, "researcher", "research-run", "research-task");
+    .with_agent_lifecycle(&workspace, role, "research-run", "research-task")
+    .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("xhigh".to_string()));
+    spec.bind_live_token_grant(grant);
     let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified);
     assert!(selected);
     assert!(!should_use_duplex_review(
         &spec,
@@ -827,7 +852,7 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
         StrictOfflineWorkspaceProfile::read_only(&workspace)
             .with_visible_read_only_root(python.parent().context("python parent")?),
     ));
-    let interactive = run_read_only_researcher_app_server_process(
+    let interactive = run_read_only_terminal_app_server_process(
         process_spec,
         &ProcessCancellation::new(),
         &spec,
@@ -3737,6 +3762,79 @@ fn exact_read_only_inputs_are_files_in_both_layers_without_parent_visibility() -
 
 #[cfg(unix)]
 #[test]
+fn immutable_researcher_input_omits_only_redundant_inner_workspace_file_rule() -> Result<()> {
+    let (root, mut command) = researcher_inputs::tests::fixture()?;
+    git2::Repository::init(&command.cwd)?;
+    create_mandatory_control_roots(&command.cwd)?;
+    let incoming = root.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    command.output_last_message = incoming.join("report.json");
+    let nested = command.cwd.join("src/runtime_adapter/source.rs");
+    fs::create_dir_all(nested.parent().unwrap())?;
+    fs::write(&nested, b"immutable source\n")?;
+    let schema = root.path().join("schema.json");
+    fs::write(&schema, b"{}\n")?;
+    command.read_only_input_files = vec![nested.clone(), schema.clone()];
+    command.researcher_source_inputs = vec![researcher_inputs::ResearcherSourceInput {
+        path: "src/runtime_adapter/source.rs".into(),
+        sha256: sha256_hex(b"immutable source\n"),
+    }];
+    researcher_inputs::validate_command(&command)?;
+    let controls = protected_worktree_controls(&command)?;
+    let rendered = codex_filesystem_permissions(&command, &controls);
+    let rule = |path: &Path| format!("{}=\"read\"", toml_basic_string(path.to_str().unwrap()));
+    assert!(rendered.contains("\":workspace_roots\"={\".\"=\"read\"}"));
+    assert!(!rendered.contains(&rule(&nested)));
+    assert!(rendered.contains(&rule(&schema)));
+    assert!(
+        !rendered.contains(&rule(root.path())),
+        "no new ancestor grant"
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        Path::new("/usr/bin/cat"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(
+        profile.visible_read_only_files().contains(&nested),
+        "outer exact-file binding remains"
+    );
+
+    for variant in [
+        "undeclared",
+        "writable",
+        "other-role",
+        "malformed-hash",
+        "mismatched-hash",
+    ] {
+        let mut changed = command.clone();
+        match variant {
+            "undeclared" => changed.researcher_source_inputs.clear(),
+            "writable" => changed.workspace_access = WorkspaceAccess::ReadWrite,
+            "other-role" => changed.agent_lifecycle.as_mut().unwrap().role = "auditor".into(),
+            "malformed-hash" => changed.researcher_source_inputs[0].sha256 = "invalid".into(),
+            "mismatched-hash" => changed.researcher_source_inputs[0].sha256 = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            codex_filesystem_permissions(&changed, &controls).contains(&rule(&nested)),
+            "{variant}"
+        );
+    }
+    let mut hidden = command.clone();
+    hidden
+        .hidden_roots
+        .push(nested.parent().unwrap().to_path_buf());
+    assert!(protected_worktree_controls(&hidden).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, _common, _child_git_dir) =
@@ -5073,6 +5171,10 @@ done
             })
         );
         assert!(evidence.model_mismatch);
+        // Successful fixture transport is not qualified provider acceptance.
+        assert!(report.error.is_none());
+        assert!(!report.publishable);
+        assert!(!report.succeeded());
         Ok(())
     }
 
@@ -9076,6 +9178,26 @@ fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()
 }
 
 #[test]
+fn codex_usage_parser_rejects_component_and_combined_total_overflow() {
+    let max = usize::MAX;
+    for (first, second, reason) in [
+        ((max - 1, 1), (max - 1, 1), "input"),
+        ((1, max - 1), (1, max - 1), "output"),
+        ((max - 1, 0), (0, 2), "total"),
+        ((max, 1), (0, 0), "total"),
+    ] {
+        let stream = [first, second].into_iter().map(|(input, output)| {
+            format!(r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0,"reasoning_output_tokens":0}}}}"#)
+        }).collect::<Vec<_>>().join("\n");
+        let error =
+            codex_usage_from_jsonl(stream.as_bytes()).expect_err("overflow must fail closed");
+        assert!(error
+            .to_string()
+            .contains(&format!("aggregate {reason} token count overflowed")));
+    }
+}
+
+#[test]
 fn codex_usage_parser_sums_only_valid_completed_turns() -> Result<()> {
     let usage = codex_usage_from_jsonl(
         br#"{"type":"thread.started","thread_id":"thread-a"}
@@ -12498,4 +12620,124 @@ fn live_token_grant_rejects_tampered_launch_identity() {
     );
     command.model = Some("tampered-model".to_string());
     assert!(command.verified_live_token_grant().is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_retains_private_identity_usage_and_refuses_bad_outcomes() -> Result<()>
+{
+    skip_without_containment!(ok);
+    for mode in [
+        "read",
+        "unknown-effort",
+        "low-effort",
+        "model-mismatch",
+        "truncated-capture",
+        "permission-approval",
+        "write",
+    ] {
+        let (run, workspace, _temp) =
+            contained_read_only_terminal_app_server(mode, "auditor", None)?;
+        assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md"))?,
+            "read-only fixture\n"
+        );
+        let held = run
+            .authenticated_app_server_evidence()
+            .context("private Auditor evidence")?;
+        if mode == "read" {
+            assert!(run.error.is_none(), "{run:?}");
+            assert_eq!(held.resolution_status, "complete");
+            assert_eq!(held.observed_model.known(), Some("gpt-5.6-sol"));
+            assert_eq!(held.observed_effort.known(), Some("xhigh"));
+            assert_eq!(
+                run.authenticated_codex_usage().unwrap().total_tokens,
+                37_000
+            );
+            assert!(matches!(
+                held.rollout_model,
+                CodexParentResolvedField::Unknown
+            ));
+            assert_eq!(
+                run.output_last_message(),
+                Some(b"{\"summary\":\"read-only fixture\"}".as_slice())
+            );
+        } else {
+            assert!(run.error.is_some(), "{mode}: {run:?}");
+            if mode == "low-effort" {
+                assert_eq!(held.observed_effort.known(), Some("high"));
+                assert!(!run.codex_auditor_effort_qualified());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+            if mode == "model-mismatch" {
+                assert!(held.model_mismatch);
+            }
+            if mode == "unknown-effort" {
+                assert!(held.observed_effort.known().is_none());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+        }
+        assert!(
+            !run.publishable,
+            "local transport cannot confer provider trust"
+        );
+        let decoded: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+        assert!(decoded.authenticated_app_server_evidence().is_none());
+        assert!(decoded.authenticated_codex_usage().is_none());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_interrupts_live_grant_and_retains_partial_usage() -> Result<()> {
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    skip_without_containment!(ok);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: Some(36_000),
+        ..Default::default()
+    })?;
+    let BudgetAdmission::Admitted { reservation, .. } =
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 16_384,
+            cost_usd: None,
+        })?
+    else {
+        panic!("admission");
+    };
+    let grant = ledger.live_token_grant(reservation.id)?.unwrap();
+    assert_eq!(grant.tokens(), 36_000);
+    let (run, _, _temp) =
+        contained_read_only_terminal_app_server("budget", "auditor", Some(grant.clone()))?;
+    assert!(grant.stopped());
+    assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+    assert!(!run.publishable);
+    assert!(
+        run.error.as_deref().is_some_and(
+            |error| error.contains("token grant exhausted: observed 37000 >= grant 36000")
+        ),
+        "{run:?}"
+    );
+    assert!(run.output_last_message().is_none_or(<[u8]>::is_empty));
+    assert!(matches!(
+        run.authenticated_app_server_evidence().unwrap().turn_usage,
+        CodexParentTurnUsage::Known {
+            input_tokens: 35_000,
+            output_tokens: 2_000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 1,
+            cost_usd: None,
+        })?,
+        BudgetAdmission::Refused { .. }
+    ));
+    Ok(())
 }

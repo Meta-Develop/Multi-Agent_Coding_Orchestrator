@@ -1,17 +1,33 @@
 use super::*;
 
+/// Placeholder catalog rates describe simulations, not real-provider prices.
+/// Keep explicit valid plan prices, including zero, distinct from those defaults.
+pub(super) fn pricing_for_runtime(
+    plan: &SupervisorPlan,
+    model: &str,
+    runtime: SupervisorRuntime,
+) -> Option<ModelPricing> {
+    use crate::llm::provider::{resolve_model_pricing, ModelPricingProvenance};
+    resolve_model_pricing(&plan.model_pricing, model)
+        .filter(|resolved| {
+            runtime == SupervisorRuntime::Fake
+                || resolved.provenance == ModelPricingProvenance::PlanOverride
+        })
+        .map(|resolved| resolved.pricing)
+}
+
 pub(super) fn reserve_dispatch_budget<'a>(
     plan: &SupervisorPlan,
     budget_config: &SupervisorBudgetConfig,
     ledger: &'a RunBudgetLedger,
-    role: AgentRole,
+    role_runtime: (AgentRole, SupervisorRuntime),
     command: &ExternalAgentCommand,
 ) -> Result<DispatchBudgetAdmission<'a>> {
     reserve_dispatch_budget_cancellable(
         plan,
         budget_config,
         ledger,
-        role,
+        role_runtime,
         command,
         &ProcessCancellation::default(),
     )
@@ -21,20 +37,21 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
     plan: &SupervisorPlan,
     budget_config: &SupervisorBudgetConfig,
     ledger: &'a RunBudgetLedger,
-    role: AgentRole,
+    role_runtime: (AgentRole, SupervisorRuntime),
     command: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
 ) -> Result<DispatchBudgetAdmission<'a>> {
+    let (role, runtime) = role_runtime;
     let tokens = budget_config.reservation_tokens(role).with_context(|| {
         format!(
             "run_budget has no token reservation for dispatched role '{}'",
             role.as_str()
         )
     })?;
-    let pricing = command.model.as_ref().and_then(|model| {
-        crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model)
-            .map(|resolved| resolved.pricing)
-    });
+    let pricing = command
+        .model
+        .as_ref()
+        .and_then(|model| pricing_for_runtime(plan, model, runtime));
     let cost_usd = pricing
         .map(|pricing| {
             const TOKENS_PER_MILLION: f64 = 1_000_000.0;
@@ -78,7 +95,8 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
                 ledger,
                 reservation,
                 pricing,
-                state: DispatchBudgetReservationState::Reserved,
+                model_pricing: plan.model_pricing.clone(),
+                state: DispatchBudgetReservationState::Reserved(runtime),
             },
         )),
         BudgetAdmission::Refused { refusal, .. } => Ok(DispatchBudgetAdmission::Refused(refusal)),
@@ -90,8 +108,8 @@ pub(super) fn external_dispatch_may_have_started(
     runtime: SupervisorRuntime,
 ) -> bool {
     runtime == SupervisorRuntime::Fake
-        || run.process_tree.is_some()
-        || !run.scratch_quiescence_verified()
+        || (!run.source_probe_confirmed_no_provider_release()
+            && (run.process_tree.is_some() || !run.scratch_quiescence_verified()))
 }
 
 pub(super) fn record_budget_dispatch_refusal(

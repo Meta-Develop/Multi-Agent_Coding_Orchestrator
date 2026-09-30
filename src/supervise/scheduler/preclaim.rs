@@ -228,6 +228,7 @@ pub(super) struct PreclaimRunEvidence {
     semantic_map: Option<SemanticRepoMap>,
     pub(super) runtime: Option<SupervisorRuntime>,
     execution_runtime: SupervisorExecutionRuntime,
+    assignment_metadata: AssignmentMetadata,
 }
 
 impl PreclaimRunEvidence {
@@ -242,6 +243,7 @@ impl PreclaimRunEvidence {
                 semantic_map: None,
                 runtime: Some(runtime),
                 execution_runtime,
+                assignment_metadata: AssignmentMetadata::default(),
             };
         }
         Self {
@@ -249,6 +251,7 @@ impl PreclaimRunEvidence {
             semantic_map: crate::repo_semantic::scan_repository(repo).ok(),
             runtime: Some(runtime),
             execution_runtime,
+            assignment_metadata: AssignmentMetadata::default(),
         }
     }
 
@@ -263,6 +266,7 @@ impl PreclaimRunEvidence {
             semantic_map: Some(semantic_map),
             runtime: Some(runtime),
             execution_runtime: SupervisorExecutionRuntime::Verified,
+            assignment_metadata: AssignmentMetadata::default(),
         }
     }
 
@@ -273,7 +277,30 @@ impl PreclaimRunEvidence {
             semantic_map: None,
             runtime: None,
             execution_runtime: SupervisorExecutionRuntime::Verified,
+            assignment_metadata: AssignmentMetadata::default(),
         }
+    }
+
+    pub(super) fn with_assignment_metadata(mut self, metadata: &AssignmentMetadata) -> Self {
+        self.assignment_metadata = metadata.clone();
+        self
+    }
+
+    pub(super) fn evaluate(
+        &self,
+        assignment: &OrchestratorAssignment,
+        requested_assignments: &[OrchestratorAssignment],
+    ) -> PreclaimDecision {
+        let risk = self.risk_for(&assignment.assigned_paths);
+        evaluate_preclaim_with_metadata(
+            assignment,
+            requested_assignments,
+            self.repo_map.as_ref(),
+            risk.as_ref(),
+            self.runtime,
+            self.execution_runtime,
+            &self.assignment_metadata,
+        )
     }
 
     pub(super) fn risk_for(&self, paths: &[PathBuf]) -> Option<SemanticRiskReport> {
@@ -302,7 +329,10 @@ trait PreclaimAssessmentProvider {
     ) -> PreclaimAssessment;
 }
 
-struct DeterministicPreclaimProvider;
+struct DeterministicPreclaimProvider<'a> {
+    assignment_metadata: &'a AssignmentMetadata,
+    runtime: Option<SupervisorRuntime>,
+}
 
 struct SyntheticSimulationPreclaimProvider;
 
@@ -332,7 +362,7 @@ impl PreclaimAssessmentProvider for SyntheticSimulationPreclaimProvider {
     }
 }
 
-impl PreclaimAssessmentProvider for DeterministicPreclaimProvider {
+impl PreclaimAssessmentProvider for DeterministicPreclaimProvider<'_> {
     fn assess(
         &self,
         assignment: &OrchestratorAssignment,
@@ -341,12 +371,28 @@ impl PreclaimAssessmentProvider for DeterministicPreclaimProvider {
         risk_report: Option<&SemanticRiskReport>,
     ) -> PreclaimAssessment {
         let limited_scope = deterministic_limited_scope(assignment, repo_map);
-        let clear_verification_path = deterministic_verification_path(
-            assignment,
-            requested_assignments,
-            repo_map,
-            risk_report,
-        );
+        let clear_verification_path = if assignment.role == AgentRole::Researcher {
+            if repo_map.is_some_and(|map| {
+                requested_researcher_source_contract(
+                    assignment,
+                    requested_assignments,
+                    self.assignment_metadata,
+                    map,
+                    self.runtime,
+                )
+            }) {
+                ViabilityFinding::Yes
+            } else {
+                ViabilityFinding::Unknown
+            }
+        } else {
+            deterministic_verification_path(
+                assignment,
+                requested_assignments,
+                repo_map,
+                risk_report,
+            )
+        };
         let autonomously_completable = deterministic_autonomous_completion(assignment);
         let dimensions = PreclaimViabilityDimensions {
             limited_scope,
@@ -412,6 +458,60 @@ fn deterministic_limited_scope(
     } else {
         ViabilityFinding::Yes
     }
+}
+
+// This establishes only a locally checkable research task. Launch still proves
+// the managed snapshot/profile, and acceptance still requires private command,
+// identity, usage and independent lens evidence.
+fn requested_researcher_source_contract(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    metadata: &AssignmentMetadata,
+    repo_map: &RepoMap,
+    runtime: Option<SupervisorRuntime>,
+) -> bool {
+    use crate::external_agent::researcher_inputs::validate_snapshot;
+
+    if unique_requested_assignment(requested_assignments, &assignment.id) != Some(assignment)
+        || assignment.role != AgentRole::Researcher
+        || assignment.category_is_operator_override()
+        || super::super::researcher::validate_researcher_assignment(assignment).is_err()
+        || runtime != Some(SupervisorRuntime::Codex)
+        || !assignment.semantic_symbols.is_empty()
+        || !assignment.semantic_modules.is_empty()
+    {
+        return false;
+    }
+    let Some(inputs) = metadata.source_inputs.get(&assignment.id) else {
+        return false;
+    };
+    if inputs.is_empty()
+        || inputs.len() != assignment.assigned_paths.len()
+        || inputs.iter().any(|input| {
+            !assignment
+                .assigned_paths
+                .contains(&PathBuf::from(&input.path))
+                || mapped_git_visible_regular_file_size(repo_map, Path::new(&input.path)).is_none()
+        })
+    {
+        return false;
+    }
+    // This is the first input-content read. The shared snapshot validator uses
+    // its existing fixed cap on the no-follow descriptor, never the map's size.
+    // Do not re-read through the legacy map-sized reader after this check.
+    if validate_snapshot(&repo_map.root, inputs).is_err() {
+        return false;
+    }
+    // The map may predate a fallback/recheck. Do not admit a dirty file even if
+    // a changed metadata hash happens to describe its current bytes.
+    let Ok(repository) = git2::Repository::open(&repo_map.root) else {
+        return false;
+    };
+    inputs.iter().all(|input| {
+        repository
+            .status_file(Path::new(&input.path))
+            .is_ok_and(|status| status.is_empty())
+    })
 }
 
 fn deterministic_verification_path(
@@ -722,42 +822,44 @@ fn requested_existing_regular_file_edit_contract(
             == execution_assignment.task_sha256
 }
 
-fn mapped_git_visible_readable_regular_file(repo_map: &RepoMap, target: &Path) -> bool {
+fn mapped_git_visible_regular_file_size(repo_map: &RepoMap, target: &Path) -> Option<u64> {
     let mut matching_entries = repo_map.entries.iter().filter(|entry| entry.path == target);
-    let Some(entry) = matching_entries.next() else {
-        return false;
-    };
+    let entry = matching_entries.next()?;
     if matching_entries.next().is_some()
         || entry.kind != RepoEntryKind::File
         || entry.git_status != RepoGitStatus::Clean
     {
-        return false;
+        return None;
     }
-    let Some(expected_bytes) = entry.size_bytes else {
-        return false;
-    };
-    let Ok(repository) = git2::Repository::open(&repo_map.root) else {
-        return false;
-    };
-    let Ok(index) = repository.index() else {
-        return false;
-    };
-    let Some(index_entry) = index.get_path(target, 0) else {
-        return false;
-    };
+    let expected_bytes = entry.size_bytes?;
+    let repository = git2::Repository::open(&repo_map.root).ok()?;
+    let index = repository.index().ok()?;
+    let index_entry = index.get_path(target, 0)?;
     if index_entry.mode & 0o170_000 != 0o100_000 {
-        return false;
+        return None;
     }
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        let Ok(metadata) = std::fs::symlink_metadata(repo_map.root.join(target)) else {
-            return false;
-        };
+        let metadata = std::fs::symlink_metadata(repo_map.root.join(target)).ok()?;
         if !metadata.is_file() || metadata.permissions().mode() & 0o444 == 0 {
-            return false;
+            return None;
         }
     }
+    Some(expected_bytes)
+}
+
+#[cfg(test)]
+thread_local! {
+    static TEST_MAP_SIZED_CONTENT_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+fn mapped_git_visible_readable_regular_file(repo_map: &RepoMap, target: &Path) -> bool {
+    let Some(expected_bytes) = mapped_git_visible_regular_file_size(repo_map, target) else {
+        return false;
+    };
+    #[cfg(test)]
+    TEST_MAP_SIZED_CONTENT_READS.with(|reads| reads.set(reads.get() + 1));
     BoundedRegularReader::read_relative(&repo_map.root, target, expected_bytes)
         .is_ok_and(|contents| u64::try_from(contents.len()) == Ok(expected_bytes))
 }
@@ -1597,6 +1699,7 @@ fn parked_decision(
     }
 }
 
+#[cfg(test)]
 pub(super) fn evaluate_preclaim_viability(
     assignment: &OrchestratorAssignment,
     requested_assignments: &[OrchestratorAssignment],
@@ -1604,6 +1707,26 @@ pub(super) fn evaluate_preclaim_viability(
     risk_report: Option<&SemanticRiskReport>,
     runtime: Option<SupervisorRuntime>,
     execution_runtime: SupervisorExecutionRuntime,
+) -> PreclaimDecision {
+    evaluate_preclaim_with_metadata(
+        assignment,
+        requested_assignments,
+        repo_map,
+        risk_report,
+        runtime,
+        execution_runtime,
+        &AssignmentMetadata::default(),
+    )
+}
+
+pub(super) fn evaluate_preclaim_with_metadata(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo_map: Option<&RepoMap>,
+    risk_report: Option<&SemanticRiskReport>,
+    runtime: Option<SupervisorRuntime>,
+    execution_runtime: SupervisorExecutionRuntime,
+    assignment_metadata: &AssignmentMetadata,
 ) -> PreclaimDecision {
     match execution_runtime {
         SupervisorExecutionRuntime::NonpublishableSimulation => evaluate_with_provider(
@@ -1622,7 +1745,10 @@ pub(super) fn evaluate_preclaim_viability(
             risk_report,
             runtime,
             execution_runtime,
-            &DeterministicPreclaimProvider,
+            &DeterministicPreclaimProvider {
+                assignment_metadata,
+                runtime,
+            },
         ),
     }
 }
@@ -1633,15 +1759,7 @@ pub(super) fn preclaim_assignment(
     requested_assignments: &[OrchestratorAssignment],
     evidence: &PreclaimRunEvidence,
 ) -> Result<PreclaimDecision> {
-    let risk = evidence.risk_for(&assignment.assigned_paths);
-    let decision = evaluate_preclaim_viability(
-        assignment,
-        requested_assignments,
-        evidence.repo_map.as_ref(),
-        risk.as_ref(),
-        evidence.runtime,
-        evidence.execution_runtime,
-    );
+    let decision = evidence.evaluate(assignment, requested_assignments);
     persist_preclaim_decision(artifacts, assignment, &decision)?;
     Ok(decision)
 }
@@ -1965,6 +2083,8 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary preclaim repository");
         let repo_path = temp.path().join("repo");
         let repository = git2::Repository::init(&repo_path).expect("initialize repository");
+        std::fs::create_dir_all(repo_path.join(relative).parent().expect("file parent"))
+            .expect("create repository file parent");
         std::fs::write(repo_path.join(relative), contents).expect("write repository file");
         if tracked {
             let mut index = repository.index().expect("open repository index");
@@ -1982,6 +2102,327 @@ mod tests {
         }
         let map = crate::repo_map::scan_repository(&repo_path).expect("scan repository map");
         (temp, map)
+    }
+
+    fn researcher_source_plan() -> (tempfile::TempDir, RepoMap, LoadedSupervisorPlan) {
+        // The actual public packet that was parked: substantive source, not a
+        // test-target name or an empty diff. No dependency on a private receipt.
+        let contents = include_str!("../../runtime_adapter/gemini.rs").replace("\r\n", "\n");
+        assert_eq!(contents.lines().count(), 394);
+        assert_eq!(
+            crate::artifacts::state_auth::sha256_hex(contents.as_bytes()),
+            "74441d996b88c90417971a9b540aa66f212a7ced9710ae89b155f3b90dcd930f"
+        );
+        let path = "src/runtime_adapter/gemini.rs";
+        let (temp, map) = repository_map_for_file(path, &contents, true);
+        let mut lenses = serde_json::to_value(default_supervisor_review_lenses()).unwrap();
+        for lens in lenses.as_array_mut().unwrap() {
+            lens["backend"]["model"] = serde_json::json!("gpt-5.6-sol");
+            lens["backend"]["reasoning_effort"] = serde_json::json!("xhigh");
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&serde_json::json!({
+            "task": "Read the complete tracked source and report cited findings without changes.",
+            "max_depth": 3, "max_child_assignments": 1, "max_child_retries": 0,
+            "max_gate_corrections": 0, "child_timeout_seconds": 240,
+            "review_lenses": lenses,
+            "role_models": {
+                "researcher": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
+                "auditor": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+            },
+            "run_budget": {"hard_tokens": 220000, "role_token_reservations": {
+                "researcher": 16384, "auditor": 16384, "child_orchestrator": 16384
+            }},
+            "assignments": [{
+                "id": "researcher-gemini-source-input", "phase": "execution",
+                "runtime": "codex", "role": "researcher", "role_category": "read_only_researcher",
+                "assigned_paths": [path], "worker_assignments": [],
+                "source_inputs": [{"path": path, "sha256": crate::artifacts::state_auth::sha256_hex(contents.as_bytes())}],
+                "task": "Read the full source, verify its hash and cite findings. No writes or delegation."
+            }]
+        }).to_string()).expect("operator plan with parent-parsed source metadata");
+        (temp, map, loaded)
+    }
+
+    #[test]
+    fn researcher_source_preclaim_initial_fallback_and_recheck_are_verified() {
+        let (_temp, map, loaded) = researcher_source_plan();
+        let assignment = &loaded.plan.assignments[0];
+        let initial = evaluate_supervisor_preclaims(
+            &loaded.plan,
+            &loaded.plan,
+            &map.root,
+            &loaded.assignment_metadata,
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(initial.len(), 1);
+        assert!(initial[0].allows_path_claim(), "{}", initial[0].reason);
+        assert!(initial[0].dimensions.all_positive());
+        assert_eq!(initial[0].evidence_source, PreclaimEvidenceSource::Acquired);
+        assert_eq!(
+            initial[0].authority,
+            PreclaimDecisionAuthority::DeterministicPolicy
+        );
+        assert_eq!(initial[0].triage_outcome, PreclaimTriageOutcome::Viable);
+        assert!(initial[0].operator_override.is_none());
+        assert!(initial[0].map_present && initial[0].risk_present && initial[0].runtime_present);
+
+        let evidence = PreclaimRunEvidence::acquire(
+            &map.root,
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+        )
+        .with_assignment_metadata(&loaded.assignment_metadata);
+        // Persistence requires the same repository authentication as a real run.
+        drop(
+            crate::artifacts::repository_auth_writer(&map.root).expect("repository authentication"),
+        );
+        let run_id = RunId::new("researcher-source-preclaim").unwrap();
+        let mut writer = ArtifactRunWriter::reserve(
+            &map.root,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "researcher-source-preclaim-test",
+        )
+        .unwrap();
+        let run_dir = writer.run_dir().to_path_buf();
+        let mut journal = Some(
+            initialize_orchestration_event_journal(&map.root, &run_id, None)
+                .expect("authenticated orchestration journal"),
+        );
+        let mut autonomy_kpis = AutonomyKpiCollector::default();
+        let artifacts = Mutex::new(SharedSupervisorArtifacts {
+            writer: &mut writer,
+            journal: &mut journal,
+            autonomy_kpis: &mut autonomy_kpis,
+            checkpoint: None,
+        });
+        let fallback =
+            preclaim_assignment(&artifacts, assignment, &loaded.plan.assignments, &evidence)
+                .unwrap();
+        assert_eq!(fallback, initial[0]);
+        assert!(recheck_narrowed_assignment_preclaim(
+            &artifacts,
+            assignment,
+            &loaded.plan.assignments,
+            (&map.root, &loaded.assignment_metadata),
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::VerifiedTestOnly,
+        )
+        .unwrap()
+        .is_none());
+        let mut drifted = assignment.clone();
+        drifted.task = Some("Different unbound research".into());
+        assert!(recheck_narrowed_assignment_preclaim(
+            &artifacts,
+            &drifted,
+            &loaded.plan.assignments,
+            (&map.root, &loaded.assignment_metadata),
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+            SupervisorWorktreeCreation::VerifiedTestOnly,
+        )
+        .unwrap()
+        .is_some());
+        let decisions = std::fs::read_to_string(run_dir.join(PRECLAIM_DECISIONS_RELATIVE)).unwrap();
+        let decisions: Vec<PreclaimDecision> = decisions
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(decisions.len(), 3);
+        assert!(decisions[0].allows_path_claim() && decisions[1].allows_path_claim());
+        assert!(!decisions[2].allows_path_claim());
+    }
+
+    #[test]
+    fn researcher_source_preclaim_oversized_input_refused_before_map_sized_read() {
+        // A matching hash and clean Git entry do not authorize size-proportional
+        // allocation. This small deterministic oversized packet exceeds the
+        // existing source-input cap without risking a supervisor-sized OOM.
+        let contents = "x".repeat(2 * 1024 * 1024);
+        let (_temp, map) = repository_map_for_file("packet.txt", &contents, true);
+        let mut candidate = assignment();
+        candidate.role = AgentRole::Researcher;
+        candidate.role_category = Some(RoleCategory::ReadOnlyResearcher);
+        candidate.runtime = Some(SupervisorRuntime::Codex);
+        candidate.assigned_paths = vec![PathBuf::from("packet.txt")];
+        let mut metadata = AssignmentMetadata::default();
+        metadata.source_inputs.insert(
+            candidate.id.clone(),
+            vec![
+                crate::external_agent::researcher_inputs::ResearcherSourceInput {
+                    path: "packet.txt".into(),
+                    sha256: crate::artifacts::state_auth::sha256_hex(contents.as_bytes()),
+                },
+            ],
+        );
+        let evidence = PreclaimRunEvidence::acquire(
+            &map.root,
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+        )
+        .with_assignment_metadata(&metadata);
+        TEST_MAP_SIZED_CONTENT_READS.with(|reads| reads.set(0));
+        let decision = evidence.evaluate(&candidate, std::slice::from_ref(&candidate));
+        assert!(!decision.allows_path_claim());
+        assert_eq!(decision.evidence_source, PreclaimEvidenceSource::Acquired);
+        assert!(decision.map_present && decision.risk_present && decision.runtime_present);
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+        assert_eq!(
+            TEST_MAP_SIZED_CONTENT_READS.with(|reads| reads.get()),
+            0,
+            "oversized source must be refused before any map-sized content read/allocation"
+        );
+    }
+
+    #[test]
+    fn researcher_source_preclaim_rejects_unbound_metadata_and_authority() {
+        let (_temp, map, loaded) = researcher_source_plan();
+        let assignment = &loaded.plan.assignments[0];
+        for case in [
+            "missing",
+            "empty",
+            "foreign",
+            "wrong_hash",
+            "foreign_path",
+            "duplicate_requested",
+            "drifted_task",
+            "wrong_role",
+            "wrong_category",
+            "wrong_runtime",
+            "workers",
+            "breakage",
+            "notes_only",
+        ] {
+            let mut candidate = assignment.clone();
+            let mut requested = loaded.plan.assignments.clone();
+            let mut metadata = loaded.assignment_metadata.clone();
+            let mut runtime = SupervisorRuntime::Codex;
+            match case {
+                "missing" | "notes_only" => metadata.source_inputs.clear(),
+                "empty" => metadata
+                    .source_inputs
+                    .get_mut(&candidate.id)
+                    .unwrap()
+                    .clear(),
+                "foreign" => {
+                    let inputs = metadata.source_inputs.remove(&candidate.id).unwrap();
+                    metadata
+                        .source_inputs
+                        .insert("another-researcher".into(), inputs);
+                }
+                "wrong_hash" => {
+                    metadata.source_inputs.get_mut(&candidate.id).unwrap()[0].sha256 =
+                        "0".repeat(64)
+                }
+                "foreign_path" => {
+                    metadata.source_inputs.get_mut(&candidate.id).unwrap()[0].path =
+                        "Cargo.toml".into()
+                }
+                "duplicate_requested" => requested.push(candidate.clone()),
+                "drifted_task" => candidate.task = Some("Different task".into()),
+                "wrong_role" => {
+                    candidate.role = AgentRole::ChildOrchestrator;
+                    requested[0] = candidate.clone();
+                }
+                "wrong_category" => {
+                    candidate.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+                    requested[0] = candidate.clone();
+                }
+                "wrong_runtime" => runtime = SupervisorRuntime::Grok,
+                "workers" => {
+                    candidate.worker_assignments.push(WorkerAssignment {
+                        id: "forbidden-worker".into(),
+                        role: AgentRole::Worker,
+                        role_category: None,
+                        selection_source: None,
+                        assigned_paths: candidate.assigned_paths.clone(),
+                        semantic_symbols: vec![],
+                        semantic_modules: vec![],
+                        task: None,
+                        environment_requirements: vec![],
+                        report_path: None,
+                    });
+                    requested[0] = candidate.clone();
+                }
+                "breakage" => {
+                    candidate.licensed_breakage = Some(LicensedBreakageDeclaration {
+                        migration_rationale: "not a Researcher capability".into(),
+                        dependents: vec![],
+                    });
+                    requested[0] = candidate.clone();
+                }
+                _ => unreachable!(),
+            }
+            if case == "notes_only" {
+                candidate.notes =
+                    Some("source_inputs sha256 verified; read_only_researcher".into());
+                requested[0] = candidate.clone();
+            }
+            let evidence = PreclaimRunEvidence::acquire(
+                &map.root,
+                runtime,
+                SupervisorExecutionRuntime::Verified,
+            )
+            .with_assignment_metadata(&metadata);
+            let decision = evidence.evaluate(&candidate, &requested);
+            assert!(!decision.allows_path_claim(), "{case}: {}", decision.reason);
+            assert_ne!(
+                decision.dimensions.clear_verification_path,
+                ViabilityFinding::Yes,
+                "{case}"
+            );
+            assert_eq!(decision.evidence_source, PreclaimEvidenceSource::Acquired);
+        }
+    }
+
+    #[test]
+    fn researcher_source_preclaim_revalidates_bytes_and_preserves_other_dimensions() {
+        let (_temp, map, loaded) = researcher_source_plan();
+        let assignment = &loaded.plan.assignments[0];
+        let mut evidence = PreclaimRunEvidence::acquire(
+            &map.root,
+            SupervisorRuntime::Codex,
+            SupervisorExecutionRuntime::Verified,
+        )
+        .with_assignment_metadata(&loaded.assignment_metadata);
+        let mut requires_environment = assignment.clone();
+        requires_environment
+            .environment_requirements
+            .push(EnvironmentRequirement::network(
+                EnvironmentNetworkAccess::Enabled,
+            ));
+        let decision = evidence.evaluate(&requires_environment, &[requires_environment.clone()]);
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(
+            decision.dimensions.autonomously_completable,
+            ViabilityFinding::No
+        );
+        assert!(!decision.allows_path_claim());
+        let path = map.root.join(&assignment.assigned_paths[0]);
+        let changed = b"pub fn changed_after_map() {}\n";
+        std::fs::write(&path, changed).unwrap();
+        assert!(!evidence
+            .evaluate(assignment, &loaded.plan.assignments)
+            .allows_path_claim());
+        // Even metadata describing the new bytes must not turn a dirty packet
+        // into a clean source contract using a stale acquired map.
+        evidence
+            .assignment_metadata
+            .source_inputs
+            .get_mut(&assignment.id)
+            .unwrap()[0]
+            .sha256 = crate::artifacts::state_auth::sha256_hex(changed);
+        assert!(!evidence
+            .evaluate(assignment, &loaded.plan.assignments)
+            .allows_path_claim());
     }
 
     fn evaluate(assignment: &OrchestratorAssignment) -> PreclaimDecision {
