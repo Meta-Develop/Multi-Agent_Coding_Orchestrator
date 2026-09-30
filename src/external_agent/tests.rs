@@ -11174,6 +11174,53 @@ fn codex_argv_and_digest_preserve_non_utf8_paths_without_collision() -> Result<(
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn gemini_consult_intent_is_distinct_and_refuses_wrong_role_access_or_runtime() -> Result<()> {
+    let (_temp, command, _marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        None,
+        "consult-gemini",
+        "consult-gemini",
+        Some("gemini-2.5-pro"),
+    )?;
+    assert!(assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &command
+    ));
+    for kind in [
+        AssignmentProcessLaunchKind::ConsultCodex,
+        AssignmentProcessLaunchKind::ConsultClaude,
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        AssignmentProcessLaunchKind::MergeArbiter,
+    ] {
+        assert!(!assignment_process_launch_kind_allowed_for_invocation(
+            kind, &command
+        ));
+    }
+    let mut wrong = command.clone();
+    wrong.workspace_access = WorkspaceAccess::ReadWrite;
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    let mut wrong = command.clone();
+    wrong.agent_lifecycle.as_mut().unwrap().role = "worker".into();
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    let wrong = command.with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    );
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn assignment_process_launch_fixture(
     kind: AssignmentProcessLaunchKind,
     grant: Option<crate::mutation_taxonomy::AssignmentProcessLaunchGrant>,
@@ -11224,6 +11271,21 @@ fn assignment_process_launch_fixture(
             incoming.join("last-message.txt"),
             Duration::from_secs(5),
         )
+        .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
+        .with_model_selection(model.map(str::to_string), None),
+        AssignmentProcessLaunchKind::ConsultGemini => ExternalAgentCommand::codex(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_runtime_adapter(
+            RuntimeId::GeminiCli,
+            RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
         .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
         .with_model_selection(model.map(str::to_string), None),
         AssignmentProcessLaunchKind::AssignmentChild

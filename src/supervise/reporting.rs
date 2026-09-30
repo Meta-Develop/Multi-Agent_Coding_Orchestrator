@@ -1946,8 +1946,10 @@ pub(super) fn external_process_completed(
             && run.error.is_none()
             && run.managed_gemini_selection_evidence().is_some()
             && evidence.provider_released
-            && evidence.managed_worker_completed
-            && evidence.tool_mutation_observed
+            && ((evidence.managed_worker_completed
+                && evidence.tool_mutation_observed
+                && !evidence.managed_read_only_completed)
+                || evidence.read_only_completion_valid(run))
             && external_safety_verified(run, runtime);
     }
     if runtime == SupervisorRuntime::Fake {
@@ -1971,6 +1973,14 @@ pub(super) fn external_process_completed(
             })
         && run.codex_auditor_effort_qualified()
         && external_safety_verified(run, runtime)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn gemini_read_only_reporting_completion_requires_live_native_custody() -> Result<()> {
+    crate::external_agent::gemini_bridge::test_read_only_completion_consumer(|run| {
+        external_process_completed(run, SupervisorRuntime::GeminiCli)
+    })
 }
 
 pub(super) fn complete_external_codex_usage(

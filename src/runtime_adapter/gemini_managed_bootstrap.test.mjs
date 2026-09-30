@@ -8,7 +8,7 @@ import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
 import net from "node:net";
-import { loadOfflineCodeAssist, instrumentVendor, VENDOR_ROOT, CLOSURE, connectManagedParent, managedEnvironmentKeysAllowed, createNativeToolJournal } from "./gemini_managed_bootstrap.mjs";
+import { loadOfflineCodeAssist, instrumentVendor, VENDOR_ROOT, CLOSURE, connectManagedParent, managedEnvironmentKeysAllowed, createNativeToolJournal, managedSessionResult } from "./gemini_managed_bootstrap.mjs";
 
 import { bindCodeAssistClient0412, createCodeAssistWireUnit } from "./gemini_code_assist_wire.mjs";
 const envelope = { traceId: "synthetic-offline", response: {
@@ -118,7 +118,7 @@ async function scenario(name) {
     assert.throws(() => new b.core.Config(params), /import_closure/);
     assert.equal(sends, 0); return;
   }
-  if (name === "tools") {
+  if (["tools", "tools-write-refusal", "tools-edit-refusal"].includes(name)) {
     await config.initialize();
     const registry = new b.core.ToolRegistry(config, config.getMessageBus(), true);
     const reader = new b.core.ReadFileTool(config, config.getMessageBus());
@@ -135,7 +135,14 @@ async function scenario(name) {
     assert.equal(observations[1].argumentsJson, observations[0].argumentsJson);
     assert.equal(observations[1].cwd, process.cwd());
     assert.equal(observations[1].afterSha256, observations[0].beforeSha256);
-    assert.throws(() => reader.build({ file_path: "../profile/system.json" }), /tool_path/);
+    assert.deepEqual(registry.getFunctionDeclarations().map((entry) => entry.name), [b.core.ReadFileTool.Name]);
+    if (name === "tools") {
+      assert.throws(() => reader.build({ file_path: "../profile/system.json" }), /tool_path/);
+    } else {
+      // Each denial uses its own unit: a prior denial is permanently latched.
+      const Tool = name === "tools-write-refusal" ? b.core.WriteFileTool : b.core.EditTool;
+      assert.throws(() => registry.registerTool(new Tool(config, config.getMessageBus())), /tool_not_authorized/);
+    }
     assert.equal(sends, 0); return;
   }
   if (name === "mcp-empty") {
@@ -248,6 +255,19 @@ async function scenario(name) {
 if (process.argv[2] === "--offline-scenario") {
   await scenario(process.argv[3]);
 } else {
+  test("read-only managed result preserves Worker mutation and terminal requirements", () => {
+    assert.equal(managedSessionResult("read_only", "completed", false, ["Observed ", "read-only result"]).toString(),
+      "Observed read-only result\n");
+    assert.throws(() => managedSessionResult("read_only", "completed", true, ["changed"]), /managed_session_incomplete/);
+    assert.throws(() => managedSessionResult("read_write", "completed", false, ["no mutation"]), /managed_session_incomplete/);
+    assert.equal(managedSessionResult("read_write", "completed", true, ["actual edit"]).toString(), "actual edit\n");
+    for (const reason of ["cancelled", "failed", undefined]) {
+      assert.throws(() => managedSessionResult("read_only", reason, false, ["partial"]), /managed_session_incomplete/);
+    }
+    assert.throws(() => managedSessionResult("read_only", "completed", false, []), /managed_result_bound/);
+    assert.throws(() => managedSessionResult("read_only", "completed", false, ["x".repeat(1024 * 1024)]), /managed_result_bound/);
+    assert.throws(() => managedSessionResult("foreign", "completed", false, ["text"]), /managed_session_incomplete/);
+  });
   test("native tool journal waits for begin and terminal ACK with original arguments", async () => {
     const root = mkdtempSync(join(tmpdir(), "maco-native-journal-"));
     const filename = join(root, "sample.txt"), candidate = process.cwd();
@@ -467,7 +487,7 @@ mount --bind /dev/null "$root/dev/null"
 cd "$root/candidate"
 exec env -i HOME=/profile GEMINI_CLI_HOME=/profile GEMINI_CLI_SYSTEM_SETTINGS_PATH=/profile/system.json GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/profile/defaults.json PATH=/nonexistent LANG=C.UTF-8 /usr/sbin/chroot "$root" "$node" /owned/gemini_managed_bootstrap.test.mjs --offline-scenario "$scenario"
 `;
-  for (const name of ["installed", "replay", "hostile-config", "sdk", "alias", "profile", "ambient-file", "preloaded", "tools", "mcp-empty", "tool-spoof", "shell", "extensions", "logging-backend", "setup-methods", "receiver", "ownership", "unclassified", "unknown-dependency", "userinfo"]) {
+  for (const name of ["installed", "replay", "hostile-config", "sdk", "alias", "profile", "ambient-file", "preloaded", "tools", "tools-write-refusal", "tools-edit-refusal", "mcp-empty", "tool-spoof", "shell", "extensions", "logging-backend", "setup-methods", "receiver", "ownership", "unclassified", "unknown-dependency", "userinfo"]) {
     test(`installed 0.41.2 offline namespace: ${name}`, { timeout: 45000 }, () => {
       const root = mkdtempSync(join(tmpdir(), "maco-gemini-phase-j-"));
       assert.match(root, /^\/tmp\/maco-gemini-phase-j-[A-Za-z0-9]+$/);

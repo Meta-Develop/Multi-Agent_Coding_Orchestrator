@@ -335,9 +335,11 @@ use researcher::*;
 mod reporting;
 #[cfg(target_os = "linux")]
 pub(crate) use reporting::append_worker_execution_journal_record;
-use reporting::*;
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) use reporting::{import_worker_execution_journals_at, parse_worker_execution_journal};
+pub(crate) use reporting::import_worker_execution_journals_at;
+#[cfg(target_os = "linux")]
+pub(crate) use reporting::parse_worker_execution_journal;
+use reporting::*;
 
 #[cfg(test)]
 pub(crate) use reporting::command_record_from_external;

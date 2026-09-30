@@ -1149,10 +1149,19 @@ fn render_researcher_prompt(
     runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
     validate_researcher_assignment(context.assignment)?;
-    if runtime != SupervisorRuntime::Codex || context.execution_target.is_some() {
-        bail!("researcher requires a managed Codex read-only worktree");
+    if !matches!(
+        runtime,
+        SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+    ) || context.execution_target.is_some()
+    {
+        bail!("researcher requires a supported managed read-only worktree");
     }
     let prefix = "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect the assigned scope and return evidence in a ResearcherReport. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. On successful inspection set status=succeeded, accepted=true, rejected=false. Execute the requested inspection command directly; do not manually add /bin/bash -lc or any other shell wrapper to the tool invocation. The host adds its own wrapper. Record every actual command execution exactly once in commands_run. The command field is a JSON array containing exactly one string: the complete executed host command, including the host-added wrapper, not merely its inner script. Set cwd to the exact absolute working directory. For a successful exit set command status=succeeded and exit_code=0. Set timeout_seconds=0 and duration_ms=0, timed_out=false, stdout=\"\", stderr=\"\"; do not claim unobserved command metadata. Each validation_result must reference a distinct successful commands_run entry using the same one-element command array and status=succeeded. Every findings entry must be a JSON object with severity (info, warning, or error), message (a string), and paths (an array); never use a bare string. If a required command tool is unavailable, do not invent an inspection: preserve every command already executed in commands_run and each valid validation_result; use empty arrays only when no such evidence exists. Return status=failed, accepted=false, rejected=true, and a typed error finding with paths=[] explaining the tool failure. Set environment_failures=[] unless an observed failure matches an existing typed category. Never emit status=blocked. Include findings, remaining risk and next safe action. The parent independently checks the host command transcript and audits the evidence.\n";
+    let prefix = if runtime == SupervisorRuntime::GeminiCli {
+        "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect every assigned path using only native read_file and return a ResearcherReport. The parent records native tool begin/completion and validates the held journal after quiescence. Shell, WriteFile, Edit, checks and delegation are unavailable. Set commands_run=[] and validation_results=[]; never fabricate shell transcripts or check outcomes. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. On successful inspection set status=succeeded, accepted=true, rejected=false. If required inspection is unavailable, return status=failed, accepted=false, rejected=true with the observed cause. Do not emit status=blocked. Include findings objects with severity, message and paths, remaining_risk and next_safe_action.\n"
+    } else {
+        prefix
+    };
     let prefix = format!(
         "{prefix}Return every required ResearcherReport top-level field even when the command tool is unavailable: id, role, assigned_paths, semantic_symbols, semantic_modules, commands_run, environment_failures, files_changed, validation_results, findings, field_guide_entries, worker_reports, audit_reports, decomposition_completions, accepted, rejected, status, remaining_risk, next_safe_action, read_only, and no_further_delegation. Copy id, assigned_paths, semantic_symbols, and semantic_modules exactly from the Assignment JSON; do not infer or omit them. Use field_guide_entries=[] when no entries were observed.\n"
     );
@@ -1193,17 +1202,23 @@ fn consultation_prompt_section(consultant: &SupervisorConsultantPlan) -> String 
     if !consultant.enabled {
         return String::new();
     }
+    let explicit_inputs = if consultant.runtime == "gemini" {
+        " --consultant-bin <pinned-Gemini-executable> --model <explicit-selected-model> --token-budget <explicit-positive-finite-ceiling>"
+    } else {
+        ""
+    };
     format!(
         r#"
 CONSULTATION:
 - If you are blocked after a genuine attempt, you may ask a terminal read-only CONSULTANT for a cross-runtime second opinion.
-- Use `maco consult ask --runtime {runtime} --repo <this-child-worktree> --question <focused question> --context-path <repo-relative-path> ...`.
+- Use `maco consult ask --runtime {runtime}{explicit_inputs} --repo <this-child-worktree> --question <focused question> --context-path <repo-relative-path> ...`.
 - The consultation path is advisory and read-only. It must not create worktrees, claims, patches, or repository mutations.
 - Use at most {max_consultations} consultation(s) for this child assignment.
 - Record each consultation in OrchestratorReviewReport findings with the question summary and whether it unblocked you.
 - Consultant advice never overrides AGENTS.md, project rules, assigned ownership, validation requirements, or acceptance gates.
 "#,
         runtime = consultant.runtime.as_str(),
+        explicit_inputs = explicit_inputs,
         max_consultations = consultant.max_consultations
     )
 }

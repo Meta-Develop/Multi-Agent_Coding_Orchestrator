@@ -9,9 +9,122 @@ pub(crate) struct HeldEvidence {
     pub(crate) provider_released: bool,
     pub(crate) no_release_quiescent: bool,
     pub(crate) managed_worker_completed: bool,
+    pub(crate) managed_read_only_completed: bool,
     pub(crate) tool_mutation_observed: bool,
+    pub(crate) read_only_journal: Option<Vec<u8>>,
+    read_only_launch: Option<ReadOnlyLaunchBinding>,
+    read_only_result_sha256: Option<String>,
     native_tool_records: Vec<NativeToolRecord>,
     ready: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReadOnlyLaunchBinding {
+    cwd: PathBuf,
+    prompt: PathBuf,
+    output: PathBuf,
+    model: String,
+    role: String,
+    run_id: String,
+    subject: String,
+    kind: AssignmentProcessLaunchKind,
+    attempt: usize,
+    process_grant: AssignmentProcessLaunchGrant,
+    selected: FrozenGeminiSelectedBinding,
+    grant: crate::supervise_budget::LiveTokenGrant,
+}
+
+impl ReadOnlyLaunchBinding {
+    fn bind(command: &ExternalAgentCommand) -> Result<Self> {
+        command
+            .verified_live_token_grant()
+            .map_err(anyhow::Error::msg)?
+            .context("missing finite Gemini read-only live token grant")?;
+        Self::snapshot(command)
+    }
+
+    fn snapshot(command: &ExternalAgentCommand) -> Result<Self> {
+        let identity = command
+            .agent_lifecycle
+            .as_ref()
+            .context("missing Gemini read-only role identity")?;
+        let kind = command
+            .assignment_process_launch_kind
+            .context("missing Gemini read-only process intent")?;
+        if !command.uses_gemini_bridge()
+            || command.workspace_access != WorkspaceAccess::ReadOnly
+            || !command.worktree_control_exceptions.is_empty()
+            || !matches!(
+                (kind, identity.role.as_str()),
+                (AssignmentProcessLaunchKind::ConsultGemini, "researcher")
+                    | (AssignmentProcessLaunchKind::ParentAuditor, "auditor")
+                    | (
+                        AssignmentProcessLaunchKind::AssignmentChild,
+                        "researcher" | "auditor" | "gate_classifier"
+                    )
+            )
+        {
+            bail!("Gemini read-only role/intent/profile mismatch");
+        }
+        Ok(Self {
+            cwd: command.cwd.clone(),
+            prompt: command.prompt.clone(),
+            output: command.output_last_message.clone(),
+            model: command
+                .model
+                .clone()
+                .context("missing Gemini read-only model input")?,
+            role: identity.role.clone(),
+            run_id: identity.run_id.clone(),
+            subject: identity.task_id.clone(),
+            kind,
+            attempt: command
+                .assignment_process_launch_attempt
+                .context("missing Gemini read-only attempt")?,
+            process_grant: command
+                .assignment_process_launch_grant
+                .clone()
+                .context("missing Gemini read-only process grant")?,
+            selected: command
+                .gemini_run_account_binding
+                .clone()
+                .context("missing frozen Gemini selected account")?,
+            grant: command
+                .bound_live_token_grant()
+                .map_err(anyhow::Error::msg)?
+                .cloned()
+                .context("missing finite Gemini read-only live token grant")?,
+        })
+    }
+}
+
+impl HeldEvidence {
+    pub(crate) fn read_only_completion_valid(&self, run: &ExternalAgentRun) -> bool {
+        let Some(binding) = &self.read_only_launch else {
+            return false;
+        };
+        run.exit_code == Some(0)
+            && !run.timed_out
+            && run.error.is_none()
+            && run.publishable
+            && run.cwd == binding.cwd
+            && run
+                .process_tree
+                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+            && run.scratch_quiescence_verified()
+            && run.side_effects
+                == Some(SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::GeminiOnlineBridge,
+                ))
+            && run
+                .managed_gemini_selection_evidence()
+                .is_some_and(|s| binding.selected.matches_selection_evidence(s))
+            && run.output_last_message().is_some_and(|result| {
+                !result.is_empty()
+                    && self.read_only_result_sha256.as_deref() == Some(sha256_hex(result).as_str())
+            })
+            && read_only_native_paths(self, &binding.cwd).is_ok()
+    }
 }
 
 // Live custody only. Serialized model reports cannot restore these correlations.
@@ -22,6 +135,84 @@ struct NativeToolRecord {
     kind: String,
     begin_offset: usize,
     record_offset: usize,
+}
+
+/// Only live parent custody can supply this evidence; restored report JSON cannot.
+pub(crate) fn verify_read_only_evidence(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    require_read: bool,
+) -> Result<Vec<PathBuf>> {
+    let evidence = run
+        .gemini_bridge_evidence()
+        .context("missing held Gemini read-only evidence")?;
+    if !evidence.read_only_completion_valid(run)
+        || evidence.read_only_launch.as_ref() != Some(&ReadOnlyLaunchBinding::snapshot(command)?)
+    {
+        bail!("Gemini read-only result lacks successful confined native custody");
+    }
+    let paths = read_only_native_paths(evidence, &command.cwd)?;
+    if require_read && paths.is_empty() {
+        bail!("Gemini read-only result omitted required native inspection")
+    }
+    Ok(paths)
+}
+
+fn read_only_native_paths(evidence: &HeldEvidence, cwd: &Path) -> Result<Vec<PathBuf>> {
+    if !evidence.provider_released
+        || !evidence.managed_read_only_completed
+        || evidence.managed_worker_completed
+        || evidence.tool_mutation_observed
+    {
+        bail!("Gemini read-only completion mode changed");
+    }
+    let bytes = evidence
+        .read_only_journal
+        .as_deref()
+        .context("missing held Gemini read-only journal")?;
+    let entries = crate::supervise::parse_worker_execution_journal(bytes, cwd)?;
+    if entries.len() != evidence.native_tool_records.len() || entries.len() % 2 != 0 {
+        bail!("Gemini read-only journal lacks correlated native reads");
+    }
+    let mut paths = BTreeSet::new();
+    for (entries, records) in entries
+        .chunks_exact(2)
+        .zip(evidence.native_tool_records.chunks_exact(2))
+    {
+        if records[0].kind != "begin"
+            || records[1].kind != "completed"
+            || records[0].action_id != records[1].action_id
+            || records[0].sequence >= records[1].sequence
+            || records[0].begin_offset != records[1].begin_offset
+            || records[0].record_offset >= records[1].record_offset
+            || entries[0].command != entries[1].command
+            || entries[0].cwd != entries[1].cwd
+            || entries[0].cwd != cwd
+            || entries[0].start_timestamp != entries[1].start_timestamp
+            || entries[0].command.len() != 2
+            || entries[0].command[0] != "read_file"
+            || !entries[0].changed_paths.is_empty()
+            || !entries[1].changed_paths.is_empty()
+        {
+            bail!("Gemini read-only native correlation changed");
+        }
+        let params: serde_json::Value = serde_json::from_str(&entries[0].command[1])?;
+        let relative = params
+            .get("file_path")
+            .and_then(serde_json::Value::as_str)
+            .context("Gemini native read omitted its path")?;
+        let relative = Path::new(relative);
+        if relative.is_absolute()
+            || relative.components().any(|c| match c {
+                std::path::Component::Normal(v) => v.to_string_lossy().starts_with('.'),
+                _ => true,
+            })
+        {
+            bail!("Gemini native read path is outside its candidate");
+        }
+        paths.insert(relative.to_path_buf());
+    }
+    Ok(paths.into_iter().collect())
 }
 
 #[derive(Clone, Deserialize)]
@@ -37,8 +228,14 @@ struct NativeToolEvent {
 }
 
 #[cfg(target_os = "linux")]
+enum NativeJournalArtifact {
+    Worker(ExactWritableArtifactFile),
+    ReadOnly(ReservedOutputFile),
+}
+
+#[cfg(target_os = "linux")]
 struct NativeToolJournal {
-    artifact: ExactWritableArtifactFile,
+    artifact: NativeJournalArtifact,
     candidate: PathBuf,
     bytes: Vec<u8>,
     last_action: u64,
@@ -61,7 +258,7 @@ impl NativeToolJournal {
             bail!("Gemini native journal was not empty at parent binding");
         }
         Ok(Some(Self {
-            artifact: artifact.clone(),
+            artifact: NativeJournalArtifact::Worker(artifact.clone()),
             candidate: fs::canonicalize(candidate)?,
             bytes: Vec::new(),
             last_action: 0,
@@ -70,6 +267,49 @@ impl NativeToolJournal {
             mutation_observed: false,
             records: Vec::new(),
         }))
+    }
+
+    fn bind_read_only(file: ReservedOutputFile, candidate: &Path) -> Result<Self> {
+        if !file
+            .read_bounded(MAX_WORKER_JOURNAL_ARTIFACT_BYTES)?
+            .is_empty()
+        {
+            bail!("Gemini read-only journal was not empty at parent binding");
+        }
+        Ok(Self {
+            artifact: NativeJournalArtifact::ReadOnly(file),
+            candidate: fs::canonicalize(candidate)?,
+            bytes: Vec::new(),
+            last_action: 0,
+            pending: None,
+            failure: None,
+            mutation_observed: false,
+            records: Vec::new(),
+        })
+    }
+
+    fn is_read_only(&self) -> bool {
+        matches!(&self.artifact, NativeJournalArtifact::ReadOnly(_))
+    }
+
+    fn held_bytes(&self) -> Result<Vec<u8>> {
+        match &self.artifact {
+            NativeJournalArtifact::Worker(file) => capture_worker_journal_artifact(file),
+            NativeJournalArtifact::ReadOnly(file) => {
+                file.read_bounded(MAX_WORKER_JOURNAL_ARTIFACT_BYTES)
+            }
+        }
+    }
+
+    fn capture_read_only(&self, quiescent: bool) -> Result<Vec<u8>> {
+        if !self.is_read_only() || !quiescent || self.pending.is_some() || self.failure.is_some() {
+            bail!("Gemini read-only journal lacks successful quiescent custody");
+        }
+        let bytes = self.held_bytes()?;
+        if bytes != self.bytes {
+            bail!("Gemini read-only journal changed outside its parent producer");
+        }
+        Ok(bytes)
     }
 
     fn observe(&mut self, event: NativeToolEvent, sequence: u64) -> Result<()> {
@@ -87,6 +327,8 @@ impl NativeToolJournal {
             || event.cwd != self.candidate
             || event.arguments_json.len() > 8192
             || !matches!(event.tool.as_str(), "read_file" | "write_file" | "replace")
+            || (self.is_read_only()
+                && (event.tool != "read_file" || event.before_sha256 != event.after_sha256))
             || !matches!(
                 event.kind.as_str(),
                 "begin" | "completed" | "failed" | "cancelled"
@@ -206,7 +448,7 @@ impl NativeToolJournal {
 
     fn append(&mut self, entry: &crate::supervise::WorkerExecutionJournalEntry) -> Result<()> {
         use std::os::unix::fs::FileExt;
-        if capture_worker_journal_artifact(&self.artifact)? != self.bytes {
+        if self.held_bytes()? != self.bytes {
             bail!("Gemini native journal bytes changed outside its parent producer");
         }
         let mut record = Vec::new();
@@ -219,12 +461,20 @@ impl NativeToolJournal {
         {
             bail!("Gemini native journal exceeded its existing capture bound");
         }
-        self.artifact
-            .held_file
-            .write_all_at(&record, self.bytes.len() as u64)?;
-        self.artifact.held_file.sync_data()?;
+        match &mut self.artifact {
+            NativeJournalArtifact::Worker(file) => {
+                file.held_file
+                    .write_all_at(&record, self.bytes.len() as u64)?;
+                file.held_file.sync_data()?;
+            }
+            NativeJournalArtifact::ReadOnly(file) => {
+                let mut bytes = self.bytes.clone();
+                bytes.extend_from_slice(&record);
+                file.write_bytes_atomic(&bytes, MAX_WORKER_JOURNAL_ARTIFACT_BYTES)?;
+            }
+        }
         self.bytes.extend(record);
-        if capture_worker_journal_artifact(&self.artifact)? != self.bytes {
+        if self.held_bytes()? != self.bytes {
             bail!("Gemini native journal changed during durable append");
         }
         Ok(())
@@ -413,6 +663,7 @@ struct Protocol {
     grant: Option<crate::supervise_budget::LiveTokenGrant>,
     release_authority: ReleaseAuthority,
     release_requires_revalidation: bool,
+    read_only: bool,
     result_sha256: Option<String>,
     #[cfg(target_os = "linux")]
     native_journal: Option<NativeToolJournal>,
@@ -445,6 +696,7 @@ impl Protocol {
             grant,
             release_authority: ReleaseAuthority::Unavailable,
             release_requires_revalidation: false,
+            read_only: false,
             result_sha256: None,
             #[cfg(target_os = "linux")]
             native_journal: None,
@@ -536,13 +788,21 @@ impl Protocol {
                 if !self.native_journal.as_ref().is_some_and(|j| {
                     j.pending.is_none()
                         && j.failure.is_none()
-                        && j.mutation_observed
-                        && j.records.last().is_some_and(|record| {
-                            record.kind == "completed"
-                                && record.action_id == j.last_action
-                                && record.sequence < self.sequence
-                                && record.record_offset > record.begin_offset
-                        })
+                        && j.is_read_only() == self.read_only
+                        && j.mutation_observed == tool_mutation_observed
+                        && (self.read_only || j.mutation_observed)
+                        && ((self.read_only
+                            && self.evidence.provider_released
+                            && j.last_action == 0
+                            && j.records.is_empty()
+                            && j.bytes.is_empty()
+                            && j.held_bytes().is_ok_and(|bytes| bytes.is_empty()))
+                            || j.records.last().is_some_and(|record| {
+                                record.kind == "completed"
+                                    && record.action_id == j.last_action
+                                    && record.sequence < self.sequence
+                                    && record.record_offset > record.begin_offset
+                            }))
                 }) {
                     bail!("Gemini managed completion lacks quiescent native tool observations");
                 }
@@ -562,7 +822,11 @@ impl Protocol {
                     bail!("Gemini invalid managed worker completion");
                 }
                 self.result_sha256 = Some(result_sha256);
-                self.evidence.managed_worker_completed = true;
+                self.evidence.managed_worker_completed = !self.read_only;
+                self.evidence.managed_read_only_completed = self.read_only;
+                if self.read_only {
+                    self.evidence.read_only_result_sha256 = self.result_sha256.clone();
+                }
                 self.evidence.tool_mutation_observed = tool_mutation_observed;
                 self.terminal = true;
             }
@@ -903,7 +1167,7 @@ pub(super) fn run(
     report
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn bootstrap_startup_category(stderr: &CapturedBytes) -> Option<&'static str> {
     if stderr.is_truncated() {
         return None;
@@ -919,7 +1183,7 @@ fn bootstrap_startup_category(stderr: &CapturedBytes) -> Option<&'static str> {
     }
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn bootstrap_startup_error(error: Option<String>, stderr: &CapturedBytes) -> Option<String> {
     let Some(category) = bootstrap_startup_category(stderr) else {
         return error;
@@ -937,14 +1201,10 @@ fn run_linux(
     started: Instant,
     report: &mut ExternalAgentRun,
 ) -> Result<()> {
-    if spec.workspace_access == WorkspaceAccess::ReadWrite {
-        run_linux_online(spec, cancellation, started, report)
-    } else {
-        run_linux_offline(spec, cancellation, started, report)
-    }
+    run_linux_online(spec, cancellation, started, report)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 fn run_linux_offline(
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
@@ -1232,12 +1492,43 @@ fn run_linux_online(
     if sha256_hex(&node) != Descriptor::NODE_SHA256 {
         bail!("Gemini pinned Node identity mismatch");
     }
-    if spec.workspace_access != WorkspaceAccess::ReadWrite
-        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
-    {
+    let read_only = spec.workspace_access == WorkspaceAccess::ReadOnly;
+    if !read_only && spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
         bail!("managed Gemini OAuth is restricted to a writable managed child worktree");
     }
+    if read_only
+        && (spec.gemini_run_account_binding.is_none()
+            || !spec.worktree_control_exceptions.is_empty())
+    {
+        bail!(
+            "managed read-only Gemini requires a frozen selected binding and no control exceptions"
+        );
+    }
+    if read_only
+        && (!matches!(
+            spec.assignment_process_launch_kind,
+            Some(
+                AssignmentProcessLaunchKind::AssignmentChild
+                    | AssignmentProcessLaunchKind::ParentAuditor
+                    | AssignmentProcessLaunchKind::ConsultGemini
+            )
+        ) || !spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.role.as_str(),
+                "researcher" | "auditor" | "gate_classifier" | "consultant"
+            )
+        }))
+    {
+        bail!("managed read-only Gemini requires an existing non-delegating role and its typed process intent");
+    }
     let frozen = spec.gemini_run_account_binding.as_ref();
+    let grant = spec
+        .verified_live_token_grant()
+        .map_err(anyhow::Error::msg)?
+        .cloned();
+    if read_only && grant.is_none() {
+        bail!("managed read-only Gemini requires its existing finite live token reservation");
+    }
     let authority = crate::account_authority::gemini::acquire_gemini_launch_authority(frozen)?;
     let selection = authority.selection_evidence();
     if frozen.is_some_and(|binding| !binding.matches_selection_evidence(&selection)) {
@@ -1245,13 +1536,16 @@ fn run_linux_online(
     }
     let credential = read_selected_personal_oauth(authority.managed_gemini_home())?;
     report.stdout.run_metadata.managed_gemini_selection = Some(selection);
-    let grant = spec
-        .verified_live_token_grant()
-        .map_err(anyhow::Error::msg)?
-        .cloned();
     let prompt = read_bounded_regular_file_nofollow(&spec.prompt, MAX_PROMPT_BYTES)?;
     let controls = protected_worktree_controls(spec)?;
-    let native_journal = NativeToolJournal::bind(&controls, &spec.cwd)?;
+    let mut native_journal = if read_only {
+        if !controls.exact_writable_artifact_files.is_empty() {
+            bail!("read-only Gemini cannot receive a writable Worker journal");
+        }
+        None
+    } else {
+        NativeToolJournal::bind(&controls, &spec.cwd)?
+    };
     let mut output_reservation = reserve_external_output(&spec.output_last_message)?;
     let mut staging =
         ExternalOutputStaging::create(&spec.cwd, spec.machine_global_retention.clone())?;
@@ -1261,6 +1555,12 @@ fn run_linux_online(
     let control = root.create_child(OsStr::new("gemini-bridge"))?;
     let profile = control.create_child(OsStr::new("profile"))?;
     let credential_directory = profile.create_child(OsStr::new(".gemini"))?;
+    if read_only {
+        native_journal = Some(NativeToolJournal::bind_read_only(
+            control.reserve(OsStr::new("native-read-only.jsonl"))?,
+            &spec.cwd,
+        )?);
+    }
     let mut held_files = Vec::new();
     for (directory, name, bytes) in [
         (
@@ -1300,7 +1600,7 @@ fn run_linux_online(
     let prompt_hash = sha256_hex(&prompt);
     let manifest = serde_json::to_vec(&serde_json::json!({ "nonce": nonce,
         "candidate": fs::canonicalize(&spec.cwd)?, "model": spec.model.as_deref().context("Gemini requested model missing")?,
-        "workspaceAccess": "read_write", "promptPath": control.path().join("prompt.txt"),
+        "workspaceAccess": if read_only { "read_only" } else { "read_write" }, "promptPath": control.path().join("prompt.txt"),
         "resultPath": result_file.path(), "promptSha256": prompt_hash,
         "bootstrapSha256": sha256_hex(Descriptor::BOOTSTRAP.as_bytes()),
         "wireSha256": sha256_hex(Descriptor::WIRE.as_bytes()) }))?;
@@ -1397,6 +1697,12 @@ fn run_linux_online(
     let child_cancel = cancellation.child_scope();
     let mut protocol = Protocol::new(nonce.clone(), prompt_hash, grant);
     protocol.release_authority = ReleaseAuthority::ManagedOAuth;
+    protocol.read_only = read_only;
+    let read_only_launch = if read_only {
+        Some(ReadOnlyLaunchBinding::bind(spec)?)
+    } else {
+        None
+    };
     protocol.native_journal = native_journal;
     report.error = None;
     report.stdout.target_launch_attempted = true;
@@ -1413,6 +1719,7 @@ fn run_linux_online(
                 }
             };
             session.verify_private_peer(&stream)?;
+            protocol.evidence.read_only_launch = read_only_launch.clone();
             stream
                 .set_nonblocking(true)
                 .map_err(|_| "Gemini private socket setup failed")?;
@@ -1496,10 +1803,24 @@ fn run_linux_online(
         |journal| journal.capture(&controls, report.scratch_quiescence_verified()),
     );
     report.replace_worker_journal_artifacts(captures);
+    if read_only {
+        match protocol
+            .native_journal
+            .as_ref()
+            .context("Gemini read-only journal missing")?
+            .capture_read_only(report.scratch_quiescence_verified())
+        {
+            Ok(bytes) => protocol.evidence.read_only_journal = Some(bytes),
+            Err(error) => record_external_error(report, error.to_string()),
+        }
+    }
     report.stdout.run_metadata.gemini_bridge = Some(protocol.evidence.clone());
-    if protocol.evidence.managed_worker_completed
-        && protocol.evidence.tool_mutation_observed
-        && report.exit_code == Some(0)
+    if (if read_only {
+        protocol.evidence.managed_read_only_completed
+            && protocol.evidence.read_only_journal.is_some()
+    } else {
+        protocol.evidence.managed_worker_completed && protocol.evidence.tool_mutation_observed
+    }) && report.exit_code == Some(0)
         && !report.timed_out
     {
         let result = result_file.read_bounded(OUTPUT_TEE_LIMIT_BYTES)?;
@@ -1526,8 +1847,13 @@ fn run_linux_online(
             .as_ref()
             .is_some_and(|evidence| {
                 evidence.provider_released
-                    && evidence.managed_worker_completed
-                    && evidence.tool_mutation_observed
+                    && if read_only {
+                        evidence.managed_read_only_completed
+                            && evidence.read_only_journal.is_some()
+                            && !evidence.tool_mutation_observed
+                    } else {
+                        evidence.managed_worker_completed && evidence.tool_mutation_observed
+                    }
             });
     if report.scratch_quiescence_verified() {
         staging.preserve_unquiescent = false;
@@ -1538,6 +1864,11 @@ fn run_linux_online(
         }
         credential_file.remove()?;
         result_file.remove()?;
+        if let Some(journal) = protocol.native_journal.take() {
+            if let NativeJournalArtifact::ReadOnly(file) = journal.artifact {
+                file.remove()?;
+            }
+        }
         drop(credential_directory);
         remove_staged_codex_home(profile)?;
         fs::remove_dir(control.path())?;
@@ -1560,6 +1891,34 @@ fn run_linux_online(
         }
     }
     Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_validate_read_only_launch(command: &ExternalAgentCommand) -> Result<()> {
+    refuse_assignment_process_launch_before_preflight(command)?;
+    ReadOnlyLaunchBinding::bind(command)?;
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_read_only_completion_consumer(
+    consume: impl Fn(&ExternalAgentRun) -> bool,
+) -> Result<()> {
+    tests::read_only_receiver_consumer_fixture(
+        &consume,
+        true,
+        AssignmentProcessLaunchKind::ConsultGemini,
+    )?;
+    tests::read_only_receiver_consumer_fixture(
+        &consume,
+        false,
+        AssignmentProcessLaunchKind::ConsultGemini,
+    )?;
+    tests::read_only_receiver_consumer_fixture(
+        consume,
+        false,
+        AssignmentProcessLaunchKind::ParentAuditor,
+    )
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -1639,6 +1998,460 @@ mod tests {
                 "beforeSha256": null, "afterSha256": after}}}),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn gemini_read_only_native_receiver_capture_and_consumer_require_live_custody() -> Result<()> {
+        read_only_receiver_consumer_fixture(
+            |run| {
+                run.gemini_bridge_evidence()
+                    .is_some_and(|evidence| evidence.read_only_completion_valid(run))
+            },
+            true,
+            AssignmentProcessLaunchKind::ConsultGemini,
+        )
+    }
+
+    #[test]
+    fn gemini_read_only_zero_action_completion_requires_bound_quiescent_live_custody() -> Result<()>
+    {
+        for kind in [
+            AssignmentProcessLaunchKind::ConsultGemini,
+            AssignmentProcessLaunchKind::ParentAuditor,
+        ] {
+            read_only_receiver_consumer_fixture(
+                |run| {
+                    run.gemini_bridge_evidence()
+                        .is_some_and(|evidence| evidence.read_only_completion_valid(run))
+                },
+                false,
+                kind,
+            )?;
+        }
+        for case in [
+            "missing",
+            "unreleased",
+            "unfinished",
+            "pending",
+            "failed",
+            "altered",
+            "worker",
+            "digest",
+        ] {
+            let (_temp, controls, candidate, _writer, incoming) = native_journal_fixture()?;
+            fs::write(candidate.join("sample.txt"), b"native\n")?;
+            let root = SecureOutputRoot::open_private(incoming.path())?;
+            let mut p = protocol();
+            p.read_only = case != "worker";
+            p.native_journal = match case {
+                "missing" => None,
+                "worker" => NativeToolJournal::bind(&controls, &candidate)?,
+                _ => Some(NativeToolJournal::bind_read_only(
+                    root.reserve(OsStr::new("read-only.jsonl"))?,
+                    &candidate,
+                )?),
+            };
+            if case != "unreleased" {
+                for kind in ["admission", "release", "terminal"] {
+                    if case == "unfinished" && kind == "terminal" {
+                        break;
+                    }
+                    p.receive(&serde_json::to_vec(&serde_json::json!({
+                        "nonce": "a".repeat(64), "sequence": p.sequence + 1,
+                        "message": {"type": "event", "event": event_value(kind, 1, None)}
+                    }))?)?;
+                }
+            }
+            if matches!(case, "pending" | "failed") {
+                let frame = serde_json::to_vec(&serde_json::json!({
+                    "nonce": "a".repeat(64), "sequence": p.sequence + 1,
+                    "message": {"type": "native_tool", "event": {"actionId": 1, "kind": "begin",
+                        "tool": if case == "pending" { "read_file" } else { "write_file" },
+                        "cwd": candidate, "argumentsJson": "{\"file_path\":\"sample.txt\"}",
+                        "beforeSha256": sha256_hex(b"native\n"), "afterSha256": sha256_hex(b"native\n")}}
+                }))?;
+                let result = p.receive(&frame);
+                assert_eq!(result.is_err(), case == "failed");
+                assert!(p
+                    .native_journal
+                    .as_ref()
+                    .unwrap()
+                    .capture_read_only(true)
+                    .is_err());
+            }
+            if case == "altered" {
+                let NativeJournalArtifact::ReadOnly(file) =
+                    &mut p.native_journal.as_mut().unwrap().artifact
+                else {
+                    unreachable!()
+                };
+                file.write_bytes_atomic(b"forged\n", MAX_WORKER_JOURNAL_ARTIFACT_BYTES)?;
+                assert!(p
+                    .native_journal
+                    .as_ref()
+                    .unwrap()
+                    .capture_read_only(true)
+                    .is_err());
+            }
+            assert!(p.receive(&serde_json::to_vec(&serde_json::json!({
+                "nonce": "a".repeat(64), "sequence": p.sequence + 1,
+                "message": {"type": "completed",
+                    "resultSha256": if case == "digest" { "invalid".to_string() } else { sha256_hex(b"{}\n") },
+                    "toolMutationObserved": false}
+            }))?).is_err(), "accepted {case}");
+            assert!(!p.evidence.managed_read_only_completed, "accepted {case}");
+            assert!(!p.evidence.managed_worker_completed, "accepted {case}");
+        }
+        Ok(())
+    }
+
+    pub(super) fn read_only_receiver_consumer_fixture(
+        consume: impl Fn(&ExternalAgentRun) -> bool,
+        with_read: bool,
+        kind: AssignmentProcessLaunchKind,
+    ) -> Result<()> {
+        let (_temp, _controls, candidate, _writer, incoming) = native_journal_fixture()?;
+        fs::write(candidate.join("sample.txt"), b"native\n")?;
+        let root = SecureOutputRoot::open_private(incoming.path())?;
+        let mut p = protocol();
+        p.read_only = true;
+        p.native_journal = Some(NativeToolJournal::bind_read_only(
+            root.reserve(OsStr::new("read-only.jsonl"))?,
+            &candidate,
+        )?);
+        let command = ExternalAgentCommand::codex(
+            Descriptor::GEMINI,
+            &candidate,
+            "prompt",
+            "log",
+            "result",
+            Duration::from_secs(1),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_runtime_adapter(
+            RuntimeId::GeminiCli,
+            RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+        )
+        .with_model_selection(Some("gemini-2.5-pro".into()), None)
+        .with_agent_lifecycle(
+            &candidate,
+            if kind == AssignmentProcessLaunchKind::ParentAuditor {
+                "auditor"
+            } else {
+                "researcher"
+            },
+            "read-only",
+            "read-only",
+        )
+        .with_gemini_run_account_binding(Some(FrozenGeminiSelectedBinding {
+            authority_id: Some("synthetic-offline-authority".into()),
+            provider_id: "gemini-cli".into(),
+            account_id: "synthetic-account".into(),
+            account_incarnation: "synthetic-incarnation".into(),
+            selection_revision: 1,
+        }));
+        let issuer = match kind {
+            AssignmentProcessLaunchKind::ConsultGemini => {
+                crate::mutation_taxonomy::admit_consult_gemini_process_intent
+            }
+            AssignmentProcessLaunchKind::ParentAuditor => {
+                crate::mutation_taxonomy::admit_parent_auditor_process_intent
+            }
+            _ => bail!("unsupported read-only fixture intent"),
+        };
+        let intent = issuer(
+            "read-only",
+            "read-only",
+            1,
+            Path::new(kind.trusted_program_spelling()),
+            command.model.as_deref(),
+            "read-only fixture",
+        )?;
+        let mut command = command.with_assignment_process_launch(kind, intent);
+        let ledger = crate::supervise_budget::RunBudgetLedger::new(
+            crate::supervise_budget::RunBudgetLimits {
+                hard_tokens: Some(100),
+                ..Default::default()
+            },
+        )?;
+        let crate::supervise_budget::BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(crate::supervise_budget::BudgetReservationRequest {
+                role: crate::supervise::AgentRole::Researcher,
+                tokens: 100,
+                cost_usd: None,
+            })?
+        else {
+            bail!("fixture budget refused")
+        };
+        command.bind_live_token_grant(ledger.live_token_grant(reservation.id)?);
+        p.evidence.read_only_launch = Some(ReadOnlyLaunchBinding::bind(&command)?);
+        p.grant = command
+            .verified_live_token_grant()
+            .map_err(anyhow::Error::msg)?
+            .cloned();
+        // Deterministic physical state receiver; no actual provider or child is
+        // launched and this is not runtime qualification evidence.
+        for (index, kind) in ["admission", "release", "terminal"].into_iter().enumerate() {
+            p.receive(&serde_json::to_vec(&serde_json::json!({
+                "nonce": "a".repeat(64), "sequence": index + 1,
+                "message": {"type": "event", "event": event_value(kind, 1, None)}
+            }))?)?;
+        }
+        let read_frame = |sequence, kind| {
+            serde_json::to_vec(&serde_json::json!({
+                "nonce": "a".repeat(64), "sequence": sequence,
+                "message": {"type": "native_tool", "event": {"actionId": 1, "kind": kind,
+                    "tool": "read_file", "cwd": candidate, "argumentsJson": "{\"file_path\":\"sample.txt\"}",
+                    "beforeSha256": sha256_hex(b"native\n"), "afterSha256": sha256_hex(b"native\n")}}
+            }))
+        };
+        let completion_sequence = if with_read {
+            p.receive(&read_frame(4, "begin")?)?;
+            assert!(p
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .capture_read_only(true)
+                .is_err());
+            p.receive(&read_frame(5, "completed")?)?;
+            6
+        } else {
+            let journal = p.native_journal.as_ref().unwrap();
+            assert_eq!(journal.last_action, 0);
+            assert!(journal.records.is_empty());
+            assert!(journal.bytes.is_empty());
+            4
+        };
+        assert!(p
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .capture_read_only(false)
+            .is_err());
+        p.receive(&serde_json::to_vec(&serde_json::json!({"nonce": "a".repeat(64), "sequence": completion_sequence,
+            "message": {"type": "completed", "resultSha256": sha256_hex(b"{}\n"), "toolMutationObserved": false}}))?)?;
+        assert!(p.terminal);
+        assert!(p.evidence.managed_read_only_completed);
+        assert!(!p.evidence.managed_worker_completed);
+        let bytes = p.native_journal.as_ref().unwrap().capture_read_only(true)?;
+        assert_eq!(bytes.is_empty(), !with_read);
+        p.evidence.read_only_journal = Some(bytes);
+        let mut run = failed_external_run(
+            &command,
+            Instant::now(),
+            Vec::new(),
+            false,
+            "fixture".into(),
+        );
+        run.error = None;
+        run.exit_code = Some(0);
+        run.publishable = true;
+        run.output_last_message = Some(b"{}\n".to_vec());
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        ));
+        run.stdout.run_metadata.managed_gemini_selection =
+            Some(ManagedGeminiAccountSelectionEvidence {
+                authority_id: Some("synthetic-offline-authority".into()),
+                provider_id: "gemini-cli".into(),
+                account_id: "synthetic-account".into(),
+                account_incarnation: "synthetic-incarnation".into(),
+                selection_revision: 1,
+            });
+        run.stdout.run_metadata.gemini_bridge = Some(p.evidence.clone());
+        let expected_paths = if with_read {
+            vec![PathBuf::from("sample.txt")]
+        } else {
+            Vec::new()
+        };
+        assert_eq!(
+            verify_read_only_evidence(&run, &command, false)?,
+            expected_paths
+        );
+        if with_read {
+            assert_eq!(
+                verify_read_only_evidence(&run, &command, true)?,
+                expected_paths
+            );
+        } else {
+            assert!(verify_read_only_evidence(&run, &command, true).is_err());
+        }
+        assert!(run
+            .gemini_bridge_evidence()
+            .unwrap()
+            .read_only_completion_valid(&run));
+        assert!(consume(&run));
+        ledger.reconcile(
+            reservation.id,
+            crate::supervise_budget::UsageMeasurement::Missing,
+        )?;
+        assert!(command.verified_live_token_grant().is_err()); // no new release after settlement
+        assert_eq!(
+            verify_read_only_evidence(&run, &command, false)?,
+            expected_paths
+        );
+        assert!(consume(&run));
+        let mut wrong_command = command.clone();
+        wrong_command.cwd = candidate.join("other");
+        assert!(verify_read_only_evidence(&run, &wrong_command, false).is_err());
+        let mut wrong_command = command.clone();
+        wrong_command.workspace_access = WorkspaceAccess::ReadWrite;
+        assert!(verify_read_only_evidence(&run, &wrong_command, false).is_err());
+        let mut wrong = run.clone();
+        wrong.output_last_message = Some(Vec::new());
+        assert!(!wrong
+            .gemini_bridge_evidence()
+            .unwrap()
+            .read_only_completion_valid(&wrong));
+        assert!(!consume(&wrong));
+        let mut wrong = run.clone();
+        wrong.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        ));
+        assert!(!wrong
+            .gemini_bridge_evidence()
+            .unwrap()
+            .read_only_completion_valid(&wrong));
+        assert!(!consume(&wrong));
+        if with_read {
+            let mut wrong = run.clone();
+            wrong
+                .stdout
+                .run_metadata
+                .gemini_bridge
+                .as_mut()
+                .unwrap()
+                .read_only_journal = Some(Vec::new());
+            assert!(!wrong
+                .gemini_bridge_evidence()
+                .unwrap()
+                .read_only_completion_valid(&wrong));
+            assert!(!consume(&wrong));
+        }
+        let mut wrong = run.clone();
+        wrong.output_last_message = Some(b"changed\n".to_vec());
+        assert!(verify_read_only_evidence(&wrong, &command, false).is_err());
+        assert!(!consume(&wrong));
+        let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+        assert!(verify_read_only_evidence(&restored, &command, false).is_err());
+        assert!(!consume(&restored));
+        run.stdout.target_launch_attempted = true;
+        run.process_tree = None; // no verified target quiescence
+        assert!(verify_read_only_evidence(&run, &command, false).is_err());
+        assert!(!consume(&run));
+        run.stdout.target_launch_attempted = false;
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        for alteration in [
+            "missing",
+            "mismatched",
+            "mutation",
+            "cancelled",
+            "unfinished",
+        ] {
+            if !with_read && alteration == "mismatched" {
+                continue;
+            }
+            let mut wrong = run.clone();
+            let held = wrong.stdout.run_metadata.gemini_bridge.as_mut().unwrap();
+            match alteration {
+                "missing" => held.read_only_journal = None,
+                "mismatched" => held.native_tool_records[1].action_id = 2,
+                "mutation" => held.tool_mutation_observed = true,
+                "cancelled" => held.managed_read_only_completed = false,
+                "unfinished" => held.read_only_result_sha256 = None,
+                _ => unreachable!(),
+            }
+            assert!(
+                verify_read_only_evidence(&wrong, &command, false).is_err(),
+                "accepted {alteration}"
+            );
+            assert!(!consume(&wrong), "accepted {alteration}");
+        }
+        if with_read {
+            let mut truncated = p.native_journal.as_ref().unwrap().bytes.clone();
+            assert!(truncated.pop().is_some());
+            let NativeJournalArtifact::ReadOnly(file) =
+                &mut p.native_journal.as_mut().unwrap().artifact
+            else {
+                unreachable!()
+            };
+            file.write_bytes_atomic(&truncated, MAX_WORKER_JOURNAL_ARTIFACT_BYTES)?;
+            assert!(p
+                .native_journal
+                .as_ref()
+                .unwrap()
+                .capture_read_only(true)
+                .is_err());
+        }
+        let NativeJournalArtifact::ReadOnly(file) =
+            &mut p.native_journal.as_mut().unwrap().artifact
+        else {
+            unreachable!()
+        };
+        file.write_bytes_atomic(b"forged\n", MAX_WORKER_JOURNAL_ARTIFACT_BYTES)?;
+        assert!(p
+            .native_journal
+            .as_ref()
+            .unwrap()
+            .capture_read_only(true)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn gemini_read_only_native_journal_refuses_mutating_tools_and_cancelled_actions() -> Result<()>
+    {
+        let (_temp, _controls, candidate, _writer, incoming) = native_journal_fixture()?;
+        fs::write(candidate.join("sample.txt"), b"native\n")?;
+        let root = SecureOutputRoot::open_private(incoming.path())?;
+        let read = NativeToolEvent {
+            action_id: 1,
+            kind: "begin".into(),
+            tool: "read_file".into(),
+            cwd: candidate.clone(),
+            arguments_json: "{\"file_path\":\"sample.txt\"}".into(),
+            before_sha256: Some(sha256_hex(b"native\n")),
+            after_sha256: Some(sha256_hex(b"native\n")),
+        };
+        for (index, tool) in [
+            "write_file",
+            "replace",
+            "run_shell_command",
+            "delegate_to_agent",
+        ]
+        .iter()
+        .enumerate()
+        {
+            let mut journal = NativeToolJournal::bind_read_only(
+                root.reserve(OsStr::new(&format!("refused-{index}.jsonl")))?,
+                &candidate,
+            )?;
+            let mut wrong = read.clone();
+            wrong.tool = (*tool).into();
+            assert!(journal.observe(wrong, 1).is_err());
+            assert!(journal.capture_read_only(true).is_err());
+        }
+        let mut journal = NativeToolJournal::bind_read_only(
+            root.reserve(OsStr::new("cancelled.jsonl"))?,
+            &candidate,
+        )?;
+        journal.observe(read.clone(), 1)?;
+        let mut cancelled = read;
+        cancelled.kind = "cancelled".into();
+        journal.observe(cancelled, 2)?;
+        assert!(journal.capture_read_only(true).is_err());
+        let entries = crate::supervise::parse_worker_execution_journal(
+            &journal.held_bytes()?,
+            Path::new("held"),
+        )?;
+        assert_eq!(entries.len(), 2);
+        assert!(journal.failure.as_deref().unwrap().contains("cancelled"));
+        Ok(())
     }
 
     #[test]
@@ -1797,9 +2610,12 @@ mod tests {
                 changed_paths: Vec::new(),
             },
         )?;
-        fs::write(&journal.artifact.path, forged)?;
+        let NativeJournalArtifact::Worker(artifact) = &journal.artifact else {
+            panic!("Worker journal fixture changed kind")
+        };
+        fs::write(&artifact.path, forged)?;
         assert!(NativeToolJournal::bind(&controls, &candidate).is_err());
-        fs::remove_file(&journal.artifact.path)?;
+        fs::remove_file(&artifact.path)?;
         let captures = journal.capture(&controls, true);
         let WorkerJournalArtifactCaptureStatus::Invalid(cause) = &captures[0].status else {
             panic!("missing held path accepted")
@@ -1860,7 +2676,11 @@ mod tests {
     }
 
     fn event(kind: &str, attempt: u64, total: Option<u64>) -> WireEvent {
-        serde_json::from_value(serde_json::json!({
+        serde_json::from_value(event_value(kind, attempt, total)).unwrap()
+    }
+
+    fn event_value(kind: &str, attempt: u64, total: Option<u64>) -> serde_json::Value {
+        serde_json::json!({
             "kind": kind, "callId": 1, "attemptId": attempt, "mode": "stream", "requestClass": "generation",
             "released": matches!(kind, "observation" | "terminal"),
             "terminal": (kind == "terminal").then_some("eof"), "terminalAck": (kind == "terminal").then_some("pending"),
@@ -1870,7 +2690,7 @@ mod tests {
             "observedModelVersion": null, "usageLowerBound": total, "usageCoverage": "observed_lower_bound_only",
             "identityAuthority": "unverified_response_field", "actualEffort": null, "cost": null, "qualified": false,
             "quiescence": "unproven", "envelopeSha256": (kind == "observation").then(|| "a".repeat(64))
-        })).unwrap()
+        })
     }
 
     fn protocol() -> Protocol {
@@ -2104,7 +2924,15 @@ mod tests {
             RuntimeId::GeminiCli,
             RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
         );
-        let run = run_external_agent(&command);
+        let started = Instant::now();
+        let mut run = failed_external_run(
+            &command,
+            started,
+            vec!["Gemini offline bootstrap fixture".into()],
+            false,
+            "Gemini offline fixture has no provider authority".into(),
+        );
+        run_linux_offline(&command, &ProcessCancellation::default(), started, &mut run)?;
         let held = run
             .gemini_bridge_evidence()
             .with_context(|| format!("no held bridge evidence: {:?}", run.error))?;

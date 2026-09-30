@@ -1822,7 +1822,8 @@ impl ConsultCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = consult::ask_consultant(ConsultAskOptions {
+                let gemini = args.gemini_inputs()?;
+                let options = ConsultAskOptions {
                     repo: resolved.repo,
                     run_id: resolved.run_id,
                     runtime: args.runtime,
@@ -1830,7 +1831,11 @@ impl ConsultCommand {
                     question,
                     context_paths: args.context_path,
                     timeout_seconds: args.timeout_seconds,
-                })?;
+                };
+                let report = match gemini {
+                    Some(inputs) => consult::ask_gemini_consultant(options, inputs)?,
+                    None => consult::ask_consultant(options)?,
+                };
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("consult ask failed");
@@ -1861,9 +1866,15 @@ struct AskConsultArgs {
     /// Consultant runtime to use. Real runtimes require --consultant-bin.
     #[arg(long, default_value = "fake")]
     runtime: ConsultantRuntime,
-    /// Codex- or Claude-compatible executable for real consultant runtimes.
+    /// Runtime executable for real consultant runtimes.
     #[arg(long)]
     consultant_bin: Option<PathBuf>,
+    /// Explicit requested model for Gemini; never an observed model identity.
+    #[arg(long)]
+    model: Option<String>,
+    /// Positive finite token ceiling required for Gemini consultation.
+    #[arg(long)]
+    token_budget: Option<usize>,
     /// Repo-relative existing path to mention as context. Contents are not inlined.
     #[arg(long = "context-path")]
     context_path: Vec<PathBuf>,
@@ -1879,6 +1890,83 @@ struct AskConsultArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+impl AskConsultArgs {
+    fn gemini_inputs(&self) -> Result<Option<consult::GeminiConsultOptions>> {
+        if self.runtime == ConsultantRuntime::Gemini {
+            let inputs = consult::GeminiConsultOptions {
+                model: self.model.clone().context("Gemini requires --model")?,
+                token_budget: self
+                    .token_budget
+                    .context("Gemini requires --token-budget")?,
+            };
+            inputs.validate()?;
+            Ok(Some(inputs))
+        } else {
+            if self.model.is_some() || self.token_budget.is_some() {
+                bail!("--model and --token-budget on consult ask require --runtime gemini");
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemini_consult_input_tests {
+    use super::*;
+
+    fn ask(flags: &[&str]) -> Result<AskConsultArgs> {
+        let argv = [
+            vec!["maco", "consult", "ask", "--question", "inspect"],
+            flags.to_vec(),
+        ]
+        .concat();
+        let parsed = Cli::try_parse_from(argv)?;
+        let Command::Consult(ConsultCommand {
+            command: ConsultSubcommand::Ask(args),
+        }) = parsed.command
+        else {
+            bail!("expected consult ask");
+        };
+        Ok(args)
+    }
+
+    #[test]
+    fn gemini_consult_cli_requires_explicit_model_and_budget_without_other_runtime_defaults(
+    ) -> Result<()> {
+        assert!(ask(&[])?.gemini_inputs()?.is_none());
+        for flags in [
+            vec!["--runtime", "gemini"],
+            vec!["--runtime", "gemini", "--model", "gemini-2.5-pro"],
+            vec!["--runtime", "gemini", "--token-budget", "10"],
+            vec![
+                "--runtime",
+                "gemini",
+                "--model",
+                "gemini-2.5-pro",
+                "--token-budget",
+                "0",
+            ],
+            vec!["--runtime", "codex", "--token-budget", "10"],
+            vec!["--runtime", "claude", "--model", "gemini-2.5-pro"],
+        ] {
+            assert!(ask(&flags)?.gemini_inputs().is_err(), "accepted {flags:?}");
+        }
+        let inputs = ask(&[
+            "--runtime",
+            "gemini",
+            "--model",
+            "gemini-2.5-pro",
+            "--token-budget",
+            "10",
+        ])?
+        .gemini_inputs()?
+        .context("missing Gemini inputs")?;
+        assert_eq!(inputs.model, "gemini-2.5-pro");
+        assert_eq!(inputs.token_budget, 10);
+        Ok(())
+    }
 }
 
 fn consult_question(args: &AskConsultArgs) -> Result<String> {

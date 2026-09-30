@@ -374,7 +374,11 @@ pub(super) fn collect_child_report_for_runtime(
             }
         })
     } else if assignment.role == AgentRole::Researcher {
-        read_researcher_report(external_run.output_last_message(), report_path)
+        if runtime == SupervisorRuntime::GeminiCli && external_command.uses_gemini_bridge() {
+            read_researcher_native_report(external_run.output_last_message(), report_path)
+        } else {
+            read_researcher_report(external_run.output_last_message(), report_path)
+        }
     } else {
         read_child_report(external_run.output_last_message(), report_path)
     };
@@ -512,6 +516,30 @@ pub(super) fn collect_child_report_for_runtime(
                 &report,
                 external_run.codex_command_execution_evidence(),
             )
+        } else if runtime == SupervisorRuntime::GeminiCli {
+            crate::external_agent::gemini_bridge::verify_read_only_evidence(
+                external_run,
+                external_command,
+                report.status == ReviewStatus::Succeeded,
+            )
+            .and_then(|paths| {
+                if !report.commands_run.is_empty() || !report.validation_results.is_empty() {
+                    bail!("Gemini native research cannot attest shell or check commands");
+                }
+                for assigned in &assignment.assigned_paths {
+                    if report.status == ReviewStatus::Succeeded
+                        && !paths
+                            .iter()
+                            .any(|p| p == assigned || p.starts_with(assigned))
+                    {
+                        bail!(
+                            "Gemini native research did not read assigned path {}",
+                            assigned.display()
+                        );
+                    }
+                }
+                Ok(())
+            })
         } else {
             Err(anyhow!(
                 "researcher command evidence requires a trusted read-only Codex launch"
@@ -519,6 +547,39 @@ pub(super) fn collect_child_report_for_runtime(
         };
         if let Err(error) = observed {
             let message = format!("researcher host command evidence rejected: {error:#}");
+            report_shape_problems.push(message.clone());
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+    }
+    if runtime == SupervisorRuntime::GeminiCli
+        && external_command.workspace_access == WorkspaceAccess::ReadOnly
+        && assignment.role != AgentRole::Researcher
+    {
+        let native = crate::external_agent::gemini_bridge::verify_read_only_evidence(
+            external_run,
+            external_command,
+            false,
+        )
+        .and_then(|_| {
+            if !report.commands_run.is_empty()
+                || report
+                    .validation_results
+                    .iter()
+                    .any(|v| !v.command.is_empty())
+            {
+                bail!("Gemini read-only review cannot attest shell or check commands");
+            }
+            Ok(())
+        });
+        if let Err(error) = native {
+            let message = format!("Gemini read-only review custody rejected: {error:#}");
             report_shape_problems.push(message.clone());
             report.status = ReviewStatus::Failed;
             report.accepted = false;
@@ -1091,6 +1152,34 @@ pub(super) fn collect_parent_auditor_report(
     reject_auditor_asserted_grok_stream_usage_evidence(report_path, &mut report);
     reject_auditor_asserted_grok_acp_parent_evidence(report_path, &mut report);
     reject_auditor_asserted_codex_parent_evidence(report_path, &mut report);
+    if runtime == SupervisorRuntime::GeminiCli {
+        let native = crate::external_agent::gemini_bridge::verify_read_only_evidence(
+            external_run,
+            external_command,
+            false,
+        )
+        .and_then(|_| {
+            if !report.commands_run.is_empty()
+                || report
+                    .validation_results
+                    .iter()
+                    .any(|v| !v.command.is_empty())
+            {
+                bail!("Gemini native auditor cannot attest shell or check commands");
+            }
+            Ok(())
+        });
+        if let Err(error) = native {
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: format!("Gemini native auditor custody rejected: {error:#}"),
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+    }
     if command_records_contain_fixed_version_probe_evidence(&report.commands_run) {
         strip_fixed_version_probe_evidence_from_command_records(&mut report.commands_run);
         report.status = ReviewStatus::Failed;

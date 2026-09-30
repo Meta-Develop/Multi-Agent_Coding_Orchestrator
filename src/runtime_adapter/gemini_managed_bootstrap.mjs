@@ -545,6 +545,21 @@ function writeHeldResult(filename, bytes) {
 let privateHandshakeAcknowledged = false;
 let managedStartupStage = "manifest";
 
+export function managedSessionResult(workspaceAccess, terminalReason, toolMutationObserved, output) {
+  if (!["read_only", "read_write"].includes(workspaceAccess) || terminalReason !== "completed"
+      || (workspaceAccess === "read_write" && toolMutationObserved !== true)
+      || (workspaceAccess === "read_only" && toolMutationObserved !== false)) {
+    throw new Error("bootstrap: managed_session_incomplete");
+  }
+  if (!Array.isArray(output) || output.some((part) => typeof part !== "string")) {
+    throw new Error("bootstrap: managed_result_shape");
+  }
+  const text = output.join("").trimEnd();
+  const result = Buffer.from(text + "\n", "utf8");
+  if (!text || result.length > 1024 * 1024) throw new Error("bootstrap: managed_result_bound");
+  return result;
+}
+
 async function managedEntry(manifestPath) {
   const root = path.dirname(manifestPath);
   const metadata = lstatSync(manifestPath);
@@ -557,7 +572,7 @@ async function managedEntry(manifestPath) {
   const online = manifestKeys === "bootstrapSha256,candidate,model,nonce,promptPath,promptSha256,resultPath,wireSha256,workspaceAccess";
   if ((!offline && !online) || !path.isAbsolute(m.candidate) || process.cwd() !== m.candidate
       || realpathSync(m.candidate) !== m.candidate || root.startsWith(`${m.candidate}/`)
-      || (online && (m.workspaceAccess !== "read_write" || !path.isAbsolute(m.promptPath)
+      || (online && (!["read_only", "read_write"].includes(m.workspaceAccess) || !path.isAbsolute(m.promptPath)
         || !path.isAbsolute(m.resultPath)))
       || typeof m.model !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/.test(m.model)
       || !/^[a-f0-9]{64}$/.test(m.promptSha256)
@@ -606,7 +621,7 @@ async function managedEntry(manifestPath) {
     await parent.send({ type: "hello", bootstrapSha256: m.bootstrapSha256, wireSha256: m.wireSha256, promptSha256: m.promptSha256 });
     privateHandshakeAcknowledged = true;
     const loaded = await loadGuardedCodeAssist({ parent, candidate: m.candidate,
-      profile, authorizedPersonalOAuth: true, writableWorker: true });
+      profile, authorizedPersonalOAuth: true, writableWorker: m.workspaceAccess === "read_write" });
     unit = loaded.unit;
     const config = new loaded.core.Config({ sessionId: "maco-private-bootstrap", model: m.model,
       targetDir: m.candidate, cwd: m.candidate, debugMode: false });
@@ -630,14 +645,10 @@ async function managedEntry(manifestPath) {
         terminalReason = event.reason;
       }
     }
-    if (terminalReason !== "completed" || !loaded.toolMutationObserved()) {
-      throw new Error("bootstrap: managed_worker_incomplete");
-    }
-    const resultText = output.join("").trimEnd();
-    if (!resultText) throw new Error("bootstrap: empty_worker_result");
-    const result = Buffer.from(resultText + "\n", "utf8");
+    const toolMutationObserved = loaded.toolMutationObserved();
+    const result = managedSessionResult(m.workspaceAccess, terminalReason, toolMutationObserved, output);
     writeHeldResult(m.resultPath, result);
-    await parent.send({ type: "completed", resultSha256: digest(result), toolMutationObserved: true });
+    await parent.send({ type: "completed", resultSha256: digest(result), toolMutationObserved });
   } finally { parent.close(); }
 }
 

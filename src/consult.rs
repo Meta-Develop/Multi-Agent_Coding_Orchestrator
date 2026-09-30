@@ -7,7 +7,7 @@ use crate::{
     llm::Redactor,
     mutation_taxonomy::{
         admit_consult_claude_process_intent, admit_consult_codex_process_intent,
-        AssignmentProcessLaunchKind, CONSULTANT_PROCESS_DUTY,
+        admit_consult_gemini_process_intent, AssignmentProcessLaunchKind, CONSULTANT_PROCESS_DUTY,
     },
     orchestrator::RunId,
     process_runner::resolve_existing_path_without_symlinks,
@@ -33,8 +33,8 @@ const CAVEAT_LIMIT: usize = 1024;
 const CONSULTANT_THREAD_DEPTH: u8 = 2;
 const MAX_CONSULT_RAW_BYTES: usize = 8 * 1024 * 1024;
 const CONSULT_PRODUCER: &str = "consult";
-/// Canonical ledger role (`RoleCategory::ReadOnlyResearcher`). Semantic consult
-/// identity stays on grant kind/duty `consultant`; `AgentRole` has no Researcher variant.
+/// Canonical lifecycle/ledger role (`RoleCategory::ReadOnlyResearcher`). Semantic
+/// consult identity stays on grant kind/duty `consultant`; lifecycle uses `AgentRole::Researcher`.
 const CONSULTANT_LIFECYCLE_ROLE: &str = "researcher";
 const CONSULT_PROCESS_LAUNCH_ATTEMPT: usize = 1;
 const QUESTION_ARTIFACT: &str = "trusted/question.md";
@@ -61,6 +61,7 @@ pub enum ConsultantRuntime {
     Fake,
     Codex,
     Claude,
+    Gemini,
 }
 
 impl ConsultantRuntime {
@@ -69,6 +70,7 @@ impl ConsultantRuntime {
             Self::Fake => "fake",
             Self::Codex => "codex",
             Self::Claude => "claude",
+            Self::Gemini => "gemini",
         }
     }
 }
@@ -81,7 +83,8 @@ impl FromStr for ConsultantRuntime {
             "fake" => Ok(Self::Fake),
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
-            _ => Err("runtime must be one of: fake, codex, claude".to_string()),
+            "gemini" => Ok(Self::Gemini),
+            _ => Err("runtime must be one of: fake, codex, claude, gemini".to_string()),
         }
     }
 }
@@ -164,13 +167,65 @@ pub fn ask_consultant(options: ConsultAskOptions) -> Result<ConsultantReport> {
     ask_consultant_with_runner(options, run_external_agent)
 }
 
+/// Explicit invocation inputs, not observed model identity or complete usage.
+#[derive(Debug, Clone)]
+pub struct GeminiConsultOptions {
+    pub model: String,
+    pub token_budget: usize,
+}
+
+impl GeminiConsultOptions {
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.model.is_empty()
+            || self.model.len() > 128
+            || !self
+                .model
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"._-/".contains(&b))
+            || self.token_budget == 0
+        {
+            bail!(
+                "Gemini consultation requires an explicit model and positive finite token budget"
+            );
+        }
+        Ok(())
+    }
+}
+
+pub fn ask_gemini_consultant(
+    options: ConsultAskOptions,
+    gemini: GeminiConsultOptions,
+) -> Result<ConsultantReport> {
+    if options.runtime != ConsultantRuntime::Gemini {
+        bail!("Gemini consultation inputs cannot bind another runtime");
+    }
+    ask_consultant_with_inputs(options, Some(gemini), run_external_agent)
+}
+
 fn ask_consultant_with_runner<F>(
     options: ConsultAskOptions,
+    external_runner: F,
+) -> Result<ConsultantReport>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    ask_consultant_with_inputs(options, None, external_runner)
+}
+
+fn ask_consultant_with_inputs<F>(
+    options: ConsultAskOptions,
+    gemini: Option<GeminiConsultOptions>,
     mut external_runner: F,
 ) -> Result<ConsultantReport>
 where
     F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 {
+    if options.runtime == ConsultantRuntime::Gemini {
+        gemini
+            .as_ref()
+            .context("Gemini consultation requires explicit model and budget inputs")?
+            .validate()?;
+    }
     let repo = artifacts::discover_repo_root(&options.repo)?;
     let mut writer = ArtifactRunWriter::reserve(
         &repo,
@@ -202,6 +257,15 @@ where
         Err(error) => {
             return finalize_operational_failure(writer, &options, &error);
         }
+    };
+    let prompt = if options.runtime == ConsultantRuntime::Gemini {
+        // Private artifact paths are not native tool inputs. Inline the report
+        // contract, and use only the confined candidate's ReadFile tool.
+        prompt.replace(&schema_prompt_path.display().to_string(),
+            "ConsultantReport object with version, run_id, runtime=gemini, question_summary, answer, confidence, references, caveats, no_further_delegation=true, read_only=true, duration_ms, exit_info, success and status.")
+            + "\nUse only native read_file for the declared context. WriteFile, Edit, shell commands and delegation are unavailable. Do not invent command or validation evidence.\n"
+    } else {
+        prompt
     };
     writer.write_bytes(
         QUESTION_ARTIFACT,
@@ -250,6 +314,17 @@ where
             )?;
             (outcome.report, outcome.raw_evidence)
         }
+        ConsultantRuntime::Gemini => {
+            let outcome = run_gemini_consultant(
+                &repo,
+                &options,
+                &prepared,
+                &mut writer,
+                gemini.as_ref().context("missing explicit Gemini inputs")?,
+                &mut external_runner,
+            )?;
+            (outcome.report, outcome.raw_evidence)
+        }
     };
 
     write_raw_evidence(&mut writer, &raw_evidence)?;
@@ -284,7 +359,7 @@ Return ConsultantReport JSON as the final response, matching this JSON schema:
 The final ConsultantReport JSON must include:
 - "no_further_delegation": true
 - "read_only": true
-- "runtime": "fake", "codex", or "claude"
+- "runtime": "fake", "codex", "claude", or "gemini"
 - "confidence": "low", "medium", or "high"
 
 Repository context paths are listed only; their contents are not inlined here:
@@ -345,7 +420,7 @@ fn prepare_consultation(options: &ConsultAskOptions, repo: &Path) -> Result<Prep
     let context_paths = validate_context_paths(repo, &options.context_paths)?;
     let consultant_bin = match options.runtime {
         ConsultantRuntime::Fake => None,
-        ConsultantRuntime::Codex | ConsultantRuntime::Claude => {
+        ConsultantRuntime::Codex | ConsultantRuntime::Claude | ConsultantRuntime::Gemini => {
             Some(options.consultant_bin.clone().with_context(|| {
                 format!(
                     "--consultant-bin is required when --runtime {} is selected",
@@ -543,6 +618,227 @@ where
     })
 }
 
+#[cfg(target_os = "linux")]
+fn freeze_gemini_consult_selection() -> Result<crate::account_authority::FrozenGeminiSelectedBinding>
+{
+    use crate::account_authority::{
+        authority_socket_config::configured_cam_authority_socket,
+        socket_client::selected_binding_via_authority_socket, FrozenGeminiSelectedBinding,
+        GEMINI_CLI_PROVIDER_ID,
+    };
+    if let Some(socket) = configured_cam_authority_socket() {
+        let (authority, binding) =
+            selected_binding_via_authority_socket(&socket, GEMINI_CLI_PROVIDER_ID)?
+                .context("no complete Gemini account is selected via the configured authority")?;
+        return Ok(FrozenGeminiSelectedBinding::from_selected_binding(
+            Some(authority),
+            &binding,
+        ));
+    }
+    use coding_agent_manager_lib::{
+        account_authority::{authority_id_for, StoredAccountRegistry},
+        paths::{project_dirs, stored_accounts_path},
+    };
+    let dirs = project_dirs().context("Coding Agent Manager data directory unavailable")?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(dirs.data_dir()));
+    let binding = registry
+        .selected_binding(GEMINI_CLI_PROVIDER_ID)?
+        .context("no complete personal Gemini account is selected")?;
+    Ok(FrozenGeminiSelectedBinding::from_selected_binding(
+        Some(authority_id_for(registry.metadata_path())),
+        &binding,
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn freeze_gemini_consult_selection() -> Result<crate::account_authority::FrozenGeminiSelectedBinding>
+{
+    bail!("managed Gemini consultation requires Linux containment")
+}
+
+fn run_gemini_consultant<F>(
+    repo: &Path,
+    options: &ConsultAskOptions,
+    prepared: &PreparedConsultation,
+    writer: &mut ArtifactRunWriter,
+    inputs: &GeminiConsultOptions,
+    external_runner: &mut F,
+) -> Result<ExternalConsultOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    let run_id = &options.run_id;
+    let consultant_bin = prepared
+        .consultant_bin
+        .as_deref()
+        .context("prepared Gemini consultant executable is missing")?;
+    let question_summary = prepared.question.summary.as_str();
+    let context_paths = prepared.context_paths.as_slice();
+    let timeout = Duration::from_secs(options.timeout_seconds);
+    use crate::process_runner::WorkspaceAccess;
+    use crate::runtime_adapter::{RuntimeAdapterConfig, RuntimeId};
+    use crate::supervise::AgentRole;
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+        UsageMeasurement,
+    };
+    crate::supervise::admit_role_category(
+        crate::supervise::RoleCategory::ReadOnlyResearcher,
+        Some(&inputs.model),
+    )?;
+    let frozen = freeze_gemini_consult_selection()?; // metadata only; bridge owns the actual use lease
+    let ledger = RunBudgetLedger::new_composed(
+        RunBudgetLimits {
+            hard_tokens: Some(inputs.token_budget),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits::default(),
+        Some(timeout.as_secs()),
+        None,
+    )?;
+    // Consultant is advisory/read-only; use the existing Researcher budget class,
+    // while its process intent and report identity remain exactly consultant.
+    let BudgetAdmission::Admitted { reservation, .. } = ledger.reserve_waiting_for_live_grants(
+        BudgetReservationRequest {
+            role: AgentRole::Researcher,
+            tokens: inputs.token_budget,
+            cost_usd: None,
+        },
+        timeout,
+        || false, // This fresh, private ledger has no other live grants to wait on.
+    )?
+    else {
+        bail!("Gemini consultant budget reservation refused")
+    };
+    struct RetainReservation<'a> {
+        ledger: &'a RunBudgetLedger,
+        id: crate::supervise_budget::BudgetReservationId,
+        settled: bool,
+    }
+    impl Drop for RetainReservation<'_> {
+        fn drop(&mut self) {
+            if !self.settled {
+                let _ = self.ledger.reconcile(self.id, UsageMeasurement::Missing);
+            }
+        }
+    }
+    let mut reservation_guard = RetainReservation {
+        ledger: &ledger,
+        id: reservation.id,
+        settled: false,
+    };
+    let (incoming, capture) = create_external_scratches(writer)?;
+    let mut command = attach_consult_process_launch(
+        ExternalAgentCommand::codex(
+            consultant_bin,
+            repo,
+            writer.run_dir().join(QUESTION_ARTIFACT),
+            capture.path().join("events.jsonl"),
+            incoming.path().join("consultant-report.json"),
+            timeout,
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_model_selection(Some(inputs.model.clone()), None)
+        .with_runtime_adapter(
+            RuntimeId::GeminiCli,
+            RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+        )
+        .with_gemini_run_account_binding(Some(frozen)),
+        repo,
+        run_id,
+        AssignmentProcessLaunchKind::ConsultGemini,
+    )?;
+    command.bind_live_token_grant(ledger.live_token_grant(reservation.id)?);
+    let external_run = external_runner(&command);
+    // Only proven no-release quiescence refunds. Whole invocation usage stays unknown.
+    if external_run
+        .gemini_bridge_evidence()
+        .is_some_and(|e| e.no_release_quiescent)
+    {
+        ledger.release(reservation.id)?;
+    } else {
+        let measurement = external_run
+            .gemini_bridge_evidence()
+            .and_then(|e| e.tokens)
+            .map_or(UsageMeasurement::Missing, |tokens| {
+                UsageMeasurement::Estimated {
+                    tokens,
+                    cost_usd: None,
+                }
+            });
+        ledger.reconcile(reservation.id, measurement)?;
+    }
+    reservation_guard.settled = true;
+    writer.write_bytes(
+        "trusted/budget.json",
+        &serde_json::to_vec_pretty(&ledger.report()?)?,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    let raw_evidence = external_run
+        .output_last_message()
+        .unwrap_or_default()
+        .to_vec();
+    let custody = crate::external_agent::gemini_bridge::verify_read_only_evidence(
+        &external_run,
+        &command,
+        !context_paths.is_empty(),
+    );
+    let custody = custody.and_then(|paths| {
+        for required in context_paths {
+            if !paths
+                .iter()
+                .any(|p| p == required || p.starts_with(required))
+            {
+                bail!(
+                    "Gemini consultant did not natively read declared context {}",
+                    required.display()
+                );
+            }
+        }
+        Ok(())
+    });
+    let report = match custody {
+        Ok(()) => match std::str::from_utf8(&raw_evidence) {
+            Ok(text) => report_from_external_text(
+                ConsultantRuntime::Gemini,
+                run_id,
+                question_summary,
+                &external_run,
+                text,
+            ),
+            Err(_) => failed_report_from_external(
+                ConsultantRuntime::Gemini,
+                run_id,
+                question_summary,
+                &external_run,
+                "",
+                "Gemini held result was not UTF-8".into(),
+            ),
+        },
+        Err(error) => failed_report_from_external(
+            ConsultantRuntime::Gemini,
+            run_id,
+            question_summary,
+            &external_run,
+            "",
+            format!("Gemini read-only native custody rejected: {error:#}"),
+        ),
+    };
+    drop(command);
+    if !external_run.scratch_quiescence_verified() {
+        bail!("Gemini consultant scratch is not quiescent; retaining its private artifacts");
+    }
+    let raw_evidence = finish_external_scratches(
+        raw_evidence,
+        writer.discard_scratch(&capture),
+        writer.discard_scratch(&incoming),
+    )?;
+    Ok(ExternalConsultOutcome {
+        report,
+        raw_evidence,
+    })
+}
+
 fn attach_consult_process_launch(
     command: ExternalAgentCommand,
     repo: &Path,
@@ -566,6 +862,14 @@ fn attach_consult_process_launch(
             CONSULTANT_PROCESS_DUTY,
         ),
         AssignmentProcessLaunchKind::ConsultClaude => admit_consult_claude_process_intent(
+            run_id.as_str(),
+            run_id.as_str(),
+            CONSULT_PROCESS_LAUNCH_ATTEMPT,
+            expected_program,
+            command.model.as_deref(),
+            CONSULTANT_PROCESS_DUTY,
+        ),
+        AssignmentProcessLaunchKind::ConsultGemini => admit_consult_gemini_process_intent(
             run_id.as_str(),
             run_id.as_str(),
             CONSULT_PROCESS_LAUNCH_ATTEMPT,
@@ -655,11 +959,18 @@ fn normalize_report(
     question_summary: &str,
     external_run: &ExternalAgentRun,
 ) -> ConsultantReport {
+    let process_completed = if runtime == ConsultantRuntime::Gemini {
+        external_run
+            .gemini_bridge_evidence()
+            .is_some_and(|e| e.read_only_completion_valid(external_run))
+    } else {
+        external_run.succeeded()
+    };
     let mut caveats = sanitize_public_fields(&report.caveats, CAVEAT_LIMIT);
     if recovered {
         caveats.push("report required lenient JSON extraction".to_string());
     }
-    if !external_run.succeeded() {
+    if !process_completed {
         caveats.push("consultant subprocess did not exit successfully".to_string());
     }
     append_stdout_truncation_caveat(&mut caveats, external_run);
@@ -681,7 +992,11 @@ fn normalize_report(
     }
 
     let status_success = matches!(report.status, ConsultantStatus::Succeeded);
-    let success = external_run.succeeded() && report.success && status_success;
+    let success = process_completed
+        && report.success
+        && status_success
+        && (runtime != ConsultantRuntime::Gemini
+            || (report.read_only && report.no_further_delegation));
     report.version = CONSULTANT_REPORT_VERSION;
     report.run_id = run_id.clone();
     report.runtime = runtime;
@@ -968,7 +1283,7 @@ fn write_consultant_schema(writer: &mut ArtifactRunWriter) -> Result<()> {
             "properties": {
                 "version": {"type": "integer"},
                 "run_id": {"type": "string"},
-                "runtime": {"type": "string", "enum": ["fake", "codex", "claude"]},
+                "runtime": {"type": "string", "enum": ["fake", "codex", "claude", "gemini"]},
                 "question_summary": {"type": "string"},
                 "answer": {"type": "string"},
                 "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
@@ -1133,6 +1448,131 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn gemini_consult_explicit_inputs_and_intent_refuse_cross_runtime_or_missing_values(
+    ) -> Result<()> {
+        for (model, token_budget) in [
+            ("", 10),
+            (" gemini-2.5-pro", 10),
+            ("gemini-2.5-pro\n", 10),
+            ("gemini-2.5-pro", 0),
+        ] {
+            assert!(GeminiConsultOptions {
+                model: model.into(),
+                token_budget
+            }
+            .validate()
+            .is_err());
+        }
+        let inputs = GeminiConsultOptions {
+            model: "gemini-2.5-pro".into(),
+            token_budget: 10,
+        };
+        inputs.validate()?;
+        let command = ExternalAgentCommand::codex(
+            "gemini",
+            ".",
+            "prompt",
+            "log",
+            "report",
+            Duration::from_secs(1),
+        )
+        .with_workspace_access(crate::process_runner::WorkspaceAccess::ReadOnly)
+        .with_model_selection(Some(inputs.model), None)
+        .with_runtime_adapter(
+            crate::runtime_adapter::RuntimeId::GeminiCli,
+            crate::runtime_adapter::RuntimeAdapterConfig::defaults(
+                crate::runtime_adapter::RuntimeId::GeminiCli,
+            ),
+        );
+        let command = attach_consult_process_launch(
+            command,
+            Path::new("."),
+            &RunId::new("consult-gemini")?,
+            AssignmentProcessLaunchKind::ConsultGemini,
+        )?;
+        let grant = command
+            .assignment_process_launch_grant
+            .as_ref()
+            .context("missing typed consult grant")?;
+        assert_eq!(grant.kind(), AssignmentProcessLaunchKind::ConsultGemini);
+        assert_eq!(grant.duty(), CONSULTANT_PROCESS_DUTY);
+        assert_eq!(command.agent_lifecycle.as_ref().unwrap().role, "researcher");
+        #[cfg(target_os = "linux")]
+        {
+            use crate::supervise_budget::{
+                BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+            };
+            use crate::{
+                account_authority::FrozenGeminiSelectedBinding,
+                process_runner::WorkspaceAccess,
+                runtime_adapter::{RuntimeAdapterConfig, RuntimeId},
+                supervise::AgentRole,
+            };
+            let mut command = command.clone();
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(inputs.token_budget),
+                ..Default::default()
+            })?;
+            let BudgetAdmission::Admitted { reservation, .. } =
+                ledger.reserve(BudgetReservationRequest {
+                    role: AgentRole::Researcher,
+                    tokens: inputs.token_budget,
+                    cost_usd: None,
+                })?
+            else {
+                bail!("fixture budget refused")
+            };
+            command = command.with_gemini_run_account_binding(Some(FrozenGeminiSelectedBinding {
+                authority_id: Some("synthetic-offline-authority".into()),
+                provider_id: "gemini-cli".into(),
+                account_id: "synthetic-account".into(),
+                account_incarnation: "synthetic-incarnation".into(),
+                selection_revision: 1,
+            }));
+            command.bind_live_token_grant(ledger.live_token_grant(reservation.id)?);
+            // The actual shared producer above must survive both production gates.
+            crate::external_agent::gemini_bridge::test_validate_read_only_launch(&command)?;
+            for wrong_role in ["consultant", "worker"] {
+                let mut wrong = command.clone();
+                wrong.agent_lifecycle.as_mut().unwrap().role = wrong_role.into();
+                assert!(
+                    crate::external_agent::gemini_bridge::test_validate_read_only_launch(&wrong)
+                        .is_err()
+                );
+            }
+            let mut wrong = command.clone();
+            wrong.workspace_access = WorkspaceAccess::ReadWrite;
+            assert!(
+                crate::external_agent::gemini_bridge::test_validate_read_only_launch(&wrong)
+                    .is_err()
+            );
+            let mut wrong = command.clone();
+            wrong = wrong.with_runtime_adapter(
+                RuntimeId::Grok,
+                RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+            );
+            assert!(
+                crate::external_agent::gemini_bridge::test_validate_read_only_launch(&wrong)
+                    .is_err()
+            );
+            let mut wrong = command.clone();
+            wrong.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::ConsultCodex);
+            assert!(
+                crate::external_agent::gemini_bridge::test_validate_read_only_launch(&wrong)
+                    .is_err()
+            );
+            ledger.release(reservation.id)?;
+        }
+        assert!(attach_consult_process_launch(
+            command,
+            Path::new("."),
+            &RunId::new("consult-gemini")?,
+            AssignmentProcessLaunchKind::AssignmentChild
+        )
+        .is_err());
+        Ok(())
+    }
     use crate::external_agent::{
         run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalAgentInvocation,
         ExternalProgramTrust,
