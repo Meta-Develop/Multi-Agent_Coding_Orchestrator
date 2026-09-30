@@ -5903,6 +5903,99 @@ fn orchestration_lifecycle_roles_enable_multi_agent_goals_without_ephemeral() {
 }
 
 #[test]
+fn opted_in_child_orchestrator_disables_native_delegation_and_keeps_role() {
+    let baseline = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle("/registry", "child_orchestrator", "run", "task");
+    let opted_in = baseline.clone().with_codex_native_delegation_disabled();
+    assert_eq!(
+        baseline
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+    assert_eq!(
+        opted_in
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+
+    let argv = |command: &ExternalAgentCommand| {
+        command_argv(command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let legacy = argv(&baseline);
+    let actual = argv(&opted_in);
+
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        0
+    );
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "goals"]));
+
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        1
+    );
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "goals"]));
+}
+
+#[test]
 fn non_multi_agent_hardened_argv_retains_ephemeral() {
     let command = ExternalAgentCommand::codex_read_only_consultant(
         "codex",

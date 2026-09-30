@@ -289,6 +289,24 @@ pub struct ExternalAgentCommand {
     /// the selected account from process-global observation state.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
+    /// Opt-in disable of Codex native multi_agent and goals. Not serialized.
+    /// Does not change role identity, permissions, adapter, model, or effort.
+    codex_native_delegation_disabled: bool,
+    /// Sealed opt-in for the verified managed read-only Codex parent app-server.
+    /// Ordinary children, researchers, and workers stay off this route.
+    codex_managed_readonly_route: CodexManagedReadonlyRoute,
+}
+
+/// Which verified managed read-only Codex app-server path this command requested.
+/// Inconsistent combinations fail closed at launch instead of falling back to the CLI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+enum CodexManagedReadonlyRoute {
+    #[default]
+    Off,
+    /// Initial parent: dynamic `maco_worker_request` tool forwarded to the sealed inbox.
+    InitialWorkerRequests,
+    /// Continuation: same read-only app-server, no dynamic tool and no fresh inbox.
+    Continuation,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -407,6 +425,39 @@ pub(crate) fn render_prompt_with_assignment_messaging_protocol_appendix(
 
 fn prompt_includes_assignment_messaging_protocol_appendix(prompt: &[u8]) -> bool {
     prompt.ends_with(ASSIGNMENT_MESSAGING_PROTOCOL_PROMPT_APPENDIX.as_bytes())
+}
+
+const MANAGED_WORKER_REQUEST_TOOL_APPENDIX: &str = r#"
+
+## Managed worker requests (parent dynamic tool)
+
+Verifier acceptance for this appendix is only the exact managed initial parent mode: Codex supervisor, read-only workspace, managed child worktree, native delegation disabled, verified execution, lifecycle role child_orchestrator, and the sealed parent inbox endpoint held by the supervisor. Invoke the dynamic tool named maco_worker_request. Yield only requests that this tool acknowledges. Do not use a shell, socket, or network connection.
+
+Tool arguments contain operation and the fields for that operation. Do not include run_id, task_id, a bearer token, an endpoint, or any path.
+- operation submit_worker_request requires request_id and worker_id
+- operation worker_request_status requires request_id
+
+"#;
+
+pub(crate) fn render_prompt_with_managed_worker_request_tool_appendix(
+    prompt: String,
+) -> Result<String> {
+    let combined_len = prompt
+        .len()
+        .saturating_add(MANAGED_WORKER_REQUEST_TOOL_APPENDIX.len());
+    if combined_len > MAX_PROMPT_BYTES {
+        bail!(
+            "managed worker-request tool appendix would exceed the bounded prompt size ({} bytes)",
+            combined_len
+        );
+    }
+    let mut rendered = prompt;
+    rendered.push_str(MANAGED_WORKER_REQUEST_TOOL_APPENDIX);
+    Ok(rendered)
+}
+
+fn prompt_includes_managed_worker_request_tool_appendix(prompt: &[u8]) -> bool {
+    prompt.ends_with(MANAGED_WORKER_REQUEST_TOOL_APPENDIX.as_bytes())
 }
 
 pub(crate) const WRITABLE_GROK_TERMINAL_WORKER_REQUIRED: &str =
@@ -1199,6 +1250,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1243,6 +1296,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1287,6 +1342,8 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            codex_native_delegation_disabled: false,
+            codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
         }
     }
 
@@ -1586,6 +1643,46 @@ impl ExternalAgentCommand {
         self
     }
 
+    /// Disable Codex native multi_agent and goals for this command only.
+    /// Grants no authority or role change and has no re-enable counterpart.
+    pub(crate) fn with_codex_native_delegation_disabled(mut self) -> Self {
+        self.codex_native_delegation_disabled = true;
+        self
+    }
+
+    /// Reads the existing private Codex native-delegation disable flag.
+    /// This is not a setter and does not re-enable delegation.
+    pub(crate) fn codex_native_delegation_is_disabled(&self) -> bool {
+        self.codex_native_delegation_disabled
+    }
+
+    /// Opt this command into the initial managed parent dynamic worker-request tool.
+    /// Callers must already have admitted the exact read-only ChildOrchestrator shape.
+    /// A later continuation opt-in replaces this; launch rejects a shape that does not match.
+    pub(crate) fn with_codex_managed_worker_requests(mut self) -> Self {
+        self.codex_managed_readonly_route = CodexManagedReadonlyRoute::InitialWorkerRequests;
+        self
+    }
+
+    /// Opt this command into the managed parent continuation app-server.
+    /// The dynamic worker tool stays absent and this does not open an inbox endpoint.
+    pub(crate) fn with_codex_managed_readonly_continuation(mut self) -> Self {
+        self.codex_managed_readonly_route = CodexManagedReadonlyRoute::Continuation;
+        self
+    }
+
+    pub(crate) fn codex_managed_worker_requests_enabled(&self) -> bool {
+        self.codex_managed_readonly_route == CodexManagedReadonlyRoute::InitialWorkerRequests
+    }
+
+    pub(crate) fn codex_managed_readonly_continuation_enabled(&self) -> bool {
+        self.codex_managed_readonly_route == CodexManagedReadonlyRoute::Continuation
+    }
+
+    fn codex_managed_readonly_route_active(&self) -> bool {
+        self.codex_managed_readonly_route != CodexManagedReadonlyRoute::Off
+    }
+
     pub fn with_worktree_control_exception(mut self, relative: impl Into<PathBuf>) -> Self {
         self.worktree_control_exceptions.push(relative.into());
         self
@@ -1671,25 +1768,66 @@ impl ExternalAgentCommand {
         self.assignment_messaging_launch.as_ref()
     }
 
-    /// Ensures the launch prompt already contains the static messaging appendix.
+    /// Ensures the launch prompt matches the messaging capability this command actually has.
     pub(crate) fn verify_assignment_messaging_protocol_instructions(&self) -> Result<()> {
-        if self.assignment_messaging_launch.is_none() {
-            return Ok(());
-        }
-        let existing = read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES)
-            .with_context(|| {
-                format!(
-                    "failed to read manifested launch prompt for assignment messaging verification: {}",
+        match self.codex_managed_readonly_route {
+            CodexManagedReadonlyRoute::Off => {
+                if self.assignment_messaging_launch.is_none() {
+                    return Ok(());
+                }
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+                    return Ok(());
+                }
+                bail!(
+                    "manifested launch prompt is missing assignment messaging protocol appendix at {}",
                     self.prompt.display()
-                )
-            })?;
-        if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
-            return Ok(());
+                );
+            }
+            CodexManagedReadonlyRoute::InitialWorkerRequests => {
+                if self.assignment_messaging_launch.is_none() {
+                    bail!(
+                        "managed initial Codex parent is missing its sealed inbox endpoint at {}",
+                        self.prompt.display()
+                    );
+                }
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_assignment_messaging_protocol_appendix(&existing) {
+                    bail!(
+                        "managed initial Codex parent prompt must use the dynamic worker-request tool appendix, not loopback IPC, at {}",
+                        self.prompt.display()
+                    );
+                }
+                if prompt_includes_managed_worker_request_tool_appendix(&existing) {
+                    return Ok(());
+                }
+                bail!(
+                    "manifested launch prompt is missing the managed worker-request tool appendix at {}",
+                    self.prompt.display()
+                );
+            }
+            CodexManagedReadonlyRoute::Continuation => {
+                let existing = self.read_manifested_launch_prompt()?;
+                if prompt_includes_managed_worker_request_tool_appendix(&existing)
+                    || prompt_includes_assignment_messaging_protocol_appendix(&existing)
+                {
+                    bail!(
+                        "managed continuation prompt must not grant worker-request or loopback messaging instructions at {}",
+                        self.prompt.display()
+                    );
+                }
+                Ok(())
+            }
         }
-        bail!(
-            "manifested launch prompt is missing assignment messaging protocol appendix at {}",
-            self.prompt.display()
-        );
+    }
+
+    fn read_manifested_launch_prompt(&self) -> Result<Vec<u8>> {
+        read_bounded_regular_file_nofollow(&self.prompt, MAX_PROMPT_BYTES).with_context(|| {
+            format!(
+                "failed to read manifested launch prompt for assignment messaging verification: {}",
+                self.prompt.display()
+            )
+        })
     }
 }
 
@@ -2755,8 +2893,25 @@ fn run_external_agent_runtime(
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
     let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
-    let read_only_researcher_app_server = should_use_read_only_researcher_app_server(spec, runtime);
-    let app_server_required = duplex_review_required || read_only_researcher_app_server;
+    let managed_readonly_app_server = match classify_managed_readonly_app_server(spec, runtime) {
+        Ok(route) => route,
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                error,
+            );
+        }
+    };
+    let read_only_researcher_app_server = managed_readonly_app_server.is_none()
+        && should_use_read_only_researcher_app_server(spec, runtime);
+    let read_only_codex_app_server =
+        read_only_researcher_app_server || managed_readonly_app_server.is_some();
+    let app_server_required = duplex_review_required || read_only_codex_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -2826,13 +2981,29 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
-    if read_only_researcher_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex
-    {
+    if read_only_codex_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex {
+        let route = if read_only_researcher_app_server {
+            "read-only Researcher app-server"
+        } else {
+            "managed read-only Codex app-server"
+        };
         return failed_external_environment_run(
             spec, started, command_display(&resolved_program, &[]), false,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(external_sandbox_requirement(spec.invocation)),
-            "read-only Researcher app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
+            format!("{route} requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence"),
+        );
+    }
+    if let Err(error) = validate_managed_readonly_execute_binding(spec, managed_readonly_app_server)
+    {
+        return failed_external_environment_run(
+            spec,
+            started,
+            command_display(&resolved_program, &[]),
+            false,
+            EnvironmentFailureCategory::SandboxUnavailable,
+            Some(external_sandbox_requirement(spec.invocation)),
+            error,
         );
     }
     let program_identity = match external_program_identity(&resolved_program) {
@@ -3762,7 +3933,7 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        let process = if read_only_researcher_app_server {
+        let process = if read_only_codex_app_server {
             run_read_only_researcher_app_server_process(process_spec, cancellation, spec, prompt)
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
@@ -4076,6 +4247,90 @@ fn should_use_read_only_researcher_app_server(
             .is_some_and(|identity| identity.role == AgentRole::Researcher.as_str())
 }
 
+fn classify_managed_readonly_app_server(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> Result<Option<CodexManagedReadonlyRoute>, String> {
+    if spec.codex_managed_readonly_route == CodexManagedReadonlyRoute::Off {
+        return Ok(None);
+    }
+    if let Some(problem) = managed_readonly_shape_problem(spec) {
+        return Err(format!(
+            "managed read-only Codex app-server opt-in refused: {problem}"
+        ));
+    }
+    if !(cfg!(target_os = "linux") && runtime == ExternalExecutionRuntime::Verified) {
+        return Err(
+            "managed read-only Codex app-server requires a verified Linux TrustedSystemCodex route"
+                .to_string(),
+        );
+    }
+    Ok(Some(spec.codex_managed_readonly_route))
+}
+
+fn managed_readonly_shape_problem(spec: &ExternalAgentCommand) -> Option<&'static str> {
+    if spec.invocation != ExternalAgentInvocation::CodexSupervisor {
+        return Some("invocation must be CodexSupervisor");
+    }
+    if spec.workspace_access != WorkspaceAccess::ReadOnly {
+        return Some("workspace must be read-only");
+    }
+    if spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree {
+        return Some("launch target must be the managed child worktree");
+    }
+    if !spec.codex_native_delegation_disabled {
+        return Some("native delegation must be disabled");
+    }
+    let role_matches = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+        identity.role == AgentRole::ChildOrchestrator.as_str() && !identity.run_id.is_empty()
+    });
+    if !role_matches {
+        return Some("lifecycle role must be child_orchestrator");
+    }
+    None
+}
+
+fn validate_managed_readonly_execute_binding(
+    spec: &ExternalAgentCommand,
+    route: Option<CodexManagedReadonlyRoute>,
+) -> Result<(), String> {
+    let Some(route) = route else {
+        return Ok(());
+    };
+    let Some(identity) = spec.agent_lifecycle.as_ref() else {
+        return Err("managed read-only Codex app-server is missing lifecycle identity".to_string());
+    };
+    match route {
+        CodexManagedReadonlyRoute::Off => Ok(()),
+        CodexManagedReadonlyRoute::InitialWorkerRequests => {
+            let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+                return Err(
+                    "managed initial Codex parent is missing its sealed inbox endpoint".to_string(),
+                );
+            };
+            launch
+                .environment_for(&identity.run_id, &identity.task_id)
+                .map(|_| ())
+                .map_err(|error| {
+                    format!(
+                        "managed initial Codex parent sealed endpoint binding refused: {error:#}"
+                    )
+                })
+        }
+        CodexManagedReadonlyRoute::Continuation => {
+            if let Some(launch) = spec.assignment_messaging_launch.as_ref() {
+                launch
+                    .environment_for(&identity.run_id, &identity.task_id)
+                    .map(|_| ())
+                    .map_err(|error| {
+                        format!("managed continuation sealed endpoint binding refused: {error:#}")
+                    })?;
+            }
+            Ok(())
+        }
+    }
+}
+
 fn should_use_duplex_review(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
@@ -4380,13 +4635,14 @@ fn run_observed_app_server_turn<T: codex_app_server::JsonLineTransport>(
     turn: &codex_app_server::AppServerTurn,
     spec: &ExternalAgentCommand,
     reviewer: &mut dyn codex_app_server::ApprovalReviewer,
+    worker_requests: Option<&mut codex_app_server::WorkerRequestCallback<'_>>,
     cancellation: &ProcessCancellation,
 ) -> Result<codex_app_server::AppServerOutcome, String> {
     let grant = spec
         .verified_live_token_grant()
         .inspect_err(|_| cancellation.cancel())?;
     let mut partial = None;
-    let result = codex_app_server::run_app_server_turn_observed(
+    let result = codex_app_server::run_app_server_turn_with_worker_requests_observed(
         transport,
         turn,
         codex_app_server::AppServerLimits {
@@ -4395,12 +4651,15 @@ fn run_observed_app_server_turn<T: codex_app_server::JsonLineTransport>(
             ..codex_app_server::AppServerLimits::default()
         },
         reviewer,
+        worker_requests,
         || cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped()),
-        &mut partial,
-        &mut || {
-            if let Some(grant) = grant {
-                grant.exhaust();
-            }
+        codex_app_server::AppServerObservation {
+            partial: &mut partial,
+            budget_exhausted: &mut || {
+                if let Some(grant) = grant {
+                    grant.exhaust();
+                }
+            },
         },
     );
     match result {
@@ -4445,13 +4704,43 @@ fn run_read_only_researcher_app_server_process(
             approval_requested = true;
             Ok(codex_app_server::ApprovalReview::cancel(None))
         };
-        let mut outcome = run_observed_app_server_turn(
-            &mut transport,
-            &turn,
-            spec,
-            &mut reviewer,
-            &cancellation,
-        )?;
+        let mut outcome = if spec.codex_managed_worker_requests_enabled() {
+            let launch = spec.assignment_messaging_launch.as_ref().ok_or_else(|| {
+                "managed initial Codex parent is missing its sealed inbox endpoint".to_string()
+            })?;
+            let identity = spec.agent_lifecycle.as_ref().ok_or_else(|| {
+                "managed initial Codex parent is missing lifecycle identity".to_string()
+            })?;
+            let grant = spec
+                .verified_live_token_grant()
+                .inspect_err(|_| cancellation.cancel())?;
+            let run_id = identity.run_id.as_str();
+            let task_id = identity.task_id.as_str();
+            let mut forward = |request: &serde_json::Value| {
+                launch
+                    .forward_worker_request(run_id, task_id, request, &|| {
+                        cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped())
+                    })
+                    .map_err(|error| error.to_string())
+            };
+            run_observed_app_server_turn(
+                &mut transport,
+                &turn,
+                spec,
+                &mut reviewer,
+                Some(&mut forward),
+                &cancellation,
+            )
+        } else {
+            run_observed_app_server_turn(
+                &mut transport,
+                &turn,
+                spec,
+                &mut reviewer,
+                None,
+                &cancellation,
+            )
+        }?;
         if let Err(error) =
             validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)
         {
@@ -4559,6 +4848,7 @@ fn run_duplex_app_server_process(
             &turn,
             spec,
             &mut reviewer,
+            None,
             &cancellation,
         )?;
         if outcome.protocol_error.is_some() {
@@ -6527,5 +6817,7 @@ mod preflight_quiescence_regression {
     }
 }
 
+#[cfg(test)]
+mod managed_readonly_route_tests;
 #[cfg(test)]
 mod tests;

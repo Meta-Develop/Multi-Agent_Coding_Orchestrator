@@ -29,6 +29,9 @@ const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
+const WORKER_REQUEST_TOOL: &str = "maco_worker_request";
+const WORKER_REQUEST_ID_MAX_BYTES: usize = 128;
+const WORKER_REQUEST_RESULT_MAX_BYTES: usize = 64 * 1024;
 
 // Only the informational prelude observed before thread/start on audited Codex 0.144.4.
 // Upstream declares both methods as ServerNotification in app-server-protocol's common.rs.
@@ -1344,17 +1347,44 @@ where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
-    run_app_server_turn_observed(
+    run_app_server_turn_with_worker_requests(transport, turn, limits, reviewer, None, cancelled)
+}
+
+pub(crate) type WorkerRequestCallback<'a> = dyn FnMut(&Value) -> Result<Value, String> + 'a;
+
+pub(crate) struct AppServerObservation<'a> {
+    pub partial: &'a mut Option<AppServerOutcome>,
+    pub budget_exhausted: &'a mut dyn FnMut(),
+}
+
+#[cfg(test)]
+pub(crate) fn run_app_server_turn_with_worker_requests<T, C>(
+    transport: &mut T,
+    turn: &AppServerTurn,
+    limits: AppServerLimits,
+    reviewer: &mut dyn ApprovalReviewer,
+    worker_requests: Option<&mut WorkerRequestCallback<'_>>,
+    cancelled: C,
+) -> Result<AppServerOutcome, AppServerError>
+where
+    T: JsonLineTransport,
+    C: Fn() -> bool,
+{
+    run_app_server_turn_with_worker_requests_observed(
         transport,
         turn,
         limits,
         reviewer,
+        worker_requests,
         cancelled,
-        &mut None,
-        &mut || {},
+        AppServerObservation {
+            partial: &mut None,
+            budget_exhausted: &mut || {},
+        },
     )
 }
 
+#[cfg(test)]
 pub(crate) fn run_app_server_turn_observed<T, C>(
     transport: &mut T,
     turn: &AppServerTurn,
@@ -1368,7 +1398,34 @@ where
     T: JsonLineTransport,
     C: Fn() -> bool,
 {
-    *partial = None;
+    run_app_server_turn_with_worker_requests_observed(
+        transport,
+        turn,
+        limits,
+        reviewer,
+        None,
+        cancelled,
+        AppServerObservation {
+            partial,
+            budget_exhausted,
+        },
+    )
+}
+
+pub(crate) fn run_app_server_turn_with_worker_requests_observed<T, C>(
+    transport: &mut T,
+    turn: &AppServerTurn,
+    limits: AppServerLimits,
+    reviewer: &mut dyn ApprovalReviewer,
+    worker_requests: Option<&mut WorkerRequestCallback<'_>>,
+    cancelled: C,
+    observation: AppServerObservation<'_>,
+) -> Result<AppServerOutcome, AppServerError>
+where
+    T: JsonLineTransport,
+    C: Fn() -> bool,
+{
+    *observation.partial = None;
     turn.validate()?;
     let limits = limits.validate()?;
     let mut state = ProtocolState::new(limits)?;
@@ -1424,7 +1481,14 @@ where
         ),
         ("ephemeral".to_string(), Value::from(true)),
         ("experimentalRawEvents".to_string(), Value::from(false)),
-        ("dynamicTools".to_string(), Value::Array(Vec::new())),
+        (
+            "dynamicTools".to_string(),
+            Value::Array(if worker_requests.is_some() {
+                vec![worker_request_tool_spec()]
+            } else {
+                Vec::new()
+            }),
+        ),
         (
             "environments".to_string(),
             Value::Array(vec![local_environment.clone()]),
@@ -1493,7 +1557,7 @@ where
         .map(str::to_string);
 
     // Preserve authenticated identity even if turn/start never acknowledges a turn ID.
-    *partial = Some(AppServerOutcome {
+    *observation.partial = Some(AppServerOutcome {
         thread_id: thread_id.clone(),
         turn_id: String::new(),
         status: TurnTerminalStatus::Failed,
@@ -1580,9 +1644,9 @@ where
         transport,
         active_turn,
         reviewer,
+        worker_requests,
         &cancelled,
-        partial,
-        budget_exhausted,
+        observation,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -1736,14 +1800,134 @@ struct ActiveTurnContext {
     lifecycle: ThreadLifecycleNotices,
 }
 
+struct ServicedWorkerRequest {
+    arguments: Value,
+    content_items: Value,
+}
+
+fn worker_request_tool_spec() -> Value {
+    json!({
+        "type": "function",
+        "name": WORKER_REQUEST_TOOL,
+        "description": "Submit or poll a supervisor-owned worker request.",
+        "inputSchema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["operation", "request_id"],
+            "properties": {
+                "operation": {
+                    "type": "string",
+                    "enum": ["submit_worker_request", "worker_request_status"]
+                },
+                "request_id": { "type": "string" },
+                "worker_id": { "type": "string" }
+            }
+        }
+    })
+}
+
+fn namespace_is_unspecified(value: Option<&Value>) -> bool {
+    matches!(value, None | Some(Value::Null))
+}
+
+fn worker_request_malformed(message: &str) -> AppServerError {
+    AppServerError::Malformed {
+        phase: "worker request",
+        message: message.to_string(),
+    }
+}
+
+fn bounded_worker_request_id(value: &str, label: &str) -> Result<(), AppServerError> {
+    validate_identifier(value, label, WORKER_REQUEST_ID_MAX_BYTES).map_err(|_| {
+        worker_request_malformed(&format!("{label} is empty, malformed, or oversized"))
+    })
+}
+
+fn validate_worker_request_arguments(arguments: &Value) -> Result<(), AppServerError> {
+    let Some(object) = arguments.as_object() else {
+        return Err(worker_request_malformed(
+            "worker request arguments are not an object",
+        ));
+    };
+    for key in object.keys() {
+        if !matches!(key.as_str(), "operation" | "request_id" | "worker_id") {
+            return Err(worker_request_malformed(
+                "worker request arguments contain an extra field",
+            ));
+        }
+    }
+    if !object.contains_key("operation") || !object.contains_key("request_id") {
+        return Err(worker_request_malformed(
+            "worker request arguments are missing a required field",
+        ));
+    }
+    let Some(operation) = object.get("operation").and_then(Value::as_str) else {
+        return Err(worker_request_malformed(
+            "worker request operation is missing or is not text",
+        ));
+    };
+    if !matches!(operation, "submit_worker_request" | "worker_request_status") {
+        return Err(worker_request_malformed(
+            "worker request operation is not supported",
+        ));
+    }
+    let Some(request_id) = object.get("request_id").and_then(Value::as_str) else {
+        return Err(worker_request_malformed(
+            "request_id is missing or is not text",
+        ));
+    };
+    bounded_worker_request_id(request_id, "request_id")?;
+    match operation {
+        "submit_worker_request" => {
+            let Some(worker_id) = object.get("worker_id") else {
+                return Err(worker_request_malformed(
+                    "submit_worker_request requires worker_id",
+                ));
+            };
+            let Some(worker_id) = worker_id.as_str() else {
+                return Err(worker_request_malformed("worker_id is not text"));
+            };
+            bounded_worker_request_id(worker_id, "worker_id")?;
+        }
+        "worker_request_status" => {
+            if object.contains_key("worker_id") {
+                return Err(worker_request_malformed(
+                    "worker_request_status forbids worker_id",
+                ));
+            }
+        }
+        _ => unreachable!("operation was already constrained"),
+    }
+    Ok(())
+}
+
+fn sanitize_worker_diagnostic(message: &str) -> String {
+    let mut sanitized = String::new();
+    for character in message.chars() {
+        if character.is_control() {
+            continue;
+        }
+        let next = character.len_utf8();
+        if sanitized.len() + next > 256 {
+            break;
+        }
+        sanitized.push(character);
+    }
+    if sanitized.is_empty() {
+        "worker request failed".to_string()
+    } else {
+        sanitized
+    }
+}
+
 fn drive_turn<T, C>(
     state: &mut ProtocolState,
     transport: &mut T,
     active_turn: ActiveTurnContext,
     reviewer: &mut dyn ApprovalReviewer,
+    mut worker_requests: Option<&mut WorkerRequestCallback<'_>>,
     cancelled: &C,
-    partial: &mut Option<AppServerOutcome>,
-    budget_exhausted: &mut dyn FnMut(),
+    observation: AppServerObservation<'_>,
 ) -> Result<AppServerOutcome, AppServerError>
 where
     T: JsonLineTransport,
@@ -1784,6 +1968,7 @@ where
     let mut auto_reviews = Vec::new();
     let mut gate_denials = Vec::new();
     let mut approval_request_items = BTreeSet::<String>::new();
+    let mut serviced_worker_requests = BTreeMap::<String, ServicedWorkerRequest>::new();
     let mut pending_correction_responses = BTreeMap::<RequestId, String>::new();
     let mut refused_ceiling_expansions = 0usize;
     let mut turn_started_seen = false;
@@ -2272,6 +2457,158 @@ where
                     && evidence.action_type == active_review.action_type;
                 auto_reviews.push(evidence);
             }
+            "item/tool/call" => {
+                let request_id = object
+                    .get("id")
+                    .ok_or_else(|| AppServerError::Malformed {
+                        phase: "worker request",
+                        message: "worker request has no id".to_string(),
+                    })
+                    .and_then(|value| RequestId::parse(value, "worker request"))?;
+                if !state.server_request_ids.insert(request_id.clone()) {
+                    return Err(AppServerError::Duplicate {
+                        phase: "worker request",
+                        message: "worker request id was reused".to_string(),
+                    });
+                }
+                validate_turn_correlation(params, thread_id, turn_id, "worker request")?;
+                if !turn_started_seen {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request arrived before turn start".to_string(),
+                    });
+                }
+                let call_id =
+                    required_text(&message, &["params", "callId"], "worker request", "call id")?;
+                validate_identifier(call_id, "call id", 256).map_err(|_| {
+                    AppServerError::Malformed {
+                        phase: "worker request",
+                        message: "call id is empty, malformed, or oversized".to_string(),
+                    }
+                })?;
+                if completed_items.contains(call_id) {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request arrived after the dynamic tool item completed"
+                            .to_string(),
+                    });
+                }
+                let active_item =
+                    active_items
+                        .get(call_id)
+                        .ok_or_else(|| AppServerError::Unexpected {
+                            phase: "worker request",
+                            message: "worker request arrived before the dynamic tool item started"
+                                .to_string(),
+                        })?;
+                if active_item.item_type != "dynamicToolCall" {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request item is not an active dynamic tool call"
+                            .to_string(),
+                    });
+                }
+                if serviced_worker_requests.contains_key(call_id) {
+                    return Err(AppServerError::Duplicate {
+                        phase: "worker request",
+                        message: "worker request call id was reused".to_string(),
+                    });
+                }
+                if !namespace_is_unspecified(params.get("namespace"))
+                    || !namespace_is_unspecified(active_item.raw.get("namespace"))
+                {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request tool is not namespaced".to_string(),
+                    });
+                }
+                let tool = required_text(&message, &["params", "tool"], "worker request", "tool")?;
+                if active_item.raw.get("tool").and_then(Value::as_str) != Some(tool) {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request tool does not match the active item".to_string(),
+                    });
+                }
+                if tool != WORKER_REQUEST_TOOL {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request tool is not registered".to_string(),
+                    });
+                }
+                let Some(arguments) = params.get("arguments") else {
+                    return Err(AppServerError::Malformed {
+                        phase: "worker request",
+                        message: "worker request arguments are missing".to_string(),
+                    });
+                };
+                if active_item.raw.get("arguments") != Some(arguments) {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request arguments do not match the active item"
+                            .to_string(),
+                    });
+                }
+                validate_worker_request_arguments(arguments)?;
+                let Some(callback) = worker_requests.as_mut() else {
+                    return Err(AppServerError::Unexpected {
+                        phase: "worker request",
+                        message: "worker request callback is not registered".to_string(),
+                    });
+                };
+                if cancelled() {
+                    return Err(AppServerError::Cancelled {
+                        phase: "worker request",
+                    });
+                }
+                if Instant::now() >= state.deadline {
+                    return Err(AppServerError::Timeout {
+                        phase: "worker request",
+                    });
+                }
+                let result = callback(arguments).map_err(|message| AppServerError::Remote {
+                    phase: "worker request",
+                    message: sanitize_worker_diagnostic(&message),
+                })?;
+                if cancelled() {
+                    return Err(AppServerError::Cancelled {
+                        phase: "worker request",
+                    });
+                }
+                if Instant::now() >= state.deadline {
+                    return Err(AppServerError::Timeout {
+                        phase: "worker request",
+                    });
+                }
+                let text =
+                    serde_json::to_string(&result).map_err(|_| AppServerError::Malformed {
+                        phase: "worker request",
+                        message: "worker request result could not be encoded".to_string(),
+                    })?;
+                if text.len() > WORKER_REQUEST_RESULT_MAX_BYTES {
+                    return Err(AppServerError::Malformed {
+                        phase: "worker request",
+                        message: "worker request result is oversized".to_string(),
+                    });
+                }
+                let content_items = json!([{ "type": "inputText", "text": text }]);
+                state.send(
+                    transport,
+                    &json!({
+                        "id": request_id.to_value(),
+                        "result": {
+                            "contentItems": content_items,
+                            "success": true
+                        }
+                    }),
+                )?;
+                serviced_worker_requests.insert(
+                    call_id.to_string(),
+                    ServicedWorkerRequest {
+                        arguments: arguments.clone(),
+                        content_items,
+                    },
+                );
+            }
             "item/completed" => {
                 validate_turn_correlation(params, thread_id, turn_id, "item/completed")?;
                 let item_id = required_text(
@@ -2309,6 +2646,36 @@ where
                         phase: "item/completed",
                         message: "item completed without one matching active lifecycle".to_string(),
                     });
+                }
+                if item_type == "dynamicToolCall" {
+                    let serviced = serviced_worker_requests.get(item_id).ok_or_else(|| {
+                        AppServerError::Unexpected {
+                            phase: "worker request",
+                            message:
+                                "dynamic tool item completed without a serviced worker request"
+                                    .to_string(),
+                        }
+                    })?;
+                    let completed = message.pointer("/params/item").ok_or_else(|| {
+                        AppServerError::Malformed {
+                            phase: "worker request",
+                            message: "completed dynamic tool item is missing".to_string(),
+                        }
+                    })?;
+                    if completed.get("tool").and_then(Value::as_str) != Some(WORKER_REQUEST_TOOL)
+                        || !namespace_is_unspecified(completed.get("namespace"))
+                        || completed.get("arguments") != Some(&serviced.arguments)
+                        || completed.get("contentItems") != Some(&serviced.content_items)
+                        || completed.get("success") != Some(&Value::Bool(true))
+                        || completed.get("status").and_then(Value::as_str) != Some("completed")
+                    {
+                        return Err(AppServerError::Unexpected {
+                            phase: "worker request",
+                            message:
+                                "dynamic tool completion did not match the serviced worker request"
+                                    .to_string(),
+                        });
+                    }
                 }
                 if completed_items.contains(item_id) {
                     return Err(AppServerError::Duplicate {
@@ -2372,6 +2739,7 @@ where
                 }
                 // Commit lifecycle removal only after all terminal validation succeeds.
                 active_items.remove(item_id);
+                serviced_worker_requests.remove(item_id);
                 completed_items.insert(item_id.to_string());
                 item_outcomes.push(ItemOutcome {
                     item_id: item_id.to_string(),
@@ -2525,7 +2893,7 @@ where
                     {
                         budget_failure =
                             Some(AppServerError::TokenBudgetExceeded { grant, observed });
-                        budget_exhausted();
+                        (observation.budget_exhausted)();
                         state.interrupt(transport, thread_id, turn_id);
                         // Bounded best-effort drain, not a provider spending guarantee.
                         state.deadline =
@@ -2566,7 +2934,7 @@ where
                 ));
             }
         }
-        *partial = Some(AppServerOutcome {
+        *observation.partial = Some(AppServerOutcome {
             thread_id: thread_id.to_string(),
             turn_id: turn_id.to_string(),
             status: TurnTerminalStatus::Failed,
@@ -2943,8 +3311,8 @@ fn bounded_json_summary(value: &Value) -> String {
 mod tests {
     use super::*;
     use std::sync::{
-        atomic::{AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, Mutex,
     };
 
     #[derive(Default)]
@@ -5581,5 +5949,700 @@ mod tests {
                 .expect("inadequate auto review remains evidence")
                 .structured_policy_decision
         );
+    }
+
+    fn worker_arguments(operation: &str) -> Value {
+        if operation == "submit_worker_request" {
+            json!({
+                "operation": operation,
+                "request_id": "req-1",
+                "worker_id": "worker-1"
+            })
+        } else {
+            json!({
+                "operation": operation,
+                "request_id": "req-1"
+            })
+        }
+    }
+
+    fn dynamic_tool_started(call_id: &str, tool: &str, arguments: &Value) -> Value {
+        json!({
+            "method": "item/started",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": call_id,
+                    "type": "dynamicToolCall",
+                    "status": "inProgress",
+                    "tool": tool,
+                    "arguments": arguments
+                }
+            }
+        })
+    }
+
+    fn dynamic_tool_call(rpc_id: Value, call_id: &str, tool: &str, arguments: &Value) -> Value {
+        json!({
+            "id": rpc_id,
+            "method": "item/tool/call",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "callId": call_id,
+                "tool": tool,
+                "arguments": arguments
+            }
+        })
+    }
+
+    fn dynamic_tool_completed(call_id: &str, arguments: &Value, result_text: &str) -> Value {
+        json!({
+            "method": "item/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turnId": "turn-1",
+                "item": {
+                    "id": call_id,
+                    "type": "dynamicToolCall",
+                    "status": "completed",
+                    "tool": WORKER_REQUEST_TOOL,
+                    "arguments": arguments,
+                    "contentItems": [{"type": "inputText", "text": result_text}],
+                    "success": true
+                }
+            }
+        })
+    }
+
+    fn turn_completed_message() -> Value {
+        json!({
+            "method": "turn/completed",
+            "params": {
+                "threadId": "thread-1",
+                "turn": {"id": "turn-1", "status": "completed"}
+            }
+        })
+    }
+
+    fn thread_start_message(transport: &FakeTransport) -> &Value {
+        transport
+            .sent
+            .iter()
+            .find(|message| message.get("method") == Some(&json!("thread/start")))
+            .expect("thread/start")
+    }
+
+    fn tool_successes(transport: &FakeTransport) -> Vec<&Value> {
+        transport
+            .sent
+            .iter()
+            .filter_map(|message| {
+                let result = message.get("result")?;
+                (result.get("contentItems").is_some()
+                    && result.get("success") == Some(&Value::Bool(true)))
+                .then_some(result)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn worker_request_tool_registers_and_serves_submit_and_status() {
+        let submit = worker_arguments("submit_worker_request");
+        let status = worker_arguments("worker_request_status");
+        let submit_body = json!({"state": "accepted"});
+        let status_body = json!({"state": "ready"});
+        let submit_text = serde_json::to_string(&submit_body).expect("submit json");
+        let status_text = serde_json::to_string(&status_body).expect("status json");
+        let mut messages = base_messages();
+        messages.extend([
+            token_usage_notice(35_000, 2_000),
+            dynamic_tool_started("call-submit", WORKER_REQUEST_TOOL, &submit),
+            dynamic_tool_call(
+                json!("rpc-submit"),
+                "call-submit",
+                WORKER_REQUEST_TOOL,
+                &submit,
+            ),
+            dynamic_tool_completed("call-submit", &submit, &submit_text),
+            dynamic_tool_started("call-status", WORKER_REQUEST_TOOL, &status),
+            dynamic_tool_call(
+                json!("rpc-status"),
+                "call-status",
+                WORKER_REQUEST_TOOL,
+                &status,
+            ),
+            dynamic_tool_completed("call-status", &status, &status_text),
+            turn_completed_message(),
+        ]);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let submit_callback = submit_body.clone();
+        let status_callback = status_body.clone();
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn_with_worker_requests(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits {
+                token_grant: Some(220_000),
+                ..AppServerLimits::default()
+            },
+            &mut |_: ApprovalRequest| panic!("worker request is not an approval"),
+            Some(&mut move |arguments| {
+                record
+                    .lock()
+                    .expect("argument record")
+                    .push(arguments.clone());
+                Ok(match arguments.get("operation").and_then(Value::as_str) {
+                    Some("submit_worker_request") => submit_callback.clone(),
+                    Some("worker_request_status") => status_callback.clone(),
+                    _ => panic!("unexpected worker operation"),
+                })
+            }),
+            || false,
+        )
+        .expect("worker request transcript");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.token_usage.unwrap().input_tokens, 35_000);
+        assert_eq!(outcome.token_usage.unwrap().output_tokens, 2_000);
+        assert_eq!(
+            thread_start_message(&transport)["params"]["dynamicTools"],
+            json!([worker_request_tool_spec()])
+        );
+        assert_eq!(
+            seen.lock().expect("argument record").as_slice(),
+            &[submit.clone(), status.clone()]
+        );
+        assert_eq!(
+            tool_successes(&transport),
+            vec![
+                &json!({
+                    "contentItems": [{"type": "inputText", "text": submit_text}],
+                    "success": true
+                }),
+                &json!({
+                    "contentItems": [{"type": "inputText", "text": status_text}],
+                    "success": true
+                })
+            ]
+        );
+        assert!(!sent_interrupt(&transport));
+    }
+
+    #[test]
+    fn worker_requests_preserve_partial_custody_and_stop_dispatch_at_budget_breach() {
+        for breach in [false, true] {
+            let arguments = worker_arguments("submit_worker_request");
+            let mut messages = command_observation_messages();
+            messages.pop(); // Keep the command start authentic and incomplete.
+            messages.pop();
+            let expected_command = messages.last().unwrap()["params"]["item"]["command"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            messages.extend([
+                if breach {
+                    token_usage_notice(210_000, 10_000)
+                } else {
+                    token_usage_notice(35_000, 2_000)
+                },
+                dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+                dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+            ]);
+            if breach {
+                messages.extend([
+                    token_usage_notice(230_000, 12_000),
+                    turn_completed_message(),
+                ]);
+            }
+            let mut transport = FakeTransport::from_values(messages);
+            let mut partial = None;
+            let mut stopped = false;
+            let mut calls = 0;
+            let error = run_app_server_turn_with_worker_requests_observed(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits {
+                    token_grant: Some(220_000),
+                    ..AppServerLimits::default()
+                },
+                &mut |_: ApprovalRequest| panic!("no approval authority"),
+                Some(&mut |_: &Value| {
+                    calls += 1;
+                    Err("managed worker request refused".to_string())
+                }),
+                || false,
+                AppServerObservation {
+                    partial: &mut partial,
+                    budget_exhausted: &mut || stopped = true,
+                },
+            )
+            .unwrap_err();
+            if breach {
+                assert_eq!(
+                    error,
+                    AppServerError::TokenBudgetExceeded {
+                        grant: 220_000,
+                        observed: 220_000,
+                    }
+                );
+                assert_eq!(calls, 0, "no worker dispatch after the budget stop");
+            } else {
+                assert!(matches!(
+                    error,
+                    AppServerError::Remote {
+                        phase: "worker request",
+                        ..
+                    }
+                ));
+                assert_eq!(calls, 1);
+            }
+            assert_eq!(stopped, breach);
+            assert!(tool_successes(&transport).is_empty());
+            assert!(sent_interrupt(&transport));
+            let partial = partial.unwrap();
+            assert_eq!(partial.thread_id, "thread-1");
+            assert_eq!(partial.turn_id, "turn-1");
+            assert_eq!(partial.resolved_model, "gpt-5.6-sol");
+            assert_eq!(partial.resolved_effort.as_deref(), Some("xhigh"));
+            assert_eq!(partial.status, TurnTerminalStatus::Failed);
+            assert!(partial.protocol_error.is_some());
+            assert!(partial.final_message.is_none());
+            let usage = partial.token_usage.unwrap();
+            assert_eq!(
+                usage.input_tokens + usage.output_tokens,
+                if breach { 242_000 } else { 37_000 }
+            );
+            assert!(matches!(
+                partial.command_execution_evidence.observations.as_slice(),
+                [CommandExecutionObservation::Incomplete { item_id, started: Some(started), .. }]
+                    if item_id == "command-1" && started.command == expected_command
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_request_without_callback_registers_no_dynamic_tools() {
+        let mut messages = base_messages();
+        messages.push(turn_completed_message());
+        let mut transport = FakeTransport::from_values(messages);
+        let outcome = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("no approval"),
+            || false,
+        )
+        .expect("turn without worker callback");
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(
+            thread_start_message(&transport)["params"]["dynamicTools"],
+            json!([])
+        );
+    }
+
+    fn assert_worker_failure(
+        messages: Vec<Value>,
+        callback: &mut dyn FnMut(&Value) -> Result<Value, String>,
+        cancelled: &dyn Fn() -> bool,
+    ) -> (AppServerError, FakeTransport) {
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn_with_worker_requests(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+            Some(callback),
+            cancelled,
+        )
+        .expect_err("worker request must fail closed");
+        assert!(sent_interrupt(&transport));
+        (error, transport)
+    }
+
+    #[test]
+    fn worker_request_rejects_foreign_correlation_tool_and_lifecycle() {
+        let arguments = worker_arguments("submit_worker_request");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reject = |label: &str, extra: Vec<Value>, check: fn(&AppServerError)| {
+            let mut messages = base_messages();
+            messages.extend(extra);
+            let seen = Arc::clone(&calls);
+            let (error, transport) = assert_worker_failure(
+                messages,
+                &mut move |_| {
+                    seen.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"ok": true}))
+                },
+                &|| false,
+            );
+            check(&error);
+            assert!(
+                tool_successes(&transport).is_empty(),
+                "{label} synthesized a success"
+            );
+        };
+        let started = dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments);
+        let call = dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments);
+        let mut foreign_thread = call.clone();
+        foreign_thread["params"]["threadId"] = json!("other-thread");
+        reject(
+            "foreign thread",
+            vec![started.clone(), foreign_thread],
+            |error| {
+                assert!(
+                    matches!(error, AppServerError::Unexpected { phase, .. } if *phase == "worker request")
+                );
+            },
+        );
+        let mut foreign_turn = call.clone();
+        foreign_turn["params"]["turnId"] = json!("other-turn");
+        reject(
+            "foreign turn",
+            vec![started.clone(), foreign_turn],
+            |error| {
+                assert!(
+                    matches!(error, AppServerError::Unexpected { phase, .. } if *phase == "worker request")
+                );
+            },
+        );
+        reject(
+            "unknown tool",
+            vec![
+                dynamic_tool_started("call-1", "shell", &arguments),
+                dynamic_tool_call(json!("rpc-1"), "call-1", "shell", &arguments),
+            ],
+            |error| {
+                assert!(matches!(
+                    error,
+                    AppServerError::Unexpected { message, .. } if message.contains("not registered")
+                ));
+            },
+        );
+        reject(
+            "mismatched tool",
+            vec![
+                started.clone(),
+                dynamic_tool_call(json!("rpc-1"), "call-1", "shell", &arguments),
+            ],
+            |error| {
+                assert!(matches!(
+                    error,
+                    AppServerError::Unexpected { message, .. } if message.contains("does not match")
+                ));
+            },
+        );
+        let mut namespaced = call.clone();
+        namespaced["params"]["namespace"] = json!("workers");
+        reject("namespace", vec![started.clone(), namespaced], |error| {
+            assert!(matches!(
+                error,
+                AppServerError::Unexpected { message, .. } if message.contains("not namespaced")
+            ));
+        });
+        reject("before item start", vec![call.clone()], |error| {
+            assert!(matches!(
+                error,
+                AppServerError::Unexpected { message, .. } if message.contains("before the dynamic tool item started")
+            ));
+        });
+        let mut early = base_messages();
+        early.insert(3, started.clone());
+        early.insert(4, call.clone());
+        let seen = Arc::clone(&calls);
+        let (error, _) = assert_worker_failure(
+            early,
+            &mut move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+            &|| false,
+        );
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { message, .. } if message.contains("before turn start")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+
+        let text = serde_json::to_string(&json!({"ok": true})).expect("result json");
+        let mut completed = base_messages();
+        completed.extend([
+            started,
+            call,
+            dynamic_tool_completed("call-1", &arguments, &text),
+            dynamic_tool_call(json!("rpc-2"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let serviced = Arc::new(AtomicUsize::new(0));
+        let serviced_calls = Arc::clone(&serviced);
+        let (error, transport) = assert_worker_failure(
+            completed,
+            &mut move |_| {
+                serviced_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+            &|| false,
+        );
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { message, .. } if message.contains("after the dynamic tool item completed")
+        ));
+        assert_eq!(serviced.load(Ordering::SeqCst), 1);
+        assert_eq!(tool_successes(&transport).len(), 1);
+    }
+
+    #[test]
+    fn worker_request_rejects_repeated_ids_malformed_arguments_and_absent_callback() {
+        let arguments = worker_arguments("submit_worker_request");
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-2"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let (error, transport) = assert_worker_failure(
+            messages,
+            &mut move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+            &|| false,
+        );
+        assert!(matches!(error, AppServerError::Duplicate { .. }));
+        assert_eq!(tool_successes(&transport).len(), 1);
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        let mut messages = base_messages();
+        messages.extend([
+            json!({
+                "method": "item/started",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "item": {"id": "item-approval", "type": "commandExecution", "status": "inProgress"}
+                }
+            }),
+            json!({
+                "id": 81,
+                "method": "item/commandExecution/requestApproval",
+                "params": {
+                    "threadId": "thread-1",
+                    "turnId": "turn-1",
+                    "itemId": "item-approval",
+                    "command": "cargo test"
+                }
+            }),
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!(81), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let seen = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&seen);
+        let (error, transport) = assert_worker_failure(
+            messages,
+            &mut move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+            &|| false,
+        );
+        assert!(matches!(error, AppServerError::Duplicate { .. }));
+        assert!(tool_successes(&transport).is_empty());
+        assert_eq!(seen.load(Ordering::SeqCst), 0);
+
+        for arguments in [
+            json!(["nope"]),
+            json!({"operation": "submit_worker_request", "request_id": "req-1", "worker_id": "worker-1", "extra": true}),
+            json!({"operation": "submit_worker_request", "request_id": "req-1"}),
+            json!({"operation": "worker_request_status", "request_id": "req-1", "worker_id": "worker-1"}),
+            json!({"operation": "drop_table", "request_id": "req-1"}),
+            json!({"operation": "submit_worker_request", "request_id": "bad\nid", "worker_id": "worker-1"}),
+            json!({"operation": "submit_worker_request", "request_id": "", "worker_id": "worker-1"}),
+            json!({"operation": "submit_worker_request", "request_id": "req-1", "worker_id": 4}),
+            json!({"request_id": "req-1"}),
+        ] {
+            let mut messages = base_messages();
+            messages.extend([
+                dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+                dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+            ]);
+            let seen = Arc::new(AtomicUsize::new(0));
+            let callback_calls = Arc::clone(&seen);
+            let (error, transport) = assert_worker_failure(
+                messages,
+                &mut move |_| {
+                    callback_calls.fetch_add(1, Ordering::SeqCst);
+                    Ok(json!({"ok": true}))
+                },
+                &|| false,
+            );
+            assert!(
+                matches!(error, AppServerError::Malformed { phase, .. } if phase == "worker request"),
+                "{error:?}"
+            );
+            assert!(tool_successes(&transport).is_empty());
+            assert_eq!(seen.load(Ordering::SeqCst), 0);
+        }
+
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("absent callback is not an approval"),
+            || false,
+        )
+        .expect_err("absent callback");
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { message, .. } if message.contains("not registered")
+        ));
+        assert!(sent_interrupt(&transport));
+        assert!(tool_successes(&transport).is_empty());
+    }
+
+    #[test]
+    fn worker_request_callback_error_cancel_and_oversize_fail_closed() {
+        let arguments = worker_arguments("submit_worker_request");
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let (error, transport) =
+            assert_worker_failure(messages, &mut |_| Err("bad\nsecret".to_string()), &|| false);
+        assert_eq!(
+            error,
+            AppServerError::Remote {
+                phase: "worker request",
+                message: "badsecret".to_string(),
+            }
+        );
+        assert!(tool_successes(&transport).is_empty());
+
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let reads = Arc::new(AtomicUsize::new(0));
+        let mut transport = FakeTransport::from_values(messages);
+        let threshold = transport.incoming.len();
+        transport.reads = Some(Arc::clone(&reads));
+        let seen_reads = Arc::clone(&reads);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let error = run_app_server_turn_with_worker_requests(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("cancel before callback"),
+            Some(&mut move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            }),
+            move || seen_reads.load(Ordering::SeqCst) >= threshold,
+        )
+        .expect_err("cancel before callback");
+        assert_eq!(
+            error,
+            AppServerError::Cancelled {
+                phase: "worker request"
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(sent_interrupt(&transport));
+        assert!(tool_successes(&transport).is_empty());
+
+        let armed = Arc::new(AtomicBool::new(false));
+        let flag = Arc::clone(&armed);
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let callback_calls = Arc::clone(&calls);
+        let (error, transport) = assert_worker_failure(
+            messages,
+            &mut move |_| {
+                callback_calls.fetch_add(1, Ordering::SeqCst);
+                flag.store(true, Ordering::SeqCst);
+                Ok(json!({"ok": true}))
+            },
+            &move || armed.load(Ordering::SeqCst),
+        );
+        assert_eq!(
+            error,
+            AppServerError::Cancelled {
+                phase: "worker request"
+            }
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert!(tool_successes(&transport).is_empty());
+
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+        ]);
+        let (error, transport) = assert_worker_failure(
+            messages,
+            &mut |_| Ok(Value::String("x".repeat(WORKER_REQUEST_RESULT_MAX_BYTES))),
+            &|| false,
+        );
+        assert!(matches!(
+            error,
+            AppServerError::Malformed { message, .. } if message.contains("oversized")
+        ));
+        assert!(tool_successes(&transport).is_empty());
+    }
+
+    #[test]
+    fn dynamic_tool_completion_requires_the_serviced_result() {
+        let arguments = worker_arguments("worker_request_status");
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_completed("call-1", &arguments, "{\"forged\":true}"),
+            turn_completed_message(),
+        ]);
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&calls);
+        let (error, transport) = assert_worker_failure(
+            messages,
+            &mut move |_| {
+                seen.fetch_add(1, Ordering::SeqCst);
+                Ok(json!({"forged": true}))
+            },
+            &|| false,
+        );
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { message, .. } if message.contains("without a serviced")
+        ));
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert!(tool_successes(&transport).is_empty());
+
+        let mut messages = base_messages();
+        messages.extend([
+            dynamic_tool_started("call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_call(json!("rpc-1"), "call-1", WORKER_REQUEST_TOOL, &arguments),
+            dynamic_tool_completed("call-1", &arguments, "{\"forged\":true}"),
+        ]);
+        let (error, transport) =
+            assert_worker_failure(messages, &mut |_| Ok(json!({"state": "ready"})), &|| false);
+        assert!(matches!(
+            error,
+            AppServerError::Unexpected { message, .. } if message.contains("did not match")
+        ));
+        assert_eq!(tool_successes(&transport).len(), 1);
+        assert!(sent_interrupt(&transport));
     }
 }

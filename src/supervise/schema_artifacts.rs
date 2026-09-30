@@ -127,6 +127,233 @@ pub(super) fn write_parent_continuation_schemas(
     write_schema(writer, &codex_relative, codex)
 }
 
+const CANONICAL_WORKER_REQUEST_ID_PATTERN: &str = "^r[1-9][0-9]{0,8}$";
+
+fn require_managed_parent_initial_shape(
+    run_id: &str,
+    parent: &OrchestratorAssignment,
+    attempt: usize,
+) -> Result<()> {
+    if run_id.is_empty() {
+        bail!("managed parent initial yield requires a nonempty run_id");
+    }
+    if parent.role != AgentRole::ChildOrchestrator
+        || parent.phase != AssignmentPhase::Execution
+        || parent.effective_role_category() != RoleCategory::DelegatingCoordinator
+    {
+        bail!(
+            "assignment '{}' is not an execution-phase delegating child orchestrator",
+            parent.id
+        );
+    }
+    if parent.worker_assignments.is_empty() {
+        bail!(
+            "assignment '{}' has no authored worker_assignments to yield",
+            parent.id
+        );
+    }
+    if attempt == 0 {
+        bail!(
+            "assignment '{}' parent_attempt must be greater than 0",
+            parent.id
+        );
+    }
+    let mut seen = std::collections::BTreeSet::new();
+    for worker in &parent.worker_assignments {
+        if worker.id.is_empty() || !seen.insert(worker.id.as_str()) {
+            bail!(
+                "assignment '{}' managed parent yield requires unique nonempty worker ids",
+                parent.id
+            );
+        }
+    }
+    Ok(())
+}
+
+/// Flat initial yield wire. Equality with this schema is not acceptance;
+/// the live authenticated inbox remains the authority.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn parent_initial_yield_schema_value(
+    run_id: &str,
+    parent: &OrchestratorAssignment,
+    attempt: usize,
+) -> Result<serde_json::Value> {
+    require_managed_parent_initial_shape(run_id, parent, attempt)?;
+    let worker_ids = parent
+        .worker_assignments
+        .iter()
+        .map(|worker| worker.id.as_str())
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "ParentInitialYield",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["version", "outcome", "run_id", "parent_id", "parent_attempt", "requests"],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "outcome": {"type": "string", "const": "yield_workers"},
+            "run_id": {"type": "string", "const": run_id},
+            "parent_id": {"type": "string", "const": parent.id},
+            "parent_attempt": {"type": "integer", "const": attempt},
+            "requests": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": parent.worker_assignments.len(),
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["request_id", "worker_id"],
+                    "properties": {
+                        "request_id": {
+                            "type": "string",
+                            "minLength": 2,
+                            "maxLength": 10,
+                            "pattern": CANONICAL_WORKER_REQUEST_ID_PATTERN
+                        },
+                        "worker_id": {"type": "string", "enum": worker_ids}
+                    }
+                }
+            }
+        }
+    }))
+}
+
+#[allow(dead_code)]
+pub(super) fn write_parent_initial_yield_schemas(
+    writer: &mut ArtifactRunWriter,
+    relative: &Path,
+    run_id: &str,
+    parent: &OrchestratorAssignment,
+    attempt: usize,
+) -> Result<()> {
+    let schema = parent_initial_yield_schema_value(run_id, parent, attempt)?;
+    let mut codex = schema.clone();
+    make_codex_response_format_compatible(&mut codex)?;
+    validate_codex_response_format_schema(&codex)?;
+    let codex_relative = relative.with_file_name(format!(
+        "{}.codex-output.schema.json",
+        relative
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".schema.json"))
+            .context("invalid parent initial yield schema filename")?
+    ));
+    write_schema(writer, relative, schema)?;
+    write_schema(writer, &codex_relative, codex)
+}
+
+#[cfg(test)]
+mod parent_initial_yield_schema_tests {
+    use super::*;
+
+    fn delegating_parent(worker_ids: &[&str]) -> OrchestratorAssignment {
+        OrchestratorAssignment {
+            id: "parent-yield".to_string(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("src/supervise/schema_artifacts.rs")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("schedule authored workers".to_string()),
+            worker_assignments: worker_ids
+                .iter()
+                .map(|id| WorkerAssignment {
+                    id: (*id).to_string(),
+                    role: AgentRole::Worker,
+                    role_category: None,
+                    selection_source: None,
+                    assigned_paths: vec![PathBuf::from("src/supervise/schema_artifacts.rs")],
+                    semantic_symbols: Vec::new(),
+                    semantic_modules: Vec::new(),
+                    task: Some(format!("task for {id}")),
+                    environment_requirements: Vec::new(),
+                    report_path: None,
+                })
+                .collect(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: None,
+            decision_refs: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn parent_initial_yield_schema_is_closed_and_codex_projected() -> Result<()> {
+        let parent = delegating_parent(&["worker-a", "worker-b"]);
+        assert_eq!(parent.role_category, None);
+        assert_eq!(
+            parent.effective_role_category(),
+            RoleCategory::DelegatingCoordinator
+        );
+        let schema = parent_initial_yield_schema_value("run-1", &parent, 2)?;
+        assert_eq!(schema["type"], json!("object"));
+        assert_eq!(schema["additionalProperties"], json!(false));
+        assert_eq!(
+            schema["required"],
+            json!([
+                "version",
+                "outcome",
+                "run_id",
+                "parent_id",
+                "parent_attempt",
+                "requests"
+            ])
+        );
+        assert_eq!(schema["properties"]["version"]["const"], json!(1));
+        assert_eq!(
+            schema["properties"]["outcome"]["const"],
+            json!("yield_workers")
+        );
+        assert_eq!(schema["properties"]["run_id"]["const"], json!("run-1"));
+        assert_eq!(
+            schema["properties"]["parent_id"]["const"],
+            json!("parent-yield")
+        );
+        assert_eq!(schema["properties"]["parent_attempt"]["const"], json!(2));
+        assert_eq!(schema["properties"]["requests"]["minItems"], json!(1));
+        assert_eq!(schema["properties"]["requests"]["maxItems"], json!(2));
+        let request = &schema["properties"]["requests"]["items"];
+        assert_eq!(request["additionalProperties"], json!(false));
+        assert_eq!(request["required"], json!(["request_id", "worker_id"]));
+        assert_eq!(
+            request["properties"]["request_id"]["pattern"],
+            json!(CANONICAL_WORKER_REQUEST_ID_PATTERN)
+        );
+        assert_eq!(
+            request["properties"]["worker_id"]["enum"],
+            json!(["worker-a", "worker-b"])
+        );
+        let mut codex = schema.clone();
+        make_codex_response_format_compatible(&mut codex)?;
+        validate_codex_response_format_schema(&codex)?;
+        assert_eq!(
+            codex["properties"]["requests"]["items"]["properties"]["worker_id"]["enum"],
+            json!(["worker-a", "worker-b"])
+        );
+        assert_eq!(
+            codex["properties"]["outcome"]["const"],
+            json!("yield_workers")
+        );
+        assert!(codex
+            .get("properties")
+            .and_then(|properties| properties.get("report"))
+            .is_none());
+        assert!(parent_initial_yield_schema_value("", &parent, 2).is_err());
+        assert!(parent_initial_yield_schema_value("run-1", &parent, 0).is_err());
+        let mut empty = parent.clone();
+        empty.worker_assignments.clear();
+        assert!(parent_initial_yield_schema_value("run-1", &empty, 2).is_err());
+        let mut incompatible = parent.clone();
+        incompatible.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        assert!(parent_initial_yield_schema_value("run-1", &incompatible, 2).is_err());
+        Ok(())
+    }
+}
+
 pub(super) fn write_worktree_writable_admission_schema(
     writer: &mut ArtifactRunWriter,
     relative: &Path,
