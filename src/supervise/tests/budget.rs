@@ -384,12 +384,21 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
 
 #[test]
 fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_launch() {
+    assert_unpriced_dispatch_refused("unpriced-model");
+}
+
+#[test]
+fn pricing_guard_placeholder_refuses_before_runner_invocation() {
+    assert_unpriced_dispatch_refused("gpt-5.6-sol");
+}
+
+fn assert_unpriced_dispatch_refused(model: &str) {
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
     let selection = RoleModelSelection {
-        model: Some("unpriced-model".to_string()),
+        model: Some(model.to_string()),
         reasoning_effort: None,
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     };
@@ -1423,7 +1432,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve uncertain-start dispatch")
@@ -1480,7 +1489,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve unverified containment dispatch")
@@ -1520,7 +1529,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("later admission result"),
@@ -1550,7 +1559,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
         &command,
     )
     .expect("reserve truncated-capture dispatch")
@@ -1597,7 +1606,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("later admission result"),
@@ -1883,7 +1892,7 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
             &plan,
             &budget,
             &ledger,
-            AgentRole::ChildOrchestrator,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
             &command,
         )
         .expect("reserve large-capture dispatch")
@@ -2046,7 +2055,7 @@ fn budget_reliability_uses_bound_adapter_runtime_completion() {
         &plan,
         &budget,
         &ledger,
-        AgentRole::ChildOrchestrator,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Grok),
         &command,
     )
     .expect("reserve adapter dispatch")
@@ -2136,5 +2145,242 @@ fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
             run_budget.limits.hard_tokens, expected,
             "{name} effective hard token ceiling"
         );
+    }
+}
+
+#[test]
+fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runtimes() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    for runtime in [
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna", "fake", "unknown-model"] {
+            // A model label never confers Fake launch authority.
+            assert!(pricing_for_runtime(&plan, model, runtime).is_none());
+        }
+    }
+    assert!(pricing_for_runtime(&plan, "unknown-model", SupervisorRuntime::Fake).is_none());
+}
+
+#[test]
+fn pricing_guard_reservation_runtime_cannot_drift_from_fake_to_real() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("gpt-5.6-sol".to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Fake),
+        &command,
+    )
+    .expect("Fake admission")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+    };
+    assert_eq!(ledger.report().unwrap().reserved.cost_usd, Some(0.0));
+    assert!(reservation
+        .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+        .is_err());
+    assert!(matches!(
+        reservation.state,
+        DispatchBudgetReservationState::Reserved(SupervisorRuntime::Fake)
+    ));
+    drop(reservation);
+    let report = ledger.report().unwrap();
+    assert_eq!(report.active_reservations, 0);
+    assert_eq!(report.consumed.tokens, 0);
+    assert_eq!(report.reserved.tokens, 0);
+    assert!(report.usage_complete);
+}
+
+#[test]
+fn pricing_guard_token_only_settlement_keeps_unknown_cost_and_complete_tokens() {
+    assert_pricing_guard_settlement(SupervisorRuntime::Codex, None, None);
+}
+
+#[test]
+fn pricing_guard_explicit_zero_and_nonzero_overrides_remain_priced() {
+    for rate in [0.0, 2.0] {
+        assert_pricing_guard_settlement(
+            SupervisorRuntime::Codex,
+            Some(rate),
+            Some(10.0 * rate / 1_000_000.0),
+        );
+    }
+}
+
+#[test]
+fn pricing_guard_fake_placeholder_simulation_remains_usable() {
+    assert_pricing_guard_settlement(SupervisorRuntime::Fake, None, Some(0.0));
+}
+
+fn assert_pricing_guard_settlement(
+    runtime: SupervisorRuntime,
+    rate: Option<f64>,
+    expected_cost: Option<f64>,
+) {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    if let Some(rate) = rate {
+        plan.model_pricing.insert(
+            "gpt-5.6-sol".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: rate,
+                output_usd_per_million_tokens: rate,
+            },
+        );
+        let resolved =
+            crate::llm::provider::resolve_model_pricing(&plan.model_pricing, "gpt-5.6-sol")
+                .unwrap();
+        assert_eq!(
+            resolved.provenance,
+            crate::llm::provider::ModelPricingProvenance::PlanOverride
+        );
+        // The persisted plan retains even an explicit zero override.
+        let persisted: SupervisorPlan =
+            serde_json::from_value(serde_json::to_value(&plan).unwrap()).unwrap();
+        assert_eq!(persisted.model_pricing, plan.model_pricing);
+    }
+    let budget = injected_run_budget(None, Some(100), None, expected_cost.map(|_| 1.0), 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("gpt-5.6-sol".to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, runtime),
+        &command,
+    )
+    .expect("admission")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+    };
+    assert_eq!(
+        ledger.report().unwrap().reserved.cost_usd.is_some(),
+        expected_cost.is_some()
+    );
+    reservation
+        .mark_invoked_for_runtime(runtime)
+        .expect("bound invocation");
+    write_injected_usage(&command, 7, 3);
+    let run = if runtime == SupervisorRuntime::Fake {
+        deterministic_fake_run(&command, Vec::new())
+    } else {
+        injected_verified_run_without_journals(&command)
+    };
+    let settlement = reservation
+        .settle_bound_runtime(&run, &command)
+        .expect("settlement");
+    assert_eq!(settlement.reliability, DispatchUsageReliability::Reliable);
+    let usage = settlement.reliable_usage().expect("complete tokens");
+    assert_eq!(usage.total_tokens, 10);
+    let report = ledger.report().unwrap();
+    assert_eq!(report.consumed.tokens, 10);
+    assert_eq!(report.consumed.cost_usd, expected_cost);
+    assert_eq!(report.roles[0].consumed.cost_usd, expected_cost);
+    assert_eq!(report.active_reservations, 0);
+    assert_eq!(report.reserved.tokens, 0);
+    assert!(report.usage_complete);
+    assert!(report.new_dispatch_allowed);
+    if expected_cost.is_none() {
+        assert!(report.reasons.contains(&BudgetReason::MissingActualCost));
+    }
+    // Settlement is single-use even when the observed cost is unknown or zero.
+    assert!(reservation.settle_bound_runtime(&run, &command).is_err());
+    assert_eq!(ledger.report().unwrap().consumed.tokens, 10);
+    let aggregation = role_usage_report(
+        &plan,
+        vec![RoleUsageSample {
+            runtime,
+            role: AgentRole::ChildOrchestrator,
+            lens_id: None,
+            model: command.model.clone(),
+            usage,
+        }],
+    )
+    .expect("role cost report");
+    assert_eq!(aggregation.total_usage, Some(usage));
+    assert_eq!(aggregation.total_cost_usd, expected_cost);
+    assert_eq!(
+        aggregation.reports[&AgentRole::ChildOrchestrator].cost_usd,
+        expected_cost
+    );
+    assert_eq!(
+        aggregation.reports[&AgentRole::Supervisor].cost_usd,
+        expected_cost
+    );
+}
+
+#[test]
+fn pricing_guard_real_usage_prevents_fake_zero_from_masking_unknown_role_and_lens_cost() {
+    let plan = injected_plan(injected_assignment(false), 0);
+    let usage = Usage {
+        input_tokens: 7,
+        output_tokens: 3,
+        total_tokens: 10,
+    };
+    let mut samples = vec![RoleUsageSample {
+        runtime: SupervisorRuntime::Fake,
+        role: AgentRole::Auditor,
+        lens_id: Some(plan.review_lenses[0].id.clone()),
+        model: Some("fake".to_string()),
+        usage,
+    }];
+    for role in [
+        AgentRole::Researcher,
+        AgentRole::Worker,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Auditor,
+    ] {
+        samples.push(RoleUsageSample {
+            runtime: SupervisorRuntime::Codex,
+            role,
+            lens_id: (role == AgentRole::Auditor).then(|| plan.review_lenses[0].id.clone()),
+            model: Some("fake".to_string()),
+            usage,
+        });
+    }
+    let report = role_usage_report(&plan, samples).expect("aggregate mixed runtime samples");
+    assert_eq!(report.total_usage.unwrap().total_tokens, 50);
+    assert!(report.total_cost_usd.is_none());
+    assert!(report.lens_total_cost_usd.is_none());
+    assert!(report
+        .lens_reports
+        .iter()
+        .all(|lens| lens.cost_usd.is_none()));
+    for role in [
+        AgentRole::Researcher,
+        AgentRole::Worker,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Auditor,
+        AgentRole::Supervisor,
+    ] {
+        assert!(report.reports[&role].cost_usd.is_none());
+        assert!(report.reports[&role].usage.is_some());
     }
 }

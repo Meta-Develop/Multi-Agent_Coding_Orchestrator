@@ -2053,8 +2053,8 @@ pub(super) fn role_usage_report(
             .model
             .as_ref()
             .and_then(|model| {
-                crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model)
-                    .map(|resolved| resolved.pricing.cost_usd(sample.usage))
+                pricing_for_runtime(plan, model, sample.runtime)
+                    .map(|pricing| pricing.cost_usd(sample.usage))
             })
             .filter(|cost| cost.is_finite());
         if let Some(lens_id) = sample.lens_id.as_deref() {

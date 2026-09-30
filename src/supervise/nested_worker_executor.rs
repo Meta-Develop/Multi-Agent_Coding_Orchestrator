@@ -422,7 +422,7 @@ pub(super) fn execute_nested_worker_attempt(
             &budget_plan,
             context.budget_config,
             context.budget_ledger,
-            AgentRole::Worker,
+            (AgentRole::Worker, runtime),
             &command,
         )? {
             DispatchBudgetAdmission::Admitted(reservation) => reservation,
@@ -531,6 +531,7 @@ pub(super) fn execute_nested_worker_attempt(
         let settlement = settlement?;
         if let Some(usage) = settlement.reliable_usage() {
             outcome.usage_samples.push(RoleUsageSample {
+                runtime,
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: command.model.clone(),
