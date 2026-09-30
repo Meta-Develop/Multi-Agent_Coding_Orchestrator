@@ -1368,24 +1368,7 @@ fn worktree_local_bounded_status_runtime_root(worktree: &Path) -> Result<PathBuf
             worktree.display()
         )
     })?;
-    let common_dir = repository.commondir();
-    let common_ancestor = worktree
-        .ancestors()
-        .find(|ancestor| common_dir.starts_with(ancestor))
-        .context(
-            "worktree and Git common directory have no common ancestor for bounded-status runtime root",
-        )?;
-    let outside_worktree = if common_ancestor == worktree {
-        common_ancestor
-            .parent()
-            .context("worktree common ancestor has no parent for bounded-status runtime root")?
-    } else {
-        common_ancestor
-    };
-    let anchor = outside_worktree
-        .ancestors()
-        .find(|ancestor| ancestor.to_str().is_some())
-        .context("worktree has no UTF-8 ancestor for its private status alias")?;
+    let anchor = bounded_status_runtime_anchor(worktree, repository.commondir())?;
     let binding = stable_checksum(worktree.as_os_str().as_bytes());
     let directory_name = if cfg!(test) {
         format!(".maco-test-worktree-status-{binding}")
@@ -1396,6 +1379,29 @@ fn worktree_local_bounded_status_runtime_root(worktree: &Path) -> Result<PathBuf
         )
     };
     Ok(anchor.join(directory_name))
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn bounded_status_runtime_anchor<'a>(worktree: &'a Path, common_dir: &Path) -> Result<&'a Path> {
+    let common_ancestor = worktree
+        .ancestors()
+        .find(|ancestor| common_dir.starts_with(ancestor))
+        .context(
+            "worktree and Git common directory have no common ancestor for bounded-status runtime root",
+        )?;
+    let embedded_primary = common_dir.file_name() == Some(OsStr::new(".git"))
+        && common_dir.parent() == Some(common_ancestor);
+    let outside_worktree = if common_ancestor == worktree || embedded_primary {
+        common_ancestor
+            .parent()
+            .context("worktree common ancestor has no parent for bounded-status runtime root")?
+    } else {
+        common_ancestor
+    };
+    outside_worktree
+        .ancestors()
+        .find(|ancestor| ancestor.to_str().is_some())
+        .context("worktree has no UTF-8 ancestor for its private status alias")
 }
 
 #[cfg(target_os = "linux")]

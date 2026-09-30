@@ -424,6 +424,7 @@ fn default_exclude_managed_creation_is_invisible_to_plain_git_and_index_add_all(
     WorktreeManager::init_repository(&repo_path, "main").unwrap();
     let repo = crate::git_repository::open(&repo_path).unwrap();
     commit_readme(&repo).unwrap();
+    fs::create_dir(repo_path.join(".maco")).unwrap();
     commit_descendant(&repo, ".maco/operator.txt", "operator baseline\n").unwrap();
     let prior = b"# operator rules\r\noperator-ignored\r\n";
     let exclude = repo.commondir().join("info/exclude");
@@ -825,6 +826,32 @@ fn bounded_status_parsers_are_lossless_and_fail_closed() {
         vec![PathBuf::from("README.md"), PathBuf::from("src/lib.rs")]
     );
     assert!(parse_nul_paths(b"../escape\0", 2).is_err());
+}
+
+#[test]
+fn bounded_status_runtime_anchor_keeps_embedded_child_cache_outside_primary() {
+    let primary = Path::new("workspace/primary");
+    let common = primary.join(".git");
+    let child = primary.join(".maco/worktrees/primary/agent-a");
+    let anchor = bounded_status_runtime_anchor(&child, &common).unwrap();
+    assert_eq!(anchor, primary.parent().unwrap());
+    assert!(!anchor.starts_with(primary));
+    assert!(!anchor.starts_with(&child));
+    assert_eq!(
+        bounded_status_runtime_anchor(primary, &common).unwrap(),
+        primary.parent().unwrap()
+    );
+
+    let external_child = Path::new("workspace/lanes/agent-a");
+    assert_eq!(
+        bounded_status_runtime_anchor(external_child, &common).unwrap(),
+        Path::new("workspace")
+    );
+    assert_eq!(
+        bounded_status_runtime_anchor(&child, &primary.join("shared.git")).unwrap(),
+        primary,
+        "other common-directory layouts retain their existing anchor"
+    );
 }
 
 #[cfg(target_os = "linux")]

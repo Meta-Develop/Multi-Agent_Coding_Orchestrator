@@ -1641,7 +1641,10 @@ fn primary_snapshot_allows_managed_default_creation_and_still_detects_primary_ed
     commit_injected_repository(&repo_path, "track runtime file");
     fs::write(repo_path.join(".gitignore"), "ignored.txt\n").expect("ignore ordinary primary file");
     commit_injected_repository(&repo_path, "track ignore rule");
-    fs::write(repo_path.join("ignored.txt"), "ignored baseline\n").expect("ignored primary file");
+    fs::write(repo_path.join("ignored.txt"), "ignored baseline\n")
+        .expect("primary file matching ignore rule");
+    run_injected_git(&repo_path, &["add", "-f", "ignored.txt"]);
+    commit_injected_repository(&repo_path, "track primary file matching ignore rule");
     run_injected_git(
         &repo_path,
         &["update-index", "--skip-worktree", "README.md"],
