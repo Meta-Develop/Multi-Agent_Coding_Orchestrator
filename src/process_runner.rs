@@ -1734,6 +1734,7 @@ pub struct GeminiOfflineBridgeProfile {
 }
 
 impl GeminiOfflineBridgeProfile {
+    #[cfg(test)]
     pub(crate) fn new(workspace: &Path, control: &Path, profile: &Path) -> Self {
         Self {
             config: WorkspaceSandboxConfig::new(workspace, WorkspaceAccess::ReadOnly)
@@ -1744,6 +1745,7 @@ impl GeminiOfflineBridgeProfile {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_hidden_root(root);
         self

@@ -363,6 +363,18 @@ impl ExternalAgentCommand {
     fn verified_live_token_grant(
         &self,
     ) -> Result<Option<&crate::supervise_budget::LiveTokenGrant>, String> {
+        let grant = self.bound_live_token_grant()?;
+        if grant.is_some_and(|grant| grant.stopped()) {
+            return Err("live token grant was stopped or released".to_string());
+        }
+        Ok(grant)
+    }
+
+    // Post-quiescence evidence can compare the original launch binding after
+    // settlement. This does not authorize another physical request/release.
+    fn bound_live_token_grant(
+        &self,
+    ) -> Result<Option<&crate::supervise_budget::LiveTokenGrant>, String> {
         let Some(bound) = &self.live_token_grant else {
             return Ok(None);
         };
@@ -382,9 +394,6 @@ impl ExternalAgentCommand {
             || bound.hidden_roots != self.hidden_roots
         {
             return Err("live token grant launch binding changed".to_string());
-        }
-        if bound.grant.stopped() {
-            return Err("live token grant was stopped or released".to_string());
         }
         Ok(Some(&bound.grant))
     }
@@ -1757,6 +1766,14 @@ impl ExternalAgentCommand {
         self
     }
 
+    pub(crate) fn with_gemini_run_account_binding(
+        mut self,
+        binding: Option<FrozenGeminiSelectedBinding>,
+    ) -> Self {
+        self.gemini_run_account_binding = binding;
+        self
+    }
+
     #[cfg(test)]
     pub(crate) fn cam_authority_socket_pin(&self) -> Option<&str> {
         self.cam_authority_socket_pin.as_deref()
@@ -2751,6 +2768,14 @@ fn assignment_process_launch_kind_allowed_for_invocation(
         }
         AssignmentProcessLaunchKind::ConsultClaude => {
             matches!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant)
+        }
+        AssignmentProcessLaunchKind::ConsultGemini => {
+            spec.uses_gemini_bridge()
+                && spec.workspace_access == WorkspaceAccess::ReadOnly
+                && spec
+                    .agent_lifecycle
+                    .as_ref()
+                    .is_some_and(|identity| identity.role == "researcher")
         }
         AssignmentProcessLaunchKind::InboxIndependentAuditor => matches!(
             spec.invocation,

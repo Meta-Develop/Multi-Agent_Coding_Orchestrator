@@ -193,7 +193,10 @@ fn direct_assignment_report_is_valid(
     match role {
         AgentRole::ChildOrchestrator => Ok(read_child_report(contents, display_path).is_ok()),
         AgentRole::Worker => Ok(read_worker_report(contents, display_path).is_ok()),
-        AgentRole::Researcher => Ok(read_researcher_report(contents, display_path).is_ok()),
+        // Shape probing does not grant acceptance; the final runtime-specific
+        // consumer verifies either Codex command custody or Gemini native custody.
+        AgentRole::Researcher => Ok(read_researcher_report(contents, display_path).is_ok()
+            || read_researcher_native_report(contents, display_path).is_ok()),
         unsupported => bail!(
             "assignment role '{}' has no direct report parser contract",
             unsupported.as_str()
@@ -581,15 +584,25 @@ fn bind_selected_runtime_launch(
 ) -> Result<BoundSelectedRuntimeLaunch> {
     if assignment.role == AgentRole::Researcher {
         validate_researcher_assignment(assignment)?;
-        if launch_runtime != SupervisorRuntime::Codex {
-            bail!("researcher requires the Codex strict Linux read-only runtime");
+        if !matches!(
+            launch_runtime,
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+        ) {
+            bail!("researcher requires a supported strict Linux read-only runtime");
         }
     }
     let configured = effective_role_model_selection(plan, assignment.role);
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
     let model_provenance =
         CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
-    if launch_runtime.is_adapter_subprocess() {
+    let gemini_read_only = launch_runtime == SupervisorRuntime::GeminiCli
+        && matches!(
+            assignment.role,
+            AgentRole::Researcher | AgentRole::Auditor | AgentRole::GateClassifier
+        )
+        && assignment.effective_role_category().is_read_only()
+        && assignment.worker_assignments.is_empty();
+    if launch_runtime.is_adapter_subprocess() && !gemini_read_only {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
@@ -610,6 +623,9 @@ fn bind_selected_runtime_launch(
         );
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
+    if gemini_read_only {
+        command = command.with_workspace_access(WorkspaceAccess::ReadOnly);
+    }
     if launch_runtime.is_adapter_subprocess() {
         command.program = selected_runtime_program(launch_runtime, options)?;
         command = command.with_runtime_adapter(
@@ -2200,7 +2216,14 @@ fn prepare_child_attempt<'a>(
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
     command = if assignment.role == AgentRole::Researcher {
         configure_researcher_command(command, launch_runtime)?
-    } else if evidence_only_reaudit.is_some() || continuation.is_some() {
+    } else if evidence_only_reaudit.is_some()
+        || continuation.is_some()
+        || (launch_runtime == SupervisorRuntime::GeminiCli
+            && matches!(
+                assignment.role,
+                AgentRole::Auditor | AgentRole::GateClassifier
+            ))
+    {
         configure_read_only_auditor_command(command)?
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
@@ -2334,15 +2357,6 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
-    if command.uses_live_app_server_budget()
-        || (launch_runtime == SupervisorRuntime::GeminiCli && command.uses_gemini_bridge())
-    {
-        command.bind_live_token_grant(
-            budget_reservation
-                .ledger
-                .live_token_grant(budget_reservation.reservation.id)?,
-        );
-    }
     let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
@@ -2999,6 +3013,14 @@ fn dispatch_and_capture_child_attempt<'a>(
                 return Err(error);
             }
         }
+    }
+    if let Err(error) = bind_final_dispatch_live_budget(&mut command, &budget_reservation) {
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        with_supervisor_artifacts(artifacts, |writer, _| {
+            discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+        })?;
+        return Err(error);
     }
     let external_run_result = match launch_runtime {
         SupervisorRuntime::Codex => {
@@ -4251,6 +4273,11 @@ fn prepare_parent_auditor<'a>(
         },
         lens_index,
     )?;
+    let auditor_prompt = if launch_runtime == SupervisorRuntime::GeminiCli {
+        auditor_prompt + "\nThe selected runtime is managed Gemini with native ReadFile only. Use the complete parent-supplied review packet. Shell, WriteFile, Edit, delegation and ambient repository discovery are unavailable. Return commands_run=[]; validation_results may state review conclusions with command=[] only. MACO validates native custody and the selected personal authority independently.\n"
+    } else {
+        auditor_prompt
+    };
     measurements.record_final_launch_prompt_bytes(&auditor_prompt)?;
     let auditor_prompt_relative = dirs.relative(&auditor_prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&auditor_prompt_relative);
@@ -4495,6 +4522,27 @@ struct ParentAuditorDispatchFrame<'a> {
 
 // A grant authenticates the exact launch, including the final duration. Parent
 // validation may shorten that duration after preparation; bind only afterward.
+fn bind_final_dispatch_live_budget(
+    command: &mut ExternalAgentCommand,
+    reservation: &DispatchBudgetReservation<'_>,
+) -> Result<()> {
+    if (reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget())
+        || (reservation.state
+            == DispatchBudgetReservationState::Reserved(SupervisorRuntime::GeminiCli)
+            && command.uses_gemini_bridge())
+    {
+        let grant = reservation
+            .ledger
+            .live_token_grant(reservation.reservation.id)?;
+        if grant.as_ref().is_some_and(|grant| grant.stopped()) {
+            bail!("final dispatch live token grant was stopped or released");
+        }
+        command.bind_live_token_grant(grant);
+    }
+    Ok(())
+}
+
 fn finalize_parent_auditor_budget(
     command: &mut ExternalAgentCommand,
     reservation: &DispatchBudgetReservation<'_>,
@@ -4507,19 +4555,7 @@ fn finalize_parent_auditor_budget(
             .timeout
             .min(authority.admit(auditor_id, cancellation)?);
     }
-    if (reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
-        && command.uses_live_app_server_budget())
-        || (reservation.state
-            == DispatchBudgetReservationState::Reserved(SupervisorRuntime::GeminiCli)
-            && command.uses_gemini_bridge())
-    {
-        command.bind_live_token_grant(
-            reservation
-                .ledger
-                .live_token_grant(reservation.reservation.id)?,
-        );
-    }
-    Ok(())
+    bind_final_dispatch_live_budget(command, reservation)
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -6296,7 +6332,23 @@ mod decomposition_tests {
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
-    fn verify_prepared_researcher_messaging_prompt(with_source_inputs: bool) -> Result<()> {
+    fn verify_prepared_researcher_messaging_prompt(
+        with_source_inputs: bool,
+        dispatch_case: Option<&str>,
+    ) -> Result<()> {
+        let runtime = if dispatch_case.is_some_and(|case| case != "codex") {
+            SupervisorRuntime::GeminiCli
+        } else {
+            SupervisorRuntime::Codex
+        };
+        let _model_overlay = if runtime == SupervisorRuntime::GeminiCli {
+            Some(install_test_fixture_models(&[(
+                "gemini-read-only-live-binding-fixture",
+                ModelCapabilityClass::GeneralJudgment,
+            )])?)
+        } else {
+            None
+        };
         let temp = tempfile::tempdir()?;
         let repo = temp.path().join("repo");
         Repository::init(&repo)?;
@@ -6319,6 +6371,15 @@ mod decomposition_tests {
                 "task": "Inspect README.md. No writes or delegation."
             }]
         });
+        if dispatch_case.is_some() {
+            plan_value["child_timeout_seconds"] = json!(300);
+        }
+        if runtime == SupervisorRuntime::GeminiCli {
+            plan_value["assignments"][0]["runtime"] = json!("gemini-cli");
+            plan_value["role_models"]["researcher"]["model"] =
+                json!("gemini-read-only-live-binding-fixture");
+            plan_value["role_models"]["researcher"]["reasoning_effort"] = json!(null);
+        }
         if with_source_inputs {
             plan_value["assignments"][0]["source_inputs"] = serde_json::json!([{
                 "path": "README.md",
@@ -6332,10 +6393,10 @@ mod decomposition_tests {
         let options = SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: temp.path().join("plan.json"),
-            run_id: RunId::new("researcher-prompt-order")?,
+            run_id: RunId::new("researcher-prompt-order-run")?,
             parent_node: None,
             codex_bin: PathBuf::from("unused-codex"),
-            runtime: SupervisorRuntime::Codex,
+            runtime,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
@@ -6371,9 +6432,41 @@ mod decomposition_tests {
         let sync_store = SyncStore::open(&repo)?;
         let semantic_store = SemanticIntentStore::open(&repo)?;
         let field_guide = SupervisorFieldGuidePrompt::empty()?;
-        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
-        let runtime_model_catalog =
-            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: dispatch_case.map(|_| 220_000),
+            ..Default::default()
+        })?;
+        let mut assignment_metadata = loaded.assignment_metadata.clone();
+        if dispatch_case.is_some() {
+            let authority_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                RunId::new("ordinary-read-only-deadline")?,
+                "test",
+            )?));
+            assignment_metadata.parent_validation = Some(held_out::ParentValidationAuthority::new(
+                held_out::HeldOutRunBinding {
+                    manifest_sha256: "a".repeat(64),
+                    profile_sha256: "b".repeat(64),
+                    profile_id: "profile".into(),
+                    repetition: 0,
+                    experiment_run_id: "ordinary-read-only-deadline".into(),
+                    supervisor_run_id: options.run_id.as_str().into(),
+                    assignment_id: assignment.id.clone(),
+                    baseline_head: "c".repeat(40),
+                    baseline_tree: "d".repeat(40),
+                },
+                Vec::new(),
+                Instant::now() + Duration::from_secs(180),
+                1,
+                authority_writer,
+            ));
+        }
+        let runtime_model_catalog = if runtime == SupervisorRuntime::GeminiCli {
+            RuntimeModelCatalog::OperatorDeclared
+        } else {
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?)
+        };
         let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id, None);
         assert!(
             journal.is_some(),
@@ -6386,7 +6479,38 @@ mod decomposition_tests {
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
         });
-        let runner = unused_external_runner;
+        let runner_calls = std::sync::atomic::AtomicUsize::new(0);
+        let original_grant = Mutex::new(None);
+        let runner = |command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            assert!(dispatch_case.is_some());
+            runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(command.assignment_messaging_launch().is_some());
+            assert!(
+                command.timeout > Duration::ZERO && command.timeout <= Duration::from_secs(180)
+            );
+            assert_eq!(
+                command.live_token_grant_for_test(),
+                original_grant.lock().unwrap().as_ref()
+            );
+            assert_eq!(
+                command.live_token_grant_for_test().unwrap().tokens(),
+                220_000
+            );
+            // Exercise the real runner's first immutable-binding refusal. Never
+            // produce provider success or enter auth/executable/child setup.
+            let mut changed = command.clone();
+            changed.timeout += Duration::from_secs(1);
+            let rejected = run_external_agent_nonpublishable_simulation(&changed);
+            assert!(rejected
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("live token grant launch binding changed"));
+            assert!(!rejected.stdout.target_launch_attempted);
+            rejected
+        };
         let context = AssignmentExecutionContext {
             index: 0,
             concurrent_mode: false,
@@ -6395,7 +6519,7 @@ mod decomposition_tests {
             execution_target: None,
             budget_config: &budget_config,
             consultant: &loaded.consultant,
-            assignment_metadata: &loaded.assignment_metadata,
+            assignment_metadata: &assignment_metadata,
             assignment,
             evidence_only_reaudit: None,
             options: &options,
@@ -6485,6 +6609,52 @@ mod decomposition_tests {
         let measurements: PromptMeasurementsArtifact =
             serde_json::from_slice(&fs::read(measurements_path)?)?;
         assert_eq!(measurements.prompts[0].full_bytes, before_binding.len());
+        if let Some(case) = dispatch_case {
+            assert_eq!(prepared.command.timeout, Duration::from_secs(300));
+            assert!(prepared.command.live_token_grant_for_test().is_none());
+            let grant = budget_ledger
+                .live_token_grant(prepared.budget_reservation.reservation.id)?
+                .context("original fixture reservation must have a live hard grant")?;
+            *original_grant.lock().unwrap() = Some(grant.clone());
+            if case == "stopped" {
+                grant.exhaust();
+            } else if case == "released" {
+                budget_ledger.release(prepared.budget_reservation.reservation.id)?;
+            }
+            let dispatched = dispatch_and_capture_child_attempt(
+                &context,
+                &mut outcome,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                prepared,
+            );
+            if matches!(case, "stopped" | "released") {
+                assert!(dispatched.is_err());
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                let captured = dispatched?;
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(captured
+                    .external_run
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("live token grant launch binding changed"));
+                assert!(!captured.external_run.publishable);
+                drop(captured);
+            }
+            assert_eq!(
+                assignment_metadata
+                    .parent_validation
+                    .as_ref()
+                    .unwrap()
+                    .dispatches()?,
+                1
+            );
+            assert_eq!(budget_ledger.report()?.active_reservations, 0);
+            return Ok(());
+        }
         // Use the production binder and its strict EOF verifier, not a rendered
         // imitation. Stop before dispatch: no external process or provider runs.
         let _server = bind_assignment_messaging_for_external_child_launch(
@@ -6502,13 +6672,23 @@ mod decomposition_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
-        verify_prepared_researcher_messaging_prompt(true)
+        verify_prepared_researcher_messaging_prompt(true, None)
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn prepared_researcher_without_source_inputs_preserves_messaging_appendix() -> Result<()> {
-        verify_prepared_researcher_messaging_prompt(false)
+        verify_prepared_researcher_messaging_prompt(false, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_read_only_dispatch_final_grant_survives_parent_timeout_and_refuses_stop_release_mutation(
+    ) -> Result<()> {
+        for case in ["codex", "gemini", "stopped", "released"] {
+            verify_prepared_researcher_messaging_prompt(false, Some(case))?;
+        }
+        Ok(())
     }
 
     fn initialize_child_dispatch_messaging_session(

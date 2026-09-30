@@ -988,7 +988,7 @@ impl SupervisorCatalogCodexPreflightGrant {
 /// Distinct from `CatalogPreflightOrigin`. Catalog grants cannot bind these
 /// worker, auditor, consult, or merge-arbiter argv surfaces. Inbox
 /// independent-auditor is a sibling kind, not a parent-auditor alias. Consult
-/// Codex and consult Claude are sibling kinds with kind-scoped trusted program
+/// Codex, consult Claude and consult Gemini are sibling kinds with kind-scoped trusted program
 /// spellings. MergeArbiter is a sibling kind for a merge-shaped CodexSupervisor
 /// command and is not a consult, Inbox, parent-auditor, or assignment-child
 /// alias.
@@ -999,6 +999,7 @@ pub(crate) enum AssignmentProcessLaunchKind {
     InboxIndependentAuditor,
     ConsultCodex,
     ConsultClaude,
+    ConsultGemini,
     MergeArbiter,
 }
 
@@ -1006,8 +1007,8 @@ impl AssignmentProcessLaunchKind {
     /// Trusted basename spelling admitted for this kind.
     ///
     /// Child, parent-auditor, Inbox independent-auditor, consult-Codex, and
-    /// merge-arbiter remain `codex`. Consult-Claude is `claude` only for that
-    /// kind.
+    /// merge-arbiter remain `codex`. Consult-Claude is `claude` and
+    /// Consult-Gemini is `gemini` only for their respective kinds.
     pub(crate) const fn trusted_program_spelling(self) -> &'static str {
         match self {
             Self::AssignmentChild
@@ -1016,6 +1017,7 @@ impl AssignmentProcessLaunchKind {
             | Self::ConsultCodex
             | Self::MergeArbiter => TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM,
             Self::ConsultClaude => TRUSTED_CONSULT_CLAUDE_PROGRAM,
+            Self::ConsultGemini => "gemini",
         }
     }
 }
@@ -1825,6 +1827,26 @@ pub(crate) fn admit_consult_claude_process_intent(
         subject,
         attempt,
         AssignmentProcessLaunchKind::ConsultClaude,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
+/// Gemini-only consultant intent; no other caller kind acquires this spelling.
+pub(crate) fn admit_consult_gemini_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::ConsultGemini,
         expected_program,
         model,
         duty,

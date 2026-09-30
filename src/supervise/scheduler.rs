@@ -4139,12 +4139,7 @@ fn account_observation_for_launch_runtime(
                     Some(observed.observation)
                 }
                 None => {
-                    record_observed_managed_selection(
-                        run_id,
-                        provider_id,
-                        None,
-                        None,
-                    );
+                    record_observed_managed_selection(run_id, provider_id, None, None);
                     None
                 }
             });

@@ -1194,8 +1194,11 @@ fn normalize_optional_model_field(value: Option<String>, field: &str) -> Result<
 }
 
 pub(super) fn validate_consultant_plan(consultant: &SupervisorConsultantPlan) -> Result<()> {
-    if !matches!(consultant.runtime.as_str(), "fake" | "codex" | "claude") {
-        bail!("consultant.runtime must be one of: fake, codex, claude");
+    if !matches!(
+        consultant.runtime.as_str(),
+        "fake" | "codex" | "claude" | "gemini"
+    ) {
+        bail!("consultant.runtime must be one of: fake, codex, claude, gemini");
     }
     if consultant.enabled && consultant.max_consultations == 0 {
         bail!("consultant.max_consultations must be greater than zero when consultant is enabled");
