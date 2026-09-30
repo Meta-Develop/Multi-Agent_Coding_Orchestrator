@@ -236,8 +236,8 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
     Ok(format!(
         r#"- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
-- If the parent supplies a bound MACO `supervise journal-append` operation, use that exact executable, journal path and precreated --device/--inode binding. Pass the original command argv after `--`, with the complete apply_patch payload as one argument, and each changed path with `--changed-path`. Never hand-escape JSON with printf/echo, discover a replacement identity, use PATH to select another appender, or repair a failed append. Report WorkerExecutionJournalRecordError and stop on failure. The appender is record transport, not an action to recursively journal.
-- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
+- If bound: exact MACO exe/journal/precreated dev/inode; original argv after --; full apply_patch one arg; --changed-path each. No hand JSON/new identity/PATH/repair; don't journal helper.
+- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Append error, empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths: WorkerExecutionJournalRecordError; stop. No prose/Markdown.
 - WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
 - Preserve the full apply_patch record:
 {apply_patch_journal_example}"#
