@@ -1021,7 +1021,11 @@ Default linked worktrees are created inside the repository at the stable path
 `.maco/worktrees/<sanitized-repo-name>/<agent-id>`. This keeps generated lanes and
 their Cargo config in the existing runtime-owned area without exempting manual
 `.worktrees` content from primary integrity checks. An explicit `--worktree-root`
-still overrides the root.
+still overrides the root. Implicit default creation registers only
+`/.maco/worktrees/<sanitized-repo-name>/` in checkout-local Git `info/exclude`
+before creating lanes. Conflicting operator negations and unadmitted local Git
+config indirection are refused without changing the exclude file. Explicit
+`--worktree-root` paths remain caller-controlled and receive no automatic ignore.
 Existing lanes are not moved or migrated: to keep creating lanes in the old
 layout, pass `--worktree-root ../.maco/worktrees/<repo-name>` with the original
 sanitized repository group name. Pass that same root to GC or lifecycle commands

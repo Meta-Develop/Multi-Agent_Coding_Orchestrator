@@ -125,6 +125,563 @@ fn default_worktree_root_preserves_explicit_overrides() {
 }
 
 #[test]
+fn default_exclude_append_preserves_bytes_newlines_and_idempotence() {
+    let rule = "/.maco/worktrees/repo/";
+    for (prior, expected) in [
+        (b"".as_slice(), b"/.maco/worktrees/repo/\n".as_slice()),
+        (
+            b"# operator\nkeep\n",
+            b"# operator\nkeep\n/.maco/worktrees/repo/\n",
+        ),
+        (
+            b"# operator\r\nkeep",
+            b"# operator\r\nkeep\r\n/.maco/worktrees/repo/\r\n",
+        ),
+        (b"keep", b"keep\n/.maco/worktrees/repo/\n"),
+    ] {
+        let next =
+            append_default_worktree_exclude(prior, rule).expect("append bounded literal rule");
+        assert_eq!(next, expected);
+        assert!(next.starts_with(prior));
+        assert_eq!(append_default_worktree_exclude(&next, rule).unwrap(), next);
+    }
+    assert!(append_default_worktree_exclude(b"\xff", rule).is_err());
+    assert!(append_default_worktree_exclude(b"keep\0", rule).is_err());
+    assert!(append_default_worktree_exclude(
+        &vec![b'a'; MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize],
+        rule
+    )
+    .is_err());
+}
+
+#[test]
+fn default_exclude_rule_is_literal_and_only_matches_selected_group() {
+    let temp = TempDir::new().unwrap();
+    assert_eq!(sanitize_path_segment("repo+[x]*?!name"), "repo__x____name");
+    let repo = Repository::init(temp.path().join("repo+[x]!name")).unwrap();
+    let rule = default_worktree_exclude_rule(&repo).unwrap();
+    assert_eq!(rule, "/.maco/worktrees/repo__x__name/");
+    repo.add_ignore_rule(&format!("{rule}\n")).unwrap();
+    assert!(repo
+        .status_should_ignore(Path::new(".maco/worktrees/repo__x__name/lane/README.md"))
+        .unwrap());
+    for path in [
+        ".maco/operator.txt",
+        ".maco/worktrees/other/lane/README.md",
+        ".worktrees/manual/README.md",
+        "README.md",
+    ] {
+        assert!(
+            !repo.status_should_ignore(Path::new(path)).unwrap(),
+            "unexpected exclusion: {path}"
+        );
+    }
+}
+
+#[test]
+fn default_exclude_matching_negations_are_not_overridden() {
+    let temp = TempDir::new().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    let rule = "/.maco/worktrees/repo/";
+    for prior in [
+        "!/.maco/worktrees/repo/\n",
+        "!/.maco/worktrees/*/\r\n",
+        "!repo/\n",
+        "!/.maco/worktrees/repo/\n/.maco/worktrees/repo/\n",
+    ] {
+        assert!(
+            reject_default_exclude_negations(
+                &repo,
+                prior.as_bytes(),
+                rule,
+                Instant::now() + WORKTREE_GC_STATUS_TIMEOUT
+            )
+            .is_err(),
+            "negation admitted: {prior}"
+        );
+    }
+    reject_default_exclude_negations(
+        &repo,
+        b"# !repo/\n!elsewhere/\n\\!literal\n",
+        rule,
+        Instant::now() + WORKTREE_GC_STATUS_TIMEOUT,
+    )
+    .unwrap();
+}
+
+#[test]
+fn default_exclude_local_config_admits_only_literal_policy_values() {
+    let common = b"[core]\nignorecase = \"ON\" # comment\n[remote \"origin#name\"]\nurl = https://example.test/repo\n[extensions]\nworktreeConfig = true\n";
+    assert!(admitted_default_exclude_ignorecase(common, None).unwrap());
+    assert!(
+        !admitted_default_exclude_ignorecase(common, Some(b"[core]\nignoreCase = false\n"))
+            .unwrap()
+    );
+    assert!(!admitted_default_exclude_ignorecase(b"[core]\nbare = false\n", None).unwrap());
+    assert!(admitted_default_exclude_ignorecase(b"[core]\nignorecase\n", None).unwrap());
+}
+
+#[test]
+fn default_exclude_local_config_refuses_indirection_and_ambiguous_syntax() {
+    for unsafe_config in [
+        "[include]\npath = outside\n",
+        "[includeIf \"gitdir:../*\"]\npath = outside\n",
+        "[IncludeIf.onbranch:main]\npath = outside\n",
+        "[include \"quoted\"]\npath = outside\n",
+        "[\"include\"]\npath = outside\n",
+        "[core]\nExcludesFile = \"outside\"\n",
+        "[core \"excludesFile\"]\npath = outside\n",
+        "[core]\nexcludesFile = \\\n outside\n",
+        "[co\\\nre]\nexcludesFile = outside\n",
+        "[core]\nignorecase = true\nignorecase = false\n",
+        "[core]\nignorecase = \"true\n",
+    ] {
+        assert!(
+            admitted_default_exclude_ignorecase(unsafe_config.as_bytes(), None).is_err(),
+            "common config admitted: {unsafe_config}"
+        );
+        assert!(
+            admitted_default_exclude_ignorecase(
+                b"[extensions]\nworktreeConfig = true\n",
+                Some(unsafe_config.as_bytes())
+            )
+            .is_err(),
+            "worktree config admitted: {unsafe_config}"
+        );
+    }
+    assert!(admitted_default_exclude_ignorecase(
+        b"[core]\nignorecase = false\n",
+        Some(b"[core]\nignorecase = true\n")
+    )
+    .is_err());
+}
+
+#[test]
+fn default_exclude_expired_deadline_refuses_patterns_and_budget_recount() {
+    let temp = TempDir::new().unwrap();
+    let repo = Repository::init(temp.path()).unwrap();
+    let expired = Instant::now() - Duration::from_secs(1);
+    let rule = "/.maco/worktrees/repo/";
+    assert!(reject_default_exclude_negations(&repo, b"!elsewhere/\n", rule, expired).is_err());
+    assert!(default_exclude_negation_probe(b"!elsewhere/\n", rule, expired).is_err());
+    assert!(ensure_default_exclude_budget(0, expired).is_err());
+    assert!(ensure_default_exclude_budget(
+        MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES + 1,
+        Instant::now() + Duration::from_secs(1)
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_config_indirection_refuses_before_exclude_write() {
+    for variant in 0..3 {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        let config_path = repo.commondir().join("config");
+        let mut bytes = fs::read(&config_path).unwrap();
+        if variant == 1 {
+            bytes.extend_from_slice(b"\n[extensions]\nworktreeConfig = true\n");
+            fs::write(&config_path, bytes).unwrap();
+            fs::write(
+                repo.commondir().join("config.worktree"),
+                b"[includeIf \"onbranch:*\"]\npath = never-authorized\n",
+            )
+            .unwrap();
+        } else if variant == 0 {
+            bytes.extend_from_slice(b"\n[core]\nexcludesFile = never-authorized\n");
+            fs::write(&config_path, bytes).unwrap();
+        } else {
+            // A libgit2 reopen would fail on this target before our refusal.
+            fs::write(repo.commondir().join("unadmitted-config"), b"[invalid\n").unwrap();
+            bytes.extend_from_slice(b"\n[include]\npath = unadmitted-config\n");
+            fs::write(&config_path, bytes).unwrap();
+        }
+        let exclude = repo.commondir().join("info/exclude");
+        let before = fs::read(&exclude).unwrap();
+        let error = ensure_default_worktree_exclude(&repo, &store, &lock).unwrap_err();
+        assert!(format!("{error:#}").contains("indirection"), "{error:#}");
+        assert_eq!(fs::read(&exclude).unwrap(), before);
+        assert!(!default_worktree_root(&repo).exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_post_git_closing_fence_rejects_binding_races() {
+    for changed in [
+        ".git/config",
+        ".git/config.worktree",
+        ".git/info",
+        ".git/objects",
+        ".maco",
+        ".gitignore",
+        ".maco/.gitignore",
+        ".maco/worktrees/.gitignore",
+        ".git/.maco/managed_worktrees.lock",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        fs::create_dir_all(repo_path.join(".maco/worktrees")).unwrap();
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        let lock_path = store.state_root.path().join("managed_worktrees.lock");
+        fs::write(repo.commondir().join("unadmitted-config"), b"[invalid\n").unwrap();
+        let config_race = changed == ".git/config";
+        let changed = changed.to_string();
+        DEFAULT_EXCLUDE_AFTER_GIT_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(move |primary| {
+                let path = if changed.ends_with("managed_worktrees.lock") {
+                    lock_path
+                } else {
+                    primary.join(&changed)
+                };
+                if path.is_dir() {
+                    fs::rename(&path, path.with_extension("operator-held")).unwrap();
+                    fs::create_dir(&path).unwrap();
+                } else {
+                    if path.exists() {
+                        fs::rename(&path, path.with_extension("operator-held")).unwrap();
+                    }
+                    fs::create_dir_all(path.parent().unwrap()).unwrap();
+                    let bytes: &[u8] = if changed == ".git/config" {
+                        b"[include]\npath = unadmitted-config\n"
+                    } else {
+                        b"# operator race\n"
+                    };
+                    fs::write(&path, bytes).unwrap();
+                }
+            }));
+        });
+        let error = ensure_default_worktree_exclude(&repo, &store, &lock).unwrap_err();
+        if config_race {
+            assert!(
+                !format!("{error:#}").contains("failed to reopen"),
+                "changed config was reopened before its generation check: {error:#}"
+            );
+        }
+        assert!(!default_worktree_root(&repo).exists());
+    }
+}
+
+#[test]
+fn default_exclude_gitignore_can_defeat_common_exclude() {
+    let temp = TempDir::new().unwrap();
+    let workdir = temp.path().join("repo");
+    fs::create_dir(&workdir).unwrap();
+    fs::create_dir_all(workdir.join(".maco/worktrees/repo")).unwrap();
+    let preview = Repository::init(temp.path().join("preview")).unwrap();
+    fs::write(
+        preview.commondir().join("info/exclude"),
+        "/.maco/worktrees/repo/\n",
+    )
+    .unwrap();
+    preview.set_workdir(&workdir, false).unwrap();
+    assert!(preview
+        .status_should_ignore(Path::new(".maco/worktrees/repo/"))
+        .unwrap());
+    fs::write(workdir.join(".gitignore"), "!/.maco/worktrees/repo/\n").unwrap();
+    let status = std::process::Command::new("git")
+        .arg("--git-dir")
+        .arg(preview.commondir())
+        .arg("--work-tree")
+        .arg(&workdir)
+        .args([
+            "check-ignore",
+            "--no-index",
+            "--quiet",
+            "--",
+            ".maco/worktrees/repo/",
+        ])
+        .status()
+        .unwrap();
+    assert_eq!(
+        status.code(),
+        Some(1),
+        "native Git must honor the .gitignore negation"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_managed_creation_is_invisible_to_plain_git_and_index_add_all() {
+    skip_without_containment!();
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").unwrap();
+    let repo = crate::git_repository::open(&repo_path).unwrap();
+    commit_readme(&repo).unwrap();
+    commit_descendant(&repo, ".maco/operator.txt", "operator baseline\n").unwrap();
+    let prior = b"# operator rules\r\noperator-ignored\r\n";
+    let exclude = repo.commondir().join("info/exclude");
+    fs::write(&exclude, prior).unwrap();
+    let manager = WorktreeManager::new(&repo_path);
+    let options = |agent: &str, root| WorktreeCreateOptions {
+        agent_id: agent.into(),
+        branch: None,
+        base: None,
+        worktree_root: root,
+    };
+    let first = manager
+        .create(options("default-a", None))
+        .expect("real default creation");
+    assert_eq!(first.path.parent().unwrap(), default_worktree_root(&repo));
+    let once = fs::read(&exclude).unwrap();
+    assert!(once.starts_with(prior));
+    assert_eq!(
+        once,
+        append_default_worktree_exclude(prior, "/.maco/worktrees/repo/").unwrap()
+    );
+    manager
+        .create(options("default-b", None))
+        .expect("second default creation");
+    assert_eq!(fs::read(&exclude).unwrap(), once);
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "{}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+    assert!(
+        status.stdout.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&status.stdout)
+    );
+    let mut index = repo.index().unwrap();
+    index
+        .add_all(["*"], git2::IndexAddOption::DEFAULT, None)
+        .expect("nested default Git lanes must not reach add_all");
+    index.write().unwrap();
+    assert!(!index
+        .iter()
+        .any(|entry| entry.path.starts_with(b".maco/worktrees/")));
+    let manual = repo_path.join(".worktrees");
+    manager
+        .create(options("manual", Some(manual)))
+        .expect("explicit manual root");
+    assert_eq!(
+        fs::read(&exclude).unwrap(),
+        once,
+        "explicit root must not update exclude"
+    );
+    fs::write(repo_path.join("README.md"), "indexed operator edit\n").unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    fs::write(repo_path.join(".maco/operator.txt"), "working tree edit\n").unwrap();
+    fs::write(
+        repo_path.join(".maco/operator-new.txt"),
+        "untracked operator edit\n",
+    )
+    .unwrap();
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .unwrap();
+    assert!(status.status.success());
+    let visible = String::from_utf8(status.stdout).unwrap();
+    for expected in [
+        "M  README.md",
+        " M .maco/operator.txt",
+        "?? .maco/operator-new.txt",
+        ".worktrees/manual/",
+    ] {
+        assert!(visible.contains(expected), "missing {expected}: {visible}");
+    }
+    assert!(!visible.contains(".maco/worktrees/repo/"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_unsafe_inputs_and_operator_conflicts_fail_before_root_creation() {
+    for kind in [
+        "symlink",
+        "hardlink",
+        "directory",
+        "utf8",
+        "oversize",
+        "negation",
+        "gitignore",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let exclude = repo.commondir().join("info/exclude");
+        let sentinel = temp.path().join("operator-sentinel");
+        fs::write(&sentinel, "operator bytes\n").unwrap();
+        fs::remove_file(&exclude).unwrap();
+        match kind {
+            "symlink" => std::os::unix::fs::symlink(&sentinel, &exclude).unwrap(),
+            "hardlink" => fs::hard_link(&sentinel, &exclude).unwrap(),
+            "directory" => fs::create_dir(&exclude).unwrap(),
+            "utf8" => fs::write(&exclude, b"\xff").unwrap(),
+            "oversize" => fs::write(
+                &exclude,
+                vec![b'a'; MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize],
+            )
+            .unwrap(),
+            "negation" => fs::write(&exclude, "!/.maco/worktrees/repo/\n").unwrap(),
+            "gitignore" => {
+                fs::write(&exclude, "# operator\n").unwrap();
+                commit_descendant(&repo, ".gitignore", "!/.maco/worktrees/repo/\n").unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(&exclude).ok();
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        assert!(
+            ensure_default_worktree_exclude(&repo, &store, &lock).is_err(),
+            "unsafe case admitted: {kind}"
+        );
+        assert_eq!(fs::read(&exclude).ok(), before, "exclude changed: {kind}");
+        assert_eq!(fs::read(&sentinel).unwrap(), b"operator bytes\n");
+        assert!(!default_worktree_root(&repo).exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_fence_preserves_concurrent_operator_edit_and_absence() {
+    for absent in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let exclude = repo.commondir().join("info/exclude");
+        if absent {
+            fs::remove_file(&exclude).unwrap();
+        }
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        DEFAULT_EXCLUDE_BEFORE_WRITE_HOOK.with(|slot| {
+            *slot.borrow_mut() = Some(Box::new(|path| {
+                fs::write(path, "concurrent operator edit\n").unwrap();
+            }));
+        });
+        assert!(ensure_default_worktree_exclude(&repo, &store, &lock).is_err());
+        assert_eq!(fs::read(&exclude).unwrap(), b"concurrent operator edit\n");
+        assert!(!default_worktree_root(&repo).exists());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_root_and_ignore_ancestor_links_do_not_mutate_operator_exclude() {
+    for linked in [
+        ".maco",
+        ".maco/worktrees",
+        ".maco/worktrees/repo",
+        ".maco/.gitignore",
+    ] {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let outside = temp.path().join("operator-owned");
+        fs::create_dir(&outside).unwrap();
+        let target = repo_path.join(linked);
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::os::unix::fs::symlink(&outside, &target).unwrap();
+        let exclude = repo.commondir().join("info/exclude");
+        let prior = fs::read(&exclude).unwrap();
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        assert!(
+            ensure_default_worktree_exclude(&repo, &store, &lock).is_err(),
+            "link admitted: {linked}"
+        );
+        assert_eq!(fs::read(&exclude).unwrap(), prior);
+        assert_eq!(fs::read_dir(&outside).unwrap().count(), 0);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_preserves_modes_and_missing_file_is_created_idempotently() {
+    for absent in [false, true] {
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let exclude = repo.commondir().join("info/exclude");
+        let info = exclude.parent().unwrap();
+        let info_mode = fs::metadata(info).unwrap().permissions().mode();
+        if absent {
+            fs::remove_file(&exclude).unwrap();
+        } else {
+            fs::set_permissions(&exclude, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+        let lock = store.lock().unwrap();
+        ensure_default_worktree_exclude(&repo, &store, &lock).unwrap();
+        let installed =
+            RegularFileBindingGuard::bind(&exclude, MAX_WORKTREE_GIT_TEXT_FILE_BYTES).unwrap();
+        assert_eq!(
+            fs::metadata(&exclude).unwrap().permissions().mode() & 0o777,
+            if absent { 0o600 } else { 0o640 }
+        );
+        assert_eq!(fs::metadata(info).unwrap().permissions().mode(), info_mode);
+        ensure_default_worktree_exclude(&repo, &store, &lock).unwrap();
+        installed
+            .verify()
+            .expect("idempotence preserves the installed inode/generation");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn default_exclude_prospective_bytes_count_toward_aggregate_limit() {
+    let temp = TempDir::new().unwrap();
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").unwrap();
+    let repo = crate::git_repository::open(&repo_path).unwrap();
+    commit_readme(&repo).unwrap();
+    let config_len = fs::read(repo.commondir().join("config")).unwrap().len() * 2;
+    let per_file = MAX_WORKTREE_GIT_TEXT_FILE_BYTES as usize;
+    let capacity = MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES as usize;
+    let mut remaining = capacity - config_len - 1;
+    for n in 0..16 {
+        let dir = repo_path.join(format!("ignore-{n}"));
+        fs::create_dir(&dir).unwrap();
+        let len = remaining.min(per_file);
+        fs::write(dir.join(".gitignore"), vec![b'#'; len]).unwrap();
+        remaining -= len;
+    }
+    assert_eq!(remaining, 0);
+    let exclude = repo.commondir().join("info/exclude");
+    fs::write(&exclude, b"\n").unwrap();
+    let store = ManagedWorktreeRegistryStore::open(&repo).unwrap();
+    let lock = store.lock().unwrap();
+    let error = ensure_default_worktree_exclude(&repo, &store, &lock).unwrap_err();
+    assert!(
+        format!("{error:#}").contains("aggregate byte limit"),
+        "{error:#}"
+    );
+    assert_eq!(fs::read(&exclude).unwrap(), b"\n");
+    assert!(!default_worktree_root(&repo).exists());
+}
+
+#[test]
 fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() {
     let temp = TempDir::new().expect("tempdir");
     let repo_path = temp.path().join("repo+name");
