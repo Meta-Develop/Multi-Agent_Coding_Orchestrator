@@ -446,11 +446,11 @@ test("explicit OAuth refresh requires separate admission and never exports its t
       assert.equal(options.fetchImplementation, undefined);
       return { status: 200, data: body(JSON.stringify({ access_token: "never-export-secret", token_type: "Bearer", expires_in: 3600 })) };
     }, () => {}, { oauthRefresh: true });
-    const pending = unit.request("unary", () => transport({
+    const pending = transport({
       url: "https://oauth2.googleapis.com/token", method: "POST",
       data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret",
       adapter: () => assert.fail("hidden adapter"), fetchImplementation: () => assert.fail("hidden fetch"),
-    }));
+    });
     if (allowed) assert.equal((await pending).data.access_token, "never-export-secret");
     else await assert.rejects(pending);
     assert.equal(sends, allowed ? 1 : 0);
@@ -461,20 +461,128 @@ test("explicit OAuth refresh requires separate admission and never exports its t
   }
 });
 
+test("each admitted startup and account endpoint has its own exact physical request class", async () => {
+  const events = []; let sends = 0;
+  const unit = createCodeAssistWireUnit({ parent: {
+    admit: async (event) => { events.push(event); return true; },
+    record: async (event) => { events.push(event); return true; },
+  } });
+  const transport = unit.wrapTransport(async () => {
+    sends++;
+    return { status: 200, data: body("{}") };
+  });
+  const cases = [
+    ["oauth_token_info", "https://oauth2.googleapis.com/tokeninfo", "POST"],
+    ["setup_user", "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist", "POST"],
+    ["setup_user", "https://cloudcode-pa.googleapis.com/v1internal:onboardUser", "POST"],
+    ["setup_user", "https://cloudcode-pa.googleapis.com/v1internal/operations/operation-1", "GET"],
+    ["experiments", "https://cloudcode-pa.googleapis.com/v1internal:listExperiments", "POST"],
+    ["quota", "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", "POST"],
+    ["admin_control", "https://cloudcode-pa.googleapis.com/v1internal:fetchAdminControls", "POST"],
+  ];
+  for (const [requestClass, url, method] of cases) {
+    await unit.request("unary", () => transport({ url, method }), undefined, requestClass);
+  }
+  assert.equal(sends, cases.length);
+  assert.deepEqual(unit.snapshot().attempts.map((attempt) => attempt.requestClass),
+    cases.map(([requestClass]) => requestClass));
+  for (let index = 0; index < cases.length; index++) {
+    const attempt = index + 1;
+    assert.deepEqual(events.filter((event) => event.attemptId === attempt)
+      .map((event) => event.kind), ["admission", "release", "terminal"]);
+  }
+  assert.ok(unit.snapshot().attempts.every((attempt) => attempt.usageLowerBound === null
+    && attempt.actualEffort === null && attempt.cost === null && attempt.qualified === false));
+});
+
+test("concurrent startup requests wait for the prior terminal ACK", async () => {
+  const events = []; let sends = 0; let sawQuotaTerminal; let acknowledgeQuotaTerminal;
+  const quotaTerminalSeen = new Promise((resolve) => { sawQuotaTerminal = resolve; });
+  const quotaTerminalAck = new Promise((resolve) => { acknowledgeQuotaTerminal = resolve; });
+  const unit = createCodeAssistWireUnit({ parent: {
+    admit: async (event) => { events.push(event); return true; },
+    record: async (event) => {
+      events.push(event);
+      if (event.kind === "terminal" && event.requestClass === "quota") {
+        sawQuotaTerminal();
+        return quotaTerminalAck;
+      }
+      return true;
+    },
+  } });
+  const transport = unit.wrapTransport(async () => {
+    sends++;
+    return { status: 200, data: body("{}") };
+  });
+  const quota = unit.request("unary", () => transport({
+    url: "https://cloudcode-pa.googleapis.com/v1internal:retrieveUserQuota", method: "POST",
+  }), undefined, "quota");
+  const experiments = unit.request("unary", () => transport({
+    url: "https://cloudcode-pa.googleapis.com/v1internal:listExperiments", method: "POST",
+  }), undefined, "experiments");
+  await quotaTerminalSeen;
+  assert.equal(sends, 1);
+  assert.deepEqual(events.map((event) => [event.kind, event.requestClass]), [
+    ["admission", "quota"], ["release", "quota"], ["terminal", "quota"],
+  ]);
+  acknowledgeQuotaTerminal(true);
+  await Promise.all([quota, experiments]);
+  assert.equal(sends, 2);
+  assert.deepEqual(events.map((event) => [event.kind, event.requestClass]), [
+    ["admission", "quota"], ["release", "quota"], ["terminal", "quota"],
+    ["admission", "experiments"], ["release", "experiments"], ["terminal", "experiments"],
+  ]);
+  assert.deepEqual(unit.snapshot().attempts.map((attempt) => attempt.callId), [1, 2]);
+});
+
+test("token info GET and malformed setup operation paths have no send authority", async () => {
+  for (const options of [
+    { url: "https://oauth2.googleapis.com/tokeninfo", method: "GET" },
+    { url: "https://cloudcode-pa.googleapis.com/v1internal/operations/../escape", method: "GET" },
+    { url: "https://cloudcode-pa.googleapis.com/v1internal:operations/operation-1", method: "POST" },
+  ]) {
+    let sends = 0;
+    const unit = createCodeAssistWireUnit({ parent: { admit: async () => true, record: async () => true } });
+    const transport = unit.wrapTransport(async () => { sends++; });
+    await assert.rejects(transport(options), /unexpected_send/);
+    assert.equal(sends, 0);
+  }
+});
+
+test("personal OAuth userinfo receives a fresh release ACK and bounded JSON custody", async () => {
+  const events = []; let sends = 0;
+  const unit = createCodeAssistWireUnit({ parent: {
+    admit: async (event) => { events.push(event); return true; },
+    record: async (event) => { events.push(event); return true; },
+  } });
+  const guardedFetch = unit.wrapFetch(async () => {
+    sends++;
+    assert.equal(events.at(-1).kind, "release");
+    return { ok: true, status: 200, json: async () => ({ email: "synthetic@example.invalid" }) };
+  });
+  const response = await guardedFetch("https://www.googleapis.com/oauth2/v2/userinfo", {
+    method: "GET", headers: { Authorization: "Bearer synthetic-secret" },
+  });
+  assert.deepEqual(await response.json(), { email: "synthetic@example.invalid" });
+  assert.equal(sends, 1);
+  assert.deepEqual(events.map((event) => event.kind), ["admission", "release", "terminal"]);
+  assert.ok(events.every((event) => event.requestClass === "oauth_userinfo"));
+  assert.doesNotMatch(JSON.stringify(events), /synthetic-secret|synthetic@example/);
+});
+
 test("malformed refresh, duplicate grants and arbitrary non-generation URLs have no send authority", async () => {
   for (const patch of [
     { url: "https://oauth2.googleapis.com/token?copy=1" },
-    { url: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist" },
     { data: "grant_type=refresh_token&grant_type=refresh_token&client_id=owned&client_secret=secret" },
     { data: "grant_type=authorization_code&refresh_token=secret&client_id=owned&client_secret=secret" },
   ]) {
     let sends = 0;
     const unit = createCodeAssistWireUnit({ parent: { admit: async () => true, record: async () => true } });
     const transport = unit.wrapTransport(async () => { sends++; }, () => {}, { oauthRefresh: true });
-    await assert.rejects(unit.request("unary", () => transport({
+    await assert.rejects(transport({
       url: "https://oauth2.googleapis.com/token", method: "POST",
       data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret", ...patch,
-    })));
+    }));
     assert.equal(sends, 0); assert.equal(unit.snapshot().stopped, true);
   }
 });
@@ -486,8 +594,8 @@ test("cancellation interrupts an uncooperative refresh body without claiming qui
   const transport = unit.wrapTransport(async () => ({ status: 200, data: {
     [Symbol.asyncIterator]() { return this; }, next() { started(); return new Promise(() => {}); },
   } }), () => {}, { oauthRefresh: true });
-  const pending = unit.request("unary", () => transport({ url: "https://oauth2.googleapis.com/token", method: "POST",
-    data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret" }));
+  const pending = transport({ url: "https://oauth2.googleapis.com/token", method: "POST",
+    data: "grant_type=refresh_token&refresh_token=secret&client_id=owned&client_secret=secret" });
   await reading; unit.cancel(); await assert.rejects(pending);
   assert.equal(unit.snapshot().activeCalls, 0);
   assert.equal(unit.snapshot().attempts[0].terminal, "transport_error");

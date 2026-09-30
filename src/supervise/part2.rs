@@ -76,7 +76,10 @@ struct BudgetAdmissionTestHookGuard(String);
 #[cfg(test)]
 impl Drop for BudgetAdmissionTestHookGuard {
     fn drop(&mut self) {
-        budget_admission_test_hooks().lock().unwrap().remove(&self.0);
+        budget_admission_test_hooks()
+            .lock()
+            .unwrap()
+            .remove(&self.0);
     }
 }
 
@@ -246,6 +249,43 @@ impl DispatchBudgetReservation<'_> {
         let DispatchBudgetReservationState::Invoked(launch_runtime) = self.state else {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
+        if launch_runtime == SupervisorRuntime::GeminiCli && command.uses_gemini_bridge() {
+            // Whole-invocation/model allocation remains unknown. Only the held
+            // total lower bound reaches the ledger; never manufacture input/
+            // output counters or restore requested-model pricing from reports.
+            let held = run.gemini_bridge_evidence();
+            let reliability = if held.is_some_and(|evidence| evidence.no_release_quiescent)
+                || !external_dispatch_may_have_started(run, launch_runtime)
+            {
+                self.ledger.release(self.reservation.id)?;
+                DispatchUsageReliability::NotStarted
+            } else {
+                let measurement = held.and_then(|evidence| evidence.tokens).map_or(
+                    UsageMeasurement::Missing,
+                    |tokens| UsageMeasurement::Estimated {
+                        tokens,
+                        cost_usd: None,
+                    },
+                );
+                self.ledger.reconcile_for_runtime_if_configured(
+                    self.reservation.id,
+                    measurement,
+                    Some(runtime_name(launch_runtime)),
+                )?;
+                if held.and_then(|evidence| evidence.tokens).is_some() {
+                    DispatchUsageReliability::Estimated
+                } else {
+                    DispatchUsageReliability::Missing
+                }
+            };
+            self.state = DispatchBudgetReservationState::Settled;
+            return Ok(DispatchUsageSettlement {
+                observed_usage: None,
+                reliability,
+                model: None,
+                cost_usd: None,
+            });
+        }
         let usage = complete_external_codex_usage(run, command);
         // One parent-owned allocation feeds both the ledger and every role/lens report.
         // A reroute notice cannot allocate cumulative turn usage between models.

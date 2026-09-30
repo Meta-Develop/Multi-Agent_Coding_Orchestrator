@@ -8,12 +8,16 @@ use serde::{Deserialize, Serialize};
 
 pub(crate) mod authority_socket_config;
 #[cfg(target_os = "linux")]
+pub(crate) mod gemini;
+#[cfg(target_os = "linux")]
 pub(crate) mod grok;
 #[cfg(target_os = "linux")]
 pub(crate) mod socket_client;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) const GROK_CLI_PROVIDER_ID: &str = "grok-cli";
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const GEMINI_CLI_PROVIDER_ID: &str = "gemini-cli";
 
 /// Non-secret selected binding recorded on MACO execution evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -24,6 +28,18 @@ pub(crate) struct ManagedGrokAccountSelectionEvidence {
     pub account_incarnation: String,
     pub selection_revision: u64,
     /// Opaque CAM authority identity. Present whenever the frozen selection captured it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_id: Option<String>,
+}
+
+/// Non-secret Gemini selected binding recorded on MACO execution evidence.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub(crate) struct ManagedGeminiAccountSelectionEvidence {
+    pub provider_id: String,
+    pub account_id: String,
+    pub account_incarnation: String,
+    pub selection_revision: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub authority_id: Option<String>,
 }
@@ -90,6 +106,67 @@ impl FrozenGrokSelectedBinding {
     }
 }
 
+/// Frozen selected Gemini binding admitted for selector observation and launch.
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) struct FrozenGeminiSelectedBinding {
+    pub authority_id: Option<String>,
+    pub provider_id: String,
+    pub account_id: String,
+    pub account_incarnation: String,
+    pub selection_revision: u64,
+}
+
+impl FrozenGeminiSelectedBinding {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn from_selected_binding(
+        authority_id: Option<String>,
+        binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
+    ) -> Self {
+        Self {
+            authority_id,
+            provider_id: binding.provider_id.clone(),
+            account_id: binding.account_id.clone(),
+            account_incarnation: binding.account_incarnation.clone(),
+            selection_revision: binding.selection_revision,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn to_selected_binding(
+        &self,
+    ) -> coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+        coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+            provider_id: self.provider_id.clone(),
+            account_id: self.account_id.clone(),
+            account_incarnation: self.account_incarnation.clone(),
+            selection_revision: self.selection_revision,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn matches_selected_binding(
+        &self,
+        binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
+    ) -> bool {
+        self.provider_id == binding.provider_id
+            && self.account_id == binding.account_id
+            && self.account_incarnation == binding.account_incarnation
+            && self.selection_revision == binding.selection_revision
+    }
+
+    pub(crate) fn matches_selection_evidence(
+        &self,
+        evidence: &ManagedGeminiAccountSelectionEvidence,
+    ) -> bool {
+        evidence.provider_id == self.provider_id
+            && evidence.account_id == self.account_id
+            && evidence.account_incarnation == self.account_incarnation
+            && evidence.selection_revision == self.selection_revision
+            && (self.authority_id.is_none() || evidence.authority_id == self.authority_id)
+    }
+}
+
 #[cfg(test)]
 thread_local! {
     static FROZEN_GROK_SELECTION: std::cell::RefCell<Option<FrozenGrokSelectedBinding>> =
@@ -102,6 +179,8 @@ static FROZEN_GROK_SELECTION: Mutex<Option<FrozenGrokSelectedBinding>> = Mutex::
 /// Production-contract store of admitted Grok bindings keyed by supervisor run id.
 /// Launch must copy this onto the run/launch contract; it is never the launch source of truth.
 static GROK_RUN_ACCOUNT_BINDINGS: Mutex<BTreeMap<String, FrozenGrokSelectedBinding>> =
+    Mutex::new(BTreeMap::new());
+static GEMINI_RUN_ACCOUNT_BINDINGS: Mutex<BTreeMap<String, FrozenGeminiSelectedBinding>> =
     Mutex::new(BTreeMap::new());
 
 /// Record or clear the Grok binding admitted from selector observation for one run.
@@ -120,6 +199,24 @@ pub(crate) fn record_observed_grok_selection(
     freeze_observed_grok_selection(frozen.clone());
     if let Some(run_id) = run_id {
         admit_grok_run_account_binding(run_id, frozen.clone());
+    }
+    frozen
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn record_observed_gemini_selection(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+) -> Option<FrozenGeminiSelectedBinding> {
+    if provider_id != GEMINI_CLI_PROVIDER_ID {
+        return None;
+    }
+    let frozen = binding
+        .map(|binding| FrozenGeminiSelectedBinding::from_selected_binding(authority_id, binding));
+    if let Some(run_id) = run_id {
+        admit_gemini_run_account_binding(run_id, frozen.clone());
     }
     frozen
 }
@@ -154,6 +251,42 @@ pub(crate) fn grok_run_account_binding(run_id: &str) -> Option<FrozenGrokSelecte
         .expect("Grok run account binding lock")
         .get(run_id)
         .cloned()
+}
+
+pub(crate) fn admit_gemini_run_account_binding(
+    run_id: &str,
+    frozen: Option<FrozenGeminiSelectedBinding>,
+) -> Option<FrozenGeminiSelectedBinding> {
+    let mut slots = GEMINI_RUN_ACCOUNT_BINDINGS
+        .lock()
+        .expect("Gemini run account binding lock");
+    match frozen {
+        Some(frozen) => {
+            slots.insert(run_id.to_string(), frozen.clone());
+            Some(frozen)
+        }
+        None => {
+            slots.remove(run_id);
+            None
+        }
+    }
+}
+
+pub(crate) fn gemini_run_account_binding(run_id: &str) -> Option<FrozenGeminiSelectedBinding> {
+    GEMINI_RUN_ACCOUNT_BINDINGS
+        .lock()
+        .expect("Gemini run account binding lock")
+        .get(run_id)
+        .cloned()
+}
+
+pub(crate) fn require_carried_gemini_launch_binding(
+    carried: Option<&FrozenGeminiSelectedBinding>,
+    _cam_socket_configured: bool,
+) -> Result<Option<&FrozenGeminiSelectedBinding>> {
+    Ok(Some(carried.ok_or_else(|| {
+        anyhow!("no frozen Gemini selection binding was carried for this run")
+    })?))
 }
 
 /// Resolve the frozen binding carried on a specific launch contract.
@@ -246,6 +379,16 @@ mod run_binding_tests {
         }
     }
 
+    fn synthetic_gemini_binding(account_id: &str, revision: u64) -> FrozenGeminiSelectedBinding {
+        FrozenGeminiSelectedBinding {
+            authority_id: Some(format!("gemini-auth-{account_id}")),
+            provider_id: GEMINI_CLI_PROVIDER_ID.to_string(),
+            account_id: account_id.to_string(),
+            account_incarnation: format!("gemini-inc-{account_id}"),
+            selection_revision: revision,
+        }
+    }
+
     #[test]
     fn two_run_interleaving_cannot_launch_with_sibling_evidence() {
         const RUN_A: &str = "issue-601-run-a";
@@ -325,5 +468,35 @@ mod run_binding_tests {
         );
         admit_grok_run_account_binding(RUN_B, None);
         freeze_observed_grok_selection(None);
+    }
+
+    #[test]
+    fn gemini_run_binding_is_isolated_and_required_for_socket_launch() {
+        const RUN_A: &str = "gemini-run-a";
+        const RUN_B: &str = "gemini-run-b";
+        let binding_a = synthetic_gemini_binding("account-a", 3);
+        let binding_b = synthetic_gemini_binding("account-b", 4);
+        admit_gemini_run_account_binding(RUN_A, Some(binding_a.clone()));
+        admit_gemini_run_account_binding(RUN_B, Some(binding_b.clone()));
+        assert_eq!(gemini_run_account_binding(RUN_A), Some(binding_a.clone()));
+        assert_eq!(gemini_run_account_binding(RUN_B), Some(binding_b));
+        assert_eq!(
+            require_carried_gemini_launch_binding(Some(&binding_a), true)
+                .expect("socket launch uses this run's binding"),
+            Some(&binding_a)
+        );
+        let missing = require_carried_gemini_launch_binding(None, true)
+            .expect_err("socket launch without this run's binding must refuse");
+        assert!(missing
+            .to_string()
+            .contains("no frozen Gemini selection binding"));
+        let local_missing = require_carried_gemini_launch_binding(None, false)
+            .expect_err("local launch without this run's binding must refuse");
+        assert!(local_missing
+            .to_string()
+            .contains("no frozen Gemini selection binding"));
+        admit_gemini_run_account_binding(RUN_B, None);
+        assert_eq!(gemini_run_account_binding(RUN_A), Some(binding_a));
+        admit_gemini_run_account_binding(RUN_A, None);
     }
 }

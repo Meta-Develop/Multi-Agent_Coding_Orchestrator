@@ -9,6 +9,18 @@ export const CODE_ASSIST_SOURCE = Object.freeze({
 });
 
 const endpoint = "https://cloudcode-pa.googleapis.com/v1internal:";
+const operationEndpoint = "https://cloudcode-pa.googleapis.com/v1internal/";
+function validOperationName(name) {
+  if (typeof name !== "string" || name.length > 512) return false;
+  const segments = name.split("/");
+  return segments.length >= 2 && segments[0] === "operations"
+    && segments.slice(1).every((segment) => segment !== "." && segment !== ".."
+      && /^[A-Za-z0-9._-]+$/.test(segment));
+}
+const requestClasses = new Set([
+  "generation", "oauth_refresh", "oauth_token_info", "oauth_userinfo",
+  "setup_user", "experiments", "quota", "admin_control",
+]);
 const defaults = Object.freeze({
   maxCalls: 64,
   maxAttempts: 128,
@@ -88,6 +100,7 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
   let stopped = false;
   let nextCall = 0;
   let nextAttempt = 0;
+  let physicalTail = Promise.resolve();
 
   function cancel() {
     stopped = true;
@@ -136,11 +149,29 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
     } catch (error) {
       attempt.terminalAck = "failed";
       throw error;
+    } finally {
+      attempt.releasePhysical?.();
+      attempt.releasePhysical = null;
     }
   }
   function releaseCall(call) {
     call.signal?.removeEventListener("abort", call.onAbort);
     calls.delete(call.id);
+  }
+  async function acquirePhysical(call) {
+    active(call);
+    const prior = physicalTail;
+    let release;
+    const complete = new Promise((resolve) => { release = resolve; });
+    physicalTail = prior.then(() => complete);
+    try {
+      await untilAbort(prior, call.controller.signal);
+      active(call);
+      return release;
+    } catch (error) {
+      release();
+      throw error;
+    }
   }
   function readEnvelope(attempt, text) {
     const envelope = parseEnvelope(text);
@@ -331,39 +362,80 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
 
   // Low-level dependency-injection interface for offline tests / a future owned
   // bootstrap. Supplying callbacks here does not authenticate vendor execution.
+  function classifyTransport(options, oauthRefresh) {
+    const refresh = oauthRefresh && options?.url === "https://oauth2.googleapis.com/token"
+      && options.method === "POST" && typeof options.data === "string"
+      && new URLSearchParams(options.data).get("grant_type") === "refresh_token"
+      && [...new URLSearchParams(options.data).keys()].every((key) =>
+        ["grant_type", "refresh_token", "client_id", "client_secret"].includes(key))
+      && options.data.length <= bounds.maxFrameBytes
+      && ["grant_type", "refresh_token", "client_id", "client_secret"].every((key) =>
+        new URLSearchParams(options.data).getAll(key).length === 1
+          && new URLSearchParams(options.data).get(key));
+    if (refresh) return "oauth_refresh";
+    if (options?.url === "https://oauth2.googleapis.com/tokeninfo" && options.method === "POST"
+        && options.data === undefined) {
+      return "oauth_token_info";
+    }
+    if (typeof options?.url === "string" && options.method === "GET"
+        && options.url.startsWith(`${operationEndpoint}operations/`)
+        && validOperationName(options.url.slice(operationEndpoint.length))) {
+      return "setup_user";
+    }
+    if (typeof options?.url !== "string" || options.method !== "POST"
+        || !options.url.startsWith(endpoint)) return null;
+    const method = options.url.slice(endpoint.length);
+    if (["generateContent", "streamGenerateContent"].includes(method)) return "generation";
+    if (["loadCodeAssist", "onboardUser"].includes(method)) return "setup_user";
+    if (method === "listExperiments") return "experiments";
+    if (method === "retrieveUserQuota") return "quota";
+    if (method === "fetchAdminControls") return "admin_control";
+    return null;
+  }
+  async function readBoundedJson(attempt, body) {
+    const chunks = [];
+    const iterator = body?.[Symbol.asyncIterator]?.();
+    if (!iterator) throw fault("json_body_shape");
+    while (true) {
+      const step = await untilAbort(iterator.next(), attempt.call.controller.signal);
+      if (step.done) break;
+      if (!(step.value instanceof Uint8Array)) throw fault("json_body_shape");
+      attempt.bytes += step.value.byteLength;
+      if (attempt.bytes > bounds.maxResponseBytes) throw fault("response_limit");
+      chunks.push(step.value);
+    }
+    const data = parseEnvelope(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+    if (!plain(data)) throw fault("json_response_shape");
+    return data;
+  }
   function wrapTransport(original, verifyShape = () => {}, { oauthRefresh = false, offlineTestFetch } = {}) {
     if (typeof original !== "function") throw fault("transport_shape");
-    return async function (options) {
-      const call = context.getStore();
-      if (!call || !calls.has(call.id)) { cancel(); throw fault("unscoped_send"); }
+    async function dispatch(receiver, options, call, requestClass) {
       active(call);
-      try { verifyShape(this); } catch { cancel(); throw fault("transport_shape_changed"); }
+      try { verifyShape(receiver); } catch { cancel(); throw fault("transport_shape_changed"); }
+      const classified = classifyTransport(options, oauthRefresh);
       const method = call.mode === "unary" ? "generateContent" : "streamGenerateContent";
-      const refresh = oauthRefresh && options?.url === "https://oauth2.googleapis.com/token"
-        && options.method === "POST" && typeof options.data === "string"
-        && new URLSearchParams(options.data).get("grant_type") === "refresh_token"
-        && [...new URLSearchParams(options.data).keys()].every((key) =>
-          ["grant_type", "refresh_token", "client_id", "client_secret"].includes(key))
-        && options.data.length <= bounds.maxFrameBytes
-        && ["grant_type", "refresh_token", "client_id", "client_secret"].every((key) =>
-          new URLSearchParams(options.data).getAll(key).length === 1 && new URLSearchParams(options.data).get(key));
-      if (!refresh && (options?.url !== endpoint + method || options.method !== "POST")) {
+      if (!requestClasses.has(requestClass) || classified !== requestClass
+          || (requestClass === "generation" && options.url !== endpoint + method)) {
         cancel();
         throw fault("unexpected_send");
       }
-      if (++nextAttempt > bounds.maxAttempts) { cancel(); throw fault("attempt_limit"); }
-      const attempt = {
-        id: nextAttempt, call, released: false, terminal: null, terminalAck: null, frames: 0,
-        bytes: 0, usage: null, model: null, lowerBound: null, sawFinish: false,
-        requestClass: refresh ? "oauth_refresh" : "generation",
-      };
-      attempts.set(attempt.id, attempt);
+      const releasePhysical = await acquirePhysical(call);
+      let attempt;
       try {
+        active(call);
+        if (++nextAttempt > bounds.maxAttempts) { cancel(); throw fault("attempt_limit"); }
+        attempt = {
+          id: nextAttempt, call, released: false, terminal: null, terminalAck: null, frames: 0,
+          bytes: 0, usage: null, model: null, lowerBound: null, sawFinish: false,
+          requestClass, releasePhysical,
+        };
+        attempts.set(attempt.id, attempt);
         await acknowledge(parent.admit, { kind: "admission", ...observation(attempt) });
         active(call);
         await acknowledge(parent.record, { kind: "release", ...observation(attempt) });
         active(call);
-        verifyShape(this);
+        verifyShape(receiver);
         // 0.41.2's Gaxios merges defaults. Refuse nonempty defaults/interceptors
         // in the bound adapter and overwrite BOTH retry switches on EVERY send.
         // Redirects could also replay POST below this boundary: refuse those.
@@ -375,35 +447,36 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
           validateStatus: () => true,
         };
         attempt.released = true;
-        const response = await untilAbort(Reflect.apply(original, this, [safe]), call.controller.signal);
+        const response = await untilAbort(Reflect.apply(original, receiver, [safe]), call.controller.signal);
         if (!Number.isInteger(response?.status)) throw fault("status_shape");
         if (response.status < 200 || response.status >= 300) {
           // Never claim a failed HTTP attempt consumed zero. Preserve any
-          // well-formed envelope facts before OAuth sees the error/replays.
-          try { for await (const _ of decode(attempt, response.data)) { /* retained */ } } catch { /* still incomplete */ }
+          // well-formed generation facts before OAuth sees the error/replays.
+          // Non-generation bodies have their own bounded JSON shape and must
+          // never be interpreted as Code Assist generation envelopes.
+          try {
+            if (requestClass === "generation") {
+              for await (const _ of decode(attempt, response.data)) { /* retained */ }
+            } else {
+              await readBoundedJson(attempt, response.data);
+            }
+          } catch { /* still incomplete */ }
           await finish(attempt, "http_error");
           if (response.status !== 401 && response.status !== 403) cancel();
           const error = fault("http_error");
           error.response = { status: response.status, config: { data: options.data } };
           throw error;
         }
-        if (refresh) {
-          const chunks = [];
-          const iterator = response.data?.[Symbol.asyncIterator]?.();
-          if (!iterator) throw fault("refresh_body_shape");
-          while (true) {
-            const step = await untilAbort(iterator.next(), call.controller.signal);
-            if (step.done) break;
-            const chunk = step.value;
-            if (!(chunk instanceof Uint8Array)) throw fault("refresh_body_shape");
-            attempt.bytes += chunk.byteLength;
-            if (attempt.bytes > Math.min(bounds.maxFrameBytes, bounds.maxResponseBytes)) throw fault("refresh_body_limit");
-            chunks.push(chunk);
-          }
-          const data = parseEnvelope(new TextDecoder("utf-8", { fatal: true }).decode(Buffer.concat(chunks)));
+        if (requestClass === "oauth_refresh") {
+          const data = await readBoundedJson(attempt, response.data);
           if (!plain(data) || typeof data.access_token !== "string" || !data.access_token
               || data.token_type !== "Bearer" || !Number.isSafeInteger(data.expires_in)
               || data.expires_in < 1) throw fault("refresh_response_shape");
+          await finish(attempt, "eof");
+          return { ...response, data };
+        }
+        if (requestClass !== "generation") {
+          const data = await readBoundedJson(attempt, response.data);
           await finish(attempt, "eof");
           return { ...response, data };
         }
@@ -413,18 +486,41 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
         await finish(attempt, "eof");
         return { ...response, data: envelope };
       } catch (error) {
+        if (!attempt) {
+          releasePhysical();
+          throw error;
+        }
         if (attempt.terminal === "http_error") throw error; // OAuth may replay, with fresh admission.
         cancel();
         await finish(attempt, attempt.released ? "transport_error" : "not_released");
         throw fault("send_failed");
       }
+    }
+    return async function (options) {
+      const requestClass = classifyTransport(options, oauthRefresh);
+      if (!requestClass) { cancel(); throw fault("unexpected_send"); }
+      const receiver = this;
+      const activeCall = context.getStore();
+      if (activeCall && activeCall.requestClass === requestClass) {
+        return dispatch(receiver, options, activeCall, requestClass);
+      }
+      if (requestClass === "generation") {
+        cancel();
+        throw fault("unscoped_send");
+      }
+      return request("unary", () => {
+        const scoped = context.getStore();
+        if (!scoped) throw fault("unscoped_send");
+        return dispatch(receiver, options, scoped, requestClass);
+      }, options?.signal, requestClass);
     };
   }
-  async function request(mode, invokeClient, signal) {
+  async function executeRequest(mode, invokeClient, signal, requestClass) {
     active();
-    if (!['unary', 'stream'].includes(mode) || typeof invokeClient !== "function") throw fault("call_shape");
+    if (!['unary', 'stream'].includes(mode) || typeof invokeClient !== "function"
+        || !requestClasses.has(requestClass)) throw fault("call_shape");
     if (++nextCall > bounds.maxCalls) { cancel(); throw fault("call_limit"); }
-    const call = { id: nextCall, mode, signal, controller: new AbortController() };
+    const call = { id: nextCall, mode, requestClass, signal, controller: new AbortController() };
     call.onAbort = cancel;
     calls.set(call.id, call);
     signal?.addEventListener("abort", call.onAbort, { once: true });
@@ -447,8 +543,90 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
       throw fault("client_failed");
     }
   }
+  function request(mode, invokeClient, signal, requestClass = "generation") {
+    return executeRequest(mode, invokeClient, signal, requestClass);
+  }
+  function wrapFetch(original) {
+    if (typeof original !== "function") throw fault("fetch_shape");
+    return async function (url, options = {}) {
+      if (url !== "https://www.googleapis.com/oauth2/v2/userinfo"
+          || (options.method !== undefined && options.method !== "GET")
+          || !plain(options) || !plain(options.headers)
+          || Object.keys(options.headers).some((key) => key !== "Authorization")
+          || typeof options.headers.Authorization !== "string"
+          || !options.headers.Authorization.startsWith("Bearer ")) {
+        cancel();
+        throw fault("unexpected_fetch");
+      }
+      return request("unary", async (signal) => {
+        const call = context.getStore();
+        if (!call || !calls.has(call.id)) throw fault("unscoped_send");
+        const releasePhysical = await acquirePhysical(call);
+        let attempt;
+        try {
+          active(call);
+          if (++nextAttempt > bounds.maxAttempts) { cancel(); throw fault("attempt_limit"); }
+          attempt = {
+            id: nextAttempt, call, released: false, terminal: null, terminalAck: null,
+            frames: 0, bytes: 0, usage: null, model: null, lowerBound: null,
+            sawFinish: false, requestClass: "oauth_userinfo", releasePhysical,
+          };
+          attempts.set(attempt.id, attempt);
+          await acknowledge(parent.admit, { kind: "admission", ...observation(attempt) });
+          active(call);
+          await acknowledge(parent.record, { kind: "release", ...observation(attempt) });
+          active(call);
+          attempt.released = true;
+          const response = await untilAbort(original(url, { ...options, signal }), signal);
+          if (typeof response?.ok !== "boolean" || !Number.isInteger(response.status)) {
+            throw fault("fetch_response_shape");
+          }
+          if (!response.ok) {
+            await finish(attempt, "http_error");
+            return response;
+          }
+          const originalJson = response.json?.bind(response);
+          if (!originalJson) throw fault("fetch_response_shape");
+          return new Proxy(response, {
+            get(target, property) {
+              if (property !== "json") {
+                const value = Reflect.get(target, property, target);
+                return typeof value === "function" ? value.bind(target) : value;
+              }
+              return async () => {
+                try {
+                  const data = await untilAbort(originalJson(), signal);
+                  const encoded = JSON.stringify(data);
+                  if (!plain(data) || typeof encoded !== "string"
+                      || Buffer.byteLength(encoded) > bounds.maxFrameBytes) throw fault("userinfo_shape");
+                  const bytes = Buffer.byteLength(encoded);
+                  attempt.frames = 1;
+                  attempt.bytes = bytes;
+                  await finish(attempt, "eof");
+                  return data;
+                } catch {
+                  cancel();
+                  await finish(attempt, attempt.released ? "transport_error" : "not_released");
+                  throw fault("fetch_failed");
+                }
+              };
+            },
+          });
+        } catch (error) {
+          if (!attempt) {
+            releasePhysical();
+            throw error;
+          }
+          if (attempt.terminal === "http_error") return Promise.reject(error);
+          cancel();
+          await finish(attempt, attempt.released ? "transport_error" : "not_released");
+          throw fault("fetch_failed");
+        }
+      }, options.signal, "oauth_userinfo");
+    };
+  }
   return Object.freeze({
-    request, wrapTransport, cancel,
+    request, wrapTransport, wrapFetch, cancel,
     snapshot: () => frozenCopy({ stopped, activeCalls: calls.size, attempts: [...attempts.values()].map(observation) }),
   });
 
@@ -459,6 +637,7 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
 const signatures = {
   post: "ef735987989a799696da99f972af46ee0c5df3322d65bd3194a31d70c315b8c8",
   stream: "b857f6155e9696ab56ebf1be09af67580418e34c153b4842d224c631ded0df62",
+  getOperation: "d1b31e732ded9cb3b9fe58963ec3e070d4b92a9c573136abe3fb1e2801aa8002",
   clientRequest: "73f427b53359b7ea9bfa19ab313b86547e6d94ab2e89568775ecffc1bfaf1b7c",
   requestAsync: "0cd4d0e90e5184ac9259a9170f5a2b52ce027dee3095c3e28326e76cf286af07",
   transportRequest: "7767d83ddd48d3ce012b6768f85f584c8a39613dccf61acfdec4ad5ee6c9d4ae",
@@ -523,7 +702,8 @@ export function bindCodeAssistClient0412(client, unit, sourceBytes, { offlineTes
 
 export function attachCodeAssist0412(server, unit, sourceBytes) {
   if (!(sourceBytes instanceof Uint8Array) || hash(sourceBytes) !== CODE_ASSIST_SOURCE.sha256) throw fault("source_binding");
-  for (const [key, signature] of [["requestPost", "post"], ["requestStreamingPost", "stream"]]) {
+  for (const [key, signature] of [["requestPost", "post"], ["requestStreamingPost", "stream"],
+    ["requestGetOperation", "getOperation"]]) {
     if (!Object.isExtensible(server) || Object.hasOwn(server, key)
         || typeof server[key] !== "function" || hash(Function.prototype.toString.call(server[key])) !== signatures[signature]) {
       throw fault("unsupported_method_shape");
@@ -535,7 +715,36 @@ export function attachCodeAssist0412(server, unit, sourceBytes) {
     if (server.client !== client) throw fault("client_owner_drift");
     binding.verify();
   };
-  function install(key, method, mode) {
+  const postClasses = Object.freeze({
+    generateContent: "generation",
+    loadCodeAssist: "setup_user",
+    onboardUser: "setup_user",
+    listExperiments: "experiments",
+    retrieveUserQuota: "quota",
+    fetchAdminControls: "admin_control",
+  });
+  function installPost() {
+    Object.defineProperty(server, "requestPost", { value: async function (selected, req, signal) {
+      const requestClass = postClasses[selected];
+      if (this !== server || !requestClass || !plain(req) || req.enabled_credit_types !== undefined) {
+        unit.cancel();
+        throw fault("unsupported_call");
+      }
+      try { verify(); } catch { unit.cancel(); throw fault("transport_shape_changed"); }
+      return unit.request("unary", async (ownedSignal) => {
+        const result = await Reflect.apply(client.request, client, [{
+          url: endpoint + selected, method: "POST", responseType: "stream",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(req), signal: ownedSignal, retry: false,
+          retryConfig: { retry: 0, noResponseRetries: 0 },
+        }]);
+        return result.data;
+      }, signal, requestClass);
+    } });
+  }
+  function installGenerationStream() {
+    const key = "requestStreamingPost";
+    const method = "streamGenerateContent";
     Object.defineProperty(server, key, { value: async function (selected, req, signal) {
       if (this !== server || selected !== method || !plain(req)
           || req.enabled_credit_types !== undefined) {
@@ -543,19 +752,37 @@ export function attachCodeAssist0412(server, unit, sourceBytes) {
         throw fault("unsupported_call");
       }
       try { verify(); } catch { unit.cancel(); throw fault("transport_shape_changed"); }
-      return unit.request(mode, async (ownedSignal) => {
+      return unit.request("stream", async (ownedSignal) => {
         const result = await Reflect.apply(client.request, client, [{
           url: endpoint + method, method: "POST", responseType: "stream",
-          ...(mode === "stream" ? { params: { alt: "sse" } } : {}),
+          params: { alt: "sse" },
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(req), signal: ownedSignal, retry: false,
           retryConfig: { retry: 0, noResponseRetries: 0 },
         }]);
         return result.data;
-      }, signal);
+      }, signal, "generation");
     } });
   }
-  install("requestPost", "generateContent", "unary");
-  install("requestStreamingPost", "streamGenerateContent", "stream");
+  function installSetupOperation() {
+    Object.defineProperty(server, "requestGetOperation", { value: async function (name, signal) {
+      if (this !== server || !validOperationName(name)) {
+        unit.cancel();
+        throw fault("unsupported_call");
+      }
+      try { verify(); } catch { unit.cancel(); throw fault("transport_shape_changed"); }
+      return unit.request("unary", async (ownedSignal) => {
+        const result = await Reflect.apply(client.request, client, [{
+          url: operationEndpoint + name, method: "GET", responseType: "stream",
+          headers: { "Content-Type": "application/json" }, signal: ownedSignal,
+          retry: false, retryConfig: { retry: 0, noResponseRetries: 0 },
+        }]);
+        return result.data;
+      }, signal, "setup_user");
+    } });
+  }
+  installPost();
+  installGenerationStream();
+  installSetupOperation();
   return unit;
 }

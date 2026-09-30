@@ -376,6 +376,8 @@ const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
     "BindPaths",
     "InaccessiblePaths",
     "TemporaryFileSystem",
+    "RootDirectory",
+    "MountAPIVFS",
 ];
 #[cfg(target_os = "linux")]
 const SYSTEMD_GUARDIAN_SCRIPT: &str = r#"
@@ -484,6 +486,7 @@ while [ "$sandbox_check_count" -gt 0 ]; do
         [ "$isolated_source" != "$isolated_root" ] || fail_guardian "isolated root mount report was malformed"
         [ "$isolated_fstype" != "$isolated_rest" ] || fail_guardian "isolated root mount report was malformed"
         [ "$isolated_fstype" = tmpfs ] || fail_guardian "isolated root was not backed by tmpfs"
+        isolated_identity=$("$stat_program" -L -c '%d %i' -- "$sandbox_path") || fail_guardian "could not stat isolated root"
         isolated_read_only=false
         for isolated_option_line in $isolated_options; do
             case ",$isolated_option_line," in
@@ -491,7 +494,7 @@ while [ "$sandbox_check_count" -gt 0 ]; do
             esac
         done
         [ "$isolated_read_only" = true ] || fail_guardian "isolated root was not read-only"
-        printf 'isolated-root %s %s %s\n' "$isolated_source" "$isolated_fstype" "$isolated_options" >> "$sandbox_report" || fail_guardian "could not write isolated-root report"
+        printf 'isolated-root %s %s %s %s\n' "$isolated_source" "$isolated_fstype" "$isolated_options" "$isolated_identity" >> "$sandbox_report" || fail_guardian "could not write isolated-root report"
         sandbox_check_count=$((sandbox_check_count - 1))
         continue
     fi
@@ -521,7 +524,16 @@ while [ "$sandbox_check_count" -gt 0 ]; do
         continue
     fi
     sandbox_identity=$("$stat_program" -L -c '%d %i' -- "$sandbox_path") || fail_guardian "could not stat sandbox path: $sandbox_path"
-    sandbox_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --target "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    case "$sandbox_mode" in
+        ro|rw) sandbox_find_mode=--target ;;
+        ro-mountpoint|rw-mountpoint) sandbox_find_mode=--mountpoint ;;
+        *) fail_guardian "invalid sandbox mount-check mode: $sandbox_mode" ;;
+    esac
+    if [ "$sandbox_find_mode" = --mountpoint ]; then
+        sandbox_options=$("$findmnt_program" --list --uniq --noheadings --output VFS-OPTIONS --mountpoint "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    else
+        sandbox_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --target "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    fi
     printf 'mounted %s %s\n' "$sandbox_identity" "$sandbox_options" >> "$sandbox_report" || fail_guardian "could not write mount report"
     sandbox_check_count=$((sandbox_check_count - 1))
 done
@@ -797,10 +809,21 @@ pub type ContainmentEvidence = ProcessTreeEvidence;
 #[serde(rename_all = "snake_case")]
 pub enum SideEffectConfinementProfileKind {
     StrictOfflineWorkspace,
+    GeminiOfflineBridge,
+    GeminiOnlineBridge,
     TrustedFixedNetwork,
     ExternalCodex,
     ExternalGrok,
     TrustedCompatibility,
+}
+
+#[cfg(target_os = "linux")]
+const fn is_gemini_bridge_kind(kind: SideEffectConfinementProfileKind) -> bool {
+    matches!(
+        kind,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge
+            | SideEffectConfinementProfileKind::GeminiOnlineBridge
+    )
 }
 
 /// Records whether the requested filesystem, socket, network, and resource policy was enforced.
@@ -1013,6 +1036,109 @@ impl PartialEq for ExternalGrokReadOnlyFileCapability {
 impl Eq for ExternalGrokReadOnlyFileCapability {}
 
 #[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct GeminiOnlineReadOnlyFileBinding {
+    source: PathBuf,
+    target: PathBuf,
+    held_file: Arc<File>,
+    identity: ExternalGrokReadOnlyFileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl GeminiOnlineReadOnlyFileBinding {
+    fn resolver() -> std::io::Result<Self> {
+        let target = PathBuf::from("/etc/resolv.conf");
+        let source = fs::canonicalize(&target)?;
+        Self::new(source, target)
+    }
+
+    fn new(source: PathBuf, target: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        if target != Path::new("/etc/resolv.conf")
+            || !source.is_absolute()
+            || fs::canonicalize(&source)? != source
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver projection is not source-bound",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let held_file = Arc::new(options.open(&source)?);
+        verify_external_grok_file_descriptor_is_read_only(&held_file)?;
+        let metadata = held_file.metadata()?;
+        if metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver source is not a trusted root-owned file",
+            ));
+        }
+        let identity = external_grok_read_only_file_identity(&metadata)?;
+        let binding = Self {
+            source,
+            target,
+            held_file,
+            identity,
+        };
+        binding.verify_source()?;
+        Ok(binding)
+    }
+
+    fn verify_source(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        verify_external_grok_file_descriptor_is_read_only(&self.held_file)?;
+        let held = self.held_file.metadata()?;
+        let named = fs::symlink_metadata(&self.source)?;
+        let held_identity = external_grok_read_only_file_identity(&held)?;
+        let named_identity = external_grok_read_only_file_identity(&named)?;
+        if held.uid() != 0
+            || held.permissions().mode() & 0o022 != 0
+            || held.nlink() != 1
+            || held_identity != self.identity
+            || named_identity != self.identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver source identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for GeminiOnlineReadOnlyFileBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeminiOnlineReadOnlyFileBinding")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for GeminiOnlineReadOnlyFileBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.target == other.target
+            && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for GeminiOnlineReadOnlyFileBinding {}
+
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum ExternalGrokReadOnlyFileProjection {
     #[cfg(test)]
@@ -1114,6 +1240,8 @@ struct WorkspaceSandboxConfig {
     external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
     #[cfg(target_os = "linux")]
     external_grok_read_only_file_capabilities: Vec<ExternalGrokReadOnlyFileCapability>,
+    #[cfg(target_os = "linux")]
+    gemini_online_read_only_file_bindings: Vec<GeminiOnlineReadOnlyFileBinding>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -1133,6 +1261,8 @@ impl WorkspaceSandboxConfig {
             external_codex_writable_file_capabilities: Vec::new(),
             #[cfg(target_os = "linux")]
             external_grok_read_only_file_capabilities: Vec::new(),
+            #[cfg(target_os = "linux")]
+            gemini_online_read_only_file_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -1215,6 +1345,13 @@ impl WorkspaceSandboxConfig {
         self.visible_read_only_files.push(path);
         self.external_grok_read_only_file_capabilities
             .push(capability);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_gemini_online_resolver(mut self) -> std::io::Result<Self> {
+        self.gemini_online_read_only_file_bindings
+            .push(GeminiOnlineReadOnlyFileBinding::resolver()?);
         Ok(self)
     }
 
@@ -1589,9 +1726,67 @@ impl ExternalGrokProfile {
     }
 }
 
+/// Only the owned Gemini launcher can construct this offline profile. It does
+/// not confer provider-network or writable-workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiOfflineBridgeProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl GeminiOfflineBridgeProfile {
+    pub(crate) fn new(workspace: &Path, control: &Path, profile: &Path) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace, WorkspaceAccess::ReadOnly)
+                .with_isolated_host_view()
+                .with_visible_read_only_root(Path::new("/nix/store"))
+                .with_visible_read_only_root(control)
+                .with_writable_artifact_root(profile),
+        }
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+}
+
+/// Managed Gemini Worker profile with a private Unix control channel and bounded
+/// provider network access. The candidate is the only writable workspace root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiOnlineBridgeProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl GeminiOnlineBridgeProfile {
+    pub(crate) fn new(
+        workspace: &Path,
+        workspace_access: WorkspaceAccess,
+        control: &Path,
+        profile: &Path,
+    ) -> std::io::Result<Self> {
+        let config = WorkspaceSandboxConfig::new(workspace, workspace_access)
+            .with_isolated_host_view()
+            .with_visible_read_only_root(Path::new("/nix/store"))
+            .with_visible_read_only_root(control)
+            .with_writable_artifact_root(profile);
+        #[cfg(target_os = "linux")]
+        let config = config.with_gemini_online_resolver()?;
+        Ok(Self { config })
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffectConfinementProfile {
     StrictOfflineWorkspace(StrictOfflineWorkspaceProfile),
+    /// Source-bound Gemini bootstrap: offline, with one private Unix control channel.
+    GeminiOfflineBridge(GeminiOfflineBridgeProfile),
+    /// Selected-account Gemini Worker with verified online confinement.
+    GeminiOnlineBridge(GeminiOnlineBridgeProfile),
     TrustedFixedNetwork(TrustedFixedNetworkProfile),
     ExternalCodex(ExternalCodexProfile),
     ExternalGrok(ExternalGrokProfile),
@@ -1602,6 +1797,8 @@ pub enum SideEffectConfinementProfile {
 impl SideEffectConfinementProfile {
     pub const fn kind(&self) -> SideEffectConfinementProfileKind {
         match self {
+            Self::GeminiOfflineBridge(_) => SideEffectConfinementProfileKind::GeminiOfflineBridge,
+            Self::GeminiOnlineBridge(_) => SideEffectConfinementProfileKind::GeminiOnlineBridge,
             Self::StrictOfflineWorkspace(_) => {
                 SideEffectConfinementProfileKind::StrictOfflineWorkspace
             }
@@ -1614,6 +1811,8 @@ impl SideEffectConfinementProfile {
 
     fn workspace_config(&self) -> Option<&WorkspaceSandboxConfig> {
         match self {
+            Self::GeminiOfflineBridge(profile) => Some(&profile.config),
+            Self::GeminiOnlineBridge(profile) => Some(&profile.config),
             Self::StrictOfflineWorkspace(profile) => Some(&profile.config),
             Self::TrustedFixedNetwork(profile) => Some(&profile.config),
             Self::ExternalCodex(profile) => Some(&profile.config),
@@ -2654,6 +2853,47 @@ fn run_process_cancellable_with_interaction(
             });
         }
     }
+    #[cfg(target_os = "linux")]
+    let private_peer_binding = if interaction.is_some()
+        && is_gemini_bridge_kind(spec.side_effects.kind())
+        && attached_process_tree.side_effects.is_verified()
+    {
+        let binding = match &mut attached_process_tree.backend {
+            ProcessTreeBackend::Systemd(unit) => unit
+                .target_pid(&mut child, operation_deadline, cancellation)
+                .and_then(|pid| {
+                    crate::agent_lifecycle::process_start_time(pid)
+                        .map(|start| (pid, start, unit.cgroup_path.clone()))
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                }),
+            _ => Err(std::io::Error::other(
+                "Gemini private peer requires verified systemd containment",
+            )),
+        };
+        match binding {
+            Ok(binding) => Some(binding),
+            Err(source) => {
+                let cleanup = attached_process_tree.cleanup(
+                    &mut child,
+                    &spec.label,
+                    "private peer PID capture rollback",
+                );
+                let cleanup_error = append_error(
+                    cleanup.error,
+                    wait_for_child_cleanup(
+                        &mut child,
+                        &spec.label,
+                        "private peer PID capture rollback",
+                    ),
+                );
+                let error =
+                    process_ownership_error(spec.label.clone(), command_display.clone(), source);
+                return Err(append_process_run_error_cleanup(error, cleanup_error));
+            }
+        }
+    } else {
+        None
+    };
     let mut process_tree = match attached_process_tree.release(
         &mut child,
         &spec.label,
@@ -2686,6 +2926,18 @@ fn run_process_cancellable_with_interaction(
                     command: command_display.clone(),
                     source,
                 })?;
+            #[cfg(target_os = "linux")]
+            if matches!(
+                spec.side_effects.kind(),
+                SideEffectConfinementProfileKind::GeminiOfflineBridge
+                    | SideEffectConfinementProfileKind::GeminiOnlineBridge
+            ) && process_tree.side_effects.is_verified()
+            {
+                // Capture the guardian-published target identity while the target is still held
+                // at the start gate. Waiting after release can consume the operation deadline
+                // before the private-channel handler starts.
+                session.peer_binding = private_peer_binding;
+            }
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&mut session)))
                 .is_err()
             {
@@ -3276,6 +3528,17 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                 }
             }
         }
+        if config.gemini_online_read_only_file_bindings.len() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Gemini online resolver projections exceed their exact bound",
+            ));
+        }
+        for binding in &config.gemini_online_read_only_file_bindings {
+            validate_bounded_path(&binding.source, "Gemini online resolver source")?;
+            validate_bounded_path(&binding.target, "Gemini online resolver target")?;
+            binding.verify_source()?;
+        }
     }
     let total = 1usize
         .checked_add(config.visible_read_only_roots.len())
@@ -3284,6 +3547,16 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
         .and_then(|total| total.checked_add(config.visible_read_write_files.len()))
         .and_then(|total| total.checked_add(config.writable_artifact_roots.len()))
         .and_then(|total| total.checked_add(config.hidden_roots.len()))
+        .and_then(|total| {
+            #[cfg(target_os = "linux")]
+            {
+                total.checked_add(config.gemini_online_read_only_file_bindings.len())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Some(total)
+            }
+        })
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,

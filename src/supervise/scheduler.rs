@@ -4111,7 +4111,7 @@ fn account_observation_for_launch_runtime(
                         provider_id,
                     )
                     .inspect(|observation| {
-                        freeze_observed_grok_from_registry(
+                        freeze_observed_managed_selection_from_registry(
                             run_id,
                             provider_id,
                             &harness.registry,
@@ -4130,7 +4130,7 @@ fn account_observation_for_launch_runtime(
             )?;
             return Ok(match observed {
                 Some(observed) => {
-                    crate::account_authority::record_observed_grok_selection(
+                    record_observed_managed_selection(
                         run_id,
                         provider_id,
                         Some(observed.authority_id),
@@ -4139,7 +4139,7 @@ fn account_observation_for_launch_runtime(
                     Some(observed.observation)
                 }
                 None => {
-                    crate::account_authority::record_observed_grok_selection(
+                    record_observed_managed_selection(
                         run_id,
                         provider_id,
                         None,
@@ -4157,24 +4157,53 @@ fn account_observation_for_launch_runtime(
             anyhow!("Coding Agent Manager provider `{provider_id}` is not registered")
         })?;
         let observation = observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)?;
-        freeze_observed_grok_from_registry(run_id, provider_id, &registry, observation.as_ref());
+        freeze_observed_managed_selection_from_registry(
+            run_id,
+            provider_id,
+            &registry,
+            observation.as_ref(),
+        );
         Ok(observation)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn freeze_observed_grok_from_registry(
+fn freeze_observed_managed_selection_from_registry(
     run_id: Option<&str>,
     provider_id: &str,
     registry: &StoredAccountRegistry,
     observation: Option<&AccountObserveResult>,
 ) {
-    crate::account_authority::record_observed_grok_selection(
+    record_observed_managed_selection(
         run_id,
         provider_id,
         observation.map(|_| authority_id_for(registry.metadata_path())),
         observation.map(|observation| &observation.binding),
     );
+}
+
+#[cfg(target_os = "linux")]
+fn record_observed_managed_selection(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+) {
+    if provider_id == crate::account_authority::GROK_CLI_PROVIDER_ID {
+        crate::account_authority::record_observed_grok_selection(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+        );
+    } else if provider_id == crate::account_authority::GEMINI_CLI_PROVIDER_ID {
+        crate::account_authority::record_observed_gemini_selection(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+        );
+    }
 }
 
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(

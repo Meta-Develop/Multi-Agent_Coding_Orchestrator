@@ -14,6 +14,7 @@ fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1889,6 +1890,7 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1924,6 +1926,7 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1971,6 +1974,7 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -2775,6 +2779,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
         visible_read_write_files: vec![exception.clone()],
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: vec![incoming.clone()],
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -2834,6 +2839,7 @@ fn ordinary_external_codex_exact_path_properties_reject_drift() {
         visible_read_write_files: vec![PathBuf::from("/worktree/AGENTS.md")],
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/primary")],
         isolated_host_view: false,
@@ -2929,6 +2935,80 @@ fn joined_property_paths(paths: &BTreeSet<PathBuf>) -> String {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn isolated_runtime_helper_prefers_nix_store_over_ubuntu_host_helper() {
+    if !Path::new("/nix/store").is_dir() {
+        eprintln!("skipping Nix-store-dependent isolated runtime helper test");
+        return;
+    }
+
+    let path = env::var_os("PATH").expect("test PATH");
+    let fixed_candidates = ["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"];
+    let fixed = find_trusted_unix_executable("env", &fixed_candidates);
+    let isolated = find_trusted_nix_store_executable_in_path("env", &path)
+        .expect("Nix development PATH env helper");
+    let canonical_isolated = fs::canonicalize(&isolated).expect("canonical Nix env");
+
+    assert!(isolated.starts_with("/nix/store"));
+    assert!(canonical_isolated.starts_with("/nix/store"));
+    let smoke = Command::new(&isolated)
+        .args(["-i", "MACO_ISOLATED_ENV_SMOKE=present"])
+        .output()
+        .expect("execute selected Nix env alias");
+    assert!(smoke.status.success());
+    assert_eq!(smoke.stdout, b"MACO_ISOLATED_ENV_SMOKE=present\n");
+    assert!(smoke.stderr.is_empty());
+    if trusted_canonical_unix_executable(Path::new("/usr/bin/env")).is_some() {
+        assert_eq!(fixed, Some(PathBuf::from("/usr/bin/env")));
+    }
+    if let Some(fixed) = fixed {
+        let canonical_fixed = fs::canonicalize(fixed).expect("canonical fixed env");
+        if !canonical_fixed.starts_with("/nix/store") {
+            assert_ne!(canonical_fixed, canonical_isolated);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_runtime_helper_rejects_unavailable_outside_and_untrusted_candidates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(
+        find_trusted_nix_store_executable_in_path("env", OsStr::new(":relative:/usr/bin"))
+            .is_none()
+    );
+    assert!(find_trusted_nix_store_executable_in_path(
+        "maco-helper-that-does-not-exist",
+        &env::var_os("PATH").unwrap_or_default()
+    )
+    .is_none());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let untrusted = temp.path().join("env");
+    fs::write(&untrusted, "#!/bin/sh\nexit 0\n").expect("untrusted helper");
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).expect("untrusted mode");
+    assert!(trusted_canonical_unix_executable(&untrusted).is_none());
+
+    if let Some(actual) =
+        find_trusted_nix_store_executable_in_path("env", &env::var_os("PATH").expect("test PATH"))
+    {
+        let outside_bin = temp.path().join("bin");
+        fs::create_dir(&outside_bin).expect("outside alias directory");
+        std::os::unix::fs::symlink(&actual, outside_bin.join("env"))
+            .expect("outside alias to actual Nix helper");
+        let escaped = Path::new("/nix/store").join("../..").join(
+            outside_bin
+                .strip_prefix("/")
+                .expect("absolute temporary directory"),
+        );
+        assert!(find_trusted_nix_store_executable_in_path("env", escaped.as_os_str()).is_none());
+    } else {
+        eprintln!("skipping Nix-store alias-parent subcase: no trusted Nix env helper");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
     if !Path::new("/nix/store").is_dir() {
         eprintln!(
@@ -3017,6 +3097,219 @@ fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn gemini_isolated_host_view_allows_only_candidate_descendant_masks() {
+    if !Path::new("/nix/store").is_dir() {
+        eprintln!("skipping Nix-store-dependent Gemini descendant-mask test");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let hidden_directory = workspace.join(".gemini");
+    let hidden_env = workspace.join(".env");
+    let hidden_git = workspace.join(".git");
+    let control = temp.path().join("control");
+    let profile = control.join("profile");
+    fs::create_dir_all(&hidden_directory).expect("hidden Gemini directory");
+    fs::write(&hidden_env, "GEMINI_API_KEY=ambient\n").expect("hidden environment file");
+    fs::write(&hidden_git, "gitdir: ../gitdir\n").expect("linked-worktree Git file");
+    fs::create_dir_all(&profile).expect("private profile");
+    let program = workspace.join("probe");
+    fs::write(&program, "probe\n").expect("workspace program");
+
+    let gemini = GeminiOfflineBridgeProfile::new(&workspace, &control, &profile)
+        .with_hidden_root(&hidden_directory)
+        .with_hidden_root(&hidden_env)
+        .with_hidden_root(&hidden_git);
+    let gemini_spec = ProcessSpec::direct(
+        "Gemini candidate descendant mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOfflineBridge(gemini));
+    let sandbox = resolve_systemd_sandbox(&gemini_spec)
+        .expect("Gemini descendant mask must resolve")
+        .expect("Gemini sandbox config");
+    assert_eq!(
+        sandbox.kind,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge
+    );
+    for hidden in [&hidden_directory, &hidden_env, &hidden_git] {
+        assert!(sandbox.hidden_roots.contains(hidden));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path.as_path() == hidden.as_path()
+                && check.access == SandboxMountAccess::Inaccessible
+        }));
+    }
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &control);
+    for hidden in [&hidden_directory, &hidden_env, &hidden_git] {
+        assert!(command.get_args().any(|argument| {
+            argument == systemd_rooted_path_property("InaccessiblePaths=", hidden, true)
+        }));
+        assert!(!command
+            .get_args()
+            .any(|argument| argument == systemd_path_property("InaccessiblePaths=", hidden, true)));
+    }
+    let expected_rooted = BTreeSet::from([
+        hidden_directory.clone(),
+        hidden_env.clone(),
+        hidden_git.clone(),
+    ]);
+    let rooted_value = expected_rooted
+        .iter()
+        .map(|path| format!("-+{}", path.display()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    verify_exact_rooted_property_paths("InaccessiblePaths", &rooted_value, &expected_rooted)
+        .expect("exact rooted masks");
+    assert!(verify_exact_rooted_property_paths(
+        "InaccessiblePaths",
+        &joined_property_paths(&expected_rooted),
+        &expected_rooted,
+    )
+    .is_err());
+
+    let ordinary = StrictOfflineWorkspaceProfile::read_only(&workspace)
+        .with_visible_read_only_root("/nix/store")
+        .with_hidden_root(&hidden_directory)
+        .with_isolated_host_view();
+    let ordinary_spec = ProcessSpec::direct(
+        "ordinary isolated descendant mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        ordinary,
+    ));
+    let ordinary_error = match resolve_systemd_sandbox(&ordinary_spec) {
+        Err(error) => error,
+        Ok(_) => panic!("ordinary isolated profiles must still reject overlapping roots"),
+    };
+    assert!(ordinary_error
+        .to_string()
+        .contains("overlapping visible and inaccessible roots"));
+
+    let ordinary_file = StrictOfflineWorkspaceProfile::read_only(&workspace)
+        .with_visible_read_only_root("/nix/store")
+        .with_hidden_root(&hidden_env)
+        .with_isolated_host_view();
+    let ordinary_file_spec = ProcessSpec::direct(
+        "ordinary isolated regular-file mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        ordinary_file,
+    ));
+    let ordinary_file_error = match resolve_systemd_sandbox(&ordinary_file_spec) {
+        Err(error) => error,
+        Ok(_) => panic!("ordinary profiles must keep directory-only hidden roots"),
+    };
+    assert!(ordinary_file_error.to_string().contains("not a directory"));
+
+    let equal_workspace = GeminiOfflineBridgeProfile::new(&workspace, &control, &profile)
+        .with_hidden_root(&workspace);
+    let equal_spec = ProcessSpec::direct(
+        "Gemini equal workspace mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOfflineBridge(
+        equal_workspace,
+    ));
+    assert!(resolve_systemd_sandbox(&equal_spec).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !Path::new("/nix/store").is_dir() {
+        eprintln!("skipping Nix-store-dependent Gemini online profile test");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let control = temp.path().join("control");
+    let profile = temp.path().join("profile");
+    for directory in [&workspace, &control, &profile] {
+        fs::create_dir(directory).expect("fixture directory");
+    }
+    let program = workspace.join("probe");
+    fs::write(&program, "probe\n").expect("workspace program");
+    let confinement =
+        GeminiOnlineBridgeProfile::new(&workspace, WorkspaceAccess::ReadWrite, &control, &profile)
+            .expect("trusted host resolver projection");
+    let spec = ProcessSpec::direct(
+        "Gemini online resolver projection",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOnlineBridge(
+        confinement,
+    ));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve Gemini online sandbox")
+        .expect("Gemini online sandbox config");
+    assert_eq!(sandbox.gemini_online_read_only_file_bindings.len(), 1);
+    let binding = &sandbox.gemini_online_read_only_file_bindings[0];
+    assert_eq!(
+        binding.source,
+        fs::canonicalize("/etc/resolv.conf").unwrap()
+    );
+    assert_eq!(binding.target, Path::new("/etc/resolv.conf"));
+    binding
+        .verify_source()
+        .expect("stable trusted resolver source");
+    assert!(sandbox.mount_checks.iter().any(|check| {
+        check.path == binding.target
+            && check.device == binding.identity.device
+            && check.inode == binding.identity.inode
+            && check.access == SandboxMountAccess::ReadOnly
+    }));
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &control);
+    let arguments = command.get_args().collect::<Vec<_>>();
+    let expected_binding =
+        systemd_path_binding_property("BindReadOnlyPaths=", &binding.source, &binding.target);
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new(&expected_binding)));
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new("--property=PrivateNetwork=no")));
+    assert!(arguments.iter().any(|argument| {
+        *argument == OsStr::new("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6")
+    }));
+
+    let untrusted = temp.path().join("writable-resolver.conf");
+    fs::write(&untrusted, "nameserver 127.0.0.1\n").expect("untrusted resolver fixture");
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o666))
+        .expect("untrusted resolver mode");
+    assert!(GeminiOnlineReadOnlyFileBinding::new(
+        fs::canonicalize(&untrusted).unwrap(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn isolated_root_property_requires_exact_single_read_only_root() {
     for value in ["/:ro", "  /:ro\n"] {
         assert!(
@@ -3060,6 +3353,7 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/source")],
         isolated_host_view: true,
@@ -3078,7 +3372,7 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
     let report = temp.path().join("report");
     fs::write(
             &report,
-            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible\ninaccessible-missing\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev 1 2\ninaccessible\ninaccessible-missing\n",
         )
         .expect("write report");
     fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
@@ -3108,11 +3402,97 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
     verify_sandbox_mount_report(&report, &checks).expect("isolated mount evidence");
     fs::write(
             &report,
-            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible-missing\ninaccessible-missing\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev 1 2\ninaccessible-missing\ninaccessible-missing\n",
         )
         .expect("replace report");
     assert!(verify_sandbox_mount_report(&report, &checks).is_err());
     assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("required inaccessible path was not mounted"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gemini_private_root_is_fresh_owned_exact_and_lifetime_bound_for_both_profiles() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let runtime = tempfile::tempdir().expect("private runtime fixture");
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
+        .expect("private runtime mode");
+    for kind in [
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+    ] {
+        let root = create_gemini_isolated_root(runtime.path()).expect("fresh Gemini root");
+        let root_path = root.path().to_path_buf();
+        let metadata = fs::symlink_metadata(&root_path).expect("Gemini root metadata");
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), effective_uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(root_path.parent(), Some(runtime.path()));
+
+        let mut sandbox = ResolvedSystemdSandbox {
+            read_only_input_snapshots: Vec::new(),
+            kind,
+            workspace_root: PathBuf::from("/candidate"),
+            current_dir: PathBuf::from("/candidate"),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            external_grok_read_only_file_capabilities: Vec::new(),
+            gemini_online_read_only_file_bindings: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: true,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: vec![SandboxMountCheck {
+                path: PathBuf::from("/"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::IsolatedRoot,
+                optional: false,
+            }],
+        };
+        bind_gemini_isolated_root_identity(&mut sandbox, &root_path)
+            .expect("bind exact private root identity");
+        let root_check = sandbox
+            .mount_checks
+            .iter()
+            .find(|check| check.access == SandboxMountAccess::IsolatedRoot)
+            .expect("private root check");
+        assert_eq!(root_check.device, metadata.dev());
+        assert_eq!(root_check.inode, metadata.ino());
+        let mut command = Command::new("systemd-run");
+        apply_gemini_isolated_root_properties(&mut command, &sandbox, &root_path)
+            .expect("Gemini private root properties");
+        apply_systemd_sandbox_properties(&mut command, &sandbox, runtime.path());
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(arguments.iter().any(|argument| {
+            *argument == systemd_path_property("RootDirectory=", &root_path, false)
+        }));
+        assert!(arguments
+            .iter()
+            .any(|argument| *argument == OsStr::new("--property=MountAPIVFS=yes")));
+        assert!(!arguments
+            .iter()
+            .any(|argument| *argument == OsStr::new("--property=TemporaryFileSystem=/:ro")));
+
+        let properties = BTreeMap::from([
+            ("RootDirectory".to_string(), root_path.display().to_string()),
+            ("MountAPIVFS".to_string(), "yes".to_string()),
+        ]);
+        verify_gemini_isolated_root_properties(&sandbox, &properties, Some(&root_path))
+            .expect("exact retained Gemini root");
+        assert!(verify_gemini_isolated_root_properties(&sandbox, &properties, None).is_err());
+
+        root.close().expect("remove Gemini root");
+        assert!(!root_path.exists());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3300,6 +3680,7 @@ fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
         external_grok_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -3447,6 +3828,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
         SideEffectConfinementProfileKind::ExternalGrok,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
         SideEffectConfinementProfileKind::TrustedCompatibility,
     ] {
         let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
@@ -3483,14 +3865,16 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
             );
         }
         let expected_address_families = match kind {
-            SideEffectConfinementProfileKind::StrictOfflineWorkspace => {
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            | SideEffectConfinementProfileKind::GeminiOfflineBridge => {
                 "--property=RestrictAddressFamilies=AF_UNIX"
             }
             SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::TrustedCompatibility => {
                 "--property=RestrictAddressFamilies=AF_INET AF_INET6"
             }
-            SideEffectConfinementProfileKind::ExternalGrok => {
+            SideEffectConfinementProfileKind::ExternalGrok
+            | SideEffectConfinementProfileKind::GeminiOnlineBridge => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
             }
             SideEffectConfinementProfileKind::ExternalCodex => {

@@ -1,11 +1,14 @@
-# Gemini managed bootstrap, phase J
+# Gemini managed bootstrap, phase R
 
-This is an offline, version-bound installed-module test unit, not a Gemini launch
-capability. `loadOfflineCodeAssist` requires a private Linux profile and denied
-network, and exposes an explicitly synthetic physical sink. It cannot authorize
-credentials, CLI main, provider generation, Rust custody, model/effort identity,
-whole-invocation usage, USD eligibility, publication or writable execution.
-The static Gemini Rust capabilities and terminal JSON observer are unchanged.
+This is a source-ready, version-bound contained launcher plus an offline
+installed-module proof. The production entry runs pinned Node directly, loads
+the guarded Gemini 0.41.2 closure, and authenticates its observations over a
+parent-created private Unix socket bound to the same contained process. It has
+no credential or provider-release authority, so it reaches guarded Config and
+CodeAssist classes and then refuses before auth, setup, generation, or CLI main.
+It cannot attest actual model or effort, complete invocation usage, USD cost,
+publication, Worker qualification, or writable execution. Static Gemini
+capabilities and the terminal JSON observer remain unchanged.
 
 ## Pinned loading and guards
 
@@ -14,8 +17,8 @@ Gemini 0.41.2 core and extension chunks. The allowlist contains the twelve actua
 imported JavaScript files. Every load hashes the bytes returned by Node's load
 hook and executes the resulting instrumented source. Alternate paths, query or
 fragment aliases, unknown dependencies, changed bytes and missing load receipts
-(including prior cached evaluation) refuse. The trusted Node executable is a
-separate verification-receipt binding; builtins are not third-party closure files.
+(including prior cached evaluation) refuse. The trusted Node executable is
+separately pinned by path and SHA256; builtins are not third-party closure files.
 Pinned optional lookups (`encoding` at Z:6816, `bufferutil`/`utf-8-validate` at
 664:88/727, and `long` through Z:24203/24485) are explicitly denied with
 MODULE_NOT_FOUND before resolution, including if a package exists. Their
@@ -81,6 +84,32 @@ and startup admission channel belongs to the later authorized Rust/bootstrap
 integration, not to this synthetic proof. No broad non-generation passthrough
 exists. Unknown usage, cost and quiescence remain unknown.
 
+## Private parent custody
+
+The Rust launcher creates private staging outside the candidate, writes the
+owned bootstrap, wire module, empty profile and source-binding manifest, then
+starts pinned Node with fixed argv and a cleared environment. The existing
+guardian owns the same deadline, cancellation, process tree, reservation and
+side-effect report. A dedicated Gemini profile keeps the network namespace
+private and admits AF_UNIX only for the parent channel; its verifier requires
+the matching address-family, namespace and syscall policy while every other
+profile retains its prior rules.
+
+The listener accepts one peer. Linux peer credentials, exact target PID,
+process start identity and guardian cgroup are checked before any message is
+accepted. A random nonce, monotonic sequence and one ACK per bounded frame bind
+hello, closure readiness and later wire events. Wrong identity, nonce or order,
+duplicate, malformed or oversized data, ACK loss, channel loss, timeout or
+stopped budget authority latches cancellation. Child messages become held
+observations only after these checks and are not serialized into run artifacts.
+
+One live token grant is bound after final command and deadline assembly.
+Distinct-attempt lower bounds are checked and summed without adding overlapping
+cached or thought counters. A breach stops the shared grant. Requested labels,
+response model fields and synthetic sinks never create provider identity,
+actual effort, known cost or full-usage evidence. A NotStarted refund requires
+both no physical release and verified contained-process quiescence.
+
 ## Offline verification
 
 Run both `.test.mjs` files with pinned Node in the retained official delegated
@@ -100,6 +129,13 @@ remain intact; added refresh tests retain unknown usage and conservative abort
 semantics. Tests never call main/getOauthClient/refreshAuth, real credentials or
 providers. Synthetic success is not actual authentication or managed execution.
 
-Phase J deliberately has no private peer protocol, provider-release authority,
-NotStarted refund witness or ledger integration. Root must separately assign and
-review those coupled Rust/launcher pieces before any real route qualification.
+The deterministic suite also covers the private nonce, sequence and ACK
+protocol, queued cancellation and malformed or oversized replies. The Rust
+bridge has source-level tests for closure binding, lower-bound retention,
+attempt serialization, replay, missing usage and grant breach; those tests
+require the exclusive Rust cache lease before execution.
+
+Phase R deliberately retains no authentication or provider-release authority.
+The contained no-release path can establish NotStarted only from the
+parent-held quiescence witness. Real auth, provider calls, model or effort
+qualification, writable use and route acceptance remain separate owner gates.

@@ -1,4 +1,7 @@
-use crate::account_authority::{FrozenGrokSelectedBinding, ManagedGrokAccountSelectionEvidence};
+use crate::account_authority::{
+    FrozenGeminiSelectedBinding, FrozenGrokSelectedBinding, ManagedGeminiAccountSelectionEvidence,
+    ManagedGrokAccountSelectionEvidence,
+};
 use crate::agent_lifecycle::{AgentLaunchMetadata, MACO_RUN_ID_ENV, MACO_TASK_ID_ENV};
 use crate::artifacts::state_auth::sha256_hex;
 use crate::gate_denial::{ExternalSideEffectState, GateDenial};
@@ -67,6 +70,7 @@ pub(crate) mod codex_app_server;
 mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
+pub(crate) mod gemini_bridge;
 mod grok_steering;
 pub(crate) mod researcher_inputs;
 
@@ -291,6 +295,9 @@ pub struct ExternalAgentCommand {
     /// the selected account from process-global observation state.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     grok_run_account_binding: Option<FrozenGrokSelectedBinding>,
+    /// Immutable Gemini account binding admitted for this run.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    gemini_run_account_binding: Option<FrozenGeminiSelectedBinding>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -308,12 +315,18 @@ struct BoundLiveTokenGrant {
     lifecycle: Option<ExternalAgentLifecycleIdentity>,
     source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     input_files: Vec<PathBuf>,
+    runtime_adapter: Option<RuntimeAdapterConfig>,
+    hidden_roots: Vec<PathBuf>,
 }
 
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
         should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
+    }
+
+    pub(crate) fn uses_gemini_bridge(&self) -> bool {
+        self.invocation == ExternalAgentInvocation::GeminiCli
     }
 
     pub(crate) fn bind_live_token_grant(
@@ -334,6 +347,8 @@ impl ExternalAgentCommand {
             lifecycle: self.agent_lifecycle.clone(),
             source_inputs: self.researcher_source_inputs.clone(),
             input_files: self.read_only_input_files.clone(),
+            runtime_adapter: self.runtime_adapter.clone(),
+            hidden_roots: self.hidden_roots.clone(),
         });
     }
 
@@ -363,6 +378,8 @@ impl ExternalAgentCommand {
             || bound.lifecycle != self.agent_lifecycle
             || bound.source_inputs != self.researcher_source_inputs
             || bound.input_files != self.read_only_input_files
+            || bound.runtime_adapter != self.runtime_adapter
+            || bound.hidden_roots != self.hidden_roots
         {
             return Err("live token grant launch binding changed".to_string());
         }
@@ -433,6 +450,18 @@ pub(crate) const WRITABLE_GROK_CONFINEMENT_PROOF_STALE: &str =
     "writable_grok_confinement_proof_stale";
 pub(crate) const WRITABLE_GROK_CONFINEMENT_UNVERIFIED: &str =
     "writable_grok_confinement_unverified";
+pub(crate) const WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED: &str =
+    "writable_gemini_terminal_worker_required";
+pub(crate) const WRITABLE_GEMINI_SELECTION_EVIDENCE_MISSING: &str =
+    "writable_gemini_selection_evidence_missing";
+pub(crate) const WRITABLE_GEMINI_SELECTION_EVIDENCE_STALE: &str =
+    "writable_gemini_selection_evidence_stale";
+pub(crate) const WRITABLE_GEMINI_CONFINEMENT_PROOF_MISSING: &str =
+    "writable_gemini_confinement_proof_missing";
+pub(crate) const WRITABLE_GEMINI_CONFINEMENT_PROOF_STALE: &str =
+    "writable_gemini_confinement_proof_stale";
+pub(crate) const WRITABLE_GEMINI_CONFINEMENT_UNVERIFIED: &str =
+    "writable_gemini_confinement_unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WritableRuntimeSelectionEvidence {
@@ -1210,6 +1239,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            gemini_run_account_binding: None,
         }
     }
 
@@ -1255,6 +1285,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            gemini_run_account_binding: None,
         }
     }
 
@@ -1300,6 +1331,7 @@ impl ExternalAgentCommand {
             assignment_messaging_launch: None,
             cam_authority_socket_pin: None,
             grok_run_account_binding: None,
+            gemini_run_account_binding: None,
         }
     }
 
@@ -1375,15 +1407,18 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
         non_delegating_terminal_worker: bool,
     ) -> Result<Self> {
-        if runtime != RuntimeId::Grok || !non_delegating_terminal_worker {
-            bail!(
-                "{WRITABLE_GROK_TERMINAL_WORKER_REQUIRED}: writable Grok requires an explicitly bound non-delegating terminal Worker"
-            );
+        if !matches!(runtime, RuntimeId::Grok | RuntimeId::GeminiCli)
+            || !non_delegating_terminal_worker
+        {
+            bail!("writable runtime requires an explicitly bound non-delegating terminal Worker");
         }
-        if self.invocation != ExternalAgentInvocation::Grok {
-            bail!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: selected Grok runtime does not match the executable invocation"
-            );
+        let expected_invocation = match runtime {
+            RuntimeId::Grok => ExternalAgentInvocation::Grok,
+            RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
+            _ => unreachable!(),
+        };
+        if self.invocation != expected_invocation {
+            bail!("selected writable runtime does not match the executable invocation");
         }
         self.writable_runtime_selection = Some(WritableRuntimeSelectionEvidence::from_command(
             assignment_id,
@@ -1495,6 +1530,38 @@ impl ExternalAgentCommand {
         Ok(&selected.cwd)
     }
 
+    fn current_gemini_writable_capabilities(
+        &self,
+    ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
+        if self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+            || self.workspace_access != WorkspaceAccess::ReadWrite
+        {
+            bail!(
+                "{WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED}: writable Gemini is restricted to a managed child worktree"
+            );
+        }
+        let selected = self.writable_runtime_selection.as_ref().with_context(|| {
+            format!(
+                "{WRITABLE_GEMINI_SELECTION_EVIDENCE_MISSING}: writable Gemini has no supervisor-selected launch evidence"
+            )
+        })?;
+        if !selected.matches_command(self, RuntimeId::GeminiCli)
+            || self.invocation != ExternalAgentInvocation::GeminiCli
+            || self
+                .runtime_adapter
+                .as_ref()
+                .is_none_or(|config| config.binary_path() != self.program.as_path())
+        {
+            bail!(
+                "{WRITABLE_GEMINI_SELECTION_EVIDENCE_STALE}: writable Gemini launch no longer matches its selected adapter contract"
+            );
+        }
+        Ok(crate::runtime_adapter::RuntimeCapabilities {
+            side_effect_confinement: SideEffectConfinement::Verified,
+            ..crate::runtime_adapter::RuntimeCapabilities::GEMINI_CLI
+        })
+    }
+
     /// Concrete capabilities used by the supervisor while creating MACO-owned confinement
     /// evidence. Static capabilities remain authoritative for every non-Grok runtime.
     pub(crate) fn selected_writable_capabilities(
@@ -1502,20 +1569,19 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
         expected_assignment_id: Option<&str>,
     ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
-        if runtime != RuntimeId::Grok {
-            return Ok(runtime.capabilities());
-        }
-        let contract = self.current_grok_writable_contract()?;
+        let capabilities = match runtime {
+            RuntimeId::Grok => self.current_grok_writable_contract()?.capabilities(),
+            RuntimeId::GeminiCli => self.current_gemini_writable_capabilities()?,
+            _ => return Ok(runtime.capabilities()),
+        };
         if expected_assignment_id.is_some_and(|expected| {
             self.writable_runtime_selection
                 .as_ref()
                 .is_none_or(|selected| selected.assignment_id != expected)
         }) {
-            bail!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_STALE}: writable Grok selection evidence belongs to a different assignment"
-            );
+            bail!("selected writable runtime evidence belongs to a different assignment");
         }
-        Ok(contract.capabilities())
+        Ok(capabilities)
     }
 
     /// Concrete capabilities used at the external process boundary. Writable Grok must carry the
@@ -1525,23 +1591,33 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
     ) -> Result<crate::runtime_adapter::RuntimeCapabilities> {
         let capabilities = self.selected_writable_capabilities(runtime, None)?;
-        if runtime != RuntimeId::Grok {
+        if !matches!(runtime, RuntimeId::Grok | RuntimeId::GeminiCli) {
             return Ok(capabilities);
         }
+        let gemini = runtime == RuntimeId::GeminiCli;
         let selected = self.writable_runtime_selection.as_ref().with_context(|| {
-            format!(
-                "{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification"
-            )
+            if gemini {
+                format!("{WRITABLE_GEMINI_SELECTION_EVIDENCE_MISSING}: writable Gemini selection evidence disappeared before confinement verification")
+            } else {
+                format!("{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification")
+            }
         })?;
         let proof = self.worktree_writable_confinement.as_ref().with_context(|| {
-            format!(
-                "{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof"
-            )
+            if gemini {
+                format!("{WRITABLE_GEMINI_CONFINEMENT_PROOF_MISSING}: writable Gemini has no MACO-owned managed-worktree confinement proof")
+            } else {
+                format!("{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof")
+            }
         })?;
         if proof.selected_launch.as_ref() != Some(selected) || !proof.command.matches_command(self)
         {
             bail!(
-                "{WRITABLE_GROK_CONFINEMENT_PROOF_STALE}: writable Grok confinement proof does not bind the current selected launch"
+                "{}: writable runtime confinement proof does not bind the current selected launch",
+                if gemini {
+                    WRITABLE_GEMINI_CONFINEMENT_PROOF_STALE
+                } else {
+                    WRITABLE_GROK_CONFINEMENT_PROOF_STALE
+                }
             );
         }
         let admission = &proof.admission;
@@ -1551,13 +1627,14 @@ impl ExternalAgentCommand {
             || admission.worktree.kind != ManagedWorktreeAdmissionKind::ManagedDisposable
             || admission.worktree.worktree_id != selected.assignment_id
             || admission.claims.state != HeldPathClaimsAdmissionState::Held
-            || admission.native_sandbox.runtime != RuntimeId::Grok
+            || admission.native_sandbox.runtime != runtime
             || admission.native_sandbox.workspace_access != WorkspaceAccess::ReadWrite
             || admission.native_sandbox.side_effect_confinement != SideEffectConfinement::Verified
             || self.workspace_access != WorkspaceAccess::ReadWrite
         {
             bail!(
-                "{WRITABLE_GROK_CONFINEMENT_UNVERIFIED}: writable Grok confinement proof does not authenticate the current bounded managed-worktree launch"
+                "{}: writable runtime confinement proof does not authenticate the current bounded managed-worktree launch",
+                if gemini { WRITABLE_GEMINI_CONFINEMENT_UNVERIFIED } else { WRITABLE_GROK_CONFINEMENT_UNVERIFIED }
             );
         }
         Ok(capabilities)
@@ -1581,6 +1658,12 @@ impl ExternalAgentCommand {
         {
             self.grok_run_account_binding =
                 crate::account_authority::grok_run_account_binding(&run_id);
+        }
+        if self.invocation == ExternalAgentInvocation::GeminiCli
+            && self.gemini_run_account_binding.is_none()
+        {
+            self.gemini_run_account_binding =
+                crate::account_authority::gemini_run_account_binding(&run_id);
         }
         self.agent_lifecycle = Some(ExternalAgentLifecycleIdentity {
             registry_repo: registry_repo.into(),
@@ -1815,6 +1898,12 @@ impl ExternalAgentRun {
         &self,
     ) -> Option<&ManagedGrokAccountSelectionEvidence> {
         self.stdout.run_metadata.managed_grok_selection.as_ref()
+    }
+
+    pub(crate) fn managed_gemini_selection_evidence(
+        &self,
+    ) -> Option<&ManagedGeminiAccountSelectionEvidence> {
+        self.stdout.run_metadata.managed_gemini_selection.as_ref()
     }
 
     pub fn fixed_version_probe_evidence(&self) -> Option<&EnvironmentFixedVersionProbeEvidence> {
@@ -2086,6 +2175,10 @@ impl ExternalAgentRun {
     /// Scratch output may be discarded only when the main target was never
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
+    pub(crate) fn gemini_bridge_evidence(&self) -> Option<&gemini_bridge::HeldEvidence> {
+        self.stdout.run_metadata.gemini_bridge.as_ref()
+    }
+
     pub(crate) fn source_probe_confirmed_no_provider_release(&self) -> bool {
         self.stdout
             .run_metadata
@@ -2170,6 +2263,8 @@ struct ExternalAgentRunWireRef<'a> {
     codex_parent_evidence: &'a Option<CodexParentEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_grok_selection: &'a Option<ManagedGrokAccountSelectionEvidence>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    managed_gemini_selection: &'a Option<ManagedGeminiAccountSelectionEvidence>,
 }
 
 #[derive(Deserialize)]
@@ -2217,6 +2312,8 @@ struct ExternalAgentRunWireOwned {
     codex_parent_evidence: Option<CodexParentEvidence>,
     #[serde(default)]
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
+    #[serde(default)]
+    managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -2260,6 +2357,7 @@ impl Serialize for ExternalAgentRun {
             grok_acp_parent_evidence: &self.grok_acp_parent_evidence,
             codex_parent_evidence: &self.codex_parent_evidence,
             managed_grok_selection: &self.stdout.run_metadata.managed_grok_selection,
+            managed_gemini_selection: &self.stdout.run_metadata.managed_gemini_selection,
         }
         .serialize(serializer)
     }
@@ -2286,6 +2384,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             wire.machine_global_retention_operation_id;
         stdout.run_metadata.pre_action_review_metrics = wire.pre_action_review_metrics;
         stdout.run_metadata.managed_grok_selection = wire.managed_grok_selection;
+        stdout.run_metadata.managed_gemini_selection = wire.managed_gemini_selection;
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -2311,6 +2410,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
+    gemini_bridge: Option<gemini_bridge::HeldEvidence>,
     read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
     local_source_probe_refusal_quiescent: bool,
     researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
@@ -2338,6 +2438,7 @@ struct ExternalAgentRunMetadata {
     codex_cli_usage: Option<Usage>,
     codex_cli_usage_complete: bool,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
+    managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2867,10 +2968,15 @@ fn run_external_agent_runtime(
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if let Some(adapter) = spec.invocation.adapter_id() {
-            let capabilities = if adapter == AdapterId::Grok
-                && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
-            {
-                match spec.verified_writable_capabilities(RuntimeId::Grok) {
+            let selected_runtime = match adapter {
+                AdapterId::Grok => Some(RuntimeId::Grok),
+                AdapterId::GeminiCli => Some(RuntimeId::GeminiCli),
+                _ => None,
+            };
+            let capabilities = if let Some(selected_runtime) = selected_runtime.filter(|_| {
+                spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+            }) {
+                match spec.verified_writable_capabilities(selected_runtime) {
                     Ok(capabilities) => capabilities,
                     Err(error) => {
                         return failed_external_environment_run(
@@ -2880,7 +2986,9 @@ fn run_external_agent_runtime(
                             false,
                             EnvironmentFailureCategory::SandboxUnavailable,
                             Some(external_sandbox_requirement(spec.invocation)),
-                            format!("writable grok failed closed before launch: {error:#}"),
+                            format!(
+                                "writable selected runtime failed closed before launch: {error:#}"
+                            ),
                         );
                     }
                 }
@@ -2904,6 +3012,9 @@ fn run_external_agent_runtime(
                 );
             }
         }
+    }
+    if spec.uses_gemini_bridge() && runtime == ExternalExecutionRuntime::Verified {
+        return gemini_bridge::run(spec, cancellation, started);
     }
     // Hosted duplex review is optional defense-in-depth. Isolated worktree
     // children launch with native permission/sandbox mode; they are not
@@ -5580,6 +5691,7 @@ fn persist_machine_global_retention_receipt(
 }
 
 struct ExternalOutputStaging {
+    preserve_unquiescent: bool,
     root_path: PathBuf,
     reservation: Option<ReservedOutputFile>,
     /// Parent-owned `CODEX_HOME` for supervisor launches. It lives below the staging root so
@@ -5650,6 +5762,7 @@ impl ExternalOutputStaging {
                 bound_store: Some(store),
                 bound_root_reservation: Some(root_reservation),
                 cleanup_completed: false,
+                preserve_unquiescent: false,
             }),
             Err(error) => {
                 store
@@ -5721,6 +5834,7 @@ impl ExternalOutputStaging {
                 bound_store: None,
                 bound_root_reservation: None,
                 cleanup_completed: false,
+                preserve_unquiescent: false,
             }),
             Err(error) => {
                 tracing::warn!(
@@ -5859,7 +5973,7 @@ impl ExternalOutputStaging {
 
 impl Drop for ExternalOutputStaging {
     fn drop(&mut self) {
-        if self.cleanup_completed {
+        if self.cleanup_completed || self.preserve_unquiescent {
             return;
         }
         if self.machine_global_retention.is_some() {

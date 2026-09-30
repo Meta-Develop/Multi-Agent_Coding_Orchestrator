@@ -322,7 +322,7 @@ pub(super) fn import_worker_execution_journals(
     import_worker_execution_journals_at(writer, assignment, incoming_scratch, external_run, None)
 }
 
-pub(super) fn import_worker_execution_journals_at(
+pub(crate) fn import_worker_execution_journals_at(
     writer: &mut ArtifactRunWriter,
     assignment: &OrchestratorAssignment,
     incoming_scratch: &ArtifactScratchDirectory,
@@ -432,7 +432,7 @@ pub(super) fn import_worker_execution_journals_at(
     Ok(journals)
 }
 
-pub(super) fn parse_worker_execution_journal(
+pub(crate) fn parse_worker_execution_journal(
     bytes: &[u8],
     display_path: &Path,
 ) -> Result<Vec<WorkerExecutionJournalEntry>> {
@@ -485,7 +485,7 @@ pub(super) fn parse_worker_execution_journal(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum WorkerExecutionJournalRecordError {
+pub(crate) enum WorkerExecutionJournalRecordError {
     #[error(
         "worker execution journal record omitted command; corrective action: provide a nonempty command array before retrying the append"
     )]
@@ -551,7 +551,7 @@ fn validate_worker_execution_journal_record(
     Ok(())
 }
 
-pub(super) fn append_worker_execution_journal_record(
+pub(crate) fn append_worker_execution_journal_record(
     journal: &mut impl std::io::Write,
     entry: &WorkerExecutionJournalEntry,
 ) -> std::result::Result<(), WorkerExecutionJournalRecordError> {
@@ -1936,6 +1936,20 @@ pub(super) fn external_process_completed(
     run: &ExternalAgentRun,
     runtime: SupervisorRuntime,
 ) -> bool {
+    if runtime == SupervisorRuntime::GeminiCli {
+        let Some(evidence) = run.gemini_bridge_evidence() else {
+            return false;
+        };
+        return run.publishable
+            && run.exit_code == Some(0)
+            && !run.timed_out
+            && run.error.is_none()
+            && run.managed_gemini_selection_evidence().is_some()
+            && evidence.provider_released
+            && evidence.managed_worker_completed
+            && evidence.tool_mutation_observed
+            && external_safety_verified(run, runtime);
+    }
     if runtime == SupervisorRuntime::Fake {
         return run.simulation_succeeded()
             && run.program_trust == ExternalProgramTrust::ExplicitCustom;

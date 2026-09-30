@@ -12,6 +12,34 @@ pub mod grok;
 pub(crate) mod grok_acp;
 pub mod hosted_callback;
 
+/// Exact owned bootstrap selection. This is not a capability or identity claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeminiBootstrapDescriptor;
+
+impl GeminiBootstrapDescriptor {
+    pub(crate) const NODE: &str =
+        "/nix/store/6x6v11xjf0psckgqmyhfyhw9bdma0rn6-nodejs-22.22.2/bin/node";
+    pub(crate) const NODE_RESOLVED: &str =
+        "/nix/store/vs03s8q30qg698zzpbszk08j4shb0gsl-nodejs-slim-22.22.2/bin/node";
+    pub(crate) const NODE_SHA256: &str =
+        "ee614b3f5d9fb5aa59845aa18fb620e5b259a3cd907353b4fd43d904a76c5191";
+    pub(crate) const GEMINI: &str =
+        "/nix/store/xxd1smzi0a54ldwpc3l8d4v7k2bgjcpl-gemini-cli-0.41.2/bin/gemini";
+    pub(crate) const BOOTSTRAP: &str = include_str!("gemini_managed_bootstrap.mjs");
+    pub(crate) const WIRE: &str = include_str!("gemini_code_assist_wire.mjs");
+
+    pub(crate) fn select(config: &RuntimeAdapterConfig, program: &Path) -> Result<Self> {
+        let mut expected = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
+        expected.binary = config.binary.clone();
+        if config != &expected
+            || std::fs::canonicalize(program)? != std::fs::canonicalize(Self::GEMINI)?
+        {
+            bail!("Gemini managed bootstrap requires the exact pinned executable and default adapter arguments");
+        }
+        Ok(Self)
+    }
+}
+
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
     BlockingPreActionCallback, CapabilityMatrix, CapabilityMatrixCell, CapabilityMatrixRow,

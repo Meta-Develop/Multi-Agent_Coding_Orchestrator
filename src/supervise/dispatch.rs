@@ -51,7 +51,8 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
     let pricing = command
         .model
         .as_ref()
-        .and_then(|model| pricing_for_runtime(plan, model, runtime));
+        .and_then(|model| pricing_for_runtime(plan, model, runtime))
+        .filter(|_| runtime != SupervisorRuntime::GeminiCli || !command.uses_gemini_bridge());
     let cost_usd = pricing
         .map(|pricing| {
             const TOKENS_PER_MILLION: f64 = 1_000_000.0;
@@ -109,6 +110,9 @@ pub(super) fn external_dispatch_may_have_started(
 ) -> bool {
     runtime == SupervisorRuntime::Fake
         || (!run.source_probe_confirmed_no_provider_release()
+            && !run
+                .gemini_bridge_evidence()
+                .is_some_and(|evidence| evidence.no_release_quiescent)
             && (run.process_tree.is_some() || !run.scratch_quiescence_verified()))
 }
 

@@ -333,7 +333,11 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+#[cfg(target_os = "linux")]
+pub(crate) use reporting::append_worker_execution_journal_record;
 use reporting::*;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use reporting::{import_worker_execution_journals_at, parse_worker_execution_journal};
 
 #[cfg(test)]
 pub(crate) use reporting::command_record_from_external;
@@ -4104,16 +4108,17 @@ struct ExternalAttemptEvidenceContext<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerExecutionJournalEvidence {
+pub(crate) struct WorkerExecutionJournalEvidence {
     incoming_relative_path: PathBuf,
     evidence_relative_path: PathBuf,
-    status: WorkerExecutionJournalStatus,
+    pub(crate) status: WorkerExecutionJournalStatus,
 }
 
-type WorkerExecutionJournalEvidenceSet = BTreeMap<String, WorkerExecutionJournalEvidence>;
+pub(crate) type WorkerExecutionJournalEvidenceSet =
+    BTreeMap<String, WorkerExecutionJournalEvidence>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerExecutionJournalStatus {
+pub(crate) enum WorkerExecutionJournalStatus {
     Loaded(Vec<WorkerExecutionJournalEntry>),
     Missing,
     Invalid(String),
@@ -4121,12 +4126,12 @@ enum WorkerExecutionJournalStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerExecutionJournalEntry {
-    command: Vec<String>,
-    cwd: PathBuf,
-    start_timestamp: String,
-    end_timestamp: String,
-    changed_paths: Vec<PathBuf>,
+pub(crate) struct WorkerExecutionJournalEntry {
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) start_timestamp: String,
+    pub(crate) end_timestamp: String,
+    pub(crate) changed_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]

@@ -1,12 +1,14 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, rmdirSync, readFileSync, mkdirSync } from "node:fs";
+import { mkdtempSync, rmdirSync, readFileSync, mkdirSync, writeFileSync, unlinkSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { fileURLToPath, pathToFileURL } from "node:url";
 import { dirname, join } from "node:path";
 import { tmpdir } from "node:os";
 import { Readable } from "node:stream";
-import { loadOfflineCodeAssist, instrumentVendor, VENDOR_ROOT, CLOSURE } from "./gemini_managed_bootstrap.mjs";
+import net from "node:net";
+import { loadOfflineCodeAssist, instrumentVendor, VENDOR_ROOT, CLOSURE, connectManagedParent, managedEnvironmentKeysAllowed, createNativeToolJournal } from "./gemini_managed_bootstrap.mjs";
 
 import { bindCodeAssistClient0412, createCodeAssistWireUnit } from "./gemini_code_assist_wire.mjs";
 const envelope = { traceId: "synthetic-offline", response: {
@@ -22,7 +24,15 @@ function physicalResponse(text, status = 200) {
 
 async function scenario(name) {
   process.chdir("/candidate");
-  const events = []; let sends = 0; let refreshes = 0;
+  const events = []; let sends = 0; let refreshes = 0; let quotaSends = 0;
+  let terminalGate;
+  function holdNextQuotaTerminal() {
+    let observe; let acknowledge;
+    const observed = new Promise((resolve) => { observe = resolve; });
+    const ack = new Promise((resolve) => { acknowledge = resolve; });
+    terminalGate = { observe, ack };
+    return { observed, acknowledge };
+  }
   if (name === "preloaded") {
     // Still inside the empty, network-denied namespace. A cached core may not
     // certify source hook coverage, even if all remaining imports are guarded.
@@ -31,7 +41,20 @@ async function scenario(name) {
   if (name === "profile") process.env.NODE_OPTIONS = "--inspect";
   if (name === "ambient-file") mkdirSync("/profile/.gemini");
   const load = () => loadOfflineCodeAssist({
-    parent: { admit: async (event) => { events.push(event); return true; }, record: async (event) => { events.push(event); return true; } },
+    parent: {
+      observeTool: async (event) => { events.push(event); return true; },
+      admit: async (event) => { events.push(event); return true; },
+      record: async (event) => {
+        events.push(event);
+        if (terminalGate && event.kind === "terminal" && event.requestClass === "quota") {
+          const gate = terminalGate;
+          terminalGate = undefined;
+          gate.observe(event);
+          return gate.ack;
+        }
+        return true;
+      },
+    },
     physicalSink: async (url, options) => {
       sends++;
       assert.equal(options.retry, false); assert.equal(options.maxRedirects, 0);
@@ -40,6 +63,10 @@ async function scenario(name) {
         refreshes++;
         assert.equal(events.at(-1).requestClass, "oauth_refresh");
         return physicalResponse(JSON.stringify({ access_token: "synthetic-refreshed", token_type: "Bearer", expires_in: 3600 }));
+      }
+      if (name === "setup-methods" && url.endsWith(":retrieveUserQuota")) {
+        quotaSends++;
+        if (quotaSends === 1) return physicalResponse("{}", 401);
       }
       if (name === "replay" && sends === 1) return physicalResponse("{}", 401);
       return physicalResponse(options.params?.alt === "sse" ? `data: ${JSON.stringify(envelope)}\n\n` : JSON.stringify(envelope));
@@ -92,13 +119,30 @@ async function scenario(name) {
     assert.equal(sends, 0); return;
   }
   if (name === "tools") {
-    const registry = new b.core.ToolRegistry(config, config.getMessageBus());
+    await config.initialize();
+    const registry = new b.core.ToolRegistry(config, config.getMessageBus(), true);
     const reader = new b.core.ReadFileTool(config, config.getMessageBus());
     registry.registerTool(reader);
+    assert.ok(registry.getFunctionDeclarations().some((declaration) =>
+      declaration.name === b.core.ReadFileTool.Name));
     const invocation = reader.build({ file_path: "sample.txt" });
     const result = await invocation.execute({ abortSignal: new AbortController().signal });
     assert.match(result.llmContent, /Substantive confined source packet/);
+    const observations = events.filter((event) => event.tool === b.core.ReadFileTool.Name);
+    assert.deepEqual(observations.map((event) => event.kind), ["begin", "completed"]);
+    assert.equal(observations[0].actionId, observations[1].actionId);
+    assert.equal(observations[0].argumentsJson, JSON.stringify({ file_path: "sample.txt" }));
+    assert.equal(observations[1].argumentsJson, observations[0].argumentsJson);
+    assert.equal(observations[1].cwd, process.cwd());
+    assert.equal(observations[1].afterSha256, observations[0].beforeSha256);
     assert.throws(() => reader.build({ file_path: "../profile/system.json" }), /tool_path/);
+    assert.equal(sends, 0); return;
+  }
+  if (name === "mcp-empty") {
+    await config.initialize();
+    assert.deepEqual(config.getMcpServers(), {});
+    assert.equal(config.getMcpServerCommand(), undefined);
+    assert.throws(() => config.getMcpServers("unexpected"), /forbidden_config_route/);
     assert.equal(sends, 0); return;
   }
   if (name === "tool-spoof") {
@@ -129,6 +173,42 @@ async function scenario(name) {
   assert.equal(client.transporter.request, transport);
   const fresh = makeClient(); const third = new b.core.CodeAssistServer(fresh, "synthetic-project", {}, "offline");
   assert.notEqual(fresh.transporter.request, transport);
+  if (name === "setup-methods") {
+    await server.loadCodeAssist({ metadata: {} });
+    await server.onboardUser({ metadata: {} });
+    await server.getOperation("operations/operation-1");
+    client.setCredentials({ access_token: "synthetic-expired", refresh_token: "synthetic-refresh", expiry_date: Date.now() - 1 });
+    const replayGate = holdNextQuotaTerminal();
+    const quota = server.retrieveUserQuota({});
+    const failedQuota = await replayGate.observed;
+    assert.equal(failedQuota.terminal, "http_error");
+    const experiments = server.listExperiments({});
+    replayGate.acknowledge(true);
+    await Promise.all([quota, experiments]);
+    assert.deepEqual(b.unit.snapshot().attempts.map((attempt) => attempt.requestClass),
+      ["setup_user", "setup_user", "setup_user", "oauth_refresh", "quota", "experiments", "oauth_refresh", "quota"]);
+    assert.equal(refreshes, 2);
+    assert.equal(quotaSends, 2);
+    assert.equal(sends, 8);
+
+    const cancelGate = holdNextQuotaTerminal();
+    const cancelQuota = server.retrieveUserQuota({});
+    assert.equal((await cancelGate.observed).terminal, "eof");
+    const cancelExperiments = server.listExperiments({});
+    await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(b.unit.snapshot().activeCalls, 2);
+    b.unit.cancel();
+    cancelGate.acknowledge(true);
+    const cancelled = await Promise.allSettled([cancelQuota, cancelExperiments]);
+    assert.deepEqual(cancelled.map((result) => result.status), ["rejected", "rejected"]);
+    const startup = b.unit.snapshot();
+    assert.equal(startup.stopped, true);
+    assert.equal(startup.activeCalls, 0);
+    assert.deepEqual(startup.attempts.map((attempt) => attempt.requestClass),
+      ["setup_user", "setup_user", "setup_user", "oauth_refresh", "quota", "experiments", "oauth_refresh", "quota", "quota"]);
+    assert.equal(sends, 9);
+    return;
+  }
   if (name === "receiver") {
     await assert.rejects(b.unit.request("unary", () => client.transporter.request.call({}, {
       url: "https://cloudcode-pa.googleapis.com/v1internal:generateContent", method: "POST",
@@ -142,7 +222,7 @@ async function scenario(name) {
     assert.equal(sends, 0); return;
   }
   if (name === "unclassified") {
-    await assert.rejects(client.request({ url: "https://oauth2.googleapis.com/tokeninfo", method: "GET" }), /unscoped_send/);
+    await assert.rejects(client.request({ url: "https://oauth2.googleapis.com/tokeninfo?copy=1", method: "GET" }), /unexpected_send/);
     assert.equal(sends, 0); assert.equal(b.unit.snapshot().stopped, true); return;
   }
   const request = { model: "gemini-2.5-pro", contents: [{ role: "user", parts: [{ text: "Synthetic offline only" }] }] };
@@ -168,7 +248,200 @@ async function scenario(name) {
 if (process.argv[2] === "--offline-scenario") {
   await scenario(process.argv[3]);
 } else {
+  test("native tool journal waits for begin and terminal ACK with original arguments", async () => {
+    const root = mkdtempSync(join(tmpdir(), "maco-native-journal-"));
+    const filename = join(root, "sample.txt"), candidate = process.cwd();
+    const events = []; let beginAck, terminalAck, beginSeen, terminalSeen;
+    const began = new Promise((resolve) => { beginSeen = resolve; });
+    const ended = new Promise((resolve) => { terminalSeen = resolve; });
+    const begin = new Promise((resolve) => { beginAck = resolve; });
+    const terminal = new Promise((resolve) => { terminalAck = resolve; });
+    const parent = { observeTool: async (event) => {
+      events.push(event);
+      if (event.kind === "begin") { beginSeen(); await begin; }
+      else { terminalSeen(); await terminal; }
+      return true;
+    } };
+    const snapshot = () => {
+      try { return createHash("sha256").update(readFileSync(filename)).digest("hex"); }
+      catch (error) { if (error.code === "ENOENT") return null; throw error; }
+    };
+    try {
+      const journal = createNativeToolJournal(parent, candidate);
+      const params = Object.freeze({ file_path: "sample.txt", content: "exact\nquoted \"argument\"" });
+      let settled = false;
+      const run = journal.run("write_file", params, new AbortController().signal, snapshot,
+        async () => { writeFileSync(filename, params.content); return { llmContent: "written" }; });
+      run.then(() => { settled = true; });
+      await began;
+      assert.equal(snapshot(), null);
+      beginAck(); await ended;
+      assert.equal(readFileSync(filename, "utf8"), params.content);
+      assert.equal(settled, false);
+      terminalAck(); await run;
+      assert.deepEqual(events.map((event) => [event.kind, event.actionId]), [["begin", 1], ["completed", 1]]);
+      assert.equal(events[0].argumentsJson, JSON.stringify(params));
+      assert.equal(events[1].argumentsJson, events[0].argumentsJson);
+      assert.equal(events[0].beforeSha256, null);
+      assert.equal(events[1].afterSha256, snapshot());
+      assert.equal(events[0].cwd, candidate);
+    } finally { unlinkSync(filename); rmdirSync(root); }
+  });
+  test("native tool journal cancellation retains observed mutation and blocks another action", async () => {
+    const events = [], controller = new AbortController(); let digest = null;
+    const journal = createNativeToolJournal({ observeTool: async (event) => { events.push(event); return true; } }, process.cwd());
+    await assert.rejects(journal.run("replace", { file_path: "sample.txt", old_string: "a", new_string: "b" },
+      controller.signal, () => digest, async () => { digest = "b".repeat(64); controller.abort(); }), /native_tool_cancelled/);
+    assert.deepEqual(events.map((event) => event.kind), ["begin", "cancelled"]);
+    assert.equal(events[1].afterSha256, "b".repeat(64));
+    let executed = false;
+    await assert.rejects(journal.run("read_file", { file_path: "sample.txt" }, new AbortController().signal,
+      () => digest, async () => { executed = true; }), /tool_journal_binding/);
+    assert.equal(executed, false);
+  });
+  test("native tool journal missing or refused custody cannot execute; failed native result stays failed", async () => {
+    let executed = false;
+    for (const parent of [{}, { observeTool: async () => false }, { observeTool: async () => { throw new Error("held journal refused"); } }]) {
+      await assert.rejects(createNativeToolJournal(parent, process.cwd()).run("read_file", { file_path: "sample.txt" },
+        new AbortController().signal, () => "a".repeat(64), async () => { executed = true; }));
+    }
+    assert.equal(executed, false);
+    const events = [];
+    await assert.rejects(createNativeToolJournal({ observeTool: async (event) => { events.push(event); return true; } }, process.cwd())
+      .run("read_file", { file_path: "sample.txt" }, new AbortController().signal, () => "a".repeat(64),
+        async () => ({ error: { type: "file_error" } })), /native_tool_failed/);
+    assert.deepEqual(events.map((event) => event.kind), ["begin", "failed"]);
+  });
+  test("managed environment keys admit only exact shell intrinsics", () => {
+    const cwd = "/synthetic-candidate";
+    const fixed = { HOME: "/synthetic-profile", GEMINI_CLI_HOME: "/synthetic-profile",
+      GEMINI_CLI_SYSTEM_SETTINGS_PATH: "/synthetic-profile/system.json",
+      GEMINI_CLI_SYSTEM_DEFAULTS_PATH: "/synthetic-profile/defaults.json", PATH: "/nonexistent", LANG: "C.UTF-8" };
+    for (const personalOAuth of [false, true]) {
+      const environment = personalOAuth ? { ...fixed, GOOGLE_GENAI_USE_GCA: "true" } : fixed;
+      for (const intrinsics of [{}, { PWD: cwd }, { SHLVL: "0" }, { PWD: cwd, SHLVL: "0" }]) {
+        assert.equal(managedEnvironmentKeysAllowed({ ...environment, ...intrinsics }, cwd, personalOAuth), true);
+      }
+      for (const refused of [{ PWD: `${cwd}/other` }, { SHLVL: "1" }, { SHLVL: "" },
+        { _: "" }, { FOREIGN_KEY: "synthetic" }, { LD_LIBRARY_PATH: "/synthetic-lib" }, { NODE_OPTIONS: "--trace-warnings" }]) {
+        assert.equal(managedEnvironmentKeysAllowed({ ...environment, ...refused }, cwd, personalOAuth), false);
+      }
+    }
+    assert.equal(managedEnvironmentKeysAllowed({ ...fixed, GOOGLE_GENAI_USE_GCA: "true" }, cwd), false);
+  });
+
+  async function privateChannelCase(reply, operation) {
+    const root = mkdtempSync(join(tmpdir(), "maco-gemini-private-channel-"));
+    assert.match(root, /^\/tmp\/maco-gemini-private-channel-[A-Za-z0-9]+$/);
+    const connections = new Set(); const messages = []; let cancelled = 0;
+    const server = net.createServer((socket) => {
+      connections.add(socket); socket.on("error", () => {});
+      let data = "";
+      socket.on("data", (bytes) => {
+        data += bytes.toString("utf8");
+        const end = data.indexOf("\n");
+        if (end < 0) return;
+        const message = JSON.parse(data.slice(0, end)); data = data.slice(end + 1);
+        messages.push(message); reply(socket, message);
+      });
+    });
+    let client;
+    try {
+      await new Promise((resolve, reject) => { server.once("error", reject); server.listen(join(root, "parent.sock"), resolve); });
+      client = await connectManagedParent(join(root, "parent.sock"), "a".repeat(64), { timeoutMs: 500, onCancel: () => cancelled++ });
+      await operation(client, messages, () => cancelled);
+    } finally {
+      client?.close(); for (const socket of connections) socket.destroy();
+      await new Promise((resolve) => server.close(resolve));
+      rmdirSync(root); // Empty owned leaf only; unexpected contents fail cleanup.
+    }
+  }
+  const acknowledge = (socket, message) => socket.write(JSON.stringify({ nonce: message.nonce, sequence: message.sequence, ok: true }) + "\n");
+  test("managed private channel requires a fresh ordered ACK for each callback", async () => {
+    await privateChannelCase(acknowledge, async (client, messages) => {
+      assert.equal(await client.admit({ kind: "admission", attemptId: 1 }), true);
+      assert.equal(await client.record({ kind: "release", attemptId: 1 }), true);
+      assert.deepEqual(messages.map((m) => m.sequence), [1, 2]);
+      assert.deepEqual(messages.map((m) => m.message.event.kind), ["admission", "release"]);
+    });
+  });
+  for (const failure of ["lost", "wrong-nonce", "replay", "duplicate", "malformed", "oversized"]) {
+    test(`managed private channel ${failure} latches cancellation and denies queued callbacks`, async () => {
+      await privateChannelCase((socket, m) => {
+        if (failure === "lost") return;
+        if (failure === "malformed") return socket.write("{\n");
+        if (failure === "oversized") return socket.write("x".repeat(4097));
+        if (failure === "duplicate") return socket.write(`{"nonce":"${m.nonce}","sequence":${m.sequence},"ok":false,"ok":true}\n`);
+        socket.write(JSON.stringify({ nonce: failure === "wrong-nonce" ? "b".repeat(64) : m.nonce,
+          sequence: failure === "replay" ? m.sequence - 1 : m.sequence, ok: true }) + "\n");
+      }, async (client, messages, cancelled) => {
+        const first = client.admit({ kind: "admission" });
+        const second = client.record({ kind: "release" });
+        const results = await Promise.allSettled([first, second]);
+        assert.deepEqual(results.map((r) => r.status), ["rejected", "rejected"]);
+        assert.equal(messages.length, 1); assert.equal(cancelled(), 1);
+        await assert.rejects(client.admit({ kind: "admission", attemptId: 2 }), /parent_channel_lost/);
+        assert.equal(messages.length, 1);
+      });
+    });
+  }
   const directory = dirname(fileURLToPath(import.meta.url));
+  test("managed bootstrap reports only an allowlisted pre-handshake category", () => {
+    const root = mkdtempSync(join(tmpdir(), "maco-gemini-bootstrap-category-"));
+    const control = join(root, "control");
+    const profile = join(control, "profile");
+    const candidate = join(root, "candidate");
+    const files = [];
+    try {
+      mkdirSync(control, { mode: 0o700 });
+      mkdirSync(profile, { mode: 0o700 });
+      mkdirSync(candidate, { mode: 0o700 });
+      const put = (filename, bytes) => {
+        writeFileSync(filename, bytes, { mode: 0o600, flag: "wx" });
+        files.push(filename);
+      };
+      const hash = (bytes) => createHash("sha256").update(bytes).digest("hex");
+      const bootstrap = readFileSync(join(directory, "gemini_managed_bootstrap.mjs"));
+      const wire = readFileSync(join(directory, "gemini_code_assist_wire.mjs"));
+      put(join(control, "gemini_managed_bootstrap.mjs"), bootstrap);
+      put(join(control, "gemini_code_assist_wire.mjs"), wire);
+      put(join(profile, "system.json"), "{}\n");
+      put(join(profile, "defaults.json"), "{}\n");
+      const manifest = join(control, "launch.json");
+      const launch = { candidate, model: "synthetic-model", nonce: "a".repeat(64),
+        promptSha256: hash("synthetic-prompt"), bootstrapSha256: hash(bootstrap), wireSha256: hash(wire) };
+      put(manifest, JSON.stringify(launch));
+      const invalidChannel = join(control, "invalid-channel.json");
+      put(invalidChannel, JSON.stringify({ ...launch, nonce: "sensitive-invalid-nonce" }));
+      const environment = { HOME: profile, GEMINI_CLI_HOME: profile,
+        GEMINI_CLI_SYSTEM_SETTINGS_PATH: join(profile, "system.json"),
+        GEMINI_CLI_SYSTEM_DEFAULTS_PATH: join(profile, "defaults.json"), PATH: "/nonexistent", LANG: "C.UTF-8" };
+      for (const [manifestPath, env, stage] of [
+        [join(control, "sensitive-manifest-name.json"), {}, "manifest"],
+        [manifest, { ...environment, FOREIGN_KEY: "sensitive-environment-value" }, "profile"],
+        [manifest, { ...environment, PWD: control }, "profile"],
+        [manifest, { ...environment, SHLVL: "1" }, "profile"],
+        [manifest, { ...environment, _: "" }, "profile"],
+        [invalidChannel, environment, "parent_connect"],
+        [manifest, { ...environment, PWD: candidate, SHLVL: "0" }, "hello_ack"],
+      ]) {
+        const result = spawnSync(process.execPath,
+          [join(directory, "gemini_managed_bootstrap.mjs"), "--maco-managed", manifestPath],
+          { cwd: candidate, encoding: "utf8", env, timeout: 5000, maxBuffer: 4096 });
+        assert.equal(result.error, undefined, String(result.error));
+        assert.equal(result.status, 1);
+        assert.equal(result.stdout, "");
+        assert.equal(result.stderr, `bootstrap: pre_handshake_${stage}\n`);
+        assert.doesNotMatch(result.stderr, /sensitive-|FOREIGN_KEY|ENOENT|Error:|synthetic-/);
+      }
+    } finally {
+      for (const filename of files) unlinkSync(filename);
+      rmdirSync(profile);
+      rmdirSync(control);
+      rmdirSync(candidate);
+      rmdirSync(root);
+    }
+  });
   const sandbox = String.raw`
 set -euo pipefail
 root="$1"
@@ -194,7 +467,7 @@ mount --bind /dev/null "$root/dev/null"
 cd "$root/candidate"
 exec env -i HOME=/profile GEMINI_CLI_HOME=/profile GEMINI_CLI_SYSTEM_SETTINGS_PATH=/profile/system.json GEMINI_CLI_SYSTEM_DEFAULTS_PATH=/profile/defaults.json PATH=/nonexistent LANG=C.UTF-8 /usr/sbin/chroot "$root" "$node" /owned/gemini_managed_bootstrap.test.mjs --offline-scenario "$scenario"
 `;
-  for (const name of ["installed", "replay", "hostile-config", "sdk", "alias", "profile", "ambient-file", "preloaded", "tools", "tool-spoof", "shell", "extensions", "logging-backend", "receiver", "ownership", "unclassified", "unknown-dependency", "userinfo"]) {
+  for (const name of ["installed", "replay", "hostile-config", "sdk", "alias", "profile", "ambient-file", "preloaded", "tools", "mcp-empty", "tool-spoof", "shell", "extensions", "logging-backend", "setup-methods", "receiver", "ownership", "unclassified", "unknown-dependency", "userinfo"]) {
     test(`installed 0.41.2 offline namespace: ${name}`, { timeout: 45000 }, () => {
       const root = mkdtempSync(join(tmpdir(), "maco-gemini-phase-j-"));
       assert.match(root, /^\/tmp\/maco-gemini-phase-j-[A-Za-z0-9]+$/);

@@ -66,8 +66,22 @@ fn verify_effective_system_call_filter(
             ));
         }
     }
-    if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-        for syscall in ["socket", "socketpair", "socketcall"] {
+    if matches!(
+        kind,
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            | SideEffectConfinementProfileKind::GeminiOfflineBridge
+            | SideEffectConfinementProfileKind::GeminiOnlineBridge
+    ) {
+        let syscalls: &[&str] = if matches!(
+            kind,
+            SideEffectConfinementProfileKind::GeminiOfflineBridge
+                | SideEffectConfinementProfileKind::GeminiOnlineBridge
+        ) {
+            &["socketpair", "socketcall"]
+        } else {
+            &["socket", "socketpair", "socketcall"]
+        };
+        for &syscall in syscalls {
             if !tokens
                 .iter()
                 .any(|token| token.trim_start_matches('~') == syscall)
@@ -114,11 +128,19 @@ fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_path_binding_property(
-    name: &str,
-    source: &Path,
-    destination: &Path,
-) -> OsString {
+fn systemd_rooted_path_property(name: &str, path: &Path, optional: bool) -> OsString {
+    let mut property = OsString::from("--property=");
+    property.push(name);
+    if optional {
+        property.push("-");
+    }
+    property.push("+");
+    property.push(path.as_os_str());
+    property
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_path_binding_property(name: &str, source: &Path, destination: &Path) -> OsString {
     let mut property = systemd_path_property(name, source, false);
     property.push(":");
     property.push(destination.as_os_str());
@@ -172,6 +194,7 @@ struct SystemdUnit {
     cgroup_path: PathBuf,
     runtime_dir: PathBuf,
     client_runtime: PathBuf,
+    isolated_root: Option<tempfile::TempDir>,
     environment_file: PathBuf,
     ready_path: PathBuf,
     waiting_path: PathBuf,
@@ -462,6 +485,7 @@ impl SystemdUnit {
             cgroup_path,
             runtime_dir,
             client_runtime,
+            isolated_root: None,
             environment_file,
             ready_path,
             waiting_path,
@@ -517,9 +541,9 @@ impl SystemdUnit {
         };
         let mut private_runtime_files = spec.private_runtime_files.clone();
         if spec.staged_codex_home.is_none()
-            && private_runtime_files.iter().any(|file| {
-                file.destination == PrivateRuntimeFileDestination::StagedCodexHome
-            })
+            && private_runtime_files
+                .iter()
+                .any(|file| file.destination == PrivateRuntimeFileDestination::StagedCodexHome)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -558,8 +582,21 @@ impl SystemdUnit {
             target_environment
         });
         let mut sandbox = resolve_systemd_sandbox(spec)?;
-        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref())
+        if sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.isolated_host_view)
         {
+            self.select_isolated_runtime_helpers()?;
+        }
+        if let Some(sandbox) = sandbox
+            .as_mut()
+            .filter(|sandbox| is_gemini_bridge_kind(sandbox.kind))
+        {
+            let root = create_gemini_isolated_root(&self.client_runtime)?;
+            bind_gemini_isolated_root_identity(sandbox, root.path())?;
+            self.isolated_root = Some(root);
+        }
+        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref()) {
             sandbox.validate_staged_codex_home(home)?;
         }
         let target_current_dir = sandbox
@@ -641,6 +678,12 @@ impl SystemdUnit {
                 runtime_max.as_millis()
             ));
         if let Some(sandbox) = &sandbox {
+            if is_gemini_bridge_kind(sandbox.kind) {
+                let isolated_root = self.isolated_root.as_ref().ok_or_else(|| {
+                    std::io::Error::other("Gemini private isolated root was not retained")
+                })?;
+                apply_gemini_isolated_root_properties(&mut command, sandbox, isolated_root.path())?;
+            }
             apply_systemd_sandbox_properties(&mut command, sandbox, &self.runtime_dir);
             command
                 .arg(systemd_path_property(
@@ -697,6 +740,14 @@ impl SystemdUnit {
             for check in &sandbox.mount_checks {
                 command
                     .arg(match check.access {
+                        SandboxMountAccess::ReadOnly if is_gemini_bridge_kind(sandbox.kind) => {
+                            "ro-mountpoint"
+                        }
+                        SandboxMountAccess::ReadWrite | SandboxMountAccess::PrivateRuntime
+                            if is_gemini_bridge_kind(sandbox.kind) =>
+                        {
+                            "rw-mountpoint"
+                        }
                         SandboxMountAccess::ReadOnly => "ro",
                         SandboxMountAccess::ReadWrite => "rw",
                         SandboxMountAccess::PrivateRuntime => "rw",
@@ -737,6 +788,21 @@ impl SystemdUnit {
             }
         }
         Ok(command)
+    }
+
+    fn select_isolated_runtime_helpers(&mut self) -> std::io::Result<()> {
+        let path = env::var_os("PATH").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated host view requires a pinned Nix-store PATH",
+            )
+        })?;
+        self.env_program = required_trusted_nix_store_executable("env", &path)?;
+        self.shell = required_trusted_nix_store_executable("sh", &path)?;
+        self.sleep_program = required_trusted_nix_store_executable("sleep", &path)?;
+        self.stat_program = required_trusted_nix_store_executable("stat", &path)?;
+        self.findmnt_program = required_trusted_nix_store_executable("findmnt", &path)?;
+        Ok(())
     }
 
     fn confirm_attached(
@@ -877,7 +943,12 @@ impl SystemdUnit {
             &self.name,
             SYSTEMD_SANDBOX_SHOW_PROPERTIES,
         )?;
-        verify_systemd_sandbox_properties(sandbox, &properties, &self.runtime_dir)
+        verify_systemd_sandbox_properties(
+            sandbox,
+            &properties,
+            &self.runtime_dir,
+            self.isolated_root.as_ref().map(tempfile::TempDir::path),
+        )
     }
 
     fn release_start_gate(
@@ -1190,7 +1261,7 @@ impl SystemdUnit {
         }
     }
 
-    fn remove_runtime_files(&self) {
+    fn remove_runtime_files(&mut self) {
         for path in &self.runtime_file_paths {
             let _ = fs::remove_file(path);
         }
@@ -1204,7 +1275,41 @@ impl SystemdUnit {
         let _ = fs::remove_file(&self.ready_path);
         let _ = fs::remove_file(&self.environment_file);
         let _ = fs::remove_dir(&self.runtime_dir);
+        if let Some(root) = self.isolated_root.take() {
+            let _ = root.close();
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_gemini_isolated_root(client_runtime: &Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::Builder::new()
+        .prefix("maco-gemini-root-")
+        .tempdir_in(client_runtime)?;
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::symlink_metadata(root.path())?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    let canonical_runtime = fs::canonicalize(client_runtime)?;
+    let canonical_root = fs::canonicalize(root.path())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+        || canonical_root.parent() != Some(canonical_runtime.as_path())
+        || canonical_root != root.path()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "unsafe Gemini private isolated root {}",
+                root.path().display()
+            ),
+        ));
+    }
+    Ok(root)
 }
 
 #[cfg(target_os = "linux")]
@@ -1523,16 +1628,48 @@ fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
 
 #[cfg(unix)]
 fn find_trusted_unix_executable(_name: &str, candidates: &[&str]) -> Option<PathBuf> {
+    candidates.iter().find_map(|candidate| {
+        trusted_canonical_unix_executable(Path::new(candidate)).map(|_| PathBuf::from(candidate))
+    })
+}
+
+#[cfg(unix)]
+fn trusted_canonical_unix_executable(candidate: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    candidates.iter().find_map(|candidate| {
-        let canonical = fs::canonicalize(candidate).ok()?;
-        let metadata = canonical.metadata().ok()?;
-        (metadata.is_file()
-            && metadata.uid() == 0
-            && metadata.permissions().mode() & 0o111 != 0
-            && metadata.permissions().mode() & 0o022 == 0)
-            .then(|| PathBuf::from(candidate))
+    let canonical = fs::canonicalize(candidate).ok()?;
+    let metadata = canonical.metadata().ok()?;
+    (metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.permissions().mode() & 0o111 != 0
+        && metadata.permissions().mode() & 0o022 == 0)
+        .then_some(canonical)
+}
+
+#[cfg(unix)]
+fn find_trusted_nix_store_executable_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+    env::split_paths(path)
+        .filter(|directory| directory.is_absolute() && directory.starts_with("/nix/store"))
+        .find_map(|directory| {
+            let directory = fs::canonicalize(directory).ok()?;
+            if !directory.starts_with("/nix/store") {
+                return None;
+            }
+            let candidate = directory.join(name);
+            let canonical = trusted_canonical_unix_executable(&candidate)?;
+            canonical.starts_with("/nix/store").then_some(candidate)
+        })
+}
+
+#[cfg(unix)]
+fn required_trusted_nix_store_executable(name: &str, path: &OsStr) -> io::Result<PathBuf> {
+    find_trusted_nix_store_executable_in_path(name, path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "isolated host view requires trusted {name} from an absolute Nix-store PATH entry"
+            ),
+        )
     })
 }
 
@@ -1590,10 +1727,7 @@ fn environment_with_private_runtime_home(
             home.to_str().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "staged Codex home is not valid UTF-8: {}",
-                        home.display()
-                    ),
+                    format!("staged Codex home is not valid UTF-8: {}", home.display()),
                 )
             })
         })
@@ -2432,6 +2566,8 @@ impl PreparedChildIo {
             std::io::Error::other("failed to open contained interactive stdin pipe")
         })?;
         Ok(ContainedProcessSession {
+            #[cfg(target_os = "linux")]
+            peer_binding: None,
             label: label.to_string(),
             cancellation,
             operation_deadline,
@@ -2460,6 +2596,8 @@ impl PreparedChildIo {
 /// start gate. The callback receives `&mut ContainedProcessSession`, so neither this value nor any
 /// stdio handle can be retained after [`run_process_interactive`] returns.
 pub(crate) struct ContainedProcessSession<'a> {
+    #[cfg(target_os = "linux")]
+    peer_binding: Option<(u32, String, PathBuf)>,
     label: String,
     cancellation: &'a ProcessCancellation,
     operation_deadline: Option<Instant>,
@@ -2473,6 +2611,55 @@ pub(crate) struct ContainedProcessSession<'a> {
 }
 
 impl ContainedProcessSession<'_> {
+    /// Verify the kernel peer against the guardian's exact target PID, its
+    /// start-time identity and owned cgroup. Only the Gemini profile fills it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_private_peer(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        self.ensure_interactive_live()?;
+        let (pid, start, cgroup) = self
+            .peer_binding
+            .as_ref()
+            .ok_or("private peer lacks verified containment")?;
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: writable ucred storage and its exact size are passed to getsockopt.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        };
+        if result != 0
+            || length as usize != std::mem::size_of::<libc::ucred>()
+            || u32::try_from(credentials.pid).ok() != Some(*pid)
+            || credentials.uid != unsafe { libc::geteuid() }
+            || crate::agent_lifecycle::process_start_time(*pid)
+                .ok()
+                .as_ref()
+                != Some(start)
+            || !fs::read_to_string(cgroup.join("cgroup.procs"))
+                .map_err(|_| "private peer cgroup unavailable")?
+                .lines()
+                .any(|line| line.trim() == pid.to_string())
+        {
+            return self.fail_io("private peer identity mismatch");
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_private_channel_live(&mut self) -> Result<(), String> {
+        self.ensure_interactive_live()?;
+        self.output_drainers.drain_ready();
+        Ok(())
+    }
+
     pub(crate) fn receive_line(
         &mut self,
         wait: Duration,

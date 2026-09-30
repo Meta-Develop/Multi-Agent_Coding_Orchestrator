@@ -675,28 +675,40 @@ fn bind_selected_runtime_launch(
     })
 }
 
-fn bind_selected_grok_execution_workspace(
+fn bind_selected_managed_execution_workspace(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
     launch_runtime: SupervisorRuntime,
     managed_worktree: &Path,
     writable_execution: bool,
 ) -> Result<ExternalAgentCommand> {
-    if launch_runtime != SupervisorRuntime::Grok {
+    if !matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::GeminiCli
+    ) {
         return Ok(command);
     }
-    let is_writable_grok_terminal_worker = writable_execution
+    if launch_runtime == SupervisorRuntime::GeminiCli
+        && command.workspace_access != WorkspaceAccess::ReadWrite
+    {
+        return Ok(command);
+    }
+    let is_writable_terminal_worker = writable_execution
         && assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if !is_writable_grok_terminal_worker
+    if !is_writable_terminal_worker
         || command.writable_launch_target
             != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
     {
         bail!(
-            "{}: assignment '{}' selected Grok launch is not exactly bound to its writable managed child worktree",
-            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            "{}: assignment '{}' selected launch is not exactly bound to its writable managed child worktree",
+            if launch_runtime == SupervisorRuntime::GeminiCli {
+                crate::external_agent::WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED
+            } else {
+                crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+            },
             assignment.id
         );
     }
@@ -705,17 +717,34 @@ fn bind_selected_grok_execution_workspace(
     let command = command.with_writable_runtime_selection(
         &assignment.id,
         launch_runtime,
-        is_writable_grok_terminal_worker,
+        is_writable_terminal_worker,
     )?;
     command
         .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
         .with_context(|| {
             format!(
-                "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                "writable selected assignment '{}' did not prove its exact launch contract",
                 assignment.id
             )
         })?;
     Ok(command)
+}
+
+#[cfg(test)]
+fn bind_selected_grok_execution_workspace(
+    command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    managed_worktree: &Path,
+    writable_execution: bool,
+) -> Result<ExternalAgentCommand> {
+    bind_selected_managed_execution_workspace(
+        command,
+        assignment,
+        launch_runtime,
+        managed_worktree,
+        writable_execution,
+    )
 }
 
 #[cfg(test)]
@@ -761,7 +790,7 @@ pub(super) fn bind_selected_assignment_launch_with_duty_for_test(
         &launch_catalog,
         mechanical_duty,
     )?;
-    let command = bind_selected_grok_execution_workspace(
+    let command = bind_selected_managed_execution_workspace(
         bound_launch.command,
         assignment,
         launch_runtime,
@@ -2186,7 +2215,7 @@ fn prepare_child_attempt<'a>(
         }
         None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
     });
-    command = bind_selected_grok_execution_workspace(
+    command = bind_selected_managed_execution_workspace(
         command,
         assignment,
         launch_runtime,
@@ -2305,7 +2334,9 @@ fn prepare_child_attempt<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
-    if command.uses_live_app_server_budget() {
+    if command.uses_live_app_server_budget()
+        || (launch_runtime == SupervisorRuntime::GeminiCli && command.uses_gemini_bridge())
+    {
         command.bind_live_token_grant(
             budget_reservation
                 .ledger
@@ -4476,8 +4507,11 @@ fn finalize_parent_auditor_budget(
             .timeout
             .min(authority.admit(auditor_id, cancellation)?);
     }
-    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
-        && command.uses_live_app_server_budget()
+    if (reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget())
+        || (reservation.state
+            == DispatchBudgetReservationState::Reserved(SupervisorRuntime::GeminiCli)
+            && command.uses_gemini_bridge())
     {
         command.bind_live_token_grant(
             reservation
@@ -10919,7 +10953,7 @@ done
         )?;
         command.cwd = primary.clone();
         command.workspace_access = WorkspaceAccess::ReadOnly;
-        let command = bind_selected_grok_execution_workspace(
+        let command = bind_selected_managed_execution_workspace(
             command,
             &assignment,
             runtime,
