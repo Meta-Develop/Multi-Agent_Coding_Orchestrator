@@ -4400,6 +4400,7 @@ pub fn sweep_workspace_worktrees(options: WorktreeSweepOptions) -> Result<Worktr
             .cmp(&right.group)
             .then_with(|| left.worktree_root.cmp(&right.worktree_root))
     });
+    roots.dedup_by(|left, right| left.worktree_root == right.worktree_root);
     let discovery_status = if roots.is_empty() {
         WorktreeSweepDiscoveryStatus::NoRootsDiscovered
     } else {

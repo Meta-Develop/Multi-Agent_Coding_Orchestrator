@@ -4128,9 +4128,13 @@ fn is_reserved_worktree_root_child(name: impl AsRef<OsStr>) -> bool {
 }
 
 fn default_worktree_root(repo: &Repository) -> PathBuf {
-    repo.workdir()
-        .unwrap_or_else(|| repo.path())
-        .join(".worktrees")
+    let repo_root = repo.workdir().unwrap_or_else(|| repo.path());
+    let repo_name = repo_root
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(sanitize_path_segment)
+        .unwrap_or_else(|| "repository".to_string());
+    repo_root.join(".maco").join("worktrees").join(repo_name)
 }
 
 // Authenticate the pre-repository-local layout without changing creation defaults.

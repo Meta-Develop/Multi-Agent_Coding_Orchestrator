@@ -1630,6 +1630,85 @@ fn primary_snapshot_verified_rejects_unsafe_or_inaccessible_state_paths() {
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn primary_snapshot_allows_managed_default_creation_and_still_detects_primary_edits() {
+    skip_without_containment!();
+    let (_temp, repo_path) = injected_repository();
+    fs::create_dir_all(repo_path.join(".maco")).expect("runtime directory");
+    fs::write(repo_path.join(".maco/tracked.txt"), "tracked runtime\n")
+        .expect("tracked runtime file");
+    commit_injected_repository(&repo_path, "track runtime file");
+    fs::write(repo_path.join(".gitignore"), "ignored.txt\n").expect("ignore ordinary primary file");
+    commit_injected_repository(&repo_path, "track ignore rule");
+    fs::write(repo_path.join("ignored.txt"), "ignored baseline\n").expect("ignored primary file");
+    run_injected_git(
+        &repo_path,
+        &["update-index", "--skip-worktree", "README.md"],
+    );
+    let before = primary_worktree_snapshot(
+        &repo_path,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    )
+    .expect("primary baseline");
+    let lane = WorktreeManager::new(&repo_path)
+        .create_for_test(crate::worktree::WorktreeCreateOptions {
+            agent_id: "integrity-child".to_string(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("create authenticated managed lane");
+    assert_eq!(
+        lane.path,
+        repo_path.join(".maco/worktrees/repo/integrity-child")
+    );
+    assert!(repo_path
+        .join(".maco/worktrees/repo/.cargo/config.toml")
+        .is_file());
+    let generated = primary_worktree_snapshot(
+        &repo_path,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    )
+    .expect("snapshot generated managed runtime");
+    assert!(primary_integrity_changes(&before, &generated).is_empty());
+    fs::write(
+        repo_path.join("README.md"),
+        "changed status-hidden primary file\n",
+    )
+    .expect("primary edit");
+    fs::write(
+        repo_path.join(".maco/tracked.txt"),
+        "changed tracked runtime\n",
+    )
+    .expect("tracked runtime edit");
+    fs::write(repo_path.join("ignored.txt"), "changed ignored primary\n")
+        .expect("ignored primary edit");
+    fs::create_dir_all(repo_path.join(".worktrees")).expect("manual root");
+    fs::write(
+        repo_path.join(".worktrees/foreign.txt"),
+        "ordinary primary content\n",
+    )
+    .expect("foreign content");
+    let after = primary_worktree_snapshot(
+        &repo_path,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+    )
+    .expect("snapshot primary edits");
+    let changes = primary_integrity_changes(&generated, &after);
+    for path in [
+        "README.md",
+        ".maco/tracked.txt",
+        "ignored.txt",
+        ".worktrees/foreign.txt",
+    ] {
+        assert!(
+            changes.paths.contains(&PathBuf::from(path)),
+            "primary guard lost {path}: {changes:?}"
+        );
+    }
+}
+
 #[test]
 fn primary_snapshot_detects_changes_to_preexisting_dirty_untracked_and_tracked_runtime_paths() {
     let (_temp, repo_path) = injected_repository();

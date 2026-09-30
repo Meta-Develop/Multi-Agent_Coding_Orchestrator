@@ -3457,7 +3457,7 @@ fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
         .join(".maco/o2/runs/verified-capability-dirty-primary")
         .exists());
     assert!(!temp.path().join(".maco/worktrees/repo/child-a").exists());
-    assert!(!repo_path.join(".worktrees/child-a").exists());
+    assert!(!repo_path.join(".maco/worktrees/repo/child-a").exists());
     assert!(crate::git_repository::open(&repo_path)
         .expect("reopen dirty primary")
         .find_branch("maco/child-a", git2::BranchType::Local)

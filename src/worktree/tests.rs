@@ -7,7 +7,7 @@ fn renamed_manual_worktree(temp: &TempDir) -> (PathBuf, PathBuf) {
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
     let repo = crate::git_repository::open(&repo_path).expect("open repo");
     commit_readme(&repo).expect("initial commit");
-    let root = default_worktree_root(&repo);
+    let root = repo.workdir().expect("workdir").join(".worktrees");
     fs::create_dir_all(&root).expect("manual worktree root");
     let renamed = root.join("manual-renamed");
     // A renamed lane keeps its original Git metadata name.
@@ -86,7 +86,10 @@ fn default_worktree_root_is_stable_and_repository_local() {
     let repo_path = temp.path().join("repo+name");
     WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
     let repo = crate::git_repository::open(&repo_path).expect("open repo");
-    let expected = repo.workdir().expect("workdir").join(".worktrees");
+    let expected = repo
+        .workdir()
+        .expect("workdir")
+        .join(".maco/worktrees/repo_name");
 
     assert_eq!(default_worktree_root(&repo), expected);
     assert_eq!(
@@ -129,9 +132,20 @@ fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() 
     let repo = crate::git_repository::open(&repo_path).expect("open repo");
     let workspace = fs::canonicalize(temp.path()).expect("workspace");
     let legacy = workspace.join(".maco/worktrees/repo_name");
-    let local = default_worktree_root(&repo);
-    fs::create_dir_all(&legacy).expect("legacy root");
+    let managed = default_worktree_root(&repo);
+    let local = repo.workdir().expect("workdir").join(".worktrees");
+    fs::create_dir_all(&managed).expect("project managed root");
     fs::create_dir_all(&local).expect("local root");
+    validate_primary_sweep_association(
+        &workspace,
+        &managed,
+        &repo_path,
+        &repo,
+        None,
+        WorktreeSweepRootKind::WorkspaceManaged,
+    )
+    .expect("project root does not require a legacy root to exist");
+    fs::create_dir_all(&legacy).expect("legacy root");
     assert_eq!(
         fs::canonicalize(legacy_workspace_worktree_root(&repo)).expect("canonical legacy root"),
         legacy
@@ -139,6 +153,7 @@ fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() 
 
     for (root, kind) in [
         (&legacy, WorktreeSweepRootKind::WorkspaceManaged),
+        (&managed, WorktreeSweepRootKind::WorkspaceManaged),
         (&local, WorktreeSweepRootKind::RepositoryLocal),
     ] {
         validate_primary_sweep_association(&workspace, root, &repo_path, &repo, None, kind)
@@ -147,6 +162,7 @@ fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() 
     for (root, kind) in [
         (&local, WorktreeSweepRootKind::WorkspaceManaged),
         (&legacy, WorktreeSweepRootKind::RepositoryLocal),
+        (&managed, WorktreeSweepRootKind::RepositoryLocal),
     ] {
         let failure =
             validate_primary_sweep_association(&workspace, root, &repo_path, &repo, None, kind)
@@ -156,6 +172,79 @@ fn sweep_root_association_preserves_exact_legacy_and_repository_local_layouts() 
             WorktreeSweepFailureKind::RepositoryAssociation
         );
     }
+    let primary = fs::canonicalize(&repo_path).expect("primary");
+    let managed = fs::canonicalize(&managed).expect("managed root");
+    for scope in [&workspace, &primary] {
+        assert_eq!(
+            resolve_sweep_repository(
+                scope,
+                &managed,
+                "repo_name",
+                WorktreeSweepRootKind::WorkspaceManaged,
+                None,
+            )
+            .expect("resolve empty exact project managed root"),
+            primary
+        );
+    }
+    assert!(
+        validate_primary_sweep_association(
+            &primary,
+            &legacy,
+            &repo_path,
+            &repo,
+            None,
+            WorktreeSweepRootKind::WorkspaceManaged,
+        )
+        .is_err(),
+        "self-workspace must not adopt the parent legacy root"
+    );
+    assert!(
+        validate_primary_sweep_association(
+            workspace.parent().expect("ancestor workspace"),
+            &managed,
+            &repo_path,
+            &repo,
+            None,
+            WorktreeSweepRootKind::WorkspaceManaged,
+        )
+        .is_err(),
+        "new default must not admit a more distant workspace ancestor"
+    );
+    let discovered =
+        discover_repository_local_sweep_roots(&workspace).expect("discover child roots");
+    assert_eq!(
+        discovered
+            .iter()
+            .filter(|candidate| candidate.worktree_root == managed)
+            .count(),
+        1
+    );
+    commit_readme(&repo).expect("initial commit");
+    repo.worktree("managed-lane", &managed.join("managed-lane"), None)
+        .expect("registered managed-root lane");
+    assert_eq!(
+        resolve_sweep_repository(
+            &primary,
+            &managed,
+            "repo_name",
+            WorktreeSweepRootKind::WorkspaceManaged,
+            None,
+        )
+        .expect("resolve exact project root from lane metadata"),
+        primary
+    );
+    WorktreeManager::init_repository(primary.join("repo+name"), "main")
+        .expect("same-group nested primary");
+    let failure = resolve_sweep_repository(
+        &primary,
+        &managed,
+        "repo_name",
+        WorktreeSweepRootKind::WorkspaceManaged,
+        None,
+    )
+    .expect_err("self and child candidates must remain ambiguous");
+    assert_eq!(failure.kind, WorktreeSweepFailureKind::AmbiguousRepository);
 }
 
 #[cfg(unix)]
@@ -1750,14 +1839,11 @@ fn workspace_sweep_discovers_repository_local_worktree_root() {
     let repo = crate::git_repository::open(&repo_path).expect("open repo");
     commit_readme(&repo).expect("initial commit");
     let worktree_root = repo_path.join(".worktrees");
-    let created = WorktreeManager::new(&repo_path)
-        .create_for_test(WorktreeCreateOptions {
-            agent_id: "repo-local-lane".to_string(),
-            branch: None,
-            base: None,
-            worktree_root: None,
-        })
-        .expect("create in default repository-local root");
+    let created = create_gc_worktree(
+        &WorktreeManager::new(&repo_path),
+        "repo-local-lane",
+        &worktree_root,
+    );
     assert_eq!(created.path, worktree_root.join("repo-local-lane"));
 
     let report = sweep_workspace_worktrees(workspace_sweep_options(&repo_path, false))
