@@ -319,6 +319,7 @@ struct BoundLiveTokenGrant {
     cwd: PathBuf,
     prompt: PathBuf,
     model: Option<String>,
+    model_provider: Option<String>,
     effort: Option<String>,
     timeout: Duration,
     workspace_access: WorkspaceAccess,
@@ -326,6 +327,12 @@ struct BoundLiveTokenGrant {
     lifecycle: Option<ExternalAgentLifecycleIdentity>,
     source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     input_files: Vec<PathBuf>,
+    confinement: WorktreeConfinementSnapshot,
+    native_delegation_disabled: bool,
+    managed_readonly_route: CodexManagedReadonlyRoute,
+    process_kind: Option<AssignmentProcessLaunchKind>,
+    process_attempt: Option<usize>,
+    process_duty: Option<String>,
 }
 
 #[cfg(target_os = "linux")]
@@ -546,6 +553,7 @@ fn bind_worker_journal_append_operation(
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
         should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
+            || managed_worker_app_server_shape(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
     }
 
@@ -560,6 +568,7 @@ impl ExternalAgentCommand {
             cwd: self.cwd.clone(),
             prompt: self.prompt.clone(),
             model: self.model.clone(),
+            model_provider: self.model_provider.clone(),
             effort: self.reasoning_effort.clone(),
             timeout: self.timeout,
             workspace_access: self.workspace_access,
@@ -567,6 +576,12 @@ impl ExternalAgentCommand {
             lifecycle: self.agent_lifecycle.clone(),
             source_inputs: self.researcher_source_inputs.clone(),
             input_files: self.read_only_input_files.clone(),
+            confinement: WorktreeConfinementSnapshot::from_command(self),
+            native_delegation_disabled: self.codex_native_delegation_disabled,
+            managed_readonly_route: self.codex_managed_readonly_route,
+            process_kind: self.assignment_process_launch_kind,
+            process_attempt: self.assignment_process_launch_attempt,
+            process_duty: self.assignment_process_launch_duty.clone(),
         });
     }
 
@@ -589,6 +604,7 @@ impl ExternalAgentCommand {
             || bound.cwd != self.cwd
             || bound.prompt != self.prompt
             || bound.model != self.model
+            || bound.model_provider != self.model_provider
             || bound.effort != self.reasoning_effort
             || bound.timeout != self.timeout
             || bound.workspace_access != self.workspace_access
@@ -596,6 +612,12 @@ impl ExternalAgentCommand {
             || bound.lifecycle != self.agent_lifecycle
             || bound.source_inputs != self.researcher_source_inputs
             || bound.input_files != self.read_only_input_files
+            || !bound.confinement.matches_command(self)
+            || bound.native_delegation_disabled != self.codex_native_delegation_disabled
+            || bound.managed_readonly_route != self.codex_managed_readonly_route
+            || bound.process_kind != self.assignment_process_launch_kind
+            || bound.process_attempt != self.assignment_process_launch_attempt
+            || bound.process_duty != self.assignment_process_launch_duty
         {
             return Err("live token grant launch binding changed".to_string());
         }
@@ -611,7 +633,7 @@ mod worker_journal_append_binding_tests {
     use super::*;
     use std::os::unix::fs::OpenOptionsExt;
 
-    fn fixture() -> (
+    pub(super) fn fixture() -> (
         tempfile::TempDir,
         ExternalAgentCommand,
         ProtectedWorktreeControls,
@@ -664,7 +686,7 @@ mod worker_journal_append_binding_tests {
         (temp, spec, controls)
     }
 
-    fn profile(spec: &ExternalAgentCommand) -> Option<SideEffectConfinementProfile> {
+    pub(super) fn profile(spec: &ExternalAgentCommand) -> Option<SideEffectConfinementProfile> {
         Some(SideEffectConfinementProfile::ExternalCodex(
             ExternalCodexProfile::read_write(&spec.cwd)
                 .with_hidden_root(spec.cwd.join(".maco"))
@@ -3805,7 +3827,22 @@ fn run_external_agent_runtime(
         && should_use_read_only_terminal_app_server(spec, runtime);
     let read_only_codex_app_server =
         read_only_terminal_app_server || managed_readonly_app_server.is_some();
-    let app_server_required = duplex_review_required || read_only_codex_app_server;
+    let managed_worker_app_server = match classify_managed_worker_app_server(spec, runtime) {
+        Ok(selected) => selected,
+        Err(error) => {
+            return failed_external_environment_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(spec.invocation)),
+                error,
+            );
+        }
+    };
+    let app_server_required =
+        duplex_review_required || read_only_codex_app_server || managed_worker_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -3875,9 +3912,13 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
-    if read_only_codex_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex {
+    if (read_only_codex_app_server || managed_worker_app_server)
+        && program_trust != ExternalProgramTrust::TrustedSystemCodex
+    {
         let route = if read_only_terminal_app_server {
             "read-only terminal Codex app-server"
+        } else if managed_worker_app_server {
+            "managed writable Worker Codex app-server"
         } else {
             "managed read-only Codex app-server"
         };
@@ -4233,21 +4274,6 @@ fn run_external_agent_runtime(
             return report;
         }
     };
-    let app_server_prompt = if app_server_required {
-        match String::from_utf8(prompt.clone()) {
-            Ok(prompt) => Some(prompt),
-            Err(_) => {
-                report.duration_ms = duration_millis(started.elapsed());
-                record_external_error(
-                    &mut report,
-                    "Codex app-server prompt is not valid UTF-8".to_string(),
-                );
-                return report;
-            }
-        }
-    } else {
-        None
-    };
     let grok_acp_prompt = if grok_acp_stdio_protocol_selected(&target_spec) {
         match String::from_utf8(prompt.clone()) {
             Ok(prompt) => Some(prompt),
@@ -4424,45 +4450,6 @@ fn run_external_agent_runtime(
         }
         (None, profile) => profile,
     };
-    #[cfg(target_os = "linux")]
-    let (prompt, side_effect_profile, worker_journal_append) = {
-        let mut prompt = prompt;
-        let mut profile = side_effect_profile;
-        let binding = match bind_worker_journal_append_operation(
-            &target_spec,
-            &target_controls,
-            runtime,
-            program_trust,
-            &mut prompt,
-            &mut profile,
-            &mut argv,
-        ) {
-            Ok(binding) => binding,
-            Err(error) => {
-                report.duration_ms = duration_millis(started.elapsed());
-                record_external_error(
-                    &mut report,
-                    format!("worker journal append binding refused: {error:#}"),
-                );
-                return report;
-            }
-        };
-        if binding.is_some() {
-            bound_argv_digest = match argv_digest(&argv) {
-                Ok(digest) => Some(digest),
-                Err(error) => {
-                    report.duration_ms = duration_millis(started.elapsed());
-                    record_external_error(
-                        &mut report,
-                        format!("worker journal argv binding failed: {error:#}"),
-                    );
-                    return report;
-                }
-            };
-            report.command = command_display(&resolved_program, &argv);
-        }
-        (prompt, profile, binding)
-    };
     let mut external_environment = allowed_env(spec.invocation, program_trust);
     if let Some(config) = &target_spec.runtime_adapter {
         for key in &config.env_passthrough {
@@ -4627,17 +4614,19 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        if let Err(error) = validate_duplex_app_server_version(version) {
-            report.duration_ms = duration_millis(started.elapsed());
-            record_environment_failure(
-                &mut report,
-                EnvironmentFailureCategory::VersionMismatch,
-                Some(codex_environment_requirement()),
-                error.to_string(),
-            );
-            return report;
-        }
-        argv = codex_app_server_argv(&target_spec, &target_controls);
+        argv = match audited_codex_app_server_argv(&target_spec, &target_controls, version) {
+            Ok(argv) => argv,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::VersionMismatch,
+                    Some(codex_environment_requirement()),
+                    error.to_string(),
+                );
+                return report;
+            }
+        };
         report.command = command_display(&resolved_program, &argv);
         bound_argv_digest = match argv_digest(&argv) {
             Ok(digest) => Some(digest),
@@ -4651,6 +4640,60 @@ fn run_external_agent_runtime(
             }
         };
     }
+    #[cfg(target_os = "linux")]
+    let (prompt, side_effect_profile, worker_journal_append) = {
+        let mut prompt = prompt;
+        let mut profile = side_effect_profile;
+        let binding = match bind_worker_journal_append_operation(
+            &target_spec,
+            &target_controls,
+            runtime,
+            program_trust,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        ) {
+            Ok(binding) => binding,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("worker journal append binding refused: {error:#}"),
+                );
+                return report;
+            }
+        };
+        if binding.is_some() {
+            bound_argv_digest = match argv_digest(&argv) {
+                Ok(digest) => Some(digest),
+                Err(error) => {
+                    report.duration_ms = duration_millis(started.elapsed());
+                    record_external_error(
+                        &mut report,
+                        format!("worker journal argv binding failed: {error:#}"),
+                    );
+                    return report;
+                }
+            };
+            report.command = command_display(&resolved_program, &argv);
+        }
+        (prompt, profile, binding)
+    };
+    let app_server_prompt = if app_server_required {
+        match String::from_utf8(prompt.clone()) {
+            Ok(prompt) => Some(prompt),
+            Err(_) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    "Codex app-server prompt is not valid UTF-8".to_string(),
+                );
+                return report;
+            }
+        }
+    } else {
+        None
+    };
     let Some(argv_digest) = bound_argv_digest else {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(
@@ -4849,6 +4892,12 @@ fn run_external_agent_runtime(
         }
     }
 
+    if let Err(error) = spec.verified_live_token_grant() {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(&mut report, error);
+        return report;
+    }
+
     if let Some(grant) = sealed_assignment_process_grant {
         if let Err(error) =
             consume_assignment_process_launch_grant(spec, grant, &mut process_spec, &staging_path)
@@ -4913,6 +4962,8 @@ fn run_external_agent_runtime(
         };
         let process = if read_only_codex_app_server {
             run_read_only_terminal_app_server_process(process_spec, cancellation, spec, prompt)
+        } else if managed_worker_app_server {
+            run_managed_worker_app_server_process(process_spec, cancellation, spec, prompt)
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -5238,6 +5289,55 @@ fn should_use_read_only_terminal_app_server(
             .is_some_and(|identity| matches!(identity.role.as_str(), "researcher" | "auditor"))
 }
 
+fn managed_worker_app_server_shape(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> bool {
+    cfg!(target_os = "linux")
+        && runtime == ExternalExecutionRuntime::Verified
+        && spec.invocation == ExternalAgentInvocation::CodexSupervisor
+        && spec.workspace_access == WorkspaceAccess::ReadWrite
+        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+        && spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == "worker")
+}
+
+fn classify_managed_worker_app_server(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+) -> Result<bool, String> {
+    if !managed_worker_app_server_shape(spec, runtime) {
+        return Ok(false);
+    }
+    // A malformed selected Worker is a refusal, never an unobserved exec fallback.
+    if !spec.codex_native_delegation_disabled
+        || spec.codex_managed_readonly_route_active()
+        || spec.assignment_process_launch_kind != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        || spec.worker_journal_artifacts.len() != 1
+    {
+        return Err("managed writable Worker app-server requires native delegation disabled, private AssignmentChild authority and one bound journal".to_string());
+    }
+    refuse_assignment_process_launch_before_preflight(spec)
+        .map_err(assignment_process_launch_refusal)?;
+    let identity = spec
+        .agent_lifecycle
+        .as_ref()
+        .ok_or_else(|| "Worker lifecycle is missing".to_string())?;
+    if identity.run_id.is_empty()
+        || identity.task_id.is_empty()
+        || spec.worker_journal_artifacts[0].worker_id != identity.task_id
+    {
+        return Err(
+            "managed writable Worker app-server journal subject differs from its launch"
+                .to_string(),
+        );
+    }
+    spec.verified_live_token_grant()?;
+    Ok(true)
+}
+
 fn classify_managed_readonly_app_server(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
@@ -5361,6 +5461,15 @@ fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()>
         );
     }
     Ok(())
+}
+
+fn audited_codex_app_server_argv(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    version: EnvironmentVersion,
+) -> Result<Vec<OsString>> {
+    validate_duplex_app_server_version(version)?;
+    Ok(codex_app_server_argv(spec, controls))
 }
 
 struct DuplexApprovalReviewer<'a> {
@@ -5745,6 +5854,53 @@ fn run_read_only_terminal_app_server_process(
         // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
         // the existing verified outer profile remains enforced, and every approval cancels.
         Ok(outcome)
+    })
+}
+
+fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTransport>(
+    transport: &mut T,
+    turn: &codex_app_server::AppServerTurn,
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> Result<codex_app_server::AppServerOutcome, String> {
+    let mut approval_requested = false;
+    let mut reviewer = |_: codex_app_server::ApprovalRequest| {
+        approval_requested = true;
+        Ok(codex_app_server::ApprovalReview::cancel(None))
+    };
+    // No dynamic Worker tool or callback. Native in-scope edits use the unchanged
+    // workspace-write profile; approval and permission expansion always cancel.
+    let mut outcome =
+        run_observed_app_server_turn(transport, turn, spec, &mut reviewer, None, cancellation)?;
+    if approval_requested || outcome.refused_ceiling_expansions != 0 {
+        cancellation.cancel();
+        fail_app_server_outcome(
+            &mut outcome,
+            "managed writable Worker app-server refused an approval or permission expansion"
+                .to_string(),
+        );
+    }
+    Ok(outcome)
+}
+
+fn run_managed_worker_app_server_process(
+    process_spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    spec: &ExternalAgentCommand,
+    prompt: String,
+) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
+    let turn = codex_app_server::AppServerTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        permission_profile: "maco_external_codex".to_string(),
+        prompt,
+        model: spec.model.clone(),
+        minimum_effort: None,
+        output_schema: load_codex_app_server_output_schema(spec)?,
+    };
+    let cancellation = cancellation.child_scope();
+    run_process_interactive(process_spec, &cancellation, |session| {
+        let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
+        run_managed_worker_app_server_turn(&mut transport, &turn, spec, &cancellation)
     })
 }
 

@@ -417,7 +417,6 @@ pub(super) fn execute_nested_worker_attempt(
                 .timeout
                 .min(validation.admit(&preflight.assignment.id, cancellation)?);
         }
-        let admission = authority.admit(worker_id, &command, runtime)?;
         let mut reservation = match reserve_dispatch_budget(
             &budget_plan,
             context.budget_config,
@@ -430,6 +429,9 @@ pub(super) fn execute_nested_worker_attempt(
                 bail!("nested worker budget refused: {refusal:?}")
             }
         };
+        // Whole-command admission must capture the final immutable live grant.
+        bind_final_dispatch_live_budget(&mut command, &reservation)?;
+        let admission = authority.admit(worker_id, &command, runtime)?;
         record_shared_orchestration_event(
             context.artifacts,
             worker_id,
@@ -851,7 +853,10 @@ mod tests {
         let signature = git2::Signature::now("test", "test@example.com")?;
         git.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])?;
         let parent = parent();
-        let plan = plan(parent.clone());
+        let mut plan = plan(parent.clone());
+        if case.starts_with("live-") {
+            plan.child_timeout_seconds = 300;
+        }
         let subject = terminal_subject(&parent, "worker")?;
         let run_id = RunId::new("nested-executor-test")?;
         let manager = WorktreeManager::new(&repo);
@@ -966,11 +971,41 @@ mod tests {
                 hard_tokens: Some(1),
                 ..Default::default()
             }
+        } else if matches!(case, "live-budget" | "live-report" | "live-partial") {
+            RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            }
         } else {
             RunBudgetLimits::default()
         };
         let ledger = RunBudgetLedger::new(limits)?;
-        let metadata = AssignmentMetadata::new();
+        let mut metadata = AssignmentMetadata::new();
+        if case.starts_with("live-") {
+            let validation_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                RunId::new("nested-live-deadline")?,
+                "test",
+            )?));
+            metadata.parent_validation = Some(held_out::ParentValidationAuthority::new(
+                held_out::HeldOutRunBinding {
+                    manifest_sha256: "a".repeat(64),
+                    profile_sha256: "b".repeat(64),
+                    profile_id: "profile".into(),
+                    repetition: 0,
+                    experiment_run_id: "experiment".into(),
+                    supervisor_run_id: run_id.as_str().into(),
+                    assignment_id: preflight.assignment.id.clone(),
+                    baseline_head: "c".repeat(40),
+                    baseline_tree: "d".repeat(40),
+                },
+                Vec::new(),
+                std::time::Instant::now() + Duration::from_secs(180),
+                1,
+                validation_writer,
+            ));
+        }
         let consultant = SupervisorConsultantPlan::default();
         let guide = SupervisorFieldGuidePrompt::empty()?;
         let catalog =
@@ -988,6 +1023,19 @@ mod tests {
             );
             assert!(command.assignment_messaging_launch().is_none());
             assert_eq!(command.worker_journal_artifacts.len(), 1);
+            if case.starts_with("live-") {
+                assert!(
+                    command.timeout > Duration::ZERO
+                        && command.timeout <= Duration::from_secs(180)
+                        && command.timeout < Duration::from_secs(plan.child_timeout_seconds)
+                );
+                assert_eq!(
+                    command
+                        .live_token_grant_for_test()
+                        .map(|grant| grant.tokens()),
+                    (case != "live-cost-only").then_some(220_000)
+                );
+            }
             assert!(fs::read_to_string(&command.prompt)
                 .unwrap()
                 .contains("worker task"));
@@ -1025,7 +1073,14 @@ mod tests {
             if case == "quiescence" {
                 run.process_tree = None;
             }
-            if case == "report" {
+            if case.starts_with("live-") {
+                super::super::decomposition_tests::retain_worker_app_server_usage_fixture(
+                    &mut run,
+                    command,
+                    case == "live-partial",
+                );
+            }
+            if matches!(case, "report" | "live-report") {
                 run.output_last_message = Some(b"{}".to_vec());
             }
             if case == "scope" {
@@ -1113,7 +1168,7 @@ mod tests {
                 "worker"
             },
         );
-        if case == "happy" {
+        if matches!(case, "happy" | "live-budget" | "live-cost-only") {
             let evidence = result?;
             assert_eq!(evidence.report.id, "worker");
             assert_eq!(evidence.journals.len(), 1);
@@ -1164,7 +1219,13 @@ mod tests {
                 calls.load(Ordering::SeqCst),
                 usize::from(matches!(
                     case,
-                    "quiescence" | "panic" | "report" | "scope" | "revoked-after"
+                    "quiescence"
+                        | "panic"
+                        | "report"
+                        | "scope"
+                        | "revoked-after"
+                        | "live-report"
+                        | "live-partial"
                 ))
             );
         }
@@ -1213,7 +1274,7 @@ mod tests {
             assert_eq!(terminal[0]["payload"]["attempt"], 1);
             assert_eq!(
                 terminal[0]["payload"]["status"],
-                if case == "happy" {
+                if matches!(case, "happy" | "live-budget" | "live-cost-only") {
                     "completed"
                 } else {
                     "failed"
@@ -1237,6 +1298,24 @@ mod tests {
             0,
             "budget reservation leaked for {case}"
         );
+        if case.starts_with("live-") {
+            assert_eq!(
+                ledger.report()?.consumed.tokens,
+                37_000,
+                "settlement must precede rejected report/drain handling"
+            );
+            if case == "live-partial" {
+                assert!(!ledger.report()?.usage_complete);
+                assert!(matches!(
+                    ledger.reserve(BudgetReservationRequest {
+                        role: AgentRole::Worker,
+                        tokens: 1,
+                        cost_usd: None,
+                    })?,
+                    BudgetAdmission::Refused { .. }
+                ));
+            }
+        }
         assert_eq!(
             manager.list_managed_verified()?.len(),
             if case == "foreign-permit" { 2 } else { 1 }
@@ -1253,6 +1332,24 @@ mod tests {
     {
         execution_fixture("foreign-permit")?;
         execution_fixture("wrong-permit-attempt")
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn nested_worker_final_live_budget_preserves_shortened_timeout_none_and_failed_report_floor(
+    ) -> Result<()> {
+        for case in [
+            "live-budget",
+            "live-cost-only",
+            "live-report",
+            "live-partial",
+        ] {
+            execution_fixture(case)?;
+        }
+        Ok(())
     }
 
     #[test]

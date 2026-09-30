@@ -6169,6 +6169,7 @@ fn codex_app_server_argv(
         "computer_use",
         "image_generation",
         "multi_agent",
+        "goals",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));

@@ -2472,13 +2472,6 @@ fn prepare_child_attempt_with_purpose<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
-    if command.uses_live_app_server_budget() {
-        command.bind_live_token_grant(
-            budget_reservation
-                .ledger
-                .live_token_grant(budget_reservation.reservation.id)?,
-        );
-    }
     let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
@@ -3251,7 +3244,9 @@ fn dispatch_and_capture_child_attempt<'a>(
             }
         }
     }
-    if let Err(error) = super::runtime_executables::validate_launch(&command) {
+    if let Err(error) = bind_final_dispatch_live_budget(&mut command, &budget_reservation)
+        .and_then(|()| super::runtime_executables::validate_launch(&command))
+    {
         drop(incoming_output_root);
         drop(capture_output_root);
         with_supervisor_artifacts(artifacts, |writer, _| {
@@ -3360,6 +3355,12 @@ fn dispatch_and_capture_child_attempt<'a>(
             )
         }
     };
+    // Settle returned provider observations exactly once before any fallible
+    // completion, journal, or reporting work. Keep the result until capture handling.
+    let usage_settlement = external_run_result
+        .as_ref()
+        .ok()
+        .map(|run| budget_reservation.settle_bound_runtime(run, &command));
     // Retain returned continuation bytes before checkpoints, settlement diagnostics,
     // or envelope validation can return early. This does not authorize or clean scratch.
     let returned_evidence = match &external_run_result {
@@ -3401,7 +3402,8 @@ fn dispatch_and_capture_child_attempt<'a>(
             }
         };
         let environment_blocked = external_run.environment_blocked();
-        let usage_settlement = budget_reservation.settle_bound_runtime(&external_run, &command)?;
+        let usage_settlement =
+            usage_settlement.context("returned dispatch is missing its retained settlement")??;
         match usage_settlement.role_sample(assignment.role, None) {
             Some(sample) => {
                 let usage = sample.usage;
@@ -5749,6 +5751,24 @@ struct ParentAuditorDispatchFrame<'a> {
 
 // A grant authenticates the exact launch, including the final duration. Parent
 // validation may shorten that duration after preparation; bind only afterward.
+fn bind_final_dispatch_live_budget(
+    command: &mut ExternalAgentCommand,
+    reservation: &DispatchBudgetReservation<'_>,
+) -> Result<()> {
+    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget()
+    {
+        let grant = reservation
+            .ledger
+            .live_token_grant(reservation.reservation.id)?;
+        if grant.as_ref().is_some_and(|grant| grant.stopped()) {
+            bail!("final dispatch live token grant was stopped or released");
+        }
+        command.bind_live_token_grant(grant);
+    }
+    Ok(())
+}
+
 fn finalize_parent_auditor_budget(
     command: &mut ExternalAgentCommand,
     reservation: &DispatchBudgetReservation<'_>,
@@ -5761,16 +5781,7 @@ fn finalize_parent_auditor_budget(
             .timeout
             .min(authority.admit(auditor_id, cancellation)?);
     }
-    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
-        && command.uses_live_app_server_budget()
-    {
-        command.bind_live_token_grant(
-            reservation
-                .ledger
-                .live_token_grant(reservation.reservation.id)?,
-        );
-    }
-    Ok(())
+    bind_final_dispatch_live_budget(command, reservation)
 }
 
 fn dispatch_and_collect_parent_auditor(
@@ -14695,8 +14706,69 @@ done
         run
     }
 
+    pub(super) fn retain_worker_app_server_usage_fixture(
+        run: &mut ExternalAgentRun,
+        command: &ExternalAgentCommand,
+        incomplete: bool,
+    ) {
+        use crate::external_agent::codex_app_server::{
+            CommandExecutionEvidence, TurnTerminalStatus,
+        };
+        use crate::external_agent::{
+            CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
+        };
+        run.codex_parent_evidence = Some(CodexParentEvidence {
+            codex_version: Some("0.144.4".into()),
+            thread_id: Some("fixture-worker-thread".into()),
+            requested_model: command.model.clone(),
+            requested_effort: command.reasoning_effort.clone(),
+            rollout_model: CodexParentResolvedField::Unknown,
+            rollout_effort: CodexParentResolvedField::Unknown,
+            observed_model: CodexParentResolvedField::Known(command.model.clone().unwrap()),
+            observed_effort: CodexParentResolvedField::Known("high".into()),
+            server_rerouted_model: None,
+            model_mismatch: false,
+            turn_usage: CodexParentTurnUsage::Known {
+                input_tokens: 35_000,
+                output_tokens: 2_000,
+                cached_input_tokens: 30_000,
+                reasoning_output_tokens: 1_000,
+            },
+            resolution_status: "complete".into(),
+        });
+        run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+            thread_id: "fixture-worker-thread".into(),
+            turn_id: "fixture-worker-turn".into(),
+            turn_status: if incomplete {
+                TurnTerminalStatus::Failed
+            } else {
+                TurnTerminalStatus::Completed
+            },
+            observations: Vec::new(),
+        });
+        if incomplete {
+            run.error = Some("injected observed interrupt with retained lower bound".into());
+            run.publishable = false;
+        }
+        run.retain_app_server_parent_evidence_for_test();
+    }
+
     #[test]
     fn weak_mechanical_executor_dispatch_spawn_journal_matches_runner_command() -> Result<()> {
+        exercise_worker_dispatch_live_budget("legacy")
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_worker_final_live_budget_reaches_runner_after_timeout_and_settles_before_bad_report(
+    ) -> Result<()> {
+        for case in ["hard", "cost-only", "report-failure"] {
+            exercise_worker_dispatch_live_budget(case)?;
+        }
+        Ok(())
+    }
+
+    fn exercise_worker_dispatch_live_budget(case: &str) -> Result<()> {
         // Dispatch-to-injected-runner + durable Spawn journal. Not live provider spawn/inference.
         const ASSIGNMENT_ID: &str = "weak-dispatch-spawn";
         const DUTY: &str = "run_preselected_command";
@@ -14704,9 +14776,11 @@ done
             WEAK_MECHANICAL_EXECUTOR_FIXTURE,
             ModelCapabilityClass::WeakMechanical,
         )])?;
-        let loaded = parse_supervisor_plan_with_consultant(&serde_json::to_string(
-            &weak_mechanical_executor_plan_json(ASSIGNMENT_ID, Some(DUTY)),
-        )?)?;
+        let mut fixture_plan = weak_mechanical_executor_plan_json(ASSIGNMENT_ID, Some(DUTY));
+        if case != "legacy" {
+            fixture_plan["child_timeout_seconds"] = json!(300);
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&serde_json::to_string(&fixture_plan)?)?;
         let assignment = loaded
             .plan
             .assignments
@@ -14732,7 +14806,7 @@ done
         let plan = loaded.plan.clone();
         let budget_config = SupervisorBudgetConfig::default();
         let consultant = loaded.consultant.clone();
-        let assignment_metadata = loaded.assignment_metadata.clone();
+        let mut assignment_metadata = loaded.assignment_metadata.clone();
         let options = SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: temp.path().join("plan.json"),
@@ -14778,8 +14852,36 @@ done
         );
         let field_guide =
             SupervisorFieldGuidePrompt::empty().context("empty fixture field guide")?;
-        let budget_ledger =
-            RunBudgetLedger::new(RunBudgetLimits::default()).context("fixture budget ledger")?;
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: matches!(case, "hard" | "report-failure").then_some(220_000),
+            ..Default::default()
+        })
+        .context("fixture budget ledger")?;
+        if case != "legacy" {
+            let validation_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                RunId::new("worker-live-deadline")?,
+                "test",
+            )?));
+            assignment_metadata.parent_validation = Some(held_out::ParentValidationAuthority::new(
+                held_out::HeldOutRunBinding {
+                    manifest_sha256: "a".repeat(64),
+                    profile_sha256: "b".repeat(64),
+                    profile_id: "profile".into(),
+                    repetition: 0,
+                    experiment_run_id: "experiment".into(),
+                    supervisor_run_id: options.run_id.as_str().into(),
+                    assignment_id: ASSIGNMENT_ID.into(),
+                    baseline_head: "c".repeat(40),
+                    baseline_tree: "d".repeat(40),
+                },
+                Vec::new(),
+                std::time::Instant::now() + Duration::from_secs(180),
+                1,
+                validation_writer,
+            ));
+        }
         let runtime_model_catalog =
             RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
                 WEAK_MECHANICAL_EXECUTOR_FIXTURE,
@@ -14840,11 +14942,32 @@ done
                         "production child dispatch must bind assignment messaging before external runner"
                     );
                     *captured.lock().expect("capture mutex") = Some(command.clone());
-                    weak_mechanical_executor_injected_deterministic_run(
+                    if case != "legacy" {
+                        assert!(
+                            command.timeout > Duration::ZERO
+                                && command.timeout <= Duration::from_secs(180)
+                                && command.timeout
+                                    < Duration::from_secs(plan.child_timeout_seconds)
+                        );
+                        assert_eq!(
+                            command
+                                .live_token_grant_for_test()
+                                .map(|grant| grant.tokens()),
+                            matches!(case, "hard" | "report-failure").then_some(220_000)
+                        );
+                    }
+                    let mut run = weak_mechanical_executor_injected_deterministic_run(
                         command,
                         &assignment,
                         &assignment_metadata,
-                    )
+                    );
+                    if case != "legacy" {
+                        retain_worker_app_server_usage_fixture(&mut run, command, false);
+                    }
+                    if case == "report-failure" {
+                        run.output_last_message = Some(b"{}".to_vec());
+                    }
+                    run
                 };
             let context = AssignmentExecutionContext {
                 index: 0,
@@ -14920,6 +15043,9 @@ done
                 prepared.command.model.as_deref(),
                 Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
             );
+            if case != "legacy" {
+                assert_eq!(prepared.command.timeout, Duration::from_secs(300));
+            }
             let collected = dispatch_and_collect_child_attempt(
                 &context,
                 &mut outcome,
@@ -14927,9 +15053,21 @@ done
                 options.run_id.as_str(),
                 1,
                 prepared,
-            )
-            .context("production dispatch_and_collect_child_attempt")?;
-            drop(collected);
+            );
+            if case == "report-failure" {
+                let collected = collected.context("collect rejected malformed Worker report")?;
+                assert!(report_failed(&collected.attempt_report));
+                assert!(!collected.attempt_report.accepted && collected.attempt_report.rejected);
+                assert!(collected.report_shape_problems.iter().any(|problem| {
+                    problem.contains("required assignment report is missing or invalid")
+                }));
+            } else {
+                drop(collected.context("production dispatch_and_collect_child_attempt")?);
+            }
+            if case != "legacy" {
+                assert_eq!(budget_ledger.report()?.consumed.tokens, 37_000);
+                assert_eq!(budget_ledger.report()?.active_reservations, 0);
+            }
             let captured_command = captured
                 .lock()
                 .expect("capture mutex")
