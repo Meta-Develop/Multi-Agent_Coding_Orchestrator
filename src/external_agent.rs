@@ -68,6 +68,7 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 mod grok_steering;
+pub(crate) mod researcher_inputs;
 
 use codex_parent_evidence::{
     codex_parent_evidence_from_app_server_run, codex_parent_evidence_from_run,
@@ -230,6 +231,7 @@ pub struct ExternalAgentCommand {
     pub output_schema: Option<PathBuf>,
     /// Exact bounded regular files exposed read-only without exposing their parent directories.
     pub read_only_input_files: Vec<PathBuf>,
+    pub(crate) researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     /// Typed precreated worker journals bound to the original incoming report root.
     pub worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     pub timeout: Duration,
@@ -304,11 +306,13 @@ struct BoundLiveTokenGrant {
     workspace_access: WorkspaceAccess,
     launch_target: WritableLaunchTarget,
     lifecycle: Option<ExternalAgentLifecycleIdentity>,
+    source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
+    input_files: Vec<PathBuf>,
 }
 
 impl ExternalAgentCommand {
     pub(crate) fn uses_live_app_server_budget(&self) -> bool {
-        should_use_read_only_researcher_app_server(self, ExternalExecutionRuntime::Verified)
+        should_use_read_only_terminal_app_server(self, ExternalExecutionRuntime::Verified)
             || should_use_duplex_review(self, ExternalExecutionRuntime::Verified, true)
     }
 
@@ -328,6 +332,8 @@ impl ExternalAgentCommand {
             workspace_access: self.workspace_access,
             launch_target: self.writable_launch_target,
             lifecycle: self.agent_lifecycle.clone(),
+            source_inputs: self.researcher_source_inputs.clone(),
+            input_files: self.read_only_input_files.clone(),
         });
     }
 
@@ -355,6 +361,8 @@ impl ExternalAgentCommand {
             || bound.workspace_access != self.workspace_access
             || bound.launch_target != self.writable_launch_target
             || bound.lifecycle != self.agent_lifecycle
+            || bound.source_inputs != self.researcher_source_inputs
+            || bound.input_files != self.read_only_input_files
         {
             return Err("live token grant launch binding changed".to_string());
         }
@@ -490,6 +498,7 @@ struct WorktreeConfinementSnapshot {
     output_last_message: PathBuf,
     output_schema: Option<PathBuf>,
     read_only_input_files: Vec<PathBuf>,
+    researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
     workspace_access: WorkspaceAccess,
     hidden_roots: Vec<PathBuf>,
@@ -505,6 +514,7 @@ impl WorktreeConfinementSnapshot {
             output_last_message: command.output_last_message.clone(),
             output_schema: command.output_schema.clone(),
             read_only_input_files: command.read_only_input_files.clone(),
+            researcher_source_inputs: command.researcher_source_inputs.clone(),
             worker_journal_artifacts: command.worker_journal_artifacts.clone(),
             workspace_access: command.workspace_access,
             hidden_roots: command.hidden_roots.clone(),
@@ -1175,6 +1185,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
@@ -1219,6 +1230,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -1263,6 +1275,7 @@ impl ExternalAgentCommand {
             output_last_message: output_last_message.into(),
             output_schema: None,
             read_only_input_files: Vec::new(),
+            researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
@@ -1876,10 +1889,170 @@ impl ExternalAgentRun {
             .as_ref()
     }
 
+    /// Private identity evidence captured by the parent, never restored from a report.
+    pub(crate) fn authenticated_codex_evidence(&self) -> Option<&CodexParentEvidence> {
+        self.authenticated_app_server_evidence().or(self
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref())
+    }
+
+    pub(crate) fn authenticated_app_server_usage_complete(&self) -> bool {
+        self.stdout.run_metadata.codex_app_server_usage_complete
+    }
+
+    pub(crate) fn authenticated_codex_usage_complete(&self) -> bool {
+        if self.authenticated_app_server_evidence().is_some() {
+            self.authenticated_app_server_usage_complete()
+        } else {
+            self.stdout.run_metadata.codex_cli_usage_complete
+                && self.stdout.run_metadata.codex_cli_usage.is_some()
+        }
+    }
+
+    /// Only the bound native subprocess capture can supply Grok token accounting.
+    /// Public evidence, JSONL files and deserialized reports cannot recreate it.
+    pub(crate) fn authenticated_grok_usage(
+        &self,
+        command: &ExternalAgentCommand,
+    ) -> Option<(Usage, bool)> {
+        let capture = self.stdout.run_metadata.grok_native_usage.as_ref()?;
+        if capture.command != *command {
+            return None;
+        }
+        let (usage, complete) = capture.observation.allocation();
+        Some((usage, complete && capture.process_completed))
+    }
+
+    fn retain_grok_native_usage(
+        &mut self,
+        command: &ExternalAgentCommand,
+        runtime: ExternalExecutionRuntime,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        if runtime != ExternalExecutionRuntime::Verified
+            || command.invocation != ExternalAgentInvocation::Grok
+            || grok_acp_stdio_protocol_selected(command)
+        {
+            return;
+        }
+        self.stdout.run_metadata.grok_native_usage =
+            crate::runtime_adapter::grok::observe_grok_native_usage(
+                stdout.as_bytes(),
+                stdout.is_truncated(),
+            )
+            .map(|observation| GrokNativeUsageCapture {
+                command: command.clone(),
+                observation,
+                process_completed,
+            });
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_grok_native_usage_for_test(
+        &mut self,
+        command: &ExternalAgentCommand,
+        stdout: &CapturedBytes,
+        process_completed: bool,
+    ) {
+        self.retain_grok_native_usage(
+            command,
+            ExternalExecutionRuntime::Verified,
+            stdout,
+            process_completed,
+        );
+    }
+
+    pub(crate) fn codex_auditor_effort_qualified(&self) -> bool {
+        !self.stdout.run_metadata.codex_auditor_effort_required
+            || self
+                .authenticated_app_server_evidence()
+                .is_some_and(|evidence| {
+                    codex_app_server::observed_effort_meets(
+                        evidence.requested_effort.as_deref(),
+                        evidence.observed_effort.known(),
+                    )
+                })
+    }
+
+    fn qualify_codex_auditor_effort(&mut self, spec: &ExternalAgentCommand) {
+        self.stdout.run_metadata.codex_auditor_effort_required = spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == AgentRole::Auditor.as_str());
+        if !self.codex_auditor_effort_qualified() {
+            self.publishable = false;
+            self.error = append_external_error(
+                self.error.take(),
+                Some("observed Auditor effort does not meet the selected requirement".to_string()),
+            );
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn qualify_codex_auditor_effort_for_test(&mut self, spec: &ExternalAgentCommand) {
+        self.qualify_codex_auditor_effort(spec);
+    }
+
+    /// Invocation-wide tokens from the same private capture as the identity.
+    /// CLI final-turn usage is not the aggregate of a multi-turn invocation.
+    pub(crate) fn authenticated_codex_usage(&self) -> Option<Usage> {
+        if self.authenticated_app_server_evidence().is_some() {
+            return self.authenticated_codex_partial_usage();
+        }
+        self.stdout.run_metadata.codex_cli_usage
+    }
+
+    /// A valid single turn is a lower bound, never a complete CLI aggregate.
+    pub(crate) fn authenticated_codex_partial_usage(&self) -> Option<Usage> {
+        if let Some(evidence) = self.authenticated_codex_evidence() {
+            let CodexParentTurnUsage::Known {
+                input_tokens,
+                output_tokens,
+                cached_input_tokens,
+                reasoning_output_tokens,
+            } = evidence.turn_usage
+            else {
+                return None;
+            };
+            if cached_input_tokens > input_tokens || reasoning_output_tokens > output_tokens {
+                return None;
+            }
+            let input_tokens = usize::try_from(input_tokens).ok()?;
+            let output_tokens = usize::try_from(output_tokens).ok()?;
+            return Some(Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens: input_tokens.checked_add(output_tokens)?,
+            });
+        }
+        None
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_cli_parent_evidence_for_test(&mut self, stdout: &[u8]) {
+        self.stdout.run_metadata.codex_cli_parent_evidence = self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_cli_usage = codex_usage_from_jsonl(stdout).ok().flatten();
+        self.stdout.run_metadata.codex_cli_usage_complete = self.publishable
+            && self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none();
+    }
+
     #[cfg(test)]
     pub(crate) fn retain_app_server_parent_evidence_for_test(&mut self) {
         self.stdout.run_metadata.codex_app_server_parent_evidence =
             self.codex_parent_evidence.clone();
+        self.stdout.run_metadata.codex_app_server_usage_complete = self.exit_code == Some(0)
+            && !self.timed_out
+            && self.error.is_none()
+            && self
+                .codex_command_execution_evidence()
+                .is_some_and(|evidence| {
+                    evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+                });
     }
 
     fn retain_codex_command_execution_evidence(
@@ -1947,7 +2120,7 @@ impl ExternalAgentRun {
     }
 
     pub fn succeeded(&self) -> bool {
-        self.safely_executed() && self.publishable
+        self.safely_executed() && self.publishable && self.codex_auditor_effort_qualified()
     }
 
     pub(crate) fn simulation_succeeded(&self) -> bool {
@@ -1967,6 +2140,17 @@ impl ExternalAgentRun {
     /// Scratch output may be discarded only when the main target was never
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
+    pub(crate) fn source_probe_confirmed_no_provider_release(&self) -> bool {
+        self.stdout
+            .run_metadata
+            .local_source_probe_refusal_quiescent
+            && !self.stdout.target_launch_attempted
+            && self
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified
+    }
+
     pub(crate) fn scratch_quiescence_verified(&self) -> bool {
         if self.stdout.target_launch_attempted {
             return self
@@ -2015,6 +2199,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_preflight_results: &'a Vec<EnvironmentPreflightResult>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    researcher_input_receipts: &'a Vec<researcher_inputs::ResearcherInputReceipt>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     environment_failures: &'a Vec<EnvironmentFailure>,
     environment_preflight_process_started: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -2058,6 +2244,8 @@ struct ExternalAgentRunWireOwned {
     codex_permissions: Option<CodexPermissionEvidence>,
     #[serde(default)]
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
+    #[serde(default)]
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     #[serde(default)]
     environment_failures: Vec<EnvironmentFailure>,
     #[serde(default = "default_environment_preflight_process_started")]
@@ -2105,6 +2293,7 @@ impl Serialize for ExternalAgentRun {
             program_trust: self.program_trust,
             codex_permissions: &self.codex_permissions,
             environment_preflight_results: &self.stdout.run_metadata.environment_preflight_results,
+            researcher_input_receipts: &self.stdout.run_metadata.researcher_input_receipts,
             environment_failures: &self.stdout.run_metadata.environment_failures,
             environment_preflight_process_started: self
                 .stdout
@@ -2140,6 +2329,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             canonicalize_sandbox_denials(wire.sandbox_denials).map_err(serde::de::Error::custom)?;
         let mut stdout = wire.stdout;
         stdout.run_metadata.environment_preflight_results = wire.environment_preflight_results;
+        stdout.run_metadata.researcher_input_receipts = wire.researcher_input_receipts;
         stdout.run_metadata.environment_failures = wire.environment_failures;
         stdout.run_metadata.environment_preflight_process_started =
             wire.environment_preflight_process_started;
@@ -2175,6 +2365,9 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
+    read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
+    local_source_probe_refusal_quiescent: bool,
+    researcher_input_receipts: Vec<researcher_inputs::ResearcherInputReceipt>,
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
@@ -2192,7 +2385,126 @@ struct ExternalAgentRunMetadata {
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
+    codex_app_server_usage_complete: bool,
+    /// Parent launch role only; never serialized or restored from public reports.
+    codex_auditor_effort_required: bool,
+    codex_cli_parent_evidence: Option<CodexParentEvidence>,
+    codex_cli_usage: Option<Usage>,
+    codex_cli_usage_complete: bool,
+    grok_native_usage: Option<GrokNativeUsageCapture>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
+}
+
+/// Full command binding and original native counters are private process custody,
+/// not public report assertions. No Serialize/Deserialize implementation.
+#[derive(Clone, PartialEq, Eq)]
+struct GrokNativeUsageCapture {
+    command: ExternalAgentCommand,
+    observation: crate::runtime_adapter::grok::GrokNativeUsageObservation,
+    process_completed: bool,
+}
+
+#[cfg(test)]
+mod grok_native_custody_tests {
+    use super::*;
+
+    fn command() -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "grok",
+            ".",
+            "prompt",
+            "log",
+            "report",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            crate::runtime_adapter::RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(crate::runtime_adapter::RuntimeId::Grok),
+        )
+    }
+
+    fn capture() -> CapturedBytes {
+        CapturedBytes::from_bytes_for_test(
+            b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5,\"cache_read_input_tokens\":4,\"cache_creation_input_tokens\":3,\"total_tokens\":24}}\n".to_vec(),
+        )
+    }
+
+    #[test]
+    fn grok_native_custody_survives_redaction_but_not_wire_roundtrip_or_command_drift() {
+        let command = command();
+        let mut run =
+            refused_external_run_before_launch(&command, "test materialization failure".into());
+        run.retain_grok_native_usage_for_test(&command, &capture(), true);
+        replace_report_stdout(&mut run, CapturedOutput::default());
+        assert_eq!(
+            run.authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            24
+        );
+        assert!(!run.publishable, "accounting cannot promote publication");
+        assert!(run.error.is_some());
+        let restored: ExternalAgentRun =
+            serde_json::from_slice(&serde_json::to_vec(&run).unwrap()).unwrap();
+        assert!(restored.authenticated_grok_usage(&command).is_none());
+        let mut rebound = command.clone();
+        rebound.json_log = "other-log".into();
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.model = Some("different-request".into());
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+        rebound = command.clone();
+        rebound.timeout += Duration::from_secs(1);
+        assert!(run.authenticated_grok_usage(&rebound).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_refuses_simulation_acp_and_foreign_invocations() {
+        let command = command();
+        let mut run = refused_external_run_before_launch(&command, "test".into());
+        run.retain_grok_native_usage(
+            &command,
+            ExternalExecutionRuntime::NonpublishableSimulation,
+            &capture(),
+            true,
+        );
+        assert!(run.authenticated_grok_usage(&command).is_none());
+        let mut acp = command.clone();
+        acp.runtime_adapter
+            .as_mut()
+            .unwrap()
+            .grok_interaction_protocol = crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+        run.retain_grok_native_usage_for_test(&acp, &capture(), true);
+        assert!(run.authenticated_grok_usage(&acp).is_none());
+        let mut codex = command.clone();
+        codex.invocation = ExternalAgentInvocation::CodexSupervisor;
+        run.retain_grok_native_usage_for_test(&codex, &capture(), true);
+        assert!(run.authenticated_grok_usage(&codex).is_none());
+    }
+
+    #[test]
+    fn grok_native_custody_retains_cancelled_and_truncated_floors_without_completion() {
+        let command = command();
+        for (capture, process_completed) in [
+            (capture(), false),
+            (
+                CapturedBytes::from_bytes_with_truncation_for_test(
+                    capture().as_bytes().to_vec(),
+                    true,
+                ),
+                true,
+            ),
+        ] {
+            let mut run =
+                refused_external_run_before_launch(&command, "cancelled or truncated".into());
+            run.retain_grok_native_usage_for_test(&command, &capture, process_completed);
+            let (usage, complete) = run.authenticated_grok_usage(&command).unwrap();
+            assert_eq!(usage.total_tokens, 24);
+            assert!(!complete);
+            assert!(!run.publishable);
+        }
+    }
 }
 
 #[derive(Clone, PartialEq, Eq)]
@@ -2702,6 +3014,15 @@ fn run_external_agent_runtime(
             "external agent was cancelled before executable preflight".to_string(),
         );
     }
+    if let Err(error) = researcher_inputs::validate_command(spec) {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            format!("Researcher source input preparation refused: {error:#}"),
+        );
+    }
     if let Err(error) = refuse_assignment_process_launch_before_preflight(spec) {
         return failed_external_run(
             spec,
@@ -2755,8 +3076,8 @@ fn run_external_agent_runtime(
     // children launch with native permission/sandbox mode; they are not
     // blocked on a parent All-callback or a missing reviewer.
     let duplex_review_required = should_use_duplex_review(spec, runtime, review_runtime.is_some());
-    let read_only_researcher_app_server = should_use_read_only_researcher_app_server(spec, runtime);
-    let app_server_required = duplex_review_required || read_only_researcher_app_server;
+    let read_only_terminal_app_server = should_use_read_only_terminal_app_server(spec, runtime);
+    let app_server_required = duplex_review_required || read_only_terminal_app_server;
     if spec.workspace_access == WorkspaceAccess::ReadWrite
         && spec.writable_launch_target == WritableLaunchTarget::PrimaryWorktree
     {
@@ -2826,13 +3147,12 @@ fn run_external_agent_runtime(
         }
     };
     let program_trust = external_program_trust_for_resolved_executable(spec, &resolved_program);
-    if read_only_researcher_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex
-    {
+    if read_only_terminal_app_server && program_trust != ExternalProgramTrust::TrustedSystemCodex {
         return failed_external_environment_run(
             spec, started, command_display(&resolved_program, &[]), false,
             EnvironmentFailureCategory::SandboxUnavailable,
             Some(external_sandbox_requirement(spec.invocation)),
-            "read-only Researcher app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
+            "read-only terminal Codex app-server requires a verified TrustedSystemCodex executable; custom transcripts cannot confer command evidence".to_string(),
         );
     }
     let program_identity = match external_program_identity(&resolved_program) {
@@ -3590,6 +3910,20 @@ fn run_external_agent_runtime(
             return report;
         }
     }
+    if let Err(error) = researcher_inputs::prepare_source_inputs(
+        &target_spec,
+        side_effect_profile.as_ref(),
+        spec.timeout.saturating_sub(started.elapsed()),
+        cancellation,
+        &mut report,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input preflight refused: {error:#}"),
+        );
+        return report;
+    }
     let mut json_log_reservation = match reserve_external_output(&spec.json_log) {
         Ok(reservation) => reservation,
         Err(error) => {
@@ -3707,6 +4041,9 @@ fn run_external_agent_runtime(
         }
     };
 
+    process_spec.read_only_input_snapshots =
+        report.stdout.run_metadata.read_only_input_snapshots.clone();
+
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(
@@ -3735,11 +4072,27 @@ fn run_external_agent_runtime(
         }
     }
 
+    if let Err(error) = researcher_inputs::revalidate_source_inputs(
+        &target_spec,
+        &report.stdout.run_metadata.researcher_input_receipts,
+    ) {
+        report.duration_ms = duration_millis(started.elapsed());
+        record_external_error(
+            &mut report,
+            format!("Researcher source input changed before target release: {error:#}"),
+        );
+        return report;
+    }
+
     // Preflight evidence describes only the bounded probes. Once the main target is released it
     // must earn fresh process-tree and side-effect evidence of its own; otherwise a target wait
     // or cancellation failure could appear quiescent because an earlier probe was clean.
     report.process_tree = None;
     report.side_effects = None;
+    report
+        .stdout
+        .run_metadata
+        .local_source_probe_refusal_quiescent = false;
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
@@ -3762,8 +4115,8 @@ fn run_external_agent_runtime(
             );
             return report;
         };
-        let process = if read_only_researcher_app_server {
-            run_read_only_researcher_app_server_process(process_spec, cancellation, spec, prompt)
+        let process = if read_only_terminal_app_server {
+            run_read_only_terminal_app_server_process(process_spec, cancellation, spec, prompt)
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
                 report.duration_ms = duration_millis(started.elapsed());
@@ -3914,6 +4267,18 @@ fn run_external_agent_runtime(
         }
     } else {
         run_process_cancellable(process_spec, cancellation).map(|output| {
+            // Bind the original supervisor command, not target_spec's private
+            // staging destination. Retain spend before any fallible materialization.
+            report.retain_grok_native_usage(
+                spec,
+                runtime,
+                &output.stdout,
+                !output.timed_out
+                    && output.status.is_some_and(|status| status.success())
+                    && output.process_error.is_none()
+                    && output.stdin_error.is_none()
+                    && output.safety_evidence_verified(),
+            );
             match output_staging.completion_handles() {
                 Ok(staging) => record_completed_target(
                     &mut report,
@@ -3958,6 +4323,7 @@ fn run_external_agent_runtime(
                 sandbox_denials.push(denial);
             }
             if let Some(evidence) = error.cancellation_evidence() {
+                report.retain_grok_native_usage(spec, runtime, &evidence.stdout, false);
                 sandbox_denials.extend(sandbox_denials_from_codex_jsonl(
                     &protected_controls,
                     evidence.stdout.as_bytes(),
@@ -4062,7 +4428,7 @@ fn run_external_agent_runtime(
     report
 }
 
-fn should_use_read_only_researcher_app_server(
+fn should_use_read_only_terminal_app_server(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
 ) -> bool {
@@ -4073,7 +4439,7 @@ fn should_use_read_only_researcher_app_server(
         && spec
             .agent_lifecycle
             .as_ref()
-            .is_some_and(|identity| identity.role == AgentRole::Researcher.as_str())
+            .is_some_and(|identity| matches!(identity.role.as_str(), "researcher" | "auditor"))
 }
 
 fn should_use_duplex_review(
@@ -4423,7 +4789,7 @@ fn fail_app_server_outcome(outcome: &mut codex_app_server::AppServerOutcome, err
     outcome.final_message = None;
 }
 
-fn run_read_only_researcher_app_server_process(
+fn run_read_only_terminal_app_server_process(
     process_spec: ProcessSpec,
     cancellation: &ProcessCancellation,
     spec: &ExternalAgentCommand,
@@ -4434,12 +4800,17 @@ fn run_read_only_researcher_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: spec
+            .agent_lifecycle
+            .as_ref()
+            .filter(|identity| identity.role == AgentRole::Auditor.as_str())
+            .map(|_| spec.reasoning_effort.clone().unwrap_or_default()),
         output_schema: load_codex_app_server_output_schema(spec)?,
     };
     let cancellation = cancellation.child_scope();
     run_process_interactive(process_spec, &cancellation, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
-        // Read-only research has no approval authority, even if a hosted reviewer exists.
+        // Read-only terminal roles have no approval authority, even if a hosted reviewer exists.
         let mut approval_requested = false;
         let mut reviewer = |_: codex_app_server::ApprovalRequest| {
             approval_requested = true;
@@ -4453,7 +4824,7 @@ fn run_read_only_researcher_app_server_process(
             &cancellation,
         )?;
         if let Err(error) =
-            validate_read_only_researcher_app_server_outcome(&outcome, approval_requested)
+            validate_read_only_terminal_app_server_outcome(&outcome, approval_requested)
         {
             fail_app_server_outcome(&mut outcome, error);
         }
@@ -4496,14 +4867,14 @@ fn load_codex_app_server_output_schema(
     Ok(Some(schema))
 }
 
-fn validate_read_only_researcher_app_server_outcome(
+fn validate_read_only_terminal_app_server_outcome(
     outcome: &codex_app_server::AppServerOutcome,
     approval_requested: bool,
 ) -> Result<(), String> {
     // The shared driver currently cancels immediately. Retain this independent guard so a
     // later Completed turn after an empty permission grant can never erase the refusal.
     if approval_requested || outcome.refused_ceiling_expansions != 0 {
-        return Err("read-only Researcher app-server refused an approval request".to_string());
+        return Err("read-only terminal Codex app-server refused an approval request".to_string());
     }
     if outcome.status != codex_app_server::TurnTerminalStatus::Completed
         || outcome
@@ -4512,7 +4883,7 @@ fn validate_read_only_researcher_app_server_outcome(
             .any(|item| item.item_type == "fileChange")
     {
         return Err(
-            "read-only Researcher app-server refused a non-completed turn or file change"
+            "read-only terminal Codex app-server refused a non-completed turn or file change"
                 .to_string(),
         );
     }
@@ -4540,6 +4911,7 @@ fn run_duplex_app_server_process(
         permission_profile: "maco_external_codex".to_string(),
         prompt,
         model: spec.model.clone(),
+        minimum_effort: None,
         output_schema: match load_codex_app_server_output_schema(spec) {
             Ok(schema) => schema,
             Err(error) => {
@@ -4972,6 +5344,7 @@ fn record_completed_app_server_target(
     credential_redactor: &CredentialRedactor,
     context: CompletedTargetContext<'_>,
 ) {
+    let launch_spec = context.spec;
     let protocol = interactive.interaction;
     let parent_evidence = output_staging.codex_home.as_ref().map(|codex_home| {
         let inputs = CodexParentEvidenceInputs {
@@ -5030,15 +5403,25 @@ fn record_completed_app_server_target(
         report.stdout.run_metadata.codex_app_server_parent_evidence = Some(evidence.clone());
         report.codex_parent_evidence = Some(evidence);
     }
+    // Capture token completion before an unavailable identity blocks acceptance.
+    report.stdout.run_metadata.codex_app_server_usage_complete = report.exit_code == Some(0)
+        && !report.timed_out
+        && report.error.is_none()
+        && report
+            .codex_command_execution_evidence()
+            .is_some_and(|evidence| {
+                evidence.turn_status == codex_app_server::TurnTerminalStatus::Completed
+            });
+    report.qualify_codex_auditor_effort(launch_spec);
     if report
         .authenticated_app_server_evidence()
-        .is_none_or(|evidence| evidence.resolution_status != "complete")
+        .is_none_or(|evidence| evidence.resolution_status != "complete" || evidence.model_mismatch)
         || report.stdout.raw_capture_truncated()
     {
         report.error = append_external_error(
             report.error.take(),
             Some(
-                "Codex app-server identity/usage resolution or raw capture is incomplete"
+                "Codex app-server identity/usage resolution or raw capture is incomplete, or the observed model mismatches the requested model"
                     .to_string(),
             ),
         );
@@ -5140,8 +5523,11 @@ fn record_completed_target(
                 requested_effort: context.spec.reasoning_effort.as_deref(),
             };
             let stdout = (!output.stdout.is_truncated()).then(|| output.stdout.as_bytes());
-            report.codex_parent_evidence =
-                Some(codex_parent_evidence_from_run(&inputs, stdout, codex_home));
+            let evidence = codex_parent_evidence_from_run(&inputs, stdout, codex_home);
+            report.stdout.run_metadata.codex_cli_parent_evidence = Some(evidence.clone());
+            report.stdout.run_metadata.codex_cli_usage =
+                stdout.and_then(|bytes| codex_usage_from_jsonl(bytes).ok().flatten());
+            report.codex_parent_evidence = Some(evidence);
         }
     }
     report.error = append_external_error(
@@ -5248,6 +5634,19 @@ fn record_completed_target(
             .grok_acp_parent_evidence
             .as_ref()
             .is_some_and(|evidence| evidence.permission_escalation_refused);
+    report.stdout.run_metadata.codex_cli_usage_complete = report.publishable;
+    if report.codex_command_execution_evidence().is_none()
+        && report
+            .stdout
+            .run_metadata
+            .codex_cli_parent_evidence
+            .as_ref()
+            .is_some_and(|evidence| {
+                evidence.model_mismatch || report.stdout.run_metadata.codex_cli_usage.is_none()
+            })
+    {
+        report.publishable = false;
+    }
 }
 
 fn capture_redacted_staged_output(

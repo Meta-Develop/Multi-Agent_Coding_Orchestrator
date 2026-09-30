@@ -1944,6 +1944,10 @@ pub(super) fn external_process_completed(
         && run.exit_code == Some(0)
         && !run.timed_out
         && run.error.is_none()
+        && (runtime != SupervisorRuntime::Codex
+            || run.authenticated_codex_evidence().is_none_or(|evidence| {
+                !evidence.model_mismatch && run.authenticated_codex_usage().is_some()
+            }))
         && run
             .authenticated_app_server_evidence()
             .is_none_or(|evidence| {
@@ -1951,7 +1955,23 @@ pub(super) fn external_process_completed(
                     && !run.stdout.raw_capture_truncated()
                     && run.codex_parent_evidence.as_ref() == Some(evidence)
             })
+        && run.codex_auditor_effort_qualified()
         && external_safety_verified(run, runtime)
+}
+
+pub(super) fn external_usage_for_runtime(
+    run: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+) -> Option<Usage> {
+    if runtime == SupervisorRuntime::Grok {
+        // Never parse mutable logs/public reports as Grok spend, including
+        // Codex-shaped counters or ACP cost ticks masquerading as tokens.
+        run.authenticated_grok_usage(command)
+            .map(|(usage, _)| usage)
+    } else {
+        complete_external_codex_usage(run, command)
+    }
 }
 
 pub(super) fn complete_external_codex_usage(
@@ -1961,21 +1981,11 @@ pub(super) fn complete_external_codex_usage(
     // Only the live app-server driver retains this private, correlated turn
     // transcript. CLI exec can emit more than one turn.completed event; its
     // JSONL accounting below must continue to sum those per-turn samples.
-    if let Some(evidence) = run.authenticated_app_server_evidence() {
-        if let crate::external_agent::CodexParentTurnUsage::Known {
-            input_tokens,
-            output_tokens,
-            ..
-        } = &evidence.turn_usage
-        {
-            let input_tokens = usize::try_from(*input_tokens).ok()?;
-            let output_tokens = usize::try_from(*output_tokens).ok()?;
-            return Some(Usage {
-                input_tokens,
-                output_tokens,
-                total_tokens: input_tokens.checked_add(output_tokens)?,
-            });
-        }
+    if run.authenticated_app_server_evidence().is_some() {
+        return run.authenticated_codex_usage();
+    }
+    if let Some(usage) = run.authenticated_codex_usage() {
+        return Some(usage);
     }
     if run.codex_command_execution_evidence().is_some() {
         return None;
@@ -1994,6 +2004,11 @@ pub(super) fn complete_external_codex_usage(
         }
         Err(_) => None,
     }
+    .into_iter()
+    .chain(run.authenticated_codex_partial_usage())
+    // These observations overlap. Keep the larger lower bound, never sum them
+    // or let a smaller mutable log erase privately retained tokens.
+    .max_by_key(|usage| usage.total_tokens)
 }
 
 pub(super) fn role_usage_report(
@@ -2011,7 +2026,7 @@ pub(super) fn role_usage_report(
     struct LensUsage {
         backend_id: String,
         configured_model: String,
-        models: BTreeMap<String, LensModelUsage>,
+        models: BTreeMap<Option<String>, LensModelUsage>,
     }
 
     let mut aggregates = BTreeMap::<AgentRole, (Usage, BTreeSet<String>, Option<f64>)>::new();
@@ -2049,14 +2064,8 @@ pub(super) fn role_usage_report(
             );
         }
         total_usage = total_usage.saturating_add(sample.usage);
-        let sample_cost_usd = sample
-            .model
-            .as_ref()
-            .and_then(|model| {
-                crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model)
-                    .map(|resolved| resolved.pricing.cost_usd(sample.usage))
-            })
-            .filter(|cost| cost.is_finite());
+        // Never reconstruct a requested-model price after settlement withheld it.
+        let sample_cost_usd = sample.cost_usd;
         if let Some(lens_id) = sample.lens_id.as_deref() {
             if sample.role != AgentRole::Auditor {
                 bail!(
@@ -2068,20 +2077,15 @@ pub(super) fn role_usage_report(
             let lens_aggregate = lens_aggregates.get_mut(lens_id).with_context(|| {
                 format!("usage referenced unknown configured review lens '{lens_id}'")
             })?;
-            let sample_model = sample.model.as_deref().with_context(|| {
-                format!(
-                    "review lens '{}' usage omitted the dispatched model attribution",
-                    lens_id
-                )
-            })?;
-            let model_aggregate = lens_aggregate
-                .models
-                .entry(sample_model.to_string())
-                .or_insert(LensModelUsage {
-                    usage: Usage::default(),
-                    cost_usd: Some(0.0),
-                    last_observed_sequence: sample_sequence,
-                });
+            let model_aggregate =
+                lens_aggregate
+                    .models
+                    .entry(sample.model.clone())
+                    .or_insert(LensModelUsage {
+                        usage: Usage::default(),
+                        cost_usd: Some(0.0),
+                        last_observed_sequence: sample_sequence,
+                    });
             model_aggregate.usage = model_aggregate.usage.saturating_add(sample.usage);
             model_aggregate.cost_usd = match (model_aggregate.cost_usd, sample_cost_usd) {
                 (Some(total), Some(cost)) => {
@@ -2215,11 +2219,11 @@ pub(super) fn role_usage_report(
                 .map(|(model, model_usage)| ReviewLensUsageReport {
                     lens_id: lens_id.clone(),
                     backend_id: aggregate.backend_id.clone(),
-                    model,
+                    model: model.clone().unwrap_or_else(|| "unknown".to_string()),
                     usage: Some(model_usage.usage),
                     cost_usd: model_usage.cost_usd,
                     observation: RoleUsageObservation::ProcessObserved,
-                    unavailable_reason: None,
+                    unavailable_reason: model.is_none().then(|| "token usage is known, but a single parent-verified model allocation is unavailable".to_string()),
                 })
                 .collect::<Vec<_>>()
         })

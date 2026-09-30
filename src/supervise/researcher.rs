@@ -322,6 +322,30 @@ mod tests {
         })
     }
 
+    #[test]
+    fn researcher_source_inputs_round_trip_and_reject_other_authority() -> Result<()> {
+        let mut value = authored_plan();
+        let inputs = json!([{"path": "packets/source.diff", "sha256": "a".repeat(64)}]);
+        value["assignments"][0]["child_assignments"][0]["source_inputs"] = inputs.clone();
+        let loaded = parse_supervisor_plan_with_consultant(&value.to_string())?;
+        let normalized = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )?;
+        assert_eq!(normalized["assignments"][1]["source_inputs"], inputs);
+        let reparsed = parse_supervisor_plan_with_consultant(&normalized.to_string())?;
+        assert_eq!(reparsed.assignment_metadata, loaded.assignment_metadata);
+        value["assignments"][0]["child_assignments"][0]["source_inputs"][0]["writable"] =
+            json!(true);
+        assert!(parse_supervisor_plan_with_consultant(&value.to_string()).is_err());
+        value["assignments"][0]["child_assignments"][0]["source_inputs"] = inputs.clone();
+        value["assignments"][0]["source_inputs"] = inputs;
+        assert!(parse_supervisor_plan_with_consultant(&value.to_string()).is_err());
+        Ok(())
+    }
+
     fn evidence() -> Value {
         json!({
             "id": "research", "role": "researcher", "read_only": true, "no_further_delegation": true,
@@ -527,6 +551,7 @@ mod tests {
         let aggregation = role_usage_report(
             &plan,
             vec![RoleUsageSample {
+                cost_usd: None,
                 role: AgentRole::Researcher,
                 lens_id: None,
                 model: Some(FRONTIER_PROFILE_MODEL.to_string()),

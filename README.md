@@ -115,7 +115,28 @@ The current implementation covers a local-first command-line slice:
   successful zero-diff result. Reports must attest read-only execution and no
   further delegation; reported or observed changes are rejected. Other runtimes
   and primary-worktree execution are refused. Generated goal/provider lowering
-  does not emit Researchers. Execution-phase implementation children retain native workspace-write and their
+  does not emit Researchers. For source packets, an operator-authored Researcher assignment
+  may declare `"source_inputs": [{"path": "review-packets/source.diff", "sha256": "<64 lowercase hex digits>"}]`.
+  These are exact, non-hidden, repo-relative regular files **already present in the selected
+  managed snapshot**, not parent-machine paths. Prepare/commit the packet in the chosen
+  source snapshot before launching; an untracked packet in a different checkout is unavailable.
+  No files are copied automatically and prose paths grant no mounts. At most eight nonempty
+  files of 1 MiB each are accepted; duplicate paths, traversal, symlinks, hard-link aliases,
+  unknown fields (including writable access), and hash mismatches are refused.
+  The parent checks the snapshot, then reads each entire file with the actual read-only child
+  confinement profile before provider dispatch and revalidates identity/content before release.
+  The probe and target mount private copies of the same verified bytes at each declared path;
+  later host-side in-place writes cannot replace the packet visible to the target. A verified,
+  quiescent local-only input refusal releases the unused provider reservation as `NotStarted`.
+  Unverified helper ownership remains conservative and cannot authorize cleanup or acceptance.
+  `researcher_input_receipts` in the private execution artifact record path, SHA256, byte count,
+  file identity and profile visibility. Receipts establish preparation only; the Researcher must
+  still inspect the substantive source and pass the existing independent acceptance gates.
+  A prelaunch refusal has no provider launch evidence; it is not an observed zero-token response.
+  Source inputs cannot be declared by nested Workers and do not change credential, network,
+  write, delegation or publication authority. Legacy plans without this optional declaration
+  retain their behavior; only explicitly declared packets receive this prelaunch guarantee.
+  Execution-phase implementation children retain native workspace-write and their
   existing bounded writable Git metadata; the optional app-server duplex
   reviewer is not their release path. Writable access to the
   primary checkout remains fail-closed because Codex cannot force a blocking
