@@ -126,6 +126,31 @@ impl GeminiLoginPort {
 }
 
 impl LoginPort for GeminiLoginPort {
+    fn start_with_browser_mode(
+        &self,
+        request: crate::login::LoginStartRequest,
+        browser_mode: crate::login::LoginBrowserMode,
+    ) -> crate::error::Result<crate::login::LoginStatus> {
+        if browser_mode == crate::login::LoginBrowserMode::Automatic {
+            return self.start(request);
+        }
+        if request.provider_id != "gemini-cli" {
+            return Err(crate::error::Error::NotImplemented(
+                "caller-managed browser login",
+            ));
+        }
+        self.service
+            .start_with_browser_mode(request, &self.adapter, browser_mode)
+    }
+
+    fn authorization(
+        &self,
+        handle: &crate::login::LoginHandle,
+        binding: &crate::login::LoginAccountBinding,
+    ) -> crate::error::Result<Option<crate::login::LoginAuthorization>> {
+        self.service.authorization(handle, binding)
+    }
+
     fn start(
         &self,
         request: crate::login::LoginStartRequest,

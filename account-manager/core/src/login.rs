@@ -43,6 +43,7 @@ pub(crate) trait PendingOAuthLogin: ProviderAdapter + Send + Sync + 'static {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send;
 }
 
@@ -62,13 +63,20 @@ impl PendingOAuthLogin for GeminiCliAdapter {
         GeminiCliAdapter::finish_pending_oauth_login(self, home)
     }
 
-    fn run_pending_oauth_login(
+    async fn run_pending_oauth_login(
         &self,
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
-        GeminiCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+        handoff: Option<LoginUrlHandoff>,
+    ) -> std::result::Result<(), OAuthLoginRunError> {
+        match handoff {
+            Some(handoff) => {
+                self.run_pending_oauth_login_with_handoff(home, plan, cancel, handoff)
+                    .await
+            }
+            None => GeminiCliAdapter::run_pending_oauth_login(self, home, plan, cancel).await,
+        }
     }
 }
 
@@ -93,6 +101,7 @@ impl PendingOAuthLogin for CodexCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        _handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         CodexCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
@@ -119,6 +128,7 @@ impl PendingOAuthLogin for ClaudeCodeAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        _handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         ClaudeCodeAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
@@ -145,6 +155,7 @@ impl PendingOAuthLogin for GrokCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        _handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         GrokCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
@@ -188,6 +199,59 @@ pub struct LoginStatus {
     pub failure_reason: Option<String>,
 }
 
+/// Browser ownership for an explicit login. Existing callers remain automatic.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoginBrowserMode {
+    #[default]
+    Automatic,
+    CallerManaged,
+}
+
+/// Public authorization handoff, returned only for a live bound login.
+/// The OAuth code, PKCE verifier and tokens never enter this value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginAuthorization {
+    pub authorization_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+pub(crate) struct ActiveLoginAuthorization {
+    pub public: LoginAuthorization,
+    pub valid_until: Instant,
+}
+
+/// In-memory producer capability bound to one operation, never the registry.
+pub(crate) struct LoginUrlHandoff {
+    publish: Box<dyn Fn(Option<ActiveLoginAuthorization>) -> bool + Send + Sync>,
+}
+
+impl LoginUrlHandoff {
+    pub(crate) fn new(
+        publish: impl Fn(Option<ActiveLoginAuthorization>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            publish: Box::new(publish),
+        }
+    }
+
+    pub(crate) fn publish(&self, authorization: ActiveLoginAuthorization) -> bool {
+        (self.publish)(Some(authorization))
+    }
+
+    pub(crate) fn invalidate(&self) {
+        (self.publish)(None);
+    }
+}
+
+impl Drop for LoginUrlHandoff {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
 /// Input for starting a managed-account login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginStartRequest {
@@ -226,6 +290,7 @@ struct RequestFingerprint {
     account_id: String,
     label: String,
     auth_kind: AuthKind,
+    browser_mode: LoginBrowserMode,
 }
 
 struct LoginOperation {
@@ -234,13 +299,14 @@ struct LoginOperation {
     expire_cancel_sent: AtomicBool,
     state: Mutex<OperationState>,
     started_at: Instant,
+    browser_mode: LoginBrowserMode,
 }
 
-#[derive(Debug, Clone)]
 struct OperationState {
     public: LoginState,
     failure_reason: Option<String>,
     finished_at: Option<Instant>,
+    authorization: Option<ActiveLoginAuthorization>,
 }
 
 /// Retain finished operations for status recovery. Bound follows the provider's
@@ -281,12 +347,34 @@ impl LoginService {
         self.start_pending_oauth(request, adapter)
     }
 
+    /// Explicit Gemini browser handoff; automatic remains the legacy default.
+    pub fn start_with_browser_mode(
+        &self,
+        request: LoginStartRequest,
+        adapter: &GeminiCliAdapter,
+        browser_mode: LoginBrowserMode,
+    ) -> Result<LoginStatus> {
+        self.start_pending_oauth_with_browser_mode(request, adapter, browser_mode)
+    }
+
     pub(crate) fn start_pending_oauth<A: PendingOAuthLogin>(
         &self,
         request: LoginStartRequest,
         adapter: &A,
     ) -> Result<LoginStatus> {
+        self.start_pending_oauth_with_browser_mode(request, adapter, LoginBrowserMode::Automatic)
+    }
+
+    fn start_pending_oauth_with_browser_mode<A: PendingOAuthLogin>(
+        &self,
+        request: LoginStartRequest,
+        adapter: &A,
+        browser_mode: LoginBrowserMode,
+    ) -> Result<LoginStatus> {
         validate_start_request(&request)?;
+        if browser_mode == LoginBrowserMode::CallerManaged && request.provider_id != "gemini-cli" {
+            return Err(Error::NotImplemented("caller-managed browser login"));
+        }
         // github-copilot is allow-listed; PendingOAuthLogin is not implemented.
         if request.provider_id == "github-copilot" {
             return Err(Error::NotImplemented("login.start"));
@@ -300,7 +388,7 @@ impl LoginService {
                 "only OAuth login is supported in this release",
             ));
         }
-        let fingerprint = RequestFingerprint::from(&request);
+        let fingerprint = RequestFingerprint::from(&request, browser_mode);
         self.reap_expired();
 
         let replay = {
@@ -403,8 +491,10 @@ impl LoginService {
                 public: LoginState::WaitingForUser,
                 failure_reason: None,
                 finished_at: None,
+                authorization: None,
             }),
             started_at: Instant::now(),
+            browser_mode,
         });
 
         {
@@ -495,7 +585,38 @@ impl LoginService {
             return Ok(operation.status(handle));
         }
         let _ = operation.cancel_tx.send(true);
+        operation.invalidate_authorization();
         Ok(operation.status(handle))
+    }
+
+    /// Read only the live URL belonging to the exact handle and incarnation.
+    pub fn authorization(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> Result<Option<LoginAuthorization>> {
+        self.reap_expired();
+        let inner = self.inner.lock().expect("login lock");
+        let Some(operation) = inner.operations.get(handle) else {
+            return Ok(None);
+        };
+        if operation.binding != *binding {
+            return Err(login_refused(
+                &binding.provider_id,
+                "login handle does not match the supplied account binding",
+            ));
+        }
+        let mut state = operation.state.lock().expect("state lock");
+        if *operation.cancel_tx.borrow()
+            || state.finished_at.is_some()
+            || state
+                .authorization
+                .as_ref()
+                .is_some_and(|url| Instant::now() >= url.valid_until)
+        {
+            state.authorization = None;
+        }
+        Ok(state.authorization.as_ref().map(|url| url.public.clone()))
     }
 
     fn remove_idempotency_key(&self, key: &str) {
@@ -507,6 +628,7 @@ impl LoginService {
         let mut inner = self.inner.lock().expect("login lock");
         for operation in inner.operations.values() {
             let _ = operation.cancel_tx.send(true);
+            operation.invalidate_authorization();
         }
         inner.tasks.clear();
     }
@@ -545,6 +667,30 @@ impl Drop for LoginService {
 }
 
 impl LoginOperation {
+    fn url_handoff(self: &Arc<Self>) -> LoginUrlHandoff {
+        let weak = Arc::downgrade(self);
+        LoginUrlHandoff::new(move |authorization| {
+            let Some(operation) = weak.upgrade() else {
+                return false;
+            };
+            let mut state = operation.state.lock().expect("state lock");
+            if authorization.as_ref().is_some_and(|url| {
+                operation.browser_mode != LoginBrowserMode::CallerManaged
+                    || *operation.cancel_tx.borrow()
+                    || state.finished_at.is_some()
+                    || Instant::now() >= url.valid_until
+            }) {
+                return false;
+            }
+            state.authorization = authorization;
+            true
+        })
+    }
+
+    fn invalidate_authorization(&self) {
+        self.state.lock().expect("state lock").authorization = None;
+    }
+
     fn status(&self, handle: &LoginHandle) -> LoginStatus {
         let state = self.state.lock().expect("state lock");
         LoginStatus {
@@ -567,6 +713,7 @@ impl LoginOperation {
 
     fn mark_ready(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         state.public = LoginState::Ready;
         state.failure_reason = None;
         state.finished_at = Some(Instant::now());
@@ -574,6 +721,7 @@ impl LoginOperation {
 
     fn mark_failed(&self, reason: String) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -584,6 +732,7 @@ impl LoginOperation {
 
     fn mark_cancelled(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -594,6 +743,7 @@ impl LoginOperation {
 
     fn mark_commit_outcome_unknown(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -623,8 +773,10 @@ async fn run_pending_oauth_task<A: PendingOAuthLogin>(
         plan: oauth_plan,
     } = prepared;
     operation.mark_in_progress();
+    let handoff = (operation.browser_mode == LoginBrowserMode::CallerManaged)
+        .then(|| operation.url_handoff());
     let oauth = adapter
-        .run_pending_oauth_login(&home, oauth_plan, cancel_rx)
+        .run_pending_oauth_login(&home, oauth_plan, cancel_rx, handoff)
         .await;
     match oauth {
         Ok(()) => {
@@ -712,12 +864,13 @@ fn commit_managed_login_after_oauth(
 }
 
 impl RequestFingerprint {
-    fn from(request: &LoginStartRequest) -> Self {
+    fn from(request: &LoginStartRequest, browser_mode: LoginBrowserMode) -> Self {
         Self {
             provider_id: request.provider_id.clone(),
             account_id: request.account_id.clone(),
             label: request.label.clone(),
             auth_kind: request.auth_kind,
+            browser_mode,
         }
     }
 }

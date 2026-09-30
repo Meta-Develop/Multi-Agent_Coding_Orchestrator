@@ -359,7 +359,29 @@ impl GeminiCliAdapter {
         &self,
         home: &Path,
         plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> std::result::Result<(), super::gemini_oauth::OAuthLoginRunError> {
+        self.run_pending_oauth_login_inner(home, plan, cancel, None)
+            .await
+    }
+
+    pub(crate) async fn run_pending_oauth_login_with_handoff(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: crate::login::LoginUrlHandoff,
+    ) -> std::result::Result<(), super::gemini_oauth::OAuthLoginRunError> {
+        self.run_pending_oauth_login_inner(home, plan, cancel, Some(handoff))
+            .await
+    }
+
+    async fn run_pending_oauth_login_inner(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<crate::login::LoginUrlHandoff>,
     ) -> std::result::Result<(), super::gemini_oauth::OAuthLoginRunError> {
         if *cancel.borrow() {
             return Err(super::gemini_oauth::OAuthLoginRunError::Cancelled);
@@ -385,7 +407,7 @@ impl GeminiCliAdapter {
                 config_write("hermetic Gemini OAuth requires an injected completer"),
             ))
         } else {
-            super::gemini_oauth::run_managed_oauth_login(home, cancel).await
+            super::gemini_oauth::run_managed_oauth_login_with_handoff(home, cancel, handoff).await
         }
     }
 

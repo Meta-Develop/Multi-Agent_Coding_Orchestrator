@@ -15,6 +15,7 @@ use crate::providers::{
 };
 
 use super::LoginStatus;
+use super::{ActiveLoginAuthorization, LoginAuthorization, LoginBrowserMode};
 
 const PROVIDER_ID: &str = "gemini-cli";
 const CODEX_PROVIDER_ID: &str = "codex-cli";
@@ -246,9 +247,27 @@ fn wait_for_state(
         if current.state == target {
             return;
         }
+        assert!(
+            !matches!(
+                current.state,
+                LoginState::Ready
+                    | LoginState::Failed
+                    | LoginState::Cancelled
+                    | LoginState::Unknown
+            ),
+            "expected {target:?}, observed {:?}: {:?}",
+            current.state,
+            current.failure_reason
+        );
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
     }
-    panic!("timed out waiting for {target:?}");
+    let current = service
+        .status(&status.handle, &status.binding)
+        .expect("status");
+    panic!(
+        "timed out waiting for {target:?}, observed {:?}: {:?}",
+        current.state, current.failure_reason
+    );
 }
 
 fn write_oauth_files(home: &Path) -> crate::error::Result<()> {
@@ -799,4 +818,127 @@ fn stale_incarnation_commit_with_material_is_outcome_unknown() {
             .state,
         StoredAccountState::Pending
     );
+}
+
+#[test]
+fn caller_managed_url_is_bound_to_handle_incarnation_and_live_deadline() {
+    let (_dir, adapter, registry) = cancel_driver_adapter();
+    let (_runtime, service) = service(&registry);
+    let status = service
+        .start_with_browser_mode(
+            start_request("handoff", "handoff-key"),
+            &adapter,
+            LoginBrowserMode::CallerManaged,
+        )
+        .expect("start");
+    let operation = Arc::clone(
+        service
+            .inner
+            .lock()
+            .expect("inner")
+            .operations
+            .get(&status.handle)
+            .expect("operation"),
+    );
+    let handoff = operation.url_handoff();
+    let publish = || ActiveLoginAuthorization {
+        public: LoginAuthorization {
+            authorization_url: "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-handoff"
+                .into(),
+            expires_at_unix_ms: None,
+        },
+        valid_until: std::time::Instant::now() + Duration::from_secs(5),
+    };
+    assert!(handoff.publish(publish()));
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("bound URL")
+        .is_some());
+    let mut wrong = status.binding.clone();
+    wrong.account_incarnation = "fedcba9876543210fedcba9876543210".into();
+    assert!(service.authorization(&status.handle, &wrong).is_err());
+    let unknown = serde_json::from_str("\"unrecognized-handle\"").expect("handle");
+    assert!(service
+        .authorization(&unknown, &status.binding)
+        .expect("unknown")
+        .is_none());
+    assert!(
+        service
+            .start(start_request("handoff", "handoff-key"), &adapter)
+            .is_err(),
+        "idempotent replay may not change browser ownership"
+    );
+    operation
+        .state
+        .lock()
+        .expect("state")
+        .authorization
+        .as_mut()
+        .expect("URL")
+        .valid_until = std::time::Instant::now();
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("expired URL")
+        .is_none());
+    assert!(handoff.publish(publish()));
+    service
+        .cancel(&status.handle, &status.binding)
+        .expect("cancel");
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("cancelled URL")
+        .is_none());
+    assert!(
+        !handoff.publish(publish()),
+        "late publication after cancellation refused"
+    );
+}
+
+#[test]
+fn caller_managed_url_is_removed_for_every_terminal_outcome_and_producer_drop() {
+    for terminal in ["ready", "failed", "cancelled", "unknown", "drop"] {
+        let (_dir, adapter, registry) = cancel_driver_adapter();
+        let (_runtime, service) = service(&registry);
+        let status = service
+            .start_with_browser_mode(
+                start_request("handoff", "handoff-key"),
+                &adapter,
+                LoginBrowserMode::CallerManaged,
+            )
+            .expect("start");
+        let operation = Arc::clone(
+            service
+                .inner
+                .lock()
+                .expect("inner")
+                .operations
+                .get(&status.handle)
+                .expect("operation"),
+        );
+        let handoff = operation.url_handoff();
+        assert!(handoff.publish(ActiveLoginAuthorization {
+            public: LoginAuthorization {
+                authorization_url:
+                    "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-terminal".into(),
+                expires_at_unix_ms: None
+            },
+            valid_until: std::time::Instant::now() + Duration::from_secs(5),
+        }));
+        assert!(service
+            .authorization(&status.handle, &status.binding)
+            .expect("URL")
+            .is_some());
+        match terminal {
+            "ready" => operation.mark_ready(),
+            "failed" => operation.mark_failed("fixture failure".into()),
+            "cancelled" => operation.mark_cancelled(),
+            "unknown" => operation.mark_commit_outcome_unknown(),
+            "drop" => drop(handoff),
+            _ => unreachable!(),
+        }
+        assert!(service
+            .authorization(&status.handle, &status.binding)
+            .expect("terminal URL")
+            .is_none());
+    }
 }

@@ -25,6 +25,7 @@ use zeroize::{Zeroize, ZeroizeOnDrop, Zeroizing};
 
 use crate::error::{Error, Result};
 use crate::fsx;
+use crate::login::{ActiveLoginAuthorization, LoginAuthorization, LoginUrlHandoff};
 
 // Public installed-application identifiers published by google-gemini/gemini-cli
 // at 571851b1077a51cef757146ce13f9da887326bec. These are not user credentials.
@@ -40,14 +41,16 @@ const FRAME_BYTES: usize = 8192;
 // The pinned Gemini CLI's browser-login deadline; covers this complete operation.
 pub(crate) const LOGIN_DEADLINE: Duration = Duration::from_secs(5 * 60);
 
-async fn oauth_login_with_deadline<F>(
+async fn oauth_login_with_deadline<F, Fut>(
     deadline: Duration,
     oauth: F,
 ) -> std::result::Result<(), OAuthLoginRunError>
 where
-    F: std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>>,
+    F: FnOnce(tokio::time::Instant) -> Fut,
+    Fut: std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>>,
 {
-    match tokio::time::timeout(deadline, oauth).await {
+    let deadline = tokio::time::Instant::now() + deadline;
+    match tokio::time::timeout_at(deadline, oauth(deadline)).await {
         Ok(result) => result,
         Err(_) => Err(OAuthLoginRunError::Cancelled),
     }
@@ -321,16 +324,25 @@ pub(crate) async fn run_managed_oauth_login(
     home: &Path,
     cancel: tokio::sync::watch::Receiver<bool>,
 ) -> std::result::Result<(), OAuthLoginRunError> {
-    oauth_login_with_deadline(
-        LOGIN_DEADLINE,
-        run_managed_oauth_login_unbounded(home, cancel),
-    )
+    run_managed_oauth_login_with_handoff(home, cancel, None).await
+}
+
+pub(crate) async fn run_managed_oauth_login_with_handoff(
+    home: &Path,
+    cancel: tokio::sync::watch::Receiver<bool>,
+    handoff: Option<LoginUrlHandoff>,
+) -> std::result::Result<(), OAuthLoginRunError> {
+    oauth_login_with_deadline(LOGIN_DEADLINE, |deadline| {
+        run_managed_oauth_login_unbounded(home, cancel, handoff, deadline)
+    })
     .await
 }
 
 async fn run_managed_oauth_login_unbounded(
     home: &Path,
     mut cancel: tokio::sync::watch::Receiver<bool>,
+    handoff: Option<LoginUrlHandoff>,
+    deadline: tokio::time::Instant,
 ) -> std::result::Result<(), OAuthLoginRunError> {
     ensure_no_credential_marker(home).map_err(OAuthLoginRunError::Failed)?;
     let directory = managed_directory(home).map_err(OAuthLoginRunError::Failed)?;
@@ -344,14 +356,11 @@ async fn run_managed_oauth_login_unbounded(
     let session = BrowserSession::bind()
         .await
         .map_err(OAuthLoginRunError::Failed)?;
-    let (browser, _reaper) = open_browser(
-        session
-            .authorization_url()
-            .map_err(OAuthLoginRunError::Failed)?
-            .as_str(),
-    )
-    .map_err(OAuthLoginRunError::Failed)?;
-    let code = select_code_or_cancel(&session, browser, &mut cancel).await?;
+    let code =
+        receive_authorization_code(&session, handoff.as_ref(), deadline, &mut cancel, |url| {
+            open_browser(url).map(|(browser, _reaper)| browser)
+        })
+        .await?;
     let client = http_client().map_err(OAuthLoginRunError::Failed)?;
     let creds = exchange(
         &client,
@@ -368,6 +377,50 @@ async fn run_managed_oauth_login_unbounded(
     write_oauth_documents(home, &creds, email.as_ref().map(|value| value.as_str()))
         .map_err(OAuthLoginRunError::Failed)?;
     Ok(())
+}
+
+/// Both browser modes use the same state/PKCE-bound loopback callback. The
+/// caller-managed branch never launches an external opener or exports a code.
+async fn receive_authorization_code<F>(
+    session: &BrowserSession,
+    handoff: Option<&LoginUrlHandoff>,
+    deadline: tokio::time::Instant,
+    cancel: &mut tokio::sync::watch::Receiver<bool>,
+    open: F,
+) -> std::result::Result<Zeroizing<String>, OAuthLoginRunError>
+where
+    F: FnOnce(&str) -> Result<BrowserExit>,
+{
+    if *cancel.borrow() || tokio::time::Instant::now() >= deadline {
+        return Err(OAuthLoginRunError::Cancelled);
+    }
+    let url = session
+        .authorization_url()
+        .map_err(OAuthLoginRunError::Failed)?;
+    let browser = if let Some(handoff) = handoff {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let expires_at_unix_ms = SystemTime::now()
+            .checked_add(remaining)
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .and_then(|time| u64::try_from(time.as_millis()).ok());
+        if !handoff.publish(ActiveLoginAuthorization {
+            public: LoginAuthorization {
+                authorization_url: url.to_string(),
+                expires_at_unix_ms,
+            },
+            valid_until: deadline.into_std(),
+        }) {
+            return Err(OAuthLoginRunError::Cancelled);
+        }
+        None
+    } else {
+        Some(open(url.as_str()).map_err(OAuthLoginRunError::Failed)?)
+    };
+    let result = select_code_or_cancel(session, browser, cancel).await;
+    if let Some(handoff) = handoff {
+        handoff.invalidate();
+    }
+    result
 }
 
 /// Async cancel fixture for login-service tests. Observes only the owned watch
@@ -391,13 +444,18 @@ pub(crate) async fn run_test_oauth_cancelled_by_watch(
 
 async fn select_code_or_cancel(
     session: &BrowserSession,
-    browser: BrowserExit,
+    browser: Option<BrowserExit>,
     cancel: &mut tokio::sync::watch::Receiver<bool>,
 ) -> std::result::Result<Zeroizing<String>, OAuthLoginRunError> {
     if *cancel.borrow() {
         return Err(OAuthLoginRunError::Cancelled);
     }
-    let flow = code_with_browser(session, browser);
+    let flow = async {
+        match browser {
+            Some(browser) => code_with_browser(session, browser).await,
+            None => session.callback().await,
+        }
+    };
     tokio::pin!(flow);
     loop {
         tokio::select! {

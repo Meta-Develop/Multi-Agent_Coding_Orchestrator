@@ -14,7 +14,8 @@ use coding_agent_manager_lib::account_authority::{
 };
 use coding_agent_manager_lib::error::Error;
 use coding_agent_manager_lib::login::{
-    LoginAccountBinding, LoginHandle, LoginService, LoginStartRequest, LoginState, LoginStatus,
+    LoginAccountBinding, LoginAuthorization, LoginBrowserMode, LoginHandle, LoginService,
+    LoginStartRequest, LoginState, LoginStatus,
 };
 use coding_agent_manager_lib::model::{
     Account, AuthKind, InstallState, Maturity, ProviderDescriptor, StoredAccountMaterial,
@@ -1009,4 +1010,155 @@ mod unix {
         assert_eq!(second["result"]["handle"], "login-handle-1");
         assert_eq!(login.starts.lock().expect("starts").len(), 2);
     }
+}
+
+#[test]
+fn login_browser_mode_defaults_to_automatic_and_rejects_unknown_values() {
+    let (_dir, registry) = isolated_registry();
+    let login = Arc::new(FakeLogin::new());
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
+    let mut body = serde_json::json!({"protocolVersion":1,"requestId":"mode","operation":"login.start","providerId":"gemini-cli","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"mode"});
+    assert!(
+        dispatch_json(&ctx, &body.to_string())["error"].is_null(),
+        "legacy request uses automatic port"
+    );
+    body["browserMode"] = serde_json::json!("caller-managed");
+    let manual = dispatch_json(&ctx, &body.to_string());
+    assert_eq!(
+        manual["error"]["code"], "unsupported-operation",
+        "a port without caller-managed capability refuses explicit mode"
+    );
+    assert_eq!(login.starts.lock().expect("starts").len(), 1);
+    body["browserMode"] = serde_json::json!("arbitrary-opener");
+    assert_eq!(
+        decode_request(body.to_string().as_bytes())
+            .expect_err("closed mode")
+            .code,
+        ErrorCode::InvalidRequest
+    );
+}
+
+struct HandoffLogin {
+    login: FakeLogin,
+    live: AtomicBool,
+}
+
+impl LoginPort for HandoffLogin {
+    fn start(
+        &self,
+        request: LoginStartRequest,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.login.start(request)
+    }
+    fn start_with_browser_mode(
+        &self,
+        request: LoginStartRequest,
+        mode: LoginBrowserMode,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        assert_eq!(mode, LoginBrowserMode::CallerManaged);
+        self.live.store(true, Ordering::SeqCst);
+        self.start(request)
+    }
+    fn status(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.login.status(handle, binding)
+    }
+    fn cancel(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.live.store(false, Ordering::SeqCst);
+        let mut status = self.status(handle, binding)?;
+        status.state = LoginState::Cancelled;
+        Ok(status)
+    }
+    fn authorization(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<Option<LoginAuthorization>> {
+        let status = self.status(handle, binding)?;
+        Ok(
+            (self.live.load(Ordering::SeqCst) && status.state == LoginState::WaitingForUser).then(
+                || LoginAuthorization {
+                    authorization_url:
+                        "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-protocol".into(),
+                    expires_at_unix_ms: None,
+                },
+            ),
+        )
+    }
+}
+
+#[test]
+fn login_url_wire_status_binds_handle_and_clears_after_cancel() {
+    let (_dir, registry) = isolated_registry();
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::new(HandoffLogin {
+            login: FakeLogin::new(),
+            live: AtomicBool::new(false),
+        }));
+    let start = serde_json::json!({"protocolVersion":1,"requestId":"start-url","operation":"login.start","providerId":"gemini-cli","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"url-key","browserMode":"caller-managed"});
+    let response = dispatch_json(&ctx, &start.to_string());
+    assert!(response["error"].is_null());
+    assert!(response["result"]["authorization"]["authorizationUrl"]
+        .as_str()
+        .expect("public URL")
+        .starts_with("https://accounts.google.com/"));
+    assert!(
+        response["result"]["authorization"]
+            .get("expiresAtUnixMs")
+            .is_none(),
+        "unknown expiry must remain absent"
+    );
+    let legacy: LoginStatus = serde_json::from_value(response["result"].clone())
+        .expect("legacy GUI status remains compatible");
+    let mut status = serde_json::json!({"protocolVersion":1,"requestId":"get-url","operation":"login.status","handle":legacy.handle,"binding":legacy.binding});
+    let active = dispatch_json(&ctx, &status.to_string());
+    assert_eq!(
+        active["result"]["authorization"],
+        response["result"]["authorization"]
+    );
+    let mut wrong = status.clone();
+    wrong["binding"]["accountIncarnation"] = serde_json::json!("fedcba9876543210fedcba9876543210");
+    assert!(dispatch_json(&ctx, &wrong.to_string())["result"]
+        .get("authorization")
+        .is_none());
+    status["operation"] = serde_json::json!("login.cancel");
+    let cancelled = dispatch_json(&ctx, &status.to_string());
+    assert_eq!(cancelled["result"]["state"], "cancelled");
+    assert!(cancelled["result"].get("authorization").is_none());
+    for key in [
+        "code_verifier",
+        "access_token",
+        "refresh_token",
+        "FAKE-owner-code",
+    ] {
+        assert!(!response.to_string().contains(key));
+    }
+}
+
+#[test]
+fn production_port_refuses_caller_managed_mode_for_other_providers_before_registration() {
+    let (_dir, registry) = isolated_registry();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        runtime.handle().clone(),
+    );
+    let ctx = AuthorityServerConfig::new(AuthorityContext::new(registry))
+        .expect("config")
+        .with_gemini_login(service, GeminiCliAdapter::default())
+        .context;
+    let body = serde_json::json!({"protocolVersion":1,"requestId":"other-mode","operation":"login.start","providerId":"claude-code","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"other-mode","browserMode":"caller-managed"});
+    let response = dispatch_json(&ctx, &body.to_string());
+    assert_eq!(response["error"]["code"], "unsupported-operation");
+    assert!(ctx.registry.load().expect("metadata").is_empty());
 }
