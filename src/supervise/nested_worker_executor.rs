@@ -562,12 +562,7 @@ pub(super) fn execute_nested_worker_attempt(
             bail!("nested worker report differs from observed per-attempt changes");
         }
         let journals = journals?;
-        if !journals
-            .values()
-            .all(|j| matches!(j.status, WorkerExecutionJournalStatus::Loaded(_)))
-        {
-            bail!("nested worker journal evidence is incomplete");
-        }
+        require_complete_nested_worker_journals(&journals)?;
         Ok(NestedWorkerAttemptEvidence {
             report,
             journals,
@@ -630,10 +625,65 @@ pub(super) fn execute_nested_worker_attempt(
     result
 }
 
+fn require_complete_nested_worker_journals(
+    journals: &WorkerExecutionJournalEvidenceSet,
+) -> Result<()> {
+    let failures = journals
+        .iter()
+        .filter_map(|(worker_id, journal)| {
+            let cause = match &journal.status {
+                WorkerExecutionJournalStatus::Loaded(_) => return None,
+                WorkerExecutionJournalStatus::Missing => "missing trusted runner capture",
+                WorkerExecutionJournalStatus::Invalid(cause) => cause.as_str(),
+            };
+            Some(format!(
+                "{worker_id} ({}): {cause}",
+                journal.evidence_relative_path.display()
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        bail!(
+            "nested worker journal evidence is incomplete: {}",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn nested_worker_journal_refusal_retains_invalid_and_missing_capture_causes() {
+        let mut journals = WorkerExecutionJournalEvidenceSet::new();
+        for (worker, status) in [
+            ("invalid", WorkerExecutionJournalStatus::Invalid(
+                "failed to parse worker execution journal line 2: expected `,` at line 1 column 85".to_string(),
+            )),
+            ("missing", WorkerExecutionJournalStatus::Missing),
+        ] {
+            journals.insert(worker.to_string(), WorkerExecutionJournalEvidence {
+                incoming_relative_path: PathBuf::from(format!("worker-journals/{worker}.jsonl")),
+                evidence_relative_path: PathBuf::from(format!("logs/workers/{worker}.jsonl")),
+                status,
+            });
+        }
+        let error = require_complete_nested_worker_journals(&journals)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid (logs/workers/invalid.jsonl): failed to parse"));
+        assert!(error.contains("line 1 column 85"));
+        assert!(
+            error.contains("missing (logs/workers/missing.jsonl): missing trusted runner capture")
+        );
+        for journal in journals.values_mut() {
+            journal.status = WorkerExecutionJournalStatus::Loaded(Vec::new());
+        }
+        assert!(require_complete_nested_worker_journals(&journals).is_ok());
+    }
 
     fn parent() -> OrchestratorAssignment {
         serde_json::from_value(json!({

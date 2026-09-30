@@ -409,7 +409,9 @@ pub(super) fn import_worker_execution_journals_at(
                         )?;
                         match parse_worker_execution_journal(bytes, &evidence_relative_path) {
                             Ok(entries) => WorkerExecutionJournalStatus::Loaded(entries),
-                            Err(error) => WorkerExecutionJournalStatus::Invalid(error.to_string()),
+                            Err(error) => {
+                                WorkerExecutionJournalStatus::Invalid(format!("{error:#}"))
+                            }
                         }
                     }
                     WorkerJournalArtifactCaptureStatus::Invalid(error) => {
@@ -571,6 +573,147 @@ pub(super) fn append_worker_execution_journal_record(
     journal
         .write_all(&record)
         .map_err(|source| WorkerExecutionJournalRecordError::Append { source })
+}
+
+/// Append through the existing serializer to an already delegated journal file.
+/// The expected identity checks continuity; it does not grant filesystem authority
+/// or replace the parent's private held-descriptor capture and acceptance checks.
+pub(crate) fn append_precreated_worker_execution_journal(
+    path: &Path,
+    expected: &crate::safe_state::FileIdentity,
+    entry: &WorkerExecutionJournalEntry,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::io::Write;
+        use std::os::unix::io::AsRawFd;
+
+        // Validate and encode before opening the append descriptor. Never expose a
+        // partial hand-escaped JSON record to the journal.
+        let mut record = Vec::new();
+        append_worker_execution_journal_record(&mut record, entry)?;
+        let mut file = open_worker_journal_no_follow(path, true)?;
+        verify_worker_journal_identity(&file.metadata()?, expected)?;
+        // No waiting or interleaving with another append operation. A failed write
+        // may leave partial evidence; callers must stop, never truncate or repair it.
+        // SAFETY: flock acts on a live file descriptor and has no pointer arguments.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+            return Err(std::io::Error::last_os_error())
+                .context("worker journal is already being appended");
+        }
+        let before = file.metadata()?;
+        verify_worker_journal_identity(&before, expected)?;
+        let final_len = before
+            .len()
+            .checked_add(u64::try_from(record.len())?)
+            .filter(|len| *len <= MAX_WORKER_EXECUTION_JOURNAL_BYTES as u64)
+            .context("worker journal append exceeds the existing capture byte limit")?;
+        let rebound = open_worker_journal_no_follow(path, false)?;
+        verify_worker_journal_identity(&rebound.metadata()?, expected)?;
+        if rebound.metadata()?.len() != before.len() {
+            bail!("worker journal length changed before append");
+        }
+        file.write_all(&record)
+            .context("worker journal append failed; stop without repairing the file")?;
+        file.sync_data()
+            .context("worker journal append flush failed")?;
+        let after = file.metadata()?;
+        verify_worker_journal_identity(&after, expected)?;
+        let rebound = open_worker_journal_no_follow(path, false)?;
+        let rebound_metadata = rebound.metadata()?;
+        verify_worker_journal_identity(&rebound_metadata, expected)?;
+        if after.len() != final_len || rebound_metadata.len() != final_len {
+            bail!("worker journal changed during append; stop without repairing the file");
+        }
+        Ok(())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, expected, entry);
+        bail!("precreated worker journal append requires the qualified Linux file contract")
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn verify_worker_journal_identity(
+    metadata: &fs::Metadata,
+    expected: &crate::safe_state::FileIdentity,
+) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let uid = unsafe { libc::geteuid() };
+    if !metadata.is_file()
+        || metadata.dev() != expected.device
+        || metadata.ino() != expected.file
+        || metadata.uid() != uid
+        || metadata.mode() & 0o7777 != 0o600
+        || metadata.nlink() != 1
+    {
+        bail!(
+            "worker journal is not the expected current-user-owned single-link 0600 regular file"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+    use std::path::Component;
+
+    if !path.is_absolute()
+        || !path
+            .components()
+            .skip(1)
+            .all(|part| matches!(part, Component::Normal(_)))
+        || path.file_name().is_none()
+    {
+        bail!("worker journal path must be an exact absolute path without traversal");
+    }
+    let relative = path.strip_prefix("/")?;
+    let name = CString::new(relative.as_os_str().as_bytes())?;
+    let root = fs::File::open("/")?;
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let how = OpenHow {
+        flags: u64::try_from(
+            (if append {
+                libc::O_WRONLY | libc::O_APPEND
+            } else {
+                libc::O_RDONLY
+            }) | libc::O_CLOEXEC
+                | libc::O_NOFOLLOW
+                | libc::O_NONBLOCK,
+        )?,
+        mode: 0,
+        // BENEATH | NO_MAGICLINKS | NO_SYMLINKS. Bind mounts are admitted by
+        // the existing exact-file containment contract; do not forbid those.
+        resolve: 0x08 | 0x02 | 0x04,
+    };
+    // SAFETY: root is held, name is NUL-terminated, and how has the kernel ABI
+    // layout and lifetime required by openat2. No create/truncate flag is used.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            name.as_ptr(),
+            &how as *const OpenHow,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error())
+            .context("cannot open the existing worker journal without following links");
+    }
+    let fd = i32::try_from(fd).context("worker journal descriptor overflow")?;
+    // SAFETY: successful openat2 returned a new descriptor, transferred once.
+    Ok(unsafe { fs::File::from_raw_fd(fd) })
 }
 
 pub(super) fn worker_execution_journal_apply_patch_example() -> Result<String> {
