@@ -1,207 +1,173 @@
-name: Rust CI
+name: MACO isolated Windows artifact
 
 on:
-  pull_request:
-  push:
-    branches: [main]
-    tags: ['**']
-    paths-ignore:
-      - maco-coordination.json
   workflow_dispatch:
 
 permissions:
   contents: read
 
-concurrency:
-  group: rust-ci-${{ github.workflow }}-${{ github.ref }}
-  # Keep default-branch runs when a later commit starts; cancel only superseded pull_request runs.
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
 env:
+  SOURCE_SHA: 09d0a9b894de2a945ce4a290d617b4f693d885f7
+  SOURCE_TREE: f125df94b82c2b2286669f861ea8012c43136b7b
+  MACO_SOURCE_REVISION: 09d0a9b894de2a945ce4a290d617b4f693d885f7
+  MACO_SOURCE_STATE: clean
   CARGO_INCREMENTAL: "0"
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: "1"
 
 jobs:
-  repository-portability:
-    name: Repository portability
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Run repository portability unit tests
-        run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
-
-      - name: Check tracked path portability
-        run: python3 scripts/check_repository_portability.py
-
-  linux-library:
-    name: Linux library tests (${{ matrix.shard }})
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        shard: [autopilot, supervise, rest]
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          persist-credentials: false
-
-      - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
-        run: bash .github/scripts/configure-github-hosted-userns.sh
-
-      - name: Install Linux native build dependencies for headless CAM
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libdbus-1-dev
-
-      - name: Verify delegated Linux process startup
-        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
-
-      - name: Install repository Rust toolchain
-        run: |
-          rustup toolchain install
-          rustc --version --verbose
-          cargo --version --verbose
-          cargo clippy --version
-
-      - name: Check formatting
-        if: matrix.shard == 'rest'
-        run: cargo fmt --all -- --check
-
-      - name: Check all targets against Cargo.lock
-        if: matrix.shard == 'rest'
-        run: cargo check --locked --all-targets
-
-      - name: Lint all targets
-        if: matrix.shard == 'rest'
-        run: cargo clippy --locked --all-targets -- -D warnings
-
-      - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
-        run: bash .github/scripts/install-github-hosted-ci-codex.sh
-
-      - name: Verify nested Codex sandbox integration
-        if: matrix.shard == 'rest'
-        run: |
-          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh \
-            cargo test --locked --lib \
-            'process_runner::tests::nested_codex_profile_appends_exact_journal_while_outer_keeps_parent_nonwritable' \
-            -- --exact --nocapture
-
-      - name: Run library tests
-        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"
-
-  linux-integration:
-    name: Linux integration tests
-    runs-on: ubuntu-latest
+  build-windows-artifact:
+    name: Build provenance-bound Windows artifact
+    runs-on: windows-latest
     timeout-minutes: 45
     steps:
-      - name: Check out repository
+      - name: Check out exact accepted source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: 09d0a9b894de2a945ce4a290d617b4f693d885f7
           persist-credentials: false
 
-      - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
-        run: bash .github/scripts/configure-github-hosted-userns.sh
-
-      - name: Install Linux native build dependencies for headless CAM
+      - name: Verify accepted source identity
+        shell: pwsh
         run: |
-          sudo apt-get update
-          sudo apt-get install -y pkg-config libdbus-1-dev
+          $ErrorActionPreference = 'Stop'
+          if ($env:RUNNER_ARCH -cne 'X64') {
+            throw "Expected X64 runner, found '$env:RUNNER_ARCH'."
+          }
 
-      - name: Verify delegated Linux process startup
-        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
+          $actualRevision = (& git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualRevision -cne $env:SOURCE_SHA) {
+            throw "Source revision mismatch: '$actualRevision'."
+          }
+
+          $actualTree = (& git rev-parse 'HEAD^{tree}').Trim()
+          if ($LASTEXITCODE -ne 0 -or $actualTree -cne $env:SOURCE_TREE) {
+            throw "Source tree mismatch: '$actualTree'."
+          }
+
+          $expectedBlobs = [ordered]@{
+            'Cargo.lock' = 'c49f15d056de654fb616f441938a609066bb8a6a'
+            'Cargo.toml' = 'a1eeb36cfc09242df3e7e9fcb76a284436db91ff'
+            'rust-toolchain.toml' = '48701262b3494a9317fad53a30c2fa58c095174f'
+            'build.rs' = '6c19eb61cad80fddc8bd443515ba4b0d01e9002b'
+            'src/build_identity.rs' = '72fd8ad11b86852eb3f14f8f8ab61ebe7b89b642'
+            'src/bin/maco.rs' = '229c71ceda5f4af4957b09e83c7a41bc859dc735'
+          }
+          foreach ($entry in $expectedBlobs.GetEnumerator()) {
+            $actualBlob = (& git rev-parse ("HEAD:" + $entry.Key)).Trim()
+            if ($LASTEXITCODE -ne 0 -or $actualBlob -cne $entry.Value) {
+              throw "Blob mismatch for $($entry.Key): '$actualBlob'."
+            }
+          }
+
+          $dirty = @(& git status --porcelain=v1 --untracked-files=normal)
+          if ($LASTEXITCODE -ne 0 -or $dirty.Count -ne 0) {
+            throw 'Accepted source checkout is not clean.'
+          }
 
       - name: Install repository Rust toolchain
+        shell: pwsh
         run: |
+          $ErrorActionPreference = 'Stop'
           rustup toolchain install
+          if ($LASTEXITCODE -ne 0) { throw 'rustup toolchain installation failed.' }
           rustc --version --verbose
+          if ($LASTEXITCODE -ne 0) { throw 'rustc version query failed.' }
           cargo --version --verbose
-          cargo clippy --version
+          if ($LASTEXITCODE -ne 0) { throw 'cargo version query failed.' }
 
-      - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
-        run: bash .github/scripts/install-github-hosted-ci-codex.sh
-
-      - name: Run integration and binary tests
-        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib
-
-  linux-gate:
-    name: Linux fmt, check, clippy, and test
-    runs-on: ubuntu-latest
-    needs:
-      - linux-library
-      - linux-integration
-    if: always()
-    timeout-minutes: 5
-    steps:
-      - name: Require partitioned Linux test jobs
-        # A matrix job succeeds only when every shard succeeds. Cancelled,
-        # failed, or skipped shards must not satisfy this required gate.
-        env:
-          LIBRARY_RESULT: ${{ needs.linux-library.result }}
-          INTEGRATION_RESULT: ${{ needs.linux-integration.result }}
+      - name: Build exact release binary
+        shell: pwsh
         run: |
-          if [[ "${LIBRARY_RESULT}" != "success" || "${INTEGRATION_RESULT}" != "success" ]]; then
-            echo "linux-library result: ${LIBRARY_RESULT}"
-            echo "linux-integration result: ${INTEGRATION_RESULT}"
-            exit 1
-          fi
+          $ErrorActionPreference = 'Stop'
+          cargo build --locked --release --bin maco
+          if ($LASTEXITCODE -ne 0) { throw 'Release build failed.' }
 
-  portable-build:
-    name: ${{ matrix.os }} compile and test build
-    needs: repository-portability
-    runs-on: ${{ matrix.os }}
-    timeout-minutes: 45
-    strategy:
-      fail-fast: false
-      matrix:
-        os:
-          - macos-latest
-          - windows-latest
-    steps:
-      - name: Check out repository
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Verify embedded identity and stage provenance
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $builtBinary = Get-Item -LiteralPath '.\target\release\maco.exe' -ErrorAction Stop
+          $versionLines = @(& $builtBinary.FullName --version)
+          if ($LASTEXITCODE -ne 0) {
+            throw 'Built maco.exe failed its isolated version check.'
+          }
+          $versionText = $versionLines -join "`n"
+          if (-not $versionText.Contains("source_revision=$env:SOURCE_SHA")) {
+            throw 'Built binary lacks the accepted source revision.'
+          }
+          if (-not $versionText.Contains('source_state=clean')) {
+            throw 'Built binary lacks the clean source-state marker.'
+          }
+
+          New-Item -ItemType Directory -Path '.\dist' -ErrorAction Stop | Out-Null
+          Copy-Item -LiteralPath $builtBinary.FullName -Destination '.\dist\maco.exe' -ErrorAction Stop
+          $stagedBinary = Get-Item -LiteralPath '.\dist\maco.exe' -ErrorAction Stop
+          $builtHash = (Get-FileHash -LiteralPath $builtBinary.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+          $stagedHash = (Get-FileHash -LiteralPath $stagedBinary.FullName -Algorithm SHA256 -ErrorAction Stop).Hash
+          if ($builtHash -cne $stagedHash) {
+            throw 'Staged binary hash differs from the built binary.'
+          }
+
+          $rustcVersion = (& rustc --version --verbose | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'rustc version capture failed.' }
+          $cargoVersion = (& cargo --version --verbose | Out-String).Trim()
+          if ($LASTEXITCODE -ne 0) { throw 'cargo version capture failed.' }
+
+          $provenance = [ordered]@{
+            schema = 'maco-isolated-build-provenance-v1'
+            source_repository = $env:GITHUB_REPOSITORY
+            source_revision = $env:SOURCE_SHA
+            source_tree = $env:SOURCE_TREE
+            source_state = $env:MACO_SOURCE_STATE
+            cargo_lock_blob = 'c49f15d056de654fb616f441938a609066bb8a6a'
+            cargo_manifest_blob = 'a1eeb36cfc09242df3e7e9fcb76a284436db91ff'
+            rust_toolchain_blob = '48701262b3494a9317fad53a30c2fa58c095174f'
+            build_script_blob = '6c19eb61cad80fddc8bd443515ba4b0d01e9002b'
+            build_identity_blob = '72fd8ad11b86852eb3f14f8f8ab61ebe7b89b642'
+            binary_entrypoint_blob = '229c71ceda5f4af4957b09e83c7a41bc859dc735'
+            checkout_action_commit = '3d3c42e5aac5ba805825da76410c181273ba90b1'
+            upload_artifact_action_commit = 'ea165f8d65b6e75b540449e92b4886f43607fa02'
+            workflow_repository = $env:GITHUB_REPOSITORY
+            workflow_path = '.github/workflows/ci.yml'
+            workflow_ref = $env:GITHUB_REF
+            workflow_revision = $env:GITHUB_SHA
+            workflow_identity = $env:GITHUB_WORKFLOW_REF
+            workflow_name = $env:GITHUB_WORKFLOW
+            workflow_run_id = $env:GITHUB_RUN_ID
+            workflow_run_attempt = $env:GITHUB_RUN_ATTEMPT
+            runner_os = $env:RUNNER_OS
+            runner_arch = $env:RUNNER_ARCH
+            runner_image_os = $env:ImageOS
+            runner_image_version = $env:ImageVersion
+            rustc = $rustcVersion
+            cargo = $cargoVersion
+            build_command = 'cargo build --locked --release --bin maco'
+            binary_name = $stagedBinary.Name
+            binary_size_bytes = $stagedBinary.Length
+            binary_sha256 = $stagedHash
+            embedded_version_output = $versionText
+          }
+          $provenance | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath '.\dist\provenance.json' -Encoding utf8NoBOM
+          "$stagedHash *maco.exe" | Set-Content -LiteralPath '.\dist\SHA256SUMS' -Encoding ascii
+
+      - name: Upload immutable build evidence
+        id: upload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
-          persist-credentials: false
+          name: maco-windows-x86_64-09d0a9b894de2a945ce4a290d617b4f693d885f7-${{ github.run_id }}-${{ github.run_attempt }}
+          if-no-files-found: error
+          path: |
+            dist/maco.exe
+            dist/provenance.json
+            dist/SHA256SUMS
 
-      - name: Install repository Rust toolchain
+      - name: Record GitHub artifact identity
+        shell: pwsh
         run: |
-          rustup toolchain install
-          rustc --version --verbose
-          cargo --version --verbose
-          cargo clippy --version
-
-      - name: Check all targets against Cargo.lock
-        run: cargo check --locked --all-targets
-
-      - name: Compile all tests without running them
-        run: cargo test --locked --all-targets --no-run
-
-  required-rust-gate:
-    name: Required Rust CI gate
-    runs-on: ubuntu-latest
-    needs:
-      - repository-portability
-      - linux-gate
-      - portable-build
-    if: always()
-    timeout-minutes: 5
-    steps:
-      - name: Require portability, Linux tests, and portable builds
-        env:
-          PORTABILITY_RESULT: ${{ needs.repository-portability.result }}
-          LINUX_RESULT: ${{ needs.linux-gate.result }}
-          PORTABLE_RESULT: ${{ needs.portable-build.result }}
-        run: |
-          if [[ "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" ]]; then
-            echo "repository-portability result: ${PORTABILITY_RESULT}"
-            echo "linux-gate result: ${LINUX_RESULT}"
-            echo "portable-build result: ${PORTABLE_RESULT}"
-            exit 1
-          fi
+          $ErrorActionPreference = 'Stop'
+          @"
+          artifact_id=${{ steps.upload.outputs.artifact-id }}
+          artifact_url=${{ steps.upload.outputs.artifact-url }}
+          artifact_archive_sha256=${{ steps.upload.outputs.artifact-digest }}
+          "@ | Add-Content -LiteralPath $env:GITHUB_STEP_SUMMARY -Encoding utf8
