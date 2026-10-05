@@ -4081,7 +4081,7 @@ fn account_observation_for_launch_runtime(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (runtime, run_id);
-        return Ok(None);
+        Ok(None)
     }
     #[cfg(target_os = "linux")]
     {

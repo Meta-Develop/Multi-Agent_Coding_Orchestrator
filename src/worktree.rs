@@ -745,7 +745,7 @@ fn worktree_report_path_from_wire(wire: &WorktreeReportPathWire) -> Result<PathB
     let path = {
         use std::os::windows::ffi::OsStringExt;
 
-        if wire.encoding != "windows-wide-hex-v1" || wire.data.len() % 4 != 0 {
+        if wire.encoding != "windows-wide-hex-v1" || !wire.data.len().is_multiple_of(4) {
             bail!("managed GC path snapshot has an invalid Windows encoding");
         }
         let mut units = Vec::with_capacity(wire.data.len() / 4);

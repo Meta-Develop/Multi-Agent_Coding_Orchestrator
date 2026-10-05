@@ -892,7 +892,7 @@ fn prepare_codex_runtime_model_catalog_process(
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (program, resolver_search_base, timeout, grant);
-        return Err(CodexRuntimeModelCatalogFailureCause::UnsupportedPlatform.into());
+        Err(CodexRuntimeModelCatalogFailureCause::UnsupportedPlatform.into())
     }
 
     #[cfg(target_os = "linux")]

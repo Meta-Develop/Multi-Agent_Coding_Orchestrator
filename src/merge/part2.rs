@@ -1594,6 +1594,9 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
             return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
         }
     };
+    #[cfg(windows)]
+    validate_repository_index_metadata(path, path_metadata, None)?;
+    #[cfg(not(windows))]
     validate_repository_index_metadata(path, &path_metadata, None)?;
     let mut options = OpenOptions::new();
     options.read(true);
@@ -1647,6 +1650,9 @@ fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
     #[cfg(not(windows))]
     let after = fs::symlink_metadata(path)
         .with_context(|| format!("failed to recheck {}", path.display()))?;
+    #[cfg(windows)]
+    validate_repository_index_metadata(path, after, None)?;
+    #[cfg(not(windows))]
     validate_repository_index_metadata(path, &after, None)?;
     #[cfg(windows)]
     let identity_matches = file_identity == after_snapshot.identity;
