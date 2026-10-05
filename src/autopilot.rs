@@ -1296,7 +1296,7 @@ fn source_head_execution_base_denial(denial: &GateDenial) -> bool {
 
 enum AutopilotCascadeDispatch<'a> {
     Production(std::marker::PhantomData<&'a ()>),
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     Injected {
         supervisor_plan: Value,
         external_runner: &'a mut (dyn FnMut(
@@ -1460,7 +1460,7 @@ where
     )?))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_autopilot_plan_file_with_injected_supervisor_and_runner(
     options: AutopilotRunOptions,
     profile: Option<AutopilotProfile>,
@@ -1548,7 +1548,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
     };
     let (injected_supervisor_plan, injected_dispatch) = match &cascade_dispatch {
         AutopilotCascadeDispatch::Production(_) => (None, false),
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         AutopilotCascadeDispatch::Injected {
             supervisor_plan, ..
         } => (Some(supervisor_plan.clone()), true),
@@ -1956,7 +1956,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
                     &mut follow_up_profile_gate,
                 )
             }
-            #[cfg(test)]
+            #[cfg(all(test, target_os = "linux"))]
             AutopilotCascadeDispatch::Injected {
                 external_runner, ..
             } => supervise::run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(

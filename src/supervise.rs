@@ -267,7 +267,7 @@ mod follow_up_cascade;
 use follow_up_cascade::*;
 mod follow_up_graph;
 mod follow_up_lease;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use follow_up_cascade::{
     clear_follow_up_cascade_test_isolation, clear_generated_follow_up_queue_observer,
     set_before_generated_follow_up_plan_load_hook, set_generated_follow_up_queue_observer,
@@ -279,7 +279,7 @@ pub(crate) use follow_up_cascade::{
     normalized_supervisor_plan_file_sha256, AuthenticatedGeneratedFollowUpTerminal,
     GeneratedFollowUpDispatchEvidence,
 };
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use follow_up_lease::{
     clear_follow_up_lease_test_isolation, set_follow_up_lease_heartbeat_test_hook,
     FollowUpLeaseClaimTimingOverride,
@@ -308,7 +308,7 @@ pub(crate) mod cam_authority_child_env;
 
 mod assignment_execution;
 pub(crate) mod held_out;
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
 
@@ -4494,4 +4494,6 @@ include!("supervise/part2.rs");
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
-pub(crate) use tests::{injected_verified_run, write_injected_json, write_injected_usage};
+pub(crate) use tests::{injected_verified_run, write_injected_usage};
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::write_injected_json;

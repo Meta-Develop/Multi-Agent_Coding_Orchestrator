@@ -2,7 +2,9 @@ use super::*;
 use crate::megafile::{FileSizeSample, MegafileRecordKind, MegafileThresholdCalibration};
 use crate::worktree::WorktreeCreateOptions;
 use git2::Signature;
-use std::process::{Command, Stdio};
+use std::process::Command;
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 use std::sync::{mpsc, Mutex};
 
 static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
@@ -2141,12 +2143,14 @@ fn trusted_network_environment_and_stdin_fail_closed() {
     .is_err());
 }
 
+#[cfg(unix)]
 fn private_runtime_test_root(temp: &tempfile::TempDir) -> PathBuf {
     let root = temp.path().join("runtime");
     create_private_directory(&root).expect("create private runtime test root");
     root
 }
 
+#[cfg(target_os = "linux")]
 fn rewrite_private_runtime_owner(path: &Path, owner: &PrivateRuntimeOwner) {
     let mut bytes = serde_json::to_vec(owner).expect("serialize private runtime owner");
     bytes.push(b'\n');
@@ -2161,6 +2165,7 @@ fn rewrite_private_runtime_owner(path: &Path, owner: &PrivateRuntimeOwner) {
     file.sync_all().expect("persist rewritten runtime owner");
 }
 
+#[cfg(unix)]
 fn private_runtime_owner_for_test(kind: PrivateRuntimeKind, nonce: &str) -> PrivateRuntimeOwner {
     PrivateRuntimeOwner {
         version: PRIVATE_RUNTIME_OWNER_VERSION,
@@ -2177,6 +2182,7 @@ fn private_runtime_owner_for_test(kind: PrivateRuntimeKind, nonce: &str) -> Priv
     }
 }
 
+#[cfg(unix)]
 fn create_incomplete_private_runtime(
     root: &Path,
     kind: PrivateRuntimeKind,

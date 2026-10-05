@@ -7,6 +7,7 @@ use crate::worktree::WorktreeManager;
 use git2::{Oid, Repository, Signature};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::sync::mpsc;
 use tempfile::TempDir;
 

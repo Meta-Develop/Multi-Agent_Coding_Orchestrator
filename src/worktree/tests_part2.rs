@@ -3409,6 +3409,7 @@
         assert_eq!(names, vec![OsString::from(WORKTREE_STATUS_RUNTIME_LOCK)]);
     }
 
+    #[cfg(target_os = "linux")]
     fn prepare_remove_operation_for_test(
         repo: &Repository,
         store: &ManagedWorktreeRegistryStore,
@@ -3482,6 +3483,7 @@
         )
     }
 
+    #[cfg(target_os = "linux")]
     fn assert_completed_remove(
         repo: &Repository,
         registry: &ManagedWorktreeRegistry,
@@ -3574,12 +3576,14 @@
         }
     }
 
+    #[cfg(target_os = "linux")]
     fn gc_targets_only_options(worktree_root: Option<PathBuf>, dry_run: bool) -> WorktreeGcOptions {
         let mut options = gc_options(worktree_root, dry_run);
         options.targets_only = true;
         options
     }
 
+    #[cfg(target_os = "linux")]
     fn test_live_target_liveness() -> WorktreeTargetLiveness {
         WorktreeTargetLiveness::Live(target_liveness_evidence(
             Some(42),
@@ -3588,6 +3592,7 @@
         ))
     }
 
+    #[cfg(target_os = "linux")]
     fn test_unknown_target_liveness() -> WorktreeTargetLiveness {
         WorktreeTargetLiveness::Unknown(target_liveness_evidence(
             Some(43),

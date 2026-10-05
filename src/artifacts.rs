@@ -1662,7 +1662,7 @@ impl ArtifactRunReader {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_artifact_append_fault(point: ArtifactAppendFaultPoint) {
     ARTIFACT_APPEND_FAULT.with(|fault| fault.set(Some(point)));
 }

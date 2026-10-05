@@ -1109,7 +1109,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_migration_after_preflight_hook(hook: impl FnOnce() + 'static) {
     MIGRATION_AFTER_PREFLIGHT_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -1125,23 +1125,23 @@ fn run_migration_after_preflight_hook() {
 #[cfg(not(test))]
 fn run_migration_after_preflight_hook() {}
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 type MigrationAfterChildBindHook = Option<(String, Box<dyn FnOnce()>)>;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static MIGRATION_AFTER_CHILD_BIND_HOOK: std::cell::RefCell<MigrationAfterChildBindHook> =
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_migration_after_child_bind_hook(name: &str, hook: impl FnOnce() + 'static) {
     MIGRATION_AFTER_CHILD_BIND_HOOK.with(|slot| {
         *slot.borrow_mut() = Some((name.to_string(), Box::new(hook)));
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn run_migration_after_child_bind_hook(name: &str) {
     let hook = MIGRATION_AFTER_CHILD_BIND_HOOK.with(|slot| {
         let mut slot = slot.borrow_mut();
@@ -1156,7 +1156,7 @@ fn run_migration_after_child_bind_hook(name: &str) {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), unix))]
 fn run_migration_after_child_bind_hook(_name: &str) {}
 
 #[cfg(test)]
@@ -1168,7 +1168,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_migration_before_final_verification_hook(hook: impl FnOnce() + 'static) {
     MIGRATION_BEFORE_FINAL_VERIFICATION_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
@@ -3464,7 +3464,7 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_migration_fault(point: MigrationFaultPoint, action: MigrationFaultAction) {
     MIGRATION_FAULT.with(|slot| slot.set(Some((point, action))));
 }

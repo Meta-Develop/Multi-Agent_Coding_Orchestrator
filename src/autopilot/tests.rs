@@ -1,22 +1,24 @@
 use super::*;
 use crate::{
+    mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+    supervise::{LicensedBreakageDeclaration, LicensedBreakageDependentScope},
+    worktree::WorktreeCreateOptions,
+};
+#[cfg(target_os = "linux")]
+use crate::{
     external_agent::ExternalAgentCommand,
     gate_denial::GateDenialReason,
     mutation_taxonomy::{
         set_autopilot_dispatch_decisions_for_test, AutonomousMutationDecision,
-        TAXONOMY_REVIEW_REQUIRED_GATE_ID,
     },
-    supervise::{
-        AuditorReport, Finding, LicensedBreakageDeclaration, LicensedBreakageDependentScope,
-        OrchestratorReviewReport,
-    },
-    worktree::WorktreeCreateOptions,
+    supervise::{AuditorReport, Finding, OrchestratorReviewReport},
 };
+#[cfg(target_os = "linux")]
 use serde_json::json;
+use std::{cell::Cell, fs::File, rc::Rc};
+#[cfg(target_os = "linux")]
 use std::{
-    cell::{Cell, RefCell},
-    fs::File,
-    rc::Rc,
+    cell::RefCell,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex, MutexGuard, OnceLock,
@@ -27,8 +29,10 @@ use std::{
 // the shared systemd slot set. Concurrent siblings only add contention; unique
 // RunIds and temp dirs still keep durable state from colliding across leftover
 // runs. Serialization is not a substitute for keeping the fixtures themselves.
+#[cfg(target_os = "linux")]
 static SNAPSHOT_HEAVY_AUTOPILOT_TEST_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
+#[cfg(target_os = "linux")]
 fn lock_snapshot_heavy_autopilot_test() -> MutexGuard<'static, ()> {
     SNAPSHOT_HEAVY_AUTOPILOT_TEST_LOCK
         .get_or_init(|| Mutex::new(()))
@@ -36,6 +40,7 @@ fn lock_snapshot_heavy_autopilot_test() -> MutexGuard<'static, ()> {
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+#[cfg(target_os = "linux")]
 fn lock_prepublication_fixture_test() -> MutexGuard<'static, ()> {
     lock_snapshot_heavy_autopilot_test()
 }
@@ -940,6 +945,7 @@ fn licensed_autopilot_profile_matches_fixture_plan_and_permits_dispatch() {
     assert!(binding.permits_dispatch());
 }
 
+#[cfg(target_os = "linux")]
 fn injected_autopilot_child_report(
     id: &str,
     assigned_paths: Vec<PathBuf>,
@@ -1014,6 +1020,7 @@ fn injected_autopilot_child_report(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn injected_autopilot_auditor_report(
     assignment_id: &str,
     reviewed_paths: Vec<PathBuf>,

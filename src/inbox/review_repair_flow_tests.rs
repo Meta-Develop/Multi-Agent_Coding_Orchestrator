@@ -1,17 +1,21 @@
 //! Consumer-level tests for the two-phase inbox PR repair flow (#90).
 
+#[cfg(unix)]
 use super::super::review_loop::{
     DispositionDecision, FrozenReviewSnapshot, RequiredCheck, ReviewLoopPhase, ReviewLoopPolicy,
     ReviewLoopState, TrustedActorBinding, TrustedActorIdentity, TrustedActorRole,
 };
+#[cfg(unix)]
 use super::super::review_loop_entry::{
     compact_independent_auditor_selection, independent_auditor_stable_id,
     select_critical_independent_auditor,
 };
 use super::super::review_policy_input::BoundReviewPolicy;
+#[cfg(unix)]
 use super::super::review_repair_evidence::{
     RepairDispositionAuditorFeedbackVerdict, RepairDispositionAuditorOutput,
 };
+#[cfg(unix)]
 use super::super::{
     DuplicateDetectionResult, GithubCheckSummary, GithubPrCandidate, GithubPrSourceTrust,
     GithubReviewFeedbackSummary, InboxActionPolicy, InboxConfig, InboxItem, InboxItemKind,
@@ -19,9 +23,10 @@ use super::super::{
     IndependentAuditRunnerResult, PrivacyScanResult,
 };
 use super::*;
-use crate::artifacts::{
-    state_auth::sha256_hex, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
-};
+use crate::artifacts::{ArtifactRunWriter, RunArtifactFamily};
+#[cfg(unix)]
+use crate::artifacts::{state_auth::sha256_hex, ArtifactRunReader};
+#[cfg(unix)]
 use crate::autopilot::{
     AutopilotArtifactPaths, AutopilotAttemptSummary, AutopilotCheckStatus, AutopilotFinalReport,
     AutopilotForgeMode, AutopilotPlanSummary, AutopilotProfile, AutopilotProfileBindingReport,
@@ -29,32 +34,41 @@ use crate::autopilot::{
     AutopilotRunStatus, AutopilotSafetyReport, AutopilotValidationStatus,
     AutopilotValidationSummary,
 };
+#[cfg(unix)]
 use crate::llm::RedactionSummary;
 use crate::merge::{
     candidate_validation_binding, raw_candidate_snapshot_diff, CandidateValidationBinding,
     ValidationReport, ValidationStatus,
 };
 use crate::optimizer::merge_authority::{
-    AgentIdentity, LensDecision, LensVerdict, MergeActor, ProducerFingerprint, SessionId,
+    AgentIdentity, MergeActor, ProducerFingerprint, SessionId,
 };
+#[cfg(unix)]
+use crate::optimizer::merge_authority::{LensDecision, LensVerdict};
 use crate::orchestrator::RunId;
 use crate::publication;
+use crate::publication::forge_transport::{ForgeRepository, ProviderObjectId, ProviderObjectKind};
+#[cfg(unix)]
 use crate::publication::forge_transport::{
     FakeForgeTransport, ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem,
-    ForgeItemKind, ForgeObservation, ForgeObservationRequest, ForgeRepository, ForgeReview,
-    ForgeReviewState, ForgeTimestamp, ProviderObjectId, ProviderObjectKind,
-    PullRequestReviewSnapshot, ReportedActorKind,
+    ForgeItemKind, ForgeObservation, ForgeObservationRequest, ForgeReview,
+    ForgeReviewState, ForgeTimestamp, PullRequestReviewSnapshot, ReportedActorKind,
 };
 use crate::publication::pr_original_update::OriginalPrUpdateReceipt;
+#[cfg(unix)]
 use crate::review::ReviewerMode;
+#[cfg(unix)]
 use crate::safe_state::SafeRoot;
+#[cfg(unix)]
 use crate::supervise::{
     AgentRole, AutonomyKpiReport, ReviewStatus, SupervisorFinalReport, SupervisorRunLifecycle,
     SupervisorRuntime,
 };
 use crate::worktree::{WorktreeCreateOptions, WorktreeManager};
+#[cfg(unix)]
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository, Signature};
+#[cfg(unix)]
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -439,11 +453,13 @@ fn resume_replays_completed_transition_without_second_update() {
     );
 }
 
+#[cfg(unix)]
 fn hashed_id(kind: ProviderObjectKind, raw: &[u8]) -> ProviderObjectId {
     ProviderObjectId::new("github", kind, format!("node:sha256:{}", sha256_hex(raw)))
         .expect("hashed github id")
 }
 
+#[cfg(unix)]
 fn local_source_revalidator(repo: &Path, item: &InboxItem) -> Result<()> {
     item.source_snapshot.validate()?;
     let git = Repository::open(repo).context("open source repo")?;
@@ -466,6 +482,7 @@ fn local_source_revalidator(repo: &Path, item: &InboxItem) -> Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
 fn captured_audit_runner(
     raw: &[u8],
 ) -> impl FnMut(&crate::external_agent::ExternalAgentCommand) -> IndependentAuditRunnerResult + '_ {
@@ -485,6 +502,7 @@ fn captured_audit_runner(
     }
 }
 
+#[cfg(unix)]
 fn counting_audit_runner<'a>(
     raw: &'a [u8],
     calls: &'a AtomicUsize,
@@ -496,6 +514,7 @@ fn counting_audit_runner<'a>(
     }
 }
 
+#[cfg(unix)]
 fn accepted_auditor_output(
     task: &super::super::review_repair_evidence::RepairDispositionAuditTask,
     model: &str,
@@ -538,6 +557,7 @@ fn accepted_auditor_output(
     }
 }
 
+#[cfg(unix)]
 fn supervisor_report(run_id: &RunId, repo: &Path) -> SupervisorFinalReport {
     SupervisorFinalReport {
         version: 1,
@@ -595,6 +615,7 @@ fn supervisor_report(run_id: &RunId, repo: &Path) -> SupervisorFinalReport {
     }
 }
 
+#[cfg(unix)]
 fn autopilot_report(
     repo: &Path,
     run_id: &RunId,
@@ -687,6 +708,7 @@ fn autopilot_report(
     }
 }
 
+#[cfg(unix)]
 fn freeze_snapshot(
     item: ForgeItem,
     human: &ForgeActor,
@@ -731,6 +753,7 @@ fn freeze_snapshot(
     FrozenReviewSnapshot::observe(&transport, &item, &observed_at).expect("freeze")
 }
 
+#[cfg(unix)]
 struct CompleteRepairFixture {
     _temp: TempDir,
     repo: PathBuf,

@@ -1084,6 +1084,7 @@ pub(crate) fn write_injected_json(path: &Path, value: &impl Serialize) {
     .expect("write injected report");
 }
 
+#[cfg(unix)]
 fn remove_report_slot_if_present(path: &Path) -> std::io::Result<()> {
     match fs::remove_file(path) {
         Ok(()) => Ok(()),

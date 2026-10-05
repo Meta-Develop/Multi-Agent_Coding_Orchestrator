@@ -41,16 +41,19 @@ use crate::{
         ExternalAgentCommand, ExternalAgentRun,
     },
     messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN},
-    process_runner::{
-        run_process, ContainmentPolicy, EnvironmentMode, ProcessCancellation, ProcessSpec,
-        StdinMode, StreamCapture, WorkspaceAccess,
-    },
+    process_runner::{ProcessCancellation, WorkspaceAccess},
     worktree::WorktreeRecord,
+};
+
+#[cfg(target_os = "linux")]
+use crate::process_runner::{
+    run_process, ContainmentPolicy, EnvironmentMode, ProcessSpec, StdinMode, StreamCapture,
 };
 
 const CHILD_ENV: &str = "MACO_TEST_ASSIGNMENT_MESSAGING_CHILD";
 /// Parent fixture process: runs `assignment_messaging_ipc_acceptance` in an isolated helper (not the IPC child probe).
 const FIXTURE_HELPER_ENV: &str = "MACO_TEST_ASSIGNMENT_MESSAGING_FIXTURE_HELPER";
+#[cfg(target_os = "linux")]
 const VERIFIED_COMPLETION_MARKER: &str =
     "verified assignment IPC and disposable-peer isolation completed";
 const PHASE_ENV: &str = "MACO_TEST_MESSAGING_PHASE";
@@ -62,6 +65,7 @@ const FIXTURE_MANIFEST_REL: &str = ".maco/assignment-messaging-fixture.env";
 const FIXTURE_MANIFEST_EMBED: &str = "@@MACO_ASSIGNMENT_MESSAGING_FIXTURE_MANIFEST@@";
 const FIXTURE_STREAM_EMBED: &str = "@@MACO_ASSIGNMENT_MESSAGING_FIXTURE_STREAM@@";
 const DISPOSABLE_PEER_PID_ENV: &str = "MACO_TEST_DISPOSABLE_PEER_PID";
+#[cfg(target_os = "linux")]
 const DISPOSABLE_PEER_SECRET_ENV: &str = "MACO_TEST_DUMMY_PEER_SECRET";
 const EXACT_FILTER_SIMULATED: &str =
     "supervise::assignment_execution::messaging_ipc_tests::assignment_messaging_ipc_at_least_once_from_simulated_grok_child";
@@ -658,6 +662,7 @@ struct DisposablePeerProcess {
 }
 
 impl DisposablePeerProcess {
+    #[cfg(target_os = "linux")]
     fn spawn() -> Result<Self> {
         use std::process::{Command, Stdio};
         let dummy_secret = random_identifier().context("disposable peer dummy secret")?;
@@ -1435,8 +1440,8 @@ fn assignment_messaging_grok_verified_process_peer_isolation_and_ipc() -> Result
                 Some(&expected_cam_binding),
             )?;
             println!("{VERIFIED_COMPLETION_MARKER}");
+            return Ok(());
         }
-        return Ok(());
     }
     run_messaging_ipc_fixture_helper_subprocess(EXACT_FILTER_VERIFIED, true)
 }

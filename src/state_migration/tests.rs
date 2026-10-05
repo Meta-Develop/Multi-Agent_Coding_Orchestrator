@@ -1,5 +1,7 @@
 use super::*;
-use crate::{semantic_coord::SemanticIntentStore, sync::ClaimToken, sync_store::SyncStore};
+use crate::sync::ClaimToken;
+#[cfg(unix)]
+use crate::{semantic_coord::SemanticIntentStore, sync_store::SyncStore};
 use tempfile::TempDir;
 
 const ISSUE33_CLAIMS_V1: &[u8] =
@@ -56,6 +58,7 @@ fn empty_repository_state() -> (TempDir, PathBuf, SafeRoot) {
     (temp, path, state)
 }
 
+#[cfg(unix)]
 fn repository_with_checksumless_claims_v1() -> (TempDir, PathBuf, PathBuf) {
     let (temp, path, state) = empty_repository_state();
     AtomicStateWriter::write_direct(&state, "claims.json", ISSUE33_CLAIMS_V1)
@@ -63,6 +66,7 @@ fn repository_with_checksumless_claims_v1() -> (TempDir, PathBuf, PathBuf) {
     (temp, path, state.path().to_path_buf())
 }
 
+#[cfg(unix)]
 fn repository_with_checksumless_semantic() -> (TempDir, PathBuf, PathBuf, SemanticIntent) {
     let (temp, path, state) = empty_repository_state();
     let intent = SemanticIntent {

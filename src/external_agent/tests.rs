@@ -6746,18 +6746,24 @@ fn record_completed_target_refuses_missing_and_conflicting_acp_identity() -> Res
     Ok(())
 }
 
+#[cfg(unix)]
 const WRITABLE_GROK_ACP_FIXTURE_DIR: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/tests/fixtures/runtime_adapter/grok"
 );
+#[cfg(target_os = "linux")]
 const WRITABLE_GROK_ACP_PRODUCTION_TEST_NAME: &str =
     "external_agent::tests::writable_grok_acp_run_external_agent_accepts_bounded_write_and_parent_evidence";
+#[cfg(target_os = "linux")]
 const WRITABLE_GROK_ACP_PRODUCTION_HELPER_ENV: &str =
     "MACO_TEST_WRITABLE_GROK_ACP_PRODUCTION_HELPER";
+#[cfg(target_os = "linux")]
 const WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT_ENV: &str =
     "MACO_TEST_WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT";
+#[cfg(target_os = "linux")]
 const WRITABLE_GROK_ACP_PRODUCTION_HELPER_RECEIPT: &[u8] =
     b"writable Grok ACP production helper completed\n";
+#[cfg(target_os = "linux")]
 const WRITABLE_GROK_ACP_STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
 
 #[cfg(unix)]

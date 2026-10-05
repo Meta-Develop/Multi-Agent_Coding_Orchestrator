@@ -3,7 +3,9 @@ use super::*;
 const LICENSED_INTERFACE: &str = "crate::api::new_name";
 const LICENSED_SIGNATURE: &str =
     "error[E0425]: cannot find function crate::api::new_name in dependent client";
+#[cfg(target_os = "linux")]
 const LICENSED_INTERFACE_B: &str = "crate::api::server_symbol";
+#[cfg(target_os = "linux")]
 const LICENSED_SIGNATURE_B: &str =
     "error[E0425]: cannot find function crate::api::server_symbol in dependent server";
 
@@ -156,6 +158,7 @@ fn licensed_assignment() -> OrchestratorAssignment {
     assignment
 }
 
+#[cfg(target_os = "linux")]
 fn licensed_dual_dependent_assignment() -> OrchestratorAssignment {
     let mut assignment = injected_assignment(false);
     assignment.licensed_breakage = Some(LicensedBreakageDeclaration {
@@ -178,6 +181,7 @@ fn licensed_dual_dependent_assignment() -> OrchestratorAssignment {
     assignment
 }
 
+#[cfg(target_os = "linux")]
 fn dual_dependent_failure_child(assignment: &OrchestratorAssignment) -> OrchestratorReviewReport {
     let mut child = dependent_failure_child(assignment, "src/client.rs");
     child.validation_results.push(ValidationResult {
@@ -203,6 +207,7 @@ fn dual_dependent_failure_child(assignment: &OrchestratorAssignment) -> Orchestr
     child
 }
 
+#[cfg(target_os = "linux")]
 fn licensed_follow_up_assignment_for_ordinal(ordinal: usize) -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: format!("child-a-licensed-update-{ordinal:02}"),
@@ -351,6 +356,7 @@ fn licensed_auditor_report(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn licensed_follow_up_assignment() -> OrchestratorAssignment {
     OrchestratorAssignment {
         id: "child-a-licensed-update-01".to_string(),
