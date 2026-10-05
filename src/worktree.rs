@@ -945,7 +945,7 @@ struct ManagedWorktreeCreateLease {
 
 enum CreateRecoveryAdmission {
     Busy,
-    Admitted(Option<ManagedWorktreeCreateLease>),
+    Admitted(Option<Box<ManagedWorktreeCreateLease>>),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

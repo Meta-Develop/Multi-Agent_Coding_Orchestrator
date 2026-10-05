@@ -799,7 +799,7 @@ impl ManagedWorktreeRegistryStore {
                         return Err(error);
                     }
                 };
-                Ok(CreateRecoveryAdmission::Admitted(Some(
+                Ok(CreateRecoveryAdmission::Admitted(Some(Box::new(
                     ManagedWorktreeCreateLease {
                         name: name.to_string(),
                         incarnation_generation: incarnation.generation,
@@ -807,7 +807,7 @@ impl ManagedWorktreeRegistryStore {
                         _lock: kernel_lock,
                         _process_lease: process_lease,
                     },
-                )))
+                ))))
             }
         }
     }
