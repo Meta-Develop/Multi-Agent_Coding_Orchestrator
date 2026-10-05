@@ -4306,6 +4306,10 @@ pub(crate) fn private_runtime_environment_for_test(
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_os = "windows"))]
+#[path = "process_runner/windows_tests.rs"]
+mod windows_tests;
+
 #[cfg(all(test, target_os = "linux"))]
 mod mechanical_executor_lifecycle_tests {
     use super::*;

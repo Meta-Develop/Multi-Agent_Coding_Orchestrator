@@ -180,8 +180,16 @@ jobs:
       - name: Check all targets against Cargo.lock
         run: cargo check --locked --all-targets
 
+      - name: Lint all targets on Windows
+        if: matrix.os == 'windows-latest'
+        run: cargo clippy --locked --all-targets -- -D warnings
+
       - name: Compile all tests without running them
         run: cargo test --locked --all-targets --no-run
+
+      - name: Run Windows windowless Job lifecycle regressions
+        if: matrix.os == 'windows-latest'
+        run: cargo test --locked --lib process_runner::windows_tests:: -- --nocapture --test-threads=1
 
   required-rust-gate:
     name: Required Rust CI gate
