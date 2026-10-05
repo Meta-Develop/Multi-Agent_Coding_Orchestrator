@@ -359,7 +359,7 @@ impl TeeSink {
     fn write_all_cancellable(
         &mut self,
         bytes: &[u8],
-        cancel: &AtomicBool,
+        _cancel: &AtomicBool,
     ) -> std::io::Result<bool> {
         let accepted = bytes.len().min(self.remaining);
         let bytes_to_write = &bytes[..accepted];
@@ -372,7 +372,7 @@ impl TeeSink {
         {
             let mut written = 0;
             while written < bytes_to_write.len() {
-                if cancel.load(Ordering::Acquire) {
+                if _cancel.load(Ordering::Acquire) {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::Interrupted,
                         "tee write cancelled",
@@ -663,7 +663,7 @@ impl PreparedProcessTree {
         side_effect_profile: &SideEffectConfinementProfile,
         label: &str,
         command: &str,
-        operation_deadline: Option<Instant>,
+        _operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
     ) -> Result<Self, ProcessRunError> {
         let unavailable = |source| ProcessRunError::ContainmentUnavailable {
@@ -704,7 +704,7 @@ impl PreparedProcessTree {
                     ReviewedRequiredContainmentBackend::LinuxSystemdCgroupV2 => {
                         #[cfg(target_os = "linux")]
                         {
-                            match SystemdUnit::prepare(operation_deadline, cancellation) {
+                            match SystemdUnit::prepare(_operation_deadline, cancellation) {
                                 Ok(unit) => Ok(Self {
                                     backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
                                     side_effects,
@@ -718,7 +718,7 @@ impl PreparedProcessTree {
                                     })
                                 }
                                 Err(source)
-                                    if operation_deadline
+                                    if _operation_deadline
                                         .is_some_and(|deadline| Instant::now() >= deadline) =>
                                 {
                                     Err(setup_timeout_error(
@@ -838,21 +838,22 @@ impl PreparedProcessTree {
         child: &mut Child,
         label: &str,
         command: &str,
-        operation_deadline: Option<Instant>,
-        cancellation: &ProcessCancellation,
+        _operation_deadline: Option<Instant>,
+        _cancellation: &ProcessCancellation,
     ) -> Result<AttachedProcessTree, ProcessRunError> {
         match self.backend {
             #[cfg(target_os = "linux")]
             PreparedContainmentBackend::Systemd(mut unit) => {
                 unit.launcher_spawned = true;
-                if let Err(source) = unit.confirm_attached(child, operation_deadline, cancellation)
+                if let Err(source) =
+                    unit.confirm_attached(child, _operation_deadline, _cancellation)
                 {
                     if let Err(error) = unit.rollback_startup(label) {
                         fail_closed_stuck_owner(&format!(
                             "{label} systemd containment startup rollback: {error}"
                         ));
                     }
-                    return if cancellation.is_cancelled() {
+                    return if _cancellation.is_cancelled() {
                         Err(ProcessRunError::Cancelled {
                             label: label.to_string(),
                             command: command.to_string(),
@@ -876,7 +877,7 @@ impl PreparedProcessTree {
                             command.to_string(),
                             source,
                         ))
-                    } else if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
+                    } else if _operation_deadline.is_some_and(|deadline| Instant::now() >= deadline)
                     {
                         Err(setup_timeout_error(
                             label,
@@ -935,7 +936,7 @@ impl AttachedProcessTree {
     fn agent_lifecycle_pid(
         &mut self,
         child: &mut Child,
-        operation_deadline: Option<Instant>,
+        _operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<u32> {
         if cancellation.is_cancelled() {
@@ -947,7 +948,7 @@ impl AttachedProcessTree {
         match &mut self.backend {
             #[cfg(target_os = "linux")]
             ProcessTreeBackend::Systemd(unit) => {
-                unit.target_pid(child, operation_deadline, cancellation)
+                unit.target_pid(child, _operation_deadline, cancellation)
             }
             #[cfg(unix)]
             ProcessTreeBackend::UnixProcessGroup => Ok(child.id()),
@@ -1140,15 +1141,15 @@ impl ProcessTree {
 fn cleanup_process_tree_backend(
     backend: &mut ProcessTreeBackend,
     side_effects: SideEffectConfinementEvidence,
-    child: &mut Child,
-    child_already_exited: bool,
+    _child: &mut Child,
+    _child_already_exited: bool,
     label: &str,
     context: &str,
 ) -> TreeCleanup {
     match backend {
         #[cfg(target_os = "linux")]
         ProcessTreeBackend::Systemd(unit) => {
-            let mut cleanup = unit.cleanup(child, label, context);
+            let mut cleanup = unit.cleanup(_child, label, context);
             cleanup.side_effects = side_effects;
             cleanup
         }
@@ -1156,7 +1157,7 @@ fn cleanup_process_tree_backend(
         ProcessTreeBackend::WindowsJob(job) => job.cleanup(label, context, side_effects),
         #[cfg(unix)]
         ProcessTreeBackend::UnixProcessGroup => TreeCleanup {
-            error: terminate_unix_process_group(child, child_already_exited, label),
+            error: terminate_unix_process_group(_child, _child_already_exited, label),
             process_tree: ProcessTreeEvidence::TrustedBestEffort(
                 ContainmentBackend::UnixProcessGroup,
             ),
@@ -1164,10 +1165,10 @@ fn cleanup_process_tree_backend(
         },
         #[cfg(not(any(unix, target_os = "windows")))]
         ProcessTreeBackend::DirectChild => TreeCleanup {
-            error: if child_already_exited {
+            error: if _child_already_exited {
                 None
             } else {
-                child
+                _child
                     .kill()
                     .err()
                     .map(|error| format!("{label} {context} direct process kill failed: {error}"))

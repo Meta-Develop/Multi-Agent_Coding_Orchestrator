@@ -5009,7 +5009,7 @@ fn strict_backend_available_for_tests() -> bool {
     }
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn strict_backend_available_for_tests() -> bool {
     false
 }

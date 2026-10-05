@@ -1,6 +1,10 @@
+#[cfg(target_os = "linux")]
+use std::collections::BTreeSet;
+#[cfg(any(test, target_os = "linux"))]
+use std::env;
+
 use std::{
-    collections::{BTreeMap, BTreeSet},
-    env,
+    collections::BTreeMap,
     ffi::{OsStr, OsString},
     fmt,
     fs::{self, File, OpenOptions},
@@ -25,10 +29,11 @@ use crate::{
     },
     external_agent::EnvironmentFailure,
     mutation_taxonomy::ConsumedMechanicalExecutorProof,
-    pinned_exec::{
-        self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
-    },
+    pinned_exec::{self, PinnedDirectExecutable},
 };
+
+#[cfg(target_os = "linux")]
+use crate::pinned_exec::{HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME};
 
 mod nested_usage;
 pub use nested_usage::{
@@ -58,6 +63,7 @@ const MAX_SHELL_COMMAND_BYTES: usize = 1024 * 1024;
 const MAX_SANDBOX_PATHS_PER_CLASS: usize = 128;
 const MAX_SANDBOX_TOTAL_PATHS: usize = 512;
 const MAX_SANDBOX_PATH_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
 const MAX_SANDBOX_MOUNT_CHECKS: usize = 768;
 #[cfg(target_os = "linux")]
 const MAX_PRIVATE_RUNTIME_FILE_BYTES: usize = 1024 * 1024;
@@ -1300,7 +1306,7 @@ impl StrictOfflineWorkspaceProfile {
         &self.config.hidden_roots
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) const fn isolated_host_view(&self) -> bool {
         self.config.isolated_host_view
     }
@@ -1448,7 +1454,7 @@ impl ExternalCodexProfile {
         &self.config.visible_read_only_roots
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn visible_read_only_files(&self) -> &[PathBuf] {
         &self.config.visible_read_only_files
     }
@@ -1555,12 +1561,12 @@ impl ExternalGrokProfile {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn writable_artifact_roots(&self) -> &[PathBuf] {
         &self.config.writable_artifact_roots
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn workspace_access(&self) -> WorkspaceAccess {
         self.config.workspace_access
     }
@@ -1865,7 +1871,7 @@ impl ProcessSpec {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn with_consumed_mechanical_executor_proof(
         mut self,
         proof: ConsumedMechanicalExecutorProof,
@@ -2042,7 +2048,7 @@ impl CapturedBytes {
         &self.bytes
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn from_bytes_for_test(bytes: impl Into<Vec<u8>>) -> Self {
         Self::from_bytes_with_truncation_for_test(bytes, false)
     }
@@ -3805,6 +3811,7 @@ fn finish_child_io(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn finish_output_drainers_after_exit(
     output_drainers: &mut OutputDrainers,
     grace: Duration,
