@@ -128,6 +128,7 @@ pub(crate) fn record_observed_grok_selection(
 ///
 /// Clearing another run id cannot drop this run's evidence. Multiple reads clone the
 /// same admitted binding. Launch still copies the value onto the run/launch contract.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn admit_grok_run_account_binding(
     run_id: &str,
     frozen: Option<FrozenGrokSelectedBinding>,
@@ -160,6 +161,7 @@ pub(crate) fn grok_run_account_binding(run_id: &str) -> Option<FrozenGrokSelecte
 ///
 /// A configured CAM socket with no binding for this run refuses, even if another run
 /// left evidence in ambient process state.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn require_carried_grok_launch_binding(
     carried: Option<&FrozenGrokSelectedBinding>,
     cam_socket_configured: bool,
@@ -218,6 +220,7 @@ impl Drop for FrozenGrokSelectionGuard {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) use authority_socket_config::configured_cam_authority_socket;
 #[cfg(target_os = "linux")]
 pub(crate) use grok::GrokLaunchAuthority;

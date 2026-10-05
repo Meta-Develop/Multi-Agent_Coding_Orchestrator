@@ -1,5 +1,6 @@
 //! Operator configuration for the headless CAM authority Unix socket.
 
+#[cfg(any(target_os = "linux", test))]
 use std::path::PathBuf;
 
 /// Operator override for the headless CAM authority socket endpoint.
@@ -83,6 +84,7 @@ impl Drop for CamAuthoritySocketTestGuard {
 }
 
 /// Returns an explicit operator-configured authority socket path, if any.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn configured_cam_authority_socket() -> Option<PathBuf> {
     let value = cam_authority_socket_value()?;
     if value.is_empty() {
