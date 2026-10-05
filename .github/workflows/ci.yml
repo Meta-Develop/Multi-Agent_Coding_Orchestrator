@@ -189,7 +189,7 @@ jobs:
 
       - name: Run Windows windowless Job lifecycle regressions
         if: matrix.os == 'windows-latest'
-        run: cargo test --locked --lib process_runner::windows_tests:: -- --nocapture --test-threads=1
+        run: 'cargo test --locked --lib process_runner::windows_tests:: -- --nocapture --test-threads=1'
 
   required-rust-gate:
     name: Required Rust CI gate
