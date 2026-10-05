@@ -33,8 +33,11 @@ fn windows_job_child_fixture() {
             "in_job": in_job != 0,
         })
     };
-    fs::write(&report, serde_json::to_vec(&state).expect("serialize OS state"))
-        .expect("write OS state");
+    fs::write(
+        &report,
+        serde_json::to_vec(&state).expect("serialize OS state"),
+    )
+    .expect("write OS state");
     fs::write(report.with_extension("ready"), b"ready").expect("publish completed report");
     let mut input = String::new();
     std::io::stdin()
