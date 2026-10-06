@@ -890,6 +890,7 @@ impl SupervisorCatalogCodexPreflightGrant {
         })
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn independently_verified_canonical_program(&self) -> Option<&Path> {
         match &self.expected_program {
             CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical { program, .. } => {
@@ -899,6 +900,7 @@ impl SupervisorCatalogCodexPreflightGrant {
         }
     }
 
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn independently_verified_canonical_parent(&self) -> Option<&Path> {
         match &self.expected_program {
             CatalogPreflightExpectedProgram::IndependentlyVerifiedCanonical { parent, .. } => {
