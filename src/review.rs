@@ -3892,7 +3892,7 @@ impl ReviewRepositoryBinding {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn confinement_profile(&self) -> Result<StrictOfflineWorkspaceProfile> {
         self.verify()?;
         let profile = StrictOfflineWorkspaceProfile::read_only(self.worktree_root.path());
