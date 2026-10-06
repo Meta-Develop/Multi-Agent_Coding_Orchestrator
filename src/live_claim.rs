@@ -877,7 +877,7 @@ where
 }
 
 fn atomic_publish_claim<F>(
-    root: &SafeRoot,
+    _root: &SafeRoot,
     lock: &KernelStateLock,
     initial_board: &ClaimBoardSnapshot,
     file_name: &OsStr,
@@ -893,23 +893,25 @@ where
         bail!("claim board has no bounded entry capacity for a new claim");
     }
     #[cfg(target_os = "linux")]
-    atomic_publish_claim_linux(
-        root,
-        lock,
-        initial_board,
-        file_name,
-        updated,
-        before_first_fence,
-    )
-    .context("claim atomic mutation was refused")?;
+    {
+        atomic_publish_claim_linux(
+            _root,
+            lock,
+            initial_board,
+            file_name,
+            updated,
+            before_first_fence,
+        )
+        .context("claim atomic mutation was refused")?;
+
+        let (final_claims, _) = load_stable_claim_board(_root, lock)?;
+        Ok(final_claims)
+    }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (lock, initial_board, file_name, updated, before_first_fence);
         bail!("claim atomic mutation requires Linux renameat2 CAS support");
     }
-
-    let (final_claims, _) = load_stable_claim_board(root, lock)?;
-    Ok(final_claims)
 }
 
 #[cfg(target_os = "linux")]
