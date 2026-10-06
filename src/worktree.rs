@@ -145,9 +145,13 @@ const WORKTREE_STATUS_RUNTIME_SEED: &str = "git-status";
 const WORKTREE_STATUS_RUNTIME_LOCK: &str = "bounded-status.lock";
 const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
     PrivateDirectoryScavengeLimits {
+        #[cfg(target_os = "linux")]
         max_root_entries: 65,
+        #[cfg(target_os = "linux")]
         max_directories: 64,
+        #[cfg(target_os = "linux")]
         max_tree_entries: 65_536,
+        #[cfg(target_os = "linux")]
         max_total_bytes: 64 * 1024 * 1024,
         max_duration: Duration::from_secs(10),
     };

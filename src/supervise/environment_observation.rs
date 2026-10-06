@@ -9,10 +9,15 @@
 /// Parent-owned account observe outcome used to decide environment cost.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum AccountObserveOutcomeKind {
+    #[cfg(any(target_os = "linux", test))]
     Unknown,
+    #[cfg(any(target_os = "linux", test))]
     Stale,
+    #[cfg(any(target_os = "linux", test))]
     Unavailable,
+    #[cfg(any(target_os = "linux", test))]
     Failed,
+    #[cfg(any(target_os = "linux", test))]
     Observed,
 }
 
@@ -23,10 +28,12 @@ pub(super) enum AccountObserveOutcomeKind {
 /// that number is missing. A missing number is never rewritten as `Some(0)`.
 pub(super) fn environment_cost_microunits_from_account_observe(
     kind: AccountObserveOutcomeKind,
-    observed_environment_microunits: Option<u64>,
+    _observed_environment_microunits: Option<u64>,
 ) -> Option<u64> {
     match kind {
-        AccountObserveOutcomeKind::Observed => observed_environment_microunits,
+        #[cfg(any(target_os = "linux", test))]
+        AccountObserveOutcomeKind::Observed => _observed_environment_microunits,
+        #[cfg(any(target_os = "linux", test))]
         AccountObserveOutcomeKind::Unknown
         | AccountObserveOutcomeKind::Stale
         | AccountObserveOutcomeKind::Unavailable

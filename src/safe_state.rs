@@ -2434,9 +2434,13 @@ pub enum TreeLinkPolicy {
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PrivateDirectoryScavengeLimits {
+    #[cfg(target_os = "linux")]
     pub max_root_entries: usize,
+    #[cfg(target_os = "linux")]
     pub max_directories: usize,
+    #[cfg(target_os = "linux")]
     pub max_tree_entries: usize,
+    #[cfg(target_os = "linux")]
     pub max_total_bytes: u64,
     pub max_duration: Duration,
 }
