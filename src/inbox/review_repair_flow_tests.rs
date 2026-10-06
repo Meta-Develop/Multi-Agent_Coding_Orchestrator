@@ -46,6 +46,7 @@ use crate::optimizer::merge_authority::{
 #[cfg(unix)]
 use crate::optimizer::merge_authority::{LensDecision, LensVerdict};
 use crate::orchestrator::RunId;
+#[cfg(unix)]
 use crate::publication;
 #[cfg(unix)]
 use crate::publication::forge_transport::{
