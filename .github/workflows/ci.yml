@@ -240,6 +240,36 @@ jobs:
             throw "Expected four accepted common inbox tests; received $completed."
           }
 
+      - name: Run common snapshot protocol golden on Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $testName = 'review::tests::snapshot_tree_entry_serialization_and_canonical_vectors_preserve_complete_schema'
+          $output = @(& cargo test --locked --lib $testName -- --exact --nocapture --test-threads=1 2>&1)
+          $cargoExit = $LASTEXITCODE
+          $output | ForEach-Object { Write-Host "$_" }
+          Write-Host "COMMON_SNAPSHOT_CARGO_EXIT=$cargoExit FILTER=$testName"
+          if ($cargoExit -ne 0) {
+            exit $cargoExit
+          }
+          $lines = @($output | ForEach-Object { "$_" -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' })
+          $namePattern = '^test ' + [regex]::Escape($testName) + ' \.\.\. ok$'
+          $summaryPattern = '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$'
+          $running = @($lines | Where-Object { $_ -cmatch '^running [0-9]+ tests?$' })
+          $named = @($lines | Where-Object { $_ -cmatch '^test (?!result:)' })
+          $summaries = @($lines | Where-Object { $_ -cmatch '^test result:' })
+          if ($running.Count -ne 1 -or $running[0] -cne 'running 1 test' -or
+              $named.Count -ne 1 -or $named[0] -cnotmatch $namePattern -or
+              $summaries.Count -ne 1 -or $summaries[0] -cnotmatch $summaryPattern -or
+              @($lines | Where-Object { $_ -match '\bskip(?:ped)?\b' }).Count -ne 0) {
+            throw "Expected exactly one executed and passed, nonignored snapshot protocol test: $testName"
+          }
+          Write-Host "COMMON_SNAPSHOT_ACCEPTED=$testName EXECUTED=1 PASSED=1 IGNORED=0"
+
   required-rust-gate:
     name: Required Rust CI gate
     runs-on: ubuntu-latest
