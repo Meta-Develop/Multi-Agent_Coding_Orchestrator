@@ -2123,6 +2123,7 @@ fn recover_pending_operations_with_held_removal_lease(
     )
 }
 
+#[cfg(any(not(test), unix))]
 fn recover_pending_operations_without_creation_cleanliness(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
