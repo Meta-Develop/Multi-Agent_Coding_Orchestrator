@@ -1,4 +1,4 @@
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use crate::safe_state::scavenge_private_random_directories;
 use crate::{
     artifacts::{

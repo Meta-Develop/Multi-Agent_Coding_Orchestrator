@@ -2468,7 +2468,7 @@ pub(crate) struct PrivateDirectoryScavengeLimits {
 /// Live directories are atomically quarantined before recursive deletion.
 /// Existing deletion quarantines are resumed in place, so an interrupted
 /// cleanup remains recoverable on the next lock-held invocation.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn scavenge_private_random_directories(
     root: &SafeRoot,
     stable_lock_file: impl AsRef<OsStr>,

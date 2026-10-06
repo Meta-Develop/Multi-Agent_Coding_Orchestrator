@@ -1188,7 +1188,7 @@ fn finish_with_status_lock_verification<T>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn scavenge_bounded_status_runtimes(
     state_root: &SafeRoot,
     limits: PrivateDirectoryScavengeLimits,
