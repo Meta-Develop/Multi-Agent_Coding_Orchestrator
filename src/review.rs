@@ -61,9 +61,12 @@ const REVIEW_SHORT_TEXT_LIMIT_BYTES: usize = 256;
 const REVIEW_LONG_TEXT_LIMIT_BYTES: usize = 32 * 1024;
 const REVIEW_SNAPSHOT_ENTRY_LIMIT: usize = 32 * 1024;
 const REVIEW_SNAPSHOT_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
+#[cfg(unix)]
 const REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(unix)]
 const REVIEW_SYMLINK_LIMIT_BYTES: usize = 4 * 1024;
 const REVIEW_PREWALK_MAX_DEPTH: usize = 128;
+#[cfg(target_os = "linux")]
 const REVIEW_PREWALK_TIMEOUT: Duration = Duration::from_secs(5);
 const REVIEW_SCHEMA_VERSION: u32 = 1;
 const REVIEW_SANDBOX_POLICY_VERSION: u32 = 2;
@@ -73,6 +76,7 @@ const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
 const REVIEW_LENS_BACKEND_CONFIG_DOMAIN: &[u8] = b"MACO\0review-lens-backend-config\0v1\0";
 const REVIEW_LENS_EVIDENCE_CONTENT_DOMAIN: &[u8] = b"MACO\0review-lens-evidence-content\0v1\0";
 const REVIEW_LENS_REQUEST_DOMAIN: &[u8] = b"MACO\0review-lens-request\0v1\0";
+#[cfg(any(unix, test))]
 const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
 const REVIEW_SHA256_IDENTITY_PREFIX: &str = "sha256:";
 const REVIEW_TRANSCRIPT_COMPLETE_MARKER: &str =
