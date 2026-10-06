@@ -1052,6 +1052,7 @@ fn execute_prepared_codex_runtime_model_catalog(
         .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
 }
 
+#[cfg(any(target_os = "linux", all(unix, test)))]
 fn codex_runtime_model_catalog_process_root(resolved_program: &Path) -> Result<&Path> {
     resolved_program
         .parent()
@@ -1077,14 +1078,19 @@ enum CodexRuntimeModelCatalogFailureCause {
     CatalogPreflightGrantConsumed,
     #[error("catalog_preflight_confinement_mismatch")]
     CatalogPreflightConfinementMismatch,
+    #[cfg(target_os = "linux")]
     #[error("invalid_timeout")]
     InvalidTimeout,
+    #[cfg(target_os = "linux")]
     #[error("trusted_executable_resolution_failed")]
     ExecutableResolutionFailed,
+    #[cfg(any(target_os = "linux", all(unix, test)))]
     #[error("trusted_executable_has_no_parent")]
     ExecutableHasNoParent,
+    #[cfg(target_os = "linux")]
     #[error("trusted_executable_identity_failed")]
     ExecutableIdentityFailed,
+    #[cfg(target_os = "linux")]
     #[error("codex_auth_validation_failed")]
     AuthValidationFailed,
     #[error("codex_auth_revalidation_failed")]
@@ -1424,7 +1430,7 @@ fn executable_ancestor_permission_decision(
     }
 }
 
-fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> Result<()> {
+fn validate_external_program_identity(path: &Path, _require_root_owned: bool) -> Result<()> {
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -1443,7 +1449,7 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
                 path.display()
             );
         }
-        if require_root_owned && metadata.uid() != 0 {
+        if _require_root_owned && metadata.uid() != 0 {
             bail!(
                 "default Codex executable must be root-owned: {}",
                 path.display()
@@ -1466,7 +1472,7 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
                 metadata.permissions().mode(),
                 metadata.uid(),
                 metadata.is_dir(),
-                require_root_owned,
+                _require_root_owned,
             ) {
                 ExecutableAncestorPermissionDecision::Accept => {}
                 ExecutableAncestorPermissionDecision::RejectWritable => {
@@ -2548,6 +2554,7 @@ fn managed_child_commit_edge_paths(
     Ok(paths.into_iter().collect())
 }
 
+#[cfg(unix)]
 const MANAGED_CHILD_PRIVATE_GIT_DIR: &str = "maco-private-git-v1";
 const MANAGED_CHILD_PRIVATE_REF: &str = "refs/heads/maco-managed-child";
 
@@ -2667,11 +2674,6 @@ fn validate_managed_child_private_ref_surface(private_git_dir: &Path) -> Result<
         }
     }
     Ok(())
-}
-
-#[cfg(not(unix))]
-fn validate_managed_child_private_ref_surface(_private_git_dir: &Path) -> Result<()> {
-    bail!("managed child private ref validation is unsupported on this platform")
 }
 
 fn read_managed_child_private_ref_oid(private_git_dir: &Path) -> Result<Oid> {
@@ -2823,12 +2825,12 @@ fn validate_exact_read_only_input_files(
         if canonical != normalized {
             bail!("exact read-only input file must already be canonical");
         }
-        let metadata = fs::symlink_metadata(&canonical)
+        let _metadata = fs::symlink_metadata(&canonical)
             .context("failed to inspect exact read-only input file")?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
-            if metadata.nlink() != 1 {
+            if _metadata.nlink() != 1 {
                 bail!("exact read-only input file has a hard-link alias");
             }
         }
@@ -3412,6 +3414,7 @@ fn managed_worktree_git_metadata_with_mode(
     }))
 }
 
+#[cfg(unix)]
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ManagedChildProjectedIdentity {
     user_name: Option<String>,
@@ -3421,6 +3424,7 @@ struct ManagedChildProjectedIdentity {
     approved_login: Option<String>,
 }
 
+#[cfg(unix)]
 fn managed_child_private_config(common_config: &[u8], filemode: &str) -> Result<Vec<u8>> {
     let identity = parse_managed_child_projected_identity(common_config)?;
     let mut config = format!(
@@ -3450,10 +3454,12 @@ fn managed_child_private_config(common_config: &[u8], filemode: &str) -> Result<
     Ok(config.into_bytes())
 }
 
+#[cfg(unix)]
 fn escape_managed_child_config_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
+#[cfg(unix)]
 fn parse_managed_child_projected_identity(bytes: &[u8]) -> Result<ManagedChildProjectedIdentity> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
@@ -3558,6 +3564,7 @@ fn parse_managed_child_projected_identity(bytes: &[u8]) -> Result<ManagedChildPr
     Ok(projected)
 }
 
+#[cfg(unix)]
 fn decode_managed_child_config_value(raw: &[u8]) -> Result<String> {
     let raw = std::str::from_utf8(raw).context("projected Git config value is not UTF-8")?;
     let value = if let Some(quoted) = raw
@@ -5302,12 +5309,16 @@ enum CodexAuthValidationFailureCause {
     HomeNotDirectory,
     #[error("auth_home_ancestor_inspection_failed")]
     HomeAncestorInspectionFailed,
+    #[cfg(unix)]
     #[error("auth_home_ancestor_not_directory")]
     HomeAncestorNotDirectory,
+    #[cfg(unix)]
     #[error("auth_home_ancestor_writable")]
     HomeAncestorWritable,
+    #[cfg(unix)]
     #[error("auth_home_ancestor_owner_mismatch")]
     HomeAncestorOwnerMismatch,
+    #[cfg(target_os = "linux")]
     #[error("auth_file_missing")]
     AuthFileMissing,
     #[error("auth_file_inspection_failed")]
@@ -5320,10 +5331,13 @@ enum CodexAuthValidationFailureCause {
     AuthFileMetadataFailed,
     #[error("auth_file_not_bounded_regular")]
     AuthFileNotBoundedRegular,
+    #[cfg(any(unix, test))]
     #[error("auth_file_owner_mismatch")]
     AuthFileOwnerMismatch,
+    #[cfg(unix)]
     #[error("auth_file_mode_too_broad")]
     AuthFileModeTooBroad,
+    #[cfg(unix)]
     #[error("auth_file_link_count_invalid")]
     AuthFileLinkCountInvalid,
     #[error("auth_file_read_failed")]
@@ -5332,12 +5346,14 @@ enum CodexAuthValidationFailureCause {
     AuthFileGrewDuringRead,
     #[error("auth_file_changed_during_read")]
     AuthFileChangedDuringRead,
+    #[cfg(unix)]
     #[error("auth_file_identity_changed_during_read")]
     AuthFileIdentityChangedDuringRead,
     #[error("auth_file_revalidation_inspection_failed")]
     AuthFileRevalidationInspectionFailed,
     #[error("auth_file_revalidation_metadata_changed")]
     AuthFileRevalidationMetadataChanged,
+    #[cfg(unix)]
     #[error("auth_file_revalidation_identity_changed")]
     AuthFileRevalidationIdentityChanged,
     #[cfg(not(unix))]
