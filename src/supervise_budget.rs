@@ -1823,13 +1823,15 @@ fn checked_cost_sub(total: f64, amount: f64) -> Result<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use std::{
         io::Read,
         process::{Command, Stdio},
+    };
+    use std::{
         sync::{Arc, Barrier},
         thread,
     };
-
     fn token_limits(soft_tokens: usize, hard_tokens: usize) -> RunBudgetLimits {
         RunBudgetLimits {
             soft_tokens: Some(soft_tokens),

@@ -63,12 +63,12 @@ impl Drop for FollowUpLeaseClaimTimingOverride {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) struct FollowUpLeaseHeartbeatTestHookGuard {
     restored: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_follow_up_lease_heartbeat_test_hook(
     hook: std::sync::Arc<dyn Fn() + Send + Sync>,
 ) -> FollowUpLeaseHeartbeatTestHookGuard {
@@ -76,14 +76,14 @@ pub(crate) fn set_follow_up_lease_heartbeat_test_hook(
     FollowUpLeaseHeartbeatTestHookGuard { restored }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for FollowUpLeaseHeartbeatTestHookGuard {
     fn drop(&mut self) {
         HEARTBEAT_TEST_HOOK.with(|slot| *slot.borrow_mut() = self.restored.take());
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_follow_up_lease_test_isolation() {
     CLAIM_TIMING_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
     HEARTBEAT_TEST_HOOK.with(|slot| *slot.borrow_mut() = None);

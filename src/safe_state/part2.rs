@@ -2059,7 +2059,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn set_scavenge_deadline_hook(hook: impl FnMut(&str) -> bool + 'static) {
     SCAVENGE_DEADLINE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }

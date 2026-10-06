@@ -36,20 +36,20 @@ static TEMP_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ChildSetupFault {
     None,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     BeforeOpen,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     AfterOpen,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AtomicWriteFault {
     None,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     RebindTempBeforeRename {
         sentinel: PathBuf,
     },
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     RebindDestinationAfterRename {
         sentinel: PathBuf,
     },
@@ -207,12 +207,12 @@ impl SecureOutputRoot {
         self.create_child_impl(name, ChildSetupFault::None)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn create_child_failing_before_open(&self, name: &OsStr) -> Result<Self> {
         self.create_child_impl(name, ChildSetupFault::BeforeOpen)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn create_child_failing_after_open(&self, name: &OsStr) -> Result<Self> {
         self.create_child_impl(name, ChildSetupFault::AfterOpen)
     }
@@ -425,7 +425,7 @@ impl SecureOutputRoot {
         self.reserve_impl(name, true, false, false)
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn reserve_failing_after_open(&self, name: &OsStr) -> Result<ReservedOutputFile> {
         self.reserve_impl(name, false, true, true)
     }
@@ -1744,7 +1744,9 @@ fn validate_private_file(metadata: &std::fs::Metadata, path: &Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     #[cfg(unix)]

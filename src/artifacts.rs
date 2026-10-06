@@ -17,10 +17,9 @@ use crate::{
 };
 
 #[cfg(test)]
-use self::state_auth::{
-    authentication_key_file_name, authentication_key_length, authentication_key_lock_name,
-    BoundStateLock,
-};
+use self::state_auth::authentication_key_file_name;
+#[cfg(all(test, unix))]
+use self::state_auth::{authentication_key_length, authentication_key_lock_name, BoundStateLock};
 use anyhow::{bail, Context, Result};
 use git2::Repository;
 use serde::{Deserialize, Serialize};
@@ -3367,7 +3366,7 @@ fn empty_prune_report<F>(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn open_or_create_quarantine(root: &SafeRoot) -> Result<SafeRoot> {
     let binding = if root.direct_child_exists(QUARANTINE_DIRECTORY)? {
         root.bind_existing_direct_child_directory(QUARANTINE_DIRECTORY)?

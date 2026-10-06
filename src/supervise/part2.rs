@@ -70,17 +70,17 @@ fn budget_admission_test_hooks() -> &'static Mutex<BTreeMap<String, BudgetAdmiss
     HOOKS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 struct BudgetAdmissionTestHookGuard(String);
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 impl Drop for BudgetAdmissionTestHookGuard {
     fn drop(&mut self) {
         budget_admission_test_hooks().lock().unwrap().remove(&self.0);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn install_budget_admission_test_hook(
     run_id: &str,
     hook: BudgetAdmissionTestHook,

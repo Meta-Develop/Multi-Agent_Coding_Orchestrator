@@ -107,7 +107,7 @@ pub(crate) fn authentication_key_file_name() -> &'static str {
     AUTH_KEY_FILE
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn authentication_key_lock_name() -> &'static str {
     AUTH_KEY_LOCK
 }
@@ -272,7 +272,7 @@ impl BoundStateLock {
         Ok(())
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn path(&self) -> &Path {
         self.lock.path()
     }
@@ -548,7 +548,7 @@ impl RepositoryAuthWriter {
         &self.authenticator
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     pub(crate) fn lock_path(&self) -> &Path {
         self.lock.path()
     }

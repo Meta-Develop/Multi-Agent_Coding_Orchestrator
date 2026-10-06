@@ -7757,10 +7757,12 @@ include!("inbox/part2.rs");
 #[cfg(test)]
 mod pr_intake_always_on_audit_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use crate::hierarchy_ledger::RoleCategory;
+    #[cfg(target_os = "linux")]
+    use crate::mutation_taxonomy::AssignmentProcessLaunchGrantError;
     use crate::mutation_taxonomy::{
-        AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
-        INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
+        AssignmentProcessLaunchKind, INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY,
     };
     use std::cell::Cell;
 

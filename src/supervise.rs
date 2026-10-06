@@ -3292,7 +3292,7 @@ pub struct ChildOrchestratorPromptContext<'a> {
     pub claim_context: ChildPromptClaimContext<'a>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_supervisor_plan_file_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
@@ -3318,7 +3318,7 @@ fn run_supervisor_plan_file_with_runner(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn run_supervisor_plan_file_cascade_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
@@ -3465,7 +3465,7 @@ fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_supervisor_plan_file_cascade_with_runner_and_gate(
     options: SupervisorRunOptions,
     outer_entrypoint: GeneratedFollowUpQueueEntrypoint,
@@ -3498,7 +3498,7 @@ fn run_supervisor_plan_file_cascade_with_runner_and_gate(
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),

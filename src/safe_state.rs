@@ -211,23 +211,23 @@ impl DirectChildBinding {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 type DirectChildBeforeQuarantineUnlinkHook = Option<Box<dyn FnOnce()>>;
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 thread_local! {
     static DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK: std::cell::RefCell<DirectChildBeforeQuarantineUnlinkHook> =
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn set_direct_child_before_quarantine_unlink_hook(hook: impl FnOnce() + 'static) {
     DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn run_direct_child_before_quarantine_unlink_hook() {
     let hook = DIRECT_CHILD_BEFORE_QUARANTINE_UNLINK_HOOK.with(|slot| slot.borrow_mut().take());
     if let Some(hook) = hook {
@@ -235,7 +235,7 @@ fn run_direct_child_before_quarantine_unlink_hook() {
     }
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn run_direct_child_before_quarantine_unlink_hook() {}
 
 impl ReservedDirectory {
@@ -1986,12 +1986,12 @@ pub(crate) fn set_temp_scavenge_after_quarantine_fault() {
     TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT.with(|fault| fault.set(true));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn take_temp_scavenge_after_quarantine_fault() -> bool {
     TEMP_SCAVENGE_AFTER_QUARANTINE_FAULT.with(|fault| fault.replace(false))
 }
 
-#[cfg(not(test))]
+#[cfg(all(not(test), target_os = "linux"))]
 fn take_temp_scavenge_after_quarantine_fault() -> bool {
     false
 }

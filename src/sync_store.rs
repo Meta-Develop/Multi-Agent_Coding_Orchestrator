@@ -2929,7 +2929,7 @@ impl SyncStore {
         )
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     fn load_snapshot(&self, lock: &RepositoryStateLock) -> Result<SyncSnapshot> {
         let store = self.open_authenticated_store(lock)?;
         Ok(SyncSnapshot {
@@ -3563,16 +3563,17 @@ fn ensure_private_state_file(path: &Path) -> Result<FileIdentity> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
     use crate::{
         artifacts::state_auth::authentication_key_file_name,
+        state_migration::{migrate_repository_state_with_options, StateMigrationOptions},
+    };
+    use crate::{
         megafile::{
             set_record_claim_fault, FileSizeSample, MegafileStore, MegafileThresholdCalibration,
             MAX_CLAIM_TELEMETRY_TARGETS,
         },
-        state_migration::{
-            migrate_repository_state_with_options, set_legacy_retirement_fault,
-            LegacyRetirementFaultPoint, StateMigrationOptions,
-        },
+        state_migration::{set_legacy_retirement_fault, LegacyRetirementFaultPoint},
         worktree::WorktreeManager,
     };
     use git2::{Oid, Repository, Signature};
@@ -3586,8 +3587,10 @@ mod tests {
     };
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     const ISSUE33_CLAIMS_V1: &[u8] =
         include_bytes!("../tests/fixtures/issue33/agent-files-claims-v1.json");
+    #[cfg(unix)]
     const ISSUE33_CLAIMS_V1_SHA256: &str =
         "58076fb067d6bbc560926628b8930075d0674eae025b945619f0890000995291";
 

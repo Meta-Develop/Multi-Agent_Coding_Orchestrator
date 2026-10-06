@@ -1873,6 +1873,7 @@ pub mod api;
             self
         }
 
+        #[cfg(unix)]
         fn task(mut self, path: &str) -> Self {
             self.inner.task_file = Some(PathBuf::from(path));
             self

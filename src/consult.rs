@@ -1133,12 +1133,14 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::external_agent::{
-        run_external_agent_nonpublishable_simulation, CapturedOutput, ExternalAgentInvocation,
-        ExternalProgramTrust,
-    };
+    #[cfg(unix)]
+    use crate::external_agent::run_external_agent_nonpublishable_simulation;
+    #[cfg(target_os = "linux")]
+    use crate::external_agent::ExternalAgentInvocation;
+    use crate::external_agent::{CapturedOutput, ExternalProgramTrust};
     #[cfg(target_os = "linux")]
     use crate::mutation_taxonomy::AssignmentProcessLaunchGrantError;
+    #[cfg(unix)]
     use crate::process_runner::{
         ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
         SideEffectConfinementProfileKind,

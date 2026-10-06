@@ -346,7 +346,7 @@ fn configure_assignment_phase_command(
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn configure_assignment_phase_command_for_test(
     command: ExternalAgentCommand,
     phase: AssignmentPhase,
@@ -1615,7 +1615,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
 
     // This does not prove an inbox generation. It is intentionally absent from
     // non-test builds; matching run/attempt/artifact paths cannot open the gate.
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn from_unbound_completed_workers_for_test(
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,

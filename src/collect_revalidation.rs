@@ -587,7 +587,9 @@ mod tests {
     };
     use anyhow::{Context, Result};
     use git2::Signature;
-    use std::{collections::BTreeMap, fs, time::Duration};
+    #[cfg(unix)]
+    use std::collections::BTreeMap;
+    use std::{fs, time::Duration};
     use tempfile::TempDir;
 
     struct Fixture {

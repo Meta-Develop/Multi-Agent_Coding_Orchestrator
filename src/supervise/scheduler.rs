@@ -173,7 +173,7 @@ fn take_supervisor_primary_worktree_snapshot() -> Option<PrimaryWorktreeSnapshot
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_before_supervisor_final_report_persist_hook(
     hook: impl FnMut(&mut SupervisorFinalReport) + 'static,
 ) {
@@ -212,7 +212,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_live_grant_admission_observer(sender: std::sync::mpsc::Sender<usize>) {
     LIVE_GRANT_ADMISSION_OBSERVER.with(|observer| *observer.borrow_mut() = Some(sender));
 }

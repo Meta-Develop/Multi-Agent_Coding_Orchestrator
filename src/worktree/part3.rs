@@ -1197,7 +1197,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_managed_registry_after_precheck_hook(hook: impl FnOnce() + 'static) {
     MANAGED_REGISTRY_AFTER_PRECHECK_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -1219,7 +1219,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_create_checkout_gap_hook(hook: impl FnOnce() + 'static) {
     CREATE_CHECKOUT_GAP_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
@@ -1296,7 +1296,7 @@ thread_local! {
         const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn set_create_cleanliness_gap_hook(
     phase: CreateCleanlinessGapPhase,
     hook: impl FnOnce() + 'static,

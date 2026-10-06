@@ -642,6 +642,7 @@ mod tests {
         AgentRuntimeAdapter, BlockingPreActionCallback, CapabilityMatrix, ClaudeCodeAdapter,
         WorkspaceWritability,
     };
+    #[cfg(unix)]
     use std::{
         io::Write,
         process::{Command, Stdio},

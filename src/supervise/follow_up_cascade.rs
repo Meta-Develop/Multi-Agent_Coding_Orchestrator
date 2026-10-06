@@ -1529,7 +1529,7 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_before_generated_follow_up_plan_load_hook(hook: impl FnMut(&Path) + 'static) {
     BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK
         .with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
@@ -1542,7 +1542,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_interrupt_after_follow_up_enqueue() {
     INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.set(true));
 }
@@ -1563,7 +1563,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_interrupt_after_follow_up_dispatch_started() {
     INTERRUPT_AFTER_FOLLOW_UP_DISPATCH_STARTED.with(|slot| slot.set(true));
 }
@@ -1580,7 +1580,7 @@ thread_local! {
     };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_interrupt_after_authenticated_follow_up_child_start() {
     INTERRUPT_AFTER_AUTHENTICATED_FOLLOW_UP_CHILD_START.with(|slot| slot.set(true));
 }
@@ -1616,19 +1616,19 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_generated_follow_up_queue_observer(
     observer: impl FnMut(GeneratedFollowUpQueueTestObservation) + 'static,
 ) {
     GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| *slot.borrow_mut() = Some(Box::new(observer)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_generated_follow_up_queue_observer() {
     GENERATED_FOLLOW_UP_QUEUE_OBSERVER.with(|slot| *slot.borrow_mut() = None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn clear_follow_up_cascade_test_isolation() {
     BEFORE_GENERATED_FOLLOW_UP_PLAN_LOAD_HOOK.with(|slot| *slot.borrow_mut() = None);
     INTERRUPT_AFTER_FOLLOW_UP_ENQUEUE.with(|slot| slot.set(false));
