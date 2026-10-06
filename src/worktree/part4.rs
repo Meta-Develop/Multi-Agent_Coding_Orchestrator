@@ -123,7 +123,7 @@ fn lock_bounded_status_process() -> std::sync::MutexGuard<'static, ()> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn bounded_worktree_is_clean_in_runtime<F>(
     path: &Path,
     max_entries: usize,
@@ -149,7 +149,7 @@ where
     .map(|records| records.status.is_empty())
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn bounded_worktree_is_clean_in_runtime_unlocked<F>(
     path: &Path,
     max_entries: usize,
