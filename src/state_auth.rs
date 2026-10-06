@@ -3,13 +3,15 @@
 //! The key bytes never leave this module. Consumers receive only repository
 //! binding evidence and domain-separated sign/verify operations.
 
+#[cfg(unix)]
+use crate::safe_state::identity_for_path;
 use crate::{
     field_guide::{FIELD_GUIDE_OPERATION_LOCK, FIELD_GUIDE_ROOT_LOCK, FIELD_GUIDE_STATE_NAMESPACE},
     follow_up_queue::{GENERATED_FOLLOW_UP_QUEUE_ROOT_LOCK, GENERATED_FOLLOW_UP_QUEUE_ROOT_NAME},
     megafile::{MEGAFILE_OPERATION_LOCK, MEGAFILE_ROOT_LOCK, MEGAFILE_STATE_NAMESPACE},
     safe_state::{
-        identity_for_path, AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock,
-        FileIdentity, KernelStateLock, SafeRoot,
+        AtomicStateWriter, BoundedRegularReader, ExistingExclusiveLock, FileIdentity,
+        KernelStateLock, SafeRoot,
     },
 };
 use anyhow::{bail, Context, Result};
