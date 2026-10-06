@@ -1,3 +1,5 @@
+#[cfg(target_os = "linux")]
+use crate::machine_global::machine_global_config_content_binding;
 use crate::{
     agent::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
@@ -19,9 +21,8 @@ use crate::{
     live_claim::{self, LiveClock},
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
-        machine_global_config_content_binding, DestructiveTargetInput, GateOutcome,
-        MachineGlobalClaimSummary, MachineGlobalClaimToken, MachineGlobalConfig,
-        MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
+        DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
+        MachineGlobalConfig, MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
         RetentionOperationToken,
     },
     megafile::{
@@ -112,6 +113,7 @@ const MAX_PROMPT_EXCERPT_BYTES: u64 = 32 * 1024;
 const MAX_PROMPT_EXCERPT_TOTAL_BYTES: usize = 48 * 1024;
 const MAX_PROMPT_PATHS: usize = 64;
 const MAX_SUPERVISE_GOAL_FILE_BYTES: u64 = 256 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_DEFAULT_MACHINE_GLOBAL_CONFIG_BYTES: u64 = 1024 * 1024;
 const MAX_EVALUATION_MANIFEST_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_EVALUATION_PLAN_BYTES: u64 = 16 * 1024 * 1024;
@@ -230,6 +232,7 @@ fn resolve_supervise_machine_global_binding(
     }
 }
 
+#[cfg(target_os = "linux")]
 fn physical_xdg_machine_global_config_path() -> Result<PathBuf> {
     let config_home = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(value) if !value.is_empty() => {
@@ -253,6 +256,7 @@ fn physical_xdg_machine_global_config_path() -> Result<PathBuf> {
     Ok(config_home.join("maco").join("machine-global.json"))
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn select_literal_machine_global_runtime_root<'a>(
     config: &'a MachineGlobalConfig,
     trusted_runtime_root: &Path,
