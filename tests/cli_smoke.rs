@@ -2,16 +2,19 @@ mod support;
 
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
+#[cfg(target_os = "linux")]
 use multi_agent_coding_orchestrator::{orchestrator::RunId, sync_store::SyncStore};
 use serde_json::Value;
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+#[cfg(target_os = "linux")]
+use std::process::Stdio;
 #[cfg(unix)]
 use std::{collections::BTreeMap, path::PathBuf};
 use std::{
     fs::{self, File},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
 };
 use tempfile::TempDir;
 
@@ -629,9 +632,12 @@ const ISSUE33_PINNED_WRAPPER_SHA256: &str =
     "93b76ebff318fb75e44f8ce48b5b48b4bad5435045d9fe736c4e1fc587a0d814";
 #[cfg(unix)]
 const ISSUE33_PINNED_CHECKOUT_HEAD: &str = "66f59aa253868d1dd909b012e04c548e7b669d2f";
+#[cfg(unix)]
 const ISSUE33_CLAIMS_V1: &[u8] = include_bytes!("fixtures/issue33/agent-files-claims-v1.json");
+#[cfg(unix)]
 const ISSUE33_CLAIMS_V1_SHA256: &str =
     "58076fb067d6bbc560926628b8930075d0674eae025b945619f0890000995291";
+#[cfg(unix)]
 const ISSUE33_PHYSICAL_JOURNAL_ID: &str =
     "d9741d2f810d605133ddfb24bca389e7f1e96fd2a3da1bc5ca236da56519306f";
 #[cfg(unix)]
@@ -641,6 +647,7 @@ const ISSUE33_FIXTURE_JOURNAL: &str = "j";
 #[cfg(unix)]
 const ISSUE33_OPTIONAL_LOGICAL_ANCHOR: &str =
     ".snapshot-init-a61808fe40feb8b3433778bbc2ececcaa47c8c47fc1657f054c239efd3f0e984.json";
+#[cfg(unix)]
 const ISSUE33_PHYSICAL_JOURNAL_MANIFEST: &str =
     include_str!("fixtures/issue33/authenticated-claims-state-v1.sha256");
 
