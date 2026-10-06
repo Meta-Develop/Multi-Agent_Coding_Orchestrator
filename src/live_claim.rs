@@ -9,12 +9,6 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
-#[cfg(target_os = "linux")]
-use std::{
-    fs::{File, OpenOptions},
-    io::Write,
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
-};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
@@ -22,6 +16,12 @@ use std::{
     fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
+};
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
 };
 
 #[cfg(unix)]

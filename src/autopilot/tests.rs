@@ -1,17 +1,15 @@
 use super::*;
-use crate::{
-    mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID,
-    supervise::{LicensedBreakageDeclaration, LicensedBreakageDependentScope},
-    worktree::WorktreeCreateOptions,
-};
 #[cfg(target_os = "linux")]
 use crate::{
     external_agent::ExternalAgentCommand,
     gate_denial::GateDenialReason,
-    mutation_taxonomy::{
-        set_autopilot_dispatch_decisions_for_test, AutonomousMutationDecision,
-    },
+    mutation_taxonomy::{set_autopilot_dispatch_decisions_for_test, AutonomousMutationDecision},
     supervise::{AuditorReport, Finding, OrchestratorReviewReport},
+};
+use crate::{
+    mutation_taxonomy::TAXONOMY_REVIEW_REQUIRED_GATE_ID,
+    supervise::{LicensedBreakageDeclaration, LicensedBreakageDependentScope},
+    worktree::WorktreeCreateOptions,
 };
 #[cfg(target_os = "linux")]
 use serde_json::json;

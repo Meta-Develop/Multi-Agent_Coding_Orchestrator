@@ -22,8 +22,8 @@ use crate::{
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
         DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
-        MachineGlobalConfig, MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
-        RetentionOperationToken,
+        MachineGlobalConfig, MachineGlobalRetentionBinding, MachineGlobalStore,
+        RetentionOperationId, RetentionOperationToken,
     },
     megafile::{
         MegafileAssessment, MegafileReport, MegafileStore, MegafileThresholdCalibration,

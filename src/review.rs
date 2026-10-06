@@ -1,9 +1,9 @@
 #[cfg(target_os = "linux")]
 use crate::process_runner::trusted_linux_runtime_root;
-#[cfg(unix)]
-use crate::safe_state::{device_id_to_u64, unsigned_to_u64};
 #[cfg(any(unix, test))]
 use crate::safe_state::unsigned_to_u32;
+#[cfg(unix)]
+use crate::safe_state::{device_id_to_u64, unsigned_to_u64};
 use crate::{
     llm::Redactor,
     pinned_exec::PinnedDirectExecutable,
@@ -17,8 +17,6 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
-#[cfg(unix)]
-use std::{fs::File, io::Read};
 #[cfg(target_os = "linux")]
 use std::time::Instant;
 use std::{
@@ -30,6 +28,8 @@ use std::{
     str::FromStr,
     time::Duration,
 };
+#[cfg(unix)]
+use std::{fs::File, io::Read};
 
 #[cfg(unix)]
 use std::os::unix::{

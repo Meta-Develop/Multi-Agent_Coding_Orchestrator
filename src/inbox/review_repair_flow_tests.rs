@@ -23,9 +23,9 @@ use super::super::{
     IndependentAuditRunnerResult, PrivacyScanResult,
 };
 use super::*;
-use crate::artifacts::{ArtifactRunWriter, RunArtifactFamily};
 #[cfg(unix)]
 use crate::artifacts::{state_auth::sha256_hex, ArtifactRunReader};
+use crate::artifacts::{ArtifactRunWriter, RunArtifactFamily};
 #[cfg(unix)]
 use crate::autopilot::{
     AutopilotArtifactPaths, AutopilotAttemptSummary, AutopilotCheckStatus, AutopilotFinalReport,
@@ -47,13 +47,13 @@ use crate::optimizer::merge_authority::{
 use crate::optimizer::merge_authority::{LensDecision, LensVerdict};
 use crate::orchestrator::RunId;
 use crate::publication;
-use crate::publication::forge_transport::{ForgeRepository, ProviderObjectId, ProviderObjectKind};
 #[cfg(unix)]
 use crate::publication::forge_transport::{
     FakeForgeTransport, ForgeActor, ForgeCheck, ForgeCheckConclusion, ForgeCheckStatus, ForgeItem,
-    ForgeItemKind, ForgeObservation, ForgeObservationRequest, ForgeReview,
-    ForgeReviewState, ForgeTimestamp, PullRequestReviewSnapshot, ReportedActorKind,
+    ForgeItemKind, ForgeObservation, ForgeObservationRequest, ForgeReview, ForgeReviewState,
+    ForgeTimestamp, PullRequestReviewSnapshot, ReportedActorKind,
 };
+use crate::publication::forge_transport::{ForgeRepository, ProviderObjectId, ProviderObjectKind};
 use crate::publication::pr_original_update::OriginalPrUpdateReceipt;
 #[cfg(unix)]
 use crate::review::ReviewerMode;

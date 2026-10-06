@@ -1343,11 +1343,11 @@ fn display_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    #[cfg(unix)]
-    use crate::llm::{LlmProvider, LlmRequest, LlmResponse, ProviderCapabilities};
     use crate::llm::{
         FakeOutcome, FakeProvider, ProposedCommand, ProposedPatch, ProviderError, WorkProposal,
     };
+    #[cfg(unix)]
+    use crate::llm::{LlmProvider, LlmRequest, LlmResponse, ProviderCapabilities};
     #[cfg(unix)]
     use crate::sync_store::ClaimTiming;
     use git2::{Oid, Signature};

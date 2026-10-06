@@ -1,7 +1,7 @@
 use super::*;
-use crate::worktree::WorktreeManager;
 #[cfg(unix)]
 use crate::worktree::WorktreeCreateOptions;
+use crate::worktree::WorktreeManager;
 use git2::{Oid, Signature};
 use tempfile::TempDir;
 

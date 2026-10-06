@@ -4494,7 +4494,7 @@ include!("supervise/part2.rs");
 
 #[cfg(test)]
 mod tests;
-#[cfg(test)]
-pub(crate) use tests::{injected_verified_run, write_injected_usage};
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use tests::write_injected_json;
+#[cfg(test)]
+pub(crate) use tests::{injected_verified_run, write_injected_usage};
