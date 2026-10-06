@@ -3759,7 +3759,7 @@ fn read_worktree_reviewer_program(
     bail!("exact no-follow review snapshots are unsupported on this platform")
 }
 
-fn read_absolute_reviewer_program(path: &Path) -> Result<BoundReviewerProgramFile> {
+fn read_absolute_reviewer_program(_path: &Path) -> Result<BoundReviewerProgramFile> {
     #[cfg(unix)]
     {
         let mut options = std::fs::OpenOptions::new();
@@ -3767,7 +3767,7 @@ fn read_absolute_reviewer_program(path: &Path) -> Result<BoundReviewerProgramFil
             .read(true)
             .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK);
         let mut file = options
-            .open(path)
+            .open(_path)
             .context("failed to open absolute reviewer program without following links")?;
         let before = fstat_file(&file)?;
         if before.st_mode & libc::S_IFMT != libc::S_IFREG || before.st_mode & 0o111 == 0 {
