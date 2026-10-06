@@ -410,18 +410,18 @@ impl SafeRoot {
     pub fn direct_child_linux_mount_id(&self, name: impl AsRef<OsStr>) -> Result<Option<u64>> {
         let name = name.as_ref();
         validate_single_component(name)?;
-        let root_mount_id = self.linux_mount_id()?;
+        let _root_mount_id = self.linux_mount_id()?;
         #[cfg(target_os = "linux")]
         {
             let name_c = c_string(name)?;
             let Some(stat) = fstatat_optional_no_follow(self.directory.as_raw_fd(), &name_c)?
             else {
-                self.verify_linux_mount_id(root_mount_id)?;
+                self.verify_linux_mount_id(_root_mount_id)?;
                 return Ok(None);
             };
             let mount =
                 linux_mount_identity_at(self.directory.as_raw_fd(), &name_c, &stat)?.mount_id;
-            self.verify_linux_mount_id(root_mount_id)?;
+            self.verify_linux_mount_id(_root_mount_id)?;
             Ok(Some(mount))
         }
         #[cfg(not(target_os = "linux"))]
@@ -1240,7 +1240,7 @@ impl BoundedTreeWalker {
         root_binding: &DirectoryBindingGuard,
         limits: BoundedTreeWalkLimits,
         options: BoundedTreeWalkOptions,
-        mut action: F,
+        action: F,
     ) -> Result<BoundedTreeWalkResult>
     where
         F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
@@ -1249,6 +1249,7 @@ impl BoundedTreeWalker {
 
         #[cfg(unix)]
         {
+            let mut action = action;
             let root_stat = fstat(root_binding.directory.as_raw_fd())?;
             #[cfg(target_os = "linux")]
             let root_mount_id = if limits.same_device {
@@ -1293,7 +1294,7 @@ impl BoundedTreeWalker {
         }
         #[cfg(not(any(unix, windows)))]
         {
-            let _ = (root_binding, limits, &mut action);
+            let _ = (root_binding, limits, &action);
             bail!("descriptor-relative bounded tree walks are unsupported on this platform")
         }
     }
@@ -1877,7 +1878,7 @@ impl AtomicStateWriter {
     pub(crate) fn scavenge_direct_temp_namespaces_bounded<F>(
         root: &SafeRoot,
         max_root_entries: usize,
-        derive_file_names: F,
+        _derive_file_names: F,
     ) -> Result<usize>
     where
         F: FnOnce(&[OsString]) -> Result<BTreeSet<OsString>>,
@@ -1892,7 +1893,7 @@ impl AtomicStateWriter {
                 remaining_entries: max_root_entries,
             };
             let entries = directory_entries(root.directory.as_raw_fd(), &mut budget)?;
-            let file_names = derive_file_names(&entries)?;
+            let file_names = _derive_file_names(&entries)?;
             for file_name in &file_names {
                 validate_single_component(file_name)?;
             }
