@@ -3344,6 +3344,7 @@ fn collect_sanitized_view_directory(
 }
 
 impl BoundReviewerProgram {
+    #[cfg(target_os = "linux")]
     fn bind_absolute_canonical(path: &Path) -> Result<Self> {
         validate_reviewer_program_path(path)?;
         if !path.is_absolute() {
@@ -3541,6 +3542,7 @@ fn is_versioned_program_name(name: &str, prefix: &str) -> bool {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn rewrite_reviewer_shebang(bytes: &[u8], interpreter: &Path) -> Result<Vec<u8>> {
     let newline = bytes
         .iter()
@@ -3562,6 +3564,7 @@ fn rewrite_reviewer_shebang(bytes: &[u8], interpreter: &Path) -> Result<Vec<u8>>
     Ok(rewritten)
 }
 
+#[cfg(target_os = "linux")]
 fn materialize_reviewer_file(path: &Path, bytes: &[u8]) -> Result<MaterializedReviewerFile> {
     #[cfg(unix)]
     {
