@@ -9,12 +9,15 @@
 //! list or infer authority from a model name.
 
 use super::AdapterId;
+#[cfg(target_os = "linux")]
+use crate::process_runner::{
+    EnvironmentMode, ExternalGrokProfile, SideEffectConfinementProfile, StdinMode,
+};
 use crate::{
     artifacts::state_auth::sha256_hex,
     process_runner::{
-        run_process, EnvironmentMode, ExternalGrokProfile, ProcessSpec, ProcessTreeEvidence,
-        SideEffectConfinementEvidence, SideEffectConfinementProfile,
-        SideEffectConfinementProfileKind, StdinMode,
+        run_process, ProcessSpec, ProcessTreeEvidence, SideEffectConfinementEvidence,
+        SideEffectConfinementProfileKind,
     },
 };
 use anyhow::{bail, Context, Result};
@@ -22,7 +25,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    env,
     ffi::{OsStr, OsString},
     path::{Path, PathBuf},
     str,
@@ -30,7 +32,7 @@ use std::{
 };
 #[cfg(target_os = "linux")]
 use std::{
-    fmt,
+    env, fmt,
     fs::{File, OpenOptions},
     sync::Arc,
 };
@@ -53,7 +55,9 @@ const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
+#[cfg(target_os = "linux")]
 const GROK_AUTH_FILE: &str = "auth.json";
+#[cfg(target_os = "linux")]
 const GROK_CONFIG_FILE: &str = "config.toml";
 
 /// Fixed host entry point used when the operator does not set `MACO_GROK_BIN`.

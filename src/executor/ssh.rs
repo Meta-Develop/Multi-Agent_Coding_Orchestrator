@@ -2048,6 +2048,7 @@ fn open_workspace_directory(path: &Path, before: &fs::Metadata) -> Result<std::f
     Ok(directory)
 }
 
+#[cfg(target_os = "linux")]
 fn read_workspace_file(
     path: &Path,
     before: &fs::Metadata,
@@ -2098,6 +2099,7 @@ fn read_workspace_file(
     Ok((contents, is_executable(&opened)))
 }
 
+#[cfg(target_os = "linux")]
 fn ensure_stable_file_contents(before: &fs::Metadata, after: &fs::Metadata) -> Result<()> {
     if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
         bail!("workspace file contents changed while staging");
@@ -2311,15 +2313,10 @@ fn ensure_same_file(before: &fs::Metadata, after: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 fn is_executable(metadata: &fs::Metadata) -> bool {
     use std::os::unix::fs::PermissionsExt;
     metadata.permissions().mode() & 0o111 != 0
-}
-
-#[cfg(not(unix))]
-fn is_executable(_metadata: &fs::Metadata) -> bool {
-    false
 }
 
 pub(crate) fn new_run_id() -> Result<String> {
