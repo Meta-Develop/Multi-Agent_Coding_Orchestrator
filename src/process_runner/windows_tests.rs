@@ -1,9 +1,11 @@
 use super::*;
 use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::{
-    Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0},
+    Foundation::{
+        GetHandleInformation, GetLastError, ERROR_INVALID_HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+    },
     System::{
-        Console::{GetConsoleCP, GetConsoleWindow},
+        Console::{GetConsoleCP, GetConsoleProcessList, GetConsoleWindow},
         JobObjects::IsProcessInJob,
         Threading::{GetCurrentProcess, WaitForSingleObject},
     },
@@ -25,11 +27,24 @@ fn windows_job_child_fixture() {
         unsafe { IsProcessInJob(GetCurrentProcess(), std::ptr::null_mut(), &mut in_job) },
         0
     );
+    let mut console_process_ids = [0; 1];
+    // SAFETY: the nonnull buffer holds one process ID; a larger required count also
+    // proves attachment, so this measurement never allocates or retries.
+    let console_process_count =
+        unsafe { GetConsoleProcessList(console_process_ids.as_mut_ptr(), 1) };
+    let console_process_list_error = if console_process_count == 0 {
+        // SAFETY: capture the failing call's thread-local error before another API.
+        unsafe { GetLastError() }
+    } else {
+        0
+    };
     // SAFETY: these APIs only read the calling process's console state.
     let state = unsafe {
         serde_json::json!({
             "console_window": !GetConsoleWindow().is_null(),
             "console_code_page": GetConsoleCP(),
+            "console_process_count": console_process_count,
+            "console_process_list_error": console_process_list_error,
             "in_job": in_job != 0,
         })
     };
@@ -144,9 +159,18 @@ fn assert_windowless_report(report: &Path, child: &mut Child) {
     }
     let state: serde_json::Value =
         serde_json::from_slice(&fs::read(report).expect("read OS state")).expect("OS state JSON");
+    eprintln!("fixture-console-state: {state}");
     assert_eq!(
         state["console_window"], false,
         "child must have no console window"
+    );
+    assert_eq!(
+        state["console_process_count"], 0,
+        "child must not have any console process list"
+    );
+    assert_eq!(
+        state["console_process_list_error"], ERROR_INVALID_HANDLE,
+        "console absence must not be inferred from an unrelated query failure"
     );
     assert_eq!(
         state["console_code_page"], 0,

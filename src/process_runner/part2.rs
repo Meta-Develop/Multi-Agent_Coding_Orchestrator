@@ -634,9 +634,9 @@ fn configure_stdin(command: &mut Command, stdin: &StdinMode) {
 #[cfg(target_os = "windows")]
 const WINDOWS_PROCESS_CREATION_FLAGS: u32 = {
     use windows_sys::Win32::System::Threading::{
-        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED,
+        CREATE_NEW_PROCESS_GROUP, CREATE_NO_WINDOW, CREATE_SUSPENDED, DETACHED_PROCESS,
     };
-    CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW
+    CREATE_NEW_PROCESS_GROUP | CREATE_SUSPENDED | CREATE_NO_WINDOW | DETACHED_PROCESS
 };
 
 include!("containment_platform.rs");
