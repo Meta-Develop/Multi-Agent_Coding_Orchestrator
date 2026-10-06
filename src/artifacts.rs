@@ -5,14 +5,14 @@ use self::state_auth::{
     sha256_hex, AuthenticationTag, RepositoryAuthWriter, RepositoryAuthenticator,
 };
 #[cfg(unix)]
-use crate::safe_state::device_id_to_u64;
+use crate::safe_state::{device_id_to_u64, identity_for_path, unsigned_to_u64};
 use crate::{
     orchestrator::RunId,
     safe_state::{
-        identity_for_path, remove_direct_child_tree, stable_checksum, unsigned_to_u64,
-        AtomicStateWriter, BoundedRegularReader, BoundedTreeEntryKind, BoundedTreeWalkAction,
-        BoundedTreeWalkLimits, BoundedTreeWalker, ExistingExclusiveLock, FileIdentity,
-        KernelStateLock, ReservedDirectory, SafeRoot, TreeLinkPolicy,
+        remove_direct_child_tree, stable_checksum, AtomicStateWriter, BoundedRegularReader,
+        BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits, BoundedTreeWalker,
+        ExistingExclusiveLock, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
+        TreeLinkPolicy,
     },
 };
 

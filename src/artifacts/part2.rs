@@ -197,9 +197,9 @@ fn read_and_verify_record(run: &SafeRoot, record: &ArtifactFileRecord) -> Result
 
 fn audit_artifact_tree(run: &SafeRoot, require_private: bool) -> Result<BTreeSet<PathBuf>> {
     run.verify()?;
-    let metadata = fs::symlink_metadata(run.path())?;
+    let _metadata = fs::symlink_metadata(run.path())?;
     #[cfg(unix)]
-    let device = metadata.dev();
+    let device = _metadata.dev();
     #[cfg(not(unix))]
     let device = 0u64;
     let mut entries = 0usize;
