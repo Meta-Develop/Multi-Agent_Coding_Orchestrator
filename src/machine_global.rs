@@ -484,6 +484,7 @@ impl MachineGlobalStore {
         Ok(coordinate)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn reserve_random_direct_child_directory(
         &self,
         root_id: &str,
@@ -513,6 +514,7 @@ impl MachineGlobalStore {
             && self.config_fingerprint == other.config_fingerprint
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn remove_empty_reserved_direct_child_directory(
         &self,
         root_id: &str,

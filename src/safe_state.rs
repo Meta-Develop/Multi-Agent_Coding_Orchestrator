@@ -689,6 +689,7 @@ impl SafeRoot {
         bail!("identity-bound directory reservations are unsupported on this platform")
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn remove_empty_reserved_direct_child_directory(
         &self,
         reserved: ReservedDirectory,
