@@ -191,6 +191,55 @@ jobs:
         if: matrix.os == 'windows-latest'
         run: 'cargo test --locked --lib process_runner::windows_tests:: -- --nocapture --test-threads=1'
 
+      - name: Run four common inbox tests on Windows
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        env:
+          CARGO_TERM_COLOR: never
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $sourcePath = 'src/inbox/review_repair_flow_tests.rs'
+          $source = [IO.File]::ReadAllText((Join-Path $PWD $sourcePath)).Replace("`r`n", "`n")
+          $sha256 = [Security.Cryptography.SHA256]::Create()
+          try {
+            $sourceHash = [BitConverter]::ToString($sha256.ComputeHash([Text.Encoding]::UTF8.GetBytes($source))).Replace('-', '').ToLowerInvariant()
+          } finally {
+            $sha256.Dispose()
+          }
+          if ($sourceHash -cne 'af14b7d700dac49b6a95985e4ebcfc4629c28350035d5ff709981f56c5043139') {
+            throw 'Common inbox test source changed; fresh caller and skip-boundary review is required.'
+          }
+          $tests = @(
+            'inbox::review_repair_flow::review_repair_flow_tests::validation_bundle_refuses_empty_or_incomplete_reports_and_retains_all_passed'
+            'inbox::review_repair_flow::review_repair_flow_tests::repair_producer_fingerprint_matches_authenticated_execution_record'
+            'inbox::review_repair_flow::review_repair_flow_tests::pending_admission_journal_append_is_idempotent_for_same_digest'
+            'inbox::review_repair_flow::review_repair_flow_tests::resume_replays_completed_transition_without_second_update'
+          )
+          $completed = 0
+          foreach ($testName in $tests) {
+            $output = @(& cargo test --locked --lib $testName -- --exact --nocapture --test-threads=1 2>&1)
+            $cargoExit = $LASTEXITCODE
+            $output | ForEach-Object { Write-Host "$_" }
+            Write-Host "COMMON_INBOX_CARGO_EXIT=$cargoExit FILTER=$testName"
+            if ($cargoExit -ne 0) {
+              exit $cargoExit
+            }
+            $lines = @($output | ForEach-Object { "$_" -replace '\x1B\[[0-?]*[ -/]*[@-~]', '' })
+            $namePattern = '^test ' + [regex]::Escape($testName) + ' \.\.\. ok$'
+            $summaryPattern = '^test result: ok\. 1 passed; 0 failed; 0 ignored; 0 measured; [0-9]+ filtered out; finished in .+$'
+            if (@($lines | Where-Object { $_ -cmatch '^running 1 test$' }).Count -ne 1 -or
+                @($lines | Where-Object { $_ -cmatch $namePattern }).Count -ne 1 -or
+                @($lines | Where-Object { $_ -cmatch $summaryPattern }).Count -ne 1) {
+              throw "Expected exactly one executed and passed, nonignored named test: $testName"
+            }
+            $completed++
+            Write-Host "COMMON_INBOX_ACCEPTED=$testName EXECUTED=1 PASSED=1 IGNORED=0"
+          }
+          if ($completed -ne 4) {
+            throw "Expected four accepted common inbox tests; received $completed."
+          }
+
   required-rust-gate:
     name: Required Rust CI gate
     runs-on: ubuntu-latest
