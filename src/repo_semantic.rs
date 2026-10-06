@@ -33,9 +33,13 @@ use proc_macro2::{LineColumn, Span};
 use serde::Serialize;
 use std::{
     collections::BTreeSet,
-    fs::{self, File, OpenOptions},
+    fs,
     path::{Component, Path, PathBuf},
 };
+#[cfg(any(target_os = "linux", test))]
+use std::fs::File;
+#[cfg(target_os = "linux")]
+use std::fs::OpenOptions;
 
 #[cfg(target_os = "linux")]
 use std::os::unix::{
