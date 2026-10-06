@@ -30,12 +30,12 @@ use super::*;
 use crate::account_authority::ManagedGrokAccountSelectionEvidence;
 #[cfg(target_os = "linux")]
 use crate::account_authority::{activate_cam_grok_test_harness, build_cam_grok_test_harness};
+#[cfg(target_os = "linux")]
+use crate::artifacts::state_auth::random_identifier;
 use crate::supervise::messaging_bridge::{
     initialize_supervisor_messaging_session, recover_supervisor_messaging_session,
     with_supervisor_messaging_session,
 };
-#[cfg(target_os = "linux")]
-use crate::artifacts::state_auth::random_identifier;
 use crate::{
     artifacts::{ArtifactRunWriter, RunArtifactFamily},
     external_agent::{
