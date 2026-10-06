@@ -5921,7 +5921,7 @@ fn cross_process_create_lease_blocks_pending_recovery() {
     );
 }
 
-#[cfg(unix)]
+#[cfg(target_os = "linux")]
 #[test]
 fn no_cleanliness_recovery_skips_busy_create_and_refuses_after_release() {
     let temp = TempDir::new().expect("tempdir");
