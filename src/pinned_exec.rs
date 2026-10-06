@@ -7,17 +7,16 @@
 
 use std::{
     env,
-    ffi::{CString, OsStr, OsString},
-    fmt,
-    fs::File,
-    io::{self, Read, Seek, SeekFrom, Write},
+    ffi::{OsStr, OsString},
+    fmt, io,
     path::{Path, PathBuf},
 };
 
 #[cfg(target_os = "linux")]
 use std::{
-    fs,
-    fs::OpenOptions,
+    ffi::CString,
+    fs::{self, File, OpenOptions},
+    io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
         unix::{
@@ -27,22 +26,31 @@ use std::{
     },
 };
 
-#[cfg(not(target_os = "linux"))]
-type RawFd = i32;
-
+#[cfg(target_os = "linux")]
 pub(crate) const PINNED_EXEC_REQUEST_VERSION: u8 = 1;
 pub(crate) const HIDDEN_PINNED_EXEC_ARGUMENT: &str = "--maco-internal-pinned-exec-v1";
+#[cfg(target_os = "linux")]
 pub(crate) const PINNED_EXEC_DESCRIPTOR_NAME: &str = "pinned-exec-request-v1";
+#[cfg(target_os = "linux")]
 const REQUEST_MAGIC: &[u8] = b"MACO-PINNED-EXEC\0";
 const SHA256_BYTES: usize = 32;
+#[cfg(target_os = "linux")]
 const SHA256_HEX_BYTES: usize = SHA256_BYTES * 2;
+#[cfg(target_os = "linux")]
 const MAX_EXECUTABLE_BYTES: u64 = 256 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_EXECUTABLE_PATH_BYTES: usize = 4096;
+#[cfg(target_os = "linux")]
 const MAX_SHEBANG_BYTES: usize = 256;
+#[cfg(target_os = "linux")]
 const MAX_PINNED_ARGUMENTS: usize = 256;
+#[cfg(target_os = "linux")]
 const MAX_PINNED_ARGUMENT_BYTES: usize = 32 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_PINNED_ARGUMENT_TOTAL_BYTES: usize = 256 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_DESCRIPTOR_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const COPY_BUFFER_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, PartialEq, Eq)]
@@ -121,22 +129,24 @@ impl fmt::Debug for EncodedPinnedExecDescriptor {
 }
 
 impl EncodedPinnedExecDescriptor {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn bytes(&self) -> &[u8] {
         &self.bytes
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn digest_hex(&self) -> String {
         hex_encode(&self.digest)
     }
 
+    #[cfg(target_os = "linux")]
     pub(crate) fn into_parts(self) -> (Vec<u8>, String) {
         let digest = hex_encode(&self.digest);
         (self.bytes, digest)
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct VerifiedPinnedExecRequest {
     source: ExecutableBinding,
@@ -145,6 +155,7 @@ pub(crate) struct VerifiedPinnedExecRequest {
     environment: Vec<(Vec<u8>, Vec<u8>)>,
 }
 
+#[cfg(target_os = "linux")]
 impl fmt::Debug for VerifiedPinnedExecRequest {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -169,12 +180,14 @@ impl fmt::Debug for VerifiedPinnedExecRequest {
     }
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ExecDescriptorPolicy {
     CloseOnExec,
     RetainForScriptPath,
 }
 
+#[cfg(target_os = "linux")]
 #[derive(Clone, PartialEq, Eq)]
 pub(crate) struct PreparedPinnedExecPlan {
     executable: ExecutableBinding,
@@ -183,6 +196,7 @@ pub(crate) struct PreparedPinnedExecPlan {
     script_descriptor_policy: ExecDescriptorPolicy,
 }
 
+#[cfg(target_os = "linux")]
 impl fmt::Debug for PreparedPinnedExecPlan {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
@@ -201,6 +215,7 @@ impl fmt::Debug for PreparedPinnedExecPlan {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl PreparedPinnedExecPlan {
     pub(crate) fn executable(&self) -> &ExecutableBinding {
         &self.executable
@@ -376,6 +391,7 @@ impl PinnedDirectExecutable {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_helper_path(path: &Path) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -402,6 +418,7 @@ pub(crate) fn validated_current_helper_path() -> io::Result<PathBuf> {
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn validate_descriptor_digest(descriptor: &[u8], digest: &OsStr) -> io::Result<()> {
     #[cfg(target_os = "linux")]
     {
@@ -426,6 +443,7 @@ pub(crate) fn validate_descriptor_digest(descriptor: &[u8], digest: &OsStr) -> i
     }
 }
 
+#[cfg(target_os = "linux")]
 pub(crate) fn decode_verified_descriptor(
     descriptor: &[u8],
     digest: &OsStr,
@@ -566,6 +584,7 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
     }
 }
 
+#[cfg(target_os = "linux")]
 impl VerifiedPinnedExecRequest {
     pub(crate) fn prepare_exec_plan(&self, script_fd: RawFd) -> io::Result<PreparedPinnedExecPlan> {
         #[cfg(target_os = "linux")]
@@ -922,11 +941,6 @@ pub(crate) fn materialize_sealed(binding: &ExecutableBinding) -> io::Result<Seal
     };
     sealed.set_close_on_exec(true)?;
     Ok(sealed)
-}
-
-#[cfg(not(target_os = "linux"))]
-pub(crate) fn materialize_sealed(_binding: &ExecutableBinding) -> io::Result<()> {
-    Err(unsupported())
 }
 
 #[cfg(target_os = "linux")]
@@ -1594,6 +1608,7 @@ fn hash_reader_with_prefix(reader: &mut File, max: u64) -> io::Result<([u8; 32],
     Ok((hasher.finalize(), prefix, total))
 }
 
+#[cfg(any(target_os = "linux", test))]
 #[derive(Clone)]
 struct Sha256 {
     state: [u32; 8],
@@ -1602,6 +1617,7 @@ struct Sha256 {
     total_bytes: u64,
 }
 
+#[cfg(any(target_os = "linux", test))]
 impl Sha256 {
     const INITIAL: [u32; 8] = [
         0x6a09e667, 0xbb67ae85, 0x3c6ef372, 0xa54ff53a, 0x510e527f, 0x9b05688c, 0x1f83d9ab,
@@ -1734,12 +1750,14 @@ impl Sha256 {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn sha256(bytes: &[u8]) -> io::Result<[u8; SHA256_BYTES]> {
     let mut state = Sha256::new();
     state.update(bytes)?;
     Ok(state.finalize())
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut output = String::with_capacity(bytes.len().saturating_mul(2));
@@ -1750,6 +1768,7 @@ fn hex_encode(bytes: &[u8]) -> String {
     output
 }
 
+#[cfg(target_os = "linux")]
 fn decode_sha256_hex(bytes: &[u8]) -> io::Result<[u8; SHA256_BYTES]> {
     if bytes.len() != SHA256_HEX_BYTES {
         return Err(invalid_input("pinned executable digest was malformed"));
@@ -1761,6 +1780,7 @@ fn decode_sha256_hex(bytes: &[u8]) -> io::Result<[u8; SHA256_BYTES]> {
     Ok(output)
 }
 
+#[cfg(target_os = "linux")]
 fn decode_lower_hex(byte: u8) -> io::Result<u8> {
     match byte {
         b'0'..=b'9' => Ok(byte - b'0'),
@@ -1769,6 +1789,7 @@ fn decode_lower_hex(byte: u8) -> io::Result<u8> {
     }
 }
 
+#[cfg(target_os = "linux")]
 fn constant_time_eq(left: &[u8; SHA256_BYTES], right: &[u8; SHA256_BYTES]) -> bool {
     left.iter()
         .zip(right)
@@ -1776,14 +1797,17 @@ fn constant_time_eq(left: &[u8; SHA256_BYTES], right: &[u8; SHA256_BYTES]) -> bo
         == 0
 }
 
+#[cfg(target_os = "linux")]
 fn invalid_input(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidInput, message)
 }
 
+#[cfg(any(target_os = "linux", test))]
 fn invalid_data(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
 
+#[cfg(target_os = "linux")]
 fn file_too_large(message: &'static str) -> io::Error {
     io::Error::new(io::ErrorKind::FileTooLarge, message)
 }
