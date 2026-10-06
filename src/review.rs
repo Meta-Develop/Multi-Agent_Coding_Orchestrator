@@ -92,7 +92,7 @@ pub const DEFAULT_OUTPUT_REVIEW_LENS_ID: &str = "default-output-report-review";
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ReviewExecutionRuntime {
     Verified,
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     NonpublishableSimulation,
 }
 
@@ -2271,7 +2271,7 @@ fn external_review(options: ReviewPrOptions) -> Result<ReviewReport> {
     external_review_runtime(options, ReviewExecutionRuntime::Verified)
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn external_review_simulation(options: ReviewPrOptions) -> Result<ReviewReport> {
     external_review_runtime(options, ReviewExecutionRuntime::NonpublishableSimulation)
 }
@@ -2295,7 +2295,7 @@ fn external_review_runtime(
     let before = repository.snapshot()?;
     let sanitized_view = match runtime {
         ReviewExecutionRuntime::Verified => Some(SanitizedReviewerView::create(&repository)?),
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         ReviewExecutionRuntime::NonpublishableSimulation => None,
     };
     materialized_program.verify(&repository)?;
@@ -2370,7 +2370,7 @@ fn external_review_runtime(
             .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
                 confinement.context("verified reviewer omitted sanitized confinement")?,
             )),
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         ReviewExecutionRuntime::NonpublishableSimulation => process_spec
             .with_containment(crate::process_runner::ContainmentPolicy::TrustedBestEffort),
     })
@@ -2411,7 +2411,7 @@ fn external_review_runtime(
     }
     let command_succeeded = match runtime {
         ReviewExecutionRuntime::Verified => output.safety_sensitive_succeeded(),
-        #[cfg(test)]
+        #[cfg(all(test, unix))]
         ReviewExecutionRuntime::NonpublishableSimulation => {
             output.status.is_some_and(|status| status.success())
                 && !output.timed_out
