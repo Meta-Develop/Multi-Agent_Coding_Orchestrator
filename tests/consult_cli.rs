@@ -677,12 +677,12 @@ JSON
     Ok(path)
 }
 
-fn make_executable(path: &Path) -> Result<()> {
+fn make_executable(_path: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(path, fs::Permissions::from_mode(0o755))
-            .with_context(|| format!("chmod {}", path.display()))?;
+        fs::set_permissions(_path, fs::Permissions::from_mode(0o755))
+            .with_context(|| format!("chmod {}", _path.display()))?;
     }
     Ok(())
 }
