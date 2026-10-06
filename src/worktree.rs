@@ -59,15 +59,25 @@ use std::io::Read;
 use std::os::unix::fs::MetadataExt;
 
 const DEFAULT_BRANCH_PREFIX: &str = "maco";
+#[cfg(unix)]
 const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
+#[cfg(unix)]
 const WORKTREE_GUARD_ASSET_V3_LEGACY: &[u8] = include_bytes!("../assets/maco-worktree-guard-v3.sh");
+#[cfg(unix)]
 const WORKTREE_GUARD_MODE: u32 = 0o755;
+#[cfg(unix)]
 const WORKTREE_GUARD_STATE_DIRECTORY: &str = ".maco-worktree-guard";
+#[cfg(unix)]
 const WORKTREE_GUARD_MARKER: &str = "maco-worktree-guard-v3";
+#[cfg(unix)]
 const WORKTREE_GUARD_PREVIOUS_SUFFIX: &str = ".maco-worktree-guard-previous";
+#[cfg(unix)]
 const WORKTREE_GUARD_STAGED_SUFFIX: &str = ".maco-worktree-guard-installing";
+#[cfg(unix)]
 const WORKTREE_GUARD_PRE_PUSH_TARGET: &str = "pre-push.human-authorship-previous";
+#[cfg(unix)]
 const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5_MODE: u32 = 0o755;
+#[cfg(unix)]
 const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5: &[u8] = br#"#!/usr/bin/env bash
 # human-authorship-guard dispatcher v5
 set -euo pipefail
@@ -118,6 +128,7 @@ private_guard="$(resolve_guard check-private-agent-paths)"
 github_actor_guard="$(resolve_guard check-approved-github-actor)"
 "$github_actor_guard"
 "#;
+#[cfg(unix)]
 const MAX_WORKTREE_GUARD_FILE_BYTES: u64 = 256 * 1024;
 const MANAGED_WORKTREE_REGISTRY_VERSION: u32 = 2;
 const MAX_WORKTREE_METADATA_BYTES: u64 = 64 * 1024;
