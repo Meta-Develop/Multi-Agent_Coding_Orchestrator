@@ -4428,7 +4428,7 @@ pub(crate) fn publish_pr_with_write_lease(
 /// Publishes a previously prepared candidate with mandatory exact validation
 /// evidence. There is intentionally no `require_validation` argument: callers
 /// cannot downgrade this strict bridge to legacy or unbound validation.
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn publish_prepared_pr_with_write_lease(
     options: PrPublicationOptions,
     bound_evidence: &BoundValidationEvidenceBundle,
