@@ -1854,7 +1854,9 @@ fn resolve_catalog_program(program: &Path) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::process_runner::{ContainmentBackend, ProcessCommand};
+    use crate::process_runner::ContainmentBackend;
+    #[cfg(target_os = "linux")]
+    use crate::process_runner::ProcessCommand;
     use std::{cell::RefCell, fs};
 
     const CAPTURED_CATALOG: &[u8] = include_bytes!(concat!(
