@@ -9,12 +9,14 @@
 // checkpoint callers continue to use the compatibility alias.
 #![allow(dead_code)]
 
+#[cfg(unix)]
+use crate::safe_state::identity_for_path;
 use crate::{
     artifacts::state_auth::{
         random_identifier, validate_repository_binding, AuthenticationDomain, AuthenticationTag,
         BoundStateLock, RepositoryAuthBinding, RepositoryAuthenticator,
     },
-    safe_state::{identity_for_path, BoundedRegularReader, FileIdentity, SafeRoot},
+    safe_state::{BoundedRegularReader, FileIdentity, SafeRoot},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -1332,12 +1334,12 @@ fn remove_published_hardlink_residue<S: JournalSpec>(
     temp_name: &std::ffi::OsStr,
     final_name: &std::ffi::OsStr,
 ) -> Result<()> {
-    let temp = root.direct_child(temp_name)?;
-    let final_path = root.direct_child(final_name)?;
+    let _temp = root.direct_child(temp_name)?;
+    let _final_path = root.direct_child(final_name)?;
     #[cfg(unix)]
     {
-        let temp_metadata = fs::symlink_metadata(&temp)?;
-        let final_metadata = fs::symlink_metadata(&final_path)?;
+        let temp_metadata = fs::symlink_metadata(&_temp)?;
+        let final_metadata = fs::symlink_metadata(&_final_path)?;
         if temp_metadata.dev() != final_metadata.dev()
             || temp_metadata.ino() != final_metadata.ino()
             || temp_metadata.nlink() != 2
@@ -1345,8 +1347,8 @@ fn remove_published_hardlink_residue<S: JournalSpec>(
         {
             bail!("checkpoint hard-link crash residue is not bound to its published record");
         }
-        fs::remove_file(&temp).context("failed to remove checkpoint hard-link crash residue")?;
-        validate_private_state_file::<S>(&final_path, false)?;
+        fs::remove_file(&_temp).context("failed to remove checkpoint hard-link crash residue")?;
+        validate_private_state_file::<S>(&_final_path, false)?;
         Ok(())
     }
     #[cfg(not(unix))]
