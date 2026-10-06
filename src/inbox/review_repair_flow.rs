@@ -487,9 +487,17 @@ pub(crate) fn resume_inbox_repair_with_services(
     if !options.grant_file.is_absolute() {
         bail!("operator grant path must be absolute and outside the repository");
     }
-    if let Some(report) = replay_completed_transition(&options.repo, &binding)? {
-        return Ok(report);
-    }
+    resume_completed_repair_or_else(
+        replay_completed_transition(&options.repo, &binding),
+        || resume_pending_repair_after_completion_check(options, binding, services),
+    )
+}
+
+fn resume_pending_repair_after_completion_check(
+    options: InboxResumeRepairOptions,
+    binding: PendingRepairBinding,
+    services: &mut RepairResumeServices<'_>,
+) -> Result<InboxResumeRepairReport> {
     let selected = load_selected_item(&options.repo, &options.run_id, options.item_index)?;
     if selected.source_snapshot.number() != binding.pr_number {
         bail!("pending repair selected item does not match pending PR number");
@@ -778,31 +786,44 @@ struct PendingRepairObservationPayload {
     snapshot: serde_json::Value,
 }
 
-fn find_existing_pending_admission(
-    repo: &Path,
-    provider_repository_id: &str,
-    pr_number: u64,
+/// A borrowed protocol view, not an authenticated record or storage capability.
+/// Production adapts records only after the original journal admission and chain checks.
+/// Test DATA carries no root, epoch, MAC, lock, durability or provider authority.
+struct PendingRepairProtocolRecord<'a> {
+    phase: &'a str,
+    subject: &'a Option<String>,
+    payload: &'a serde_json::Value,
+}
+
+fn persist_pending_binding_or_else(
+    existing: Result<Option<PendingRepairBinding>>,
+    binding: &PendingRepairBinding,
+    append: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if existing?.is_some_and(
+        |existing| existing.pending_admission_digest == binding.pending_admission_digest,
+    ) {
+        return Ok(());
+    }
+    append()
+}
+
+fn resume_completed_repair_or_else(
+    replayed: Result<Option<InboxResumeRepairReport>>,
+    resume: impl FnOnce() -> Result<InboxResumeRepairReport>,
+) -> Result<InboxResumeRepairReport> {
+    match replayed? {
+        Some(report) => Ok(report),
+        None => resume(),
+    }
+}
+
+fn find_pending_admission_in_protocol_records<'a>(
+    records: impl DoubleEndedIterator<Item = PendingRepairProtocolRecord<'a>>,
     inbox_run_id: &str,
     item_index: usize,
 ) -> Result<Option<PendingRepairBinding>> {
-    let authenticator = repository_auth_writer(repo)?
-        .into_authenticator()
-        .context("bind pending repair lookup authentication")?;
-    let instance_id = pending_instance_id(provider_repository_id, pr_number)?;
-    let state_root = authenticator.state_root();
-    if !state_root.direct_child_exists(PendingRepairJournalSpec::ROOT_NAME)? {
-        return Ok(None);
-    }
-    let journal_root = crate::safe_state::SafeRoot::open_existing(
-        state_root.path().join(PendingRepairJournalSpec::ROOT_NAME),
-    )
-    .context("open existing pending repair journal root")?;
-    if !journal_root.direct_child_exists(&instance_id)? {
-        return Ok(None);
-    }
-    let journal = PendingRepairJournal::open_instance(authenticator, &instance_id)
-        .context("open pending repair journal for lookup")?;
-    for record in journal.records().iter().rev() {
+    for record in records.rev() {
         if record.phase != PHASE_PENDING {
             continue;
         }
@@ -815,21 +836,13 @@ fn find_existing_pending_admission(
     Ok(None)
 }
 
-fn replay_completed_transition(
-    repo: &Path,
+fn completed_replay_from_protocol_records<'a>(
     binding: &PendingRepairBinding,
+    records: impl Iterator<Item = PendingRepairProtocolRecord<'a>>,
 ) -> Result<Option<InboxResumeRepairReport>> {
-    let authenticator = repository_auth_writer(repo)?
-        .into_authenticator()
-        .context("bind pending repair completion replay authentication")?;
-    let journal = PendingRepairJournal::open_instance(
-        authenticator,
-        &pending_instance_id(&binding.provider_repository_id, binding.pr_number)?,
-    )
-    .context("open pending repair journal for completion replay")?;
     let mut advanced: Option<PendingRepairAdvancedRecord> = None;
     let mut receipt: Option<OriginalPrUpdateReceipt> = None;
-    for record in journal.records().iter() {
+    for record in records {
         if record.phase == PHASE_UPDATE
             && record.subject.as_deref() == Some(binding.inbox_run_id.as_str())
         {
@@ -869,6 +882,69 @@ fn replay_completed_transition(
             "source-bound repair transition is durable; readiness and merge authority remain independently recomputed"
                 .to_string(),
     }))
+}
+
+fn find_existing_pending_admission(
+    repo: &Path,
+    provider_repository_id: &str,
+    pr_number: u64,
+    inbox_run_id: &str,
+    item_index: usize,
+) -> Result<Option<PendingRepairBinding>> {
+    let authenticator = repository_auth_writer(repo)?
+        .into_authenticator()
+        .context("bind pending repair lookup authentication")?;
+    let instance_id = pending_instance_id(provider_repository_id, pr_number)?;
+    let state_root = authenticator.state_root();
+    if !state_root.direct_child_exists(PendingRepairJournalSpec::ROOT_NAME)? {
+        return Ok(None);
+    }
+    let journal_root = crate::safe_state::SafeRoot::open_existing(
+        state_root.path().join(PendingRepairJournalSpec::ROOT_NAME),
+    )
+    .context("open existing pending repair journal root")?;
+    if !journal_root.direct_child_exists(&instance_id)? {
+        return Ok(None);
+    }
+    let journal = PendingRepairJournal::open_instance(authenticator, &instance_id)
+        .context("open pending repair journal for lookup")?;
+    find_pending_admission_in_protocol_records(
+        journal
+            .records()
+            .iter()
+            .map(|record| PendingRepairProtocolRecord {
+                phase: &record.phase,
+                subject: &record.subject,
+                payload: &record.payload,
+            }),
+        inbox_run_id,
+        item_index,
+    )
+}
+
+fn replay_completed_transition(
+    repo: &Path,
+    binding: &PendingRepairBinding,
+) -> Result<Option<InboxResumeRepairReport>> {
+    let authenticator = repository_auth_writer(repo)?
+        .into_authenticator()
+        .context("bind pending repair completion replay authentication")?;
+    let journal = PendingRepairJournal::open_instance(
+        authenticator,
+        &pending_instance_id(&binding.provider_repository_id, binding.pr_number)?,
+    )
+    .context("open pending repair journal for completion replay")?;
+    completed_replay_from_protocol_records(
+        binding,
+        journal
+            .records()
+            .iter()
+            .map(|record| PendingRepairProtocolRecord {
+                phase: &record.phase,
+                subject: &record.subject,
+                payload: &record.payload,
+            }),
+    )
 }
 
 fn replay_post_update_observation(
@@ -1010,17 +1086,20 @@ fn pending_instance_id(provider_repository_id: &str, pr_number: u64) -> Result<S
 }
 
 fn persist_pending_binding(repo: &Path, binding: &PendingRepairBinding) -> Result<()> {
-    if find_existing_pending_admission(
-        repo,
-        &binding.provider_repository_id,
-        binding.pr_number,
-        &binding.inbox_run_id,
-        binding.item_index,
-    )?
-    .is_some_and(|existing| existing.pending_admission_digest == binding.pending_admission_digest)
-    {
-        return Ok(());
-    }
+    persist_pending_binding_or_else(
+        find_existing_pending_admission(
+            repo,
+            &binding.provider_repository_id,
+            binding.pr_number,
+            &binding.inbox_run_id,
+            binding.item_index,
+        ),
+        binding,
+        || append_pending_binding_after_lookup(repo, binding),
+    )
+}
+
+fn append_pending_binding_after_lookup(repo: &Path, binding: &PendingRepairBinding) -> Result<()> {
     let authenticator = repository_auth_writer(repo)?
         .into_authenticator()
         .context("bind pending repair authentication")?;

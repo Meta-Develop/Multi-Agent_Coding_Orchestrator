@@ -207,7 +207,7 @@ jobs:
           } finally {
             $sha256.Dispose()
           }
-          if ($sourceHash -cne 'daba6453e758f137818eefe47a09e1f352fa37d4d78b2ad93b87d45f77ef3689') {
+          if ($sourceHash -cne 'a19f299befe51ac01d55e94e708e408a0ff125102cad0798d4cc5fb423d2b775') {
             throw 'Common inbox test source changed; fresh caller and skip-boundary review is required.'
           }
           $tests = @(

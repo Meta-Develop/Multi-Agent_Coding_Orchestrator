@@ -10,6 +10,7 @@ use super::super::review_loop_entry::{
     compact_independent_auditor_selection, independent_auditor_stable_id,
     select_critical_independent_auditor,
 };
+#[cfg(unix)]
 use super::super::review_policy_input::BoundReviewPolicy;
 #[cfg(unix)]
 use super::super::review_repair_evidence::{
@@ -25,6 +26,7 @@ use super::super::{
 use super::*;
 #[cfg(unix)]
 use crate::artifacts::{state_auth::sha256_hex, ArtifactRunReader};
+#[cfg(unix)]
 use crate::artifacts::{ArtifactRunWriter, RunArtifactFamily};
 #[cfg(unix)]
 use crate::autopilot::{
@@ -36,9 +38,10 @@ use crate::autopilot::{
 };
 #[cfg(unix)]
 use crate::llm::RedactionSummary;
+#[cfg(unix)]
+use crate::merge::raw_candidate_snapshot_diff;
 use crate::merge::{
-    candidate_validation_binding, raw_candidate_snapshot_diff, CandidateValidationBinding,
-    ValidationReport, ValidationStatus,
+    candidate_validation_binding, CandidateValidationBinding, ValidationReport, ValidationStatus,
 };
 use crate::optimizer::merge_authority::{
     AgentIdentity, MergeActor, ProducerFingerprint, SessionId,
@@ -65,7 +68,9 @@ use crate::supervise::{
     AgentRole, AutonomyKpiReport, ReviewStatus, SupervisorFinalReport, SupervisorRunLifecycle,
     SupervisorRuntime,
 };
-use crate::worktree::{WorktreeCreateOptions, WorktreeManager};
+#[cfg(unix)]
+use crate::worktree::WorktreeCreateOptions;
+use crate::worktree::WorktreeManager;
 #[cfg(unix)]
 use anyhow::{bail, Context, Result};
 use git2::{Oid, Repository, Signature};
@@ -125,21 +130,48 @@ fn init_git_abc_candidate() -> (TempDir, Oid, Oid, Oid, CandidateValidationBindi
             &[&prior_head_commit],
         )
         .expect("commit C");
-    let record = WorktreeManager::new(&repo_path)
-        .create_for_test(WorktreeCreateOptions {
-            agent_id: "repair-agent".to_string(),
-            branch: None,
-            base: None,
-            worktree_root: None,
+    #[cfg(unix)]
+    let (candidate_path, candidate_branch, raw_diff) = {
+        let record = WorktreeManager::new(&repo_path)
+            .create_for_test(WorktreeCreateOptions {
+                agent_id: "repair-agent".to_string(),
+                branch: None,
+                base: None,
+                worktree_root: None,
+            })
+            .expect("worktree");
+        let raw_diff =
+            raw_candidate_snapshot_diff(&repo, &record.path, prior_head, candidate).expect("diff");
+        (record.path, record.branch, raw_diff)
+    };
+    #[cfg(not(unix))]
+    let (candidate_path, candidate_branch, raw_diff) = {
+        // This common protocol fixture needs real Git objects, not managed-state admission.
+        let diff = repo
+            .diff_tree_to_tree(Some(&head_tree), Some(&repair_tree), None)
+            .expect("candidate tree diff");
+        let mut raw_diff = Vec::new();
+        diff.print(git2::DiffFormat::Patch, |_delta, _hunk, line| {
+            if matches!(line.origin(), ' ' | '+' | '-') {
+                raw_diff.push(line.origin() as u8);
+            }
+            raw_diff.extend_from_slice(line.content());
+            true
         })
-        .expect("worktree");
-    let raw_diff =
-        raw_candidate_snapshot_diff(&repo, &record.path, prior_head, candidate).expect("diff");
+        .expect("render candidate tree diff");
+        let candidate_branch = repo
+            .head()
+            .expect("candidate HEAD")
+            .shorthand()
+            .expect("candidate branch")
+            .to_string();
+        (repo_path.clone(), candidate_branch, raw_diff)
+    };
     let binding = candidate_validation_binding(
         &crate::merge::WorktreeMergeMetadata {
             agent_id: "repair-agent".to_string(),
-            worktree_path: record.path.clone(),
-            branch: record.branch.clone(),
+            worktree_path: candidate_path,
+            branch: candidate_branch.clone(),
             primary_repo_root: repo_path.clone(),
             primary_head: Some(prior_head.to_string()),
             agent_head: Some(candidate.to_string()),
@@ -149,7 +181,7 @@ fn init_git_abc_candidate() -> (TempDir, Oid, Oid, Oid, CandidateValidationBindi
         &raw_diff,
     )
     .expect("binding");
-    (temp, pr_base, prior_head, candidate, binding, record.branch)
+    (temp, pr_base, prior_head, candidate, binding, candidate_branch)
 }
 
 fn passed_report(name: &str) -> ValidationReport {
@@ -344,6 +376,124 @@ fn pending_admission_journal_append_is_idempotent_for_same_digest() {
         repair_execution: execution,
     };
     pending.pending_admission_digest = pending_binding_digest(&pending).expect("digest");
+    // Exercise the actual production selector and deduplication dispatch with untrusted DATA.
+    let mut records = Vec::new();
+    let append_calls = AtomicUsize::new(0);
+    let existing = find_pending_admission_in_protocol_records(
+        protocol_records_for_test_data(&records),
+        &pending.inbox_run_id,
+        pending.item_index,
+    );
+    persist_pending_binding_or_else(existing, &pending, || {
+        append_calls.fetch_add(1, Ordering::SeqCst);
+        records.push((
+            PHASE_PENDING.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            serde_json::to_value(&pending).expect("pending protocol payload"),
+        ));
+        Ok(())
+    })
+    .expect("first protocol append decision");
+    let existing = find_pending_admission_in_protocol_records(
+        protocol_records_for_test_data(&records),
+        &pending.inbox_run_id,
+        pending.item_index,
+    );
+    persist_pending_binding_or_else(existing, &pending, || {
+        append_calls.fetch_add(1, Ordering::SeqCst);
+        Err(anyhow::anyhow!("same-digest append must not run"))
+    })
+    .expect("same-digest protocol reuse");
+    assert_eq!(append_calls.load(Ordering::SeqCst), 1);
+    assert_eq!(records.len(), 1);
+    assert_ne!(pr_base, prior_head);
+    assert_ne!(prior_head, candidate);
+    assert!(
+        find_pending_admission_in_protocol_records(
+            protocol_records_for_test_data(&records),
+            "another-run",
+            pending.item_index,
+        )
+        .expect("other run selection")
+        .is_none()
+    );
+    assert!(
+        find_pending_admission_in_protocol_records(
+            protocol_records_for_test_data(&records),
+            &pending.inbox_run_id,
+            pending.item_index + 1,
+        )
+        .expect("other item selection")
+        .is_none()
+    );
+    // The lower-level current behavior appends a changed digest; the consumer conflict refusal
+    // remains unchanged and is not replaced by this protocol helper.
+    let mut changed = pending.clone();
+    changed.pending_admission_digest.push('x');
+    persist_pending_binding_or_else(Ok(Some(pending.clone())), &changed, || {
+        append_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .expect("different digest is not deduplicated");
+    assert_eq!(append_calls.load(Ordering::SeqCst), 2);
+    let malformed = vec![(
+        PHASE_PENDING.to_string(),
+        Some(pending.inbox_run_id.clone()),
+        serde_json::json!({}),
+    )];
+    let existing = find_pending_admission_in_protocol_records(
+        protocol_records_for_test_data(&malformed),
+        &pending.inbox_run_id,
+        pending.item_index,
+    );
+    let malformed_error = persist_pending_binding_or_else(existing, &pending, || {
+        append_calls.fetch_add(1, Ordering::SeqCst);
+        Ok(())
+    })
+    .expect_err("malformed pending protocol payload");
+    assert!(format!("{malformed_error:#}").contains("decode pending binding"));
+    assert_eq!(append_calls.load(Ordering::SeqCst), 2);
+    // Keep the original actual private journal integration, with every original assertion.
+    #[cfg(unix)]
+    pending_admission_journal_append_is_idempotent_for_same_digest_durable_unix();
+}
+
+#[cfg(unix)]
+fn pending_admission_journal_append_is_idempotent_for_same_digest_durable_unix() {
+    let (temp, pr_base, prior_head, candidate, binding, branch) = init_git_abc_candidate();
+    let repo = temp.path().join("repo");
+    let execution = RepairProducerExecutionRecord {
+        agent_id: "repair-agent".to_string(),
+        supervisor_run_id: "sup-run".to_string(),
+        child_autopilot_run_id: "auto-child".to_string(),
+        model_label: "codex".to_string(),
+    };
+    let producer = repair_producer_fingerprint(&repo, &binding, &execution).expect("producer");
+    let run_id = RunId::new("repair-idempotent-pending").expect("run id");
+    let mut pending = PendingRepairBinding {
+        version: PENDING_FORMAT_VERSION,
+        inbox_run_id: run_id.as_str().to_string(),
+        item_index: 1,
+        autopilot_run_id: "auto-1".to_string(),
+        review_policy_file: PathBuf::from("/tmp/unused-policy.json"),
+        provider_repository_id: "node:sha256:test-repo".to_string(),
+        pr_number: 90,
+        source_snapshot_sha256: "0".repeat(64),
+        raw_policy_sha256: "1".repeat(64),
+        policy_sha256: "2".repeat(64),
+        prior_state_sha256: "3".repeat(64),
+        prior_snapshot_sha256: "4".repeat(64),
+        prior_head_oid: prior_head.to_string(),
+        prior_base_oid: pr_base.to_string(),
+        candidate_binding: binding,
+        from_branch: branch,
+        repair_producer: producer,
+        verified_proof_sha256: "5".repeat(64),
+        validation_evidence_sha256: "6".repeat(64),
+        pending_admission_digest: String::new(),
+        repair_execution: execution,
+    };
+    pending.pending_admission_digest = pending_binding_digest(&pending).expect("digest");
     persist_pending_binding(&repo, &pending).expect("first persist");
     persist_pending_binding(&repo, &pending).expect("second persist");
     let authenticator = repository_auth_writer(&repo)
@@ -367,6 +517,208 @@ fn pending_admission_journal_append_is_idempotent_for_same_digest() {
 
 #[test]
 fn resume_replays_completed_transition_without_second_update() {
+    let (temp, pr_base, prior_head, candidate, binding, branch) = init_git_abc_candidate();
+    let repo = temp.path().join("repo");
+    let run_id = RunId::new("repair-replay-complete").expect("run id");
+    let execution = RepairProducerExecutionRecord {
+        agent_id: "repair-agent".to_string(),
+        supervisor_run_id: "sup-run".to_string(),
+        child_autopilot_run_id: "auto-child".to_string(),
+        model_label: "codex".to_string(),
+    };
+    let producer = repair_producer_fingerprint(&repo, &binding, &execution).expect("producer");
+    let mut pending = PendingRepairBinding {
+        version: PENDING_FORMAT_VERSION,
+        inbox_run_id: run_id.as_str().to_string(),
+        item_index: 1,
+        autopilot_run_id: "auto-1".to_string(),
+        review_policy_file: PathBuf::from("/tmp/unused-policy.json"),
+        provider_repository_id: "node:sha256:test-repo".to_string(),
+        pr_number: 90,
+        source_snapshot_sha256: "0".repeat(64),
+        raw_policy_sha256: "1".repeat(64),
+        policy_sha256: "2".repeat(64),
+        prior_state_sha256: "3".repeat(64),
+        prior_snapshot_sha256: "4".repeat(64),
+        prior_head_oid: prior_head.to_string(),
+        prior_base_oid: pr_base.to_string(),
+        candidate_binding: binding,
+        from_branch: branch,
+        repair_producer: producer,
+        verified_proof_sha256: "5".repeat(64),
+        validation_evidence_sha256: "6".repeat(64),
+        pending_admission_digest: String::new(),
+        repair_execution: execution,
+    };
+    pending.pending_admission_digest = pending_binding_digest(&pending).expect("digest");
+    // These payloads are protocol DATA, not authenticated storage or provider receipts.
+    let receipt = test_update_receipt(&candidate.to_string(), pending.candidate_binding.clone());
+    let update_payload = serde_json::to_value(PendingRepairUpdateReceipt {
+        version: PENDING_FORMAT_VERSION,
+        receipt: receipt.clone(),
+    })
+    .expect("update protocol payload");
+    let advanced_payload = serde_json::to_value(PendingRepairAdvancedRecord {
+        version: PENDING_FORMAT_VERSION,
+        advanced_state_sha256: "9".repeat(64),
+        collection_started_at: "2026-08-16T02:00:00Z".to_string(),
+        source_bound_completion: true,
+    })
+    .expect("completion protocol payload");
+    let records = vec![
+        (
+            PHASE_UPDATE.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            update_payload.clone(),
+        ),
+        (
+            PHASE_ADVANCED.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            advanced_payload.clone(),
+        ),
+    ];
+    let apply_calls = AtomicUsize::new(0);
+    let report = resume_completed_repair_or_else(
+        completed_replay_from_protocol_records(
+            &pending,
+            protocol_records_for_test_data(&records),
+        ),
+        || {
+            apply_calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("completed replay must not run continuation"))
+        },
+    )
+    .expect("protocol completion replay");
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(report.status, "replayed_source_bound_completion");
+    assert_eq!(
+        report.updated_head_oid.as_deref(),
+        Some(candidate.to_string().as_str()),
+    );
+    assert_eq!(report.prior_state_sha256, pending.prior_state_sha256);
+    // Positive control: unmatched subjects cannot claim completion and invoke continuation.
+    let wrong_subject = vec![
+        (
+            PHASE_UPDATE.to_string(),
+            Some("other-run".to_string()),
+            update_payload.clone(),
+        ),
+        (
+            PHASE_ADVANCED.to_string(),
+            Some("other-run".to_string()),
+            advanced_payload.clone(),
+        ),
+    ];
+    assert!(
+        resume_completed_repair_or_else(
+            completed_replay_from_protocol_records(
+                &pending,
+                protocol_records_for_test_data(&wrong_subject),
+            ),
+            || {
+                apply_calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("unmatched completion invokes continuation"))
+            },
+        )
+        .is_err()
+    );
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    let missing_receipt = vec![(
+        PHASE_ADVANCED.to_string(),
+        Some(pending.inbox_run_id.clone()),
+        advanced_payload.clone(),
+    )];
+    let mut wrong_head_payload = update_payload.clone();
+    wrong_head_payload["receipt"]["updated_oid"] = serde_json::json!("0".repeat(40));
+    let wrong_head = vec![
+        (
+            PHASE_UPDATE.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            wrong_head_payload,
+        ),
+        (
+            PHASE_ADVANCED.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            advanced_payload.clone(),
+        ),
+    ];
+    let mut not_bound_payload = advanced_payload.clone();
+    not_bound_payload["source_bound_completion"] = serde_json::json!(false);
+    let not_source_bound = vec![
+        (
+            PHASE_UPDATE.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            update_payload.clone(),
+        ),
+        (
+            PHASE_ADVANCED.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            not_bound_payload,
+        ),
+    ];
+    let malformed = vec![
+        (
+            PHASE_UPDATE.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            serde_json::json!({}),
+        ),
+        (
+            PHASE_ADVANCED.to_string(),
+            Some(pending.inbox_run_id.clone()),
+            advanced_payload,
+        ),
+    ];
+    for (invalid, expected) in [
+        (
+            &missing_receipt,
+            "completed pending-repair transition missing update receipt",
+        ),
+        (
+            &wrong_head,
+            "durable pending-repair completion receipt head mismatch",
+        ),
+        (
+            &not_source_bound,
+            "pending repair advanced record is not source-bound",
+        ),
+        (&malformed, "decode update receipt"),
+    ] {
+        let error = resume_completed_repair_or_else(
+            completed_replay_from_protocol_records(
+                &pending,
+                protocol_records_for_test_data(invalid),
+            ),
+            || {
+                apply_calls.fetch_add(1, Ordering::SeqCst);
+                Err(anyhow::anyhow!("invalid completion must not run continuation"))
+            },
+        )
+        .expect_err("invalid protocol completion");
+        assert!(format!("{error:#}").contains(expected));
+        assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    }
+    let mut missing_head = pending.clone();
+    missing_head.candidate_binding.agent_head = None;
+    let missing_head_error = resume_completed_repair_or_else(
+        completed_replay_from_protocol_records(
+            &missing_head,
+            protocol_records_for_test_data(&records),
+        ),
+        || {
+            apply_calls.fetch_add(1, Ordering::SeqCst);
+            Err(anyhow::anyhow!("missing candidate head must not run continuation"))
+        },
+    )
+    .expect_err("missing candidate head");
+    assert!(format!("{missing_head_error:#}").contains("pending repair omitted candidate head"));
+    assert_eq!(apply_calls.load(Ordering::SeqCst), 1);
+    // Keep the complete original real artifact/journal/private resume integration.
+    #[cfg(unix)]
+    resume_replays_completed_transition_without_second_update_durable_unix();
+}
+
+#[cfg(unix)]
+fn resume_replays_completed_transition_without_second_update_durable_unix() {
     let (temp, pr_base, prior_head, candidate, binding, branch) = init_git_abc_candidate();
     let repo = temp.path().join("repo");
     let run_id = RunId::new("repair-replay-complete").expect("run id");
@@ -452,6 +804,19 @@ fn resume_replays_completed_transition_without_second_update() {
         report.updated_head_oid.as_deref(),
         Some(candidate.to_string().as_str())
     );
+}
+
+// Only untrusted protocol DATA; these tuples are not authenticated journal records.
+fn protocol_records_for_test_data(
+    records: &[(String, Option<String>, serde_json::Value)],
+) -> impl DoubleEndedIterator<Item = PendingRepairProtocolRecord<'_>> {
+    records
+        .iter()
+        .map(|(phase, subject, payload)| PendingRepairProtocolRecord {
+            phase,
+            subject,
+            payload,
+        })
 }
 
 #[cfg(unix)]
