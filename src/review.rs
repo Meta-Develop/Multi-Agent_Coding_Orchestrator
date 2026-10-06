@@ -78,7 +78,7 @@ const FAKE_REVIEW_REQUEST_DOMAIN: &[u8] = b"MACO\0fake-review-request\0v1\0";
 const REVIEW_LENS_BACKEND_CONFIG_DOMAIN: &[u8] = b"MACO\0review-lens-backend-config\0v1\0";
 const REVIEW_LENS_EVIDENCE_CONTENT_DOMAIN: &[u8] = b"MACO\0review-lens-evidence-content\0v1\0";
 const REVIEW_LENS_REQUEST_DOMAIN: &[u8] = b"MACO\0review-lens-request\0v1\0";
-#[cfg(any(unix, test))]
+#[cfg(target_os = "linux")]
 const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0";
 const REVIEW_SHA256_IDENTITY_PREFIX: &str = "sha256:";
 const REVIEW_TRANSCRIPT_COMPLETE_MARKER: &str =
@@ -3125,7 +3125,7 @@ fn validate_sanitized_view_paths(selection: &SanitizedViewSelection) -> Result<(
     Ok(())
 }
 
-#[cfg(any(unix, test))]
+#[cfg(target_os = "linux")]
 fn sanitized_view_parent_directories(
     entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
 ) -> Result<Vec<PathBuf>> {
@@ -3212,7 +3212,7 @@ fn sanitized_view_content_matches(
     }
 }
 
-#[cfg(any(unix, test))]
+#[cfg(target_os = "linux")]
 fn sanitized_view_binding(
     selection: &SanitizedViewSelection,
     directories: &BTreeMap<PathBuf, BoundReviewDirectory>,
