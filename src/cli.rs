@@ -1,5 +1,7 @@
 #[cfg(target_os = "linux")]
 use crate::machine_global::machine_global_config_content_binding;
+#[cfg(any(target_os = "linux", test))]
+use crate::machine_global::MachineGlobalConfig;
 use crate::{
     agent::{
         self, AgentRunOptions, AgentRunReport, AgentValidationCommand, AgentWorktreeReusePolicy,
@@ -22,8 +24,8 @@ use crate::{
     llm::{FakeProvider, PromptContext, ProviderCapabilities, Redactor, RepoExcerpt, WorkProposal},
     machine_global::{
         DestructiveTargetInput, GateOutcome, MachineGlobalClaimSummary, MachineGlobalClaimToken,
-        MachineGlobalConfig, MachineGlobalRetentionBinding, MachineGlobalStore,
-        RetentionOperationId, RetentionOperationToken,
+        MachineGlobalRetentionBinding, MachineGlobalStore, RetentionOperationId,
+        RetentionOperationToken,
     },
     megafile::{
         MegafileAssessment, MegafileReport, MegafileStore, MegafileThresholdCalibration,
