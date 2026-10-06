@@ -2671,7 +2671,9 @@ struct SanitizedReviewerView {
     directory_name: OsString,
     directory_identity: FileIdentity,
     selection: SanitizedViewSelection,
+    #[cfg(any(unix, test))]
     source_directories: BTreeMap<PathBuf, BoundReviewDirectory>,
+    #[cfg(any(unix, test))]
     source_entries: BTreeMap<PathBuf, SnapshotTreeEntry>,
     binding: String,
 }
@@ -2785,6 +2787,7 @@ impl SanitizedReviewerView {
         &self.binding
     }
 
+    #[cfg(any(unix, test))]
     fn verify(&self, repository: &ReviewRepositoryBinding) -> Result<()> {
         self.root
             .verify()
@@ -2845,6 +2848,24 @@ impl SanitizedReviewerView {
         }
         view.verify(&view_root)?;
         Ok(())
+    }
+
+    #[cfg(all(not(unix), not(test)))]
+    fn verify(&self, repository: &ReviewRepositoryBinding) -> Result<()> {
+        self.root
+            .verify()
+            .map_err(|_| anyhow::anyhow!("sanitized reviewer runtime root changed"))?;
+        let reserved = self
+            .root
+            .bind_existing_direct_child_directory(&self.directory_name)?;
+        if reserved.identity() != &self.directory_identity {
+            bail!("sanitized reviewer view directory identity changed");
+        }
+        if collect_sanitized_view_selection(repository)? != self.selection {
+            bail!("sanitized reviewer index or worktree selection changed");
+        }
+        ReviewTreeReader::bind(&repository.worktree_root)?;
+        bail!("exact no-follow review snapshots are unsupported on this platform")
     }
 }
 
@@ -3093,6 +3114,7 @@ fn validate_sanitized_view_paths(selection: &SanitizedViewSelection) -> Result<(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn sanitized_view_parent_directories(
     entries: &BTreeMap<PathBuf, SnapshotTreeEntry>,
 ) -> Result<Vec<PathBuf>> {
@@ -3139,6 +3161,7 @@ fn validate_sanitized_view_symlinks(
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn sanitized_view_content_matches(
     expected: &SnapshotTreeEntry,
     observed: &SnapshotTreeEntry,
@@ -3178,6 +3201,7 @@ fn sanitized_view_content_matches(
     }
 }
 
+#[cfg(any(unix, test))]
 fn sanitized_view_binding(
     selection: &SanitizedViewSelection,
     directories: &BTreeMap<PathBuf, BoundReviewDirectory>,
@@ -3231,6 +3255,7 @@ fn sanitized_view_binding(
     Ok(domain_sha256(SANITIZED_REVIEW_VIEW_DOMAIN, &bytes))
 }
 
+#[cfg(any(unix, test))]
 fn validate_sanitized_view_entry_mode(entry: &SnapshotTreeEntry) -> Result<()> {
     let mode = match entry {
         SnapshotTreeEntry::Missing => return Ok(()),
@@ -3242,6 +3267,7 @@ fn validate_sanitized_view_entry_mode(entry: &SnapshotTreeEntry) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn collect_sanitized_view_paths(root: &SafeRoot) -> Result<BTreeSet<PathBuf>> {
     let reader = ReviewTreeReader::bind(root)?;
     #[cfg(target_os = "linux")]
@@ -3656,6 +3682,7 @@ fn shell_args_request_command(args: &[String]) -> bool {
         })
 }
 
+#[cfg(any(unix, test))]
 fn read_worktree_reviewer_program(
     repository: &ReviewRepositoryBinding,
     path: &Path,
@@ -3710,6 +3737,15 @@ fn read_worktree_reviewer_program(
             bail!("external reviewer program must be a bound no-follow regular file")
         }
     }
+}
+
+#[cfg(all(not(unix), not(test)))]
+fn read_worktree_reviewer_program(
+    repository: &ReviewRepositoryBinding,
+    _path: &Path,
+) -> Result<BoundReviewerProgramFile> {
+    ReviewTreeReader::bind(&repository.worktree_root)?;
+    bail!("exact no-follow review snapshots are unsupported on this platform")
 }
 
 fn read_absolute_reviewer_program(path: &Path) -> Result<BoundReviewerProgramFile> {
@@ -3885,6 +3921,7 @@ impl ReviewRepositoryBinding {
         Ok(profile)
     }
 
+    #[cfg(any(unix, test))]
     fn snapshot(&self) -> Result<ReviewRepoSnapshot> {
         self.verify()?;
         let repository = crate::git_repository::open(self.worktree_root.path())
@@ -4049,6 +4086,34 @@ impl ReviewRepositoryBinding {
             git_backlink,
             state_identity: self.state.identity(),
         })
+    }
+
+    #[cfg(all(not(unix), not(test)))]
+    fn snapshot(&self) -> Result<ReviewRepoSnapshot> {
+        self.verify()?;
+        let repository = crate::git_repository::open(self.worktree_root.path())
+            .context("failed to open bound review repository")?;
+        let (_head, _head_name) = match repository.head() {
+            Ok(head) => {
+                let name = head
+                    .name()
+                    .map(ToOwned::to_owned)
+                    .context("review HEAD name is not valid UTF-8")?;
+                (head.target().map(|oid| oid.to_string()), Some(name))
+            }
+            Err(error) if error.code() == git2::ErrorCode::UnbornBranch => (None, None),
+            Err(error) => return Err(error).context("failed to read review HEAD"),
+        };
+        let _head_symbolic_target = match repository.find_reference("HEAD") {
+            Ok(reference) => reference
+                .symbolic_target()
+                .context("review HEAD symbolic target is not valid UTF-8")?
+                .map(ToOwned::to_owned),
+            Err(error) if error.code() == git2::ErrorCode::NotFound => None,
+            Err(error) => return Err(error).context("failed to read review HEAD backlink"),
+        };
+        ReviewTreeReader::bind(&self.git_dir_root)?;
+        bail!("exact no-follow review snapshots are unsupported on this platform")
     }
 }
 

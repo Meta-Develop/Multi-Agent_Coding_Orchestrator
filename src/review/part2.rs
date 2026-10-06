@@ -78,6 +78,7 @@ fn bind_review_state(common_root: &SafeRoot) -> Result<ReviewStateBinding> {
     })
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Default, Clone, Copy)]
 struct SnapshotPathOrigin {
     tracked: bool,
@@ -85,6 +86,7 @@ struct SnapshotPathOrigin {
     ignored: bool,
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 enum SnapshotTreeEntry {
     Missing,
@@ -109,6 +111,7 @@ enum SnapshotTreeEntry {
     },
 }
 
+#[cfg(any(unix, test))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundReviewDirectory {
     mode: u32,
@@ -119,6 +122,7 @@ struct BoundReviewDirectory {
     changed_nanoseconds: i64,
 }
 
+#[cfg(any(unix, test))]
 impl SnapshotTreeEntry {
     fn append_canonical(&self, output: &mut Vec<u8>) {
         match self {
@@ -176,6 +180,7 @@ impl SnapshotTreeEntry {
     }
 }
 
+#[cfg(any(unix, test))]
 fn append_file_generation(
     output: &mut Vec<u8>,
     identity: &FileIdentity,
@@ -196,6 +201,7 @@ fn append_file_generation(
 struct ReviewTreeReader {
     #[cfg(unix)]
     root: File,
+    #[cfg(any(unix, test))]
     identity: FileIdentity,
 }
 
@@ -231,6 +237,7 @@ impl ReviewTreeReader {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn verify(&self, root: &SafeRoot) -> Result<()> {
         root.verify()
             .map_err(|_| anyhow::anyhow!("review worktree root changed"))?;
@@ -252,6 +259,7 @@ impl ReviewTreeReader {
         bail!("exact no-follow review snapshots are unsupported on this platform")
     }
 
+    #[cfg(any(unix, test))]
     fn snapshot_directory(&self, path: &Path) -> Result<BoundReviewDirectory> {
         validate_snapshot_relative_path(path)?;
         #[cfg(unix)]
@@ -296,6 +304,7 @@ impl ReviewTreeReader {
         bail!("exact no-follow review directories are unsupported on this platform")
     }
 
+    #[cfg(any(unix, test))]
     fn prewalk(&self) -> Result<()> {
         #[cfg(target_os = "linux")]
         {
@@ -319,6 +328,7 @@ impl ReviewTreeReader {
         bail!("bounded descriptor review prewalk is unsupported on this platform")
     }
 
+    #[cfg(any(unix, test))]
     fn snapshot_entry(
         &self,
         path: &Path,
@@ -448,6 +458,7 @@ impl ReviewTreeReader {
         }
     }
 
+    #[cfg(any(unix, test))]
     fn snapshot_git_backlink(&self) -> Result<GitBacklinkSnapshot> {
         #[cfg(unix)]
         {
@@ -751,6 +762,7 @@ fn validate_snapshot_relative_path(path: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(any(unix, test))]
 fn validate_git_reference_path(reference: &str) -> Result<()> {
     if reference.len() > REVIEW_PATH_LIMIT_BYTES || !reference.starts_with("refs/") {
         bail!("review HEAD reference path is not canonical");
@@ -759,6 +771,7 @@ fn validate_git_reference_path(reference: &str) -> Result<()> {
         .context("review HEAD reference path is not canonical")
 }
 
+#[cfg(any(unix, test))]
 fn snapshot_regular_entry_digest(
     reader: &ReviewTreeReader,
     path: &Path,
@@ -784,6 +797,7 @@ fn snapshot_regular_entry_digest(
     }
 }
 
+#[cfg(any(unix, test))]
 fn append_snapshot_bytes(output: &mut Vec<u8>, bytes: &[u8]) -> Result<()> {
     let length = u32::try_from(bytes.len()).context("review snapshot field length overflow")?;
     output.extend_from_slice(&length.to_be_bytes());

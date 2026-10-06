@@ -1,5 +1,71 @@
 use super::*;
 
+#[test]
+fn snapshot_tree_entry_serialization_and_canonical_vectors_preserve_complete_schema() -> Result<()> {
+    for (entry, expected_json, expected_canonical, expected_sha256) in [
+        (
+            SnapshotTreeEntry::Missing,
+            r#""Missing""#,
+            vec![
+                0x00,
+            ],
+            "6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d",
+        ),
+        (
+            SnapshotTreeEntry::Regular {
+                mode: 0o100644,
+                length: 3,
+                sha256: [0xab; 32],
+                identity: FileIdentity { device: 1, file: 2 },
+                modified_seconds: 3,
+                modified_nanoseconds: 4,
+                changed_seconds: 5,
+                changed_nanoseconds: 6,
+            },
+            r#"{"Regular":{"mode":33188,"length":3,"sha256":[171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171,171],"identity":{"device":1,"file":2},"modified_seconds":3,"modified_nanoseconds":4,"changed_seconds":5,"changed_nanoseconds":6}}"#,
+            vec![
+                0x01, 0x00, 0x00, 0x81, 0xa4, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x03, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab,
+                0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0xab, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x00, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x05, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x06,
+            ],
+            "2234f7ad332cf35199d0f637f4b5ca881045c4272bf57fb2758e31786ec8c9b1",
+        ),
+        (
+            SnapshotTreeEntry::Symlink {
+                mode: 0o120777,
+                target: b"dst".to_vec(),
+                identity: FileIdentity { device: 7, file: 8 },
+                modified_seconds: 9,
+                modified_nanoseconds: 10,
+                changed_seconds: 11,
+                changed_nanoseconds: 12,
+            },
+            r#"{"Symlink":{"mode":41471,"target":[100,115,116],"identity":{"device":7,"file":8},"modified_seconds":9,"modified_nanoseconds":10,"changed_seconds":11,"changed_nanoseconds":12}}"#,
+            vec![
+                0x02, 0x00, 0x00, 0xa1, 0xff, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+                0x03, 0x64, 0x73, 0x74, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x07,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x09, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0a,
+                0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x0b, 0x00, 0x00, 0x00, 0x00,
+                0x00, 0x00, 0x00, 0x0c,
+            ],
+            "87ce2546ee4c86fd60872a14d7735cd124adf27054a1696f08f2a9ca3b1b4789",
+        ),
+    ] {
+        assert_eq!(serde_json::to_string(&entry)?, expected_json);
+        let mut canonical = Vec::new();
+        entry.append_canonical(&mut canonical);
+        assert_eq!(canonical, expected_canonical);
+        assert_eq!(sha256_hex(&canonical), expected_sha256);
+    }
+    Ok(())
+}
+
 fn model_review_lens(
     id: &str,
     backend_id: &str,
