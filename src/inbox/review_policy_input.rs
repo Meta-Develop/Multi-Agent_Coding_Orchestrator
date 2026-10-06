@@ -19,6 +19,7 @@ use std::path::Path;
 #[cfg(unix)]
 use std::{fs, path::Component};
 
+#[cfg(unix)]
 const REVIEW_POLICY_INPUT_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -58,15 +59,18 @@ impl std::fmt::Display for ReviewPolicyRepositoryMismatch {
 
 impl std::error::Error for ReviewPolicyRepositoryMismatch {}
 
+#[cfg(unix)]
 #[derive(Debug)]
 pub(super) struct ReviewPolicyFileMissing;
 
+#[cfg(unix)]
 impl std::fmt::Display for ReviewPolicyFileMissing {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         formatter.write_str("operator review-policy file is missing")
     }
 }
 
+#[cfg(unix)]
 impl std::error::Error for ReviewPolicyFileMissing {}
 
 impl BoundReviewPolicy {
