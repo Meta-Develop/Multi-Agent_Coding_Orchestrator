@@ -3,6 +3,7 @@
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
+#[cfg(any(target_os = "linux", test))]
 use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 
