@@ -1,6 +1,6 @@
 #[cfg(target_os = "linux")]
 use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 #[cfg(test)]
 use crate::review::{build_review_lens_request, ReviewLensRequestSources};
