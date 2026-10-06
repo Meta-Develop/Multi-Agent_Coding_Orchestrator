@@ -3271,7 +3271,9 @@ fn recover_remove_operation(
             }
             if let Some(target) = current_target.as_ref() {
                 match target_liveness(target) {
+                    #[cfg(target_os = "linux")]
                     WorktreeTargetLiveness::Clear => {}
+                    #[cfg(target_os = "linux")]
                     WorktreeTargetLiveness::Live(evidence) => bail!(
                         "pending removal '{}' refused target liveness state=live before quarantine: {}",
                         operation.name,

@@ -2684,7 +2684,9 @@ fn target_identity_changed_evidence() -> WorktreeTargetLivenessEvidence {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum WorktreeTargetLiveness {
+    #[cfg(target_os = "linux")]
     Clear,
+    #[cfg(target_os = "linux")]
     Live(WorktreeTargetLivenessEvidence),
     Unknown(WorktreeTargetLivenessEvidence),
 }
@@ -2697,7 +2699,9 @@ where
     F: Fn(&WorktreeGcTarget) -> WorktreeTargetLiveness,
 {
     match target_liveness(target) {
+        #[cfg(target_os = "linux")]
         WorktreeTargetLiveness::Clear => None,
+        #[cfg(target_os = "linux")]
         WorktreeTargetLiveness::Live(evidence) => Some((WorktreeGcReason::LiveTarget, evidence)),
         WorktreeTargetLiveness::Unknown(evidence) => {
             Some((WorktreeGcReason::TargetLivenessUnknown, evidence))
