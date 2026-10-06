@@ -3349,7 +3349,7 @@ pub(crate) struct AutopilotSourceDispatchBinding<'a> {
     pub(crate) expected_head: Option<Oid>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilot(
     options: SupervisorRunOptions,
     outer_command_run_id: &RunId,
@@ -3392,7 +3392,7 @@ pub(crate) fn run_supervisor_plan_file_cascade_with_runner_and_gate_for_autopilo
     )
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 #[allow(clippy::too_many_arguments)]
 fn run_supervisor_plan_file_cascade_with_cancellable_runner_and_gate(
     options: SupervisorRunOptions,

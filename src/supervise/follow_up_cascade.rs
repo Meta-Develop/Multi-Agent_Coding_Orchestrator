@@ -31,7 +31,7 @@ pub(super) struct FollowUpCascadeInvocation<'a> {
 #[derive(Clone, Copy)]
 pub(super) enum FollowUpRuntimeCatalog {
     Production,
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     Injected,
 }
 
@@ -953,7 +953,7 @@ fn run_follow_up_supervisor_loaded_plan(
             admit_production_supervisor_catalog_preflight_grant(&options, &repo)
                 .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant))
         }
-        #[cfg(test)]
+        #[cfg(all(test, target_os = "linux"))]
         FollowUpRuntimeCatalog::Injected => {
             Ok(test_runtime_model_catalog(&loaded.plan, options.runtime)?)
         }
