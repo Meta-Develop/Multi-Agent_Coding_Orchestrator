@@ -191,12 +191,12 @@ thread_local! {
         std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_agent_protected_stage_hook(hook: impl FnMut(AgentProtectedStage) + 'static) {
     AGENT_PROTECTED_STAGE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn clear_agent_protected_stage_hook() {
     AGENT_PROTECTED_STAGE_HOOK.with(|slot| *slot.borrow_mut() = None);
 }
@@ -216,7 +216,7 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn set_agent_claim_timing_for_test(timing: crate::sync_store::ClaimTiming) {
     AGENT_CLAIM_TIMING.with(|slot| *slot.borrow_mut() = Some(timing));
 }
@@ -1343,12 +1343,15 @@ fn display_paths(paths: &[PathBuf]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use crate::llm::{LlmProvider, LlmRequest, LlmResponse, ProviderCapabilities};
     use crate::llm::{
-        FakeOutcome, FakeProvider, LlmProvider, LlmRequest, LlmResponse, ProposedCommand,
-        ProposedPatch, ProviderCapabilities, ProviderError, WorkProposal,
+        FakeOutcome, FakeProvider, ProposedCommand, ProposedPatch, ProviderError, WorkProposal,
     };
+    #[cfg(unix)]
     use crate::sync_store::ClaimTiming;
     use git2::{Oid, Signature};
+    #[cfg(unix)]
     use std::{io::Read, sync::mpsc, thread};
     use tempfile::TempDir;
 
@@ -1839,8 +1842,10 @@ diff --git a/README.md b/README.md
         Ok(())
     }
 
+    #[cfg(unix)]
     struct PanicOnCompleteProvider;
 
+    #[cfg(unix)]
     impl LlmProvider for PanicOnCompleteProvider {
         fn provider_id(&self) -> &str {
             "panic-provider"
@@ -1858,11 +1863,13 @@ diff --git a/README.md b/README.md
         }
     }
 
+    #[cfg(unix)]
     struct DetachHeadOnComplete {
         inner: FakeProvider,
         worktree_path: PathBuf,
     }
 
+    #[cfg(unix)]
     impl LlmProvider for DetachHeadOnComplete {
         fn provider_id(&self) -> &str {
             self.inner.provider_id()
@@ -1890,6 +1897,7 @@ diff --git a/README.md b/README.md
         }
     }
 
+    #[cfg(unix)]
     fn default_agent_options(repo: PathBuf, agent_id: &str) -> AgentRunOptions {
         AgentRunOptions {
             repo,
@@ -1906,6 +1914,7 @@ diff --git a/README.md b/README.md
         }
     }
 
+    #[cfg(unix)]
     fn exclusive_same_worktree_ops_refused(manager: &WorktreeManager, agent_id: &str) {
         let write_err = manager
             .acquire_write_execution_lease(agent_id)

@@ -1793,14 +1793,14 @@ thread_local! {
         std::cell::RefCell<Option<Box<dyn FnOnce()>>> = std::cell::RefCell::new(None);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn set_after_retention_preflight_hook(hook: impl FnOnce() + 'static) {
     AFTER_RETENTION_PREFLIGHT_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn set_before_recovery_mutation_hook(hook: impl FnOnce() + 'static) {
     BEFORE_RECOVERY_MUTATION_HOOK.with(|slot| {
         *slot.borrow_mut() = Some(Box::new(hook));

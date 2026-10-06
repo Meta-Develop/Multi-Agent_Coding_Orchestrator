@@ -1382,7 +1382,7 @@ impl AssignmentProcessLaunchGrant {
         self.model.as_deref()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn nonce(&self) -> u64 {
         self.nonce
     }
@@ -1434,13 +1434,13 @@ impl AssignmentProcessLaunchGrant {
         })
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn without_mechanical_executor_for_test(mut self) -> Self {
         self.mechanical_executor = None;
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn tamper_mechanical_executor_for_test(
         mut self,
         duty: SealedMechanicalExecutorDuty,
@@ -1498,7 +1498,7 @@ impl AssignmentProcessLaunchGrant {
         self
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn seal_independently_verified_canonical_program_for_test(
         self,
         independently_verified_canonical_program: &Path,

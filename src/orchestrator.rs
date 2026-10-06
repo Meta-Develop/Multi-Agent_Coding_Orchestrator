@@ -116,6 +116,7 @@ static CHECKPOINT_EVENT_FAILURE_HOOK: std::sync::OnceLock<
 
 #[cfg(test)]
 struct ReadyWaveIdentityDriftHook {
+    #[cfg(unix)]
     installation_id: u64,
     owner_repo: PathBuf,
     reached: std::sync::mpsc::SyncSender<()>,
@@ -129,6 +130,7 @@ static READY_WAVE_IDENTITY_DRIFT_HOOKS: std::sync::OnceLock<
 
 #[cfg(test)]
 struct ReadyWavePatchWriteHook {
+    #[cfg(unix)]
     installation_id: u64,
     owner_repo: PathBuf,
     agent_id: String,
@@ -151,6 +153,7 @@ thread_local! {
 
 #[cfg(test)]
 struct ReadyAgentSpawnPanicHook {
+    #[cfg(unix)]
     installation_id: u64,
     owner_repo: PathBuf,
     agent_id: String,
@@ -161,10 +164,10 @@ static READY_AGENT_SPAWN_PANIC_HOOKS: std::sync::OnceLock<
     std::sync::Mutex<Vec<ReadyAgentSpawnPanicHook>>,
 > = std::sync::OnceLock::new();
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 static READY_WAVE_HOOK_INSTALLATION_SEQ: AtomicU64 = AtomicU64::new(1);
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_ready_agent_setup_fault(agent_id: impl Into<String>) {
     READY_AGENT_SETUP_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
 }
@@ -181,7 +184,7 @@ fn take_ready_agent_setup_fault(agent_id: &str) -> bool {
     })
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_ready_agent_post_spawn_fault(agent_id: impl Into<String>) {
     READY_AGENT_POST_SPAWN_FAULT.with(|slot| *slot.borrow_mut() = Some(agent_id.into()));
 }
@@ -219,7 +222,7 @@ fn ready_wave_hook_owner_matches(installed_key: &Path, consumer: &Path) -> bool 
         || ready_wave_hook_owner_key(installed_key) == consumer_key
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn next_ready_wave_hook_installation_id() -> u64 {
     READY_WAVE_HOOK_INSTALLATION_SEQ.fetch_add(1, Ordering::Relaxed)
 }
@@ -233,7 +236,7 @@ fn lock_ready_wave_hooks<T>(
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn set_ready_agent_spawn_panic(owner_repo: &Path, agent_id: impl Into<String>) -> u64 {
     let agent_id = agent_id.into();
     let owner_repo = ready_wave_hook_owner_key(owner_repo);
@@ -273,7 +276,7 @@ fn panic_if_ready_agent_spawn_injected(owner_repo: &Path, agent_id: &str) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn uninstall_ready_wave_test_hooks(installation_ids: &[u64]) {
     if installation_ids.is_empty() {
         return;
@@ -3660,7 +3663,7 @@ fn protected_wave_indices(summaries: &[AgentRunSummary], ready: &[usize]) -> Vec
 /// Production ready waves use `revalidate_ready_wave`. This helper stays
 /// test-valid so the isolated negative control can execute the old
 /// drop-before-spawn lifetime.
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn revalidate_ready_agent(
     agent: &AgentPlan,
     summary: &AgentRunSummary,
@@ -3682,7 +3685,7 @@ fn revalidate_ready_agent(
     .with_context(|| format!("pre-mutation revalidation failed for agent '{}'", agent.id))
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_ready_wave_identity_drift_hook(
     owner_repo: &Path,
 ) -> (
@@ -3725,7 +3728,7 @@ fn fire_ready_wave_identity_drift_hook(repo: &Path) {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_ready_wave_patch_write_hook(
     owner_repo: &Path,
     agent_id: &str,
@@ -3802,7 +3805,7 @@ impl Drop for ReadyWavePatchWriteBarrier {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn install_candidate_boundary_failure_hook(
     agent_id: &str,
 ) -> (

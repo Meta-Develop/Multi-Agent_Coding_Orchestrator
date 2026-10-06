@@ -334,7 +334,7 @@ impl ExternalAgentCommand {
         });
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn live_token_grant_for_test(
         &self,
     ) -> Option<&crate::supervise_budget::LiveTokenGrant> {

@@ -720,7 +720,7 @@ fn set_after_autopilot_safety_hook(hook: impl FnMut() + 'static) {
     AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn clear_autopilot_test_hooks() {
     AUTOPILOT_PROFILE_CALLSITE_HOOK.with(|slot| *slot.borrow_mut() = None);
     AFTER_AUTOPILOT_SAFETY_HOOK.with(|slot| *slot.borrow_mut() = None);

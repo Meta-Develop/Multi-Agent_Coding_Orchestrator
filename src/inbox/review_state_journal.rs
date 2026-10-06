@@ -567,7 +567,9 @@ pub(super) fn advance_with_verified_dispositions(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use super::*;
+    #[cfg(unix)]
     use crate::{
         inbox::review_loop::{
             DispositionDecision, RequiredCheck, ReviewFeedbackIdentity, TrustedActorBinding,
@@ -581,12 +583,15 @@ mod tests {
         },
         worktree::WorktreeManager,
     };
+    #[cfg(unix)]
     use tempfile::TempDir;
 
+    #[cfg(unix)]
     fn object(kind: ProviderObjectKind, id: &str) -> ProviderObjectId {
         ProviderObjectId::new("github", kind, id).unwrap()
     }
 
+    #[cfg(unix)]
     fn fixture() -> (
         TempDir,
         std::path::PathBuf,
@@ -634,6 +639,7 @@ mod tests {
     }
 
     // Test fixtures expose the two clocks and each independent provider state explicitly.
+    #[cfg(unix)]
     #[allow(clippy::too_many_arguments)]
     fn observe_provider(
         provider_observed_at: &str,
@@ -716,6 +722,7 @@ mod tests {
         FrozenReviewSnapshot::observe(&transport, &item, collection_started_at).unwrap()
     }
 
+    #[cfg(unix)]
     fn ts(value: &str) -> ForgeTimestamp {
         ForgeTimestamp::new(value).unwrap()
     }
@@ -1168,6 +1175,7 @@ mod tests {
         assert!(super::observe(&repo, &rescan, &policy, &collection_t3).is_err());
     }
 
+    #[cfg(unix)]
     fn trusted_identity(human: &ForgeActor) -> TrustedActorIdentity {
         TrustedActorIdentity::new(
             human.provider_actor_id().clone(),
@@ -1177,10 +1185,12 @@ mod tests {
         .unwrap()
     }
 
+    #[cfg(unix)]
     fn blocking_feedback_identity() -> ReviewFeedbackIdentity {
         ReviewFeedbackIdentity::review(object(ProviderObjectKind::Review, "review:blocking"))
     }
 
+    #[cfg(unix)]
     fn addressed_disposition(
         snapshot: &FrozenReviewSnapshot,
         human: &ForgeActor,

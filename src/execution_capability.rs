@@ -54,12 +54,17 @@ impl EffectfulExecutionCapability {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
     use anyhow::{Context, Result};
+    #[cfg(target_os = "linux")]
     use git2::{Repository, Signature};
+    #[cfg(target_os = "linux")]
     use std::fs;
+    #[cfg(target_os = "linux")]
     use std::path::Path;
     use tempfile::TempDir;
 
+    #[cfg(target_os = "linux")]
     fn commit_readme(repo: &Repository) -> Result<git2::Oid> {
         let workdir = repo.workdir().context("test repo must have workdir")?;
         fs::write(workdir.join("README.md"), "# Test\n").context("write README")?;
@@ -83,6 +88,7 @@ mod tests {
         .context("commit")
     }
 
+    #[cfg(target_os = "linux")]
     fn clean_repo(temp: &TempDir) -> Result<(std::path::PathBuf, WorktreeManager)> {
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main")?;

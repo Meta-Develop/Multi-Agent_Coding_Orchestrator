@@ -609,7 +609,9 @@ mod tests {
     use super::*;
     use crate::orchestrator::RunId;
     use git2::{Repository, Signature};
-    use std::{fs, process::Command};
+    use std::fs;
+    #[cfg(target_os = "linux")]
+    use std::process::Command;
 
     fn test_repo() -> (tempfile::TempDir, PathBuf) {
         let temp = tempfile::tempdir().expect("tempdir");
@@ -772,6 +774,7 @@ mod tests {
         assert!(operator_summary_exists(writer.run_dir()));
     }
 
+    #[cfg(target_os = "linux")]
     fn spawn_sleep() -> std::process::Child {
         Command::new("sleep")
             .arg("60")

@@ -802,27 +802,27 @@ thread_local! {
         const { std::cell::Cell::new(0) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) {
     let _ = replace_injected_trusted_codex_executable_for_test(path);
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 fn replace_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
     INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.replace(path))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn set_injected_codex_auth_home_for_test(home: Option<PathBuf>) -> Option<PathBuf> {
     INJECTED_CODEX_AUTH_HOME.with(|injected| injected.replace(home))
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn codex_runtime_model_catalog_process_launch_attempts_for_test() -> usize {
     CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS.with(std::cell::Cell::get)
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn reset_codex_runtime_model_catalog_process_launch_attempts_for_test() {
     CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS.with(|attempts| attempts.set(0));
 }
