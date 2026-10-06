@@ -1,6 +1,7 @@
+#[cfg(target_os = "linux")]
+use crate::artifacts::state_auth::sha256_hex;
 use crate::{
     agent_lifecycle::process_start_time,
-    artifacts::state_auth::sha256_hex,
     safe_state::{
         stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity, KernelStateLock,
         SafeRoot,
@@ -8,14 +9,18 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
+#[cfg(target_os = "linux")]
+use std::{
+    fs::{File, OpenOptions},
+    io::Write,
+    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
+};
 use std::{
     cmp::Ordering,
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
-    fs::{self, File, OpenOptions},
-    io::Write,
+    fs,
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering as AtomicOrdering},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -57,6 +62,7 @@ const CLAIM_FALLBACK_RESIDUE_PREFIX: &str = ".maco-live-old-v1.";
 #[cfg(target_os = "linux")]
 const CLAIM_FALLBACK_RESIDUE_SUFFIX: &str = ".txn";
 
+#[cfg(target_os = "linux")]
 static CLAIM_TEMP_COUNTER: AtomicU64 = AtomicU64::new(1);
 
 /// Boot-scoped identity for the MACO process that acquired a durable path claim.
@@ -669,6 +675,7 @@ struct ClaimBoardSnapshot {
     entries: BTreeMap<OsString, ClaimFileGeneration>,
 }
 
+#[cfg(target_os = "linux")]
 fn verify_claim_board_replacement(
     before: &ClaimBoardSnapshot,
     after: &ClaimBoardSnapshot,
