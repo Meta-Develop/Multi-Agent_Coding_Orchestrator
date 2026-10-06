@@ -497,6 +497,7 @@ fn record_grok_credential_environment_failure(
     );
 }
 
+#[cfg(target_os = "linux")]
 fn insert_admitted_grok_home_environment(
     environment: &mut BTreeMap<String, String>,
     credentials: &AdmittedGrokCredentials,
@@ -772,6 +773,7 @@ pub(crate) fn resolve_trusted_system_codex_executable_for_catalog(
 
 /// Refuse when logical `codex` resolution no longer matches the canonical
 /// executable sealed into the supervisor catalog preflight grant.
+#[cfg(target_os = "linux")]
 pub(crate) fn supervisor_catalog_preflight_refuse_sealed_executable_resolution_drift(
     grant: &SupervisorCatalogCodexPreflightGrant,
     resolver_search_base: &Path,

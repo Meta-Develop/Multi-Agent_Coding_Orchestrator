@@ -42,7 +42,9 @@ use crate::runtime_adapter::{
     AdapterId, LaunchContext, RuntimeAdapterConfig, RuntimeId, SideEffectConfinement, TypedRuntime,
     TypedRuntimeContract, WritableLaunchTarget,
 };
-use crate::safe_state::{unsigned_to_u32, ReservedDirectory};
+#[cfg(unix)]
+use crate::safe_state::unsigned_to_u32;
+use crate::safe_state::ReservedDirectory;
 use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
@@ -84,6 +86,7 @@ pub use crate::protected_path::SandboxDenialRetryability;
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_TEE_LIMIT_BYTES: usize = 8 * 1024 * 1024;
 const MAX_PROMPT_BYTES: usize = 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_WORKER_JOURNAL_ARTIFACT_BYTES: usize = 1024 * 1024;
 const CODEX_MODEL_CATALOG_MAX_BYTES: usize = 8 * 1024 * 1024;
 const CODEX_MODEL_CATALOG_MAX_MODELS: usize = 512;
@@ -948,6 +951,7 @@ pub struct EnvironmentFailure {
 }
 
 impl EnvironmentFailure {
+    #[cfg(any(target_os = "linux", test))]
     pub(crate) fn sandbox_unavailable(summary: String) -> Self {
         environment_failure(
             EnvironmentFailureCategory::SandboxUnavailable,
@@ -2327,6 +2331,7 @@ impl AdmittedGrokCredentials {
         })
     }
 
+    #[cfg(target_os = "linux")]
     fn grok_home_environment(&self) -> Result<&str> {
         #[cfg(target_os = "linux")]
         {
