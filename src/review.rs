@@ -65,6 +65,7 @@ const REVIEW_SNAPSHOT_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 const REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
 #[cfg(unix)]
 const REVIEW_SYMLINK_LIMIT_BYTES: usize = 4 * 1024;
+#[cfg(target_os = "linux")]
 const REVIEW_PREWALK_MAX_DEPTH: usize = 128;
 #[cfg(target_os = "linux")]
 const REVIEW_PREWALK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -3081,6 +3082,7 @@ fn validate_sanitized_changed_paths(paths: &[PathBuf]) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn validate_sanitized_view_paths(selection: &SanitizedViewSelection) -> Result<()> {
     let mut folded = BTreeMap::<Vec<u8>, PathBuf>::new();
     let mut materialized = BTreeSet::<PathBuf>::new();
