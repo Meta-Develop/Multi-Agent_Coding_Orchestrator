@@ -1,13 +1,14 @@
 use anyhow::{Context, Result};
+#[cfg(target_os = "linux")]
 use git2::{Oid, Repository, Signature};
+#[cfg(target_os = "linux")]
 use serde_json::Value;
-use std::{
-    fs,
-    path::{Path, PathBuf},
-    process::Command,
-};
+#[cfg(target_os = "linux")]
+use std::path::PathBuf;
+use std::{fs, path::Path, process::Command};
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
 mod support;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
@@ -249,6 +250,7 @@ fn role_category_cli_stamps_stores_and_refuses_weak_coordinator() -> Result<()> 
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn write_plan(path: &Path, model: Option<&str>) -> Result<()> {
     let mut plan = serde_json::json!({
         "version": 1,
@@ -274,6 +276,7 @@ fn write_plan(path: &Path, model: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn read_plan_snapshot(repo: &Path, run_id: &str) -> Result<Value> {
     let path = repo
         .join(".maco/o2/runs")
@@ -286,6 +289,7 @@ fn read_plan_snapshot(repo: &Path, run_id: &str) -> Result<Value> {
     .context("parse stored supervisor plan snapshot")
 }
 
+#[cfg(target_os = "linux")]
 fn run_json(args: &[&str]) -> Result<Value> {
     let output = command_with_test_machine_global_binding(BIN, args)
         .output()
@@ -299,6 +303,7 @@ fn run_json(args: &[&str]) -> Result<Value> {
     })
 }
 
+#[cfg(target_os = "linux")]
 fn run_success_json(args: &[&str]) -> Result<Value> {
     let output = command_with_test_machine_global_binding(BIN, args)
         .output()
@@ -313,6 +318,7 @@ fn run_success_json(args: &[&str]) -> Result<Value> {
     serde_json::from_slice(&output.stdout).context("parse success JSON")
 }
 
+#[cfg(target_os = "linux")]
 fn command_with_test_machine_global_binding(bin: impl AsRef<Path>, args: &[&str]) -> Command {
     let mut command = Command::new(bin.as_ref());
     command.args(args);
@@ -359,11 +365,13 @@ fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
     Ok(config)
 }
 
+#[cfg(target_os = "linux")]
 #[cfg(not(target_os = "linux"))]
 fn write_test_machine_global_config(repo: &Path) -> Result<PathBuf> {
     Ok(repo.join("unsupported-machine-global-config"))
 }
 
+#[cfg(target_os = "linux")]
 fn create_committed_repo(root: &Path) -> Result<PathBuf> {
     let repo_path = root.join("repo");
     let output = Command::new(BIN)
@@ -384,6 +392,7 @@ fn create_committed_repo(root: &Path) -> Result<PathBuf> {
     Ok(repo_path)
 }
 
+#[cfg(target_os = "linux")]
 fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
