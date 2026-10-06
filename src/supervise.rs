@@ -476,6 +476,7 @@ const LOCAL_RUNTIME_ROOTS: &[&[u8]] = &[
     b".agents/storage",
     b".agents/live",
 ];
+#[cfg(unix)]
 const MANDATORY_WORKTREE_DIRECTORY_CONTROLS: &[&str] =
     &[".maco", ".maco-cache", ".codex", ".agents"];
 const PERMANENT_WORKTREE_CONTROL_ROOTS: &[&str] = &[".git", ".maco", ".maco-cache", ".codex"];
