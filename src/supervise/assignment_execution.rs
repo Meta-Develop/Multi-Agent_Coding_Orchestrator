@@ -1599,7 +1599,7 @@ pub(super) struct ParentContinuationLaunch<'evidence> {
     _held_workers: Vec<&'evidence nested_worker_executor::NestedWorkerAttemptEvidence>,
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 const MAX_PARENT_CONTINUATION_BYTES: usize = 64 * 1024;
 
 impl<'evidence> ParentContinuationLaunch<'evidence> {
