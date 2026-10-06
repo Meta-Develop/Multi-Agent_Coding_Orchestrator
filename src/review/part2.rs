@@ -29,6 +29,7 @@ impl ReviewStateBinding {
         Ok(())
     }
 
+    #[cfg(any(unix, test))]
     fn identity(&self) -> Option<FileIdentity> {
         match self {
             Self::Bound { state_root, .. } => Some(state_root.identity().clone()),

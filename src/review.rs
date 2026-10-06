@@ -2,6 +2,8 @@
 use crate::process_runner::trusted_linux_runtime_root;
 #[cfg(any(unix, test))]
 use crate::safe_state::unsigned_to_u32;
+#[cfg(any(unix, test))]
+use crate::safe_state::BoundedRegularReader;
 #[cfg(unix)]
 use crate::safe_state::{device_id_to_u64, unsigned_to_u64};
 use crate::{
@@ -11,9 +13,7 @@ use crate::{
         run_process, EnvironmentMode, ProcessOutput, ProcessSpec, SideEffectConfinementProfile,
         StdinMode, StrictOfflineWorkspaceProfile,
     },
-    safe_state::{
-        remove_direct_child_tree, BoundedRegularReader, FileIdentity, SafeRoot, TreeLinkPolicy,
-    },
+    safe_state::{remove_direct_child_tree, FileIdentity, SafeRoot, TreeLinkPolicy},
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
@@ -60,6 +60,7 @@ const REVIEW_TARGET_LIMIT_BYTES: usize = 512;
 const REVIEW_SHORT_TEXT_LIMIT_BYTES: usize = 256;
 const REVIEW_LONG_TEXT_LIMIT_BYTES: usize = 32 * 1024;
 const REVIEW_SNAPSHOT_ENTRY_LIMIT: usize = 32 * 1024;
+#[cfg(any(unix, test))]
 const REVIEW_SNAPSHOT_FILE_LIMIT_BYTES: u64 = 32 * 1024 * 1024;
 #[cfg(unix)]
 const REVIEW_SNAPSHOT_TOTAL_LIMIT_BYTES: u64 = 256 * 1024 * 1024;
