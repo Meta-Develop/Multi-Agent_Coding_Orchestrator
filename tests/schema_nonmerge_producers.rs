@@ -369,6 +369,7 @@ fn run_json_in<const N: usize>(working: &Path, args: [&str; N]) -> Result<Value>
     serde_json::from_slice(&output.stdout).context("parse production CLI JSON")
 }
 
+#[cfg(unix)]
 fn run_json_refusal_in<const N: usize>(working: &Path, args: [&str; N]) -> Result<Value> {
     let output = Command::new(BIN)
         .current_dir(working)
@@ -386,6 +387,7 @@ fn run_json_refusal_in<const N: usize>(working: &Path, args: [&str; N]) -> Resul
     })
 }
 
+#[cfg(unix)]
 fn load_fixture_schema_id(name: &str) -> Result<Value> {
     let schema = serde_json::from_slice::<Value>(
         &fs::read(repo_root().join("schemas").join(name))
