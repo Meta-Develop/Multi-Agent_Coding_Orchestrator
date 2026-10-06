@@ -631,7 +631,7 @@ fn recover_remote_binding_secret_temp_link(path: &Path) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 fn is_remote_binding_secret_temp_name(name: &str) -> bool {
     let prefix = format!(".{REMOTE_BINDING_SECRET_FILE}-");
     let Some(stem) = name
