@@ -59,6 +59,8 @@ fn windows_job_child_fixture() {
     std::io::stdin()
         .read_to_string(&mut input)
         .expect("read fixture stdin");
+    fs::write(report.with_extension("stdin-complete"), b"stdin-complete")
+        .expect("publish fixture stdin completion");
     assert_eq!(input, "fixture-input\n");
     println!("fixture-stdout");
     eprintln!("fixture-stderr");
@@ -216,6 +218,10 @@ fn windows_job_launch_is_windowless_and_preserves_captured_stdio() {
         .write_all(b"fixture-input\n")
         .expect("write input");
     assert!(wait_for_fixture_exit(&mut child.0).success());
+    assert_eq!(
+        fs::read(report.with_extension("stdin-complete")).expect("read fixture stdin completion"),
+        b"stdin-complete"
+    );
     let cleanup = tree.cleanup(&mut child.0, true, "Windows Job fixture", "normal exit");
     assert!(cleanup.error.is_none(), "{:?}", cleanup.error);
     assert_eq!(
@@ -260,8 +266,19 @@ fn windows_job_close_terminates_the_owned_child() {
     assert_windowless_report(&report, &mut child.0);
     assert!(child.0.try_wait().expect("poll blocked child").is_none());
     // Keep stdin open: only closing the non-inherited Job should release this wait.
+    let stdin = child.0.stdin.take().expect("stdin pipe");
+    assert!(
+        !report.with_extension("stdin-complete").exists(),
+        "fixture must still be blocked on stdin before Job close"
+    );
     drop(tree);
-    assert!(!wait_for_fixture_exit(&mut child.0).success());
+    let status = wait_for_fixture_exit(&mut child.0);
+    eprintln!("fixture-job-close-exit-status: {status}");
+    assert!(
+        !report.with_extension("stdin-complete").exists(),
+        "fixture returned from stdin instead of being terminated by Job close"
+    );
+    drop(stdin);
 }
 
 #[test]
