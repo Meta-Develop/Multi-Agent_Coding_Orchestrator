@@ -17,15 +17,18 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use serde::{de::Error as _, Deserialize, Deserializer, Serialize, Serializer};
+#[cfg(unix)]
+use std::{fs::File, io::Read};
+#[cfg(target_os = "linux")]
+use std::time::Instant;
 use std::{
     collections::{BTreeMap, BTreeSet},
     ffi::{OsStr, OsString},
     fmt,
-    fs::File,
-    io::{Read, Write},
+    io::Write,
     path::{Path, PathBuf},
     str::FromStr,
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 #[cfg(unix)]
