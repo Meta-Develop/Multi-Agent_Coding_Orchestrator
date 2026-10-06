@@ -12,13 +12,13 @@ use anyhow::{bail, Context, Result};
 use serde::Serialize;
 use std::{
     ffi::OsStr,
-    fs::File,
     path::{Path, PathBuf},
 };
 
 #[cfg(unix)]
 use std::{
     ffi::CString,
+    fs::File,
     io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsRawFd, FromRawFd, RawFd},
@@ -59,6 +59,7 @@ enum AtomicWriteFault {
 #[derive(Debug)]
 pub(crate) struct SecureOutputRoot {
     path: PathBuf,
+    #[cfg(unix)]
     directory: File,
     #[cfg(unix)]
     device: u64,
@@ -98,8 +99,11 @@ struct CollectBudget {
 #[derive(Debug)]
 pub(crate) struct ReservedOutputFile {
     path: PathBuf,
+    #[cfg(unix)]
     directory: File,
+    #[cfg(unix)]
     file: File,
+    #[cfg(unix)]
     name: std::ffi::OsString,
     #[cfg(unix)]
     root_device: u64,
@@ -809,6 +813,7 @@ impl ReservedOutputFile {
         }
     }
 
+    #[cfg(unix)]
     fn verify_held_file(&self) -> Result<()> {
         #[cfg(unix)]
         {
