@@ -1,7 +1,9 @@
+#[cfg(unix)]
+use multi_agent_coding_orchestrator::executor::OpenSshTransport;
 use multi_agent_coding_orchestrator::executor::{
     AgentExecutor, BoundedExecutor, CancellationToken, CandidateArtifact, CapturedOutput,
     CleanupStatus, EffectReconciliation, ExecutionSemantics, ExecutionStatus, ExecutorKind,
-    ExecutorLifecycleEvent, ExecutorLimits, ExecutorRequest, ExecutorUsage, OpenSshTransport,
+    ExecutorLifecycleEvent, ExecutorLimits, ExecutorRequest, ExecutorUsage,
     RecoveryTarget, RemoteExecutionReply, RemoteExecutionRequest, RemoteProcessIdentity, SshConfig,
     SshConfigInput, SshExecutor, SshTransport, TransportFailure, TransportFailureKind,
     TransportStage,
@@ -17,7 +19,9 @@ use std::sync::{
     Arc, Mutex,
 };
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 use tempfile::TempDir;
 
 fn limits() -> ExecutorLimits {
@@ -80,6 +84,7 @@ enum FakeMode {
     LaunchLoss,
     TransportFailure(TransportStage, TransportFailureKind),
     OversizedTransportFailure(TransportStage, TransportFailureKind),
+    #[cfg(unix)]
     ExactReceipt,
     OversizedReceipt,
     OversizedStdout,
@@ -124,15 +129,23 @@ enum LifecycleForgery {
 
 #[derive(Debug, Clone, Copy)]
 enum FinalWorkspaceCase {
+    #[cfg(unix)]
     AddFileBeyondEntries,
+    #[cfg(unix)]
     AddDirectoryBeyondEntries,
+    #[cfg(unix)]
     AddFileBeyondBytes,
+    #[cfg(unix)]
     ModifyBeyondAggregate,
+    #[cfg(unix)]
     ModifyBeyondPerFile,
+    #[cfg(unix)]
     DeleteThenCreate,
+    #[cfg(unix)]
     ReplaceEntryTypes,
     DeleteDirectoryWithChild,
     RetypeDirectoryWithChild,
+    #[cfg(unix)]
     ExactFinalLimits,
 }
 
@@ -202,8 +215,13 @@ impl SshTransport for FakeTransport {
                 );
                 Err(TransportFailure::new(stage, kind, reason))
             }
+            #[cfg(unix)]
+            FakeMode::ExactReceipt => {
+                let mut reply = scenario_reply(request, cancellation);
+                resize_failed_receipt(&mut reply, request.limits.max_receipt_bytes);
+                Ok(reply)
+            }
             FakeMode::Scenario
-            | FakeMode::ExactReceipt
             | FakeMode::OversizedReceipt
             | FakeMode::OversizedStdout
             | FakeMode::OversizedStderr
@@ -228,10 +246,7 @@ impl SshTransport for FakeTransport {
             | FakeMode::HostileLifecycle(_)
             | FakeMode::FinalWorkspace(_) => {
                 let mut reply = scenario_reply(request, cancellation);
-                if matches!(
-                    self.mode,
-                    FakeMode::ExactReceipt | FakeMode::OversizedReceipt
-                ) {
+                if matches!(self.mode, FakeMode::OversizedReceipt) {
                     let target = request.limits.max_receipt_bytes
                         + usize::from(matches!(self.mode, FakeMode::OversizedReceipt));
                     resize_failed_receipt(&mut reply, target);
@@ -427,37 +442,44 @@ impl SshTransport for FakeTransport {
 
 fn final_workspace_effects(
     case: FinalWorkspaceCase,
-    request: &RemoteExecutionRequest,
+    _request: &RemoteExecutionRequest,
 ) -> EffectReconciliation {
     let artifacts = match case {
+        #[cfg(unix)]
         FinalWorkspaceCase::AddFileBeyondEntries => {
             vec![CandidateArtifact::file("new-file", b"x".to_vec(), false)
                 .expect("construct added-file fixture")]
         }
+        #[cfg(unix)]
         FinalWorkspaceCase::AddDirectoryBeyondEntries => {
             vec![CandidateArtifact::directory("new-directory")]
         }
+        #[cfg(unix)]
         FinalWorkspaceCase::AddFileBeyondBytes => {
             vec![CandidateArtifact::file("new-file", b"x".to_vec(), false)
                 .expect("construct byte-overflow fixture")]
         }
+        #[cfg(unix)]
         FinalWorkspaceCase::ModifyBeyondAggregate => {
             vec![
                 CandidateArtifact::file("grow.txt", b"123456".to_vec(), false)
                     .expect("construct aggregate-growth fixture"),
             ]
         }
+        #[cfg(unix)]
         FinalWorkspaceCase::ModifyBeyondPerFile => vec![CandidateArtifact::file(
             "grow.txt",
-            vec![b'x'; request.limits.max_file_bytes + 1],
+            vec![b'x'; _request.limits.max_file_bytes + 1],
             false,
         )
         .expect("construct per-file-growth fixture")],
+        #[cfg(unix)]
         FinalWorkspaceCase::DeleteThenCreate => vec![
             CandidateArtifact::file("new.txt", b"123456".to_vec(), false)
                 .expect("construct capacity-replacement fixture"),
             CandidateArtifact::deleted("old.txt"),
         ],
+        #[cfg(unix)]
         FinalWorkspaceCase::ReplaceEntryTypes => vec![
             CandidateArtifact::file("dir-node", b"xy".to_vec(), false)
                 .expect("construct directory-to-file fixture"),
@@ -472,6 +494,7 @@ fn final_workspace_effects(
                     .expect("construct invalid directory-retype fixture"),
             ]
         }
+        #[cfg(unix)]
         FinalWorkspaceCase::ExactFinalLimits => vec![
             CandidateArtifact::directory("added-dir"),
             CandidateArtifact::file("added-file", b"123456".to_vec(), false)
@@ -1648,7 +1671,7 @@ fn host_only_constructor_and_invalid_trust_fail_before_transport() {
     assert!(error.to_string().contains("explicit authentication"));
 
     let fixture = TempDir::new().expect("SSH fixture tempdir");
-    let (identity_file, known_hosts_file) = write_trust_files(fixture.path());
+    let (_identity_file, known_hosts_file) = write_trust_files(fixture.path());
     let missing = SshConfig::new(SshConfigInput {
         identity_file: fixture.path().join("missing"),
         known_hosts_file,
@@ -1666,7 +1689,7 @@ fn host_only_constructor_and_invalid_trust_fail_before_transport() {
     #[cfg(unix)]
     {
         let link = fixture.path().join("identity-link");
-        std::os::unix::fs::symlink(identity_file, &link).expect("create identity symlink");
+        std::os::unix::fs::symlink(_identity_file, &link).expect("create identity symlink");
         let (_, known_hosts_file) = write_trust_files(fixture.path());
         let error = SshConfig::new(SshConfigInput {
             host_id: "fixture-host".to_string(),
