@@ -679,6 +679,7 @@ fn status_and_collect_fail_closed_across_absent_active_and_tampered_runs() -> Re
     Ok(())
 }
 
+#[cfg(unix)]
 fn assert_corrupt_inbox_status(repo: &Path, run_id: &str) -> Result<()> {
     let failure = run_failure_stderr(&[
         "inbox",
@@ -2640,12 +2641,12 @@ fn run_inbox_refusal(repo: &Path, run_id: &str) -> Result<Value> {
     ])
 }
 
-fn make_inbox_artifact_root_private(repo: &Path) -> Result<()> {
+fn make_inbox_artifact_root_private(_repo: &Path) -> Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         fs::set_permissions(
-            repo.join(".maco/inbox/runs"),
+            _repo.join(".maco/inbox/runs"),
             fs::Permissions::from_mode(0o700),
         )
         .context("chmod inbox artifact root")?;
