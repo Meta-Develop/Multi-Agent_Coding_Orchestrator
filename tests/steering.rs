@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use git2::Repository;
+#[cfg(unix)]
+use multi_agent_coding_orchestrator::agent_lifecycle::{AgentLaunchMetadata, AgentRegistry};
 use multi_agent_coding_orchestrator::{
-    agent_lifecycle::{AgentLaunchMetadata, AgentRegistry},
     hierarchy_ledger::RoleCategory,
     steering::{
         AssignmentBinding, AssignmentKind, SteeringAction, SteeringActor, SteeringOutcome,
@@ -9,14 +10,17 @@ use multi_agent_coding_orchestrator::{
     },
     supervise::ModelCapabilityClass,
 };
+#[cfg(unix)]
 use std::{
     path::Path,
     process::{Child, Command},
 };
 use tempfile::TempDir;
 
+#[cfg(unix)]
 struct SleepChild(Child);
 
+#[cfg(unix)]
 impl SleepChild {
     fn spawn() -> Result<Self> {
         let program = [
@@ -37,6 +41,7 @@ impl SleepChild {
     }
 }
 
+#[cfg(unix)]
 impl Drop for SleepChild {
     fn drop(&mut self) {
         let _ = self.0.kill();
