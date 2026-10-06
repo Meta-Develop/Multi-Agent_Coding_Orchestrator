@@ -4,6 +4,7 @@
 
 use super::*;
 use crate::effect_wal::EffectEvent;
+#[cfg(unix)]
 use crate::safe_state::BoundedRegularReader;
 
 const UPDATE_GRANT_VERSION: u32 = 1;

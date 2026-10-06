@@ -46,12 +46,14 @@ use git2::{
     BranchType, Delta, DiffFormat, DiffOptions, ObjectType, Oid, Repository, Signature, Time, Tree,
 };
 use serde::{Deserialize, Serialize, Serializer};
+#[cfg(unix)]
+use std::io::{Seek, SeekFrom};
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     ffi::OsString,
     fs::{self, OpenOptions},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Read, Write},
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };

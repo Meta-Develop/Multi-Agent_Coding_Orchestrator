@@ -1448,6 +1448,7 @@ fn read_publication_journal_record(path: &Path) -> Result<Vec<u8>> {
     Ok(bytes)
 }
 
+#[cfg(not(windows))]
 fn publication_same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     #[cfg(unix)]
     {
