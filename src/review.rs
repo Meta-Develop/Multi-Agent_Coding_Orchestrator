@@ -1,7 +1,9 @@
 #[cfg(target_os = "linux")]
 use crate::process_runner::trusted_linux_runtime_root;
 #[cfg(unix)]
-use crate::safe_state::device_id_to_u64;
+use crate::safe_state::{device_id_to_u64, unsigned_to_u64};
+#[cfg(any(unix, test))]
+use crate::safe_state::unsigned_to_u32;
 use crate::{
     llm::Redactor,
     pinned_exec::PinnedDirectExecutable,
@@ -10,8 +12,7 @@ use crate::{
         StdinMode, StrictOfflineWorkspaceProfile,
     },
     safe_state::{
-        remove_direct_child_tree, unsigned_to_u32, unsigned_to_u64, BoundedRegularReader,
-        FileIdentity, SafeRoot, TreeLinkPolicy,
+        remove_direct_child_tree, BoundedRegularReader, FileIdentity, SafeRoot, TreeLinkPolicy,
     },
 };
 use anyhow::{bail, Context, Result};

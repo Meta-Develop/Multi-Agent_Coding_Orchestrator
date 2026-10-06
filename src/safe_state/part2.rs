@@ -1421,6 +1421,7 @@ struct InventoryWalkState<'a, F> {
     nested_repository_boundaries: &'a mut Vec<PathBuf>,
 }
 
+#[cfg(unix)]
 pub(crate) fn unsigned_to_u64<T>(value: T) -> u64
 where
     T: TryInto<u64>,
@@ -1444,6 +1445,7 @@ pub(crate) const fn device_id_to_u64(value: libc::dev_t) -> u64 {
     device_id_bits_to_u64(value as i64)
 }
 
+#[cfg(any(unix, test))]
 pub(crate) fn unsigned_to_u32<T>(value: T) -> u32
 where
     T: TryInto<u32>,
