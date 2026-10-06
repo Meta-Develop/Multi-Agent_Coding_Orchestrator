@@ -60,12 +60,14 @@ use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     env,
     ffi::OsString,
-    fs::{self, File, OpenOptions},
-    io::{Read, Write},
+    fs::{self, File},
+    io::Write,
     path::{Component, Path, PathBuf},
     process, thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
+#[cfg(unix)]
+use std::{fs::OpenOptions, io::Read};
 
 use crate::optimizer::merge_authority::{assess_independence, CompletionMode, ProducerFingerprint};
 #[cfg(test)]
@@ -140,6 +142,7 @@ const APPROVED_GITHUB_ACTOR_CAPTURE_LIMIT: usize = 4 * 1024;
 const APPROVED_GITHUB_ACTOR_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_GITHUB_TOKEN_BYTES: usize = 16 * 1024;
 const MAX_PR_OBSERVATION_DETAIL_CHARS: usize = 256;
+#[cfg(unix)]
 const MAX_REPOSITORY_CONFIG_BYTES: usize = 128 * 1024;
 
 pub const DEFAULT_ROLLING_WINDOW_SECONDS: u64 =
