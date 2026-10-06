@@ -8,6 +8,8 @@
 //! transaction outside the state root makes the chmod-to-manifest crash window
 //! forward recoverable.
 
+#[cfg(unix)]
+use crate::safe_state::DirectChildType;
 use crate::{
     artifacts::{
         repository_auth_writer, repository_authenticator_key_only,
@@ -18,8 +20,8 @@ use crate::{
     },
     authenticated_snapshot::{AuthenticatedSnapshotStore, SnapshotSpec},
     safe_state::{
-        identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader,
-        DirectChildType, FileIdentity, KernelStateLock, ReservedDirectory, SafeRoot,
+        identity_for_path, stable_checksum, AtomicStateWriter, BoundedRegularReader, FileIdentity,
+        KernelStateLock, ReservedDirectory, SafeRoot,
     },
     semantic_coord::{
         validate_legacy_semantic_payload, ResolvedSemanticSymbol, SemanticIntent,
@@ -2370,10 +2372,10 @@ fn decode_persisted_path_wire(path: &PersistedPathWire) -> Result<PathBuf> {
     bail!("managed worktree path decoding is unsupported on this platform")
 }
 
-fn encode_persisted_path_wire(path: &Path) -> Result<PersistedPathWire> {
+fn encode_persisted_path_wire(_path: &Path) -> Result<PersistedPathWire> {
     #[cfg(unix)]
     {
-        let bytes = path.as_os_str().as_bytes();
+        let bytes = _path.as_os_str().as_bytes();
         if bytes.is_empty() || bytes.len() > 64 * 1024 || bytes.contains(&0) {
             bail!("managed worktree path exceeds its canonical bound");
         }
