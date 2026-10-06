@@ -7,8 +7,10 @@
 
 use anyhow::{bail, Context, Result};
 use serde::Serialize;
+#[cfg(target_os = "linux")]
+use std::collections::BTreeMap;
 use std::{
-    collections::{hash_map::RandomState, BTreeMap, BTreeSet},
+    collections::{hash_map::RandomState, BTreeSet},
     ffi::{OsStr, OsString},
     fs::{self, File, OpenOptions},
     hash::{BuildHasher, Hash, Hasher},
@@ -37,7 +39,9 @@ use std::os::windows::{
 
 pub const DEFAULT_MAX_STATE_BYTES: u64 = 8 * 1024 * 1024;
 pub const DEFAULT_MAX_TEXT_BYTES: u64 = 2 * 1024 * 1024;
+#[cfg(target_os = "linux")]
 const MAX_TREE_DEPTH: usize = 128;
+#[cfg(unix)]
 const MAX_TREE_ENTRIES: usize = 1_000_000;
 #[cfg(target_os = "linux")]
 const ENTRY_QUARANTINE_PREFIX: &str = ".maco-entry-quarantine-";
