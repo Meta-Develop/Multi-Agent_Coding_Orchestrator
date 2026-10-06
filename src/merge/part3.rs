@@ -1323,6 +1323,7 @@ fn validate_trusted_shebang(path: &Path) -> Result<()> {
         .context("trusted executable script interpreter was unsafe")
 }
 
+#[cfg(any(unix, test))]
 fn is_native_executable_magic(magic: [u8; 4]) -> bool {
     magic == *b"\x7fELF"
         || matches!(

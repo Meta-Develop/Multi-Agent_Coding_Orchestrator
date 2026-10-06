@@ -507,6 +507,7 @@ impl Drop for PrivateRuntimeRootLock {
     }
 }
 
+#[cfg(unix)]
 fn reserve_owner_only_directory(path: &Path) -> std::io::Result<()> {
     let mut builder = fs::DirBuilder::new();
     #[cfg(unix)]
@@ -517,6 +518,7 @@ fn reserve_owner_only_directory(path: &Path) -> std::io::Result<()> {
     builder.create(path)
 }
 
+#[cfg(unix)]
 fn write_private_runtime_owner(directory: &Path, owner: &PrivateRuntimeOwner) -> Result<()> {
     let owner_path = owner.kind.owner_path(directory);
     let owner_parent = owner_path
@@ -546,7 +548,7 @@ fn write_private_runtime_owner(directory: &Path, owner: &PrivateRuntimeOwner) ->
     Ok(())
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn scavenge_private_runtime_orphans(runtime_root: &Path) -> Result<PrivateRuntimeScavengeReport> {
     let boot_id = private_runtime_boot_id()?;
     scavenge_private_runtime_orphans_with(runtime_root, boot_id.as_deref(), |pid| {
@@ -554,7 +556,7 @@ fn scavenge_private_runtime_orphans(runtime_root: &Path) -> Result<PrivateRuntim
     })
 }
 
-#[cfg(test)]
+#[cfg(all(unix, test))]
 fn scavenge_private_runtime_orphans_with(
     runtime_root: &Path,
     current_boot_id: Option<&str>,
@@ -565,6 +567,7 @@ fn scavenge_private_runtime_orphans_with(
     scavenge_private_runtime_orphans_locked_with(runtime_root, current_boot_id, process_identity)
 }
 
+#[cfg(unix)]
 fn scavenge_private_runtime_orphans_locked_with(
     runtime_root: &Path,
     current_boot_id: Option<&str>,
@@ -702,6 +705,7 @@ fn scavenge_private_runtime_orphans_locked_with(
     Ok(report)
 }
 
+#[cfg(unix)]
 fn validate_incomplete_private_runtime_name(path: &Path, kind: PrivateRuntimeKind) -> Result<()> {
     let name = path
         .file_name()
@@ -734,6 +738,7 @@ fn validate_incomplete_private_runtime_name(path: &Path, kind: PrivateRuntimeKin
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_runtime_kind_for_name(name: &OsStr) -> Result<Option<PrivateRuntimeKind>> {
     let kinds = [
         PrivateRuntimeKind::CandidateCapture,
@@ -920,6 +925,7 @@ fn validate_private_runtime_owner_file_metadata(
     Ok(())
 }
 
+#[cfg(unix)]
 fn validate_private_runtime_owner(
     directory: &Path,
     owner: &PrivateRuntimeOwner,
@@ -954,6 +960,7 @@ fn validate_private_runtime_owner(
     Ok(())
 }
 
+#[cfg(unix)]
 fn private_runtime_owner_boot_matches(
     owner: &PrivateRuntimeOwner,
     current_boot_id: Option<&str>,
@@ -1037,6 +1044,8 @@ fn remove_private_runtime_directory_by_identity(
     #[cfg(unix)]
     {
         remove_private_runtime_directory_unix(runtime_root, path, expected_directory_metadata)?;
+        sync_managed_directory(runtime_root)?;
+        Ok(())
     }
     #[cfg(not(unix))]
     {
@@ -1046,8 +1055,6 @@ fn remove_private_runtime_directory_by_identity(
             path.display()
         );
     }
-    sync_managed_directory(runtime_root)?;
-    Ok(())
 }
 
 #[cfg(unix)]
@@ -1393,28 +1400,34 @@ fn get_unix_errno() -> i32 {
     unsafe { *libc::__error() }
 }
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
 fn set_unix_errno(_value: i32) {}
 
-#[cfg(not(any(
-    target_os = "linux",
-    target_os = "android",
-    target_os = "macos",
-    target_os = "ios",
-    target_os = "freebsd",
-    target_os = "openbsd",
-    target_os = "netbsd",
-    target_os = "dragonfly"
-)))]
+#[cfg(all(
+    unix,
+    not(any(
+        target_os = "linux",
+        target_os = "android",
+        target_os = "macos",
+        target_os = "ios",
+        target_os = "freebsd",
+        target_os = "openbsd",
+        target_os = "netbsd",
+        target_os = "dragonfly"
+    ))
+))]
 fn get_unix_errno() -> i32 {
     0
 }
@@ -1463,6 +1476,7 @@ fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
     }
 }
 
+#[cfg(unix)]
 fn private_runtime_current_process_start_identity() -> Result<Option<ProcessStartIdentity>> {
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
@@ -1485,13 +1499,15 @@ fn private_runtime_boot_id() -> Result<Option<String>> {
     Ok(Some(value))
 }
 
-#[cfg(not(target_os = "linux"))]
+#[cfg(all(unix, not(target_os = "linux")))]
 fn private_runtime_boot_id() -> Result<Option<String>> {
     Ok(None)
 }
 
 pub(crate) fn create_private_directory(path: &Path) -> Result<()> {
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
@@ -1527,7 +1543,9 @@ pub(crate) fn write_git_alternates_file(object_directory: &Path, alternate: &Pat
         )
     })?;
     let info = object_directory.join("info");
-    let mut builder = fs::DirBuilder::new();
+    let builder = fs::DirBuilder::new();
+    #[cfg(unix)]
+    let mut builder = builder;
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;

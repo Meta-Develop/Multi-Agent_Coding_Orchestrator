@@ -110,12 +110,16 @@ const GIT_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const VALIDATION_CAPTURE_LIMIT_BYTES: usize = 1024 * 1024;
 const GIT_STDIN_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const REPOSITORY_INDEX_MAX_BYTES: u64 = 64 * 1024 * 1024;
+#[cfg(unix)]
 const PRIVATE_RUNTIME_OWNER_VERSION: u32 = 1;
 const PRIVATE_RUNTIME_OWNER_FILE: &str = "maco-runtime-owner.json";
 const PRIVATE_RUNTIME_LOCK_FILE: &str = ".maco-private-runtime.lock";
 const PRIVATE_RUNTIME_OWNER_MAX_BYTES: u64 = 4 * 1024;
+#[cfg(unix)]
 const PRIVATE_RUNTIME_SCAN_MAX_DIRECTORIES: usize = 128;
+#[cfg(unix)]
 const PRIVATE_RUNTIME_REMOVAL_MAX_ENTRIES: usize = 32 * 1024;
+#[cfg(unix)]
 const PRIVATE_RUNTIME_REMOVAL_MAX_DEPTH: usize = 128;
 
 #[derive(Debug, thiserror::Error, PartialEq, Eq)]
@@ -2289,6 +2293,7 @@ pub(crate) enum PrivateRuntimeKind {
 }
 
 impl PrivateRuntimeKind {
+    #[cfg(unix)]
     fn prefix(self) -> &'static str {
         match self {
             Self::CandidateCapture => "maco-candidate-capture-",
@@ -2330,6 +2335,7 @@ struct PrivateRuntimeRootLock {
     file: fs::File,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PrivateRuntimeScavengeReport {
     removed: usize,
