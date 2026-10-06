@@ -80,17 +80,21 @@ pub struct SafeRoot {
 #[derive(Debug)]
 pub struct ReservedDirectory {
     path: PathBuf,
+    #[cfg(unix)]
     name: OsString,
     identity: FileIdentity,
+    #[cfg(unix)]
     directory: File,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DirectChildType {
     SingleLinkRegularFile,
     Directory,
 }
 
+#[cfg(unix)]
 #[derive(Debug)]
 pub(crate) struct DirectChildBinding {
     name: OsString,
@@ -100,6 +104,7 @@ pub(crate) struct DirectChildBinding {
     file: File,
 }
 
+#[cfg(unix)]
 impl DirectChildBinding {
     pub(crate) fn verify(&self, root: &SafeRoot) -> Result<()> {
         root.verify()?;
@@ -553,6 +558,7 @@ impl SafeRoot {
         bail!("handle-relative direct-child inspection is unsupported on this platform")
     }
 
+    #[cfg(unix)]
     pub(crate) fn bind_owned_direct_child(
         &self,
         name: impl AsRef<OsStr>,
@@ -603,6 +609,7 @@ impl SafeRoot {
         }
     }
 
+    #[cfg(unix)]
     pub(crate) fn set_directory_permissions_fenced(&self, mode: u32) -> Result<()> {
         self.verify()?;
         #[cfg(unix)]
