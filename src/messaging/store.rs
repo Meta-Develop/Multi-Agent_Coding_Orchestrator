@@ -445,14 +445,14 @@ impl StorePathBinding {
 
     fn validate_child_regular_before_open(
         &self,
-        name: &OsStr,
+        _name: &OsStr,
         path: &Path,
     ) -> Result<(), StoreError> {
         self.verify_parent()?;
         #[cfg(unix)]
         {
             let stat =
-                unix_child_stat(self.parent.as_raw_fd(), name)?.ok_or_else(|| StoreError::Io {
+                unix_child_stat(self.parent.as_raw_fd(), _name)?.ok_or_else(|| StoreError::Io {
                     operation: "opening direct child at",
                     path: path.to_path_buf(),
                     source: io::Error::from(io::ErrorKind::NotFound),
@@ -627,7 +627,7 @@ impl StorePathBinding {
     fn rename_child(
         &self,
         source: &OsStr,
-        destination: &OsStr,
+        _destination: &OsStr,
         destination_path: &Path,
     ) -> Result<(), StoreError> {
         self.verify_parent()?;
@@ -638,7 +638,7 @@ impl StorePathBinding {
                 path: self.child_path(source),
                 source: io_error,
             })?;
-            let destination_name = unix_name(destination).map_err(|source| StoreError::Io {
+            let destination_name = unix_name(_destination).map_err(|source| StoreError::Io {
                 operation: "encoding tail-anchor publication destination at",
                 path: destination_path.to_path_buf(),
                 source,
@@ -680,13 +680,13 @@ impl StorePathBinding {
         file: &File,
         expected_identity: &DataFileIdentity,
     ) -> Result<(), StoreError> {
-        let path = self.child_path(name);
+        let _path = self.child_path(name);
         self.validate_named_file(name, file, expected_identity)?;
         #[cfg(target_os = "linux")]
         {
             let source = unix_name(name).map_err(|source| StoreError::Io {
                 operation: "encoding recoverable publication name at",
-                path: path.clone(),
+                path: _path.clone(),
                 source,
             })?;
             let quarantine_name = OsString::from(format!(
@@ -715,13 +715,13 @@ impl StorePathBinding {
             {
                 return Err(StoreError::Io {
                     operation: "quarantining interrupted tail-anchor publication at",
-                    path,
+                    path: _path,
                     source: io::Error::last_os_error(),
                 });
             }
             self.validate_named_file(&quarantine_name, file, expected_identity)?;
             if unix_child_stat(self.parent.as_raw_fd(), name)?.is_some() {
-                return Err(StoreError::TailAnchorTemporaryExists { path });
+                return Err(StoreError::TailAnchorTemporaryExists { path: _path });
             }
             if unsafe { libc::unlinkat(self.parent.as_raw_fd(), quarantine.as_ptr(), 0) } != 0 {
                 return Err(StoreError::Io {
@@ -732,18 +732,18 @@ impl StorePathBinding {
             }
             let handle_stat = unix_file_stat(file).map_err(|source| StoreError::Io {
                 operation: "revalidating removed tail-anchor publication handle for",
-                path: path.clone(),
+                path: _path.clone(),
                 source,
             })?;
             if DataFileIdentity::from_stat(&handle_stat) != *expected_identity
                 || handle_stat.st_nlink != 0
             {
-                return Err(StoreError::DataFileIdentityChanged { path });
+                return Err(StoreError::DataFileIdentityChanged { path: _path });
             }
             if unix_child_stat(self.parent.as_raw_fd(), name)?.is_some()
                 || unix_child_stat(self.parent.as_raw_fd(), &quarantine_name)?.is_some()
             {
-                return Err(StoreError::TailAnchorTemporaryExists { path });
+                return Err(StoreError::TailAnchorTemporaryExists { path: _path });
             }
             self.sync_parent()
         }
