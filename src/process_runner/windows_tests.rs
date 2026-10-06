@@ -2,7 +2,8 @@ use super::*;
 use std::os::windows::io::AsRawHandle;
 use windows_sys::Win32::{
     Foundation::{
-        GetHandleInformation, GetLastError, ERROR_INVALID_HANDLE, HANDLE_FLAG_INHERIT, WAIT_OBJECT_0,
+        GetHandleInformation, GetLastError, ERROR_INVALID_HANDLE, HANDLE_FLAG_INHERIT,
+        WAIT_OBJECT_0,
     },
     System::{
         Console::{GetConsoleCP, GetConsoleProcessList, GetConsoleWindow},
