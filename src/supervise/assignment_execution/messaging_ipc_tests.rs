@@ -34,8 +34,10 @@ use crate::supervise::messaging_bridge::{
     initialize_supervisor_messaging_session, recover_supervisor_messaging_session,
     with_supervisor_messaging_session,
 };
+#[cfg(target_os = "linux")]
+use crate::artifacts::state_auth::random_identifier;
 use crate::{
-    artifacts::{state_auth::random_identifier, ArtifactRunWriter, RunArtifactFamily},
+    artifacts::{ArtifactRunWriter, RunArtifactFamily},
     external_agent::{
         run_external_agent_cancellable_reviewed, run_external_agent_nonpublishable_simulation,
         ExternalAgentCommand, ExternalAgentRun,
