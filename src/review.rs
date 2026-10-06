@@ -330,7 +330,7 @@ impl PublicationReviewResult {
             && self.report.reviewer == authority.reviewer_identity
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn issue_for_test(
         options: ReviewPrOptions,
         report: ReviewReport,
