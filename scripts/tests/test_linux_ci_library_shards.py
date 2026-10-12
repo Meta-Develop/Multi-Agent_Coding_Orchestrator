@@ -114,26 +114,28 @@ class LibraryShardTests(unittest.TestCase):
         selected = shards.partition_inventory(inventory)["rest"]
         summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
         with mock.patch.object(shards.subprocess, "run") as run:
-            run.side_effect = [
+            responses = [
                 subprocess.CompletedProcess([], 0, listing(inventory)),
                 subprocess.CompletedProcess([], 0, listing(selected)),
-                subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[:1])),
-                subprocess.CompletedProcess([], 0, summary, ""),
-                subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[1:])),
-                subprocess.CompletedProcess([], 0, summary, ""),
-                subprocess.CompletedProcess([], 0),
             ]
+            for name in shards.REST_SAFETY_PREFLIGHTS:
+                responses.extend([
+                    subprocess.CompletedProcess([], 0, listing([name])),
+                    subprocess.CompletedProcess([], 0, summary, ""),
+                ])
+            responses.append(subprocess.CompletedProcess([], 0))
+            run.side_effect = responses
             self.assertEqual(shards.run_shard(["harness"], "rest"), 0)
-            self.assertEqual(run.call_count, 7)
-            for index, name in zip([3, 5], shards.REST_SAFETY_PREFLIGHTS):
-                self.assertEqual(run.call_args_list[index].args[0], ["harness", "--exact", "--nocapture", "--", name])
+            self.assertEqual(run.call_count, 3 + 2 * len(shards.REST_SAFETY_PREFLIGHTS))
+            for index, name in enumerate(shards.REST_SAFETY_PREFLIGHTS):
+                self.assertEqual(run.call_args_list[3 + 2 * index].args[0], ["harness", "--exact", "--nocapture", "--", name])
             self.assertEqual(run.call_args.args[0], shards.test_command(["harness"], selected))
             self.assertNotIn("--nocapture", run.call_args.args[0])
 
     def test_rest_preflight_failure_stops_before_full_shard(self):
         inventory = sorted([*INVENTORY, *shards.REST_SAFETY_PREFLIGHTS])
         selected = shards.partition_inventory(inventory)["rest"]
-        for failed_index in [0, 1]:
+        for failed_index in range(len(shards.REST_SAFETY_PREFLIGHTS)):
             with self.subTest(failed_index=failed_index), mock.patch.object(shards.subprocess, "run") as run:
                 responses = [
                     subprocess.CompletedProcess([], 0, listing(inventory)),
@@ -444,6 +446,8 @@ mod process_runner {
 mod runtime_adapter {
     mod cursor_managed_parent {
         mod tests {
+            // Empty bodies verify wrapper selection only, not privacy/authority semantics.
+            #[test] fn offline_check_failure_diagnostic_keeps_untrusted_output_private() {}
             #[test] fn assignment_authority_admits_exact_write_read_and_parent_owned_check() {}
         }
     }
@@ -454,7 +458,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 15)
+            self.assertEqual(len(inventory), 16)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -480,7 +484,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 15', result.stdout)
+                self.assertIn('"total": 16', result.stdout)
 
 
 if __name__ == "__main__":

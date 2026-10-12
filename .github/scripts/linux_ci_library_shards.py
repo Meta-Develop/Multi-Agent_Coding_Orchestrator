@@ -17,6 +17,7 @@ from typing import Sequence
 SHARDS = ("autopilot", "supervise", "rest")
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
+    "runtime_adapter::cursor_managed_parent::tests::offline_check_failure_diagnostic_keeps_untrusted_output_private",
     "runtime_adapter::cursor_managed_parent::tests::assignment_authority_admits_exact_write_read_and_parent_owned_check",
 )
 SAFETY_PREFLIGHTS = {

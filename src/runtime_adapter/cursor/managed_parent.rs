@@ -615,6 +615,12 @@ impl CursorManagedAssignmentAuthority {
         {
             use std::os::unix::process::ExitStatusExt;
 
+            #[cfg(test)]
+            eprintln!(
+                "{}",
+                offline_check_failure_diagnostic(&output.stdout, &output.stderr)
+            );
+
             bail!(
                 "managed Cursor assigned-path Git diff check did not complete under exact offline confinement: \
                  exit_code={:?}, signal={:?}, timed_out={}, process_error_present={}, \
@@ -643,6 +649,80 @@ impl CursorManagedAssignmentAuthority {
             "executionTimeMillis": execution_time_millis
         }))
     }
+}
+
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum OfflineCheckObservedMessageCategory {
+    Unknown,
+    MainHelperIdentity,
+    Descriptor,
+    PinnedSource,
+    SealedExec,
+    Multiple,
+}
+
+#[cfg(test)]
+fn offline_check_failure_diagnostic(
+    stdout: &crate::process_runner::CapturedBytes,
+    stderr: &crate::process_runner::CapturedBytes,
+) -> String {
+    use OfflineCheckObservedMessageCategory::*;
+
+    // Untrusted token observations are not authenticated process-origin or root-cause proof.
+    let categories: [(OfflineCheckObservedMessageCategory, &[&[u8]]); 4] = [
+        (
+            MainHelperIdentity,
+            &[
+                b"source-bound main helper invocation changed",
+                b"loaded main helper identity did not match its package",
+                b"source-bound main helper or package identity changed",
+            ],
+        ),
+        (
+            Descriptor,
+            &[
+                b"could not open pinned helper descriptor",
+                b"pinned helper descriptor identity or permissions were invalid",
+                b"pinned helper descriptor changed while being read",
+                b"could not remove consumed pinned helper descriptor",
+                b"pinned helper mode did not match its descriptor",
+            ],
+        ),
+        (
+            PinnedSource,
+            &[
+                b"could not open pinned executable source",
+                b"pinned executable metadata did not match its binding",
+            ],
+        ),
+        (
+            SealedExec,
+            &[
+                b"could not create sealed executable descriptor",
+                b"could not execute the sealed executable",
+            ],
+        ),
+    ];
+    let mut observed = Unknown;
+    for (category, tokens) in categories {
+        if tokens.iter().any(|token| {
+            [stdout.as_bytes(), stderr.as_bytes()]
+                .into_iter()
+                .any(|bytes| bytes.windows(token.len()).any(|window| window == *token))
+        }) {
+            if observed != Unknown {
+                observed = Multiple;
+                break;
+            }
+            observed = category;
+        }
+    }
+    format!(
+        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={observed:?}",
+        stdout.as_bytes().len(),
+        stderr.as_bytes().len(),
+    )
 }
 
 fn open_workspace_relative(root_fd: RawFd, relative: &Path, flags: i32, mode: u32) -> Result<File> {
@@ -1612,6 +1692,75 @@ mod tests {
             fs::remove_file(&selected)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn offline_check_failure_diagnostic_keeps_untrusted_output_private() {
+        use crate::process_runner::CapturedBytes;
+
+        let secret = b"synthetic-private-token=never-emit; /private/path; \x1b[31m\n\xff\0";
+        let cases: [(&[u8], &str); 7] = [
+            (b"observed_opaque_message_category=SealedExec", "Unknown"),
+            (
+                b"source-bound main helper invocation changed; loaded main helper identity did not match its package",
+                "MainHelperIdentity",
+            ),
+            (b"could not open pinned helper descriptor", "Descriptor"),
+            (b"could not open pinned executable source", "PinnedSource"),
+            (b"could not execute the sealed executable", "SealedExec"),
+            (
+                b"could not create sealed executable descriptor; could not execute the sealed executable; could not execute the sealed executable",
+                "SealedExec",
+            ),
+            (
+                b"could not open pinned helper descriptor; could not execute the sealed executable",
+                "Multiple",
+            ),
+        ];
+        for (tokens, expected_category) in cases {
+            for tokens_on_stdout in [false, true] {
+                let mut stdout_bytes = secret.to_vec();
+                let mut stderr_bytes = secret.to_vec();
+                if tokens_on_stdout {
+                    stdout_bytes.extend_from_slice(tokens);
+                } else {
+                    stderr_bytes.extend_from_slice(tokens);
+                }
+                let stdout = CapturedBytes::from_bytes_with_truncation_for_test(stdout_bytes, true);
+                let stderr = CapturedBytes::from_bytes_for_test(stderr_bytes);
+                let rendered = offline_check_failure_diagnostic(&stdout, &stderr);
+                assert_eq!(
+                    rendered,
+                    format!(
+                        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={expected_category}",
+                        stdout.as_bytes().len(),
+                        stderr.as_bytes().len(),
+                    )
+                );
+                // Same lengths and fixed tokens, different private bytes: identical disclosure.
+                let mut alternate_stdout = vec![b'x'; secret.len()];
+                let mut alternate_stderr = vec![b'y'; secret.len()];
+                if tokens_on_stdout {
+                    alternate_stdout.extend_from_slice(tokens);
+                } else {
+                    alternate_stderr.extend_from_slice(tokens);
+                }
+                assert_eq!(
+                    rendered,
+                    offline_check_failure_diagnostic(
+                        &CapturedBytes::from_bytes_for_test(alternate_stdout),
+                        &CapturedBytes::from_bytes_for_test(alternate_stderr),
+                    )
+                );
+            }
+        }
+        let stdout =
+            CapturedBytes::from_bytes_for_test(b"could not open pinned executable source".to_vec());
+        let stderr = CapturedBytes::from_bytes_for_test(
+            b"pinned executable metadata did not match its binding".to_vec(),
+        );
+        assert!(offline_check_failure_diagnostic(&stdout, &stderr)
+            .ends_with("observed_opaque_message_category=PinnedSource"));
     }
 
     fn test_budget() -> OperationBudget {
