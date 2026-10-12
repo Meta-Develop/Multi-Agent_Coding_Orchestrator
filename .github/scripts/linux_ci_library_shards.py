@@ -8,6 +8,7 @@ import hashlib
 import json
 import os
 import re
+import signal
 import subprocess
 import sys
 from pathlib import Path
@@ -26,6 +27,16 @@ SAFETY_PREFLIGHTS = {
         "supervise::assignment_execution::attached_parent_capture_tests::attached_capture_bookkeeping_and_shutdown_errors_retain_owners",
     ),
 }
+
+
+SUPERVISE_DIAGNOSTICS = (
+    "supervise::tests::plan_runtime::no_override_selects_single_slug_effort_profile_for_every_role",
+    "supervise::assignment_execution::decomposition_tests::auditor_runtime_override_preserves_active_heterogeneous_lens_contract",
+    "supervise::selection_bridge::tests::runtime_reselection_returns_matching_executable_runtime_binding",
+)
+# Per-command diagnostic ceiling; not an acceptance threshold.
+# Each of three cases gets one inventory query and at most one body, with no retry.
+SUPERVISE_DIAGNOSTIC_TIMEOUT_SECONDS = 30
 
 
 def parse_inventory(output: str) -> list[str]:
@@ -98,6 +109,70 @@ def run_safety_preflights(runner: Sequence[str], selected: Sequence[str], shard:
     return 0
 
 
+def _capture_supervise_diagnostic(command: Sequence[str]) -> subprocess.CompletedProcess[str]:
+    # The inspected bodies create no processes. Cargo may own the libtest child,
+    # so terminate this new session's process group, not only the Cargo wrapper.
+    with subprocess.Popen(
+        command, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True, start_new_session=True,
+    ) as process:
+        try:
+            stdout, stderr = process.communicate(timeout=SUPERVISE_DIAGNOSTIC_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+            stdout, stderr = process.communicate()
+            return subprocess.CompletedProcess(command, 124, stdout, stderr)
+        return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+
+
+def run_supervise_diagnostics(runner: Sequence[str], selected: Sequence[str]) -> int:
+    failed = False
+    for name in SUPERVISE_DIAGNOSTICS:
+        print(json.dumps({"supervise_diagnostic": name}, sort_keys=True), flush=True)
+        if name not in selected:
+            print("supervise diagnostic refused: name absent from shard inventory", flush=True)
+            failed = True
+            continue
+        try:
+            inventory = _capture_supervise_diagnostic(
+                [*runner, "--list", "--format", "terse", "--exact", "--", name]
+            )
+            print(inventory.stdout, end="", flush=True)
+            print(inventory.stderr, end="", file=sys.stderr, flush=True)
+            if inventory.returncode != 0 or parse_inventory(inventory.stdout) != [name]:
+                print(json.dumps({"supervise_diagnostic_inventory_refused": name,
+                                  "returncode": inventory.returncode}, sort_keys=True), flush=True)
+                failed = True
+                continue
+            result = _capture_supervise_diagnostic(
+                [*runner, "--exact", "--nocapture", "--", name]
+            )
+        except (OSError, ValueError) as error:
+            print(json.dumps({"supervise_diagnostic_refused": name,
+                              "error_kind": type(error).__name__}, sort_keys=True), flush=True)
+            failed = True
+            continue
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        summaries = re.findall(
+            r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+            r"(\d+) measured; \d+ filtered out; finished in .+$",
+            result.stdout, re.MULTILINE,
+        )
+        expected = [("ok", "1", "0", "0", "0")] if result.returncode == 0 else [
+            ("FAILED", "0", "1", "0", "0")
+        ]
+        single_body = summaries == expected
+        print(json.dumps({"supervise_diagnostic_result": name,
+                          "returncode": result.returncode,
+                          "exactly_one_nonignored_body": single_body}, sort_keys=True), flush=True)
+        failed = failed or result.returncode != 0 or not single_body
+    return 1 if failed else 0
+
+
 def run_shard(runner: Sequence[str], shard: str) -> int:
     if shard not in SHARDS:
         raise ValueError(f"unknown library shard: {shard}")
@@ -127,6 +202,10 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
         preflight_status = run_safety_preflights(runner, selected, shard)
         if preflight_status != 0:
             return preflight_status
+    if shard == "supervise":
+        diagnostic_status = run_supervise_diagnostics(runner, selected)
+        if diagnostic_status != 0:
+            return diagnostic_status
     return subprocess.run(command, check=False).returncode
 
 
