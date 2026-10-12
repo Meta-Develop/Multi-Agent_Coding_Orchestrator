@@ -532,14 +532,16 @@ fn verified_grok_preflight_launch_evidence_and_source_replacement() -> Result<()
     for mutation in ["none", "missing", "replaced"] {
         let temp = tempfile::tempdir()?;
         let (harness, home, binding) = build_cam_grok_test_harness("account-a")?;
-        let command = admitted_verified_grok_cam_command(temp.path())?
-            .with_environment_requirement(EnvironmentRequirement::executable(
-                EnvironmentExecutable::Git,
-                None,
-            ))
-            .with_environment_requirement(EnvironmentRequirement::network(
-                EnvironmentNetworkAccess::Enabled,
-            ));
+        let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+            command
+                .with_environment_requirement(EnvironmentRequirement::executable(
+                    EnvironmentExecutable::Git,
+                    None,
+                ))
+                .with_environment_requirement(EnvironmentRequirement::network(
+                    EnvironmentNetworkAccess::Enabled,
+                ))
+        })?;
         GROK_PREFLIGHT_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 if mutation != "none" {
@@ -604,9 +606,11 @@ fn verified_grok_preflight_rejects_unavailable_offline_requirement_before_launch
     let _no_socket = CamSocketEnvGuard::unset();
     let temp = tempfile::tempdir()?;
     let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
-    let command = admitted_verified_grok_cam_command(temp.path())?.with_environment_requirement(
-        EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
-    );
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_environment_requirement(EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Disabled,
+        ))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert!(!report.stdout.target_launch_attempted, "{report:#?}");
     assert!(report.environment_preflight_results().iter().any(|result| {
@@ -676,6 +680,14 @@ fn build_cam_grok_test_harness_unselected(
 
 #[cfg(target_os = "linux")]
 fn admitted_verified_grok_cam_command(temp: &std::path::Path) -> Result<ExternalAgentCommand> {
+    admitted_verified_grok_cam_command_with_setup(temp, |command| command)
+}
+
+#[cfg(target_os = "linux")]
+fn admitted_verified_grok_cam_command_with_setup(
+    temp: &std::path::Path,
+    setup: impl FnOnce(ExternalAgentCommand) -> ExternalAgentCommand,
+) -> Result<ExternalAgentCommand> {
     use std::os::unix::fs::PermissionsExt;
 
     const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
@@ -724,6 +736,7 @@ exit 42
         writable_grok_command_before_runtime_selection(&program, &child, &prompt, &incoming)?
             .with_agent_lifecycle(&primary, "worker", "verified-grok-cam", "grok-worker");
     command.output_schema = Some(schema);
+    let command = setup(command);
     Ok(command
         .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
         .with_worktree_writable_confinement(writable_grok_confinement(
@@ -1993,7 +2006,7 @@ fn worktree_writable_codex_launch_is_not_blocked_by_coverage() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn worktree_writable_claude_refuses_unverified_selected_runtime_confinement() -> Result<()> {
+fn worktree_writable_claude_without_reservation_refuses_before_confinement() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir()?;
@@ -2024,11 +2037,11 @@ fn worktree_writable_claude_refuses_unverified_selected_runtime_confinement() ->
     let report = run_external_agent(&spec);
     assert!(!marker.exists());
     assert!(!report.stdout.target_launch_attempted);
-    assert!(report.environment_blocked());
-    assert!(report.error.as_deref().is_some_and(|error| {
-        error.contains("writable claude-code failed closed before launch")
-            && error.contains("side_effect_confinement != verified")
-    }));
+    assert!(!report.environment_blocked());
+    assert_eq!(
+        report.error.as_deref(),
+        Some("Claude managed-Worker reservation identity binding is missing")
+    );
     assert_eq!(
         crate::runtime_adapter::AdapterId::ClaudeCode
             .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
@@ -6926,11 +6939,9 @@ fn grok_acp_runtime_adapter_argv_uses_contained_agent_stdio() {
         [
             "--sandbox",
             "strict",
-            "--always-approve",
             "--disable-web-search",
-            "--no-memory",
-            "--no-subagents",
             "agent",
+            "--always-approve",
             "--no-leader",
             "-m",
             "grok-4.6",
@@ -7092,6 +7103,7 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
         Duration::from_secs(10),
     );
     command.invocation = ExternalAgentInvocation::Cursor;
+    command.workspace_access = WorkspaceAccess::ReadOnly;
     command.model = Some("cursor-selected-model".to_string());
     command.reasoning_effort = Some("high".to_string());
     let mut evidence = crate::runtime_adapter::CursorManagedParentEvidence {
@@ -8756,31 +8768,61 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
         .with_worktree_writable_confinement(writable_grok_confinement(
             SideEffectConfinement::Verified,
         ));
-    let acp_refusal = acp
-        .current_grok_writable_contract()
-        .expect_err("Grok 4.7 ACP must not receive writable capability elevation")
-        .to_string();
-    assert!(
-        acp_refusal.contains(WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED),
-        "{acp_refusal}"
-    );
+    let acp_contract = acp.current_grok_writable_contract()?;
+    assert_eq!(acp_contract.runtime(), TypedRuntime::GrokAcpStdio);
+    assert!(acp
+        .verified_writable_capabilities(RuntimeId::Grok)?
+        .admits_worktree_writable());
+    // Selected ACP admission never grants the generic headless proof.
+    assert!(acp
+        .runtime_adapter
+        .as_ref()
+        .expect("ACP adapter")
+        .typed_runtime_contract(
+            AdapterId::Grok,
+            &LaunchContext {
+                prompt: &acp.prompt,
+                model: acp.model.as_deref(),
+                effort: acp.reasoning_effort.as_deref(),
+                cwd: &acp.cwd,
+                output: &acp.output_last_message,
+            },
+        )
+        .is_none());
     let acp_argv = runtime_adapter_argv(&acp)?
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(acp_argv
-        .windows(2)
-        .any(|pair| pair[0] == "-m" && pair[1] == "grok-4.7"));
+    assert_eq!(
+        acp_argv,
+        [
+            "--sandbox",
+            "strict",
+            "--disable-web-search",
+            "agent",
+            "--always-approve",
+            "--no-leader",
+            "-m",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "stdio",
+        ]
+    );
     assert!(!acp_argv.iter().any(|argument| argument == "--json-schema"));
-    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
-        assert_eq!(
-            acp_argv
-                .iter()
-                .filter(|argument| argument.as_str() == required)
-                .count(),
-            1
-        );
-    }
+    let mut acp_environment = BTreeMap::from([
+        ("GROK_MEMORY".to_string(), "1".to_string()),
+        ("GROK_SUBAGENTS".to_string(), "1".to_string()),
+    ]);
+    crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR
+        .apply_required_environment(&mut acp_environment);
+    assert_eq!(
+        acp_environment,
+        BTreeMap::from([
+            ("GROK_MEMORY".to_string(), "0".to_string()),
+            ("GROK_SUBAGENTS".to_string(), "0".to_string()),
+        ])
+    );
 
     let selected_model = selected_writable_grok_command_for_model(
         &program,
@@ -9154,7 +9196,7 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         EnvironmentFailureCategory::SandboxUnavailable
     );
     assert!(unproved_report.error.as_deref().is_some_and(|error| {
-        error.contains("writable selected runtime failed closed before launch")
+        error.contains("writable grok failed closed before launch")
             && error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)
     }));
     assert!(!child.join("bounded-result.txt").exists());
@@ -9709,7 +9751,7 @@ fn held_grok_completion_retainer_refuses_unsettled_context_without_losing_usage(
     )
     .with_workspace_access(WorkspaceAccess::ReadOnly);
     let captured = CapturedBytes::from_bytes_for_test(
-        b"{\"type\":\"end\",\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12}}\n".to_vec(),
+        b"{\"type\":\"end\",\"sessionId\":\"held-session\",\"requestId\":\"held-request\",\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12}}\n".to_vec(),
     );
     let mut report = refused_external_run_before_launch(&command, "test fixture".to_string());
     report.error = None;
@@ -13790,8 +13832,9 @@ fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() ->
         expected_with_authority.authority_id.is_some(),
         "local observation must freeze authority_id"
     );
-    let command = admitted_verified_grok_cam_command(temp.path())?
-        .with_grok_run_account_binding(Some(frozen));
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_grok_run_account_binding(Some(frozen))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -13815,8 +13858,9 @@ fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -
         authority_id: frozen.authority_id.clone(),
     };
     let _socket_env = CamSocketEnvGuard::set(&socket_path);
-    let command = admitted_verified_grok_cam_command(temp.path())?
-        .with_grok_run_account_binding(Some(frozen));
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_grok_run_account_binding(Some(frozen))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -14937,7 +14981,12 @@ fn selected_merge_native_public_shape_refuses_at_common_sink() {
         Duration::from_secs(1),
     )
     .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle("/primary", "Auditor", "merge-run", "merge-arbiter")
+    .with_agent_lifecycle(
+        "/primary",
+        crate::supervise::AgentRole::Auditor.as_str(),
+        "merge-run",
+        "merge-arbiter",
+    )
     .with_runtime_adapter(
         RuntimeId::Grok,
         RuntimeAdapterConfig::defaults(RuntimeId::Grok),

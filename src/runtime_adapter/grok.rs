@@ -221,11 +221,9 @@ impl GrokAcpRuntimeDescriptor {
         [
             "--sandbox",
             self.sandbox_profile,
-            self.headless_approval_flag,
             "--disable-web-search",
-            "--no-memory",
-            "--no-subagents",
             "agent",
+            self.headless_approval_flag,
             "--no-leader",
             "-m",
             "{model}",
@@ -236,6 +234,21 @@ impl GrokAcpRuntimeDescriptor {
         .into_iter()
         .map(str::to_string)
         .collect()
+    }
+}
+
+impl GrokAcpRuntimeDescriptor {
+    /// ACP's agent branch does not forward the pager's memory/subagent flags.
+    /// These forced values outrank local/remote configuration in that branch.
+    pub(crate) fn required_environment(self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("GROK_SUBAGENTS".to_string(), "0".to_string()),
+            ("GROK_MEMORY".to_string(), "0".to_string()),
+        ])
+    }
+
+    pub(crate) fn apply_required_environment(self, environment: &mut BTreeMap<String, String>) {
+        environment.extend(self.required_environment());
     }
 }
 
@@ -2263,11 +2276,9 @@ mod tests {
             [
                 "--sandbox",
                 "strict",
-                "--always-approve",
                 "--disable-web-search",
-                "--no-memory",
-                "--no-subagents",
                 "agent",
+                "--always-approve",
                 "--no-leader",
                 "-m",
                 "{model}",

@@ -418,6 +418,14 @@ impl RuntimeCapabilities {
         ..Self::GROK
     };
 
+    /// Exact contained ACP leaf launches use parent identity/schema evidence.
+    /// This grants no all-tool callback, headless usage parser or session reuse.
+    pub(super) const GROK_ACP: Self = Self {
+        side_effect_confinement: SideEffectConfinement::Verified,
+        session_resume: SessionResume::Unsupported,
+        ..Self::GROK
+    };
+
     pub const CURSOR: Self = Self {
         blocking_pre_action_callback: BlockingPreActionCallback::None,
         writable_workspace: WorkspaceWritability::Partial,

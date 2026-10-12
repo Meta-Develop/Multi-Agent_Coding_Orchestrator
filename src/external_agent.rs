@@ -3644,23 +3644,30 @@ impl ExternalAgentCommand {
                 "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter executable is not bound to the selected program"
             );
         }
-        config
-            .typed_runtime_contract_with_output_schema(
+        let context = LaunchContext {
+            prompt: &self.prompt,
+            model: self.model.as_deref(),
+            effort: self.reasoning_effort.as_deref(),
+            cwd: &self.cwd,
+            output: &self.output_last_message,
+        };
+        let contract = if grok_acp_stdio_protocol_selected(self) {
+            config.grok_acp_runtime_contract(
+                &context,
+                &crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.required_environment(),
+            )
+        } else {
+            config.typed_runtime_contract_with_output_schema(
                 AdapterId::Grok,
-                &LaunchContext {
-                    prompt: &self.prompt,
-                    model: self.model.as_deref(),
-                    effort: self.reasoning_effort.as_deref(),
-                    cwd: &self.cwd,
-                    output: &self.output_last_message,
-                },
+                &context,
                 self.output_schema.as_deref(),
             )
-            .with_context(|| {
-                format!(
-                    "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not an immutable bounded headless contract"
-                )
-            })
+        };
+        contract.with_context(|| {
+            format!(
+                "{WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Grok adapter contract is not an immutable bounded protocol contract"
+            )
+        })
     }
 
     fn current_claude_writable_contract(&self) -> Result<ClaudeManagedLaunchContract> {
@@ -8263,6 +8270,12 @@ fn run_external_agent_runtime(
     };
     #[cfg(not(target_os = "linux"))]
     let mut claude_relay: Option<()> = None;
+    if grok_acp_stdio_protocol_selected(&target_spec) {
+        // Override any inherited/configured enablement before ClearAndSet is
+        // sealed into the actual ProcessSpec. Never rely on pager-only flags.
+        crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR
+            .apply_required_environment(&mut external_environment);
+    }
     let process_spec = ProcessSpec::direct(
         "external agent",
         &resolved_program,
@@ -10227,6 +10240,29 @@ fn run_grok_acp_external_process(
     prompt: String,
     operation_timeout: Duration,
 ) -> Result<InteractiveProcessOutput<GrokAcpInteractiveOutcome>, ProcessRunError> {
+    if spec.workspace_access == WorkspaceAccess::ReadWrite {
+        let context = LaunchContext {
+            prompt: &spec.prompt,
+            model: spec.model.as_deref(),
+            effort: spec.reasoning_effort.as_deref(),
+            cwd: &spec.cwd,
+            output: &spec.output_last_message,
+        };
+        let contract = spec
+            .runtime_adapter
+            .as_ref()
+            .and_then(|config| config.grok_acp_process_contract(&context, &process_spec));
+        if contract.is_none() {
+            return Err(ProcessRunError::IoSetup {
+                label: "Grok ACP launch contract".to_string(),
+                command: spec.program.display().to_string(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Grok ACP process lost its bounded descriptor or forced leaf environment",
+                ),
+            });
+        }
+    }
     let launch_schema =
         bind_grok_acp_launch_schema(spec).map_err(|error| ProcessRunError::IoSetup {
             label: "Grok ACP output schema".to_string(),

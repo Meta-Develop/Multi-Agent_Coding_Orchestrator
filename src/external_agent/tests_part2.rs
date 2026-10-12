@@ -626,6 +626,11 @@
 
         fn assert_verified_external_codex_fixed_version_preflight(report: &ExternalAgentRun) {
             let requirement = codex_environment_requirement();
+            let auth_failure_cause = report.error.as_deref().and_then(|error| {
+                error
+                    .split_whitespace()
+                    .find(|field| field.starts_with("codex_auth_preflight_cause="))
+            });
             assert!(
                 report
                     .environment_preflight_results()
@@ -641,8 +646,9 @@
                                 })
                             )
                     }),
-                "trusted held-out executable must satisfy Codex version preflight: {:?}",
-                report.environment_preflight_results()
+                "trusted held-out executable must satisfy Codex version preflight: {:?}; sanitized auth error: {:?}",
+                report.environment_preflight_results(),
+                auth_failure_cause
             );
             let evidence = report
                 .fixed_version_probe_evidence()

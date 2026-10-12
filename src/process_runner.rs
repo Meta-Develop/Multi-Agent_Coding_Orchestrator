@@ -5461,7 +5461,29 @@ mod filesystem_capture_contract_tests {
 
     #[test]
     fn identical_public_command_without_private_pin_is_refused() {
-        let program = env::current_exe().expect("test executable");
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().expect("pin fixture directory");
+        let program = temp.path().join("pin-fixture");
+        let source = ["/usr/bin/true", "/bin/sh"]
+            .into_iter()
+            .find(|path| {
+                let Ok(metadata) = fs::metadata(path) else {
+                    return false;
+                };
+                if !metadata.is_file() || metadata.len() > 4 * 1024 * 1024 {
+                    return false;
+                }
+                let Ok(mut file) = fs::File::open(path) else {
+                    return false;
+                };
+                let mut magic = [0; 4];
+                std::io::Read::read_exact(&mut file, &mut magic).is_ok() && magic == *b"\x7fELF"
+            })
+            .expect("a readable native ELF no larger than 4 MiB at /usr/bin/true or /bin/sh");
+        fs::copy(source, &program).expect("copy small native executable fixture");
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o755))
+            .expect("make fixture executable");
         let base = ProcessSpec::direct(
             "pin contract",
             &program,

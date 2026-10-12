@@ -440,14 +440,16 @@ pub enum TypedRuntime {
     #[serde(rename = "grok-4.7-xhigh")]
     Grok47Xhigh,
     GrokHeadlessStreamingJson,
+    GrokAcpStdio,
 }
 
 impl TypedRuntime {
     pub const fn adapter_id(self) -> AdapterId {
         match self {
-            Self::Grok46Xhigh | Self::Grok47Xhigh | Self::GrokHeadlessStreamingJson => {
-                AdapterId::Grok
-            }
+            Self::Grok46Xhigh
+            | Self::Grok47Xhigh
+            | Self::GrokHeadlessStreamingJson
+            | Self::GrokAcpStdio => AdapterId::Grok,
         }
     }
 
@@ -505,12 +507,18 @@ impl TypedRuntimeContract {
 
     /// Capability elevation is available only after the adapter proof exists.
     pub const fn capabilities(self) -> RuntimeCapabilities {
-        RuntimeCapabilities::GROK_HEADLESS
+        match self.runtime {
+            TypedRuntime::GrokAcpStdio => RuntimeCapabilities::GROK_ACP,
+            _ => RuntimeCapabilities::GROK_HEADLESS,
+        }
     }
 
     /// Parse the output protocol selected by this proof. The Grok parser
     /// enforces byte, line, event-count, and terminal-event bounds.
     pub fn parse_output(self, bytes: &[u8]) -> Result<grok::GrokParsedEventStream> {
+        if self.runtime == TypedRuntime::GrokAcpStdio {
+            bail!("Grok ACP requires parent protocol evidence, not a headless event stream");
+        }
         grok::parse_grok_event_stream(bytes)
     }
 
@@ -814,8 +822,66 @@ impl RuntimeAdapterConfig {
                     }
                 }
             }
-            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh => None,
+            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh | TypedRuntime::GrokAcpStdio => {
+                None
+            }
         }
+    }
+
+    /// ACP proof is separate from the generic headless admission surface. The
+    /// caller must deliver this forced environment to the contained process;
+    /// `grok_acp_process_contract` rechecks the actual prepared launch.
+    pub(crate) fn grok_acp_runtime_contract(
+        &self,
+        context: &LaunchContext<'_>,
+        environment: &BTreeMap<String, String>,
+    ) -> Option<TypedRuntimeContract> {
+        TypedRuntime::from_launch(AdapterId::Grok, context.model, context.effort)?;
+        if self.grok_interaction_protocol != GrokInteractionProtocol::AcpStdio
+            || !context.cwd.is_absolute()
+        {
+            return None;
+        }
+        let mut expected = Self::defaults_for(AdapterId::Grok);
+        expected.binary = self.binary.clone();
+        expected.grok_interaction_protocol = GrokInteractionProtocol::AcpStdio;
+        expected.restore_immutable_grok_descriptor();
+        if self != &expected
+            || grok::GROK_ACP_RUNTIME_DESCRIPTOR
+                .required_environment()
+                .iter()
+                .any(|(key, value)| environment.get(key) != Some(value))
+        {
+            return None;
+        }
+        Some(TypedRuntimeContract {
+            runtime: TypedRuntime::GrokAcpStdio,
+        })
+    }
+
+    /// Executable identity, selected account and OS confinement are separately
+    /// enforced by the external-agent launch gates. This proof binds the ACP
+    /// descriptor, interactive transport, cwd and forced environment to the
+    /// actual process about to enter that runner.
+    pub(crate) fn grok_acp_process_contract(
+        &self,
+        context: &LaunchContext<'_>,
+        process: &crate::process_runner::ProcessSpec,
+    ) -> Option<TypedRuntimeContract> {
+        use crate::process_runner::{EnvironmentMode, ProcessCommand, StdinMode};
+        let EnvironmentMode::ClearAndSet(environment) = &process.environment else {
+            return None;
+        };
+        let ProcessCommand::Direct { args, .. } = &process.command else {
+            return None;
+        };
+        if process.current_dir != context.cwd
+            || process.stdin != StdinMode::Interactive
+            || *args != self.render_os_argv(context).ok()?
+        {
+            return None;
+        }
+        self.grok_acp_runtime_contract(context, environment)
     }
 
     /// Capabilities for one concrete launch. Static adapter capabilities remain
@@ -1293,6 +1359,134 @@ mod tests {
                 AdapterId::Grok.capabilities()
             );
         }
+        Ok(())
+    }
+
+    #[test]
+    fn grok_acp_proof_binds_actual_process_and_keeps_protocols_distinct() -> Result<()> {
+        use crate::process_runner::{EnvironmentMode, ProcessCommand, ProcessSpec, StdinMode};
+        let config = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "acp_stdio")],
+        )?;
+        let workspace = tempfile::tempdir()?;
+        let context = launch_context(
+            Path::new("prompt.txt"),
+            Some("fixture-catalog-model"),
+            Some("high"),
+            workspace.path(),
+            Path::new("out.txt"),
+        );
+        // Forced values replace conflicting enablement while preserving other
+        // admitted environment values. They are delivered to the process, not
+        // merely supplied to a proof-only predicate.
+        let mut environment = BTreeMap::from([
+            ("GROK_SUBAGENTS".to_string(), "1".to_string()),
+            ("GROK_MEMORY".to_string(), "1".to_string()),
+            ("OTHER".to_string(), "retained".to_string()),
+        ]);
+        grok::GROK_ACP_RUNTIME_DESCRIPTOR.apply_required_environment(&mut environment);
+        assert_eq!(
+            environment.get("OTHER").map(String::as_str),
+            Some("retained")
+        );
+        let process = ProcessSpec::direct(
+            "ACP proof fixture",
+            config.binary_path(),
+            config.render_os_argv(&context)?,
+            context.cwd,
+            1024,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_stdin(StdinMode::Interactive);
+        let proof = config
+            .grok_acp_process_contract(&context, &process)
+            .expect("immutable ACP process has a distinct bounded proof");
+        assert_eq!(proof.runtime(), TypedRuntime::GrokAcpStdio);
+        assert!(proof.subagents_disabled());
+        assert_eq!(
+            proof.capabilities().side_effect_confinement,
+            SideEffectConfinement::Verified
+        );
+        assert_eq!(
+            proof.capabilities().blocking_pre_action_callback,
+            BlockingPreActionCallback::None
+        );
+        assert_eq!(
+            proof.capabilities().session_resume,
+            SessionResume::Unsupported
+        );
+        assert!(proof.parse_output(b"{\"type\":\"done\"}\n").is_err());
+        assert!(proof.usage_status(b"{}").is_err());
+        assert!(config
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .is_none());
+        assert_eq!(
+            config.capabilities_for_launch(AdapterId::Grok, &context),
+            AdapterId::Grok.capabilities()
+        );
+        for key in ["GROK_SUBAGENTS", "GROK_MEMORY"] {
+            for value in [None, Some("1")] {
+                let mut changed = process.clone();
+                let EnvironmentMode::ClearAndSet(environment) = &mut changed.environment else {
+                    unreachable!();
+                };
+                match value {
+                    Some(value) => {
+                        environment.insert(key.to_string(), value.to_string());
+                    }
+                    None => {
+                        environment.remove(key);
+                    }
+                }
+                assert!(
+                    config
+                        .grok_acp_process_contract(&context, &changed)
+                        .is_none(),
+                    "{key}={value:?}"
+                );
+            }
+        }
+        let mut changed = process.clone();
+        changed.environment = EnvironmentMode::Inherit;
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        changed.current_dir = workspace.path().join("elsewhere");
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        changed.stdin = StdinMode::Null;
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        let ProcessCommand::Direct { args, .. } = &mut changed.command else {
+            unreachable!();
+        };
+        args.push("--leader".into());
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        let mut changed_config = config.clone();
+        changed_config
+            .env_passthrough
+            .push("GROK_SUBAGENTS".to_string());
+        assert!(changed_config
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
+        changed_config = config.clone();
+        changed_config
+            .argument_template
+            .retain(|arg| arg != "--no-leader");
+        assert!(changed_config
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
+        assert!(RuntimeAdapterConfig::defaults_for(AdapterId::Grok)
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
         Ok(())
     }
 
@@ -1804,11 +1998,9 @@ mod tests {
             [
                 "--sandbox",
                 "strict",
-                "--always-approve",
                 "--disable-web-search",
-                "--no-memory",
-                "--no-subagents",
                 "agent",
+                "--always-approve",
                 "--no-leader",
                 "-m",
                 "grok-4.6",

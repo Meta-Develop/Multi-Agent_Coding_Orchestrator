@@ -5605,6 +5605,7 @@ pub(crate) fn selected_claude_systemd_properties_for_test(
         writable_artifact_root: Some(fs::canonicalize(output_parent)?),
         ..ProtectedWorktreeControls::default()
     };
+    let containment_owner = crate::process_runner::ClaudeContainmentOwnerBinding::new();
     let profile = external_side_effect_profile_with_claude_relay(
         spec,
         &spec.program,
@@ -5618,7 +5619,7 @@ pub(crate) fn selected_claude_systemd_properties_for_test(
             helper_registration_nonce: Some(
                 "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
             ),
-            containment_owner: None,
+            containment_owner: Some(&containment_owner),
         },
     )?;
     let SideEffectConfinementProfile::ExternalClaude(profile) = profile else {
