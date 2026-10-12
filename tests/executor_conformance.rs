@@ -2901,19 +2901,26 @@ fn grok_47_xhigh_acp_keeps_immutable_argv_but_refuses_capability_elevation() {
     let launch = config
         .render(&context)
         .expect("render typed Grok ACP launch");
-    assert!(launch
-        .argv
-        .windows(2)
-        .any(|pair| { pair[0] == "-m" && pair[1] == "grok-4.7" }));
-    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
-        assert_eq!(
-            launch
-                .argv
-                .iter()
-                .filter(|argument| argument.as_str() == required)
-                .count(),
-            1,
-            "missing or duplicated immutable ACP argument {required}"
+    assert_eq!(
+        launch.argv,
+        [
+            "--sandbox",
+            "strict",
+            "--disable-web-search",
+            "agent",
+            "--always-approve",
+            "--no-leader",
+            "-m",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "stdio",
+        ]
+    );
+    for unsupported in ["--no-memory", "--no-subagents"] {
+        assert!(
+            !launch.argv.iter().any(|argument| argument == unsupported),
+            "unsupported ACP argument {unsupported}"
         );
     }
 }
