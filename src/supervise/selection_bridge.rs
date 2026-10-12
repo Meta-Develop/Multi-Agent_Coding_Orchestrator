@@ -4406,6 +4406,243 @@ mod tests {
         }
     }
 
+    fn bind_fixture_routing_policy() -> Result<crate::selection::routing_policy::RoutingPolicyGuard>
+    {
+        use crate::selection::routing_policy::{
+            bind_routing_policy, FrozenRoutingPolicy, LoadedRoutingPolicy,
+        };
+        let policy: LoadedRoutingPolicy =
+            serde_json::from_str(include_str!("../selection/data/routing-policy.json"))?;
+        policy.validate()?;
+        let frozen = FrozenRoutingPolicy {
+            sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+            policy,
+            source: "bundled-selection-fixture-policy".to_string(),
+        };
+        bind_routing_policy(Some(frozen))
+    }
+
+    fn fixture_task_assessment(
+        plan: &SupervisorPlan,
+    ) -> Result<(
+        TaskRoutingAssessment,
+        crate::selection::routing_policy::TaskRoutingFeatures,
+        crate::selection::routing_policy::FrozenRoutingPolicy,
+    )> {
+        let frozen = crate::selection::routing_policy::current_routing_policy().context(
+            "selection fixture requires a policy guard held through all follow-up checks",
+        )?;
+        let (assessment, features) = fixture_task_assessment_for_policy(plan, &frozen)?;
+        Ok((assessment, features, frozen))
+    }
+
+    fn fixture_task_assessment_for_policy(
+        plan: &SupervisorPlan,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    ) -> Result<(
+        TaskRoutingAssessment,
+        crate::selection::routing_policy::TaskRoutingFeatures,
+    )> {
+        let mut paths = BTreeSet::new();
+        let mut symbols = BTreeSet::new();
+        let mut modules = BTreeSet::new();
+        let mut dependencies = BTreeSet::new();
+        for assignment in &plan.assignments {
+            dependencies.extend(
+                assignment
+                    .decision_refs
+                    .iter()
+                    .map(|reference| reference.question_key.clone()),
+            );
+            if assignment.worker_assignments.is_empty() {
+                paths.extend(assignment.assigned_paths.iter().cloned());
+                symbols.extend(assignment.semantic_symbols.iter().cloned());
+                modules.extend(assignment.semantic_modules.iter().cloned());
+            } else {
+                for worker in &assignment.worker_assignments {
+                    paths.extend(worker.assigned_paths.iter().cloned());
+                    symbols.extend(worker.semantic_symbols.iter().cloned());
+                    modules.extend(worker.semantic_modules.iter().cloned());
+                }
+            }
+        }
+        // These selector fixtures declare one bounded task over their real scope union.
+        // Repeated ledger subjects do not assert independent ownership or execution.
+        // The production estimator validates that declaration; final-plan topology is
+        // recounted separately. No score, account fact or launch authority is invented.
+        let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(json!({
+            "fragments":[{"id":"selection-fixture", "text": &plan.task}],
+            "assignments":[{"id":"selection-fixture", "task": &plan.task,
+                "fragment_ids":["selection-fixture"], "assigned_paths":paths,
+                "semantic_symbols":symbols, "semantic_modules":modules,
+                "decision_dependencies":dependencies}],
+            "diagnostics":{"degraded":false, "notes":[]},
+            "disjointness":{"disjoint":true, "conflicts":[]}
+        }))?;
+        let assessment =
+            super::super::task_routing::assess_task_routing(&plan.task, &proposal, frozen)?;
+        let features = routing_features_with_assessment(plan, Some(&assessment), Some(frozen))?;
+        Ok((assessment, features))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn select_normal_account_intake_with_history(
+        plan: &SupervisorPlan,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+        observations: &[(SupervisorRuntime, AccountObserveResult)],
+        admission: &SupervisorAdmissionPolicyInput,
+        objective: &ResolvedObjectiveProfile,
+        history: Option<&FrozenOutcomeHistory>,
+    ) -> Result<(
+        Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+        SelectionProvenance,
+    )> {
+        // Assess under the caller's exact policy. The production entry point binds
+        // that policy for projection, then restores the caller's ambient binding.
+        let (assessment, _) = fixture_task_assessment_for_policy(plan, frozen)?;
+        super::select_normal_account_intake_with_assessment(
+            plan,
+            frozen,
+            observations,
+            admission,
+            objective,
+            history,
+            Some(&assessment),
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn select_account_intake_for_role_with_history(
+        plan: &SupervisorPlan,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+        observations: &[(SupervisorRuntime, AccountObserveResult)],
+        admission: &SupervisorAdmissionPolicyInput,
+        objective: &ResolvedObjectiveProfile,
+        history: Option<&FrozenOutcomeHistory>,
+        role: AgentRole,
+    ) -> Result<(
+        Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+        SelectionProvenance,
+    )> {
+        let (assessment, _) = fixture_task_assessment_for_policy(plan, frozen)?;
+        super::select_account_intake_for_role_with_assessment(
+            plan,
+            frozen,
+            observations,
+            admission,
+            objective,
+            history,
+            role,
+            Some(&assessment),
+        )
+    }
+
+    fn initialize_supervisor_selection_with_profile(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+        resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    ) -> Result<SupervisorSelectionResolution> {
+        initialize_supervisor_selection_with_quota(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            resolved_objective_profile,
+            SupervisorQuotaSelectionInput::default(),
+        )
+    }
+
+    fn initialize_supervisor_selection_with_quota(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+        resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+        quota: SupervisorQuotaSelectionInput<'_>,
+    ) -> Result<SupervisorSelectionResolution> {
+        initialize_supervisor_selection_with_history(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            resolved_objective_profile,
+            quota,
+            None,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_supervisor_selection_with_history(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+        resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+        quota: SupervisorQuotaSelectionInput<'_>,
+        history: Option<&FrozenOutcomeHistory>,
+        account_observation: Option<&AccountObserveResult>,
+    ) -> Result<SupervisorSelectionResolution> {
+        let accounts = account_observation
+            .map(|observation| vec![(runtime, observation.clone())])
+            .unwrap_or_default();
+        initialize_supervisor_selection_with_accounts(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            resolved_objective_profile,
+            quota,
+            history,
+            &accounts,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn initialize_supervisor_selection_with_accounts(
+        plan: &mut SupervisorPlan,
+        runtime: SupervisorRuntime,
+        catalog: &RuntimeModelCatalog,
+        admission: &SupervisorAdmissionPolicyInput,
+        advertised: &AdvertisedCatalogSet,
+        resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+        quota: SupervisorQuotaSelectionInput<'_>,
+        history: Option<&FrozenOutcomeHistory>,
+        account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+    ) -> Result<SupervisorSelectionResolution> {
+        let (assessment, _, _) = fixture_task_assessment(plan)?;
+        super::initialize_supervisor_selection_with_assessment(
+            plan,
+            runtime,
+            catalog,
+            admission,
+            advertised,
+            resolved_objective_profile,
+            quota,
+            history,
+            account_observations,
+            Some(&assessment),
+        )
+    }
+
+    fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
+        let (assessment, features, frozen) = fixture_task_assessment(&test_plan())?;
+        selection_input_for_role_with_assessment(
+            args,
+            Some(&assessment),
+            Some(&features),
+            Some(&frozen),
+        )
+    }
+
     fn initialize_supervisor_selection(
         plan: &mut SupervisorPlan,
         runtime: SupervisorRuntime,
@@ -4414,7 +4651,7 @@ mod tests {
         advertised: &AdvertisedCatalogSet,
     ) -> Result<SupervisorSelectionResolution> {
         let resolved = default_resolved_profile();
-        super::initialize_supervisor_selection(
+        initialize_supervisor_selection_with_profile(
             plan,
             runtime,
             catalog,
@@ -4674,6 +4911,7 @@ mod tests {
 
     #[test]
     fn completed_event_commit_is_atomic_when_assignment_chain_is_malformed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut manager_state) = automatic_state()?;
         let before = manager_state.clone();
         let mut assignment_state = manager_state.clone();
@@ -4732,6 +4970,7 @@ mod tests {
 
     #[test]
     fn automatic_empty_role_models_resolve_all_roles_from_eligible_catalog() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let admission = test_admission();
@@ -4785,6 +5024,7 @@ mod tests {
 
     #[test]
     fn authored_researcher_selection_preserves_distinct_role_and_binding() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         plan.assignments.push(serde_json::from_value(json!({
@@ -4825,6 +5065,7 @@ mod tests {
 
     #[test]
     fn authenticated_exhausted_quota_projects_into_supervisor_refusal_and_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         use crate::{
             budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
             optimizer::{
@@ -4973,6 +5214,7 @@ mod tests {
 
     #[test]
     fn available_source_pressure_and_marginal_cost_reach_assignment_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         use crate::{
             budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
             optimizer::{
@@ -5078,6 +5320,7 @@ mod tests {
 
     #[test]
     fn degraded_choice_records_the_selected_runtime_pool_in_assignment_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         use crate::{
             budget_ledger::{CompletedPoolConsumption, WorkspaceBudgetLedger},
             optimizer::{
@@ -5205,6 +5448,7 @@ mod tests {
 
     #[test]
     fn initial_retry_and_budget_degrade_reuse_exact_frozen_profile_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let mut profile = crate::objective_profile::default_objective_profile();
@@ -5215,7 +5459,7 @@ mod tests {
             profile: profile.binding()?,
             source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
         };
-        let resolution = super::initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection_with_profile(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
@@ -5258,6 +5502,7 @@ mod tests {
 
     #[test]
     fn verified_bridge_applies_supported_profile_to_score_arithmetic_and_choice() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let admission = test_admission();
         let advertised = AdvertisedCatalogSet::empty();
@@ -5290,7 +5535,7 @@ mod tests {
             source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
         };
         let mut adjusted_plan = test_plan();
-        let adjusted = super::initialize_supervisor_selection(
+        let adjusted = initialize_supervisor_selection_with_profile(
             &mut adjusted_plan,
             SupervisorRuntime::Codex,
             &catalog,
@@ -5405,6 +5650,7 @@ mod tests {
 
     #[test]
     fn assignment_selection_ledger_projects_role_decisions_onto_each_assignment() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         plan.assignments = vec![
@@ -5473,6 +5719,7 @@ mod tests {
 
     #[test]
     fn assignment_selection_ledger_records_plan_role_models_source() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
             prior.class_fit.iter().any(|class_fit| {
@@ -5529,6 +5776,7 @@ mod tests {
 
     #[test]
     fn assignment_selection_ledger_records_typed_mechanical_degradation_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         plan.assignments = vec![child_assignment("assignment-a")];
@@ -5627,6 +5875,7 @@ mod tests {
 
     #[test]
     fn assignment_selection_ledger_preserves_later_worker_retry_provenance() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         plan.assignments = vec![child_assignment("assignment-a")];
@@ -5739,6 +5988,7 @@ mod tests {
 
     #[test]
     fn explicit_debug_override_requires_parseable_effort() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
             prior
@@ -5782,6 +6032,7 @@ mod tests {
 
     #[test]
     fn partial_profile_retains_typed_authority_refusal_instead_of_catalog_fallback() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let worker_prior = codex_prior_for(|prior| {
             prior
                 .prohibited_authority_roles
@@ -5838,6 +6089,7 @@ mod tests {
 
     #[test]
     fn debug_mode_applies_exact_selector_triple_to_plan() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let prior = codex_prior_for(|prior| {
             prior.class_fit.iter().any(|class_fit| {
@@ -5904,6 +6156,7 @@ mod tests {
 
     #[test]
     fn custom_review_lens_must_match_selector_validated_auditor() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let auditor_prior = codex_prior_for(|prior| {
             prior
@@ -5969,6 +6222,7 @@ mod tests {
 
     #[test]
     fn degrade_reselection_is_deterministic_and_returns_exact_executable_overrides() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, state) = automatic_state()?;
         let mut first_state = state.clone();
         let first = reselect_roles_from_supplied_catalog_snapshot(
@@ -6092,6 +6346,7 @@ mod tests {
 
     #[test]
     fn this_run_rejected_or_accepted_attempt_moves_reselect_posterior() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, state) = automatic_state()?;
         let worker = state
             .decisions
@@ -6180,6 +6435,7 @@ mod tests {
 
     #[test]
     fn this_run_cost_only_attempt_does_not_move_reselect_posterior() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let worker = state
             .decisions
@@ -6237,6 +6493,7 @@ mod tests {
 
     #[test]
     fn this_run_exclusions_append_to_existing_outcome_history() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let frozen = crate::selection::AuthenticatedOutcomeHistoryProvenance {
             snapshot_sha256: "a".repeat(64),
@@ -6280,6 +6537,7 @@ mod tests {
 
     #[test]
     fn degrade_transition_retains_previous_choice_and_switch_score_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (_, mut state) = automatic_state()?;
         let previous = state
             .decisions
@@ -6380,6 +6638,7 @@ mod tests {
 
     #[test]
     fn retry_penalizes_only_previous_choice_and_changes_worker_choice() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let previous = state
             .decisions
@@ -6445,6 +6704,7 @@ mod tests {
 
     #[test]
     fn sequential_reselection_uses_immediately_prior_selected_choice() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let first = reselect_roles_from_supplied_catalog_snapshot(
             &mut state,
@@ -6490,6 +6750,7 @@ mod tests {
 
     #[test]
     fn failed_multi_role_reselection_does_not_commit_partial_state() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let worker_before = state
             .decisions
@@ -6521,6 +6782,7 @@ mod tests {
 
     #[test]
     fn supplied_catalog_withdrawal_records_change_and_reselects() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (_, mut state) = automatic_state()?;
         let previous = state
             .decisions
@@ -6594,6 +6856,7 @@ mod tests {
 
     #[test]
     fn typed_environment_rejection_uses_one_shot_data_declared_fallback() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
         let previous = state
             .decisions
@@ -6899,6 +7162,7 @@ mod tests {
     #[test]
     fn captured_cursor_catalog_makes_composer_slugs_selectable_without_operator_lists() -> Result<()>
     {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = captured_cursor_observation()?;
         assert!(observation.catalog().contains("composer-2.5"));
         assert!(observation.catalog().contains("composer-2.5-fast"));
@@ -6955,6 +7219,7 @@ mod tests {
 
     #[test]
     fn runtime_reselection_returns_matching_executable_runtime_binding() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
@@ -7055,6 +7320,7 @@ mod tests {
 
     #[test]
     fn withdrawn_cursor_catalog_removes_composer_candidates() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
@@ -7078,6 +7344,7 @@ mod tests {
 
     #[test]
     fn composer_stays_fail_closed_for_judgment_roles_under_codex_pressure() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
@@ -7143,6 +7410,7 @@ mod tests {
 
     #[test]
     fn optional_cursor_gap_becomes_unavailable_catalog_and_ledger_evidence() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let advertised = advertised_with_cursor_gap("cursor-agent was not found");
         let mut plan = test_plan();
@@ -7221,6 +7489,7 @@ mod tests {
 
     #[test]
     fn selected_cursor_runtime_fails_preflight_on_catalog_gap() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let advertised = advertised_with_cursor_gap("catalog output was malformed");
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
@@ -7249,6 +7518,7 @@ mod tests {
 
     #[test]
     fn selected_cursor_runtime_fails_preflight_when_catalog_is_missing_without_gap() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
             &mut plan,
@@ -7323,6 +7593,7 @@ mod tests {
 
     #[test]
     fn advertised_grok_47_requires_task_provided_evidence_for_explicit_selection() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = discover_grok_observation(CAPTURED_GROK_47_CATALOG)?;
         assert!(observation.catalog().contains("grok-4.7"));
         assert!(observation.catalog().contains("grok-4.7-build-fast"));
@@ -7422,6 +7693,7 @@ mod tests {
 
     #[test]
     fn genuinely_duplicated_grok_catalog_input_still_fails_closed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
         let resolved = default_resolved_profile();
         let mut input = selection_input_for_role(SelectionInputForRoleArgs {
@@ -7729,6 +8001,7 @@ mod tests {
 
     #[test]
     fn live_grok_46_xhigh_is_selected_by_recorded_worker_economics() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
         let mut plan = test_plan();
@@ -7838,6 +8111,7 @@ mod tests {
 
     #[test]
     fn unavailable_grok_46_falls_back_to_scored_codex_with_honest_membership() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let withdrawn =
             discover_grok_observation(&grok_listing("grok-4.5", &["  * grok-4.5 (default)"]))?;
@@ -7879,6 +8153,7 @@ mod tests {
 
     #[test]
     fn grok_worker_economics_never_grant_delegating_or_judgment_authority() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let priors = selector_priors_with_terminal_worker_economics()?;
         for authority in [
             AuthorityRole::Delegating,
@@ -7937,6 +8212,7 @@ mod tests {
 
     #[test]
     fn explicit_worker_override_wins_over_live_grok_worker_economics() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let observation = discover_grok_observation(CAPTURED_GROK_CATALOG)?;
         let requested = codex_prior_for(|prior| {
@@ -7985,6 +8261,7 @@ mod tests {
 
     #[test]
     fn injected_grok_catalog_joins_without_hardcoded_slug_lists() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         use crate::runtime_adapter::grok::{
             inject_grok_advertised_catalog, GrokModelCatalog, GrokModelCatalogEntry,
         };
@@ -8061,6 +8338,7 @@ mod tests {
 
     #[test]
     fn observed_grok_catalog_joins_and_withdrawal_removes_membership() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let priors = selection::built_in_prior_dataset()?;
         let grok_prior = priors
@@ -8129,6 +8407,7 @@ mod tests {
 
     #[test]
     fn codex_primary_applies_explicit_worker_override_on_authored_grok_runtime() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         // The built-in Grok prior is fixture evidence for catalog membership.
         // It is not a qualification claim for any specific production model.
         let catalog = codex_catalog()?;
@@ -8214,6 +8493,7 @@ mod tests {
 
     #[test]
     fn observed_grok_catalog_stays_fail_closed_for_judgment_roles() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let priors = selection::built_in_prior_dataset()?;
         let grok_prior = priors
@@ -8268,6 +8548,7 @@ mod tests {
 
     #[test]
     fn selected_runtime_is_stamped_onto_the_assignment() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         plan.assignments = vec![worker_assignment()];
@@ -8529,6 +8810,7 @@ mod tests {
 
     #[test]
     fn live_online_router_persists_zero_continue_and_priced_switch_arms() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         reset_live_switch_cost_session();
         bind_live_router_config(SupervisorRouterConfig {
             hysteresis_margin_bp: 2_500,
@@ -8558,7 +8840,7 @@ mod tests {
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let frozen = default_resolved_profile();
-        let resolution = super::initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection_with_profile(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
@@ -8604,6 +8886,7 @@ mod tests {
 
     #[test]
     fn frozen_resolved_profile_flows_through_selector_and_evaluation_without_drift() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         reset_live_switch_cost_session();
         let catalog = codex_catalog()?;
         let mut profile = crate::objective_profile::default_objective_profile();
@@ -8615,7 +8898,7 @@ mod tests {
             source: crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
         };
         let mut plan = test_plan();
-        let resolution = super::initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection_with_profile(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
@@ -8882,6 +9165,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn stale_secondary_principal_refuses_before_role_initialization() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let mut secondary = qualified_account_fixture("grok-cli", "secondary-fixture", "high");
         secondary
             .models
@@ -9766,12 +10050,13 @@ mod tests {
         observation: &AccountObserveResult,
         advertised: &AdvertisedCatalogSet,
     ) -> Result<SelectionInput> {
+        let (assessment, features, frozen) = fixture_task_assessment(&test_plan())?;
         selection_input_with_account_observation_and_assessment(
             observation,
             advertised,
-            None,
-            None,
-            None,
+            Some(&assessment),
+            Some(&features),
+            Some(&frozen),
         )
     }
 
@@ -9889,6 +10174,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_unknown_models_fail_closed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
             "codex-cli",
             CategoryObservation::unknown(),
@@ -9896,7 +10182,7 @@ mod tests {
         );
         let advertised = advertised_with_cursor(captured_cursor_observation()?);
         let mut plan = test_plan();
-        let resolution = super::initialize_supervisor_selection_with_history(
+        let resolution = initialize_supervisor_selection_with_history(
             &mut plan,
             SupervisorRuntime::Codex,
             &codex_catalog()?,
@@ -9921,6 +10207,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_does_not_fill_efforts_from_priors() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
             "codex-cli",
             CategoryObservation::observed(ModelsObservation {
@@ -9955,6 +10242,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_unknown_quota_does_not_invent_zeros_or_price() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
             "codex-cli",
             observed_sol_high_xhigh(),
@@ -9985,6 +10273,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_observed_quota_projects_utilization_without_price() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
             "codex-cli",
             observed_sol_high_xhigh(),
@@ -10079,6 +10368,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_binding_runtime_mismatch_fail_closed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
             "grok-cli",
             CategoryObservation::observed(ModelsObservation {
@@ -10103,6 +10393,7 @@ mod tests {
 
     #[test]
     fn account_observe_none_keeps_advertised_catalog_path() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
         let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
         let priors = selector_priors_with_terminal_worker_economics()?;
         let catalogs = constructed_selection_catalogs(
@@ -10148,6 +10439,104 @@ mod tests {
             input.pools[0].entitlement_remaining_units,
             input.pools[0].entitlement_capacity_units
         );
+        Ok(())
+    }
+    #[test]
+    fn assessed_fixture_keeps_missing_assessment_and_changed_task_fail_closed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
+        let plan = test_plan();
+        let (assessment, features, frozen) = fixture_task_assessment(&plan)?;
+        assessment.validate_for_task(&frozen, &plan.task)?;
+        assert_eq!(
+            features.scope_paths,
+            routing_features_from_plan(&plan).scope_paths
+        );
+        let assessed = task_profile_with_assessment(
+            AgentRole::Worker,
+            Some(&assessment),
+            Some(&features),
+            Some(&frozen),
+        )?;
+        assert_ne!(assessed.risk, RiskLevel::Unknown);
+        let unknown = task_profile_with_assessment(AgentRole::Worker, None, None, Some(&frozen))?;
+        assert_eq!(unknown.risk, RiskLevel::Unknown);
+        assert_eq!(unknown.context, ContextSize::Unknown);
+        assert_eq!(unknown.horizon, TaskHorizon::Unknown);
+        assert_eq!(unknown.boundedness, Boundedness::Unknown);
+        let catalog = codex_catalog()?;
+        let advertised = AdvertisedCatalogSet::empty();
+        let admission = test_admission();
+        let objective = default_resolved_profile();
+        let unassessed_input = super::selection_input_for_role(SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Codex,
+            catalog: &catalog,
+            advertised: &advertised,
+            admission: &admission,
+            resolved_objective_profile: &objective,
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
+            },
+            debug_override: None,
+            history: None,
+        })?;
+        let error = selection::select(&unassessed_input)
+            .expect_err("generic None fixture wrapper must retain the unknown-risk refusal");
+        assert!(error.to_string().contains("task.risk must be known"));
+        #[cfg(target_os = "linux")]
+        {
+            let observations = [(
+                SupervisorRuntime::Codex,
+                account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+            )];
+            let error = super::select_normal_account_intake_with_history(
+                &plan,
+                &frozen,
+                &observations,
+                &admission,
+                &objective,
+                None,
+            )
+            .expect_err("generic None intake must retain the unknown-risk refusal");
+            assert!(error.to_string().contains("task.risk must be known"));
+            assert_eq!(
+                crate::selection::routing_policy::current_routing_policy(),
+                Some(frozen.clone())
+            );
+        }
+        let mut missing = plan.clone();
+        let error = super::initialize_supervisor_selection_with_assessment(
+            &mut missing,
+            SupervisorRuntime::Codex,
+            &codex_catalog()?,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            None,
+        )
+        .expect_err("production missing-assessment routing must remain unknown and fail closed");
+        assert!(error.to_string().contains("task.risk must be known"));
+        assert!(missing.role_models.is_empty());
+        assert!(assessment
+            .validate_for_task(&frozen, &format!("{} changed", plan.task))
+            .is_err());
+        let mut foreign = frozen.clone();
+        foreign.policy.unknown_access_policy =
+            crate::selection::routing_policy::UnknownAccessPolicy::Reject;
+        foreign.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&foreign.policy)?);
+        assert!(assessment.validate_for_task(&foreign, &plan.task).is_err());
         Ok(())
     }
 }
