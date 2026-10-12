@@ -938,10 +938,7 @@ fn evaluate_candidate(
     let ledger = ledger_summary(input, &candidate)?;
     let mut reasons = Vec::new();
 
-    if !model.available
-        || model.access
-            == Some(coding_agent_manager_lib::account_authority::ModelAccessOutcome::Unavailable)
-    {
+    if !model.available || model.access == Some(ModelAccessOutcome::Unavailable) {
         reject(
             &mut reasons,
             IneligibilityCode::CatalogUnavailable,

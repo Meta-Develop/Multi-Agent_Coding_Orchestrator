@@ -7520,17 +7520,26 @@ fn run_external_agent_runtime(
                 child_config_home: claude_session
                     .as_ref()
                     .map(|session| session.authority.child_config_home()),
+                #[cfg(not(target_os = "linux"))]
+                child_config_home: None,
                 #[cfg(target_os = "linux")]
                 managed_data_root: claude_session
                     .as_ref()
                     .map(|session| session.authority.managed_data_root()),
+                #[cfg(not(target_os = "linux"))]
+                managed_data_root: None,
                 #[cfg(target_os = "linux")]
                 helper_registration_nonce: claude_session
                     .as_ref()
                     .map(|session| session.helper_registration_nonce.as_str()),
+                #[cfg(not(target_os = "linux"))]
+                helper_registration_nonce: None,
+                #[cfg(target_os = "linux")]
                 containment_owner: claude_session
                     .as_ref()
                     .map(|session| &session.containment_owner),
+                #[cfg(not(target_os = "linux"))]
+                containment_owner: None,
                 parent_socket: claude_parent_socket.as_deref(),
                 deadline_unix_millis: claude_deadline_unix_millis,
             },

@@ -429,7 +429,7 @@ fn legacy_catalog_access_absence_preserves_wire_digest_and_replay() {
 
 #[test]
 fn typed_catalog_access_survives_normalization_and_changes_digests() {
-    use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+    use crate::selection::ModelAccessOutcome;
     let mut input = base_input();
     let runtime = input.catalogs[0].runtime.clone();
     let model = input.catalogs[0].models[0].model.clone();
@@ -476,7 +476,7 @@ fn typed_catalog_access_survives_normalization_and_changes_digests() {
 
 #[test]
 fn explicit_catalog_access_never_overrides_eligibility_refusal() {
-    use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+    use crate::selection::ModelAccessOutcome;
     for (eligible, access) in [
         (true, ModelAccessOutcome::Unavailable),
         (false, ModelAccessOutcome::Available),

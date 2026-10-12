@@ -1129,7 +1129,7 @@ mod tests {
 
     #[test]
     fn catalog_access_schema_is_optional_nullable_closed_and_matches_typed_wire() {
-        use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+        use crate::selection::ModelAccessOutcome;
         let schema = catalog_model();
         assert_eq!(schema["additionalProperties"], false);
         assert!(!schema["required"]

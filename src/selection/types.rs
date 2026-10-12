@@ -162,6 +162,20 @@ pub struct CandidateCapabilities {
     pub long_context: bool,
 }
 
+// Keep the Linux observation type identity; other platforms only consume catalog wire data.
+#[cfg(target_os = "linux")]
+pub use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelAccessOutcome {
+    #[default]
+    UnknownAccess,
+    Available,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogModel {
@@ -171,7 +185,7 @@ pub struct CatalogModel {
     /// Optional observed access data, not private account or launch authority.
     /// Legacy, advertised, and prior-only catalogs omit this unconfirmed field.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub access: Option<coding_agent_manager_lib::account_authority::ModelAccessOutcome>,
+    pub access: Option<ModelAccessOutcome>,
     pub supported_efforts: Vec<ReasoningEffort>,
     pub capabilities: CandidateCapabilities,
 }
