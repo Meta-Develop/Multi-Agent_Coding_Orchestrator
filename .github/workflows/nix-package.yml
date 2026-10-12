@@ -1,0 +1,197 @@
+name: Nix package
+
+on:
+  workflow_call:
+    outputs:
+      artifact_id:
+        value: ${{ jobs.linux-package.outputs.artifact_id }}
+      receipt_sha256:
+        value: ${{ jobs.linux-package.outputs.receipt_sha256 }}
+      payload_sha256:
+        value: ${{ jobs.linux-package.outputs.payload_sha256 }}
+      source_revision:
+        value: ${{ jobs.linux-package.outputs.source_revision }}
+      lock_sha256:
+        value: ${{ jobs.linux-package.outputs.lock_sha256 }}
+      maco_root:
+        value: ${{ jobs.linux-package.outputs.maco_root }}
+      helpers_root:
+        value: ${{ jobs.linux-package.outputs.helpers_root }}
+      source_manifest_sha256:
+        value: ${{ jobs.linux-package.outputs.source_manifest_sha256 }}
+      binary_sha256:
+        value: ${{ jobs.linux-package.outputs.binary_sha256 }}
+      main_entry_sha256:
+        value: ${{ jobs.linux-package.outputs.main_entry_sha256 }}
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: nix-package-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  linux-package:
+    name: Linux package and Darwin evaluation
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    outputs:
+      artifact_id: ${{ steps.upload.outputs.artifact-id }}
+      receipt_sha256: ${{ steps.export.outputs.receipt_sha256 }}
+      payload_sha256: ${{ steps.export.outputs.payload_sha256 }}
+      source_revision: ${{ steps.export.outputs.source_revision }}
+      lock_sha256: ${{ steps.export.outputs.lock_sha256 }}
+      maco_root: ${{ steps.export.outputs.maco_root }}
+      helpers_root: ${{ steps.export.outputs.helpers_root }}
+      source_manifest_sha256: ${{ steps.export.outputs.source_manifest_sha256 }}
+      binary_sha256: ${{ steps.export.outputs.binary_sha256 }}
+      main_entry_sha256: ${{ steps.export.outputs.main_entry_sha256 }}
+    steps:
+      - name: Check out exact source revision
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          persist-credentials: false
+
+      - name: Install checksum-pinned official Nix on the ephemeral runner
+        id: install_nix
+        run: bash .github/scripts/install-github-hosted-ci-nix.sh
+
+      - name: Evaluate locked packages and build the Linux package once
+        shell: bash
+        env:
+          NIX_CI_LANE: ${{ steps.install_nix.outputs.lane }}
+        run: |
+          set -euo pipefail
+          test -z "$(git status --porcelain)"
+          git rev-parse HEAD
+          sha256sum flake.lock > "$NIX_CI_LANE/flake.lock.sha256"
+          env -i HOME="$NIX_CI_LANE/home" USER="$(id -un)" LOGNAME="$(id -un)" \
+            PATH=/nix/var/nix/profiles/default/bin:/usr/bin:/bin LANG=C.UTF-8 \
+            NIX_REMOTE=daemon NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt \
+            LANE="$NIX_CI_LANE" \
+            /bin/bash --noprofile --norc -euo pipefail <<'NIX'
+          version="$(nix --version)"
+          printf '%s\n' "$version"
+          test "$version" = 'nix (Nix) 2.35.2'
+          for system in x86_64-linux x86_64-darwin aarch64-darwin; do
+            nix eval --no-update-lock-file --no-write-lock-file --raw ".#packages.$system.maco.drvPath"
+            printf '\n'
+          done
+          nix eval --no-update-lock-file --no-write-lock-file --raw \
+            .#packages.x86_64-linux.maco.drvPath > "$LANE/maco.drv"
+          nix eval --no-update-lock-file --no-write-lock-file --raw \
+            .#packages.x86_64-linux.runtime-test-helpers.drvPath > "$LANE/helpers.drv"
+          nix build --no-update-lock-file --no-write-lock-file --no-link --print-build-logs --json \
+            .#packages.x86_64-linux.maco .#packages.x86_64-linux.runtime-test-helpers \
+            --max-jobs 1 --cores 1 --option sandbox true > "$LANE/build.json"
+          NIX
+          sha256sum --check "$NIX_CI_LANE/flake.lock.sha256"
+          test -z "$(git status --porcelain)"
+
+      - name: Export the source-bound public runtime closure and receipt
+        id: export
+        shell: bash
+        env:
+          NIX_CI_LANE: ${{ steps.install_nix.outputs.lane }}
+        run: |
+          set -euo pipefail
+          env -i HOME="$NIX_CI_LANE/home" USER="$(id -un)" LOGNAME="$(id -un)" \
+            PATH=/nix/var/nix/profiles/default/bin:/usr/bin:/bin LANG=C.UTF-8 \
+            NIX_REMOTE=daemon LANE="$NIX_CI_LANE" \
+            /usr/bin/python3 -I -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import subprocess
+
+          lane = pathlib.Path(os.environ["LANE"])
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+          revision = command("git", "rev-parse", "HEAD")
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          assert not command("git", "status", "--porcelain")
+          builds = json.loads((lane / "build.json").read_text())
+          def output(name):
+              drv = (lane / (name + ".drv")).read_text().strip()
+              matches = [item for item in builds if item["drvPath"] == drv]
+              assert len(matches) == 1 and set(matches[0]["outputs"]) == {"out"}
+              root = matches[0]["outputs"]["out"]
+              assert re.fullmatch(r"/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+", root)
+              return pathlib.Path(root)
+          maco, helpers = output("maco"), output("helpers")
+          manifest_path = maco / "share/maco/source-manifest.json"
+          declaration_path = maco / "share/maco/main-helper.json"
+          for path in (manifest_path, declaration_path, maco / "source-manifest.json"):
+              meta = path.lstat()
+              assert stat.S_ISREG(meta.st_mode) and meta.st_uid == 0
+              assert 0 < meta.st_size <= 1024 * 1024 and meta.st_mode & 0o6022 == 0
+          manifest = json.loads(manifest_path.read_text())
+          assert manifest["source_revision"] == revision and manifest["source_state"] == "clean"
+          assert (maco / "source-manifest.json").read_bytes() == manifest_path.read_bytes()
+          binary = maco / "bin/maco"
+          meta = binary.lstat()
+          assert stat.S_ISREG(meta.st_mode) and meta.st_uid == 0
+          assert 0 < meta.st_size <= 256 * 1024 * 1024 and meta.st_mode & 0o6022 == 0
+          with binary.open("rb") as source:
+              assert source.read(4) == b"\x7fELF"
+          manifest_sha = digest(manifest_path)
+          binary_sha = digest(binary)
+          entry_sha = digest(pathlib.Path("src/bin/maco.rs"))
+          assert json.loads(declaration_path.read_text()) == {
+              "schema": "maco-source-bound-main-helper-v1",
+              "binary_sha256": binary_sha,
+              "source_manifest_sha256": manifest_sha,
+              "main_entry_sha256": entry_sha,
+          }
+          closure = sorted(set(command("nix-store", "--query", "--requisites", str(maco), str(helpers)).splitlines()))
+          assert str(maco) in closure and str(helpers) in closure
+          assert all(re.fullmatch(r"/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+", path)
+                     and not path.endswith(".drv") for path in closure)
+          payload = lane / "runtime-closure.export"
+          with payload.open("xb") as target:
+              subprocess.run(["nix-store", "--export", *closure], stdout=target, check=True)
+          receipt = {
+              "schema": "maco-ci-runtime-closure-v1",
+              "source_revision": revision,
+              "lock_sha256": digest(pathlib.Path("flake.lock")),
+              "maco_root": str(maco),
+              "helpers_root": str(helpers),
+              "source_manifest_sha256": manifest_sha,
+              "binary_sha256": binary_sha,
+              "main_entry_sha256": entry_sha,
+              "payload_sha256": digest(payload),
+              "payload_bytes": payload.stat().st_size,
+          }
+          receipt_path = lane / "runtime-closure.json"
+          with receipt_path.open("x") as target:
+              target.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")) + "\n")
+          outputs = {key: value for key, value in receipt.items() if key not in ("schema", "payload_bytes")}
+          outputs["receipt_sha256"] = digest(receipt_path)
+          (lane / "outputs").write_text("".join(f"{key}={value}\n" for key, value in outputs.items()))
+          print(json.dumps(receipt, sort_keys=True))
+          PY
+          # Only validated public hashes and store roots enter independent job outputs.
+          cat "$NIX_CI_LANE/outputs" >> "$GITHUB_OUTPUT"
+          sha256sum --check "$NIX_CI_LANE/flake.lock.sha256"
+
+      - name: Upload only the public closure and its receipt
+        id: upload
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: maco-runtime-${{ steps.export.outputs.source_revision }}-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            ${{ steps.install_nix.outputs.lane }}/runtime-closure.export
+            ${{ steps.install_nix.outputs.lane }}/runtime-closure.json
+          if-no-files-found: error
+          overwrite: false
+          compression-level: 0
+          retention-days: 7

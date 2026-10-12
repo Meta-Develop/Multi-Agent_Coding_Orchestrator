@@ -14,6 +14,91 @@ and matching `apps` so `nix profile install` and `nix run` work. The package
 builds the release `maco` binary with the Rust toolchain selected by
 `rust-toolchain.toml`.
 
+On Linux the same locked root-workspace build also includes the existing
+`coding-agent-manager` binary `account-authority`. The output contains
+`bin/maco`, `bin/account-authority`, and `source-manifest.json` beside `bin/`.
+It also installs identical manifest bytes at `share/maco/source-manifest.json`
+and the protected main declaration at `share/maco/main-helper.json`.
+Darwin retains the `maco`-only output. The app and default package still select
+`maco`; packaging does not start an authority or provider.
+
+The deterministic manifest records `schema_version: 1`, `source_revision`,
+`source_state`, and sorted relative source entries. Regular files carry their
+SHA-256, size, and executable bit; symbolic links carry a SHA-256 of their link
+target bytes and are not followed. It binds the immutable package fileset,
+including both crates, the root lockfile, flake definition/lockfile, and Rust
+toolchain file. It excludes the desktop source and private runtime data; it is
+not a manifest of the entire repository. It contains no build timestamps or
+machine-local source paths. Dirty and unknown inputs remain dirty and unknown.
+
+The Linux build exports `MACO_SOURCE_MANIFEST_SHA256` from those generated
+manifest bytes before Cargo compilation. This is a build-phase input read,
+with no import-from-derivation. After stripping and other binary fixups, the
+package writes a deterministic declaration with exactly four fields:
+
+```json
+{
+  "schema": "maco-source-bound-main-helper-v1",
+  "binary_sha256": "<SHA-256 of final bin/maco>",
+  "source_manifest_sha256": "<SHA-256 of installed manifest bytes>",
+  "main_entry_sha256": "<SHA-256 of immutable src/bin/maco.rs>"
+}
+```
+
+The main remains a regular native ELF, not a wrapper or symlink. Both manifest
+copies and the declaration are regular, bounded files installed with mode
+0444. The Linux install check verifies these hashes, exact declaration fields,
+ELF header, CLI version/revision/state, helper `--help`, and identical manifest
+copies. Store finalization supplies root ownership after the build user exits;
+installCheck does not claim to have passed protected root-owned runtime capture
+inside the build sandbox. It performs no login or listener startup and does
+not establish runtime containment.
+
+Linux additionally exports `packages.<system>.runtime-test-helpers`. Its five
+links resolve to genuine locked Nix store executables: coreutils `env`, `sleep`
+and `stat`, Bash `sh`, and util-linux `findmnt`. This output supplies existing
+runtime test prerequisites without replacing the main binary or changing the
+default package/app. Darwin receives neither this output nor the Linux main
+declaration and compile binding.
+
+### Source-bound Linux CI
+
+Rust CI calls the reusable Nix package workflow once. The producer evaluates
+the Linux and Darwin package derivations and builds only the Linux package and
+helper output. Evaluation and build use both `--no-update-lock-file` and
+`--no-write-lock-file`, sandboxing, one build job and one core. The lockfile hash
+must remain unchanged. Only checksum-verified official Nix 2.35.2 is installed,
+and only on ephemeral GitHub-hosted Linux runners; the shared installer passes
+an allowlisted environment without credential exports to curl and the official
+installer. The package workflow also supports manual diagnostics but has no
+separate automatic PR/push build.
+
+The producer exports the complete public runtime closure with standard
+`nix-store --export` and uploads only that payload and its public JSON receipt.
+Independent producer outputs bind the artifact ID, receipt/payload hashes,
+selected checkout revision, lockfile, exact store roots, installed manifest,
+final main ELF and entry source. The three library shards and integration job
+download that exact artifact in the same run. They verify hashes before parsing
+the receipt or importing into a real Nix store, retain normal signature/trust
+policy, and check protected ancestry, final bytes and checkout source entries.
+No consumer rebuilds the Nix source package.
+
+Before its first Cargo compilation, each consumer sets the same
+`MACO_SOURCE_MANIFEST_SHA256` and the existing
+`MACO_CURSOR_MAIN_HELPER_FOR_TEST`, `MACO_CURSOR_MAIN_HELPER_SHA256_FOR_TEST`
+and `MACO_CURSOR_MAIN_HELPER_SOURCE_SHA256_FOR_TEST` qualification inputs from
+that verified package. The genuine helper output precedes other PATH entries.
+Package and controller use the exact PR head (or push SHA), not different
+synthetic-merge and head sources. Existing delegated user-manager, namespace,
+cgroup and test partition gates still run; missing producer/import/binding
+fails the required aggregate rather than skipping tests. No credentials,
+private homes, mutable caches or deployment records enter the artifact.
+
+This CI package is a candidate for that source revision. It does not establish
+accepted default-branch installation, fresh-shell invocation, persistent CAM
+authority or provider/runtime acceptance. The deployment gates below still
+apply.
+
 From a checkout of this repository:
 
 ```bash
@@ -100,6 +185,23 @@ data directory: `$XDG_DATA_HOME/coding-agent-manager`, or
 `$HOME/.local/share/coding-agent-manager` when `XDG_DATA_HOME` is unset.
 The service and MACO must share that data-directory identity. Installing the
 service does not complete owner OAuth or select a pending account.
+
+The package output supplies the Linux binaries and source manifest, not their
+host deployment. The Windows GUI additionally requires its existing private
+`authority-connection.json` record and the fixed root-protected WSL launcher
+`/usr/local/libexec/maco-account-authority` resolving to the accepted package's
+`bin/account-authority`. That record binds the distribution, non-root user/UID,
+socket, helper path and ELF SHA-256, source-manifest SHA-256, and authority ID.
+Use hashes of the final installed helper and manifest, not intermediate build
+artifacts. The relay verifies those bindings and protected package ancestry;
+a user-writable Cargo install alone does not meet that deployment contract.
+
+Installing that launcher, connection record, and same-user persistent service
+is a separate reviewed deployment step. This flake does not write them, enable
+lingering, change user-manager lifetime, install the Windows GUI, or select an
+account. Package checks do not establish accepted-default-branch status,
+fresh-shell invocation, GUI-to-WSL principal continuity, owner login, or actual
+delegated Linux runtime containment; each still needs its own acceptance proof.
 
 ## Version recording
 
