@@ -9766,42 +9766,98 @@ mod tests {
         observation: &AccountObserveResult,
         advertised: &AdvertisedCatalogSet,
     ) -> Result<SelectionInput> {
+        selection_input_with_account_observation_and_assessment(
+            observation,
+            advertised,
+            None,
+            None,
+            None,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn selection_input_with_account_observation_and_assessment(
+        observation: &AccountObserveResult,
+        advertised: &AdvertisedCatalogSet,
+        assessment: Option<&TaskRoutingAssessment>,
+        final_features: Option<&crate::selection::routing_policy::TaskRoutingFeatures>,
+        frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+    ) -> Result<SelectionInput> {
         let catalog = codex_catalog()?;
         let admission = test_admission();
         let resolved = default_resolved_profile();
-        selection_input_for_role(SelectionInputForRoleArgs {
-            role: AgentRole::Worker,
-            runtime: SupervisorRuntime::Codex,
-            catalog: &catalog,
-            advertised,
-            admission: &admission,
-            resolved_objective_profile: &resolved,
-            quota_context: None,
-            quota_ledger: None,
-            account_observation: Some(observation),
-            signals: DynamicSignals {
-                retry_count: 0,
-                budget_signal: BudgetSignal::Continue,
-                previous_choice: None,
-                previous_catalog_digest: None,
-                environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+        selection_input_for_role_with_assessment(
+            SelectionInputForRoleArgs {
+                role: AgentRole::Worker,
+                runtime: SupervisorRuntime::Codex,
+                catalog: &catalog,
+                advertised,
+                admission: &admission,
+                resolved_objective_profile: &resolved,
+                quota_context: None,
+                quota_ledger: None,
+                account_observation: Some(observation),
+                signals: DynamicSignals {
+                    retry_count: 0,
+                    budget_signal: BudgetSignal::Continue,
+                    previous_choice: None,
+                    previous_catalog_digest: None,
+                    environment_rejections: Vec::new(),
+                    observed_cost_per_accepted_task_microunits: None,
+                },
+                debug_override: None,
+                history: None,
             },
-            debug_override: None,
-            history: None,
-        })
+            assessment,
+            final_features,
+            frozen,
+        )
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn account_observe_admits_only_observed_model_and_effort() -> Result<()> {
+        use crate::selection::routing_policy::{
+            bind_routing_policy, load_routing_policy, RoutingPolicyReceipt, UnknownAccessPolicy,
+        };
+
+        let policy_root = tempfile::tempdir()?;
+        let frozen = load_routing_policy(policy_root.path())?;
+        assert_eq!(
+            frozen.policy.unknown_access_policy,
+            UnknownAccessPolicy::UnknownAccessForProductiveAttempt
+        );
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let mut plan = test_plan();
+        plan.task = "Create marker.txt with one line: ready".to_string();
+        plan.assignments = vec![serde_json::from_value(json!({
+            "id":"marker", "phase":"execution", "role":"worker",
+            "task": &plan.task, "assigned_paths":["marker.txt"]
+        }))?];
+        let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(json!({
+            "fragments":[{"id":"marker", "text": &plan.task}],
+            "assignments":[{"id":"marker", "task": &plan.task,
+                "fragment_ids":["marker"], "assigned_paths":["marker.txt"],
+                "semantic_symbols":[], "semantic_modules":[]}],
+            "diagnostics":{"degraded":false, "notes":[]},
+            "disjointness":{"disjoint":true, "conflicts":[]}
+        }))?;
+        let assessment =
+            super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+        let features = routing_features_with_assessment(&plan, Some(&assessment), Some(&frozen))?;
         let observation = account_observe_result(
             "codex-cli",
             observed_sol_high_xhigh(),
             Some(CategoryObservation::unknown()),
         );
         let advertised = advertised_with_cursor(captured_cursor_observation()?);
-        let input = selection_input_with_account_observation(&observation, &advertised)?;
+        let input = selection_input_with_account_observation_and_assessment(
+            &observation,
+            &advertised,
+            Some(&assessment),
+            Some(&features),
+            Some(&frozen),
+        )?;
         assert_eq!(input.catalogs.len(), 1);
         assert_eq!(input.catalogs[0].runtime, "codex");
         assert_eq!(input.catalogs[0].models.len(), 1);
@@ -9814,7 +9870,12 @@ mod tests {
             .catalogs
             .iter()
             .all(|catalog| catalog.runtime != "cursor"));
-        let decision = selection::select(&input)?;
+        let receipt = RoutingPolicyReceipt {
+            frozen,
+            role: AgentRole::Worker.as_str().to_string(),
+            features,
+        };
+        let decision = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
         let choice = decision.choice.as_ref().context("observed worker choice")?;
         assert_eq!(choice.candidate.runtime, "codex");
         assert_eq!(choice.candidate.model, FRONTIER_PROFILE_MODEL);

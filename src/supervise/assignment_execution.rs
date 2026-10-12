@@ -677,7 +677,7 @@ fn bind_selected_runtime_launch(
         );
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
-    if gemini_read_only || managed_control_parent {
+    if gemini_read_only || (managed_control_parent && launch_runtime != SupervisorRuntime::Fake) {
         command = command.with_workspace_access(WorkspaceAccess::ReadOnly);
     }
     if launch_runtime.is_adapter_subprocess()

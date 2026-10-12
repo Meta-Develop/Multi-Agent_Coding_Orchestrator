@@ -194,9 +194,12 @@ fn evaluation_experiment_cli_runs_two_profiles_as_json() -> Result<()> {
 
     let working = TempDir::new().context("create empty experiment cwd")?;
     let manifest_path = fixture_path("experiment-manifest-v1.json");
+    let absent_authority_socket = working.path().join("absent-authority.sock");
+    assert!(!absent_authority_socket.exists());
 
     let output = Command::new(BIN)
         .current_dir(working.path())
+        .env("MACO_CAM_AUTHORITY_SOCKET", &absent_authority_socket)
         .arg("evaluation")
         .arg("experiment")
         .arg(&manifest_path)

@@ -4740,6 +4740,20 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
     plan_metadata: &mut SupervisorPlanMetadata,
     request: PreparedSupervisorSelectionRequest<'_>,
 ) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_catalog_discovery(
+        plan,
+        plan_metadata,
+        request,
+        advertised_catalogs_for_launch,
+    )
+}
+
+fn initialize_supervisor_selection_with_catalog_discovery(
+    plan: &mut SupervisorPlan,
+    plan_metadata: &mut SupervisorPlanMetadata,
+    request: PreparedSupervisorSelectionRequest<'_>,
+    discover_catalogs: impl FnOnce(&Path) -> Result<AdvertisedCatalogSet>,
+) -> Result<SupervisorSelectionResolution> {
     let PreparedSupervisorSelectionRequest {
         repo,
         current_run,
@@ -4773,7 +4787,19 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             selection_preflight_failure: None,
         }),
         Ok(catalog) => {
-            let advertised = advertised_catalogs_for_launch(repo)?;
+            // Model labels do not select an executor. Only an acquired local
+            // Fake catalog with no authored real executor can avoid discovery.
+            let local_deterministic_fake = runtime == SupervisorRuntime::Fake
+                && matches!(catalog, RuntimeModelCatalog::LocalDeterministicFake)
+                && plan.assignments.iter().all(|assignment| {
+                    assignment.runtime.is_none()
+                        || assignment.runtime == Some(SupervisorRuntime::Fake)
+                });
+            let advertised = if local_deterministic_fake {
+                AdvertisedCatalogSet::empty()
+            } else {
+                discover_catalogs(repo)?
+            };
             #[cfg(all(test, target_os = "linux"))]
             let advertised = CAM_OBSERVE_TEST_OVERRIDE
                 .with(|cell| {
@@ -4900,22 +4926,27 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
                 #[cfg(target_os = "linux")]
-                freeze_selected_codex_launch_binding(current_run.map(RunId::as_str))?;
-                #[cfg(target_os = "linux")]
-                if plan
-                    .assignments
-                    .iter()
-                    .any(|assignment| assignment.runtime == Some(SupervisorRuntime::ClaudeCode))
+                // Automatic state supplies budget-selected Worker/Auditor
+                // runtimes. Any such state or decision retains account binding.
+                if !local_deterministic_fake
+                    || resolution.automatic_state.is_some()
+                    || !resolution.decisions.is_empty()
                 {
-                    freeze_selected_claude_launch_binding(current_run.map(RunId::as_str))?;
+                    freeze_selected_codex_launch_binding(current_run.map(RunId::as_str))?;
+                    if plan
+                        .assignments
+                        .iter()
+                        .any(|assignment| assignment.runtime == Some(SupervisorRuntime::ClaudeCode))
+                    {
+                        freeze_selected_claude_launch_binding(current_run.map(RunId::as_str))?;
+                    }
+                    freeze_selected_secondary_managed_launch_bindings(
+                        plan,
+                        &resolution.decisions,
+                        runtime,
+                        current_run.map(RunId::as_str),
+                    )?;
                 }
-                #[cfg(target_os = "linux")]
-                freeze_selected_secondary_managed_launch_bindings(
-                    plan,
-                    &resolution.decisions,
-                    runtime,
-                    current_run.map(RunId::as_str),
-                )?;
             }
             Ok(resolution)
         }
@@ -6101,11 +6132,50 @@ mod selection_policy_tests {
         })
     }
 
+    fn assessed_selection_fixture() -> Result<(
+        SupervisorPlan,
+        TaskRoutingAssessment,
+        crate::selection::routing_policy::FrozenRoutingPolicy,
+    )> {
+        use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+
+        let policy: LoadedRoutingPolicy =
+            serde_json::from_str(include_str!("../selection/data/routing-policy.json"))?;
+        policy.validate()?;
+        let frozen = FrozenRoutingPolicy {
+            sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+            policy,
+            source: "public-scheduler-selection-fixture".to_string(),
+        };
+        let mut plan = test_plan();
+        plan.task = format!("Create {SELECTOR_TEST_TARGET} with one line: ready");
+        plan.assignments = vec![serde_json::from_value(serde_json::json!({
+            "id":"selector-parent", "phase":"execution", "role":"child_orchestrator",
+            "task": &plan.task, "assigned_paths":["tests"], "worker_assignments":[
+                {"id":"selector-worker", "role":"worker", "task": &plan.task,
+                    "assigned_paths":[SELECTOR_TEST_TARGET]}
+            ]
+        }))?];
+        let proposal: crate::planning::TaskDecompositionProposal =
+            serde_json::from_value(serde_json::json!({
+                "fragments":[{"id":"selector", "text": &plan.task}],
+                "assignments":[{"id":"selector-worker", "task": &plan.task,
+                    "fragment_ids":["selector"], "assigned_paths":[SELECTOR_TEST_TARGET],
+                    "semantic_symbols":[], "semantic_modules":[]}],
+                "diagnostics":{"degraded":false, "notes":[]},
+                "disjointness":{"disjoint":true, "conflicts":[]}
+            }))?;
+        let assessment =
+            super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+        Ok((plan, assessment, frozen))
+    }
+
     fn automatic_selection_fixture() -> Result<(
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         Vec<SupervisorSelectionEvent>,
         SupervisorPlan,
+        crate::selection::routing_policy::FrozenRoutingPolicy,
     )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -6143,16 +6213,22 @@ mod selection_policy_tests {
             },
             resolved_bound: 1,
         };
-        let mut plan = test_plan();
+        let (mut plan, assessment, frozen) = assessed_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let resolution = initialize_supervisor_selection(
-            &mut plan,
-            SupervisorRuntime::Codex,
-            &catalog,
-            &admission,
-            &AdvertisedCatalogSet::empty(),
-            Some(&resolved_objective_profile),
-        )?;
+        let resolution =
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                &mut plan,
+                SupervisorRuntime::Codex,
+                &catalog,
+                &admission,
+                &AdvertisedCatalogSet::empty(),
+                Some(&resolved_objective_profile),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                &[],
+                Some(&assessment),
+            )?;
         Ok((
             catalog,
             resolution
@@ -6160,6 +6236,7 @@ mod selection_policy_tests {
                 .context("automatic selector same-run state")?,
             resolution.decisions,
             plan,
+            frozen,
         ))
     }
 
@@ -6217,7 +6294,7 @@ mod selection_policy_tests {
 
     #[test]
     fn worker_role_binding_uses_unanimous_cross_runtime_assignment_evidence() -> Result<()> {
-        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        let (catalog, _, initial_events, mut plan, _) = automatic_selection_fixture()?;
         plan.assignments = vec![
             terminal_worker_assignment("worker-a"),
             terminal_worker_assignment("worker-b"),
@@ -6304,7 +6381,7 @@ mod selection_policy_tests {
 
     #[test]
     fn worker_role_binding_keeps_heterogeneous_assignments_explicit() -> Result<()> {
-        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        let (catalog, _, initial_events, mut plan, _) = automatic_selection_fixture()?;
         plan.assignments = vec![
             terminal_worker_assignment("worker-a"),
             terminal_worker_assignment("worker-b"),
@@ -6685,7 +6762,8 @@ mod selection_policy_tests {
 
     #[test]
     fn completed_retry_promotes_matching_execution_override_and_reroute_state() -> Result<()> {
-        let (catalog, state, _, plan) = automatic_selection_fixture()?;
+        let (catalog, state, _, plan, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let mut controller = BudgetDegradationController::new_with_selection_state(
             2,
             Some(state),
@@ -6875,7 +6953,8 @@ mod selection_policy_tests {
 
     #[test]
     fn commit_prefix_feeds_complete_cpo_into_shared_policy_reselect() -> Result<()> {
-        let (catalog, state, _, _) = automatic_selection_fixture()?;
+        let (catalog, state, _, _, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let mut controller = BudgetDegradationController::new_with_selection_state(
             2,
             Some(state),
@@ -6942,7 +7021,8 @@ mod selection_policy_tests {
 
     #[test]
     fn concurrent_retries_share_predispatch_state_and_commit_in_schedule_order() -> Result<()> {
-        let (catalog, state, initial_events, plan) = automatic_selection_fixture()?;
+        let (catalog, state, initial_events, plan, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
         let initial_worker = initial_events
             .iter()
             .find(|event| event.role == AgentRole::Worker)
@@ -6962,9 +7042,12 @@ mod selection_policy_tests {
             for (index, mut policy) in policies.into_iter().enumerate() {
                 let barrier = barrier.clone();
                 let catalog = &catalog;
+                let frozen = frozen.clone();
                 handles.push(scope.spawn(
                     move || -> Result<(usize, SupervisorSelectionEvent, RoleModelSelection)> {
                         barrier.wait();
+                        let _policy =
+                            crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
                         let events = policy.reselect(
                             SupervisorRuntime::Codex,
                             catalog,
@@ -7191,7 +7274,8 @@ mod selection_policy_tests {
     #[test]
     fn empty_role_model_test_catalog_supports_verified_automatic_selection() -> Result<()> {
         let (temporary, repo) = initialized_repository();
-        let mut plan = test_plan();
+        let (mut plan, assessment, frozen) = assessed_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
         let priors = crate::selection::built_in_prior_dataset()?;
         let RuntimeModelCatalog::Codex(codex_catalog) = &catalog else {
@@ -7212,14 +7296,19 @@ mod selection_policy_tests {
         )?;
 
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let resolution = initialize_supervisor_selection(
-            &mut plan,
-            SupervisorRuntime::Codex,
-            &catalog,
-            &admission,
-            &AdvertisedCatalogSet::empty(),
-            Some(&resolved_objective_profile),
-        )?;
+        let resolution =
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                &mut plan,
+                SupervisorRuntime::Codex,
+                &catalog,
+                &admission,
+                &AdvertisedCatalogSet::empty(),
+                Some(&resolved_objective_profile),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                &[],
+                Some(&assessment),
+            )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
         assert_eq!(resolution.decisions.len(), 5);
@@ -7627,6 +7716,119 @@ mod selection_policy_tests {
                 ..SupervisorPlanMetadata::default()
             };
             Ok((temporary, repo, catalog, admission, plan, plan_metadata))
+        }
+
+        #[test]
+        fn prepared_local_fake_selection_avoids_discovery_and_account_freezing() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let (_temporary, repo, _, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            let absent_socket = repo.join("absent-authority.sock");
+            assert!(!absent_socket.exists());
+            let _socket = CamAuthoritySocketTestGuard::install(Some(absent_socket.as_os_str()));
+            let run = RunId::new("prepared-local-fake-no-authority")?;
+            let catalog = Ok(RuntimeModelCatalog::LocalDeterministicFake);
+            plan.assignments = vec![super::terminal_worker_assignment("fake-worker")];
+            let original_lenses = plan.review_lenses.clone();
+            for authored_runtime in [None, Some(SupervisorRuntime::Fake)] {
+                plan.assignments[0].runtime = authored_runtime;
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = SupervisorRuntime::Fake;
+                request.current_run = Some(&run);
+                // Verified is the production experiment entrypoint, not the
+                // legacy nonpublishable-simulation shortcut used by unit helpers.
+                let resolution = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("local Fake must not discover real catalogs"),
+                )?;
+                assert_eq!(resolution.mode, SupervisorSelectionMode::LegacyFake);
+                assert!(resolution.selection_preflight_failure.is_none());
+                assert!(resolution.decisions.is_empty());
+                assert!(resolution.automatic_state.is_none());
+                assert_eq!(plan.assignments[0].runtime, authored_runtime);
+                assert_eq!(plan.review_lenses, original_lenses);
+                assert!(metadata.resolved_routing_policy.is_some());
+                assert!(metadata.resolved_objective_profile.is_some());
+                let controller = BudgetDegradationController::new_with_selection_state(
+                    1,
+                    resolution.automatic_state,
+                    SupervisorRuntime::Fake,
+                )?;
+                for role in [AgentRole::Worker, AgentRole::Auditor] {
+                    assert!(controller.policy.selected_runtime_for(role).is_none());
+                }
+                assert!(
+                    crate::account_authority::codex_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(
+                    crate::account_authority::claude_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(crate::account_authority::grok_run_account_binding(run.as_str()).is_none());
+                assert!(
+                    crate::account_authority::gemini_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(
+                    crate::account_authority::cursor_run_account_binding(run.as_str()).is_none()
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn prepared_fake_real_runtime_overrides_retain_catalog_discovery_errors() -> Result<()> {
+            let (_temporary, repo, _, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("mixed-worker")];
+            let catalog = Ok(RuntimeModelCatalog::LocalDeterministicFake);
+            for authored_runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::Cursor,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::GeminiCli,
+            ] {
+                plan.assignments[0].runtime = Some(authored_runtime);
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = SupervisorRuntime::Fake;
+                let error = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("real catalog discovery refused"),
+                )
+                .expect_err("an authored real executor must retain discovery failure");
+                assert_eq!(error.to_string(), "real catalog discovery refused");
+                assert_eq!(plan.assignments[0].runtime, Some(authored_runtime));
+            }
+            // Neither a real primary executor nor a non-local acquired catalog
+            // qualifies, even when assignment runtimes are unspecified.
+            plan.assignments[0].runtime = None;
+            for (runtime, catalog) in [
+                (
+                    SupervisorRuntime::Codex,
+                    RuntimeModelCatalog::LocalDeterministicFake,
+                ),
+                (
+                    SupervisorRuntime::Fake,
+                    RuntimeModelCatalog::OperatorDeclared,
+                ),
+            ] {
+                let catalog = Ok(catalog);
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = runtime;
+                let error = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("real catalog discovery refused"),
+                )
+                .expect_err("Fake runtime and acquired local catalog are both required");
+                assert_eq!(error.to_string(), "real catalog discovery refused");
+            }
+            Ok(())
         }
 
         #[test]
