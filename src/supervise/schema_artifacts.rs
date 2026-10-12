@@ -2422,6 +2422,10 @@ fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
             "task": {"type": "string", "minLength": 1},
             "task_file": {"type": ["string", "null"]},
+            // These optional typed carriers have no separate public nested schema.
+            // Strict serde and the ordinary loader validate their fields and bindings.
+            "resolved_routing_policy": {"type": "object", "additionalProperties": true},
+            "task_routing_assessment": {"type": "object", "additionalProperties": true},
             "max_depth": {"type": "integer"},
             "max_child_assignments": {"type": "integer", "const": 1},
             "max_child_retries": {"type": "integer"},
@@ -4615,6 +4619,163 @@ mod selection_schema_tests {
             schema_accepts_instance(&schema, &instance),
             "generated complete supervisor contract rejected the published valid fixture"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn generated_plan_schema_accepts_emitted_assessment_and_legacy_absence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let frozen = crate::selection::routing_policy::load_routing_policy(temp.path())?;
+        let declaration = LicensedBreakageDeclaration {
+            migration_rationale: "Update the bounded dependent to the renamed API".into(),
+            dependents: vec![LicensedBreakageDependentScope {
+                dependent_id: "client-a".into(),
+                paths: vec![PathBuf::from("src/client.rs")],
+                interfaces: vec!["crate::api::new_name".into()],
+            }],
+        };
+        let assignment = OrchestratorAssignment {
+            id: "source-child".into(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: None,
+            selection_source: None,
+            assigned_paths: vec![PathBuf::from("README.md")],
+            semantic_symbols: Vec::new(),
+            semantic_modules: Vec::new(),
+            task: Some("Apply the licensed README source change".into()),
+            worker_assignments: Vec::new(),
+            environment_requirements: Vec::new(),
+            licensed_breakage: Some(declaration.clone()),
+            notes: None,
+            decision_refs: Vec::new(),
+        };
+        let source_plan = SupervisorPlan {
+            version: SUPERVISOR_SCHEMA_VERSION,
+            task: "Update README.md".into(),
+            task_file: None,
+            max_depth: 2,
+            max_child_assignments: 1,
+            max_child_retries: 0,
+            max_gate_corrections: 0,
+            child_timeout_seconds: 10,
+            semantic_coordination: SemanticCoordinationMode::Off,
+            role_models: BTreeMap::new(),
+            model_pricing: BTreeMap::new(),
+            review_lenses: default_supervisor_review_lenses()
+                .into_iter()
+                .filter(|lens| lens.id == "parent-acceptance")
+                .collect(),
+            review_lens_correlation: ReviewLensCorrelation::default(),
+            review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+            assignments: vec![assignment.clone()],
+        };
+        let mut report: OrchestratorReviewReport = serde_json::from_value(json!({
+            "id": assignment.id,
+            "role": "child_orchestrator",
+            "accepted": true,
+            "rejected": false,
+            "status": "succeeded"
+        }))?;
+        report.licensed_breakage_review = Some(LicensedBreakageReview {
+            declaration_sha256: licensed_breakage_declaration_sha256(&declaration)?,
+            migration_rationale: declaration.migration_rationale.clone(),
+            failures: vec![LicensedDependentFailure {
+                dependent_id: "client-a".into(),
+                validation_name: "client-a".into(),
+                failure_signature: "src/client.rs cannot resolve crate::api::new_name".into(),
+                paths: vec![PathBuf::from("src/client.rs")],
+                interfaces: vec!["crate::api::new_name".into()],
+            }],
+        });
+        let budget = SupervisorBudgetConfig {
+            limits: RunBudgetLimits::default(),
+            role_token_reservations: BTreeMap::from([
+                (AgentRole::ChildOrchestrator, 1),
+                (AgentRole::Auditor, 1),
+            ]),
+        };
+        let candidate = CandidateValidationBinding {
+            version: VALIDATION_BINDING_VERSION,
+            agent_id: assignment.id.clone(),
+            primary_head: None,
+            agent_head: None,
+            merge_base: None,
+            diff_oid: "1".repeat(40),
+        };
+        let schema_id = "https://example.invalid/generated-dependent-assessment";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(
+                schema_id,
+                generated_follow_up_supervisor_plan_schema_value(),
+            )
+            .expect("register generated plan schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile generated plan schema");
+        for policy in [None, Some(frozen.clone())] {
+            let assessed = policy.is_some();
+            let generated = {
+                let _policy = crate::selection::routing_policy::bind_routing_policy(policy)?;
+                let mut tasks = generated_licensed_follow_up_tasks(
+                    &source_plan,
+                    &SupervisorConsultantPlan::default(),
+                    &budget,
+                    &assignment,
+                    &report,
+                    &candidate,
+                )?;
+                assert_eq!(tasks.len(), 1);
+                tasks.remove(0).supervisor_plan
+            };
+            let payload = serde_json::to_value(&generated)?;
+            assert_eq!(payload.get("resolved_routing_policy").is_some(), assessed);
+            assert_eq!(payload.get("task_routing_assessment").is_some(), assessed);
+            schemas.validate(&payload, index).unwrap_or_else(|error| {
+                panic!("schema rejected producer payload (assessed={assessed}): {error:#}")
+            });
+            validate_generated_follow_up_plan_document_in_repo(&generated, None)?;
+            let mut unknown = payload.clone();
+            unknown["extra_dispatch_authority"] = json!(true);
+            assert!(schemas.validate(&unknown, index).is_err());
+            let mut unknown = payload.clone();
+            unknown["generated_follow_up"]["extra_dispatch_authority"] = json!(true);
+            assert!(schemas.validate(&unknown, index).is_err());
+            if !assessed {
+                continue;
+            }
+            let assessment = generated.task_routing_assessment.as_ref().unwrap();
+            assessment.validate_for_task(&frozen, &generated.task)?;
+            assert!(assessment
+                .validate_for_task(&frozen, &source_plan.task)
+                .is_err());
+            for field in ["resolved_routing_policy", "task_routing_assessment"] {
+                for invalid in [json!(null), json!("invalid")] {
+                    let mut malformed = payload.clone();
+                    malformed[field] = invalid;
+                    assert!(schemas.validate(&malformed, index).is_err());
+                }
+            }
+            let mut unknown = payload.clone();
+            unknown["task_routing_assessment"]["extra_dispatch_authority"] = json!(true);
+            assert!(serde_json::from_value::<GeneratedFollowUpSupervisorPlan>(unknown).is_err());
+            // The schema checks carrier shape; the loader checks deterministic semantics.
+            let mut altered = generated.clone();
+            altered
+                .task_routing_assessment
+                .as_mut()
+                .unwrap()
+                .features
+                .risk += 1;
+            assert!(schemas
+                .validate(&serde_json::to_value(&altered)?, index)
+                .is_ok());
+            assert!(validate_generated_follow_up_plan_document_in_repo(&altered, None).is_err());
+        }
         Ok(())
     }
 

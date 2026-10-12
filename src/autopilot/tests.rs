@@ -877,6 +877,26 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
     )
 }
 
+#[cfg(target_os = "linux")]
+fn assessed_licensed_autopilot_supervisor_plan(
+    repo: &Path,
+) -> (Value, LicensedBreakageDeclaration, String) {
+    let (mut plan, declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let assessed = supervise::supervisor_plan_document_from_goal_spec(
+        repo,
+        "Perform the licensed source change in README.md before the bounded dependent update.",
+        "",
+    )
+    .expect("assess the bounded licensed Autopilot source fixture");
+    for key in ["task", "resolved_routing_policy", "task_routing_assessment"] {
+        plan[key] = assessed
+            .get(key)
+            .expect("goal/spec planning must emit bound task assessment metadata")
+            .clone();
+    }
+    (plan, declaration, declaration_sha256)
+}
+
 #[test]
 fn requested_default_stacked_profile_mismatches_licensed_diffonly_free_fixture_and_refuses_dispatch(
 ) {
@@ -1205,7 +1225,8 @@ fn run_injected_licensed_autopilot_cascade_result_with_bounds(
         .expect("serialize injected Autopilot outer plan"),
     )
     .expect("write injected Autopilot outer plan");
-    let (supervisor_plan, _declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let (supervisor_plan, _declaration, declaration_sha256) =
+        assessed_licensed_autopilot_supervisor_plan(repo);
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
     let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
     let mut runner = injected_licensed_autopilot_runner(
@@ -1589,7 +1610,8 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
         .expect("serialize cancelling Autopilot outer plan"),
     )
     .expect("write cancelling Autopilot outer plan");
-    let (supervisor_plan, _declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let (supervisor_plan, _declaration, declaration_sha256) =
+        assessed_licensed_autopilot_supervisor_plan(repo);
     let caller_cancellation = ProcessCancellation::new();
     let source_scheduler_cancellation_observed = Arc::new(AtomicBool::new(false));
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
@@ -1910,7 +1932,8 @@ fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
         RunId::new(format!("{run_name}-supervise")).expect("source supervisor run id");
     let outer_run_id = RunId::new(run_name).expect("outer inbox run id");
     let plan_file = fixture.temp_path().join("bound-source-supervisor.json");
-    let (plan, _declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let (plan, _declaration, declaration_sha256) =
+        assessed_licensed_autopilot_supervisor_plan(repo);
     fs::write(
         &plan_file,
         serde_json::to_vec_pretty(&plan).expect("serialize source supervisor plan"),
@@ -2368,7 +2391,8 @@ fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_ident
         .expect("serialize cross-entrypoint Autopilot plan"),
     )
     .expect("write cross-entrypoint Autopilot plan");
-    let (supervisor_plan, _declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
+    let (supervisor_plan, _declaration, declaration_sha256) =
+        assessed_licensed_autopilot_supervisor_plan(repo);
     let retention = secure_autopilot_machine_global_retention(fixture.temp_path(), run_name);
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
     let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));

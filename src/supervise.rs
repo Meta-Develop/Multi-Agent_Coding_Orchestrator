@@ -2179,6 +2179,10 @@ pub struct GeneratedFollowUpSupervisorPlan {
     pub task: String,
     #[serde(serialize_with = "serialize_optional_path")]
     pub task_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_routing_policy: Option<crate::selection::routing_policy::FrozenRoutingPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_routing_assessment: Option<TaskRoutingAssessment>,
     pub max_depth: u8,
     pub max_child_assignments: usize,
     pub max_child_retries: u8,
@@ -2200,6 +2204,42 @@ pub struct GeneratedFollowUpSupervisorPlan {
 }
 
 impl GeneratedFollowUpSupervisorPlan {
+    /// Assess this dependent's declaration, never the source task's assessment.
+    /// The ordinary loader replays this exact scope to reject substituted metadata.
+    pub(crate) fn assess_task_routing_for_plan(
+        plan: &SupervisorPlan,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    ) -> Result<TaskRoutingAssessment> {
+        let assignment = plan
+            .assignments
+            .first()
+            .filter(|_| plan.assignments.len() == 1)
+            .context("generated task assessment requires exactly one assignment")?;
+        if !assignment.worker_assignments.is_empty() {
+            bail!("generated task assessment requires the exact terminal dependent scope");
+        }
+        let fragment_id = "licensed-dependent-update".to_string();
+        let proposal = planning::TaskDecompositionProposal {
+            fragments: vec![planning::TaskSpecFragment {
+                id: fragment_id.clone(),
+                text: plan.task.clone(),
+            }],
+            assignments: vec![planning::TaskAssignmentProposal {
+                id: assignment.id.clone(),
+                task: assignment.task.clone().unwrap_or_else(|| plan.task.clone()),
+                fragment_ids: vec![fragment_id],
+                assigned_paths: assignment.assigned_paths.clone(),
+                semantic_symbols: assignment.semantic_symbols.clone(),
+                semantic_modules: assignment.semantic_modules.clone(),
+                decision_dependencies: Vec::new(),
+            }],
+            coverage_gaps: Vec::new(),
+            diagnostics: planning::TaskPathProposalDiagnostics::default(),
+            disjointness: planning::TaskDisjointnessReport::default(),
+        };
+        task_routing::assess_task_routing(&plan.task, &proposal, frozen)
+    }
+
     fn bind_assignment_role_categories(&mut self) {
         for assignment in &mut self.assignments {
             assignment.bind_role_category();

@@ -3465,6 +3465,8 @@ mod tests {
             version: 1,
             task: format!("dispatch dependent update {suffix}"),
             task_file: None,
+            resolved_routing_policy: None,
+            task_routing_assessment: None,
             max_depth: 2,
             max_child_assignments: 1,
             max_child_retries: 0,
@@ -3499,6 +3501,161 @@ mod tests {
             dispatch_status: GeneratedFollowUpDispatchStatus::DeferredForPlannedRun,
             handoff,
         }
+    }
+
+    fn assessed_generated_task(repo: &Path) -> GeneratedFollowUpTaskRecord {
+        let mut task = generated_task("01");
+        let frozen = crate::selection::routing_policy::load_routing_policy(repo)
+            .expect("validated repository routing policy");
+        task.supervisor_plan.task_routing_assessment = Some(
+            GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                &task.supervisor_plan.ordinary_plan(),
+                &frozen,
+            )
+            .expect("assess the exact dependent declaration"),
+        );
+        task.supervisor_plan.resolved_routing_policy = Some(frozen);
+        task
+    }
+
+    #[test]
+    fn assessed_generated_task_survives_loader_and_authenticated_queue_replay() {
+        let (_temp, repo) = repository();
+        let task = assessed_generated_task(&repo);
+        let encoded = serde_json::to_vec(&task).expect("encode assessed dependent");
+        let decoded: GeneratedFollowUpTaskRecord =
+            serde_json::from_slice(&encoded).expect("decode assessed dependent");
+        assert_eq!(decoded, task);
+        assert_eq!(
+            validate_generated_follow_up_plan_document_in_repo(&task.supervisor_plan, Some(&repo))
+                .expect("ordinary full-document loader accepts bound metadata"),
+            task.supervisor_plan.ordinary_plan()
+        );
+        let source = source(&repo, "source-assessed-dependent");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue
+            .enqueue_all_before_dispatch(std::slice::from_ref(&task))
+            .expect("enqueue assessed dependent");
+        let item_id = queue.snapshot().pending_item_ids()[0].to_string();
+        let snapshot = queue.snapshot().clone();
+        assert_eq!(queue.replay_snapshot().expect("replay"), snapshot);
+        drop(queue);
+        let reopened = GeneratedFollowUpQueue::open(authenticator(&repo), &source)
+            .expect("reopen authenticated queue");
+        assert_eq!(reopened.snapshot(), &snapshot);
+        let item = reopened.snapshot().item(&item_id).expect("queued item");
+        assert_eq!(item.task(), &task);
+        assert_eq!(item.phase(), GeneratedFollowUpQueuePhase::Enqueued);
+    }
+
+    #[test]
+    fn generated_assessment_tampering_refuses_before_queue_admission() {
+        let (_temp, repo) = repository();
+        let task = assessed_generated_task(&repo);
+        let mut changed_task = task.clone();
+        changed_task
+            .supervisor_plan
+            .task
+            .push_str(" different task");
+        let mut changed_assignment = task.clone();
+        changed_assignment.supervisor_plan.assignments[0].task = Some("different update".into());
+        let mut changed_scope = task.clone();
+        changed_scope.supervisor_plan.assignments[0].assigned_paths =
+            vec![std::path::PathBuf::from("src/other.rs")];
+        let mut substituted_scope = task.clone();
+        substituted_scope.supervisor_plan.task_routing_assessment = Some(
+            GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                &changed_scope.supervisor_plan.ordinary_plan(),
+                task.supervisor_plan
+                    .resolved_routing_policy
+                    .as_ref()
+                    .unwrap(),
+            )
+            .expect("valid assessment for a different exact scope"),
+        );
+        let mut source_plan = task.supervisor_plan.ordinary_plan();
+        source_plan.task = "Update README.md".into();
+        source_plan.assignments[0].task = Some("Update README.md".into());
+        source_plan.assignments[0].assigned_paths = vec![std::path::PathBuf::from("README.md")];
+        let mut copied_source_assessment = task.clone();
+        copied_source_assessment
+            .supervisor_plan
+            .task_routing_assessment = Some(
+            GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                &source_plan,
+                task.supervisor_plan
+                    .resolved_routing_policy
+                    .as_ref()
+                    .unwrap(),
+            )
+            .expect("valid assessment for the separate README source task"),
+        );
+        let mut changed_score = task.clone();
+        changed_score
+            .supervisor_plan
+            .task_routing_assessment
+            .as_mut()
+            .unwrap()
+            .features
+            .risk += 1;
+        let mut changed_policy = task.clone();
+        changed_policy
+            .supervisor_plan
+            .resolved_routing_policy
+            .as_mut()
+            .unwrap()
+            .sha256 = "0".repeat(64);
+        let mut missing_policy = task.clone();
+        missing_policy.supervisor_plan.resolved_routing_policy = None;
+        let mut queue = GeneratedFollowUpQueue::create(
+            authenticator(&repo),
+            source(&repo, "source-assessment-tamper"),
+            bounds(1),
+        )
+        .expect("create queue");
+        for (label, altered) in [
+            ("canonical task", changed_task),
+            ("assignment task", changed_assignment),
+            ("assigned scope", changed_scope),
+            ("valid assessment for another scope", substituted_scope),
+            ("copied README source assessment", copied_source_assessment),
+            ("estimated score", changed_score),
+            ("frozen policy digest", changed_policy),
+            ("assessment without policy", missing_policy),
+        ] {
+            assert!(
+                validate_generated_follow_up_plan_document_in_repo(
+                    &altered.supervisor_plan,
+                    Some(&repo)
+                )
+                .is_err(),
+                "ordinary loader admitted altered {label}"
+            );
+            assert!(
+                queue.enqueue_all_before_dispatch(&[altered]).is_err(),
+                "queue admitted altered {label}"
+            );
+            assert_eq!(queue.journal.records().len(), 1);
+        }
+        assert!(queue.snapshot().items().is_empty());
+        assert!(!queue.snapshot().enqueue_committed());
+    }
+
+    #[test]
+    fn legacy_generated_task_does_not_acquire_an_assessment() {
+        let task = generated_task("01");
+        let value = serde_json::to_value(&task.supervisor_plan).expect("encode legacy plan");
+        assert!(value.get("resolved_routing_policy").is_none());
+        assert!(value.get("task_routing_assessment").is_none());
+        let plan = validate_generated_follow_up_plan_document_in_repo(&task.supervisor_plan, None)
+            .expect("legacy structural loading remains supported");
+        assert!(
+            crate::supervise::task_routing_assessment_from_plan_document(&plan, &value)
+                .expect("read legacy metadata without synthesizing risk")
+                .is_none()
+        );
     }
 
     fn cited_generated_task(suffix: &str) -> GeneratedFollowUpTaskRecord {

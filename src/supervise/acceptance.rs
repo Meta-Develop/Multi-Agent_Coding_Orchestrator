@@ -1077,10 +1077,25 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 handoff: handoff.clone(),
                 operator_defaults: generated_follow_up_operator_defaults(),
             };
+            // The scheduler binds and propagates this validated parent policy.
+            // Legacy unassessed inputs remain unassessed and fail closed at selection.
+            let resolved_routing_policy = crate::selection::routing_policy::current_routing_policy();
+            let task_routing_assessment = resolved_routing_policy
+                .as_ref()
+                .filter(|frozen| frozen.policy.task_estimation.is_some())
+                .map(|frozen| {
+                    GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                        &ordinary_plan,
+                        frozen,
+                    )
+                })
+                .transpose()?;
             let mut supervisor_plan = GeneratedFollowUpSupervisorPlan {
                 version: ordinary_plan.version,
                 task: ordinary_plan.task.clone(),
                 task_file: ordinary_plan.task_file.clone(),
+                resolved_routing_policy,
+                task_routing_assessment,
                 max_depth: ordinary_plan.max_depth,
                 max_child_assignments: ordinary_plan.max_child_assignments,
                 max_child_retries: ordinary_plan.max_child_retries,
@@ -1110,6 +1125,10 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 || loaded.plan_metadata.run_budget != supervisor_plan.run_budget
                 || loaded.plan_metadata.generated_follow_up
                     != Some(supervisor_plan.generated_follow_up.clone())
+                || loaded.plan_metadata.resolved_routing_policy
+                    != supervisor_plan.resolved_routing_policy
+                || loaded.plan_metadata.task_routing_assessment
+                    != supervisor_plan.task_routing_assessment
             {
                 bail!("generated follow-up supervisor plan changed across the ordinary plan loader");
             }

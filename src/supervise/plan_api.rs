@@ -3490,6 +3490,8 @@ pub(crate) fn validate_generated_follow_up_plan_document_in_repo(
         || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
         || loaded.plan_metadata.run_budget != generated.run_budget
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
+        || loaded.plan_metadata.resolved_routing_policy != generated.resolved_routing_policy
+        || loaded.plan_metadata.task_routing_assessment != generated.task_routing_assessment
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
     {
         bail!("ordinary full-document loader changed generated follow-up authority");
@@ -3786,6 +3788,14 @@ fn validate_task_routing_assessment_binding(
     let historical = metadata.evidence_only_reaudit.is_some();
     if !historical {
         assessment.validate_for_task(frozen, &plan.task)?;
+        if metadata.generated_follow_up.is_some()
+            && *assessment
+                != GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(plan, frozen)?
+        {
+            bail!(
+                "generated task assessment differs from the exact dependent declaration or scope"
+            );
+        }
     }
     if let Some(selected) = &metadata.normal_intake_selection {
         let features = &selected.task_features;
