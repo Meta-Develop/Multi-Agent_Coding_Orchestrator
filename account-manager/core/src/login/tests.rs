@@ -1230,7 +1230,10 @@ async fn cursor_caller_managed_operation_binds_native_url_and_refuses_stale_or_l
     .expect("actual adapter stdout reached operation");
     assert_eq!(authorization.authorization_url, url);
     assert!(authorization.expires_at_unix_ms.is_some());
-    assert!(!format!("{authorization:?}").contains("cursor.com"));
+    let public_status = service
+        .status(&status.handle, &status.binding)
+        .expect("bound live status");
+    assert!(!format!("{public_status:?}").contains("cursor.com"));
     let replay = service
         .start_pending_oauth_with_browser_mode(
             request.clone(),
