@@ -7260,6 +7260,8 @@ mod tests {
     #[test]
     fn runtime_reselection_returns_matching_executable_runtime_binding() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
+        let frozen = crate::selection::routing_policy::current_routing_policy()
+            .context("runtime reselection fixture policy")?;
         let catalog = codex_catalog()?;
         let mut plan = test_plan();
         let resolution = initialize_supervisor_selection(
@@ -7272,6 +7274,13 @@ mod tests {
         let mut state = resolution
             .automatic_state
             .context("automatic runtime-switch replay state")?;
+        let initial_policy_receipt = state
+            .decisions
+            .get(&AgentRole::Worker)
+            .and_then(|decision| decision.routing_policy.as_ref())
+            .context("initial worker frozen-policy receipt")?
+            .clone();
+        assert_eq!(initial_policy_receipt.frozen, frozen);
         let previous = state
             .decisions
             .get(&AgentRole::Worker)
@@ -7320,9 +7329,11 @@ mod tests {
             choice.switch_transition,
             selection::ContextSwitchTransition::RuntimeChange
         );
+        assert_eq!(choice.reason, selection::ChoiceReason::LoadedRoutingPolicy);
         assert_eq!(
-            choice.reason,
-            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
+            reselection.decisions[0].1.routing_policy.as_ref(),
+            Some(&initial_policy_receipt),
+            "runtime replay must preserve the exact frozen policy, role, and assessed task features"
         );
         assert_eq!(choice.candidate.runtime, "cursor");
         let previous_score = reselection.decisions[0]

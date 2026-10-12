@@ -14121,7 +14121,11 @@ done
         );
         assert_eq!(
             active_plan.review_lenses[1].backend.reasoning_effort(),
-            Some("xhigh")
+            Some("ultra")
+        );
+        assert_eq!(
+            active_plan.review_lenses[1], plan.review_lenses[1],
+            "the heterogeneous lens must retain its complete independent configuration"
         );
         assert_eq!(
             active_policy.selected_runtime_for(AgentRole::Auditor),
@@ -14150,6 +14154,7 @@ done
             diff: "retry diff",
             output_report: "retry output report",
         };
+        let raw_primary_request = build_review_lens_request(&plan.review_lenses[0], sources)?;
         let raw_custom_request = build_review_lens_request(&plan.review_lenses[1], sources)?;
         let assignment = &active_plan.assignments[0];
         let required_coverage = ReviewCoverageRequirement {
@@ -14163,16 +14168,22 @@ done
             validate_review_lens_runtime_selection(lens, SupervisorRuntime::Codex, &catalog)?;
             let request = build_review_lens_request(lens, sources)?;
             if lens_index == 1 {
-                assert_ne!(
+                assert_eq!(
                     request.request_binding, raw_custom_request.request_binding,
-                    "the active request binding must seal the final assignment-clamped effort"
+                    "the independent lens must keep its original request binding"
+                );
+            } else {
+                assert_ne!(
+                    request.request_binding, raw_primary_request.request_binding,
+                    "the selected primary model must change its request binding"
                 );
             }
-            let resolved_effort = resolve_reasoning_effort(
-                AgentRole::Auditor,
-                assignment_reasoning_effort,
+            let resolved_effort =
+                resolve_review_lens_reasoning_effort(lens, assignment_reasoning_effort);
+            assert_eq!(
+                Some(resolved_effort.resolved.as_str()),
                 lens.backend.reasoning_effort(),
-                0,
+                "assignment effort must not rewrite a selected review-lens triple"
             );
             let rendered = render_review_lens_auditor_prompt(
                 ReviewLensAuditorPromptContext {

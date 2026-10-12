@@ -3150,55 +3150,22 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
         AgentRole::GateClassifier,
         AgentRole::Auditor,
     ] {
-        assert_eq!(
-            profile.role_models[&role].model.as_deref(),
-            Some(FRONTIER_PROFILE_MODEL),
-            "default {role:?} binding diverged from the standard slug"
-        );
-        let UnavailableModelFallback::OrderedCatalogChain(chain) =
-            &profile.role_models[&role].unavailable_model_fallback
-        else {
-            panic!("default {role:?} binding lost catalog-chain data");
-        };
         assert!(
-            chain.models.is_empty(),
-            "default {role:?} availability chain names a nonstandard slug"
+            profile.role_models[&role].model.is_none(),
+            "omitted {role:?} model must remain selector input"
         );
+        assert!(profile.role_models[&role].reasoning_effort.is_none());
+        assert!(matches!(
+            &profile.role_models[&role].unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        ));
         let resolved = catalog
             .resolve_role_model_selection(&profile.role_models[&role], SupervisorRuntime::Codex)
             .unwrap_or_else(|error| panic!("default {role:?} binding did not resolve: {error:#}"));
-        assert_eq!(
-            resolved.selection.model.as_deref(),
-            Some(FRONTIER_PROFILE_MODEL),
-            "default {role:?} binding resolved away from the standard slug"
-        );
+        assert_eq!(resolved.selection, profile.role_models[&role]);
+        assert!(resolved.configured_model_chain.is_empty());
+        assert_eq!(resolved.resolved_candidate_index, None);
     }
-    assert_eq!(
-        profile.role_models[&AgentRole::ChildOrchestrator]
-            .reasoning_effort
-            .as_deref(),
-        Some("xhigh")
-    );
-    assert_eq!(
-        profile.role_models[&AgentRole::Worker]
-            .reasoning_effort
-            .as_deref(),
-        Some("medium")
-    );
-    assert!(matches!(
-        &profile.role_models[&AgentRole::GateClassifier].unavailable_model_fallback,
-        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-            on_exhausted: TerminalUnavailableModelFallback::LocalDeterministicFake,
-            ..
-        })
-    ));
-    assert!(matches!(
-        &profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
-        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
-            ..
-        })
-    ));
 
     let base_command = || {
         ExternalAgentCommand::codex(
@@ -3218,16 +3185,44 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     let runtime_profile = plan.effective_role_economics_profile_for_runtime(&catalog);
     assert_eq!(
         runtime_profile.model_availability,
-        RoleModelAvailability::Available
+        RoleModelAvailability::Unavailable
     );
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        let error = match apply_role_model_selection(
+            base_command(),
+            &plan,
+            role,
+            SupervisorRuntime::Codex,
+            &catalog,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an omitted {role:?} model must not authorize a real-runtime command"),
+        };
+        assert!(error
+            .to_string()
+            .contains("without an authoritative trusted model identity"));
+    }
+
+    // Explicit fixture bindings exercise argv projection without supplying routing defaults.
+    let mut configured_plan = plan.clone();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        configured_plan.role_models.insert(
+            role,
+            RoleModelSelection {
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+    }
     let child = apply_role_model_selection(
         base_command(),
-        &plan,
+        &configured_plan,
         AgentRole::ChildOrchestrator,
         SupervisorRuntime::Codex,
         &catalog,
     )
-    .expect("apply no-override child selection");
+    .expect("apply explicit child fixture selection");
     let child_argv = crate::external_agent::app_server_command_argv(&child)
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -3236,7 +3231,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
         child_argv
             .windows(2)
             .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
-        "writable child app-server argv did not select the provisional model: {child_argv:?}"
+        "writable child app-server argv did not preserve the explicit fixture model: {child_argv:?}"
     );
     assert!(child_argv
         .windows(2)
@@ -3244,12 +3239,12 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
 
     let auditor = apply_role_model_selection(
         base_command(),
-        &plan,
+        &configured_plan,
         AgentRole::Auditor,
         SupervisorRuntime::Codex,
         &catalog,
     )
-    .expect("apply no-override auditor selection");
+    .expect("apply explicit auditor fixture selection");
     let auditor_argv = crate::external_agent::command_argv(&auditor)
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
