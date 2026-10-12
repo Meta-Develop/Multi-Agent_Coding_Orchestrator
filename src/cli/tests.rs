@@ -2557,7 +2557,7 @@ fn sniff_decision_ref_load_error_is_not_a_runtime_fallback() {
 }
 
 #[test]
-fn route_literal_instruction_args_injects_explicit_codex_runtime() {
+fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
     let routed = route_literal_instruction_args(["maco", "Update README.md"]);
     assert_eq!(
         routed,
@@ -2567,8 +2567,6 @@ fn route_literal_instruction_args_injects_explicit_codex_runtime() {
             OsString::from("run"),
             OsString::from("--literal-goal"),
             OsString::from("Update README.md"),
-            OsString::from("--runtime"),
-            OsString::from("codex"),
         ]
     );
 
@@ -2582,8 +2580,6 @@ fn route_literal_instruction_args_injects_explicit_codex_runtime() {
             OsString::from("run"),
             OsString::from("--literal-goal"),
             OsString::from("supervise is quoted instruction text"),
-            OsString::from("--runtime"),
-            OsString::from("codex"),
         ]
     );
 
@@ -2592,7 +2588,39 @@ fn route_literal_instruction_args_injects_explicit_codex_runtime() {
     let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run");
     };
-    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
+    assert_eq!(args.runtime, None);
+    assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
+
+    let quoted = Cli::try_parse_from(route_literal_instruction_args([
+        "maco",
+        "Update README.md",
+        "--runtime",
+        "grok",
+    ]))
+    .expect("option-shaped instruction words remain literal text");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(quoted.command).command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, None);
+    assert_eq!(
+        args.literal_goal.as_deref(),
+        Some("Update README.md --runtime grok")
+    );
+
+    let explicit = Cli::try_parse_from(route_literal_instruction_args([
+        "maco",
+        "supervise",
+        "run",
+        "--literal-goal",
+        "Update README.md",
+        "--runtime",
+        "grok",
+    ]))
+    .expect("explicit supervise runtime is retained");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(explicit.command).command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Grok));
     assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
 
     assert_eq!(

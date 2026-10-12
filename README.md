@@ -3940,11 +3940,12 @@ The shipped spine is `maco <instruction>`, `maco supervise run`, and
 `--from-goal <file>` through the same planner as `supervise plan`, then
 executes the validated plan through the live supervisor gates. Pass
 `--runtime fake` for the deterministic in-process Fake runtime. A bare
-`maco <instruction>` is an explicit live Codex launch: the rewriter injects
-`--runtime codex` after `--literal-goal` and treats extra words as goal
-text. Omitting `--runtime` on `supervise run` sniffs a loadable plan
-assignment runtime and otherwise fail-closes, naming `--runtime`; it does
-not silently choose Codex for `--literal-goal` or `--from-goal`. Omitting
+`maco <instruction>` routes through `--literal-goal`, with extra words kept
+as goal text. New goal/spec runs without `--runtime` use provider-neutral,
+account-bound normal intake and the loaded routing policy before dispatch;
+required account, model, and admission evidence must pass the existing gates.
+Explicit `--runtime` retains operator selection; positional plans and resumed
+runs retain plan-runtime sniffing when it is omitted. Omitting
 `--codex-bin` does not select Fake. Stay local with
 `supervise run --literal-goal ... --runtime fake`.
 Explicit `supervise run` must name the reviewed machine-global
