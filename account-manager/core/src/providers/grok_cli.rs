@@ -1384,9 +1384,9 @@ impl ProviderAdapter for GrokCliAdapter {
     ) -> Result<
         crate::account_authority::CategoryObservation<crate::account_authority::ModelsObservation>,
     > {
-        use crate::account_authority::{
-            CategoryObservation, ObservationError, ObservationErrorKind,
-        };
+        use crate::account_authority::CategoryObservation;
+        #[cfg(unix)]
+        use crate::account_authority::{ObservationError, ObservationErrorKind};
         validate_managed_metadata(account)?;
         if account.state != StoredAccountState::Complete {
             return Err(config_read(
@@ -1655,7 +1655,9 @@ fn read_grok_model_cache(path: &Path) -> io::Result<Option<Vec<u8>>> {
 #[cfg(test)]
 mod grok_model_metadata_tests {
     use super::*;
-    use crate::account_authority::{ModelAccessOutcome, ObservationOutcome};
+    use crate::account_authority::ModelAccessOutcome;
+    #[cfg(unix)]
+    use crate::account_authority::ObservationOutcome;
 
     fn cache() -> Value {
         serde_json::json!({
@@ -1682,6 +1684,7 @@ mod grok_model_metadata_tests {
         parse_grok_model_cache(&serde_json::to_vec(value).unwrap())
     }
 
+    #[cfg(unix)]
     fn account() -> StoredAccountMetadata {
         StoredAccountMetadata {
             id: "work".into(),

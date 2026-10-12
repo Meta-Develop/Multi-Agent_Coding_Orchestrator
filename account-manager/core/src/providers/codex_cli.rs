@@ -1283,9 +1283,9 @@ impl ProviderAdapter for CodexCliAdapter {
     ) -> Result<
         crate::account_authority::CategoryObservation<crate::account_authority::ModelsObservation>,
     > {
-        use crate::account_authority::{
-            CategoryObservation, ObservationError, ObservationErrorKind,
-        };
+        use crate::account_authority::CategoryObservation;
+        #[cfg(unix)]
+        use crate::account_authority::{ObservationError, ObservationErrorKind};
         if account.provider_id != self.id()
             || !account_id_is_safe(&account.id)
             || account.state != StoredAccountState::Complete
@@ -1297,7 +1297,7 @@ impl ProviderAdapter for CodexCliAdapter {
         }
         #[cfg(not(unix))]
         {
-            return Ok(CategoryObservation::unavailable());
+            Ok(CategoryObservation::unavailable())
         }
         #[cfg(unix)]
         {
@@ -1327,10 +1327,13 @@ impl ProviderAdapter for CodexCliAdapter {
     }
 }
 
+#[cfg(any(unix, test))]
 const MAX_MANAGED_MODEL_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(unix, test))]
 const MAX_MANAGED_MODEL_CACHE_MODELS: usize = 512;
 
 /// Cache advertisement is metadata, not proof of entitlement or judgment quality.
+#[cfg(any(unix, test))]
 fn parse_managed_model_cache(
     bytes: &[u8],
 ) -> std::result::Result<crate::account_authority::ModelsObservation, ()> {

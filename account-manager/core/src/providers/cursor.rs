@@ -980,7 +980,7 @@ mod tests {
         let complete = metadata("work", StoredAccountState::Complete, true);
         let launch = adapter.launch_spec(&complete).expect("launch spec");
         let environment = launch.plain_environment();
-        let managed_home = data.path().join("accounts/cursor/work");
+        let managed_home = data.path().join("accounts").join("cursor").join("work");
         assert_eq!(
             environment,
             vec![
