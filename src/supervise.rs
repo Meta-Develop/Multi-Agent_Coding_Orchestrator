@@ -324,6 +324,72 @@ pub(crate) mod held_out;
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test(
+    repo: &Path,
+    document: &mut Value,
+) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
+    let mut loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
+        &serde_json::to_string(document)?,
+        Some(repo),
+    )?;
+    let frozen = loaded
+        .plan_metadata
+        .resolved_routing_policy
+        .clone()
+        .context("assessed injected fixture requires its frozen routing policy")?;
+    let policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
+    // Exclude only the unresolved lens placeholder from catalog acquisition.
+    // The complete default stack still goes through normal selection below.
+    let mut catalog_plan = loaded.plan.clone();
+    catalog_plan.review_lenses.clear();
+    let catalog = test_runtime_model_catalog(&catalog_plan, SupervisorRuntime::Codex)?;
+    loaded.plan.review_lenses = default_supervisor_review_lenses();
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        repo,
+        1,
+        loaded.plan_metadata.admission,
+        SupervisorAdmissionConfig::default(),
+    )?;
+    let objective =
+        resolve_objective_profile(repo, loaded.plan_metadata.objective_profile.as_deref())?;
+    let advertised = advertised_catalogs_for_launch(repo)?;
+    let accounts = account_observations_for_selection(SupervisorRuntime::Codex, None)?;
+    let resolution = initialize_supervisor_selection_with_assessment(
+        &mut loaded.plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &advertised,
+        Some(&objective),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &accounts,
+        loaded.plan_metadata.task_routing_assessment.as_ref(),
+    )?;
+    if let Some(failure) = resolution.selection_preflight_failure {
+        bail!(
+            "injected fixture auditor bootstrap refused: {}",
+            failure.message
+        );
+    }
+    let parent_acceptance = loaded
+        .plan
+        .review_lenses
+        .into_iter()
+        .find(|lens| {
+            lens.id == "parent-acceptance"
+                && lens.information_scope == ReviewInformationScope::FullChildTranscript
+        })
+        .context("bound default review stack omitted parent-acceptance")?;
+    document["review_lenses"] = serde_json::to_value(vec![parent_acceptance])?;
+    let source_plan: SupervisorPlan = serde_json::from_value(document.clone())?;
+    if test_runtime_model_catalog(&source_plan, SupervisorRuntime::Codex)? != catalog {
+        bail!("licensed source fixture must retain the exact bootstrap catalog");
+    }
+    Ok(policy)
+}
+
 mod plan_validation;
 use plan_validation::*;
 
