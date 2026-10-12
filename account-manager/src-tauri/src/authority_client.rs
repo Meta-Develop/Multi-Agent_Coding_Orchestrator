@@ -1580,6 +1580,8 @@ mod tests {
 
         #[test]
         fn remote_selection_uses_server_cas_without_local_vendor_home_validation() {
+            use crate::providers::codex_cli::CodexCliAdapter;
+
             let (_registry_dir, registry) = isolated_registry();
             registry
                 .begin_add(
@@ -1592,7 +1594,15 @@ mod tests {
                 .unwrap();
             registry.complete_add("codex-cli", "work").unwrap();
             let account = registry.account("codex-cli", "work").unwrap();
-            let (_guard, listener) = listen_fixture(registry);
+            let (_guard, root) = private_tempdir();
+            let socket = root.join("account.sock");
+            let path = resolve_socket_path(&socket).unwrap();
+            let adapter = CodexCliAdapter::with_home(root.join("vendor-home"))
+                .with_data_dir(root.join("data"));
+            let ctx = AuthorityContext::new(registry)
+                .without_registry_fallback()
+                .with_adapter(std::sync::Arc::new(adapter));
+            let listener = listen(path, AuthorityServerConfig::new(ctx).unwrap()).unwrap();
             let client = AuthorityClient::connect(listener.path()).unwrap();
             let server = thread::spawn(move || {
                 for _ in 0..6 {

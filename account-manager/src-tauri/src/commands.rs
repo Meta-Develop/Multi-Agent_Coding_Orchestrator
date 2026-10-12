@@ -280,7 +280,16 @@ fn add_account_blocking(
 ) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
     let authority = account_authority()?;
-    if matches!(&authority, AccountAuthority::Remote(_)) {
+    add_account_with_authority(adapter.as_ref(), &authority, &account_id, auth_kind)
+}
+
+fn add_account_with_authority(
+    adapter: &dyn ProviderAdapter,
+    authority: &AccountAuthority,
+    account_id: &str,
+    auth_kind: Option<AuthKind>,
+) -> Result<()> {
+    if matches!(authority, AccountAuthority::Remote(_)) {
         return Err(Error::NotImplemented(
             "remote add_account; use login.start for OAuth",
         ));
@@ -289,16 +298,16 @@ fn add_account_blocking(
         Some(kind) => adapter.managed_account_plan_for(kind),
         None => adapter.managed_account_plan(),
     }) else {
-        return adapter.add_account(&account_id);
+        return adapter.add_account(account_id);
     };
     let store = (plan.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
         .transpose()?;
     providers::add_managed_account_for(
         authority.in_process_registry()?,
-        adapter.as_ref(),
-        &account_id,
-        &account_id,
+        adapter,
+        account_id,
+        account_id,
         store.as_deref(),
         auth_kind,
     )
@@ -312,13 +321,21 @@ fn add_account_blocking(
 pub fn activate_account(provider_id: String, account_id: String) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
     let authority = account_authority()?;
-    if matches!(&authority, AccountAuthority::Remote(_)) {
-        return select_launch_account(&authority, adapter.as_ref(), &account_id);
+    activate_account_with_authority(adapter.as_ref(), &authority, &account_id)
+}
+
+fn activate_account_with_authority(
+    adapter: &dyn ProviderAdapter,
+    authority: &AccountAuthority,
+    account_id: &str,
+) -> Result<()> {
+    if matches!(authority, AccountAuthority::Remote(_)) {
+        return select_launch_account(authority, adapter, account_id);
     }
     match adapter.activation_mechanism() {
-        ActivationMechanism::ToolConfiguration => adapter.activate_account(&account_id),
+        ActivationMechanism::ToolConfiguration => adapter.activate_account(account_id),
         ActivationMechanism::LaunchEnvironment => {
-            select_launch_account(&authority, adapter.as_ref(), &account_id)
+            select_launch_account(authority, adapter, account_id)
         }
     }
 }
@@ -329,18 +346,27 @@ pub fn activate_account(provider_id: String, account_id: String) -> Result<()> {
 pub fn delete_account(provider_id: String, account_id: String) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
     let authority = account_authority()?;
-    if matches!(&authority, AccountAuthority::Remote(_)) {
+    delete_account_with_authority(&provider_id, &account_id, adapter.as_ref(), &authority)
+}
+
+fn delete_account_with_authority(
+    provider_id: &str,
+    account_id: &str,
+    adapter: &dyn ProviderAdapter,
+    authority: &AccountAuthority,
+) -> Result<()> {
+    if matches!(authority, AccountAuthority::Remote(_)) {
         return Err(Error::NotImplemented("remote delete_account"));
     }
     if adapter.managed_account_plan().is_none() {
-        return adapter.delete_account(&account_id);
+        return adapter.delete_account(account_id);
     }
     let registry = authority.in_process_registry()?;
-    let account = registry.account(&provider_id, &account_id)?;
+    let account = registry.account(provider_id, account_id)?;
     let store = (account.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
         .transpose()?;
-    providers::delete_managed_account(registry, adapter.as_ref(), &account_id, store.as_deref())
+    providers::delete_managed_account(registry, adapter, account_id, store.as_deref())
 }
 
 /// Start a provider tool with the environment of its selected stored account.
@@ -1210,20 +1236,32 @@ mod tests {
 
     #[test]
     fn mutating_commands_on_an_unimplemented_adapter_are_not_implemented() {
-        // Cursor's methods are stubs: they return NotImplemented without
-        // touching the real home, keychain, or data directory.
-        let add =
-            tauri::async_runtime::block_on(add_account("cursor".into(), "acct-work".into(), None))
-                .expect_err("cursor add");
-        let activate =
-            activate_account("cursor".into(), "acct-work".into()).expect_err("cursor activate");
-        let delete =
-            delete_account("cursor".into(), "acct-work".into()).expect_err("cursor delete");
+        let temp = tempfile::tempdir().expect("isolated unimplemented adapter");
+        let home = temp.path().join("home");
+        let metadata_path = crate::paths::stored_accounts_path(&temp.path().join("data"));
+        let adapter = providers::github_copilot::GithubCopilotAdapter::with_home(&home);
+        let authority = AccountAuthority::InProcess(
+            crate::account_authority::StoredAccountRegistry::new(metadata_path.clone()),
+        );
+        let add = add_account_with_authority(&adapter, &authority, "acct-work", None)
+            .expect_err("unimplemented add");
+        let activate = activate_account_with_authority(&adapter, &authority, "acct-work")
+            .expect_err("unimplemented activate");
+        let delete = delete_account_with_authority(adapter.id(), "acct-work", &adapter, &authority)
+            .expect_err("unimplemented delete");
         assert!(matches!(add, Error::NotImplemented(_)), "got {add:?}");
         assert!(
             matches!(activate, Error::NotImplemented(_)),
             "got {activate:?}"
         );
         assert!(matches!(delete, Error::NotImplemented(_)), "got {delete:?}");
+        assert!(
+            !home.exists(),
+            "inert operations must not create a vendor home"
+        );
+        assert!(
+            !metadata_path.exists(),
+            "inert operations must not create metadata"
+        );
     }
 }
