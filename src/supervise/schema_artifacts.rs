@@ -2408,6 +2408,17 @@ fn generated_follow_up_tasks_schema_value() -> serde_json::Value {
 }
 
 fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
+    let selection_event = crate::selection::selection_event_schema_value();
+    let routing_receipt =
+        &selection_event["properties"]["provenance"]["properties"]["routing_policy"];
+    let frozen_policy = routing_receipt["properties"]
+        .get("frozen")
+        .expect("canonical selection schema has a frozen routing policy")
+        .clone();
+    let routing_features = routing_receipt["properties"]
+        .get("features")
+        .expect("canonical selection schema has task routing features")
+        .clone();
     json!({
         "type": "object",
         "additionalProperties": false,
@@ -2422,10 +2433,9 @@ fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
             "version": {"type": "integer", "const": SUPERVISOR_SCHEMA_VERSION},
             "task": {"type": "string", "minLength": 1},
             "task_file": {"type": ["string", "null"]},
-            // These optional typed carriers have no separate public nested schema.
-            // Strict serde and the ordinary loader validate their fields and bindings.
-            "resolved_routing_policy": {"type": "object", "additionalProperties": true},
-            "task_routing_assessment": {"type": "object", "additionalProperties": true},
+            // Optional carrier shapes; the loader validates digests and declaration bindings.
+            "resolved_routing_policy": frozen_policy,
+            "task_routing_assessment": task_routing_assessment_schema_value(routing_features),
             "max_depth": {"type": "integer"},
             "max_child_assignments": {"type": "integer", "const": 1},
             "max_child_retries": {"type": "integer"},
@@ -2455,6 +2465,62 @@ fn generated_follow_up_supervisor_plan_schema_value() -> serde_json::Value {
             "run_budget": supervisor_budget_config_schema_value(),
             "consultant": supervisor_consultant_plan_schema_value(),
             "generated_follow_up": generated_follow_up_plan_context_schema_value()
+        }
+    })
+}
+
+fn task_routing_assessment_schema_value(features: serde_json::Value) -> serde_json::Value {
+    let strings = json!({"type": "array", "items": {"type": "string", "minLength": 1}});
+    let digest = json!({"type": "string", "pattern": "^[0-9a-f]{64}$"});
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "features", "policy_sha256", "declared_input_sha256", "provenance", "declaration"
+        ],
+        "properties": {
+            "features": features,
+            "policy_sha256": digest.clone(),
+            "declared_input_sha256": digest,
+            "provenance": {"type": "string", "const": "policy_heuristic"},
+            "declaration": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["declared_task", "fragments", "assignments"],
+                "properties": {
+                    "declared_task": {"type": "string", "minLength": 1},
+                    "fragments": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": ["id", "text"],
+                            "properties": {
+                                "id": {"type": "string", "minLength": 1},
+                                "text": {"type": "string", "minLength": 1}
+                            }
+                        }
+                    },
+                    "assignments": {
+                        "type": "array", "minItems": 1,
+                        "items": {
+                            "type": "object", "additionalProperties": false,
+                            "required": [
+                                "id", "task", "fragment_ids", "assigned_paths",
+                                "semantic_symbols", "semantic_modules", "decision_dependencies"
+                            ],
+                            "properties": {
+                                "id": {"type": "string", "minLength": 1},
+                                "task": {"type": "string", "minLength": 1},
+                                "fragment_ids": strings.clone(),
+                                "assigned_paths": strings.clone(),
+                                "semantic_symbols": strings.clone(),
+                                "semantic_modules": strings.clone(),
+                                "decision_dependencies": strings
+                            }
+                        }
+                    }
+                }
+            }
         }
     })
 }
@@ -4760,9 +4826,62 @@ mod selection_schema_tests {
                     assert!(schemas.validate(&malformed, index).is_err());
                 }
             }
-            let mut unknown = payload.clone();
-            unknown["task_routing_assessment"]["extra_dispatch_authority"] = json!(true);
-            assert!(serde_json::from_value::<GeneratedFollowUpSupervisorPlan>(unknown).is_err());
+            for pointer in [
+                "/resolved_routing_policy",
+                "/resolved_routing_policy/policy",
+                "/resolved_routing_policy/policy/default_role",
+                "/resolved_routing_policy/policy/task_estimation",
+                "/task_routing_assessment",
+                "/task_routing_assessment/features",
+                "/task_routing_assessment/declaration",
+                "/task_routing_assessment/declaration/fragments/0",
+                "/task_routing_assessment/declaration/assignments/0",
+            ] {
+                let mut unknown = payload.clone();
+                unknown
+                    .pointer_mut(pointer)
+                    .and_then(serde_json::Value::as_object_mut)
+                    .context("emitted assessment carrier object")?
+                    .insert("extra_dispatch_authority".into(), json!(true));
+                assert!(
+                    schemas.validate(&unknown, index).is_err(),
+                    "schema accepted an unknown field at {pointer}"
+                );
+                assert!(
+                    serde_json::from_value::<GeneratedFollowUpSupervisorPlan>(unknown).is_err()
+                );
+            }
+            for (pointer, malformed) in [
+                ("/resolved_routing_policy/sha256", json!("not-a-digest")),
+                (
+                    "/resolved_routing_policy/policy/role_preferences",
+                    json!({"worker": true}),
+                ),
+                (
+                    "/task_routing_assessment/provenance",
+                    json!("native_observed"),
+                ),
+                ("/task_routing_assessment/features/risk", json!("low")),
+                (
+                    "/task_routing_assessment/declaration/assignments/0/assigned_paths",
+                    json!([true]),
+                ),
+            ] {
+                let mut malformed_payload = payload.clone();
+                *malformed_payload
+                    .pointer_mut(pointer)
+                    .context("emitted assessment carrier field")? = malformed;
+                assert!(
+                    schemas.validate(&malformed_payload, index).is_err(),
+                    "schema accepted malformed carrier field {pointer}"
+                );
+            }
+            let mut missing = payload.clone();
+            missing["task_routing_assessment"]["declaration"]
+                .as_object_mut()
+                .context("emitted assessment declaration")?
+                .remove("assignments");
+            assert!(schemas.validate(&missing, index).is_err());
             // The schema checks carrier shape; the loader checks deterministic semantics.
             let mut altered = generated.clone();
             altered

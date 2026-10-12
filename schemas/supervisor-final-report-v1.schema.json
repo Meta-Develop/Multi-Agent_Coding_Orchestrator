@@ -4489,7 +4489,714 @@
                 "type": "object"
               },
               "resolved_routing_policy": {
-                "additionalProperties": true,
+                "additionalProperties": false,
+                "properties": {
+                  "policy": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "default_role": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "execution_evidence_requirements": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "effort": {
+                                "enum": [
+                                  "native_observed",
+                                  "source_qualified_applied"
+                                ],
+                                "type": "string"
+                              },
+                              "model": {
+                                "enum": [
+                                  "native_observed",
+                                  "source_qualified_applied"
+                                ],
+                                "type": "string"
+                              },
+                              "permissions": {
+                                "enum": [
+                                  "native_observed",
+                                  "source_qualified_applied"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "model",
+                              "effort",
+                              "permissions"
+                            ],
+                            "type": "object"
+                          },
+                          "minimum_effort": {
+                            "oneOf": [
+                              {
+                                "enum": [
+                                  "none",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max",
+                                  "ultra"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "minimum_quality_basis_points": {
+                            "maximum": 10000,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "minimum_samples": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "preferred_effort": {
+                            "oneOf": [
+                              {
+                                "enum": [
+                                  "none",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max",
+                                  "ultra"
+                                ],
+                                "type": "string"
+                              },
+                              {
+                                "type": "null"
+                              }
+                            ]
+                          },
+                          "require_measured_quality": {
+                            "type": "boolean"
+                          }
+                        },
+                        "required": [
+                          "preferred_effort",
+                          "minimum_effort",
+                          "require_measured_quality",
+                          "minimum_quality_basis_points",
+                          "minimum_samples"
+                        ],
+                        "type": "object"
+                      },
+                      "objective": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "accepted_cycle_cost_weight": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "effort_distance_weight": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "rejected_attempt_weight": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "unknown_evidence_penalty": {
+                            "minimum": 1,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "accepted_cycle_cost_weight",
+                          "rejected_attempt_weight",
+                          "effort_distance_weight",
+                          "unknown_evidence_penalty"
+                        ],
+                        "type": "object"
+                      },
+                      "policy_id": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "role_preferences": {
+                        "additionalProperties": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "execution_evidence_requirements": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "effort": {
+                                  "enum": [
+                                    "native_observed",
+                                    "source_qualified_applied"
+                                  ],
+                                  "type": "string"
+                                },
+                                "model": {
+                                  "enum": [
+                                    "native_observed",
+                                    "source_qualified_applied"
+                                  ],
+                                  "type": "string"
+                                },
+                                "permissions": {
+                                  "enum": [
+                                    "native_observed",
+                                    "source_qualified_applied"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "model",
+                                "effort",
+                                "permissions"
+                              ],
+                              "type": "object"
+                            },
+                            "minimum_effort": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "none",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "ultra"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "minimum_quality_basis_points": {
+                              "maximum": 10000,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "minimum_samples": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "preferred_effort": {
+                              "oneOf": [
+                                {
+                                  "enum": [
+                                    "none",
+                                    "minimal",
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "xhigh",
+                                    "max",
+                                    "ultra"
+                                  ],
+                                  "type": "string"
+                                },
+                                {
+                                  "type": "null"
+                                }
+                              ]
+                            },
+                            "require_measured_quality": {
+                              "type": "boolean"
+                            }
+                          },
+                          "required": [
+                            "preferred_effort",
+                            "minimum_effort",
+                            "require_measured_quality",
+                            "minimum_quality_basis_points",
+                            "minimum_samples"
+                          ],
+                          "type": "object"
+                        },
+                        "type": "object"
+                      },
+                      "schema_version": {
+                        "const": 1,
+                        "type": "integer"
+                      },
+                      "task_estimation": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "boundedness_bands": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "max_complexity": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "max_dependency_edges": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "max_scope_modules": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "max_scope_paths": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "value": {
+                                  "enum": [
+                                    "tightly_bounded",
+                                    "bounded",
+                                    "cross_cutting",
+                                    "unknown"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "max_scope_paths",
+                                "max_scope_modules",
+                                "max_dependency_edges",
+                                "max_complexity",
+                                "value"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "complexity": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_assignment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_declared_kib": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_dependency_edge": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_fragment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_module": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_path": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "base",
+                              "per_declared_kib",
+                              "per_fragment",
+                              "per_assignment",
+                              "per_scope_path",
+                              "per_scope_module",
+                              "per_dependency_edge"
+                            ],
+                            "type": "object"
+                          },
+                          "context": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "bytes_per_estimated_token": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "max_estimated_tokens": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "per_assignment_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_module_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_path_tokens": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "bytes_per_estimated_token",
+                              "base_tokens",
+                              "per_scope_path_tokens",
+                              "per_scope_module_tokens",
+                              "per_assignment_tokens",
+                              "max_estimated_tokens"
+                            ],
+                            "type": "object"
+                          },
+                          "context_bands": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "max_inclusive": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "value": {
+                                  "enum": [
+                                    "small",
+                                    "medium",
+                                    "large",
+                                    "long",
+                                    "unknown"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "max_inclusive",
+                                "value"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "horizon": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_assignment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_declared_kib": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_dependency_edge": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_fragment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_module": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_path": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "base",
+                              "per_declared_kib",
+                              "per_fragment",
+                              "per_assignment",
+                              "per_scope_path",
+                              "per_scope_module",
+                              "per_dependency_edge"
+                            ],
+                            "type": "object"
+                          },
+                          "horizon_bands": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "max_inclusive": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "value": {
+                                  "enum": [
+                                    "short",
+                                    "medium",
+                                    "long",
+                                    "unknown"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "max_inclusive",
+                                "value"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "max_assignments": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max_declaration_bytes": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max_fragments": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max_rules": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max_scope_items": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "risk": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "base": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_assignment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_declared_kib": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_dependency_edge": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_fragment": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_module": {
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "per_scope_path": {
+                                "minimum": 0,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "base",
+                              "per_declared_kib",
+                              "per_fragment",
+                              "per_assignment",
+                              "per_scope_path",
+                              "per_scope_module",
+                              "per_dependency_edge"
+                            ],
+                            "type": "object"
+                          },
+                          "risk_bands": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "max_inclusive": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "value": {
+                                  "enum": [
+                                    "low",
+                                    "medium",
+                                    "high",
+                                    "critical",
+                                    "unknown"
+                                  ],
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "max_inclusive",
+                                "value"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "rules": {
+                            "items": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "complexity_basis_points": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "horizon_basis_points": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "id": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "match_kind": {
+                                  "enum": [
+                                    "declared_task_contains_ascii_insensitive",
+                                    "scope_path_prefix"
+                                  ],
+                                  "type": "string"
+                                },
+                                "pattern": {
+                                  "minLength": 1,
+                                  "type": "string"
+                                },
+                                "risk_basis_points": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "id",
+                                "match_kind",
+                                "pattern",
+                                "complexity_basis_points",
+                                "risk_basis_points",
+                                "horizon_basis_points"
+                              ],
+                              "type": "object"
+                            },
+                            "type": "array"
+                          },
+                          "score_cap_basis_points": {
+                            "maximum": 10000,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "max_declaration_bytes",
+                          "max_fragments",
+                          "max_assignments",
+                          "max_scope_items",
+                          "max_rules",
+                          "score_cap_basis_points",
+                          "complexity",
+                          "risk",
+                          "horizon",
+                          "rules",
+                          "context",
+                          "risk_bands",
+                          "horizon_bands",
+                          "context_bands",
+                          "boundedness_bands"
+                        ],
+                        "type": "object"
+                      },
+                      "tree": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "coordinated_complexity_min": {
+                            "maximum": 10000,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "coordinated_context_tokens_min": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "coordinated_horizon_min": {
+                            "maximum": 10000,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "coordinated_risk_min": {
+                            "maximum": 10000,
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "coordinated_scope_paths_min": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "max_depth": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "max_workers": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "min_independent_groups": {
+                            "minimum": 1,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "coordinated_complexity_min",
+                          "coordinated_risk_min",
+                          "coordinated_horizon_min",
+                          "coordinated_context_tokens_min",
+                          "coordinated_scope_paths_min",
+                          "min_independent_groups",
+                          "max_workers",
+                          "max_depth"
+                        ],
+                        "type": "object"
+                      },
+                      "unknown_access_policy": {
+                        "enum": [
+                          "reject",
+                          "unknown_access_for_productive_attempt"
+                        ],
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "schema_version",
+                      "policy_id",
+                      "unknown_access_policy",
+                      "tree",
+                      "default_role",
+                      "role_preferences",
+                      "objective"
+                    ],
+                    "type": "object"
+                  },
+                  "sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "source": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "sha256",
+                  "source",
+                  "policy"
+                ],
                 "type": "object"
               },
               "review_aggregation_policy": {
@@ -5092,7 +5799,186 @@
                 ]
               },
               "task_routing_assessment": {
-                "additionalProperties": true,
+                "additionalProperties": false,
+                "properties": {
+                  "declaration": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "assignments": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "assigned_paths": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "decision_dependencies": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "fragment_ids": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "id": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "semantic_modules": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "semantic_symbols": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "task": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "task",
+                            "fragment_ids",
+                            "assigned_paths",
+                            "semantic_symbols",
+                            "semantic_modules",
+                            "decision_dependencies"
+                          ],
+                          "type": "object"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      },
+                      "declared_task": {
+                        "minLength": 1,
+                        "type": "string"
+                      },
+                      "fragments": {
+                        "items": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "id": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "text": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "id",
+                            "text"
+                          ],
+                          "type": "object"
+                        },
+                        "minItems": 1,
+                        "type": "array"
+                      }
+                    },
+                    "required": [
+                      "declared_task",
+                      "fragments",
+                      "assignments"
+                    ],
+                    "type": "object"
+                  },
+                  "declared_input_sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "features": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "complexity": {
+                        "maximum": 10000,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "context_tokens": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "dependency_edges": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "evidence": {
+                        "items": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "horizon": {
+                        "maximum": 10000,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "independent_groups": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "risk": {
+                        "maximum": 10000,
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "scope_modules": {
+                        "minimum": 0,
+                        "type": "integer"
+                      },
+                      "scope_paths": {
+                        "minimum": 0,
+                        "type": "integer"
+                      }
+                    },
+                    "required": [
+                      "scope_paths",
+                      "scope_modules",
+                      "complexity",
+                      "risk",
+                      "horizon",
+                      "context_tokens",
+                      "dependency_edges",
+                      "independent_groups",
+                      "evidence"
+                    ],
+                    "type": "object"
+                  },
+                  "policy_sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "provenance": {
+                    "const": "policy_heuristic",
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "features",
+                  "policy_sha256",
+                  "declared_input_sha256",
+                  "provenance",
+                  "declaration"
+                ],
                 "type": "object"
               },
               "version": {
@@ -10411,7 +11297,714 @@
                       "type": "object"
                     },
                     "resolved_routing_policy": {
-                      "additionalProperties": true,
+                      "additionalProperties": false,
+                      "properties": {
+                        "policy": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "default_role": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "execution_evidence_requirements": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "effort": {
+                                      "enum": [
+                                        "native_observed",
+                                        "source_qualified_applied"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "model": {
+                                      "enum": [
+                                        "native_observed",
+                                        "source_qualified_applied"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    "permissions": {
+                                      "enum": [
+                                        "native_observed",
+                                        "source_qualified_applied"
+                                      ],
+                                      "type": "string"
+                                    }
+                                  },
+                                  "required": [
+                                    "model",
+                                    "effort",
+                                    "permissions"
+                                  ],
+                                  "type": "object"
+                                },
+                                "minimum_effort": {
+                                  "oneOf": [
+                                    {
+                                      "enum": [
+                                        "none",
+                                        "minimal",
+                                        "low",
+                                        "medium",
+                                        "high",
+                                        "xhigh",
+                                        "max",
+                                        "ultra"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "minimum_quality_basis_points": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "minimum_samples": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "preferred_effort": {
+                                  "oneOf": [
+                                    {
+                                      "enum": [
+                                        "none",
+                                        "minimal",
+                                        "low",
+                                        "medium",
+                                        "high",
+                                        "xhigh",
+                                        "max",
+                                        "ultra"
+                                      ],
+                                      "type": "string"
+                                    },
+                                    {
+                                      "type": "null"
+                                    }
+                                  ]
+                                },
+                                "require_measured_quality": {
+                                  "type": "boolean"
+                                }
+                              },
+                              "required": [
+                                "preferred_effort",
+                                "minimum_effort",
+                                "require_measured_quality",
+                                "minimum_quality_basis_points",
+                                "minimum_samples"
+                              ],
+                              "type": "object"
+                            },
+                            "objective": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "accepted_cycle_cost_weight": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "effort_distance_weight": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "rejected_attempt_weight": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "unknown_evidence_penalty": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "accepted_cycle_cost_weight",
+                                "rejected_attempt_weight",
+                                "effort_distance_weight",
+                                "unknown_evidence_penalty"
+                              ],
+                              "type": "object"
+                            },
+                            "policy_id": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "role_preferences": {
+                              "additionalProperties": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "execution_evidence_requirements": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "effort": {
+                                        "enum": [
+                                          "native_observed",
+                                          "source_qualified_applied"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "model": {
+                                        "enum": [
+                                          "native_observed",
+                                          "source_qualified_applied"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "permissions": {
+                                        "enum": [
+                                          "native_observed",
+                                          "source_qualified_applied"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "model",
+                                      "effort",
+                                      "permissions"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "minimum_effort": {
+                                    "oneOf": [
+                                      {
+                                        "enum": [
+                                          "none",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max",
+                                          "ultra"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "minimum_quality_basis_points": {
+                                    "maximum": 10000,
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "minimum_samples": {
+                                    "minimum": 0,
+                                    "type": "integer"
+                                  },
+                                  "preferred_effort": {
+                                    "oneOf": [
+                                      {
+                                        "enum": [
+                                          "none",
+                                          "minimal",
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "xhigh",
+                                          "max",
+                                          "ultra"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      {
+                                        "type": "null"
+                                      }
+                                    ]
+                                  },
+                                  "require_measured_quality": {
+                                    "type": "boolean"
+                                  }
+                                },
+                                "required": [
+                                  "preferred_effort",
+                                  "minimum_effort",
+                                  "require_measured_quality",
+                                  "minimum_quality_basis_points",
+                                  "minimum_samples"
+                                ],
+                                "type": "object"
+                              },
+                              "type": "object"
+                            },
+                            "schema_version": {
+                              "const": 1,
+                              "type": "integer"
+                            },
+                            "task_estimation": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "boundedness_bands": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "max_complexity": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "max_dependency_edges": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "max_scope_modules": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "max_scope_paths": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "value": {
+                                        "enum": [
+                                          "tightly_bounded",
+                                          "bounded",
+                                          "cross_cutting",
+                                          "unknown"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "max_scope_paths",
+                                      "max_scope_modules",
+                                      "max_dependency_edges",
+                                      "max_complexity",
+                                      "value"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "complexity": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "base": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_assignment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_declared_kib": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_dependency_edge": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_fragment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_module": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_path": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "base",
+                                    "per_declared_kib",
+                                    "per_fragment",
+                                    "per_assignment",
+                                    "per_scope_path",
+                                    "per_scope_module",
+                                    "per_dependency_edge"
+                                  ],
+                                  "type": "object"
+                                },
+                                "context": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "base_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "bytes_per_estimated_token": {
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "max_estimated_tokens": {
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "per_assignment_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_module_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_path_tokens": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "bytes_per_estimated_token",
+                                    "base_tokens",
+                                    "per_scope_path_tokens",
+                                    "per_scope_module_tokens",
+                                    "per_assignment_tokens",
+                                    "max_estimated_tokens"
+                                  ],
+                                  "type": "object"
+                                },
+                                "context_bands": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "max_inclusive": {
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "value": {
+                                        "enum": [
+                                          "small",
+                                          "medium",
+                                          "large",
+                                          "long",
+                                          "unknown"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "max_inclusive",
+                                      "value"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "horizon": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "base": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_assignment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_declared_kib": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_dependency_edge": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_fragment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_module": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_path": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "base",
+                                    "per_declared_kib",
+                                    "per_fragment",
+                                    "per_assignment",
+                                    "per_scope_path",
+                                    "per_scope_module",
+                                    "per_dependency_edge"
+                                  ],
+                                  "type": "object"
+                                },
+                                "horizon_bands": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "max_inclusive": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "value": {
+                                        "enum": [
+                                          "short",
+                                          "medium",
+                                          "long",
+                                          "unknown"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "max_inclusive",
+                                      "value"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "max_assignments": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "max_declaration_bytes": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "max_fragments": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "max_rules": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "max_scope_items": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "risk": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "base": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_assignment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_declared_kib": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_dependency_edge": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_fragment": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_module": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    },
+                                    "per_scope_path": {
+                                      "minimum": 0,
+                                      "type": "integer"
+                                    }
+                                  },
+                                  "required": [
+                                    "base",
+                                    "per_declared_kib",
+                                    "per_fragment",
+                                    "per_assignment",
+                                    "per_scope_path",
+                                    "per_scope_module",
+                                    "per_dependency_edge"
+                                  ],
+                                  "type": "object"
+                                },
+                                "risk_bands": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "max_inclusive": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "value": {
+                                        "enum": [
+                                          "low",
+                                          "medium",
+                                          "high",
+                                          "critical",
+                                          "unknown"
+                                        ],
+                                        "type": "string"
+                                      }
+                                    },
+                                    "required": [
+                                      "max_inclusive",
+                                      "value"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "rules": {
+                                  "items": {
+                                    "additionalProperties": false,
+                                    "properties": {
+                                      "complexity_basis_points": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "horizon_basis_points": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      },
+                                      "id": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "match_kind": {
+                                        "enum": [
+                                          "declared_task_contains_ascii_insensitive",
+                                          "scope_path_prefix"
+                                        ],
+                                        "type": "string"
+                                      },
+                                      "pattern": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "risk_basis_points": {
+                                        "maximum": 10000,
+                                        "minimum": 0,
+                                        "type": "integer"
+                                      }
+                                    },
+                                    "required": [
+                                      "id",
+                                      "match_kind",
+                                      "pattern",
+                                      "complexity_basis_points",
+                                      "risk_basis_points",
+                                      "horizon_basis_points"
+                                    ],
+                                    "type": "object"
+                                  },
+                                  "type": "array"
+                                },
+                                "score_cap_basis_points": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "max_declaration_bytes",
+                                "max_fragments",
+                                "max_assignments",
+                                "max_scope_items",
+                                "max_rules",
+                                "score_cap_basis_points",
+                                "complexity",
+                                "risk",
+                                "horizon",
+                                "rules",
+                                "context",
+                                "risk_bands",
+                                "horizon_bands",
+                                "context_bands",
+                                "boundedness_bands"
+                              ],
+                              "type": "object"
+                            },
+                            "tree": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "coordinated_complexity_min": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "coordinated_context_tokens_min": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "coordinated_horizon_min": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "coordinated_risk_min": {
+                                  "maximum": 10000,
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "coordinated_scope_paths_min": {
+                                  "minimum": 0,
+                                  "type": "integer"
+                                },
+                                "max_depth": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "max_workers": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                },
+                                "min_independent_groups": {
+                                  "minimum": 1,
+                                  "type": "integer"
+                                }
+                              },
+                              "required": [
+                                "coordinated_complexity_min",
+                                "coordinated_risk_min",
+                                "coordinated_horizon_min",
+                                "coordinated_context_tokens_min",
+                                "coordinated_scope_paths_min",
+                                "min_independent_groups",
+                                "max_workers",
+                                "max_depth"
+                              ],
+                              "type": "object"
+                            },
+                            "unknown_access_policy": {
+                              "enum": [
+                                "reject",
+                                "unknown_access_for_productive_attempt"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "schema_version",
+                            "policy_id",
+                            "unknown_access_policy",
+                            "tree",
+                            "default_role",
+                            "role_preferences",
+                            "objective"
+                          ],
+                          "type": "object"
+                        },
+                        "sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "source": {
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "sha256",
+                        "source",
+                        "policy"
+                      ],
                       "type": "object"
                     },
                     "review_aggregation_policy": {
@@ -11014,7 +12607,186 @@
                       ]
                     },
                     "task_routing_assessment": {
-                      "additionalProperties": true,
+                      "additionalProperties": false,
+                      "properties": {
+                        "declaration": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "assignments": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "assigned_paths": {
+                                    "items": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "decision_dependencies": {
+                                    "items": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "fragment_ids": {
+                                    "items": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "id": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "semantic_modules": {
+                                    "items": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "semantic_symbols": {
+                                    "items": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "task": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "id",
+                                  "task",
+                                  "fragment_ids",
+                                  "assigned_paths",
+                                  "semantic_symbols",
+                                  "semantic_modules",
+                                  "decision_dependencies"
+                                ],
+                                "type": "object"
+                              },
+                              "minItems": 1,
+                              "type": "array"
+                            },
+                            "declared_task": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
+                            "fragments": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "id": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "text": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "id",
+                                  "text"
+                                ],
+                                "type": "object"
+                              },
+                              "minItems": 1,
+                              "type": "array"
+                            }
+                          },
+                          "required": [
+                            "declared_task",
+                            "fragments",
+                            "assignments"
+                          ],
+                          "type": "object"
+                        },
+                        "declared_input_sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "features": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "complexity": {
+                              "maximum": 10000,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "context_tokens": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "dependency_edges": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "evidence": {
+                              "items": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "horizon": {
+                              "maximum": 10000,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "independent_groups": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "risk": {
+                              "maximum": 10000,
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "scope_modules": {
+                              "minimum": 0,
+                              "type": "integer"
+                            },
+                            "scope_paths": {
+                              "minimum": 0,
+                              "type": "integer"
+                            }
+                          },
+                          "required": [
+                            "scope_paths",
+                            "scope_modules",
+                            "complexity",
+                            "risk",
+                            "horizon",
+                            "context_tokens",
+                            "dependency_edges",
+                            "independent_groups",
+                            "evidence"
+                          ],
+                          "type": "object"
+                        },
+                        "policy_sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "provenance": {
+                          "const": "policy_heuristic",
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "features",
+                        "policy_sha256",
+                        "declared_input_sha256",
+                        "provenance",
+                        "declaration"
+                      ],
                       "type": "object"
                     },
                     "version": {
