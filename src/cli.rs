@@ -3344,8 +3344,7 @@ impl WorktreeCommand {
                 // repository is observed clean through the bounded status boundary.
                 let cleanliness = manager.acquire_repository_cleanliness().context(
                     "managed worktree creation requires a capability-bound repository \
-                     cleanliness input; commit, stash, or remove pending changes in the \
-                     primary repository, then rerun `maco worktree create`",
+                     cleanliness input",
                 )?;
                 let record = manager.create_with_repository_cleanliness_and_retention(
                     WorktreeCreateOptions {

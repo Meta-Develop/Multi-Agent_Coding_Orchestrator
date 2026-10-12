@@ -1244,14 +1244,7 @@ impl BoundedTreeWalker {
             } else {
                 None
             };
-            let deadline = Instant::now()
-                .checked_add(limits.max_duration)
-                .context("bounded tree walk deadline overflowed")?;
-            let mut budget = InventoryBudget {
-                remaining_entries: limits.max_entries,
-                total_path_bytes: 0,
-                deadline,
-            };
+            let mut budget = InventoryBudget::new(limits)?;
             let mut entries = Vec::new();
             let mut nested_repository_boundaries = Vec::new();
             let mut walker = InventoryWalkState {
@@ -1298,14 +1291,7 @@ where
     F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
 {
     let limits = limits.validate()?;
-    let deadline = Instant::now()
-        .checked_add(limits.max_duration)
-        .context("bounded tree walk deadline overflowed")?;
-    let mut budget = InventoryBudget {
-        remaining_entries: limits.max_entries,
-        total_path_bytes: 0,
-        deadline,
-    };
+    let mut budget = InventoryBudget::new(limits)?;
     let mut entries = Vec::new();
     let mut nested_repository_boundaries = Vec::new();
     walk_bound_windows_dir(
@@ -1346,6 +1332,7 @@ fn walk_bound_windows_dir<F>(
 where
     F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
 {
+    budget.current_relative_directory = relative_directory.to_path_buf();
     budget.ensure_before_deadline("before directory enumeration")?;
     let current_path = if relative_directory.as_os_str().is_empty() {
         root_binding.path.clone()
@@ -1435,6 +1422,8 @@ where
             changed_seconds,
             changed_nanoseconds,
         };
+        // Enumeration already bounds this counter by the global entry limit.
+        budget.entries_inspected += 1;
         let decision = (action)(&entry)?;
         budget.ensure_before_deadline("after repository inventory callback")?;
         if matches!(
@@ -1462,6 +1451,7 @@ where
                 entries,
                 nested_repository_boundaries,
             )?;
+            budget.current_relative_directory = relative_directory.to_path_buf();
         }
         let rebound =
             crate::file_identity::open_windows_path_identity(&full_path).with_context(|| {

@@ -1153,6 +1153,141 @@ fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
 }
 
 #[cfg(any(unix, windows))]
+fn walk_inventory_with_budget_for_test<F>(
+    binding: &DirectoryBindingGuard,
+    limits: BoundedTreeWalkLimits,
+    budget: &mut InventoryBudget,
+    mut action: F,
+) -> Result<()>
+where
+    F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+{
+    let mut entries = Vec::new();
+    let mut boundaries = Vec::new();
+    #[cfg(unix)]
+    {
+        let root_stat = fstat(binding.directory.as_raw_fd())?;
+        #[cfg(target_os = "linux")]
+        let root_mount_id = if limits.same_device {
+            Some(linux_mount_identity_for_fd(binding.directory.as_raw_fd())?.mount_id)
+        } else {
+            None
+        };
+        InventoryWalkState {
+            root_device: root_stat.st_dev,
+            #[cfg(target_os = "linux")]
+            root_mount_id,
+            limits,
+            options: BoundedTreeWalkOptions::default(),
+            budget,
+            action: &mut action,
+            entries: &mut entries,
+            nested_repository_boundaries: &mut boundaries,
+        }
+        .walk(binding.directory.as_raw_fd(), Path::new(""), 0)
+    }
+    #[cfg(windows)]
+    {
+        walk_bound_windows_dir(
+            binding,
+            Path::new(""),
+            0,
+            binding.identity.device,
+            limits,
+            BoundedTreeWalkOptions::default(),
+            budget,
+            &mut action,
+            &mut entries,
+            &mut boundaries,
+        )
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_timeout_reports_context_without_counting_enumeration_as_inspection() {
+    let mut budget = InventoryBudget::new(inventory_limits(2)).expect("inventory budget");
+    budget.current_relative_directory = PathBuf::from("vendor/sdk");
+    budget.consume_entry().expect("first enumerated name");
+    budget.consume_entry().expect("second enumerated name");
+    budget.started_at = Instant::now()
+        .checked_sub(Duration::from_millis(50))
+        .expect("earlier start");
+    budget.deadline = Instant::now();
+
+    let error = budget
+        .ensure_before_deadline("before directory stream open")
+        .expect_err("expired inventory must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("time limit before directory stream open"));
+    assert!(message.contains("failure_class=inventory_timeout"));
+    assert!(message.contains("relative_directory=\"vendor/sdk\""));
+    assert!(message.contains("entries_inspected=0"));
+    let elapsed_ms = message
+        .split("elapsed_ms=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .expect("elapsed milliseconds")
+        .parse::<u128>()
+        .expect("numeric elapsed milliseconds");
+    assert!(elapsed_ms >= 50);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_diagnostics_count_inspections_and_restore_parent_directory() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join("a-dir")).expect("child directory");
+    fs::write(root.join("a-dir/leaf.txt"), "leaf\n").expect("child file");
+    fs::write(root.join("z.txt"), "last\n").expect("root file");
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+    let limits = inventory_limits(3);
+    let mut budget = InventoryBudget::new(limits).expect("inventory budget");
+    walk_inventory_with_budget_for_test(&binding, limits, &mut budget, |entry| {
+        Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+            BoundedTreeWalkAction::RecordAndDescend
+        } else {
+            BoundedTreeWalkAction::Record
+        })
+    })
+    .expect("inspect child and later root entries");
+
+    assert_eq!(budget.remaining_entries, 0);
+    assert_eq!(budget.entries_inspected, 3);
+    assert!(budget.current_relative_directory.as_os_str().is_empty());
+    budget.deadline = Instant::now();
+    let message = format!(
+        "{:#}",
+        budget
+            .ensure_before_deadline("after repository traversal")
+            .expect_err("completed traversal still obeys its deadline")
+    );
+    assert!(message.contains("relative_directory=\".\""));
+    assert!(message.contains("entries_inspected=3"));
+    assert!(!message.contains(&format!("{:?}", root)));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_diagnostics_count_the_entry_before_a_callback_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("a.txt"), "first\n").expect("first file");
+    fs::write(temp.path().join("z.txt"), "last\n").expect("last file");
+    let binding = DirectoryBindingGuard::bind(temp.path()).expect("bind repository root");
+    let limits = inventory_limits(2);
+    let mut budget = InventoryBudget::new(limits).expect("inventory budget");
+    let error = walk_inventory_with_budget_for_test(&binding, limits, &mut budget, |_| {
+        bail!("callback failure sentinel")
+    })
+    .expect_err("callback error must stop traversal");
+
+    assert!(format!("{error:#}").contains("callback failure sentinel"));
+    assert_eq!(budget.remaining_entries, 0);
+    assert_eq!(budget.entries_inspected, 1);
+}
+
+#[cfg(any(unix, windows))]
 fn nested_repository_options() -> BoundedTreeWalkOptions {
     BoundedTreeWalkOptions {
         stop_at_nested_repositories: true,
