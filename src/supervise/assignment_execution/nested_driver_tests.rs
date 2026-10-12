@@ -34,6 +34,18 @@ impl Drop for GrokBinaryEnvironmentGuard {
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
 pub(super) fn driver_fixture(case: &str) -> Result<()> {
+    let attached_capture = matches!(
+        case,
+        "attached-capture-success"
+            | "attached-capture-panic"
+            | "attached-capture-unquiescent"
+            | "attached-capture-errors"
+    );
+    let _cam_authority = attached_capture.then(|| {
+        crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+            None,
+        )
+    });
     let isolated = case.starts_with("managed-cycle-isolated-");
     let grok_continuation = case == "continuation-grok-happy";
     let temp = tempfile::tempdir()?;
@@ -98,7 +110,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             "auditor":{"model":"gpt-5.6-sol", "reasoning_effort":"high"}
         }
     }))?;
-    let run_id = if case.starts_with("managed-cycle-") {
+    let run_id = if case.starts_with("managed-cycle-") || attached_capture {
         RunId::new(format!(
             "nested-driver-test-{}",
             crate::artifacts::state_auth::random_identifier()?
@@ -107,7 +119,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         RunId::new("nested-driver-test")?
     };
     #[cfg(target_os = "linux")]
-    if case.starts_with("managed-cycle-") {
+    if case.starts_with("managed-cycle-") || attached_capture {
         crate::account_authority::record_observed_codex_selection(
             Some(run_id.as_str()),
             crate::account_authority::CODEX_CLI_PROVIDER_ID,
@@ -379,6 +391,26 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             subject
         };
         calls.lock().unwrap().push(subject.id.clone());
+        if attached_capture {
+            let identity = command.agent_lifecycle.as_ref().unwrap();
+            assert_eq!(identity.run_id, run_id.as_str());
+            assert_eq!(identity.task_id, parent.id);
+            assert_eq!(identity.role, "child_orchestrator");
+            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+            assert!(command.codex_native_delegation_is_disabled());
+            assert!(command.codex_managed_worker_requests_enabled());
+            assert!(!command.codex_managed_readonly_continuation_enabled());
+            assert!(command.worker_journal_artifacts.is_empty());
+            let launch = command
+                .assignment_messaging_launch()
+                .expect("attached managed parent inbox launch");
+            assert!(launch.environment_for(run_id.as_str(), &parent.id).is_ok());
+            assert!(launch.environment_for("foreign-run", &parent.id).is_err());
+            assert!(launch.environment_for(run_id.as_str(), &worker.id).is_err());
+            command
+                .verify_assignment_messaging_protocol_instructions()
+                .expect("attached managed parent inbox protocol instructions");
+        }
         if case == "attached-capture-panic" && subject.id == "parent" {
             panic!("attached parent runner panicked");
         }
@@ -456,7 +488,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         let mut simulated = command.clone();
         simulated.model = None;
         let mut fake_subject = subject.clone();
-        if case.starts_with("managed-cycle-") && subject.id == "parent" {
+        if (case.starts_with("managed-cycle-") || attached_capture) && subject.id == "parent" {
             fake_subject.worker_assignments.clear();
         }
         if case.starts_with("managed-cycle-") && subject.id != "parent" {
@@ -1120,7 +1152,7 @@ fn prepare_and_collect_fixture_parent<'a>(
 ) -> Result<Option<Box<CollectedChildAttempt<'a>>>> {
     let run_id = &context.options.run_id;
     let dirs = context.dirs;
-    if case.starts_with("managed-cycle-") {
+    if case.starts_with("managed-cycle-") || case.starts_with("attached-capture-") {
         let prepared = match prepare_managed_parent_initial_attempt(
             context,
             outcome,
@@ -1139,6 +1171,14 @@ fn prepare_and_collect_fixture_parent<'a>(
                 bail!("managed parent preparation unexpectedly completed")
             }
         };
+        if case.starts_with("attached-capture-") {
+            let result = super::attached_parent_capture_tests::exercise(
+                case, context, preflight, outcome, prepared,
+            );
+            assert_eq!(*calls.lock().unwrap(), ["parent"]);
+            result?;
+            return Ok(None);
+        }
         super::managed_parent_controller_tests::exercise(
             case, context, preflight, outcome, prepared, calls,
         )?;
@@ -1163,14 +1203,6 @@ fn prepare_and_collect_fixture_parent<'a>(
             bail!("parent preparation unexpectedly completed")
         }
     };
-    if case.starts_with("attached-capture-") {
-        let result = super::attached_parent_capture_tests::exercise(
-            case, context, preflight, outcome, prepared,
-        );
-        assert_eq!(*calls.lock().unwrap(), ["parent"]);
-        result?;
-        return Ok(None);
-    }
     let collected = dispatch_and_collect_child_attempt(
         context,
         outcome,

@@ -528,6 +528,16 @@ fn admit_read_only(
         .admit_managed_parent_read_only(&preflight.assignment.id, command, runtime)
 }
 
+#[cfg(test)]
+pub(super) fn admit_attached_parent_initial_for_test(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    prepared: &PreparedChildAttempt<'_>,
+) -> Result<super::AssignmentCommandAdmission> {
+    require_read_only_native_off(prepared, "managed parent initial attempt")?;
+    admit_read_only(context, preflight, 1, &prepared.command)
+}
+
 fn managed_cancellation<'a>(
     preflight: &'a AssignmentExecutionPreflight<'_>,
 ) -> &'a ProcessCancellation {

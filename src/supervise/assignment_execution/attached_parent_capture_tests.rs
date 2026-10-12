@@ -20,12 +20,27 @@ pub(super) fn exercise<'budget>(
     context: &AssignmentExecutionContext<'budget, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
-    prepared: Box<PreparedChildAttempt<'budget>>,
+    mut prepared: Box<PreparedChildAttempt<'budget>>,
 ) -> Result<()> {
+    // The typed lock refusal carries the exact journal derived from this binding.
+    // Missing/corrupt state is never evidence that an owner retained the lock.
+    fn held_inbox_journal(repo: &Path, binding: &WorkerRequestBinding) -> Result<PathBuf> {
+        let error =
+            WorkerRequestInbox::recover(repository_authenticator_key_only(repo)?, binding.clone())
+                .err()
+                .context(
+                    "inbox recovery acquired the journal while attached capture still owned it",
+                )?;
+        match error.downcast_ref::<crate::messaging::store::StoreError>() {
+            Some(crate::messaging::store::StoreError::WriterAlreadyActive { path }) => {
+                Ok(path.clone())
+            }
+            _ => Err(error).context("expected the exact parent inbox journal lock refusal"),
+        }
+    }
+
     let incoming_scratch = prepared.incoming_scratch.path().to_path_buf();
     let capture_scratch = prepared.capture_scratch.path().to_path_buf();
-    let journal =
-        incoming_scratch.join(worker_execution_journal_incoming_relative_for_id("worker"));
     let binding = with_supervisor_messaging_session(context.run_dir, |factory| {
         factory.worker_request_binding(
             &context.options.run_id,
@@ -49,9 +64,31 @@ pub(super) fn exercise<'budget>(
         repository_authenticator_key_only(context.repo)?,
         binding.clone(),
     )?;
+    let journal = held_inbox_journal(context.repo, &binding)?;
+    assert!(
+        journal.is_file(),
+        "managed parent inbox journal exists before attachment"
+    );
+    let journal_identity = crate::safe_state::BoundedRegularReader::identity(&journal)?;
     let endpoint =
         WorkerInboxEndpoint::start(context.run_dir, &turn, inbox, ProcessCancellation::new())?;
     let launch = endpoint.launch();
+    prepared.command = prepared
+        .command
+        .clone()
+        .with_assignment_messaging(launch.clone());
+    prepared
+        .command
+        .verify_assignment_messaging_protocol_instructions()?;
+    assert_eq!(
+        prepared.command.assignment_messaging_launch(),
+        Some(&launch)
+    );
+    prepared.command_admission = Some(
+        super::managed_parent_controller::admit_attached_parent_initial_for_test(
+            context, preflight, &prepared,
+        )?,
+    );
     let capture = dispatch_and_capture_attached_parent_attempt(
         context,
         outcome,
@@ -68,7 +105,7 @@ pub(super) fn exercise<'budget>(
         && capture.prepared.capture_scratch.path() == capture_scratch;
     assert!(
         owners_remain,
-        "prepared scratch and worker journal stayed owned"
+        "prepared scratch and managed parent inbox journal stayed owned"
     );
     match case {
         "attached-capture-success" => {
@@ -146,10 +183,25 @@ pub(super) fn exercise<'budget>(
         other => bail!("unknown attached capture case {other}"),
     }
     recover_while_held(context.repo, &binding)?;
+    assert_eq!(held_inbox_journal(context.repo, &binding)?, journal);
+    assert_eq!(
+        crate::safe_state::BoundedRegularReader::identity(&journal)?,
+        journal_identity,
+        "attached capture retained the exact managed parent inbox journal"
+    );
     drop(capture);
     let recovered =
         WorkerRequestInbox::recover(repository_authenticator_key_only(context.repo)?, binding)?;
     assert!(recovered.requires_reconciliation());
+    assert!(
+        journal.is_file(),
+        "managed parent inbox journal survives recovery"
+    );
+    assert_eq!(
+        crate::safe_state::BoundedRegularReader::identity(&journal)?,
+        journal_identity,
+        "recovery reopened the same managed parent inbox journal"
+    );
     Ok(())
 }
 
