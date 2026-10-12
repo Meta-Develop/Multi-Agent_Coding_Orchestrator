@@ -509,6 +509,9 @@ struct ArbitrationRunnerRequest {
     hidden_primary_root: PathBuf,
     run_id: String,
     arbiter_id: String,
+    /// Canonical source proposal scope; decision data, never an access grant.
+    #[cfg(target_os = "linux")]
+    reviewed_paths: Vec<PathBuf>,
 }
 
 trait ArbitrationRunner {
@@ -692,9 +695,49 @@ fn merge_arbiter_selection_plan(
             "id": request.arbiter_id,
             "phase": "execution",
             "role": "auditor",
-            "assigned_paths": []
+            "assigned_paths": &request.reviewed_paths
         }]
     })).context("failed to construct the readonly merge review task")
+}
+
+#[cfg(target_os = "linux")]
+fn merge_arbiter_task_assessment(
+    plan: &crate::supervise::SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> Result<crate::supervise::TaskRoutingAssessment> {
+    use crate::planning::{
+        TaskAssignmentProposal, TaskDecompositionProposal, TaskDisjointnessReport,
+        TaskPathProposalDiagnostics, TaskSpecFragment,
+    };
+    let [assignment] = plan.assignments.as_slice() else {
+        bail!("merge review assessment requires its single declared assignment");
+    };
+    let proposal = TaskDecompositionProposal {
+        fragments: vec![TaskSpecFragment {
+            id: assignment.id.clone(),
+            text: plan.task.clone(),
+        }],
+        assignments: vec![TaskAssignmentProposal {
+            id: assignment.id.clone(),
+            task: plan.task.clone(),
+            fragment_ids: vec![assignment.id.clone()],
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: assignment.semantic_symbols.clone(),
+            semantic_modules: assignment.semantic_modules.clone(),
+            decision_dependencies: assignment
+                .decision_refs
+                .iter()
+                .map(|reference| reference.question_key.clone())
+                .collect(),
+        }],
+        coverage_gaps: Vec::new(),
+        diagnostics: TaskPathProposalDiagnostics::default(),
+        disjointness: TaskDisjointnessReport {
+            disjoint: true,
+            ..Default::default()
+        },
+    };
+    crate::supervise::assess_task_routing(&plan.task, &proposal, frozen)
 }
 
 #[cfg(target_os = "linux")]
@@ -708,6 +751,7 @@ fn prepare_selected_merge_arbiter_command(
         SupervisorAdmissionConfig, SupervisorAdmissionPolicyInput, SupervisorRuntime,
     };
     let plan = merge_arbiter_selection_plan(runner, request)?;
+    let assessment = merge_arbiter_task_assessment(&plan, &frozen)?;
     let admission = SupervisorAdmissionPolicyInput::resolve(
         &request.hidden_primary_root,
         1,
@@ -720,12 +764,13 @@ fn prepare_selected_merge_arbiter_command(
         SupervisorRuntime::Codex,
         Some(&request.run_id),
     )?;
-    let (selected, decision) = crate::supervise::select_account_review_auditor(
+    let (selected, decision) = crate::supervise::select_account_review_auditor_with_assessment(
         &plan,
         &frozen,
         &observations,
         &admission,
         &objective,
+        Some(&assessment),
     )?;
     let selected = selected.context("merge review has no admissible selected Auditor account")?;
     let candidate = selected.candidate();
@@ -1063,6 +1108,8 @@ fn arbitrate_merge_with_environment(
         hidden_primary_root: repo_root.clone(),
         run_id: options.run_id.as_str().to_string(),
         arbiter_id: options.arbiter_agent_id.clone(),
+        #[cfg(target_os = "linux")]
+        reviewed_paths: arbitration_candidate_scope(&prepared.input.sides)?,
     };
     let runner_result = runner.run(&runner_request);
     if runner_result

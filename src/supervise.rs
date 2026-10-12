@@ -293,12 +293,16 @@ mod scheduler;
 pub use scheduler::*;
 
 mod selection_bridge;
-#[cfg(target_os = "linux")]
-pub(crate) use selection_bridge::select_account_review_auditor;
 use selection_bridge::*;
+#[cfg(target_os = "linux")]
+pub(crate) use selection_bridge::{
+    select_account_review_auditor, select_account_review_auditor_with_assessment,
+};
 
 mod parent_broker;
 mod task_routing;
+#[cfg(target_os = "linux")]
+pub(crate) use task_routing::assess_task_routing;
 pub use task_routing::TaskRoutingAssessment;
 
 mod accepted_task_cost;

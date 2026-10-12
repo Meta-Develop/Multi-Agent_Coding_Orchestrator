@@ -2003,6 +2003,46 @@ pub(crate) fn select_account_review_auditor(
     Ok((selected, decision))
 }
 
+/// Supply validated task decision data without changing account or launch authority.
+/// Missing assessment retains the existing unassessed, fail-closed API.
+#[cfg(target_os = "linux")]
+pub(crate) fn select_account_review_auditor_with_assessment(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+    assessment: Option<&TaskRoutingAssessment>,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    let Some(assessment) = assessment else {
+        return crate::supervise::select_account_review_auditor(
+            plan,
+            frozen,
+            observations,
+            admission,
+            objective,
+        );
+    };
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen) {
+        bail!("account review requires the caller's matching frozen routing policy");
+    }
+    let (selected, decision) = select_account_intake_for_role_with_assessment(
+        plan,
+        frozen,
+        observations,
+        admission,
+        objective,
+        None,
+        AgentRole::Auditor,
+        Some(assessment),
+    )?;
+    validate_and_seal_account_review_selection(frozen, selected.as_ref(), &decision)?;
+    Ok((selected, decision))
+}
+
 #[cfg(target_os = "linux")]
 fn validate_and_seal_account_review_selection(
     frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
@@ -9546,12 +9586,14 @@ mod tests {
             SupervisorRuntime::Codex,
             account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
         )];
-        let (selected, decision) = crate::supervise::select_account_review_auditor(
+        let (assessment, _) = fixture_task_assessment_for_policy(&plan, &frozen)?;
+        let (selected, decision) = crate::supervise::select_account_review_auditor_with_assessment(
             &plan,
             &frozen,
             &observations,
             &test_admission(),
             &default_resolved_profile(),
+            Some(&assessment),
         )?;
         let selected = selected.context("account review selection")?;
         let receipt = decision
@@ -9629,12 +9671,15 @@ mod tests {
         );
         let expected_binding = AccountBinding::from(&observation.binding);
         let observations = [(SupervisorRuntime::Grok, observation)];
-        let (selected, decision) = crate::supervise::select_account_review_auditor(
-            &test_plan(),
+        let plan = test_plan();
+        let (assessment, _) = fixture_task_assessment_for_policy(&plan, &frozen)?;
+        let (selected, decision) = crate::supervise::select_account_review_auditor_with_assessment(
+            &plan,
             &frozen,
             &observations,
             &test_admission(),
             &default_resolved_profile(),
+            Some(&assessment),
         )?;
         let selected = selected.context("Grok account review selection")?;
         let receipt = decision
@@ -9826,12 +9871,15 @@ mod tests {
             SupervisorRuntime::Codex,
             account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
         )];
-        let (selected, decision) = select_account_review_auditor(
-            &test_plan(),
+        let plan = test_plan();
+        let (assessment, _) = fixture_task_assessment_for_policy(&plan, &frozen)?;
+        let (selected, decision) = crate::supervise::select_account_review_auditor_with_assessment(
+            &plan,
             &frozen,
             &observations,
             &test_admission(),
             &default_resolved_profile(),
+            Some(&assessment),
         )?;
         assert!(selected.is_none());
         assert_eq!(decision.status, DecisionStatus::FailClosed);
@@ -10537,6 +10585,89 @@ mod tests {
         foreign.sha256 =
             crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&foreign.policy)?);
         assert!(assessment.validate_for_task(&foreign, &plan.task).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_review_assessment_refuses_omitted_changed_task_and_foreign_policy() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let _policy = bind_fixture_routing_policy()?;
+        let plan = test_plan();
+        let frozen = current_routing_policy().context("held review policy")?;
+        let (assessment, _) = fixture_task_assessment_for_policy(&plan, &frozen)?;
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        let admission = test_admission();
+        let objective = default_resolved_profile();
+        let error = crate::supervise::select_account_review_auditor(
+            &plan,
+            &frozen,
+            &observations,
+            &admission,
+            &objective,
+        )
+        .expect_err("legacy missing-assessment review must retain its refusal");
+        assert!(error.to_string().contains("task.risk must be known"));
+        let error = crate::supervise::select_account_review_auditor_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &admission,
+            &objective,
+            None,
+        )
+        .expect_err("omitted review assessment must retain its refusal");
+        assert!(error.to_string().contains("task.risk must be known"));
+        assert!(captured_selected_authorizations().is_empty());
+        let mut changed = plan.clone();
+        changed.task.push_str(" changed");
+        let error = crate::supervise::select_account_review_auditor_with_assessment(
+            &changed,
+            &frozen,
+            &observations,
+            &admission,
+            &objective,
+            Some(&assessment),
+        )
+        .expect_err("assessment from another declared task cannot select a reviewer");
+        assert!(error
+            .to_string()
+            .contains("current canonical declared task"));
+        assert!(captured_selected_authorizations().is_empty());
+        let mut foreign = frozen.clone();
+        foreign.policy.unknown_access_policy = UnknownAccessPolicy::Reject;
+        foreign.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&foreign.policy)?);
+        let (foreign_assessment, _) = fixture_task_assessment_for_policy(&plan, &foreign)?;
+        let error = crate::supervise::select_account_review_auditor_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &admission,
+            &objective,
+            Some(&foreign_assessment),
+        )
+        .expect_err("assessment from another frozen policy cannot select a reviewer");
+        assert!(error.to_string().contains("task assessment"));
+        assert!(captured_selected_authorizations().is_empty());
+        for ambient in [None, Some(foreign)] {
+            let _ambient = bind_routing_policy(ambient)?;
+            let error = crate::supervise::select_account_review_auditor_with_assessment(
+                &plan,
+                &frozen,
+                &observations,
+                &admission,
+                &objective,
+                Some(&assessment),
+            )
+            .expect_err("valid task assessment cannot substitute for the caller's policy guard");
+            assert!(error.to_string().contains("matching frozen routing policy"));
+            assert!(captured_selected_authorizations().is_empty());
+        }
+        assert_eq!(current_routing_policy(), Some(frozen));
         Ok(())
     }
 }
