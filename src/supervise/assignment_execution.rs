@@ -12769,6 +12769,49 @@ done
         plan
     }
 
+    #[test]
+    fn model_less_cli_fake_bind_and_prompt_keep_synthetic_provenance() -> Result<()> {
+        let mut plan = worker_plan("unused-model");
+        plan.role_models.clear();
+        let assignment = phase_fixture_assignment("model-less-fake", AssignmentPhase::Execution);
+        plan.assignments = vec![assignment.clone()];
+        let options = launch_fixture_options(SupervisorRuntime::Fake);
+        let bound = bind_selected_runtime_launch(
+            quota_usage_command(Path::new(".")),
+            &assignment,
+            &plan,
+            &options,
+            SupervisorRuntime::Fake,
+            &RuntimeModelCatalog::LocalDeterministicFake,
+            None,
+        )?;
+        assert_eq!(bound.command.model, None);
+        assert_eq!(bound.model_provenance.configured_model, None);
+        assert_eq!(bound.model_provenance.launched_model, None);
+        assert_eq!(
+            bound.model_provenance.launch_runtime,
+            SupervisorRuntime::Fake
+        );
+        assert_eq!(
+            bound.model_provenance.resolution_observation,
+            ModelResolutionObservation::PreferredModel,
+        );
+        assert_eq!(bound.model_provenance.transition_subject_model(), None);
+
+        let prompt_plan = runtime_resolved_prompt_plan(
+            &plan,
+            &assignment,
+            SupervisorRuntime::Fake,
+            SupervisorRuntime::Fake,
+            &RuntimeModelCatalog::LocalDeterministicFake,
+        )?;
+        assert_eq!(
+            prompt_plan.role_models[&AgentRole::ChildOrchestrator].model,
+            None,
+        );
+        Ok(())
+    }
+
     fn valid_child_plan_with_nested_worker() -> Result<SupervisorPlan> {
         let assignment = OrchestratorAssignment {
             id: "child-with-worker".to_string(),

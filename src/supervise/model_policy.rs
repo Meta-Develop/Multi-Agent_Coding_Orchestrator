@@ -494,6 +494,14 @@ pub fn authorize_resolved_judgment_model(
         return validate_known_judgment_role_model(role, Some(model));
     }
     match (runtime, observation) {
+        // An explicitly fake, model-less selection is deterministic simulation,
+        // including the catalog's empty-candidate PreferredModel resolution.
+        // Configured and resolved slugs still take the capability checks.
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::PreferredModel
+            | super::ModelResolutionObservation::RuntimeDefault,
+        ) if configured_model.is_none() => Ok(()),
         (
             super::SupervisorRuntime::Fake,
             super::ModelResolutionObservation::LocalDeterministicFake,
@@ -539,6 +547,13 @@ pub fn authorize_resolved_executor_model(
         return authorize_known_executor_role_model(role, Some(model), mechanical_duty);
     }
     match (runtime, observation) {
+        // The CLI fake runtime has no provider model to authorize. Admit only
+        // resolved, model-less simulation; never infer real-runtime authority.
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::PreferredModel
+            | super::ModelResolutionObservation::RuntimeDefault,
+        ) if configured_model.is_none() => Ok(()),
         (
             super::SupervisorRuntime::Fake,
             super::ModelResolutionObservation::LocalDeterministicFake,
@@ -992,6 +1007,115 @@ mod tests {
             SupervisorRuntime::Codex,
         )
         .expect_err("unknown resolved slugs stay fail-closed");
+    }
+
+    #[test]
+    fn model_less_fake_binding_is_resolved_simulation_only() {
+        for observation in [
+            ModelResolutionObservation::PreferredModel,
+            ModelResolutionObservation::RuntimeDefault,
+            ModelResolutionObservation::LocalDeterministicFake,
+        ] {
+            for result in [
+                authorize_resolved_executor_model(
+                    AgentRole::ChildOrchestrator,
+                    None,
+                    None,
+                    observation,
+                    SupervisorRuntime::Fake,
+                    None,
+                ),
+                authorize_resolved_judgment_model(
+                    AgentRole::ChildOrchestrator,
+                    None,
+                    None,
+                    observation,
+                    SupervisorRuntime::Fake,
+                ),
+            ] {
+                result.expect("explicit model-less fake resolution is simulation");
+            }
+            for runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::Cursor,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::GeminiCli,
+            ] {
+                for result in [
+                    authorize_resolved_executor_model(
+                        AgentRole::ChildOrchestrator,
+                        None,
+                        None,
+                        observation,
+                        runtime,
+                        None,
+                    ),
+                    authorize_resolved_judgment_model(
+                        AgentRole::ChildOrchestrator,
+                        None,
+                        None,
+                        observation,
+                        runtime,
+                    ),
+                ] {
+                    let error = result.expect_err("real runtimes require model identity");
+                    assert!(error
+                        .to_string()
+                        .contains("without an authoritative trusted model identity"));
+                }
+            }
+        }
+        for observation in [
+            ModelResolutionObservation::NotResolved,
+            ModelResolutionObservation::CatalogFallback,
+        ] {
+            assert!(authorize_resolved_executor_model(
+                AgentRole::ChildOrchestrator,
+                None,
+                None,
+                observation,
+                SupervisorRuntime::Fake,
+                None,
+            )
+            .is_err());
+            assert!(authorize_resolved_judgment_model(
+                AgentRole::ChildOrchestrator,
+                None,
+                None,
+                observation,
+                SupervisorRuntime::Fake,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn fake_binding_keeps_configured_and_resolved_role_prohibitions() {
+        let model = "fixture-fake-bind-weak-mechanical";
+        let _guard = install_test_fixture_models(&[(model, ModelCapabilityClass::WeakMechanical)])
+            .expect("install mechanical-only fixture");
+        for (configured, resolved) in [(Some(model), None), (None, Some(model))] {
+            for result in [
+                authorize_resolved_executor_model(
+                    AgentRole::ChildOrchestrator,
+                    configured,
+                    resolved,
+                    ModelResolutionObservation::RuntimeDefault,
+                    SupervisorRuntime::Fake,
+                    None,
+                ),
+                authorize_resolved_judgment_model(
+                    AgentRole::ChildOrchestrator,
+                    configured,
+                    resolved,
+                    ModelResolutionObservation::RuntimeDefault,
+                    SupervisorRuntime::Fake,
+                ),
+            ] {
+                result.expect_err("fake runtime must not hide a model's role prohibition");
+            }
+        }
     }
 
     #[test]

@@ -155,6 +155,14 @@ fn fake_backed_multi_assignment_plan_run_completes_under_cli_token_ceiling() -> 
         report["success"], true,
         "fake-backed plan→run under a hard CLI ceiling must complete: {report} stderr={stderr}"
     );
+    assert_eq!(
+        report["accepted"], false,
+        "fake completion is simulation only"
+    );
+    assert_eq!(
+        report["publishable"], false,
+        "fake completion cannot publish"
+    );
     let started = report["role_economics_profile"]["execution"]["started_assignment_count"]
         .as_u64()
         .unwrap_or(0);
