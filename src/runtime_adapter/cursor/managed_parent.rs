@@ -613,8 +613,24 @@ impl CursorManagedAssignmentAuthority {
                     SideEffectConfinementProfileKind::StrictOfflineWorkspace,
                 )
         {
+            use std::os::unix::process::ExitStatusExt;
+
             bail!(
-                "managed Cursor assigned-path Git diff check did not complete under exact offline confinement"
+                "managed Cursor assigned-path Git diff check did not complete under exact offline confinement: \
+                 exit_code={:?}, signal={:?}, timed_out={}, process_error_present={}, \
+                 stdin_error_present={}, stdout_truncated={}, stderr_truncated={}, \
+                 process_tree={:?}, side_effects={:?}, assigned_path_count={}, git_path_sha256={}",
+                output.status.and_then(|status| status.code()),
+                output.status.and_then(|status| status.signal()),
+                output.timed_out,
+                output.process_error.is_some(),
+                output.stdin_error.is_some(),
+                output.stdout.is_truncated(),
+                output.stderr.is_truncated(),
+                output.process_tree,
+                output.side_effects,
+                changed.len(),
+                crate::artifacts::state_auth::sha256_hex(git.as_os_str().as_bytes()),
             );
         }
         let execution_time_millis = u64::try_from(started.elapsed().as_millis())
