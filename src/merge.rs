@@ -727,7 +727,7 @@ fn merge_arbiter_task_assessment(
             decision_dependencies: assignment
                 .decision_refs
                 .iter()
-                .map(|reference| reference.question_key.clone())
+                .map(|reference| reference.question_key().to_owned())
                 .collect(),
         }],
         coverage_gaps: Vec::new(),

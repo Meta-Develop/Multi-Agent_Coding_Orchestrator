@@ -4492,7 +4492,7 @@ mod tests {
                 assignment
                     .decision_refs
                     .iter()
-                    .map(|reference| reference.question_key.clone()),
+                    .map(|reference| reference.question_key().to_owned()),
             );
             if assignment.worker_assignments.is_empty() {
                 paths.extend(assignment.assigned_paths.iter().cloned());
