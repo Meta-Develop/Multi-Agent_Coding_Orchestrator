@@ -1499,9 +1499,10 @@ mod managed_model_metadata_tests {
     #[test]
     fn bounded_reader_refuses_symlink_and_preserves_missing_unknown() {
         let root = tempfile::tempdir().unwrap();
-        let cache = root.path().join("models_cache.json");
+        let root_path = root.path().canonicalize().unwrap();
+        let cache = root_path.join("models_cache.json");
         assert!(read_managed_model_cache(&cache).unwrap().is_none());
-        let real = root.path().join("real.json");
+        let real = root_path.join("real.json");
         fs::write(&real, br#"{"models":[{"slug":"m"}]}"#).unwrap();
         std::os::unix::fs::symlink(&real, &cache).unwrap();
         assert!(read_managed_model_cache(&cache).is_err());

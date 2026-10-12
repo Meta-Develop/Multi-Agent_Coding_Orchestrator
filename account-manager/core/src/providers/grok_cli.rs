@@ -1803,14 +1803,15 @@ mod grok_model_metadata_tests {
     #[cfg(unix)]
     fn observation_reads_only_derived_slot_without_auth_or_ambient_cache() {
         let temp = tempfile::tempdir().unwrap();
-        let ambient = temp.path().join("ambient");
+        let root = temp.path().canonicalize().unwrap();
+        let ambient = root.join("ambient");
         fs::create_dir_all(ambient.join(".grok")).unwrap();
         fs::write(
             ambient.join(".grok/models_cache.json"),
             serde_json::to_vec(&cache()).unwrap(),
         )
         .unwrap();
-        let adapter = GrokCliAdapter::with_home(&ambient).with_data_dir(temp.path().join("data"));
+        let adapter = GrokCliAdapter::with_home(&ambient).with_data_dir(root.join("data"));
         let account = account();
         assert_eq!(
             adapter
@@ -1852,7 +1853,8 @@ mod grok_model_metadata_tests {
     fn bounded_reader_rejects_leaf_ancestor_links_hardlinks_writable_and_oversize_files() {
         use std::os::unix::fs::{symlink, PermissionsExt};
         let temp = tempfile::tempdir().unwrap();
-        let real = temp.path().join("real");
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real");
         fs::create_dir(&real).unwrap();
         let path = real.join("models_cache.json");
         fs::write(&path, serde_json::to_vec(&cache()).unwrap()).unwrap();
@@ -1860,13 +1862,13 @@ mod grok_model_metadata_tests {
         assert!(read_grok_model_cache(&real.join("missing"))
             .unwrap()
             .is_none());
-        let leaf = temp.path().join("leaf");
+        let leaf = root.join("leaf");
         symlink(&path, &leaf).unwrap();
         assert!(read_grok_model_cache(&leaf).is_err());
-        let ancestor = temp.path().join("ancestor");
+        let ancestor = root.join("ancestor");
         symlink(&real, &ancestor).unwrap();
         assert!(read_grok_model_cache(&ancestor.join("models_cache.json")).is_err());
-        let hard = temp.path().join("hard");
+        let hard = root.join("hard");
         fs::hard_link(&path, &hard).unwrap();
         assert!(read_grok_model_cache(&path).is_err());
         fs::remove_file(hard).unwrap();

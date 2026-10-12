@@ -959,6 +959,12 @@ mod tests {
     fn provision_and_launch_bind_only_the_private_cursor_file_store() {
         let live = tempfile::tempdir().expect("live");
         let data = tempfile::tempdir().expect("data");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(data.path(), fs::Permissions::from_mode(0o700))
+                .expect("private data directory");
+        }
         let cwd = tempfile::tempdir().expect("cwd");
         let adapter = CursorAdapter::with_home(live.path())
             .with_data_dir(data.path())
