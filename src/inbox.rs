@@ -5941,6 +5941,8 @@ fn independent_auditor_available_models(
 
 fn selector_effort_label(effort: crate::selection::ReasoningEffort) -> &'static str {
     match effort {
+        crate::selection::ReasoningEffort::None => "none",
+        crate::selection::ReasoningEffort::Minimal => "minimal",
         crate::selection::ReasoningEffort::Low => "low",
         crate::selection::ReasoningEffort::Medium => "medium",
         crate::selection::ReasoningEffort::High => "high",

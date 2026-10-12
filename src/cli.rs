@@ -138,8 +138,7 @@ pub struct Cli {
 /// an option. Every routed argument is joined with one ASCII space and passed
 /// as one literal goal/spec, so option-shaped words after the first instruction
 /// word remain instruction text rather than becoming MACO options. The rewriter
-/// injects `--runtime codex` after `--literal-goal` so a bare
-/// `maco <instruction>` is an explicit live Codex launch.
+/// leaves runtime selection to account-bound normal intake before dispatch.
 pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = T>,
@@ -176,8 +175,6 @@ where
         OsString::from("run"),
         OsString::from("--literal-goal"),
         instruction,
-        OsString::from("--runtime"),
-        OsString::from("codex"),
     ]
 }
 
@@ -1149,13 +1146,71 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 host_disk_per_child_mib: args.host_disk_per_child_mib,
                 host_fallback_children: args.host_fallback_children,
             };
+            let mut normal_document = None;
             let runtime = match args.runtime {
                 Some(runtime) => runtime,
+                None if goal_spec.is_some() && !resume_existing => {
+                    let (plan, mut document) =
+                        supervise::supervisor_plan_and_document_from_goal_spec(
+                            &resolved_repo,
+                            "",
+                            goal_spec
+                                .as_deref()
+                                .context("normal intake goal disappeared")?,
+                        )?;
+                    let frozen: crate::selection::routing_policy::FrozenRoutingPolicy =
+                        serde_json::from_value(
+                            document
+                                .get("resolved_routing_policy")
+                                .cloned()
+                                .context("normal intake has no frozen routing policy")?,
+                        )
+                        .context("normal intake routing policy receipt is invalid")?;
+                    let task_routing_assessment =
+                        supervise::task_routing_assessment_from_plan_document(&plan, &document)?;
+                    let (runtime, selected, decision) = supervise::select_normal_intake(
+                        &resolved_repo,
+                        &resolved_run_id,
+                        &plan,
+                        &frozen,
+                        task_routing_assessment.as_ref(),
+                        supervise::NormalIntakeConfig {
+                            admission_overrides,
+                            max_concurrent_children: args
+                                .max_concurrent_children
+                                .resolve(crate::process_runner::HostProcessCapacity::measured()),
+                            objective_profile: args.objective_profile.as_deref(),
+                        },
+                    )?;
+                    let decision_sha256 =
+                        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&decision)?);
+                    let object = document
+                        .as_object_mut()
+                        .context("normal intake plan is not an object")?;
+                    object.insert(
+                        "normal_intake_selection".to_string(),
+                        serde_json::to_value(selected)?,
+                    );
+                    object.insert(
+                        "normal_intake_decision".to_string(),
+                        serde_json::to_value(decision)?,
+                    );
+                    object.insert(
+                        "normal_intake_decision_sha256".to_string(),
+                        serde_json::Value::String(decision_sha256),
+                    );
+                    normal_document = Some(document);
+                    runtime
+                }
                 None => sniff_supervise_runtime_from_plan(&plan_file, &resolved_repo)?,
             };
             let json = args.json;
             let objective_profile_override = args.objective_profile.clone();
             let role_category_override = args.role_category_override.role_category;
+            if let (Some(document), Some(category)) = (&mut normal_document, role_category_override)
+            {
+                stamp_operator_role_category_override(document, category)?;
+            }
             if resume_existing && objective_profile_override.is_some() {
                 bail!(
                     "--objective-profile cannot change an existing supervise run; resume uses its frozen objective profile"
@@ -1166,13 +1221,17 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "--role-category cannot change an existing supervise run; resume uses its frozen role categories"
                 );
             }
-            let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
-                plan_file,
-                goal_spec,
-                &resolved_repo,
-                resolved_run_id.as_str(),
-                role_category_override,
-            )?;
+            let (plan_file, goal_spec) = if normal_document.is_some() {
+                (plan_file, goal_spec)
+            } else {
+                materialize_launch_plan_for_operator_role_category(
+                    plan_file,
+                    goal_spec,
+                    &resolved_repo,
+                    resolved_run_id.as_str(),
+                    role_category_override,
+                )?
+            };
             let reap_repo = resolved_repo.clone();
             let _rolling_guard = rolling_quota
                 .map(|quota| {
@@ -1257,7 +1316,16 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 )?)
             };
             let outcome = (|| {
-                let report = match (goal_spec, resume_existing) {
+                let report = if let Some(document) = normal_document {
+                    supervise::run_supervisor_normal_document_cascade(
+                        options,
+                        document,
+                        args.max_concurrent_children,
+                        args.allow_primary_worktree,
+                        objective_profile_override,
+                    )?
+                } else {
+                    match (goal_spec, resume_existing) {
                     (Some(goal_spec), true) => {
                         supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
                             options,
@@ -1290,6 +1358,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                             objective_profile_override,
                         )?
                     }
+                }
                 };
                 print_query_report(&report, json)?;
                 if !report.follow_up_cascade_success {
@@ -1904,7 +1973,8 @@ impl ConsultCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = consult::ask_consultant(ConsultAskOptions {
+                let gemini = args.gemini_inputs()?;
+                let options = ConsultAskOptions {
                     repo: resolved.repo,
                     run_id: resolved.run_id,
                     runtime: args.runtime,
@@ -1912,7 +1982,11 @@ impl ConsultCommand {
                     question,
                     context_paths: args.context_path,
                     timeout_seconds: args.timeout_seconds,
-                })?;
+                };
+                let report = match gemini {
+                    Some(inputs) => consult::ask_gemini_consultant(options, inputs)?,
+                    None => consult::ask_consultant(options)?,
+                };
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("consult ask failed");
@@ -1943,9 +2017,15 @@ struct AskConsultArgs {
     /// Consultant runtime to use. Real runtimes require --consultant-bin.
     #[arg(long, default_value = "fake")]
     runtime: ConsultantRuntime,
-    /// Codex- or Claude-compatible executable for real consultant runtimes.
+    /// Runtime executable for real consultant runtimes.
     #[arg(long)]
     consultant_bin: Option<PathBuf>,
+    /// Explicit requested model for Gemini; never an observed model identity.
+    #[arg(long)]
+    model: Option<String>,
+    /// Positive finite token ceiling required for Gemini consultation.
+    #[arg(long)]
+    token_budget: Option<usize>,
     /// Repo-relative existing path to mention as context. Contents are not inlined.
     #[arg(long = "context-path")]
     context_path: Vec<PathBuf>,
@@ -1961,6 +2041,83 @@ struct AskConsultArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+impl AskConsultArgs {
+    fn gemini_inputs(&self) -> Result<Option<consult::GeminiConsultOptions>> {
+        if self.runtime == ConsultantRuntime::Gemini {
+            let inputs = consult::GeminiConsultOptions {
+                model: self.model.clone().context("Gemini requires --model")?,
+                token_budget: self
+                    .token_budget
+                    .context("Gemini requires --token-budget")?,
+            };
+            inputs.validate()?;
+            Ok(Some(inputs))
+        } else {
+            if self.model.is_some() || self.token_budget.is_some() {
+                bail!("--model and --token-budget on consult ask require --runtime gemini");
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemini_consult_input_tests {
+    use super::*;
+
+    fn ask(flags: &[&str]) -> Result<AskConsultArgs> {
+        let argv = [
+            vec!["maco", "consult", "ask", "--question", "inspect"],
+            flags.to_vec(),
+        ]
+        .concat();
+        let parsed = Cli::try_parse_from(argv)?;
+        let Command::Consult(ConsultCommand {
+            command: ConsultSubcommand::Ask(args),
+        }) = parsed.command
+        else {
+            bail!("expected consult ask");
+        };
+        Ok(args)
+    }
+
+    #[test]
+    fn gemini_consult_cli_requires_explicit_model_and_budget_without_other_runtime_defaults(
+    ) -> Result<()> {
+        assert!(ask(&[])?.gemini_inputs()?.is_none());
+        for flags in [
+            vec!["--runtime", "gemini"],
+            vec!["--runtime", "gemini", "--model", "gemini-2.5-pro"],
+            vec!["--runtime", "gemini", "--token-budget", "10"],
+            vec![
+                "--runtime",
+                "gemini",
+                "--model",
+                "gemini-2.5-pro",
+                "--token-budget",
+                "0",
+            ],
+            vec!["--runtime", "codex", "--token-budget", "10"],
+            vec!["--runtime", "claude", "--model", "gemini-2.5-pro"],
+        ] {
+            assert!(ask(&flags)?.gemini_inputs().is_err(), "accepted {flags:?}");
+        }
+        let inputs = ask(&[
+            "--runtime",
+            "gemini",
+            "--model",
+            "gemini-2.5-pro",
+            "--token-budget",
+            "10",
+        ])?
+        .gemini_inputs()?
+        .context("missing Gemini inputs")?;
+        assert_eq!(inputs.model, "gemini-2.5-pro");
+        assert_eq!(inputs.token_budget, 10);
+        Ok(())
+    }
 }
 
 fn consult_question(args: &AskConsultArgs) -> Result<String> {

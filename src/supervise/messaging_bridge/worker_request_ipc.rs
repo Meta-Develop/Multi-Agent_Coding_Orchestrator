@@ -51,7 +51,7 @@ impl SupervisorMessagingSessionFactory {
     /// authored equality then prevents substituting another parent's Workers. The only
     /// supervisor-controlled exception is runtime projection: the requested-plan freeze
     /// may still have `runtime: None` when the trusted selector has set the live parent
-    /// to `Some(Codex)`. An explicit frozen runtime must match exactly. No other field,
+    /// to its selected runtime. An explicit frozen runtime must match exactly. No other field,
     /// including nested Workers, may differ. A known parent is consumed even when the
     /// claim is later refused, so callers must retain the returned binding for this live
     /// turn and never retry that parent after downstream failure. An unknown parent id
@@ -82,13 +82,13 @@ impl SupervisorMessagingSessionFactory {
             parents.remove(index)
         };
         if attempt != 1
-            || resolved_runtime != SupervisorRuntime::Codex
+            || resolved_runtime == SupervisorRuntime::Fake
             || parent
                 .runtime
-                .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
-            || !authored_parent_accepts_codex_runtime_projection(&authored, parent)
+                .is_some_and(|runtime| runtime != resolved_runtime)
+            || !authored_parent_accepts_runtime_projection(&authored, parent, resolved_runtime)
         {
-            bail!("fresh Worker request admission requires the exact authored first Codex parent turn");
+            bail!("fresh Worker request admission requires the exact authored first selected parent turn");
         }
         let generation =
             random_identifier().context("failed to mint fresh Worker inbox generation")?;
@@ -123,17 +123,21 @@ impl SupervisorMessagingSessionFactory {
 }
 
 /// Requested-plan admission freezes assignments before the selector writes a runtime.
-/// Only an omitted frozen runtime may match a live `Some(Codex)` parent. Every other
+/// Only an omitted frozen runtime may match the live selected runtime. Every other
 /// field, including nested Workers, stays under authored `PartialEq`.
-fn authored_parent_accepts_codex_runtime_projection(
+fn authored_parent_accepts_runtime_projection(
     authored: &OrchestratorAssignment,
     parent: &OrchestratorAssignment,
+    resolved_runtime: SupervisorRuntime,
 ) -> bool {
     match (authored.runtime, parent.runtime) {
-        (None, None) | (Some(SupervisorRuntime::Codex), Some(SupervisorRuntime::Codex)) => {
+        (None, None) => authored == parent,
+        (Some(authored_runtime), Some(runtime))
+            if authored_runtime == resolved_runtime && runtime == resolved_runtime =>
+        {
             authored == parent
         }
-        (None, Some(SupervisorRuntime::Codex)) => {
+        (None, Some(runtime)) if runtime == resolved_runtime => {
             let mut projected = parent.clone();
             projected.runtime = None;
             authored == &projected

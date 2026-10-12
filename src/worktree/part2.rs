@@ -796,6 +796,16 @@ fn discover_repository_local_sweep_roots(
         let repository = workspace.join(&child.name);
         if path_entry_exists(&repository.join(".git"))? {
             add_repository_local_sweep_root(&repository, &mut roots)?;
+            let group = child
+                .name
+                .to_str()
+                .map(sanitize_path_segment)
+                .unwrap_or_else(|| "repository".to_string());
+            roots.extend(
+                discover_workspace_managed_sweep_roots(&repository)?
+                    .into_iter()
+                    .filter(|candidate| candidate.group == group),
+            );
         }
     }
     Ok(roots)
@@ -1448,6 +1458,29 @@ fn resolve_sweep_repository_from_workspace(
                 sweep_failure(WorktreeSweepFailureKind::RepositoryAssociation, error)
             })?;
     let mut candidates = Vec::new();
+    if workspace
+        .file_name()
+        .and_then(OsStr::to_str)
+        .map(sanitize_path_segment)
+        .as_deref()
+        == Some(group)
+        && group_root == workspace.join(".maco").join("worktrees").join(group)
+    {
+        match fs::symlink_metadata(workspace.join(".git")) {
+            Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {
+                candidates.push(workspace.to_path_buf())
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(sweep_failure(
+                    WorktreeSweepFailureKind::RepositoryOpen,
+                    anyhow::Error::new(error)
+                        .context("failed to inspect workspace primary repository Git metadata"),
+                ))
+            }
+        }
+    }
     for child_name in child_names {
         if child_name == OsStr::new(".maco") {
             continue;
@@ -1641,8 +1674,25 @@ fn validate_primary_sweep_association(
             message: "lane and primary repository common directories do not match".to_string(),
         });
     }
+    let canonical_group_root = fs::canonicalize(group_root).map_err(|error| {
+        sweep_failure(
+            WorktreeSweepFailureKind::RepositoryAssociation,
+            anyhow::Error::new(error).context("failed to resolve workspace worktree group"),
+        )
+    })?;
+    let project_managed_root = canonical_primary.join(".maco").join("worktrees").join(
+        canonical_primary
+            .file_name()
+            .and_then(OsStr::to_str)
+            .map(sanitize_path_segment)
+            .unwrap_or_else(|| "repository".to_string()),
+    );
+    let is_project_managed_root = canonical_group_root == project_managed_root;
     let primary_is_in_scope = match root_kind {
-        WorktreeSweepRootKind::WorkspaceManaged => canonical_primary.parent() == Some(workspace),
+        WorktreeSweepRootKind::WorkspaceManaged => {
+            canonical_primary.parent() == Some(workspace)
+                || (canonical_primary == workspace && is_project_managed_root)
+        }
         WorktreeSweepRootKind::RepositoryLocal => {
             canonical_primary == workspace || canonical_primary.parent() == Some(workspace)
         }
@@ -1654,21 +1704,16 @@ fn validate_primary_sweep_association(
                 .to_string(),
         });
     }
-    let canonical_group_root = fs::canonicalize(group_root).map_err(|error| {
-        sweep_failure(
-            WorktreeSweepFailureKind::RepositoryAssociation,
-            anyhow::Error::new(error).context("failed to resolve workspace worktree group"),
-        )
-    })?;
     let expected_group_root = match root_kind {
-        WorktreeSweepRootKind::WorkspaceManaged => default_worktree_root(primary),
+        WorktreeSweepRootKind::WorkspaceManaged if is_project_managed_root => project_managed_root,
+        WorktreeSweepRootKind::WorkspaceManaged => legacy_workspace_worktree_root(primary),
         WorktreeSweepRootKind::RepositoryLocal => canonical_primary.join(".worktrees"),
     };
     let canonical_expected_root = fs::canonicalize(&expected_group_root).map_err(|error| {
         sweep_failure(
             WorktreeSweepFailureKind::RepositoryAssociation,
             anyhow::Error::new(error)
-                .context("failed to resolve primary repository default worktree root"),
+                .context("failed to resolve primary repository expected sweep root"),
         )
     })?;
     if canonical_group_root != canonical_expected_root {

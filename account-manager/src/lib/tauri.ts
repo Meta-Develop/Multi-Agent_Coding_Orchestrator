@@ -11,6 +11,7 @@ import type {
   ProviderQuotaList,
   RelayStatus,
   RouteRule,
+  SelectedAccountBinding,
 } from '@/types'
 
 /**
@@ -57,6 +58,15 @@ export function deleteAccount(
   accountId: string,
 ): Promise<void> {
   return invoke<void>('delete_account', { providerId, accountId })
+}
+
+/** Read the authority's current public selection tuple; never selects or resolves a secret. */
+export function selectedAccountBinding(
+  providerId: string,
+): Promise<SelectedAccountBinding | null> {
+  return invoke<SelectedAccountBinding | null>('selected_account_binding', {
+    providerId,
+  })
 }
 
 /** Observes only the account named by `request.binding`; never auto-selects. */
@@ -123,4 +133,12 @@ export function loginCancel(input: {
   binding: LoginAccountBinding
 }): Promise<LoginStatus> {
   return invoke<LoginStatus>('login_cancel', input)
+}
+
+/** Native code fetches the current bound owner action; the caller cannot supply a URL. */
+export function loginOpenAuthorization(input: {
+  handle: string
+  binding: LoginAccountBinding
+}): Promise<void> {
+  return invoke<void>('login_open_authorization', input)
 }

@@ -61,6 +61,46 @@ Re-run that command to update. A crates.io publication is not part of this
 slice; when one exists, `cargo install --locked maco` (or the published crate
 name) is the same global-binary contract.
 
+## Linux CAM authority endpoint
+
+The standard Linux client endpoint is `maco/account-authority.sock` beneath
+`XDG_RUNTIME_DIR` when that directory is absolute, non-symlink, owned by the
+effective user, and has no group/world permissions. Otherwise the client uses
+`/run/user/<effective-uid>/maco/account-authority.sock`. The connection still
+checks socket ancestry and the authority enforces same-UID peers. Explicit
+`--cam-authority-socket` and `MACO_CAM_AUTHORITY_SOCKET` overrides are preserved.
+This default does not enable authority transport on Windows.
+
+The headless authority needs its own long-lived process under the same Linux
+user as MACO. For a systemd user installation, the minimal service settings are:
+
+```ini
+[Service]
+ExecStart=<accepted-package>/bin/account-authority --socket-path %t/maco/account-authority.sock
+RuntimeDirectory=maco
+RuntimeDirectoryMode=0700
+UMask=0077
+Restart=on-failure
+
+[Install]
+WantedBy=default.target
+```
+
+Replace `<accepted-package>` with the absolute immutable package path containing
+the accepted `maco` and `account-authority` binaries and their source binding.
+The user's normal `XDG_RUNTIME_DIR` must match the user manager's `%t` directory.
+Keep the service stopped until that package is accepted; inspect any existing
+authority before starting it, because the server replaces an existing socket.
+Enable the unit for normal user-manager sessions. Persistence beyond the last
+login depends on the host's approved user-manager lifetime; do not enable
+lingering or start a manager as an installation workaround.
+
+Run the service as the operator user, never as root. Retain the existing CAM
+data directory: `$XDG_DATA_HOME/coding-agent-manager`, or
+`$HOME/.local/share/coding-agent-manager` when `XDG_DATA_HOME` is unset.
+The service and MACO must share that data-directory identity. Installing the
+service does not complete owner OAuth or select a pending account.
+
 ## Version recording
 
 `maco --version` and `maco -V` print this text, plus a trailing newline:

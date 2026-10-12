@@ -41,8 +41,7 @@ use crate::selection::{
 };
 #[cfg(target_os = "linux")]
 use coding_agent_manager_lib::account_authority::{
-    validate_observed_models, ModelsObservation, ObservationOutcome, ObservedModel,
-    QuotaObservation,
+    ModelsObservation, ObservationOutcome, ObservedModel, QuotaObservation,
 };
 use std::path::Path;
 
@@ -654,6 +653,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     quota_context: Option<LiveQuotaSelectionContext>,
     quota_ledger: Option<RunBudgetLedger>,
     account_observation: Option<AccountObserveResult>,
+    account_observations: Vec<(SupervisorRuntime, AccountObserveResult)>,
     observed_cost_per_accepted_task_microunits: Option<u64>,
     this_run_outcomes: Vec<OutcomeRecord>,
     this_run_exclusions: Vec<String>,
@@ -907,6 +907,7 @@ pub(super) fn initialize_supervisor_selection_with_quota(
     )
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub(super) fn initialize_supervisor_selection_with_history(
     plan: &mut SupervisorPlan,
@@ -919,6 +920,69 @@ pub(super) fn initialize_supervisor_selection_with_history(
     history: Option<&FrozenOutcomeHistory>,
     account_observation: Option<&AccountObserveResult>,
 ) -> Result<SupervisorSelectionResolution> {
+    let accounts = account_observation
+        .map(|observation| vec![(runtime, observation.clone())])
+        .unwrap_or_default();
+    initialize_supervisor_selection_with_accounts(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        history,
+        &accounts,
+    )
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+pub(super) fn initialize_supervisor_selection_with_accounts(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
+    account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_assessment(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        history,
+        account_observations,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn initialize_supervisor_selection_with_assessment(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
+    account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+    assessment: Option<&TaskRoutingAssessment>,
+) -> Result<SupervisorSelectionResolution> {
+    let frozen_policy = crate::selection::routing_policy::current_routing_policy();
+    let routing_features =
+        routing_features_with_assessment(plan, assessment, frozen_policy.as_ref())?;
+    let account_observation = account_observations
+        .iter()
+        .find(|(observed_runtime, _)| *observed_runtime == runtime)
+        .map(|(_, observation)| observation);
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
             mode: SupervisorSelectionMode::LegacyFake,
@@ -938,19 +1002,9 @@ pub(super) fn initialize_supervisor_selection_with_history(
     } = quota;
 
     let automatic = plan.role_models.is_empty();
-    // A resolved profile is an input to selection, not permission to leave
-    // unspecified roles on the provisional catalog-order path. Resolve every
-    // executable role and apply authored entries only as exact debug
-    // overrides so launch and persisted evidence share one complete decision
-    // set.
-    let mut roles = all_selector_roles().to_vec();
-    if plan
-        .assignments
-        .iter()
-        .any(|assignment| assignment.role == AgentRole::Researcher)
-    {
-        roles.push(AgentRole::Researcher);
-    }
+    // Resolve reachable execution roles and mandatory control gates. An unused
+    // role preference cannot veto a bounded direct Worker assignment.
+    let roles = required_selector_roles(plan);
     if runtime == SupervisorRuntime::Cursor
         && advertised.cursor.is_none()
         && account_observation.is_none()
@@ -983,7 +1037,7 @@ pub(super) fn initialize_supervisor_selection_with_history(
     }
     let mut resolved = BTreeMap::new();
     let mut decisions = Vec::with_capacity(roles.len());
-    for role in roles {
+    for role in roles.iter().copied() {
         let configured = plan.role_models.get(&role);
         let debug_override = configured
             .map(|selection| {
@@ -994,33 +1048,47 @@ pub(super) fn initialize_supervisor_selection_with_history(
                 )
             })
             .transpose()?;
-        let input = selection_input_for_role(SelectionInputForRoleArgs {
-            role,
-            runtime,
-            catalog,
-            advertised,
-            admission,
-            resolved_objective_profile: &resolved_objective_profile,
-            quota_context,
-            quota_ledger,
-            account_observation,
-            signals: DynamicSignals {
-                retry_count: 0,
-                budget_signal: BudgetSignal::Continue,
-                previous_choice: None,
-                previous_catalog_digest: None,
-                environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+        let input = selection_input_for_role_with_assessment_and_accounts(
+            SelectionInputForRoleArgs {
+                role,
+                runtime,
+                catalog,
+                advertised,
+                admission,
+                resolved_objective_profile: &resolved_objective_profile,
+                quota_context,
+                quota_ledger,
+                account_observation,
+                signals: DynamicSignals {
+                    retry_count: 0,
+                    budget_signal: BudgetSignal::Continue,
+                    previous_choice: None,
+                    previous_catalog_digest: None,
+                    environment_rejections: Vec::new(),
+                    observed_cost_per_accepted_task_microunits: None,
+                },
+                debug_override,
+                history,
             },
-            debug_override,
-            history,
-        })?;
-        let mut decision = select_with_live_switch_cost(&input).map_err(|error| {
-            anyhow!(
-                "automatic selector rejected role '{}': {error}",
-                role.as_str()
-            )
-        })?;
+            account_observations,
+            assessment,
+            Some(&routing_features),
+            frozen_policy.as_ref(),
+        )?;
+        let routing_policy = frozen_policy.as_ref().map(|frozen| {
+            crate::selection::routing_policy::RoutingPolicyReceipt {
+                frozen: frozen.clone(),
+                role: role.as_str().to_string(),
+                features: routing_features.clone(),
+            }
+        });
+        let mut decision = select_with_live_switch_cost_for_policy(&input, routing_policy.as_ref())
+            .map_err(|error| {
+                anyhow!(
+                    "automatic selector rejected role '{}': {error}",
+                    role.as_str()
+                )
+            })?;
         decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
         decision.operator_prior_data = super::prior_input::current_provenance();
         let primary_cause = if configured.is_some() {
@@ -1051,6 +1119,10 @@ pub(super) fn initialize_supervisor_selection_with_history(
                 });
             }
         };
+        crate::selection::routing_policy::seal_selected_candidate(
+            role.as_str(),
+            &event.provenance,
+        )?;
         if configured.is_some() {
             let requested = &input
                 .debug_override
@@ -1097,6 +1169,8 @@ pub(super) fn initialize_supervisor_selection_with_history(
                 quota_context.cloned(),
                 quota_ledger.cloned(),
                 account_observation.cloned(),
+                account_observations.to_vec(),
+                &roles,
             )
         })
         .transpose()?;
@@ -1119,6 +1193,8 @@ impl SupervisorAutomaticSelectionState {
         quota_context: Option<LiveQuotaSelectionContext>,
         quota_ledger: Option<RunBudgetLedger>,
         account_observation: Option<AccountObserveResult>,
+        account_observations: Vec<(SupervisorRuntime, AccountObserveResult)>,
+        required_roles: &[AgentRole],
     ) -> Result<Self> {
         let mut by_role = BTreeMap::new();
         for decision in decisions {
@@ -1140,7 +1216,7 @@ impl SupervisorAutomaticSelectionState {
                 );
             }
         }
-        for role in all_selector_roles() {
+        for role in required_roles {
             if !by_role.contains_key(role) {
                 bail!(
                     "automatic selector omitted initial provenance for role '{}'",
@@ -1154,6 +1230,7 @@ impl SupervisorAutomaticSelectionState {
             quota_context,
             quota_ledger,
             account_observation,
+            account_observations,
             observed_cost_per_accepted_task_microunits: None,
             this_run_outcomes: Vec::new(),
             this_run_exclusions: Vec::new(),
@@ -1354,14 +1431,18 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )
         })?;
         let mut input = previous.normalized_input.clone();
-        let constructed = constructed_selection_catalogs(
-            runtime,
-            catalog,
-            &advertised,
-            &input.task,
-            &input.priors,
-            state.account_observation.as_ref(),
-        )?;
+        let constructed = if state.account_observations.is_empty() {
+            constructed_selection_catalogs(
+                runtime,
+                catalog,
+                &advertised,
+                &input.task,
+                &input.priors,
+                state.account_observation.as_ref(),
+            )?
+        } else {
+            account_selection_catalogs(&state.account_observations, &input.task, &input.priors)?
+        };
         input.constraints.allowed_runtimes = constructed
             .iter()
             .map(|runtime_catalog| runtime_catalog.runtime.clone())
@@ -1399,12 +1480,14 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
         }
         merge_this_run_outcomes_into_input(&mut input, &state.this_run_outcomes);
 
-        let mut decision = select_with_live_switch_cost(&input).map_err(|error| {
-            anyhow!(
-                "automatic selector replay rejected role '{}': {error}",
-                role.as_str()
-            )
-        })?;
+        let routing_policy = previous.routing_policy.as_ref();
+        let mut decision = select_with_live_switch_cost_for_policy(&input, routing_policy)
+            .map_err(|error| {
+                anyhow!(
+                    "automatic selector replay rejected role '{}': {error}",
+                    role.as_str()
+                )
+            })?;
         decision.outcome_history = previous.outcome_history.clone();
         attach_this_run_exclusions(&mut decision, &state.this_run_exclusions)?;
         decision.operator_prior_data = previous.operator_prior_data.clone();
@@ -1417,6 +1500,7 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
                 )
             }
         };
+        crate::selection::routing_policy::seal_selected_candidate(role.as_str(), &decision)?;
         overrides.insert(role, role_selection_from_choice(choice));
         runtime_overrides.insert(
             role,
@@ -1503,6 +1587,24 @@ fn role_for_task_profile(task: &TaskProfile) -> Result<AgentRole> {
     }
 }
 
+fn required_selector_roles(plan: &SupervisorPlan) -> Vec<AgentRole> {
+    // Parent acceptance, independent audit, and failure classification remain
+    // reachable control paths even for a single terminal assignment.
+    let mut roles = BTreeSet::from([
+        AgentRole::Supervisor,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ]);
+    for assignment in &plan.assignments {
+        roles.insert(assignment.role);
+        for worker in &assignment.worker_assignments {
+            roles.insert(worker.role);
+        }
+    }
+    roles.into_iter().collect()
+}
+
+#[cfg(test)]
 fn all_selector_roles() -> &'static [AgentRole] {
     &[
         AgentRole::Supervisor,
@@ -1529,6 +1631,7 @@ fn bind_automatic_review_lenses_to_auditor_selection(plan: &mut SupervisorPlan) 
             ..
         } = &mut lens.backend
         {
+            // Bind the authorized triple. Scope never invents an effort preference.
             *lens_model = model.clone();
             *reasoning_effort = selection.reasoning_effort.clone();
         }
@@ -1642,6 +1745,7 @@ fn debug_override_for_role(
     })
 }
 
+#[derive(Clone)]
 struct SelectionInputForRoleArgs<'a> {
     role: AgentRole,
     runtime: SupervisorRuntime,
@@ -1664,14 +1768,400 @@ fn live_switch_cost_evidence(input: &SelectionInput) -> Vec<CandidateSwitchCostE
 fn select_with_live_switch_cost(
     input: &SelectionInput,
 ) -> Result<SelectionProvenance, selection::SelectionError> {
+    select_with_live_switch_cost_for_policy(input, None)
+}
+
+fn select_with_live_switch_cost_for_policy(
+    input: &SelectionInput,
+    routing_policy: Option<&crate::selection::routing_policy::RoutingPolicyReceipt>,
+) -> Result<SelectionProvenance, selection::SelectionError> {
     let evidence = live_switch_cost_evidence(input);
-    let provenance = selection::select_with_switch_cost_estimates(input, &evidence)?;
+    let provenance =
+        selection::select_with_loaded_routing_policy(input, &evidence, routing_policy)?;
     if let Err(error) = route_live_four_arm_comparison(input) {
         return Err(selection::SelectionError::InvalidInput(format!(
             "live online-router four-arm comparison failed: {error:#}"
         )));
     }
     Ok(provenance)
+}
+
+pub(super) fn routing_features_from_plan(
+    plan: &SupervisorPlan,
+) -> crate::selection::routing_policy::TaskRoutingFeatures {
+    // Assess terminal scopes: a genuine Execution parent contains its Workers,
+    // so counting top-level assignments would incorrectly collapse their grain.
+    let mut scopes: Vec<(&[PathBuf], &[String])> = Vec::new();
+    let mut dependency_edges = 0usize;
+    for assignment in &plan.assignments {
+        dependency_edges = dependency_edges.saturating_add(assignment.decision_refs.len());
+        if assignment.phase != AssignmentPhase::Execution {
+            continue;
+        }
+        if assignment.worker_assignments.is_empty() {
+            scopes.push((&assignment.assigned_paths, &assignment.semantic_modules));
+        } else {
+            scopes.extend(assignment.worker_assignments.iter().map(|worker| {
+                (
+                    worker.assigned_paths.as_slice(),
+                    worker.semantic_modules.as_slice(),
+                )
+            }));
+        }
+    }
+    let paths = scopes
+        .iter()
+        .flat_map(|scope| scope.0.iter())
+        .collect::<BTreeSet<_>>();
+    let modules = scopes
+        .iter()
+        .flat_map(|scope| scope.1.iter())
+        .collect::<BTreeSet<_>>();
+    let mut groups: Vec<usize> = (0..scopes.len()).collect();
+    for left in 0..scopes.len() {
+        for right in left + 1..scopes.len() {
+            let overlap = scopes[left].0.iter().any(|a| {
+                scopes[right]
+                    .0
+                    .iter()
+                    .any(|b| a.starts_with(b) || b.starts_with(a))
+            }) || scopes[left].1.iter().any(|a| scopes[right].1.contains(a));
+            if overlap {
+                let previous = groups[right];
+                let joined = groups[left];
+                for group in &mut groups {
+                    if *group == previous {
+                        *group = joined;
+                    }
+                }
+            }
+        }
+    }
+    let independent_groups = if dependency_edges != 0 && !scopes.is_empty() {
+        // Decision references do not prove absence of cross-worker dependencies.
+        1
+    } else {
+        groups.into_iter().collect::<BTreeSet<_>>().len()
+    };
+    crate::selection::routing_policy::TaskRoutingFeatures {
+        scope_paths: paths.len(), scope_modules: modules.len(), complexity: 0, risk: 0, horizon: 0,
+        context_tokens: 0, dependency_edges, independent_groups,
+        evidence: vec!["Validated terminal Worker scopes and overlap-connected groups; decision dependencies conservatively join groups; complexity/risk/horizon/context are unassessed lower bounds".to_string()],
+    }
+}
+
+/// Recount current lowered scopes independently from the assessed declaration.
+/// Only the four assessed dimensions survive from the original input morphology.
+pub(super) fn routing_features_with_assessment(
+    plan: &SupervisorPlan,
+    assessment: Option<&TaskRoutingAssessment>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<crate::selection::routing_policy::TaskRoutingFeatures> {
+    let mut features = routing_features_from_plan(plan);
+    if let Some(assessment) = assessment {
+        let frozen = frozen.context("task assessment requires its frozen routing policy")?;
+        assessment.validate_for_task(frozen, &plan.task)?;
+        features.complexity = assessment.features.complexity;
+        features.risk = assessment.features.risk;
+        features.horizon = assessment.features.horizon;
+        features.context_tokens = assessment.features.context_tokens;
+        features.evidence = assessment.features.evidence.clone();
+        features.evidence.push(
+            "Final-plan terminal scope/dependency/independence counts revalidated separately from assessed declaration morphology; score/context estimates remain policy heuristics".to_string(),
+        );
+    }
+    Ok(features)
+}
+
+pub(super) fn task_profile_with_assessment(
+    role: AgentRole,
+    assessment: Option<&TaskRoutingAssessment>,
+    final_features: Option<&crate::selection::routing_policy::TaskRoutingFeatures>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<TaskProfile> {
+    let mut base = task_profile_for_role(role);
+    if let Some(assessment) = assessment {
+        let frozen = frozen.context("task profile assessment requires its frozen policy")?;
+        let final_features =
+            final_features.context("assessed task profile requires final routing features")?;
+        let projected = super::task_routing::project_task_profile_with_final_features(
+            &base,
+            assessment,
+            final_features,
+            frozen,
+        )?;
+        if projected.authority_role != base.authority_role
+            || projected.task_class != base.task_class
+        {
+            bail!("task profile projection changed intrinsic authority or benchmark class");
+        }
+        Ok(projected)
+    } else {
+        base.risk = RiskLevel::Unknown;
+        base.context = ContextSize::Unknown;
+        base.horizon = TaskHorizon::Unknown;
+        base.boundedness = Boundedness::Unknown;
+        Ok(base)
+    }
+}
+
+/// Keep the complete evaluator decision for the parent's run evidence. Only
+/// authenticated parent-owned history may supply measured outcomes and costs.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn select_normal_account_intake_with_history(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+    history: Option<&FrozenOutcomeHistory>,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    // Projection of unknown access must use this exact frozen argument, not an
+    // unrelated caller's ambient policy. Restore the caller's binding on exit.
+    let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+    let role = plan
+        .assignments
+        .first()
+        .context("normal intake has no assignment")?
+        .role;
+    select_account_intake_for_role_with_history(
+        plan,
+        frozen,
+        observations,
+        admission,
+        objective,
+        history,
+        role,
+    )
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn select_normal_account_intake_with_assessment(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+    history: Option<&FrozenOutcomeHistory>,
+    assessment: Option<&TaskRoutingAssessment>,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+    let role = plan
+        .assignments
+        .first()
+        .context("normal intake has no assignment")?
+        .role;
+    select_account_intake_for_role_with_assessment(
+        plan,
+        frozen,
+        observations,
+        admission,
+        objective,
+        history,
+        role,
+        assessment,
+    )
+}
+
+/// Select the required review role before evaluation. The caller must keep its
+/// matching frozen-policy guard alive through launch. This seals only the
+/// selector tuple; live account, executable, run, protocol and confinement
+/// authority remain the downstream launch constructor's responsibility.
+#[cfg(target_os = "linux")]
+pub(crate) fn select_account_review_auditor(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(
+        SupervisorRuntime,
+        coding_agent_manager_lib::account_authority::AccountObserveResult,
+    )],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen) {
+        bail!("account review requires the caller's matching frozen routing policy");
+    }
+    let (selected, decision) = select_account_intake_for_role_with_history(
+        plan,
+        frozen,
+        observations,
+        admission,
+        objective,
+        None,
+        AgentRole::Auditor,
+    )?;
+    validate_and_seal_account_review_selection(frozen, selected.as_ref(), &decision)?;
+    Ok((selected, decision))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_and_seal_account_review_selection(
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    selected: Option<&crate::selection::routing_policy::SelectedLaunchRequest>,
+    decision: &SelectionProvenance,
+) -> Result<()> {
+    use crate::selection::routing_policy::{
+        current_routing_policy, seal_selected_candidate, validate_selected_launch,
+    };
+    let receipt = decision
+        .routing_policy
+        .as_ref()
+        .context("account review selection is missing its frozen-policy receipt")?;
+    if &receipt.frozen != frozen
+        || receipt.role != AgentRole::Auditor.as_str()
+        || current_routing_policy().as_ref() != Some(frozen)
+        || decision.normalized_input.task.authority_role != AuthorityRole::ReviewAuditor
+    {
+        bail!("account review selection has a foreign role or frozen-policy receipt");
+    }
+    let Some(selected) = selected else {
+        if decision.status == DecisionStatus::Selected {
+            bail!("selected account review is missing its launch request");
+        }
+        return Ok(());
+    };
+    let choice = decision
+        .choice
+        .as_ref()
+        .context("account review selection is missing its selected choice")?;
+    if decision.status != DecisionStatus::Selected
+        || &choice.candidate != selected.candidate()
+        || selected.policy_digest != frozen.sha256
+        || selected.task_features != receipt.features
+    {
+        bail!("account review launch request differs from its evaluator decision");
+    }
+    seal_selected_candidate(AgentRole::Auditor.as_str(), decision)?;
+    let candidate = selected.candidate();
+    validate_selected_launch(
+        AgentRole::Auditor.as_str(),
+        &candidate.runtime,
+        &candidate.model,
+        candidate.effort.as_str(),
+    )
+}
+
+#[cfg(target_os = "linux")]
+fn select_account_intake_for_role_with_history(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+    history: Option<&FrozenOutcomeHistory>,
+    role: AgentRole,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    select_account_intake_for_role_with_assessment(
+        plan,
+        frozen,
+        observations,
+        admission,
+        objective,
+        history,
+        role,
+        None,
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn select_account_intake_for_role_with_assessment(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+    admission: &SupervisorAdmissionPolicyInput,
+    objective: &ResolvedObjectiveProfile,
+    history: Option<&FrozenOutcomeHistory>,
+    role: AgentRole,
+    assessment: Option<&TaskRoutingAssessment>,
+) -> Result<(
+    Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    SelectionProvenance,
+)> {
+    use crate::selection::routing_policy::{RoutingPolicyReceipt, SelectedLaunchRequest};
+    let receipt = RoutingPolicyReceipt {
+        frozen: frozen.clone(),
+        role: role.as_str().to_string(),
+        features: routing_features_with_assessment(plan, assessment, Some(frozen))?,
+    };
+    let mut combined: Option<SelectionInput> = None;
+    for (runtime, observation) in observations {
+        let input = selection_input_for_role_with_assessment(
+            SelectionInputForRoleArgs {
+                role,
+                runtime: *runtime,
+                catalog: &RuntimeModelCatalog::OperatorDeclared,
+                advertised: &AdvertisedCatalogSet::empty(),
+                admission,
+                resolved_objective_profile: objective,
+                quota_context: None,
+                quota_ledger: None,
+                account_observation: Some(observation),
+                signals: DynamicSignals {
+                    retry_count: 0,
+                    budget_signal: BudgetSignal::Continue,
+                    previous_choice: None,
+                    previous_catalog_digest: None,
+                    environment_rejections: vec![],
+                    observed_cost_per_accepted_task_microunits: None,
+                },
+                debug_override: None,
+                history,
+            },
+            assessment,
+            Some(&receipt.features),
+            Some(frozen),
+        )?;
+        if let Some(combined) = &mut combined {
+            combined.catalogs.extend(input.catalogs);
+            combined.pools.extend(input.pools);
+            combined
+                .constraints
+                .allowed_runtimes
+                .extend(input.constraints.allowed_runtimes);
+        } else {
+            combined = Some(input);
+        }
+    }
+    let input = combined.context(
+        "normal intake requires a selected account with observed supported model/effort metadata",
+    )?;
+    let mut decision = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
+    decision.operator_prior_data = super::prior_input::current_provenance();
+    if decision.status != DecisionStatus::Selected {
+        return Ok((None, decision));
+    }
+    let candidate = decision
+        .choice
+        .as_ref()
+        .context("selected normal intake has no choice")?
+        .candidate
+        .clone();
+    let (_, observation) = observations
+        .iter()
+        .find(|(runtime, _)| runtime_name(*runtime) == candidate.runtime)
+        .context("selected runtime has no account observation")?;
+    let selected = SelectedLaunchRequest::from_observation(
+        candidate,
+        observation,
+        frozen,
+        receipt.features,
+        None,
+    )?;
+    Ok((Some(selected), decision))
 }
 
 pub(super) fn selector_priors_with_terminal_worker_economics() -> Result<selection::PriorDataset> {
@@ -1799,7 +2289,17 @@ pub(super) fn base_selector_priors_with_terminal_worker_economics(
     Ok(priors)
 }
 
+#[cfg(test)]
 fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<SelectionInput> {
+    selection_input_for_role_with_assessment(args, None, None, None)
+}
+
+fn selection_input_for_role_with_assessment(
+    args: SelectionInputForRoleArgs<'_>,
+    assessment: Option<&TaskRoutingAssessment>,
+    final_features: Option<&crate::selection::routing_policy::TaskRoutingFeatures>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<SelectionInput> {
     let SelectionInputForRoleArgs {
         role,
         runtime,
@@ -1815,7 +2315,7 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
         history,
     } = args;
     let priors = selector_priors_with_terminal_worker_economics()?;
-    let task = task_profile_for_role(role);
+    let task = task_profile_with_assessment(role, assessment, final_features, frozen)?;
     let outcomes = history
         .map(|snapshot| snapshot.outcomes_for(&task))
         .unwrap_or_default();
@@ -1870,6 +2370,92 @@ fn selection_input_for_role(args: SelectionInputForRoleArgs<'_>) -> Result<Selec
     }
     input.operational_observations = Some(live_operational_observations(&input));
     Ok(input)
+}
+
+fn selection_input_for_role_with_assessment_and_accounts(
+    args: SelectionInputForRoleArgs<'_>,
+    accounts: &[(SupervisorRuntime, AccountObserveResult)],
+    assessment: Option<&TaskRoutingAssessment>,
+    final_features: Option<&crate::selection::routing_policy::TaskRoutingFeatures>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<SelectionInput> {
+    if accounts.is_empty() {
+        return selection_input_for_role_with_assessment(args, assessment, final_features, frozen);
+    }
+    if !accounts.iter().any(|(runtime, _)| *runtime == args.runtime) {
+        bail!("account catalog set is missing the selected primary runtime binding");
+    }
+    let mut runtimes = BTreeSet::new();
+    let mut combined: Option<SelectionInput> = None;
+    for (runtime, observation) in accounts {
+        if !runtimes.insert(runtime.as_str()) {
+            bail!("account catalog set repeats a runtime selection");
+        }
+        let input = selection_input_for_role_with_assessment(
+            SelectionInputForRoleArgs {
+                runtime: *runtime,
+                account_observation: Some(observation),
+                // Apply the configured quota contract once over the complete set;
+                // each account still supplies its own observed admission pool.
+                quota_context: None,
+                quota_ledger: None,
+                ..args.clone()
+            },
+            assessment,
+            final_features,
+            frozen,
+        )?;
+        if let Some(combined) = &mut combined {
+            combined.catalogs.extend(input.catalogs);
+            combined.pools.extend(input.pools);
+            combined
+                .constraints
+                .allowed_runtimes
+                .extend(input.constraints.allowed_runtimes);
+        } else {
+            combined = Some(input);
+        }
+    }
+    let mut input = combined.context("account catalog set is empty")?;
+    if let Some(quota_context) = args.quota_context {
+        apply_live_quota_selection_input(
+            &mut input,
+            quota_context,
+            args.quota_ledger,
+            runtime_name(args.runtime),
+        )?;
+    }
+    input.operational_observations = Some(live_operational_observations(&input));
+    Ok(input)
+}
+
+fn account_selection_catalogs(
+    accounts: &[(SupervisorRuntime, AccountObserveResult)],
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<Vec<RuntimeCatalog>> {
+    #[cfg(target_os = "linux")]
+    {
+        let mut runtimes = BTreeSet::new();
+        let mut catalogs = Vec::new();
+        for (runtime, observation) in accounts {
+            if !runtimes.insert(runtime.as_str()) {
+                bail!("account catalog set repeats a runtime selection");
+            }
+            catalogs.extend(catalogs_from_account_observation(
+                observation,
+                *runtime,
+                task,
+                priors,
+            )?);
+        }
+        Ok(catalogs)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (accounts, task, priors);
+        bail!("account catalog sets require the managed Linux runtime");
+    }
 }
 
 fn live_operational_observations(input: &SelectionInput) -> LiveOperationalObservations {
@@ -2057,6 +2643,13 @@ fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
 }
 
 #[cfg(target_os = "linux")]
+pub(super) fn runtime_for_account_provider(provider_id: &str) -> Option<SupervisorRuntime> {
+    runtime_from_account_provider(provider_id)
+        .ok()
+        .and_then(|runtime| runtime_from_name(runtime).ok())
+}
+
+#[cfg(target_os = "linux")]
 fn account_observe_environment_decision(
     observation: &AccountObserveResult,
 ) -> (AccountObserveOutcomeKind, Option<u64>) {
@@ -2097,11 +2690,14 @@ fn catalogs_from_account_observation(
                     observation.binding.provider_id
                 )
             })?;
-            validate_observed_models(content).map_err(|error| {
-                anyhow!("account observation models failed validation: {error}")
-            })?;
+            coding_agent_manager_lib::account_authority::validate_observed_models_for_binding(
+                content,
+                &observation.binding,
+            )
+            .map_err(|error| anyhow!("account observation models failed validation: {error}"))?;
             Ok(vec![runtime_catalog_from_observed_models(
                 mapped,
+                &observation.binding,
                 content,
                 observation.observed_at.clone(),
                 task,
@@ -2123,6 +2719,7 @@ fn catalogs_from_account_observation(
 #[cfg(target_os = "linux")]
 fn runtime_catalog_from_observed_models(
     runtime: &str,
+    binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
     observed: &ModelsObservation,
     advertised_at: String,
     task: &TaskProfile,
@@ -2137,8 +2734,22 @@ fn runtime_catalog_from_observed_models(
         }
     }
     models.sort_by(|left, right| left.model.cmp(&right.model));
+    // Preserve source qualification and access state even when two observations
+    // project to the same executable model/effort menu. Canonicalize set-valued
+    // metadata before hashing without promoting a cache listing to entitlement.
+    let mut normalized_observed = observed.clone();
+    normalized_observed
+        .models
+        .sort_by(|left, right| left.model_id.cmp(&right.model_id));
+    for model in &mut normalized_observed.models {
+        if let Some(efforts) = &mut model.supported_efforts {
+            efforts.sort();
+            efforts.dedup();
+        }
+    }
     let revision_material =
-        serde_json::to_vec(&models).context("failed to normalize account-observed catalog")?;
+        serde_json::to_vec(&(binding, &advertised_at, &normalized_observed, &models))
+            .context("failed to normalize account-observed catalog")?;
     Ok(RuntimeCatalog {
         runtime: runtime.to_string(),
         revision: format!(
@@ -2190,7 +2801,15 @@ fn catalog_model_from_observed(
         });
     Some(CatalogModel {
         model: observed.model_id.clone(),
-        available: true,
+        access: Some(observed.access),
+        available: match observed.access {
+            coding_agent_manager_lib::account_authority::ModelAccessOutcome::Unavailable => false,
+            coding_agent_manager_lib::account_authority::ModelAccessOutcome::Available => true,
+            coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess =>
+                crate::selection::routing_policy::current_routing_policy().is_some_and(|policy|
+                    policy.policy.unknown_access_policy ==
+                        crate::selection::routing_policy::UnknownAccessPolicy::UnknownAccessForProductiveAttempt),
+        },
         supported_efforts,
         capabilities,
     })
@@ -2480,6 +3099,7 @@ fn catalog_model_from_prior(
     Some(CatalogModel {
         model: prior.model.clone(),
         available,
+        access: None,
         supported_efforts,
         capabilities: CandidateCapabilities {
             task_classes: prior
@@ -2559,6 +3179,7 @@ pub(super) fn runtime_catalog_from_priors(
         models.push(CatalogModel {
             model: prior.model.clone(),
             available,
+            access: None,
             supported_efforts,
             capabilities: CandidateCapabilities {
                 task_classes: prior
@@ -3309,6 +3930,8 @@ fn policy_id_for_candidate(candidate: &CandidateKey) -> String {
 
 fn selector_effort_label(effort: SelectorEffort) -> &'static str {
     match effort {
+        SelectorEffort::None => "none",
+        SelectorEffort::Minimal => "minimal",
         SelectorEffort::Low => "low",
         SelectorEffort::Medium => "medium",
         SelectorEffort::High => "high",
@@ -3320,17 +3943,20 @@ fn selector_effort_label(effort: SelectorEffort) -> &'static str {
 
 fn selector_effort_to_canonical(effort: SelectorEffort) -> CanonicalEffort {
     match effort {
+        SelectorEffort::None => CanonicalEffort::ProviderNative("none".to_string()),
+        SelectorEffort::Minimal => CanonicalEffort::Minimal,
         SelectorEffort::Low => CanonicalEffort::Low,
         SelectorEffort::Medium => CanonicalEffort::Medium,
         SelectorEffort::High => CanonicalEffort::High,
         SelectorEffort::Xhigh => CanonicalEffort::XHigh,
         SelectorEffort::Max => CanonicalEffort::Max,
-        SelectorEffort::Ultra => CanonicalEffort::Max,
+        SelectorEffort::Ultra => CanonicalEffort::ProviderNative("ultra".to_string()),
     }
 }
 
 fn canonical_effort_from_label(label: &str) -> Option<CanonicalEffort> {
     Some(match label {
+        "none" => CanonicalEffort::ProviderNative("none".to_string()),
         "minimal" => CanonicalEffort::Minimal,
         "low" => CanonicalEffort::Low,
         "medium" => CanonicalEffort::Medium,
@@ -3722,7 +4348,7 @@ pub(super) fn runtime_name(runtime: SupervisorRuntime) -> &'static str {
     runtime.as_str()
 }
 
-fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
+pub(super) fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
     match runtime {
         "codex" => Ok(SupervisorRuntime::Codex),
         "fake" => Ok(SupervisorRuntime::Fake),
@@ -3736,7 +4362,9 @@ fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
 
 fn selector_effort_from_str(value: &str) -> Option<SelectorEffort> {
     match value {
-        "minimal" | "low" => Some(SelectorEffort::Low),
+        "none" => Some(SelectorEffort::None),
+        "minimal" => Some(SelectorEffort::Minimal),
+        "low" => Some(SelectorEffort::Low),
         "medium" => Some(SelectorEffort::Medium),
         "high" => Some(SelectorEffort::High),
         "xhigh" => Some(SelectorEffort::Xhigh),
@@ -3748,6 +4376,8 @@ fn selector_effort_from_str(value: &str) -> Option<SelectorEffort> {
 
 pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
     match effort {
+        SelectorEffort::None => "none",
+        SelectorEffort::Minimal => "minimal",
         SelectorEffort::Low => "low",
         SelectorEffort::Medium => "medium",
         SelectorEffort::High => "high",
@@ -3937,8 +4567,40 @@ mod tests {
             review_lenses: default_supervisor_review_lenses(),
             review_lens_correlation: Default::default(),
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
-            assignments: Vec::new(),
+            assignments: vec![serde_json::from_value(json!({
+                "id":"coordinated-fixture", "phase":"execution", "role":"child_orchestrator",
+                "assigned_paths":["src"], "worker_assignments":[
+                    {"id":"bounded-worker-fixture", "role":"worker", "assigned_paths":["src/a.rs"]}
+                ]
+            }))
+            .expect("reachable orchestrator and Worker fixture")],
         }
+    }
+
+    #[test]
+    fn routing_features_count_real_nested_workers_and_join_overlapping_or_dependent_scopes(
+    ) -> Result<()> {
+        let mut plan = test_plan();
+        plan.assignments = vec![serde_json::from_value(json!({
+            "id":"actual-execution-parent", "phase":"execution", "role":"child_orchestrator",
+            "assigned_paths":["src"], "worker_assignments":[
+                {"id":"a", "role":"worker", "assigned_paths":["src/a.rs"]},
+                {"id":"b", "role":"worker", "assigned_paths":["src/b.rs"]}
+            ]
+        }))?];
+        let features = routing_features_from_plan(&plan);
+        assert_eq!(features.scope_paths, 2);
+        assert_eq!(features.independent_groups, 2);
+        plan.assignments[0].worker_assignments[1].assigned_paths = vec!["src".into()];
+        assert_eq!(routing_features_from_plan(&plan).independent_groups, 1);
+        plan.assignments[0].worker_assignments[1].assigned_paths = vec!["src/b.rs".into()];
+        // Shared decision incidence cannot be interpreted as independent work.
+        plan.assignments[0].decision_refs = serde_json::from_value(
+            json!([{"question_key":"shared-decision", "expected_resolution":"shared resolution"}]),
+        )?;
+        assert_eq!(routing_features_from_plan(&plan).independent_groups, 1);
+        assert_eq!(routing_features_from_plan(&plan).dependency_edges, 1);
+        Ok(())
     }
 
     fn test_admission() -> SupervisorAdmissionPolicyInput {
@@ -4087,6 +4749,19 @@ mod tests {
         assert_eq!(plan.role_models.len(), all_selector_roles().len());
         for role in all_selector_roles() {
             assert!(plan.role_models.contains_key(role));
+        }
+        let auditor_model = plan.role_models[&AgentRole::Auditor]
+            .model
+            .as_deref()
+            .context("selected Auditor model")?;
+        for lens in &plan.review_lenses {
+            assert_eq!(lens.backend.model(), auditor_model);
+            assert_eq!(
+                lens.backend.reasoning_effort(),
+                plan.role_models[&AgentRole::Auditor]
+                    .reasoning_effort
+                    .as_deref()
+            );
         }
         assert!(resolution.decisions.iter().all(|decision| {
             decision.assignment_id.is_none()
@@ -8078,9 +8753,1007 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn qualified_account_fixture(
+        provider: &str,
+        model: &str,
+        effort: &str,
+    ) -> AccountObserveResult {
+        use coding_agent_manager_lib::account_authority::{
+            ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        };
+        let mut observation = account_observe_result(
+            provider,
+            CategoryObservation::observed(ModelsObservation {
+                provenance: None,
+                models: vec![ObservedModel {
+                    model_id: model.into(),
+                    supported_efforts: Some(vec![effort.into()]),
+                    default_effort: None,
+                    access: ModelAccessOutcome::Available,
+                }],
+            }),
+            None,
+        );
+        observation
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap()
+            .provenance = Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some(observation.observed_at.clone()),
+            stale: false,
+            principal_binding: Some(observation.binding.clone()),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        });
+        observation
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mixed_accounts_survive_role_initialization_and_reselection() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let mut frozen = load_routing_policy(temp.path())?;
+        frozen.policy.default_role.preferred_effort = Some(SelectorEffort::High);
+        let mut worker = frozen.policy.default_role.clone();
+        worker.preferred_effort = Some(SelectorEffort::None);
+        frozen
+            .policy
+            .role_preferences
+            .insert("worker".into(), worker);
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        let _policy = bind_routing_policy(Some(frozen))?;
+        let accounts = vec![
+            (
+                SupervisorRuntime::Codex,
+                qualified_account_fixture("codex-cli", "account-parent-fixture", "high"),
+            ),
+            (
+                SupervisorRuntime::Grok,
+                qualified_account_fixture("grok-cli", "account-worker-fixture", "none"),
+            ),
+        ];
+        let mut plan = test_plan();
+        let catalog = RuntimeModelCatalog::OperatorDeclared;
+        let resolution = initialize_supervisor_selection_with_accounts(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &accounts,
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        for event in &resolution.decisions {
+            assert_eq!(event.provenance.normalized_input.catalogs.len(), 2);
+            assert_eq!(event.provenance.normalized_input.pools.len(), 2);
+            let selected = &event.provenance.choice.as_ref().unwrap().candidate;
+            assert_eq!(
+                selected.runtime,
+                if event.role == AgentRole::Worker {
+                    "grok"
+                } else {
+                    "codex"
+                }
+            );
+        }
+        let mut state = resolution
+            .automatic_state
+            .context("automatic mixed-account state")?;
+        assert_eq!(state.account_observations, accounts);
+        let replay = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(
+            replay.runtime_overrides[&AgentRole::Worker],
+            SupervisorRuntime::Grok
+        );
+        assert_eq!(replay.decisions[0].1.normalized_input.catalogs.len(), 2);
+        assert_eq!(replay.decisions[0].1.normalized_input.pools.len(), 2);
+        // A stale secondary source identity is rejected again on replay; the
+        // primary's valid binding must never substitute for that principal.
+        state.account_observations[1].1.binding.selection_revision += 1;
+        assert!(reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            2,
+            BudgetSignal::Continue,
+            &[],
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn stale_secondary_principal_refuses_before_role_initialization() -> Result<()> {
+        let mut secondary = qualified_account_fixture("grok-cli", "secondary-fixture", "high");
+        secondary
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap()
+            .provenance
+            .as_mut()
+            .unwrap()
+            .principal_binding
+            .as_mut()
+            .unwrap()
+            .account_incarnation = "different-incarnation".into();
+        let accounts = vec![
+            (
+                SupervisorRuntime::Codex,
+                qualified_account_fixture("codex-cli", "primary-fixture", "high"),
+            ),
+            (SupervisorRuntime::Grok, secondary),
+        ];
+        let mut plan = test_plan();
+        assert!(initialize_supervisor_selection_with_accounts(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &accounts,
+        )
+        .is_err());
+        assert!(plan.role_models.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn direct_worker_ignores_unused_orchestrator_effort_but_keeps_required_audit() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let mut frozen = load_routing_policy(temp.path())?;
+        let mut unsupported = frozen.policy.default_role.clone();
+        unsupported.preferred_effort = Some(SelectorEffort::Xhigh);
+        unsupported.minimum_effort = Some(SelectorEffort::Xhigh);
+        frozen
+            .policy
+            .role_preferences
+            .insert("child_orchestrator".into(), unsupported.clone());
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let accounts = vec![(
+            SupervisorRuntime::Codex,
+            qualified_account_fixture("codex-cli", "bounded-direct-fixture", "none"),
+        )];
+        let mut plan = test_plan();
+        plan.assignments = vec![serde_json::from_value(json!({
+            "id":"direct", "phase":"execution", "role":"worker", "assigned_paths":["src/a.rs"]
+        }))?];
+        let required = required_selector_roles(&plan);
+        assert!(!required.contains(&AgentRole::ChildOrchestrator));
+        let resolution = initialize_supervisor_selection_with_accounts(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &accounts,
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        assert_eq!(resolution.decisions.len(), required.len());
+        assert!(!plan.role_models.contains_key(&AgentRole::ChildOrchestrator));
+        for gate in [
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            assert!(plan.role_models.contains_key(&gate));
+        }
+        assert!(resolution.automatic_state.is_some());
+        frozen
+            .policy
+            .role_preferences
+            .insert("auditor".into(), unsupported);
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        let _required_audit = bind_routing_policy(Some(frozen))?;
+        plan.role_models.clear();
+        let refusal = initialize_supervisor_selection_with_accounts(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &accounts,
+        )?;
+        assert_eq!(
+            refusal.selection_preflight_failure.unwrap().role,
+            AgentRole::Auditor
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn assessed_normal_intake_projects_task_before_evaluation_and_recounts_final_scopes(
+    ) -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let frozen = load_routing_policy(temp.path())?;
+        let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(json!({
+            "fragments":[{"id":"a","text":"Create marker.txt with one line: ready"}],
+            "assignments":[{"id":"a","task":"Create marker.txt with one line: ready",
+                "fragment_ids":["a"],"assigned_paths":["marker.txt"],
+                "semantic_symbols":[],"semantic_modules":[]}],
+            "diagnostics":{"degraded":false,"notes":[]},
+            "disjointness":{"disjoint":true,"conflicts":[]}
+        }))?;
+        let mut plan = test_plan();
+        plan.task = "Create marker.txt with one line: ready".into();
+        plan.assignments = vec![serde_json::from_value(json!({
+            "id":"assessed-intake","phase":"execution","role":"worker",
+            "assigned_paths":["marker.txt"]
+        }))?];
+        let low = super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+        let low_features = routing_features_with_assessment(&plan, Some(&low), Some(&frozen))?;
+        let low_profile = task_profile_with_assessment(
+            AgentRole::Worker,
+            Some(&low),
+            Some(&low_features),
+            Some(&frozen),
+        )?;
+        plan.task = "Delete obsolete data in a long-running multi-stage migration".into();
+        let high = super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+        let high_features = routing_features_with_assessment(&plan, Some(&high), Some(&frozen))?;
+        let high_profile = task_profile_with_assessment(
+            AgentRole::Worker,
+            Some(&high),
+            Some(&high_features),
+            Some(&frozen),
+        )?;
+        assert_ne!(low_profile.risk, high_profile.risk);
+        assert_ne!(low_profile.horizon, high_profile.horizon);
+        assert_eq!(low_profile.authority_role, high_profile.authority_role);
+        assert_eq!(low_profile.task_class, high_profile.task_class);
+        // The lowered scope is recounted independently of the original declaration.
+        plan.assignments[0]
+            .assigned_paths
+            .push(PathBuf::from("another.txt"));
+        let features = routing_features_with_assessment(&plan, Some(&high), Some(&frozen))?;
+        assert_eq!(features.scope_paths, 2);
+        assert_eq!(high.features.scope_paths, 1);
+        assert_eq!(features.context_tokens, high.features.context_tokens);
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        let high_task = plan.task.clone();
+        plan.task = "Create marker.txt with one line: ready".into();
+        let low_final_features =
+            routing_features_with_assessment(&plan, Some(&low), Some(&frozen))?;
+        let low_final_profile = task_profile_with_assessment(
+            AgentRole::Worker,
+            Some(&low),
+            Some(&low_final_features),
+            Some(&frozen),
+        )?;
+        assert_ne!(low_final_profile.boundedness, low_profile.boundedness);
+        assert_eq!(low_final_profile.risk, low_profile.risk);
+        assert_eq!(low_final_profile.context, low_profile.context);
+        assert_eq!(low_final_profile.horizon, low_profile.horizon);
+        assert_eq!(low_final_profile.authority_role, low_profile.authority_role);
+        assert_eq!(low_final_profile.task_class, low_profile.task_class);
+        let (low_selected, low_decision) = select_normal_account_intake_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            None,
+            Some(&low),
+        )?;
+        assert_eq!(low_decision.normalized_input.task, low_final_profile);
+        assert_eq!(
+            low_decision
+                .routing_policy
+                .as_ref()
+                .context("final-scope receipt")?
+                .features,
+            low_final_features
+        );
+        assert_eq!(
+            low_selected.context("final-scope selection")?.task_features,
+            low_final_features
+        );
+        // The account-combined initializer uses this same profile before catalogs/history.
+        let admission = test_admission();
+        let objective = default_resolved_profile();
+        let catalog = RuntimeModelCatalog::OperatorDeclared;
+        let advertised = AdvertisedCatalogSet::empty();
+        let args = SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Codex,
+            catalog: &catalog,
+            advertised: &advertised,
+            admission: &admission,
+            resolved_objective_profile: &objective,
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: Some(&observations[0].1),
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+                observed_cost_per_accepted_task_microunits: None,
+            },
+            debug_override: None,
+            history: None,
+        };
+        for accounts in [&observations[..], &[]] {
+            let input = selection_input_for_role_with_assessment_and_accounts(
+                args.clone(),
+                accounts,
+                Some(&low),
+                Some(&low_final_features),
+                Some(&frozen),
+            )?;
+            assert_eq!(input.task, low_final_profile);
+        }
+        plan.task = high_task;
+        let (selected, decision) = select_normal_account_intake_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            None,
+            Some(&high),
+        )?;
+        let selected = selected.context("assessed account selection")?;
+        let final_high_profile = task_profile_with_assessment(
+            AgentRole::Worker,
+            Some(&high),
+            Some(&features),
+            Some(&frozen),
+        )?;
+        assert_eq!(decision.normalized_input.task, final_high_profile);
+        assert_eq!(
+            decision
+                .routing_policy
+                .as_ref()
+                .context("assessment receipt")?
+                .features,
+            features
+        );
+        assert_eq!(selected.task_features, features);
+        assert_eq!(
+            selected.candidate(),
+            &decision
+                .choice
+                .as_ref()
+                .context("assessed choice")?
+                .candidate
+        );
+        plan.task.push_str(" changed");
+        assert!(select_normal_account_intake_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            None,
+            Some(&high)
+        )
+        .is_err());
+        let unknown = task_profile_with_assessment(AgentRole::Worker, None, None, Some(&frozen))?;
+        assert_eq!(unknown.risk, RiskLevel::Unknown);
+        assert_eq!(unknown.context, ContextSize::Unknown);
+        assert_eq!(unknown.horizon, TaskHorizon::Unknown);
+        assert_eq!(unknown.boundedness, Boundedness::Unknown);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_intake_uses_its_frozen_policy_and_preserves_refusal_evidence() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+        let temp = tempfile::tempdir()?;
+        let allow = load_routing_policy(temp.path())?;
+        let mut reject = allow.clone();
+        reject.policy.unknown_access_policy = UnknownAccessPolicy::Reject;
+        reject.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&reject.policy)?);
+        let _ambient = bind_routing_policy(Some(reject.clone()))?;
+        let mut plan = test_plan();
+        plan.assignments = vec![serde_json::from_value(json!({
+            "id":"bounded-intake", "phase":"execution", "role":"worker",
+            "assigned_paths":["src/a.rs"]
+        }))?];
+        let observation = account_observe_result(
+            "codex-cli",
+            CategoryObservation::observed(ModelsObservation {
+                provenance: None,
+                models: vec![ObservedModel {
+                    model_id: "unmeasured-account-model".into(),
+                    supported_efforts: Some(vec!["none".into()]),
+                    default_effort: None,
+                    access: ModelAccessOutcome::UnknownAccess,
+                }],
+            }),
+            None,
+        );
+        let observations = [(SupervisorRuntime::Codex, observation)];
+        let admission = test_admission();
+        let objective = default_resolved_profile();
+        let (selected, decision) = select_normal_account_intake_with_history(
+            &plan,
+            &allow,
+            &observations,
+            &admission,
+            &objective,
+            None,
+        )?;
+        assert!(!selected
+            .context("productive attempt selection")?
+            .access_uncertainty
+            .is_empty());
+        assert_eq!(decision.status, DecisionStatus::Selected);
+        assert_eq!(decision.routing_policy.as_ref().unwrap().frozen, allow);
+        let evidence = decision.candidate_set[0]
+            .loaded_policy_evidence
+            .as_ref()
+            .unwrap();
+        assert_eq!(evidence.quality_basis_points, None);
+        assert_eq!(evidence.expected_accepted_cycle_cost_microunits, None);
+        assert_eq!(current_routing_policy(), Some(reject.clone()));
+        let (selected, refusal) = select_normal_account_intake_with_history(
+            &plan,
+            &reject,
+            &observations,
+            &admission,
+            &objective,
+            None,
+        )?;
+        assert!(selected.is_none());
+        assert_eq!(refusal.status, DecisionStatus::FailClosed);
+        assert!(refusal.candidate_set[0]
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| { reason.code == selection::IneligibilityCode::CatalogUnavailable }));
+        assert_eq!(current_routing_policy(), Some(reject));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_review_auditor_selects_required_role_before_evaluation() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let frozen = load_routing_policy(temp.path())?;
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let mut plan = test_plan();
+        plan.assignments[0].role = AgentRole::Worker;
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        let (selected, decision) = crate::supervise::select_account_review_auditor(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+        )?;
+        let selected = selected.context("account review selection")?;
+        let receipt = decision
+            .routing_policy
+            .as_ref()
+            .context("review policy receipt")?;
+        assert_eq!(plan.assignments[0].role, AgentRole::Worker);
+        assert_eq!(
+            decision.normalized_input.task.authority_role,
+            AuthorityRole::ReviewAuditor
+        );
+        assert_eq!(receipt.role, AgentRole::Auditor.as_str());
+        assert_eq!(receipt.frozen, frozen);
+        assert_eq!(
+            selected.candidate(),
+            &decision.choice.as_ref().context("review choice")?.candidate
+        );
+        assert_eq!(selected.policy_digest, frozen.sha256);
+        assert_eq!(selected.task_features, receipt.features);
+        assert_eq!(
+            selected.account_binding(),
+            &AccountBinding::from(&observations[0].1.binding)
+        );
+        assert!(!selected.access_uncertainty.is_empty());
+        let candidate = selected.candidate();
+        validate_selected_launch(
+            AgentRole::Auditor.as_str(),
+            &candidate.runtime,
+            &candidate.model,
+            candidate.effort.as_str(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_review_auditor_selects_grok_from_supported_unknown_access_catalog() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+        let temp = tempfile::tempdir()?;
+        let frozen = load_routing_policy(temp.path())?;
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let task = task_profile_for_role(AgentRole::Auditor);
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        // Reuse existing capability/effort data without granting account access.
+        let models = priors
+            .models
+            .iter()
+            .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Grok))
+            .filter_map(|prior| catalog_model_from_prior(prior, &task, false))
+            .map(|model| ObservedModel {
+                model_id: model.model,
+                supported_efforts: Some(
+                    model
+                        .supported_efforts
+                        .iter()
+                        .map(|effort| effort.as_str().to_string())
+                        .collect(),
+                ),
+                default_effort: None,
+                access: ModelAccessOutcome::UnknownAccess,
+            })
+            .collect::<Vec<_>>();
+        assert!(
+            !models.is_empty(),
+            "existing Grok review model/effort fixture"
+        );
+        let observation = account_observe_result(
+            "grok-cli",
+            CategoryObservation::observed(ModelsObservation {
+                provenance: None,
+                models,
+            }),
+            None,
+        );
+        let expected_binding = AccountBinding::from(&observation.binding);
+        let observations = [(SupervisorRuntime::Grok, observation)];
+        let (selected, decision) = crate::supervise::select_account_review_auditor(
+            &test_plan(),
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+        )?;
+        let selected = selected.context("Grok account review selection")?;
+        let receipt = decision
+            .routing_policy
+            .as_ref()
+            .context("Grok review policy receipt")?;
+        assert_eq!(decision.status, DecisionStatus::Selected);
+        assert_eq!(
+            decision.normalized_input.task.authority_role,
+            AuthorityRole::ReviewAuditor
+        );
+        assert_eq!(receipt.role, AgentRole::Auditor.as_str());
+        assert_eq!(receipt.frozen, frozen);
+        assert_eq!(
+            selected.candidate().runtime,
+            runtime_name(SupervisorRuntime::Grok)
+        );
+        assert_eq!(
+            selected.candidate(),
+            &decision
+                .choice
+                .as_ref()
+                .context("Grok review choice")?
+                .candidate
+        );
+        assert_eq!(selected.account_binding(), &expected_binding);
+        assert_eq!(selected.policy_digest, frozen.sha256);
+        assert_eq!(selected.task_features, receipt.features);
+        assert!(!selected.access_uncertainty.is_empty());
+        assert!(decision
+            .candidate_set
+            .iter()
+            .any(|entry| { entry.eligible && &entry.candidate == selected.candidate() }));
+        assert!(decision.normalized_input.catalogs.iter().all(|catalog| {
+            catalog.runtime == runtime_name(SupervisorRuntime::Grok)
+                && catalog
+                    .models
+                    .iter()
+                    .all(|model| model.access == Some(ModelAccessOutcome::UnknownAccess))
+        }));
+        let candidate = selected.candidate();
+        validate_selected_launch(
+            AgentRole::Auditor.as_str(),
+            &candidate.runtime,
+            &candidate.model,
+            candidate.effort.as_str(),
+        )?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn normal_account_intake_preserves_worker_and_orchestrator_roles() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let frozen = load_routing_policy(temp.path())?;
+        let _ambient = bind_routing_policy(None)?;
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        for role in [AgentRole::Worker, AgentRole::ChildOrchestrator] {
+            let mut plan = test_plan();
+            plan.assignments[0].role = role;
+            let (selected, decision) = select_normal_account_intake_with_history(
+                &plan,
+                &frozen,
+                &observations,
+                &test_admission(),
+                &default_resolved_profile(),
+                None,
+            )?;
+            let selected = selected.context("normal account selection")?;
+            assert_eq!(
+                decision.normalized_input.task.authority_role,
+                task_profile_for_role(role).authority_role
+            );
+            assert_eq!(
+                decision
+                    .routing_policy
+                    .as_ref()
+                    .context("normal receipt")?
+                    .role,
+                role.as_str()
+            );
+            assert_eq!(
+                selected.candidate(),
+                &decision.choice.as_ref().context("normal choice")?.candidate
+            );
+            assert!(current_routing_policy().is_none());
+            assert!(captured_selected_authorizations().is_empty());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_review_refuses_missing_or_foreign_receipts_before_sealing() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let frozen = load_routing_policy(temp.path())?;
+        let mut foreign = frozen.clone();
+        foreign.policy.unknown_access_policy = UnknownAccessPolicy::Reject;
+        foreign.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&foreign.policy)?);
+        let plan = test_plan();
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        for ambient in [None, Some(foreign.clone())] {
+            let _policy = bind_routing_policy(ambient)?;
+            assert!(select_account_review_auditor(
+                &plan,
+                &frozen,
+                &observations,
+                &test_admission(),
+                &default_resolved_profile(),
+            )
+            .is_err());
+            assert!(captured_selected_authorizations().is_empty());
+        }
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let (selected, decision) = select_account_intake_for_role_with_history(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            None,
+            AgentRole::Auditor,
+        )?;
+        let selected = selected.context("review selection for receipt refusal")?;
+        let mut missing = decision.clone();
+        missing.routing_policy = None;
+        let mut wrong_role = decision.clone();
+        wrong_role.routing_policy.as_mut().unwrap().role = AgentRole::Worker.as_str().into();
+        let mut wrong_policy = decision.clone();
+        wrong_policy.routing_policy.as_mut().unwrap().frozen = foreign;
+        let mut wrong_choice = decision.clone();
+        wrong_choice
+            .choice
+            .as_mut()
+            .unwrap()
+            .candidate
+            .model
+            .push('-');
+        let mut wrong_task = decision.clone();
+        wrong_task.normalized_input.task.authority_role = AuthorityRole::TerminalLeaf;
+        for invalid in [missing, wrong_role, wrong_policy, wrong_choice, wrong_task] {
+            assert!(
+                validate_and_seal_account_review_selection(&frozen, Some(&selected), &invalid)
+                    .is_err()
+            );
+            assert!(captured_selected_authorizations().is_empty());
+        }
+        assert!(validate_and_seal_account_review_selection(&frozen, None, &decision).is_err());
+        let mut wrong_request = selected.clone();
+        wrong_request.policy_digest.push('0');
+        assert!(validate_and_seal_account_review_selection(
+            &frozen,
+            Some(&wrong_request),
+            &decision
+        )
+        .is_err());
+        let candidate = selected.candidate();
+        assert!(validate_selected_launch(
+            AgentRole::Auditor.as_str(),
+            &candidate.runtime,
+            &candidate.model,
+            candidate.effort.as_str(),
+        )
+        .is_err());
+        assert!(captured_selected_authorizations().is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_review_preserves_evaluator_refusal_without_authorization() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        let temp = tempfile::tempdir()?;
+        let mut frozen = load_routing_policy(temp.path())?;
+        frozen.policy.unknown_access_policy = UnknownAccessPolicy::Reject;
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let observations = [(
+            SupervisorRuntime::Codex,
+            account_observe_result("codex-cli", observed_sol_high_xhigh(), None),
+        )];
+        let (selected, decision) = select_account_review_auditor(
+            &test_plan(),
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+        )?;
+        assert!(selected.is_none());
+        assert_eq!(decision.status, DecisionStatus::FailClosed);
+        assert_eq!(
+            decision
+                .routing_policy
+                .as_ref()
+                .context("refusal receipt")?
+                .role,
+            AgentRole::Auditor.as_str()
+        );
+        assert_eq!(
+            decision.normalized_input.task.authority_role,
+            AuthorityRole::ReviewAuditor
+        );
+        assert!(captured_selected_authorizations().is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_catalog_revision_binds_access_source_qualification() -> Result<()> {
+        use coding_agent_manager_lib::account_authority::{
+            ModelCatalogProvenance, ModelCatalogSourceKind,
+        };
+        let observation = account_observe_result("codex-cli", observed_sol_high_xhigh(), None);
+        let observed = observation.models.unwrap().content.unwrap();
+        let task = task_profile_for_role(AgentRole::Worker);
+        let priors = selector_priors_with_terminal_worker_economics()?;
+        let build = |models: &ModelsObservation| {
+            runtime_catalog_from_observed_models(
+                "codex",
+                &observation.binding,
+                models,
+                observation.observed_at.clone(),
+                &task,
+                &priors,
+            )
+        };
+        let unqualified = build(&observed)?;
+        let mut cache = observed.clone();
+        cache.provenance = Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::ManagedHomeCache,
+            fetched_at: Some(observation.observed_at.clone()),
+            stale: true,
+            principal_binding: None,
+            access_basis: None,
+        });
+        let cached_source = build(&cache)?;
+        assert_eq!(unqualified.models, cached_source.models);
+        assert_ne!(unqualified.revision, cached_source.revision);
+        cache.models[0]
+            .supported_efforts
+            .as_mut()
+            .unwrap()
+            .reverse();
+        cache.models[0]
+            .supported_efforts
+            .as_mut()
+            .unwrap()
+            .push("high".into());
+        assert_eq!(build(&cache)?, cached_source);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn selected_launch_unknown_access_is_explicit_and_principal_or_effort_tampering_refuses(
+    ) -> Result<()> {
+        use crate::selection::routing_policy::*;
+        use coding_agent_manager_lib::account_authority::{
+            ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        };
+        let temp = tempfile::tempdir()?;
+        let mut frozen = load_routing_policy(temp.path())?;
+        let mut observation = account_observe_result(
+            "codex-cli",
+            CategoryObservation::observed(ModelsObservation {
+                provenance: None,
+                models: vec![ObservedModel {
+                    model_id: "account-menu-model".into(),
+                    supported_efforts: Some(vec!["none".into()]),
+                    default_effort: Some("none".into()),
+                    access: ModelAccessOutcome::UnknownAccess,
+                }],
+            }),
+            None,
+        );
+        let candidate = CandidateKey {
+            runtime: "codex".into(),
+            model: "account-menu-model".into(),
+            effort: SelectorEffort::None,
+        };
+        let features = routing_features_from_plan(&test_plan());
+        let receipt = SelectedLaunchRequest::from_observation(
+            candidate.clone(),
+            &observation,
+            &frozen,
+            features.clone(),
+            None,
+        )?;
+        assert!(!receipt.access_uncertainty.is_empty());
+        frozen.policy.unknown_access_policy = UnknownAccessPolicy::Reject;
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        assert!(SelectedLaunchRequest::from_observation(
+            candidate.clone(),
+            &observation,
+            &frozen,
+            features.clone(),
+            None
+        )
+        .is_err());
+        frozen.policy.unknown_access_policy =
+            UnknownAccessPolicy::UnknownAccessForProductiveAttempt;
+        frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        let models = observation
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap();
+        models.models[0].access = ModelAccessOutcome::Unavailable;
+        models.provenance = Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some(observation.observed_at.clone()),
+            stale: false,
+            principal_binding: Some(observation.binding.clone()),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        });
+        assert!(SelectedLaunchRequest::from_observation(
+            candidate.clone(),
+            &observation,
+            &frozen,
+            features.clone(),
+            None
+        )
+        .is_err());
+        let models = observation
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap();
+        models.models[0].access = ModelAccessOutcome::Available;
+        let available = SelectedLaunchRequest::from_observation(
+            candidate.clone(),
+            &observation,
+            &frozen,
+            features.clone(),
+            None,
+        )?;
+        assert!(available.access_uncertainty.is_empty());
+        observation
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap()
+            .provenance
+            .as_mut()
+            .unwrap()
+            .principal_binding
+            .as_mut()
+            .unwrap()
+            .selection_revision += 1;
+        assert!(SelectedLaunchRequest::from_observation(
+            candidate.clone(),
+            &observation,
+            &frozen,
+            features.clone(),
+            None
+        )
+        .is_err());
+        let models = observation
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap();
+        models.models[0].access = ModelAccessOutcome::UnknownAccess;
+        models.provenance = None;
+        models.models[0].supported_efforts = Some(vec!["deep".into()]);
+        assert!(SelectedLaunchRequest::from_observation(
+            candidate,
+            &observation,
+            &frozen,
+            features,
+            None
+        )
+        .is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     fn observed_sol_high_xhigh() -> CategoryObservation<ModelsObservation> {
         CategoryObservation::observed(ModelsObservation {
+            provenance: None,
             models: vec![ObservedModel {
+                access:
+                    coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                 model_id: FRONTIER_PROFILE_MODEL.to_string(),
                 supported_efforts: Some(vec!["high".to_string(), "xhigh".to_string()]),
                 default_effort: Some("high".to_string()),
@@ -8190,7 +9863,9 @@ mod tests {
         let observation = account_observe_result(
             "codex-cli",
             CategoryObservation::observed(ModelsObservation {
+                provenance: None,
                 models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                     model_id: FRONTIER_PROFILE_MODEL.to_string(),
                     supported_efforts: Some(vec!["high".to_string()]),
                     default_effort: None,
@@ -8346,7 +10021,9 @@ mod tests {
         let observation = account_observe_result(
             "grok-cli",
             CategoryObservation::observed(ModelsObservation {
+                provenance: None,
                 models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                     model_id: "grok-4.6".to_string(),
                     supported_efforts: Some(vec!["high".to_string()]),
                     default_effort: None,

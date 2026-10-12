@@ -988,7 +988,7 @@ impl SupervisorCatalogCodexPreflightGrant {
 /// Distinct from `CatalogPreflightOrigin`. Catalog grants cannot bind these
 /// worker, auditor, consult, or merge-arbiter argv surfaces. Inbox
 /// independent-auditor is a sibling kind, not a parent-auditor alias. Consult
-/// Codex and consult Claude are sibling kinds with kind-scoped trusted program
+/// Codex, consult Claude and consult Gemini are sibling kinds with kind-scoped trusted program
 /// spellings. MergeArbiter is a sibling kind for a merge-shaped CodexSupervisor
 /// command and is not a consult, Inbox, parent-auditor, or assignment-child
 /// alias.
@@ -999,6 +999,7 @@ pub(crate) enum AssignmentProcessLaunchKind {
     InboxIndependentAuditor,
     ConsultCodex,
     ConsultClaude,
+    ConsultGemini,
     MergeArbiter,
 }
 
@@ -1006,8 +1007,8 @@ impl AssignmentProcessLaunchKind {
     /// Trusted basename spelling admitted for this kind.
     ///
     /// Child, parent-auditor, Inbox independent-auditor, consult-Codex, and
-    /// merge-arbiter remain `codex`. Consult-Claude is `claude` only for that
-    /// kind.
+    /// merge-arbiter remain `codex`. Consult-Claude is `claude` and
+    /// Consult-Gemini is `gemini` only for their respective kinds.
     pub(crate) const fn trusted_program_spelling(self) -> &'static str {
         match self {
             Self::AssignmentChild
@@ -1016,6 +1017,7 @@ impl AssignmentProcessLaunchKind {
             | Self::ConsultCodex
             | Self::MergeArbiter => TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM,
             Self::ConsultClaude => TRUSTED_CONSULT_CLAUDE_PROGRAM,
+            Self::ConsultGemini => "gemini",
         }
     }
 }
@@ -1240,6 +1242,7 @@ impl ReservedMechanicalExecutorExecution {
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AssignmentProcessExpectedProgram {
     TrustedSpelling,
+    SelectedMergeProgram { declared: PathBuf },
     IndependentlyVerifiedCanonical { program: PathBuf, parent: PathBuf },
 }
 
@@ -1467,7 +1470,8 @@ impl AssignmentProcessLaunchGrant {
             AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
                 program, ..
             } => Some(program),
-            AssignmentProcessExpectedProgram::TrustedSpelling => None,
+            AssignmentProcessExpectedProgram::TrustedSpelling
+            | AssignmentProcessExpectedProgram::SelectedMergeProgram { .. } => None,
         }
     }
 
@@ -1477,7 +1481,8 @@ impl AssignmentProcessLaunchGrant {
             AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical { parent, .. } => {
                 Some(parent)
             }
-            AssignmentProcessExpectedProgram::TrustedSpelling => None,
+            AssignmentProcessExpectedProgram::TrustedSpelling
+            | AssignmentProcessExpectedProgram::SelectedMergeProgram { .. } => None,
         }
     }
 
@@ -1527,6 +1532,48 @@ impl AssignmentProcessLaunchGrant {
         })
     }
 
+    /// Selected intent is refined only with the same private admission and actual resolved target.
+    pub(crate) fn seal_selected_merge_canonical_binding<A: AsRef<OsStr>>(
+        self,
+        admission: &crate::external_agent::SelectedMergeArbiterAdmission,
+        canonical_program: &Path,
+        argv: impl IntoIterator<Item = A>,
+        output_staging: &Path,
+        cwd: &Path,
+    ) -> Result<Self, AssignmentProcessLaunchGrantError> {
+        let (run, subject, declared, model) = admission
+            .validated_process_intent()
+            .map_err(|_| AssignmentProcessLaunchGrantError::IdentityMismatch)?;
+        if self.kind != AssignmentProcessLaunchKind::MergeArbiter
+            || self.run_id != run
+            || self.subject != subject
+            || self.attempt != 0
+            || self.duty != MERGE_ARBITER_PROCESS_DUTY
+            || self.model.as_deref() != model
+            || !matches!(&self.expected_program, AssignmentProcessExpectedProgram::SelectedMergeProgram { declared: expected } if expected == declared)
+            || !canonical_program.is_absolute()
+        {
+            return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+        }
+        let parent = canonical_program
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .ok_or(AssignmentProcessLaunchGrantError::CurrentDirMismatch)?;
+        Self {
+            expected_program: AssignmentProcessExpectedProgram::IndependentlyVerifiedCanonical {
+                program: canonical_program.to_path_buf(),
+                parent: parent.to_path_buf(),
+            },
+            ..self
+        }
+        .seal_independently_verified_canonical_binding(
+            canonical_program,
+            argv,
+            output_staging,
+            cwd,
+        )
+    }
+
     /// Refine admitted trusted spelling with an independently verified
     /// canonical program, final argv, output staging path, and ProcessSpec cwd.
     ///
@@ -1541,6 +1588,9 @@ impl AssignmentProcessLaunchGrant {
         cwd: &Path,
     ) -> Result<Self, AssignmentProcessLaunchGrantError> {
         let expected_program = match &self.expected_program {
+            AssignmentProcessExpectedProgram::SelectedMergeProgram { .. } => {
+                return Err(AssignmentProcessLaunchGrantError::ProgramMismatch);
+            }
             AssignmentProcessExpectedProgram::TrustedSpelling => {
                 if independently_verified_canonical_program
                     == Path::new(self.kind.trusted_program_spelling())
@@ -1831,10 +1881,57 @@ pub(crate) fn admit_consult_claude_process_intent(
     )
 }
 
+/// Gemini-only consultant intent; no other caller kind acquires this spelling.
+pub(crate) fn admit_consult_gemini_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::ConsultGemini,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
+/// Only a checked, selector-bound private admission can issue this provider-neutral intent.
+pub(crate) fn admit_selected_merge_arbiter_process_intent(
+    admission: &crate::external_agent::SelectedMergeArbiterAdmission,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    let (run, subject, program, model) = admission
+        .validated_process_intent()
+        .map_err(|_| AssignmentProcessLaunchGrantError::IdentityMismatch)?;
+    if program.as_os_str().is_empty() || run.is_empty() || subject.is_empty() || model.is_none() {
+        return Err(AssignmentProcessLaunchGrantError::IdentityMismatch);
+    }
+    Ok(AssignmentProcessLaunchGrant {
+        nonce: NEXT_ASSIGNMENT_PROCESS_LAUNCH_NONCE.fetch_add(1, Ordering::Relaxed),
+        run_id: run.to_string(),
+        subject: subject.to_string(),
+        attempt: 0,
+        kind: AssignmentProcessLaunchKind::MergeArbiter,
+        expected_program: AssignmentProcessExpectedProgram::SelectedMergeProgram {
+            declared: program.to_path_buf(),
+        },
+        model: model.map(str::to_string),
+        duty: MERGE_ARBITER_PROCESS_DUTY.to_string(),
+        sealed_delivery: None,
+        mechanical_executor: None,
+    })
+}
+
 /// Trusted merge-arbiter issuer. Distinct kind from assignment child, parent
 /// auditor, Inbox independent-auditor, and consult. Shares the process-launch
 /// nonce ledger, not the catalog ledger. Trusted spelling is `codex`. Does not
 /// mint a grant from `run_id` plus a repository path.
+#[cfg(any(test, not(target_os = "linux")))]
 pub(crate) fn admit_merge_arbiter_process_intent(
     run_id: &str,
     subject: &str,

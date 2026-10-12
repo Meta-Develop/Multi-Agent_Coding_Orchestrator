@@ -458,7 +458,7 @@ pub enum GrokStreamEvent {
     },
 }
 
-/// Successful terminal metadata from a Grok stream.
+/// Terminal metadata from a Grok stream; the stop reason determines success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokEndEvent {
     stop_reason: String,
@@ -731,8 +731,19 @@ impl GrokParsedEventStream {
         &self.outcome
     }
 
+    /// Whether an end terminal is present, independently of its success reason.
     pub const fn completed(&self) -> bool {
         matches!(self.outcome, GrokStreamOutcome::Completed(_))
+    }
+
+    /// Only a normal turn end establishes successful stream completion.
+    pub fn successful_completion(&self) -> bool {
+        match &self.outcome {
+            GrokStreamOutcome::Completed(end) => {
+                matches!(end.stop_reason(), "end_turn" | "EndTurn")
+            }
+            GrokStreamOutcome::Failed { .. } => false,
+        }
     }
 
     /// Spend status for this bounded stream. Failed terminals stay
@@ -1060,6 +1071,50 @@ mod native_budget_observation_tests {
         serde_json::json!({"input_tokens":12,"output_tokens":5,
             "cache_read_input_tokens":4,"cache_creation_input_tokens":3,
             "reasoning_tokens":2,"total_tokens":24})
+    }
+
+    #[test]
+    fn native_stop_reason_gates_success_without_discarding_terminal_usage() {
+        for reason in [
+            "end_turn",
+            "EndTurn",
+            "max_tokens",
+            "max_turn_requests",
+            "refusal",
+            "cancelled",
+            "unknown_reason",
+        ] {
+            for incomplete in [false, true] {
+                let mut event: Value =
+                    serde_json::from_slice(&stream(native(), incomplete)).unwrap();
+                event["stopReason"] = reason.into();
+                let mut bytes = serde_json::to_vec(&event).unwrap();
+                bytes.push(b'\n');
+                let parsed = parse_grok_event_stream(&bytes).unwrap();
+                assert!(parsed.completed(), "end remains terminal evidence");
+                let expected_success = matches!(reason, "end_turn" | "EndTurn");
+                assert_eq!(parsed.successful_completion(), expected_success);
+                let GrokStreamOutcome::Completed(end) = parsed.outcome() else {
+                    panic!("terminal metadata must remain available");
+                };
+                assert_eq!(end.stop_reason(), reason);
+                assert_eq!(end.session_id(), "session");
+                assert_eq!(end.request_id(), "request");
+                if incomplete {
+                    assert_eq!(parsed.usage_status(), GrokUsageStatus::Incomplete);
+                } else {
+                    let GrokUsageStatus::Native(usage) = parsed.usage_status() else {
+                        panic!("charged native usage must remain available");
+                    };
+                    assert_eq!(usage.total_tokens(), Some(24));
+                }
+                let (usage, complete) = observe_grok_native_usage(&bytes, false)
+                    .unwrap()
+                    .allocation();
+                assert_eq!(usage.total_tokens, 24);
+                assert_eq!(complete, !incomplete);
+            }
+        }
     }
 
     #[test]
@@ -2734,8 +2789,8 @@ mod tests {
     }
 
     #[test]
-    fn captured_47_catalog_preserves_standard_and_fast_slugs_without_granting_fast_authority(
-    ) -> Result<()> {
+    fn captured_47_catalog_preserves_slugs_without_using_names_for_protocol_admission() -> Result<()>
+    {
         let catalog = parse_grok_model_catalog(CAPTURED_47_CATALOG)?;
         assert_eq!(
             catalog.slugs().collect::<Vec<_>>(),
@@ -2747,14 +2802,14 @@ mod tests {
                 Some("grok-4.7"),
                 Some("xhigh")
             ),
-            Some(crate::runtime_adapter::TypedRuntime::Grok47Xhigh)
+            Some(crate::runtime_adapter::TypedRuntime::GrokHeadlessStreamingJson)
         ));
         assert!(crate::runtime_adapter::TypedRuntime::from_launch(
             AdapterId::Grok,
             Some("grok-4.7-build-fast"),
             Some("xhigh")
         )
-        .is_none());
+        .is_some());
         Ok(())
     }
 

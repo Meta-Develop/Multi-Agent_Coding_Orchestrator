@@ -6,9 +6,9 @@ const ACCOUNT_ID_MAX_LENGTH = 128
 
 /**
  * Adds a stored account for one adapter. The nickname is the account id.
- * Codex, Claude, and Grok start vendor sign-in; Gemini opens the system
- * browser for Google sign-in, and can also import GEMINI_API_KEY from the
- * native parent process. This webview never accepts a secret.
+ * OAuth adapters use the core login lifecycle. Gemini can also import
+ * GEMINI_API_KEY from the native parent process. This webview never accepts
+ * a secret.
  */
 export default function AddAccountForm({
   provider,
@@ -46,7 +46,7 @@ export default function AddAccountForm({
 
   async function handleSubmit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault()
-    await add(isGemini ? 'oauth' : undefined)
+    await add(provider.authKinds.includes('oauth') ? 'oauth' : undefined)
   }
 
   const describedBy = [
@@ -179,7 +179,7 @@ function addFlow(provider: ProviderDescriptor): {
     steps: [],
     submitLabel: `Sign in to ${provider.displayName}`,
     submitHint:
-      'The vendor window or terminal completes OAuth. This window never takes a password or token.',
+      'Complete the provider’s sign-in when its authorization instructions are available. This window tracks progress and never takes a password or token.',
   }
 }
 

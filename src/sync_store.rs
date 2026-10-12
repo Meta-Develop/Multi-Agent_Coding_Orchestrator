@@ -1,5 +1,6 @@
 use crate::sync::{
-    normalize_repo_relative_path, ClaimToken, PathClaim, SyncCoordinator, SyncSnapshot,
+    normalize_repo_relative_path, ClaimToken, PathClaim, SubordinateClaimBinding, SyncCoordinator,
+    SyncSnapshot,
 };
 use crate::{
     artifacts::{
@@ -8,8 +9,8 @@ use crate::{
     },
     authenticated_snapshot::{AuthenticatedSnapshot, AuthenticatedSnapshotStore, SnapshotSpec},
     live_claim::{
-        claim_process_liveness, current_claim_process_identity, ClaimProcessIdentity,
-        ClaimProcessLiveness,
+        claim_process_liveness, claim_process_liveness_observation, current_claim_process_identity,
+        ClaimProcessIdentity, ClaimProcessLiveness, ClaimProcessLivenessObservation,
     },
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     orchestrator::RunId,
@@ -651,6 +652,8 @@ struct AuthenticatedClaimsState {
     repository: RepositoryAuthBinding,
     next_token: u64,
     claims: Vec<PathClaim>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    subordinate_bindings: Vec<SubordinateClaimBinding>,
     #[serde(default)]
     run_owners: Vec<AuthenticatedClaimRunOwner>,
     #[serde(default)]
@@ -667,6 +670,53 @@ struct AuthenticatedClaimRunOwner {
     token: ClaimToken,
     run_id: String,
     process: ClaimProcessIdentity,
+}
+
+fn coordinator_from_authenticated(value: &AuthenticatedClaimsState) -> Result<SyncCoordinator> {
+    let snapshot = SyncSnapshot {
+        next_token: value.next_token,
+        claims: value.claims.clone(),
+    };
+    validate_sync_snapshot(&snapshot)?;
+    if value.subordinate_bindings.len() > MAX_SYNC_CLAIMS {
+        bail!("authenticated subordinate reservation history exceeds its bounded inventory");
+    }
+    let mut reserved_paths = 0usize;
+    for binding in &value.subordinate_bindings {
+        if binding.worker_id.len() > MAX_AGENT_ID_BYTES {
+            bail!("subordinate Worker ID exceeds the authenticated claim bound");
+        }
+        reserved_paths = reserved_paths
+            .checked_add(binding.paths.len())
+            .context("subordinate reserved scope count overflow")?;
+        if reserved_paths > MAX_SYNC_PATHS {
+            bail!("subordinate reservation history exceeds its bounded scope inventory");
+        }
+        for path in &binding.paths {
+            validate_state_path(path)?;
+        }
+        if value
+            .claims
+            .iter()
+            .any(|claim| claim.token == binding.child_token)
+        {
+            let parent = value
+                .run_owners
+                .iter()
+                .find(|owner| owner.token == binding.parent_token)
+                .context("active subordinate claim has no authenticated parent run owner")?;
+            let child = value
+                .run_owners
+                .iter()
+                .find(|owner| owner.token == binding.child_token)
+                .context("active subordinate claim has no authenticated Worker run owner")?;
+            if child.run_id != parent.run_id || child.process != parent.process {
+                bail!("subordinate claim belongs to a different run or process than its parent");
+            }
+        }
+    }
+    SyncCoordinator::from_snapshot_with_subordinates(snapshot, value.subordinate_bindings.clone())
+        .map_err(Into::into)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -1059,10 +1109,7 @@ fn validate_existing_authenticated_claims_snapshot(
     {
         bail!("authenticated claims snapshot binding or revision is inconsistent");
     }
-    validate_sync_snapshot(&SyncSnapshot {
-        next_token: snapshot.value.next_token,
-        claims: snapshot.value.claims.clone(),
-    })?;
+    coordinator_from_authenticated(&snapshot.value)?;
     validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)?;
     validate_claim_remote_owners(&snapshot.value.claims, &snapshot.value.remote_owners)?;
     validate_claim_liveness(
@@ -1254,10 +1301,7 @@ fn persist_exact_owner_heartbeat_locked(held: &mut HeldClaimsPersist, now: u64) 
         .checked_add(1)
         .context("authenticated claims snapshot revision exhausted")?;
     next.snapshot_revision = revision;
-    validate_sync_snapshot(&SyncSnapshot {
-        next_token: next.next_token,
-        claims: next.claims.clone(),
-    })?;
+    coordinator_from_authenticated(&next)?;
     validate_claim_run_owners(&next.claims, &next.run_owners)?;
     validate_claim_remote_owners(&next.claims, &next.remote_owners)?;
     validate_claim_liveness(
@@ -1922,10 +1966,7 @@ impl SyncStore {
     ) -> Result<remote_coordination::RemoteOwnerBinding> {
         let lock = self.state.lock()?;
         let store = self.open_authenticated_store(&lock)?;
-        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-            next_token: store.current().value.next_token,
-            claims: store.current().value.claims.clone(),
-        })?;
+        let coordinator = coordinator_from_authenticated(&store.current().value)?;
         let claims = coordinator.snapshot()?;
         let claim = claims
             .iter()
@@ -1955,6 +1996,183 @@ impl SyncStore {
         P: AsRef<Path>,
     {
         Ok(self.claim_paths_with_telemetry(agent_id, paths)?.claim)
+    }
+
+    /// Only a live frozen-parent consumer supplies this source digest and exact
+    /// authored Worker scope. Numeric tokens or child JSON are not dispatch authority.
+    pub(crate) fn claim_subordinate_paths_for_run(
+        &self,
+        run: &RunId,
+        parent: &PathClaim,
+        worker_id: &str,
+        paths: &[PathBuf],
+        source_digest: &str,
+    ) -> Result<PathClaim> {
+        if self.remote.is_some() {
+            bail!("isolated subordinate claims require local coordination; selected remote subdivision is unsupported");
+        }
+        let process = current_claim_process_identity();
+        let now = current_unix_seconds()?;
+        self.with_locked_update(|coordinator, run_owners, liveness, supersessions, _| {
+            let claims = coordinator.snapshot()?;
+            ensure_unambiguous_liveness(&claims, liveness, supersessions, now)?;
+            let owner = run_owners
+                .iter()
+                .find(|owner| owner.token == parent.token)
+                .context("subordinate claims require an authenticated parent run owner")?;
+            if owner.run_id != run.as_str() {
+                bail!("subordinate parent claim is not owned by this exact live run process; guard=run_mismatch");
+            }
+            if owner.process != process {
+                let pid_match = owner.process.pid == process.pid;
+                let recorded_start_present = owner.process.process_start_time.is_some();
+                let captured_start_present = process.process_start_time.is_some();
+                let recorded_parts = owner
+                    .process
+                    .process_start_time
+                    .as_deref()
+                    .and_then(|token| token.split_once(':'));
+                let captured_parts = process
+                    .process_start_time
+                    .as_deref()
+                    .and_then(|token| token.split_once(':'));
+                let valid_shape = |parts: Option<(&str, &str)>| {
+                    parts.is_some_and(|(prefix, suffix)| {
+                        !prefix.is_empty()
+                            && !suffix.is_empty()
+                            && prefix.bytes().all(|byte| byte.is_ascii_digit())
+                            && suffix.bytes().all(|byte| byte.is_ascii_digit())
+                    })
+                };
+                let recorded_shape_valid = valid_shape(recorded_parts);
+                let captured_shape_valid = valid_shape(captured_parts);
+                let valid_parts = recorded_parts
+                    .zip(captured_parts)
+                    .filter(|_| recorded_shape_valid && captured_shape_valid);
+                let prefix_equal = valid_parts.is_some_and(|(recorded, captured)| {
+                    recorded.0 == captured.0
+                });
+                let suffix_equal = valid_parts.is_some_and(|(recorded, captured)| {
+                    recorded.1 == captured.1
+                });
+                bail!("subordinate parent claim is not owned by this exact live run process; guard=process_mismatch, pid_match={pid_match}, recorded_start_present={recorded_start_present}, captured_start_present={captured_start_present}, recorded_shape_valid={recorded_shape_valid}, captured_shape_valid={captured_shape_valid}, prefix_equal={prefix_equal}, suffix_equal={suffix_equal}");
+            }
+            let observation = claim_process_liveness_observation(&owner.process);
+            if observation.liveness != ClaimProcessLiveness::Live {
+                let reason = observation.reason.diagnostic_label();
+                bail!("subordinate parent claim is not owned by this exact live run process; guard=liveness, classification={:?}, reason={reason}", observation.liveness);
+            }
+            drop(observation);
+            if !claims.iter().any(|claim| claim == parent) {
+                bail!("subordinate parent claim is not owned by this exact live run process; guard=parent_claim_missing");
+            }
+            if coordinator.subordinate_bindings()?.len() >= MAX_SYNC_CLAIMS {
+                bail!("subordinate reservation history exceeds the authenticated claim bound");
+            }
+            let claim =
+                coordinator.claim_subordinate_paths(parent, worker_id, paths, source_digest)?;
+            run_owners.push(AuthenticatedClaimRunOwner {
+                token: claim.token,
+                run_id: run.as_str().to_string(),
+                process,
+            });
+            liveness.push(new_claim_liveness(
+                &claim,
+                ClaimTiming::default(),
+                now,
+                None,
+            )?);
+            Ok(claim)
+        })
+    }
+
+    pub(crate) fn verify_subordinate_claim(
+        &self,
+        run: &RunId,
+        parent: &PathClaim,
+        child: &PathClaim,
+        source_digest: &str,
+    ) -> Result<()> {
+        let lock = self.state.lock()?;
+        let store = self.open_authenticated_store(&lock)?;
+        let value = &store.current().value;
+        if !value.claims.iter().any(|claim| claim == parent)
+            || !value.claims.iter().any(|claim| claim == child)
+            || !value.subordinate_bindings.iter().any(|binding| {
+                binding.parent_token == parent.token
+                    && binding.child_token == child.token
+                    && binding.worker_id == child.agent_id
+                    && binding.paths == child.paths
+                    && binding.source_digest == source_digest
+            })
+        {
+            bail!("isolated Worker claim differs from its authenticated frozen parent reservation");
+        }
+        let requests = [parent, child]
+            .iter()
+            .map(|claim| ExistingClaimBindingRequest {
+                agent_id: claim.agent_id.clone(),
+                token: claim.token,
+                paths: claim.paths.clone(),
+            })
+            .collect::<Vec<_>>();
+        verify_existing_claim_requests(value, &requests, current_unix_seconds()?)?;
+        if let Some(reason) = Self::isolated_run_owner_failure(
+            &requests,
+            &value.run_owners,
+            run.as_str(),
+            claim_process_liveness_observation,
+        ) {
+            bail!("isolated Worker or parent run ownership changed; {reason}");
+        }
+        self.state.verify(&lock)
+    }
+
+    fn isolated_run_owner_failure(
+        requests: &[ExistingClaimBindingRequest],
+        owners: &[AuthenticatedClaimRunOwner],
+        run: &str,
+        mut observe: impl FnMut(&ClaimProcessIdentity) -> ClaimProcessLivenessObservation,
+    ) -> Option<String> {
+        requests
+            .iter()
+            .zip(["Parent", "Worker"])
+            .find_map(|(request, label)| {
+                let mut owner_missing = true;
+                let mut token_match = false;
+                let mut run_match = None;
+                let mut liveness_reason = None;
+                let accepted = owners.iter().any(|owner| {
+                    if owner.token != request.token {
+                        return false;
+                    }
+                    owner_missing = false;
+                    token_match = true;
+                    run_match = Some(owner.run_id == run);
+                    if run_match != Some(true) {
+                        return false;
+                    }
+                    let observation = observe(&owner.process);
+                    let live = observation.liveness == ClaimProcessLiveness::Live;
+                    liveness_reason = Some(observation.reason);
+                    live
+                });
+                if accepted {
+                    return None;
+                }
+                let run_match = match run_match {
+                    Some(true) => "true",
+                    Some(false) => "false",
+                    None => "NotChecked",
+                };
+                let liveness_reason = match liveness_reason {
+                    Some(reason) => reason.diagnostic_label(),
+                    None => "NotChecked",
+                };
+                Some(format!(
+                    "{label}: owner_missing={owner_missing}, token_match={token_match}, run_match={run_match}, liveness_reason={liveness_reason}"
+                ))
+            })
     }
 
     /// Acquires a path claim attributed to one supervise run and its exact
@@ -2355,10 +2573,7 @@ impl SyncStore {
     pub fn liveness_snapshot_at(&self, now_unix_seconds: u64) -> Result<Vec<ClaimLivenessReport>> {
         let lock = self.state.lock()?;
         let store = self.open_authenticated_store(&lock)?;
-        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-            next_token: store.current().value.next_token,
-            claims: store.current().value.claims.clone(),
-        })?;
+        let coordinator = coordinator_from_authenticated(&store.current().value)?;
         let claims = coordinator.snapshot()?;
         let liveness = store
             .current()
@@ -2618,10 +2833,7 @@ impl SyncStore {
         let (claims, run_owners) = {
             let lock = self.state.lock()?;
             let store = self.open_authenticated_store(&lock)?;
-            let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-                next_token: store.current().value.next_token,
-                claims: store.current().value.claims.clone(),
-            })?;
+            let coordinator = coordinator_from_authenticated(&store.current().value)?;
             let claims = coordinator.snapshot()?;
             let run_owners = store
                 .current()
@@ -2652,10 +2864,7 @@ impl SyncStore {
         let claims = finish_with_lock_verification(
             (|| {
                 let store = self.open_authenticated_store(&lock)?;
-                let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-                    next_token: store.current().value.next_token,
-                    claims: store.current().value.claims.clone(),
-                })?;
+                let coordinator = coordinator_from_authenticated(&store.current().value)?;
                 coordinator.snapshot().map_err(Into::into)
             })(),
             self.state.verify(&lock),
@@ -2679,10 +2888,7 @@ impl SyncStore {
     ) -> Result<T> {
         let lock = self.state.lock()?;
         let mut store = self.open_authenticated_store(&lock)?;
-        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-            next_token: store.current().value.next_token,
-            claims: store.current().value.claims.clone(),
-        })?;
+        let coordinator = coordinator_from_authenticated(&store.current().value)?;
         let mut run_owners = store.current().value.run_owners.clone();
         let mut liveness = store.current().value.liveness.clone();
         let mut supersessions = store.current().value.supersessions.clone();
@@ -2695,6 +2901,7 @@ impl SyncStore {
             &mut remote_owners,
         )?;
         let snapshot = coordinator.to_snapshot()?;
+        let subordinate_bindings = coordinator.subordinate_bindings()?;
         validate_sync_snapshot(&snapshot)?;
         let active_tokens = snapshot
             .claims
@@ -2718,6 +2925,7 @@ impl SyncStore {
         )?;
         if snapshot.next_token == store.current().value.next_token
             && snapshot.claims == store.current().value.claims
+            && subordinate_bindings == store.current().value.subordinate_bindings
             && run_owners == store.current().value.run_owners
             && liveness == store.current().value.liveness
             && supersessions == store.current().value.supersessions
@@ -2738,6 +2946,7 @@ impl SyncStore {
             repository: store.current().value.repository.clone(),
             next_token: snapshot.next_token,
             claims: snapshot.claims,
+            subordinate_bindings,
             run_owners,
             liveness,
             supersessions,
@@ -2769,10 +2978,7 @@ impl SyncStore {
     ) -> Result<T> {
         let lock = self.state.lock()?;
         let store = self.open_authenticated_store(&lock)?;
-        let coordinator = SyncCoordinator::from_snapshot(SyncSnapshot {
-            next_token: store.current().value.next_token,
-            claims: store.current().value.claims.clone(),
-        })?;
+        let coordinator = coordinator_from_authenticated(&store.current().value)?;
         operation(&coordinator)
     }
 
@@ -2814,6 +3020,7 @@ impl SyncStore {
                 repository: binding,
                 next_token: 1,
                 claims: Vec::new(),
+                subordinate_bindings: Vec::new(),
                 run_owners: Vec::new(),
                 liveness: Vec::new(),
                 supersessions: Vec::new(),
@@ -2851,6 +3058,7 @@ impl SyncStore {
                     repository: binding,
                     next_token: snapshot.next_token,
                     claims: snapshot.claims,
+                    subordinate_bindings: Vec::new(),
                     run_owners: Vec::new(),
                     liveness: Vec::new(),
                     supersessions: Vec::new(),
@@ -2895,10 +3103,7 @@ impl SyncStore {
         {
             bail!("authenticated claims snapshot binding or revision is inconsistent");
         }
-        validate_sync_snapshot(&SyncSnapshot {
-            next_token: snapshot.value.next_token,
-            claims: snapshot.value.claims.clone(),
-        })?;
+        coordinator_from_authenticated(&snapshot.value)?;
         validate_claim_run_owners(&snapshot.value.claims, &snapshot.value.run_owners)
             .and_then(|()| {
                 validate_claim_remote_owners(&snapshot.value.claims, &snapshot.value.remote_owners)
@@ -2955,6 +3160,7 @@ impl SyncStore {
             repository: store.current().value.repository.clone(),
             next_token: snapshot.next_token,
             claims: snapshot.claims,
+            subordinate_bindings: Vec::new(),
             run_owners: Vec::new(),
             liveness: Vec::new(),
             supersessions: Vec::new(),
@@ -3988,6 +4194,224 @@ mod tests {
             .current()
             .value
             .clone()
+    }
+
+    #[test]
+    fn isolated_claim_owner_diagnostics_distinguish_missing_run_and_liveness_without_tokens() {
+        use crate::live_claim::ClaimProcessLivenessReason;
+
+        let run = RunId::new("private-diagnostic-run").unwrap();
+        let requests = vec![
+            ExistingClaimBindingRequest {
+                agent_id: "private-parent".into(),
+                token: ClaimToken::from_u64(1),
+                paths: vec!["src".into()],
+            },
+            ExistingClaimBindingRequest {
+                agent_id: "private-worker".into(),
+                token: ClaimToken::from_u64(2),
+                paths: vec!["src/private.rs".into()],
+            },
+        ];
+        let process = ClaimProcessIdentity {
+            pid: 17,
+            process_start_time: Some("123:456".into()),
+        };
+        let owners = requests
+            .iter()
+            .map(|request| AuthenticatedClaimRunOwner {
+                token: request.token,
+                run_id: run.as_str().to_string(),
+                process: process.clone(),
+            })
+            .collect::<Vec<_>>();
+        let assert_private = |diagnostic: &str| {
+            for excluded in [
+                run.as_str(),
+                "private-parent",
+                "private-worker",
+                "src/private.rs",
+                "ClaimToken",
+                "token=",
+                "run_id=",
+                "private error context",
+                "123:456",
+                "123:457",
+            ] {
+                assert!(!diagnostic.contains(excluded), "{diagnostic}");
+            }
+        };
+        let missing = SyncStore::isolated_run_owner_failure(&requests, &[], run.as_str(), |_| {
+            panic!("missing owner must not probe")
+        })
+        .unwrap();
+        assert_eq!(
+            missing,
+            "Parent: owner_missing=true, token_match=false, run_match=NotChecked, liveness_reason=NotChecked"
+        );
+        assert_private(&missing);
+        let wrong_run =
+            SyncStore::isolated_run_owner_failure(&requests, &owners, "private-wrong-run", |_| {
+                panic!("run mismatch must not probe")
+            })
+            .unwrap();
+        assert_eq!(
+            wrong_run,
+            "Parent: owner_missing=false, token_match=true, run_match=false, liveness_reason=NotChecked"
+        );
+        assert_private(&wrong_run);
+        assert!(!wrong_run.contains("private-wrong-run"));
+        let failures = [
+            (
+                ClaimProcessLiveness::Unknown,
+                ClaimProcessLivenessReason::MissingRecordedToken,
+                "MissingRecordedToken",
+            ),
+            (
+                ClaimProcessLiveness::Unknown,
+                ClaimProcessLivenessReason::UnsupportedRecordedToken,
+                "UnsupportedRecordedToken",
+            ),
+            (
+                ClaimProcessLiveness::Unknown,
+                ClaimProcessLivenessReason::UnsupportedObservedToken,
+                "UnsupportedObservedToken",
+            ),
+            (
+                ClaimProcessLiveness::Unknown,
+                ClaimProcessLivenessReason::ReadFailure {
+                    error_kind: Some(std::io::ErrorKind::PermissionDenied),
+                },
+                "ReadFailure",
+            ),
+            (
+                ClaimProcessLiveness::Interrupted,
+                ClaimProcessLivenessReason::DifferentStartToken {
+                    pid: 17,
+                    expected: "123:456".into(),
+                    observed: "123:457".into(),
+                },
+                "DifferentStartToken",
+            ),
+        ];
+        for (liveness, reason, expected_reason) in failures {
+            let mut probes = 0;
+            let mut failure = Some(ClaimProcessLivenessObservation { liveness, reason });
+            let diagnostic =
+                SyncStore::isolated_run_owner_failure(&requests, &owners, run.as_str(), |_| {
+                    probes += 1;
+                    if probes == 1 {
+                        ClaimProcessLivenessObservation {
+                            liveness: ClaimProcessLiveness::Live,
+                            reason: ClaimProcessLivenessReason::Matched,
+                        }
+                    } else {
+                        failure.take().unwrap()
+                    }
+                })
+                .unwrap();
+            assert_eq!(probes, 2);
+            assert_eq!(
+                diagnostic,
+                format!(
+                    "Worker: owner_missing=false, token_match=true, run_match=true, liveness_reason={expected_reason}"
+                )
+            );
+            assert_private(&diagnostic);
+        }
+        let mut probes = 0;
+        assert!(
+            SyncStore::isolated_run_owner_failure(&requests, &owners, run.as_str(), |_| {
+                probes += 1;
+                ClaimProcessLivenessObservation {
+                    liveness: ClaimProcessLiveness::Live,
+                    reason: ClaimProcessLivenessReason::Matched,
+                }
+            },)
+            .is_none()
+        );
+        assert_eq!(probes, 2);
+    }
+
+    #[test]
+    fn authenticated_subordinate_claims_reopen_with_exact_run_scope_and_spent_reservations() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").unwrap();
+        let store = SyncStore::open(&repo).unwrap();
+        let run = RunId::new("isolated-run").unwrap();
+        let parent = store.claim_paths_for_run(&run, "parent", ["src"]).unwrap();
+        let digest = "a".repeat(64);
+        assert!(store
+            .claim_subordinate_paths_for_run(
+                &RunId::new("wrong-run").unwrap(),
+                &parent,
+                "first",
+                &["src/a.rs".into()],
+                &digest
+            )
+            .is_err());
+        let first = store
+            .claim_subordinate_paths_for_run(&run, &parent, "first", &["src/a.rs".into()], &digest)
+            .unwrap();
+        let second = store
+            .claim_subordinate_paths_for_run(&run, &parent, "second", &["src/b.rs".into()], &digest)
+            .unwrap();
+        let reopened = SyncStore::open(&repo).unwrap();
+        reopened
+            .verify_subordinate_claim(&run, &parent, &first, &digest)
+            .unwrap();
+        assert!(reopened
+            .verify_subordinate_claim(&run, &parent, &first, &"b".repeat(64))
+            .is_err());
+        assert!(reopened.snapshot().unwrap().contains(&parent));
+        assert!(reopened.release(parent.token).is_err());
+        assert!(reopened.claim_paths("outside", ["src/a.rs"]).is_err());
+        reopened.release(first.token).unwrap();
+        assert!(reopened
+            .claim_subordinate_paths_for_run(&run, &parent, "first", &["src/a.rs".into()], &digest)
+            .is_err());
+        reopened.release(second.token).unwrap();
+        reopened.release(parent.token).unwrap();
+        assert!(reopened.snapshot().unwrap().is_empty());
+        assert_eq!(
+            authenticated_claims_state(&reopened)
+                .subordinate_bindings
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn authenticated_subordinate_snapshot_rejects_forgery_missing_owner_and_inventory_overflow() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo, "main").unwrap();
+        let store = SyncStore::open(&repo).unwrap();
+        let run = RunId::new("isolated-run").unwrap();
+        let parent = store.claim_paths_for_run(&run, "parent", ["src"]).unwrap();
+        let child = store
+            .claim_subordinate_paths_for_run(
+                &run,
+                &parent,
+                "worker",
+                &["src/a.rs".into()],
+                &"a".repeat(64),
+            )
+            .unwrap();
+        let value = authenticated_claims_state(&store);
+        let mut missing_owner = value.clone();
+        missing_owner
+            .run_owners
+            .retain(|owner| owner.token != child.token);
+        assert!(coordinator_from_authenticated(&missing_owner).is_err());
+        let mut forged = value.clone();
+        forged.subordinate_bindings[0].parent_token = child.token;
+        assert!(coordinator_from_authenticated(&forged).is_err());
+        let mut excessive = value;
+        excessive.subordinate_bindings =
+            vec![excessive.subordinate_bindings[0].clone(); MAX_SYNC_CLAIMS + 1];
+        assert!(coordinator_from_authenticated(&excessive).is_err());
     }
 
     fn commit_unvalidated_authenticated_state(

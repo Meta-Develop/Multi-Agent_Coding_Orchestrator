@@ -4286,7 +4286,7 @@ fn finalize_does_not_coerce_environment_none_to_zero() {
     assert_eq!(rollup.complete_attempt_count, 1);
     assert_eq!(rollup.complete_accepted_count, 1);
     assert_eq!(rollup.complete_total_cycle_cost_microunits, 12);
-    assert_eq!(rollup.cost_per_accepted_task_microunits, Some(12));
+    assert_eq!(rollup.cost_per_accepted_task_microunits, None);
     assert_ne!(rollup.cost_per_accepted_task_microunits, Some(0));
     assert_ne!(
         rollup.complete_total_cycle_cost_microunits,

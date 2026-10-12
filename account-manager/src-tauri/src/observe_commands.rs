@@ -1,6 +1,8 @@
 //! Thin Tauri IPC for core [`observe_selected_account`] (exact binding only).
 
-use crate::account_authority::{AccountObserveRequest, AccountObserveResult};
+use crate::account_authority::{
+    AccountObserveRequest, AccountObserveResult, SelectedAccountBinding,
+};
 use crate::error::Result;
 use crate::model::StoredAccountMaterial;
 use crate::providers::observe_selected_account;
@@ -8,6 +10,16 @@ use crate::storage;
 
 use super::adapter_for;
 use super::authority_client::{account_authority, AccountAuthority};
+
+/// Return authority-owned selection metadata without resolving any credential.
+#[tauri::command]
+pub fn selected_account_binding(provider_id: String) -> Result<Option<SelectedAccountBinding>> {
+    adapter_for(&provider_id)?;
+    match account_authority()? {
+        AccountAuthority::InProcess(registry) => registry.selected_binding(&provider_id),
+        AccountAuthority::Remote(client) => client.selected_binding(&provider_id),
+    }
+}
 
 /// Observe only the account named by `request.binding`; never auto-selects or rotates.
 #[tauri::command]
@@ -29,7 +41,6 @@ pub(crate) fn observe_account_blocking(
                 .transpose()?;
             observe_selected_account(&registry, adapter.as_ref(), request, store.as_deref())
         }
-        #[cfg(unix)]
         AccountAuthority::Remote(client) => client.account_observe(request),
     }
 }

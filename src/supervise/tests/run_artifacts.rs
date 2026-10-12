@@ -3457,6 +3457,7 @@ fn verified_run_entry_refuses_dirty_repository_before_assignment_creation() {
         .join(".maco/o2/runs/verified-capability-dirty-primary")
         .exists());
     assert!(!temp.path().join(".maco/worktrees/repo/child-a").exists());
+    assert!(!repo_path.join(".maco/worktrees/repo/child-a").exists());
     assert!(crate::git_repository::open(&repo_path)
         .expect("reopen dirty primary")
         .find_branch("maco/child-a", git2::BranchType::Local)
@@ -4481,6 +4482,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
                 output_last_message: Some(contents),
                 grok_stream_usage_evidence: None,
                 grok_acp_parent_evidence: None,
+                cursor_managed_parent_evidence: None,
                 codex_parent_evidence: None,
             };
             injected_target_attempted(run)

@@ -10,11 +10,13 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+use crate::account_authority::SelectedAccountBinding;
 use crate::error::{Error, Result};
 use crate::model::{
     Account, AccountListError, AccountListErrorKind, AccountListOutcome, AuthKind, LaunchedProcess,
     ProviderAccountList, ProviderDescriptor, ProviderQuotaList, QuotaListError, QuotaListErrorKind,
-    QuotaListOutcome, QuotaSnapshot, RelayStatus, RouteRule,
+    QuotaListOutcome, QuotaSnapshot, RelayStatus, RouteRule, StoredAccountMetadata,
+    StoredAccountState,
 };
 use crate::providers;
 use crate::providers::claude_code::ClaudeCodeAdapter;
@@ -83,10 +85,70 @@ fn collect_account_listings(provider_id: Option<&str>) -> Vec<ProviderAccountLis
         Some(id) => providers::find(id).into_iter().collect::<Vec<_>>(),
         None => providers::registry(),
     };
+    let authority = account_authority();
     adapters
         .iter()
-        .map(|adapter| listing_for(adapter.as_ref()))
+        .map(|adapter| match &authority {
+            Ok(AccountAuthority::InProcess(_)) => listing_for(adapter.as_ref()),
+            Ok(AccountAuthority::Remote(client)) => listing_from_result(
+                adapter.id(),
+                (|| {
+                    let records = client.accounts_list(adapter.id())?;
+                    let selected = client.selected_binding(adapter.id())?;
+                    remote_account_rows(adapter.id(), records, selected.as_ref())
+                })(),
+            ),
+            Err(error) => ProviderAccountList {
+                provider_id: adapter.id().to_string(),
+                accounts: Vec::new(),
+                outcome: AccountListOutcome::Failed {
+                    error: account_list_error(error),
+                },
+            },
+        })
         .collect()
+}
+
+/// Remote metadata is not evidence of a local tool identity or vendor acceptance.
+fn remote_account_rows(
+    provider_id: &str,
+    records: Vec<StoredAccountMetadata>,
+    selected: Option<&SelectedAccountBinding>,
+) -> Result<Vec<Account>> {
+    if records
+        .iter()
+        .any(|record| record.provider_id != provider_id)
+        || selected.is_some_and(|binding| binding.provider_id != provider_id)
+    {
+        return Err(Error::ConfigRead {
+            provider: "account-authority".to_string(),
+            reason: "account listing did not match the requested provider".to_string(),
+        });
+    }
+    Ok(records
+        .into_iter()
+        .map(|record| {
+            let complete = record.state == StoredAccountState::Complete;
+            let is_selected = complete
+                && record.is_selected
+                && selected.is_some_and(|binding| {
+                    binding.account_id == record.id
+                        && binding.account_incarnation == record.account_incarnation
+                });
+            Account {
+                id: record.id,
+                provider_id: record.provider_id,
+                label: record.label,
+                masked_identity: None,
+                auth_kind: record.auth_kind,
+                is_active: false,
+                is_selected_for_launch: is_selected,
+                is_stored: true,
+                is_incomplete: !complete,
+                expires_at: None,
+            }
+        })
+        .collect())
 }
 
 /// Codex and Claude can enumerate stored copies when the live document
@@ -217,6 +279,12 @@ fn add_account_blocking(
     auth_kind: Option<AuthKind>,
 ) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
+    let authority = account_authority()?;
+    if matches!(&authority, AccountAuthority::Remote(_)) {
+        return Err(Error::NotImplemented(
+            "remote add_account; use login.start for OAuth",
+        ));
+    }
     let Some(plan) = (match auth_kind {
         Some(kind) => adapter.managed_account_plan_for(kind),
         None => adapter.managed_account_plan(),
@@ -226,7 +294,6 @@ fn add_account_blocking(
     let store = (plan.material == crate::model::StoredAccountMaterial::CredentialStore)
         .then(storage::default_store)
         .transpose()?;
-    let authority = account_authority()?;
     providers::add_managed_account_for(
         authority.in_process_registry()?,
         adapter.as_ref(),
@@ -244,10 +311,14 @@ fn add_account_blocking(
 #[tauri::command]
 pub fn activate_account(provider_id: String, account_id: String) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
+    let authority = account_authority()?;
+    if matches!(&authority, AccountAuthority::Remote(_)) {
+        return select_launch_account(&authority, adapter.as_ref(), &account_id);
+    }
     match adapter.activation_mechanism() {
         ActivationMechanism::ToolConfiguration => adapter.activate_account(&account_id),
         ActivationMechanism::LaunchEnvironment => {
-            select_launch_account(&account_authority()?, adapter.as_ref(), &account_id)
+            select_launch_account(&authority, adapter.as_ref(), &account_id)
         }
     }
 }
@@ -257,10 +328,13 @@ pub fn activate_account(provider_id: String, account_id: String) -> Result<()> {
 #[tauri::command]
 pub fn delete_account(provider_id: String, account_id: String) -> Result<()> {
     let adapter = adapter_for(&provider_id)?;
+    let authority = account_authority()?;
+    if matches!(&authority, AccountAuthority::Remote(_)) {
+        return Err(Error::NotImplemented("remote delete_account"));
+    }
     if adapter.managed_account_plan().is_none() {
         return adapter.delete_account(&account_id);
     }
-    let authority = account_authority()?;
     let registry = authority.in_process_registry()?;
     let account = registry.account(&provider_id, &account_id)?;
     let store = (account.material == crate::model::StoredAccountMaterial::CredentialStore)
@@ -285,10 +359,7 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
         AccountAuthority::InProcess(registry) => registry
             .selected(&provider_id)?
             .ok_or_else(|| Error::NoSelectedAccount(provider_id.clone()))?,
-        #[cfg(unix)]
-        AccountAuthority::Remote(client) => client
-            .selected_metadata(&provider_id)?
-            .ok_or_else(|| Error::NoSelectedAccount(provider_id.clone()))?,
+        AccountAuthority::Remote(_) => return Err(Error::NotImplemented("remote launch_provider")),
     };
     let spec = providers::launch_spec_for(adapter.as_ref(), &account)?;
     let store = spec
@@ -316,9 +387,18 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
 /// adapter contract violation can never become a visible number (FR-5, NFR-8).
 #[tauri::command]
 pub fn list_quota() -> Vec<ProviderQuotaList> {
+    let authority = account_authority();
     providers::registry()
         .iter()
-        .map(|adapter| quota_listing_for(adapter.as_ref()))
+        .map(|adapter| match &authority {
+            Ok(AccountAuthority::InProcess(_)) => quota_listing_for(adapter.as_ref()),
+            // There is no unbound remote quota operation. Do not substitute the
+            // Windows user's ambient provider account for the Linux selection.
+            Ok(AccountAuthority::Remote(_)) => {
+                quota_listing_from_results(adapter.id(), Ok(Vec::new()), Ok(None))
+            }
+            Err(error) => failed_quota_listing(adapter.id(), quota_list_error(error)),
+        })
         .collect()
 }
 
@@ -579,7 +659,9 @@ pub fn run() {
             login_commands::login_start,
             login_commands::login_status,
             login_commands::login_cancel,
+            login_commands::login_open_authorization,
             observe_commands::observe_account,
+            observe_commands::selected_account_binding,
         ])
         .run(tauri::generate_context!())
         .expect("error while running Coding Agent Manager");
@@ -588,7 +670,77 @@ pub fn run() {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Account, AuthKind, QuotaSource};
+    use crate::model::{Account, AuthKind, QuotaSource, StoredAccountMaterial};
+
+    fn remote_record(state: StoredAccountState) -> StoredAccountMetadata {
+        StoredAccountMetadata {
+            id: "work".to_string(),
+            provider_id: "codex-cli".to_string(),
+            label: "Work".to_string(),
+            auth_kind: AuthKind::OAuth,
+            state,
+            material: StoredAccountMaterial::VendorHome,
+            is_selected: true,
+            account_incarnation: "incarnation-1".to_string(),
+        }
+    }
+
+    fn remote_binding(incarnation: &str) -> SelectedAccountBinding {
+        SelectedAccountBinding {
+            provider_id: "codex-cli".to_string(),
+            account_id: "work".to_string(),
+            account_incarnation: incarnation.to_string(),
+            selection_revision: 7,
+        }
+    }
+
+    #[test]
+    fn remote_listing_requires_complete_exact_selected_incarnation_without_auth_claim() {
+        let selected = remote_binding("incarnation-1");
+        let rows = remote_account_rows(
+            "codex-cli",
+            vec![remote_record(StoredAccountState::Complete)],
+            Some(&selected),
+        )
+        .expect("rows");
+        assert!(rows[0].is_selected_for_launch);
+        assert!(!rows[0].is_active);
+        assert!(rows[0].masked_identity.is_none());
+        assert!(rows[0].expires_at.is_none());
+
+        let stale = remote_binding("old-incarnation");
+        let rows = remote_account_rows(
+            "codex-cli",
+            vec![remote_record(StoredAccountState::Complete)],
+            Some(&stale),
+        )
+        .expect("stale rows");
+        assert!(!rows[0].is_selected_for_launch);
+
+        for state in [StoredAccountState::Pending, StoredAccountState::Deleting] {
+            let rows =
+                remote_account_rows("codex-cli", vec![remote_record(state)], Some(&selected))
+                    .expect("pending rows");
+            assert!(rows[0].is_incomplete);
+            assert!(!rows[0].is_selected_for_launch);
+            assert!(!rows[0].is_active);
+        }
+    }
+
+    #[test]
+    fn remote_listing_refuses_cross_provider_records_and_selection() {
+        let mut record = remote_record(StoredAccountState::Complete);
+        record.provider_id = "grok-cli".to_string();
+        assert!(remote_account_rows("codex-cli", vec![record], None).is_err());
+        let mut selected = remote_binding("incarnation-1");
+        selected.provider_id = "grok-cli".to_string();
+        assert!(remote_account_rows(
+            "codex-cli",
+            vec![remote_record(StoredAccountState::Complete)],
+            Some(&selected)
+        )
+        .is_err());
+    }
 
     fn sample_account(provider_id: &str) -> Account {
         Account {

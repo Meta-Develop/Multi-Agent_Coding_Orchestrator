@@ -54,7 +54,7 @@ pub(super) fn exercise(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
-    prepared: PreparedChildAttempt<'_>,
+    prepared: Box<PreparedChildAttempt<'_>>,
     calls: &Mutex<Vec<String>>,
 ) -> Result<()> {
     if case.starts_with("managed-cycle-retained-") {
@@ -91,6 +91,9 @@ pub(super) fn exercise(
         &schemas.join("auditor-report.schema.json"),
     );
     let observed = calls.lock().unwrap().clone();
+    if case.starts_with("managed-cycle-isolated-") {
+        return exercise_isolated_result(case, context, preflight, outcome, result, &observed);
+    }
     match case {
         "managed-cycle-happy" | "managed-cycle-lost-reply" => {
             let collected = result?;
@@ -172,6 +175,207 @@ pub(super) fn exercise(
     Ok(())
 }
 
+fn exercise_isolated_result(
+    case: &str,
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    outcome: &AssignmentExecutionOutcome,
+    result: Result<CollectedChildAttempt<'_>>,
+    observed: &[String],
+) -> Result<()> {
+    assert_eq!(observed.first().map(String::as_str), Some("parent"));
+    if case == "managed-cycle-isolated-unstarted" {
+        assert!(result.is_err());
+        assert_eq!(observed, ["parent"]);
+        let budget = context.budget_ledger.report()?;
+        assert_eq!(budget.active_reservations, 0);
+        assert!(!budget
+            .roles
+            .iter()
+            .any(|role| role.role == AgentRole::Worker && role.consumed.tokens != 0));
+        assert!(
+            preflight.issue_nested_turn(1).is_err(),
+            "unstarted grant replay was accepted"
+        );
+        held_resources(context, preflight)?;
+        return Ok(());
+    }
+    let worker_calls = observed
+        .iter()
+        .filter(|id| id.as_str() != "parent")
+        .cloned()
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        worker_calls,
+        BTreeSet::from(["worker".into(), "worker-two".into()]),
+        "isolated worker call set mismatch; controller error: {:#?}; error_finding_messages: {:?}",
+        result.as_ref().err(),
+        outcome
+            .findings
+            .iter()
+            .rev()
+            .filter(|finding| matches!(finding.severity, FindingSeverity::Error))
+            .take(4)
+            .map(|finding| finding.message.chars().take(512).collect::<String>())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        observed.iter().filter(|id| id.as_str() == "worker").count(),
+        1
+    );
+    assert_eq!(
+        observed
+            .iter()
+            .filter(|id| id.as_str() == "worker-two")
+            .count(),
+        1
+    );
+    let budget = context.budget_ledger.report()?;
+    assert_eq!(
+        budget.active_reservations, 0,
+        "started dispatch reservation remained live"
+    );
+    assert_eq!(budget.reserved.tokens, 0);
+    let worker_budget = budget
+        .roles
+        .iter()
+        .find(|role| role.role == AgentRole::Worker)
+        .context("actual Worker settlement")?;
+    assert_eq!(
+        worker_budget.consumed.tokens, 28,
+        "both returned Worker usages must settle exactly once"
+    );
+    assert_eq!(worker_budget.active_reservations, 0);
+    if case.ends_with("final-panic") {
+        assert!(
+            outcome.usage_incomplete,
+            "failed entered parent was reported with complete usage"
+        );
+        assert!(
+            !budget.usage_complete,
+            "missing usage disappeared from the run ledger"
+        );
+    }
+    assert_eq!(
+        fs::read_to_string(context.repo.join("src/lib.rs"))?,
+        "pub fn selected() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(context.repo.join("src/other.rs"))?,
+        "pub fn other() {}\n"
+    );
+    assert_eq!(
+        current_head_oid(context.repo)?,
+        preflight.child_base_head,
+        "primary HEAD changed"
+    );
+    assert!(
+        preflight.issue_nested_turn(1).is_err(),
+        "spent frozen turn was replayed"
+    );
+    if case == "managed-cycle-isolated-happy" {
+        let collected = result?;
+        assert!(!report_failed(&collected.attempt_report));
+        assert!(collected.report_shape_problems.is_empty());
+        assert!(collected.attempt_containment_verified);
+        assert_eq!(observed.len(), 4);
+        assert_eq!(observed.last().map(String::as_str), Some("parent"));
+        assert_eq!(collected._worker_journal_evidence.len(), 2);
+        for (path, worker) in [("src/lib.rs", "worker"), ("src/other.rs", "worker-two")] {
+            assert_eq!(
+                fs::read_to_string(preflight.worktree.path.join(path))?,
+                format!("// written by {worker}\n")
+            );
+        }
+        held_resources(context, preflight)?;
+    } else {
+        assert!(result.is_err(), "isolated refusal case accepted: {case}");
+        assert_eq!(
+            fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
+            "pub fn selected() {}\n"
+        );
+        assert_eq!(
+            fs::read_to_string(preflight.worktree.path.join("src/other.rs"))?,
+            "pub fn other() {}\n"
+        );
+        if case.ends_with("unknown-containment") || case.ends_with("final-panic") {
+            assert!(outcome.external_containment_failed);
+            let claims = context.sync_store.snapshot()?;
+            assert!(claims.contains(&preflight.claim));
+            assert!(
+                claims.iter().any(|claim| claim.agent_id == "worker"),
+                "unknown child was released"
+            );
+            assert!(
+                context.sync_store.release(preflight.claim.token).is_err(),
+                "quarantined descendant allowed parent release"
+            );
+        } else {
+            held_resources(context, preflight)?;
+        }
+        if case.contains("-final-") {
+            assert_eq!(observed.len(), 4);
+        } else {
+            assert_eq!(
+                observed.len(),
+                3,
+                "continuation ran after worker failure/cancellation"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_cycle_isolated_workers_overlap_and_import_exact_union() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-happy")
+}
+
+#[test]
+fn managed_cycle_isolated_unstarted_threads_release_spent_grants_without_usage() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-unstarted")
+}
+
+#[test]
+fn managed_cycle_isolated_cancellation_settles_both_started_workers() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-cancel-both")
+}
+
+#[test]
+fn managed_cycle_isolated_settled_seal_rejection_releases_children() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-seal-rejection")
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cycle_isolated_unknown_containment_quarantines_exact_child() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-unknown-containment")
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_cycle_isolated_unknown_final_return_and_panic_keep_completed_owners() -> Result<()> {
+    for case in [
+        "managed-cycle-isolated-final-unknown-containment",
+        "managed-cycle-isolated-final-panic",
+    ] {
+        super::nested_driver_tests::driver_fixture(case)?;
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_cycle_isolated_final_rejections_release_quiescent_children_without_import() -> Result<()>
+{
+    for case in [
+        "managed-cycle-isolated-final-forgery",
+        "managed-cycle-isolated-final-malformed",
+    ] {
+        super::nested_driver_tests::driver_fixture(case)?;
+    }
+    Ok(())
+}
+
 #[test]
 fn managed_cycle_happy_runs_both_workers_and_final_parent() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-happy")
@@ -209,7 +413,7 @@ fn exercise_retained_failure(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
-    prepared: PreparedChildAttempt<'_>,
+    prepared: Box<PreparedChildAttempt<'_>>,
     calls: &Mutex<Vec<String>>,
 ) -> Result<()> {
     use crate::external_agent::{

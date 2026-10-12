@@ -6,9 +6,10 @@ use time::format_description::well_known::Rfc3339;
 use time::OffsetDateTime;
 
 use crate::account_authority::{
-    AccountObserveRequest, AccountObserveResult, AuthObservation, CategoryObservation,
-    ModelsObservation, ObservationError, ObservationErrorKind, ObserveCategory, QuotaObservation,
-    StoredAccountRegistry,
+    validate_observed_models_for_binding, AccountObserveRequest, AccountObserveResult,
+    AuthObservation, CategoryObservation, ModelsObservation, ObservationError,
+    ObservationErrorKind, ObservationOutcome, ObserveCategory, QuotaObservation,
+    SelectedAccountBinding, StoredAccountRegistry,
 };
 use crate::error::{Error, Result};
 use crate::model::QuotaSnapshot;
@@ -43,7 +44,13 @@ pub fn observe_selected_account(
     let _lease = registry.acquire_selected_use(&request.binding)?;
     let account = registry.complete(adapter.id(), &request.binding.account_id)?;
 
-    let payload = adapter.observe_account(&account, &categories, credential_store)?;
+    let payload = observe_bound_account(
+        adapter,
+        &account,
+        &request.binding,
+        &categories,
+        credential_store,
+    )?;
     let observed_at = OffsetDateTime::now_utc()
         .format(&Rfc3339)
         .map_err(|error| Error::ConfigRead {
@@ -58,6 +65,33 @@ pub fn observe_selected_account(
         models: payload.models,
         quota: payload.quota,
     })
+}
+
+/// Observe and validate model source evidence for the exact selected binding.
+fn observe_bound_account(
+    adapter: &dyn ProviderAdapter,
+    account: &crate::model::StoredAccountMetadata,
+    binding: &SelectedAccountBinding,
+    categories: &BTreeSet<ObserveCategory>,
+    credential_store: Option<&dyn CredentialStore>,
+) -> Result<AdapterObservePayload> {
+    let payload =
+        adapter.observe_account_for_binding(account, binding, categories, credential_store)?;
+    if let Some(models) = &payload.models {
+        if models.outcome == ObservationOutcome::Observed {
+            let content = models.content.as_ref().ok_or_else(|| Error::ConfigRead {
+                provider: binding.provider_id.clone(),
+                reason: "Observed model category requires content".to_string(),
+            })?;
+            validate_observed_models_for_binding(content, binding).map_err(|_| {
+                Error::ConfigRead {
+                    provider: binding.provider_id.clone(),
+                    reason: "Observed model category has invalid source evidence".to_string(),
+                }
+            })?;
+        }
+    }
+    Ok(payload)
 }
 
 /// Per-category observations returned by an adapter for one stored account.
@@ -220,6 +254,208 @@ mod tests {
             is_selected: true,
             account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
         }
+    }
+
+    struct ObservationAdapter {
+        expected_binding: Option<SelectedAccountBinding>,
+        models: Option<CategoryObservation<ModelsObservation>>,
+    }
+
+    impl ProviderAdapter for ObservationAdapter {
+        fn id(&self) -> &'static str {
+            "stub"
+        }
+        fn descriptor(&self) -> crate::model::ProviderDescriptor {
+            StubAdapter.descriptor()
+        }
+        fn config_paths(&self) -> Vec<std::path::PathBuf> {
+            Vec::new()
+        }
+        fn detect(&self) -> crate::model::InstallState {
+            StubAdapter.detect()
+        }
+        fn list_accounts(&self) -> Result<Vec<crate::model::Account>> {
+            Ok(Vec::new())
+        }
+        fn activate_account(&self, account_id: &str) -> Result<()> {
+            StubAdapter.activate_account(account_id)
+        }
+        fn observe_account(
+            &self,
+            account: &StoredAccountMetadata,
+            categories: &BTreeSet<ObserveCategory>,
+            credential_store: Option<&dyn CredentialStore>,
+        ) -> Result<AdapterObservePayload> {
+            assert!(
+                self.expected_binding.is_none(),
+                "bound override must be used"
+            );
+            assert_eq!(account, &fixture_account());
+            assert_eq!(categories, &BTreeSet::from([ObserveCategory::Models]));
+            assert!(credential_store.is_none());
+            Ok(AdapterObservePayload {
+                auth: None,
+                models: self.models.clone(),
+                quota: None,
+            })
+        }
+        fn observe_account_for_binding(
+            &self,
+            account: &StoredAccountMetadata,
+            binding: &SelectedAccountBinding,
+            categories: &BTreeSet<ObserveCategory>,
+            credential_store: Option<&dyn CredentialStore>,
+        ) -> Result<AdapterObservePayload> {
+            if let Some(expected) = &self.expected_binding {
+                assert!(
+                    binding == expected,
+                    "exact selected binding must reach adapter"
+                );
+                assert_eq!(account, &fixture_account());
+                assert_eq!(categories, &BTreeSet::from([ObserveCategory::Models]));
+                assert!(credential_store.is_none());
+                Ok(AdapterObservePayload {
+                    auth: None,
+                    models: self.models.clone(),
+                    quota: None,
+                })
+            } else {
+                self.observe_account(account, categories, credential_store)
+            }
+        }
+    }
+
+    struct LegacyObservationAdapter(ObservationAdapter);
+
+    impl ProviderAdapter for LegacyObservationAdapter {
+        fn id(&self) -> &'static str {
+            self.0.id()
+        }
+
+        fn descriptor(&self) -> crate::model::ProviderDescriptor {
+            self.0.descriptor()
+        }
+
+        fn config_paths(&self) -> Vec<std::path::PathBuf> {
+            self.0.config_paths()
+        }
+
+        fn detect(&self) -> crate::model::InstallState {
+            self.0.detect()
+        }
+
+        fn list_accounts(&self) -> Result<Vec<crate::model::Account>> {
+            self.0.list_accounts()
+        }
+
+        fn activate_account(&self, account_id: &str) -> Result<()> {
+            self.0.activate_account(account_id)
+        }
+
+        fn observe_account(
+            &self,
+            account: &StoredAccountMetadata,
+            categories: &BTreeSet<ObserveCategory>,
+            credential_store: Option<&dyn CredentialStore>,
+        ) -> Result<AdapterObservePayload> {
+            self.0
+                .observe_account(account, categories, credential_store)
+        }
+    }
+
+    fn fixture_binding() -> SelectedAccountBinding {
+        SelectedAccountBinding {
+            provider_id: "stub".into(),
+            account_id: "work".into(),
+            account_incarnation: "0123456789abcdef0123456789abcdef".into(),
+            selection_revision: 7,
+        }
+    }
+
+    fn cache_models() -> ModelsObservation {
+        ModelsObservation {
+            models: vec![crate::account_authority::ObservedModel {
+                model_id: "cached-model".into(),
+                supported_efforts: None,
+                default_effort: None,
+                access: crate::account_authority::ModelAccessOutcome::UnknownAccess,
+            }],
+            provenance: Some(crate::account_authority::ModelCatalogProvenance {
+                source_kind: crate::account_authority::ModelCatalogSourceKind::ManagedHomeCache,
+                fetched_at: None,
+                stale: true,
+                principal_binding: None,
+                access_basis: None,
+            }),
+        }
+    }
+
+    fn observe_fixture(adapter: &dyn ProviderAdapter) -> Result<AdapterObservePayload> {
+        observe_bound_account(
+            adapter,
+            &fixture_account(),
+            &fixture_binding(),
+            &BTreeSet::from([ObserveCategory::Models]),
+            None,
+        )
+    }
+
+    #[test]
+    fn bound_hook_receives_exact_selected_tuple() {
+        let adapter = ObservationAdapter {
+            expected_binding: Some(fixture_binding()),
+            models: Some(CategoryObservation::observed(cache_models())),
+        };
+        assert_eq!(observe_fixture(&adapter).unwrap().models, adapter.models);
+    }
+
+    #[test]
+    fn observed_models_refuse_foreign_principal_and_missing_content() {
+        let mut models = cache_models();
+        let mut foreign = fixture_binding();
+        foreign.selection_revision += 1;
+        models.provenance.as_mut().unwrap().principal_binding = Some(foreign);
+        let mut adapter = ObservationAdapter {
+            expected_binding: Some(fixture_binding()),
+            models: Some(CategoryObservation::observed(models)),
+        };
+        assert!(matches!(
+            observe_fixture(&adapter),
+            Err(Error::ConfigRead { .. })
+        ));
+        let category = adapter.models.as_mut().unwrap();
+        category.content = None;
+        assert!(matches!(
+            observe_fixture(&adapter),
+            Err(Error::ConfigRead { .. })
+        ));
+    }
+
+    #[test]
+    fn unknown_cache_models_without_source_principal_remain_unknown() {
+        let adapter = ObservationAdapter {
+            expected_binding: Some(fixture_binding()),
+            models: Some(CategoryObservation::observed(cache_models())),
+        };
+        let payload = observe_fixture(&adapter).unwrap();
+        assert_eq!(payload.models, adapter.models);
+        let mut absent = adapter;
+        absent.models = None;
+        assert!(observe_fixture(&absent).unwrap().models.is_none());
+        absent.models = Some(CategoryObservation::unavailable());
+        assert_eq!(observe_fixture(&absent).unwrap().models, absent.models);
+    }
+
+    #[test]
+    fn default_bound_hook_forwards_legacy_observation() {
+        let legacy = LegacyObservationAdapter(ObservationAdapter {
+            expected_binding: None,
+            models: Some(CategoryObservation::observed(cache_models())),
+        });
+        let payload = observe_fixture(&legacy).expect("legacy observation");
+        assert_eq!(payload.models, legacy.0.models);
+        assert!(payload.auth.is_none());
+        assert!(payload.quota.is_none());
     }
 
     #[test]

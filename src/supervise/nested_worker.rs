@@ -99,6 +99,62 @@ impl<'a> AssignmentAttemptAuthority<'a> {
         )
     }
 
+    /// Seal the exact finalized nested Grok command after the unique serial permit and
+    /// parent-owned resources have both been revalidated. The Worker remains the launch
+    /// subject while the enclosing ChildOrchestrator remains the worktree/claim owner.
+    pub(super) fn seal_nested_grok_worktree_confinement(
+        &self,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        permit: &mut NestedTurnExecutionPermit<'_, '_>,
+        subject_id: &str,
+        command: ExternalAgentCommand,
+    ) -> Result<ExternalAgentCommand> {
+        permit.revalidate(preflight, self.attempt)?;
+        self.admit(subject_id, &command, SupervisorRuntime::Grok)?;
+        let worker = self
+            .parent
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.id == subject_id)
+            .context("nested Grok authority lost its authored Worker")?;
+        let capabilities =
+            command.selected_writable_capabilities(SupervisorRuntime::Grok, Some(subject_id))?;
+        if capabilities
+            .writable_launch_refusal(command.writable_launch_target)
+            .is_some()
+            || capabilities.side_effect_confinement
+                != crate::runtime_adapter::SideEffectConfinement::Verified
+        {
+            bail!("nested Grok authority requires verified native confinement");
+        }
+        let nested =
+            crate::external_agent::NestedWorktreeWritableAdmission::from_live_assignment_authority(
+                subject_id,
+                &self.parent.id,
+                self.run_id.as_str(),
+                self.attempt,
+                self.attempt,
+                &self.worktree.name,
+                &self.worktree.path,
+                &self.worktree.branch,
+                &self.claim.agent_id,
+                self.claim.token.get(),
+                &self.claim.paths,
+                &worker.assigned_paths,
+                self.held_semantic_token,
+                crate::external_agent::NativeSandboxAdmission {
+                    runtime: SupervisorRuntime::Grok,
+                    workspace_access: command.workspace_access,
+                    side_effect_confinement: capabilities.side_effect_confinement,
+                },
+                &command.worker_journal_artifacts,
+            )?;
+        let command = command.with_nested_worktree_writable_confinement(nested)?;
+        self.admit(subject_id, &command, SupervisorRuntime::Grok)?;
+        permit.revalidate(preflight, self.attempt)?;
+        Ok(command)
+    }
+
     fn admit_with_mode(
         &self,
         subject_id: &str,
@@ -177,9 +233,6 @@ impl<'a> AssignmentAttemptAuthority<'a> {
                 if self.parent.worker_assignments.is_empty() {
                     bail!("managed read-only parent admission requires authored workers");
                 }
-                if runtime != SupervisorRuntime::Codex {
-                    bail!("managed read-only parent admission requires the Codex runtime");
-                }
                 (self.parent.role, self.journal_parent_id, None)
             }
         };
@@ -226,11 +279,6 @@ impl<'a> AssignmentAttemptAuthority<'a> {
                 if !command.worktree_control_exceptions.is_empty() {
                     bail!("managed read-only parent admission refuses worktree control exceptions");
                 }
-                if !command.codex_native_delegation_is_disabled() {
-                    bail!(
-                        "managed read-only parent admission requires Codex native delegation to be disabled"
-                    );
-                }
             }
         }
         let expected_invocation = match runtime {
@@ -254,6 +302,9 @@ impl<'a> AssignmentAttemptAuthority<'a> {
             AssignmentAdmissionMode::WritableAssignment => {
                 let capabilities =
                     command.selected_writable_capabilities(runtime, Some(subject_id))?;
+                if runtime == SupervisorRuntime::Grok {
+                    command.verify_grok_run_account_binding(self.run_id.as_str())?;
+                }
                 if capabilities
                     .writable_launch_refusal(command.writable_launch_target)
                     .is_some()
@@ -264,12 +315,9 @@ impl<'a> AssignmentAttemptAuthority<'a> {
                 }
             }
             AssignmentAdmissionMode::ManagedReadOnlyParent => {
-                let capabilities = crate::runtime_adapter::RuntimeId::Codex.capabilities();
-                if capabilities.side_effect_confinement
-                    != crate::runtime_adapter::SideEffectConfinement::Verified
-                {
-                    bail!("assignment admission requires verified native confinement");
-                }
+                // The command owns the effective selected descriptor, account and
+                // native-off configuration. A bare vendor descriptor is insufficient.
+                command.managed_parent_control_transport(runtime)?;
             }
         }
         Ok(AssignmentCommandAdmission {
@@ -942,10 +990,26 @@ mod tests {
     }
 
     fn read_only_parent_command(fixture: &Fixture) -> Result<ExternalAgentCommand> {
+        #[cfg(target_os = "linux")]
+        crate::account_authority::record_observed_codex_selection(
+            Some(fixture.run_id.as_str()),
+            "codex-cli",
+            Some("test-authority".into()),
+            Some(
+                &coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+                    provider_id: "codex-cli".into(),
+                    account_id: "test-account".into(),
+                    account_incarnation: "test-incarnation".into(),
+                    selection_revision: 1,
+                },
+            ),
+        );
         Ok(fixture
             .command("parent")?
             .with_workspace_access(WorkspaceAccess::ReadOnly)
-            .with_codex_native_delegation_disabled())
+            .with_model_selection(Some("fixture-model".into()), Some("fixture-effort".into()))
+            .with_codex_native_delegation_disabled()
+            .with_codex_managed_readonly_continuation())
     }
 
     #[test]

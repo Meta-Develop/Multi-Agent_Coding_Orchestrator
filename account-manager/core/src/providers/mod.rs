@@ -304,6 +304,17 @@ pub trait ProviderAdapter: Send + Sync {
         self.plan_label()
     }
 
+    /// Observe the exact selected binding, preserving legacy adapter overrides.
+    fn observe_account_for_binding(
+        &self,
+        account: &StoredAccountMetadata,
+        _binding: &SelectedAccountBinding,
+        categories: &BTreeSet<ObserveCategory>,
+        credential_store: Option<&dyn CredentialStore>,
+    ) -> Result<observe::AdapterObservePayload> {
+        self.observe_account(account, categories, credential_store)
+    }
+
     /// Read-only observations for one stored account and explicit categories.
     fn observe_account(
         &self,

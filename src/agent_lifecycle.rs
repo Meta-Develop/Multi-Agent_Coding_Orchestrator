@@ -1097,16 +1097,63 @@ fn process_state_with_probes(
     exists: impl FnOnce(u32) -> Result<bool>,
     identity: impl FnOnce(u32) -> Result<(char, String)>,
 ) -> Result<ProcessIdentityState> {
+    if !supported_process_start_time(pid, expected_start_time) {
+        bail!("recorded process incarnation is unsupported or malformed; liveness is uncertain");
+    }
     if !exists(pid)? {
         return Ok(ProcessIdentityState::Gone);
     }
     match identity(pid) {
-        Ok(('Z' | 'X', _)) => Ok(ProcessIdentityState::Gone),
-        Ok((_, observed)) if observed == expected_start_time => Ok(ProcessIdentityState::Live),
-        Ok(_) => Ok(ProcessIdentityState::Reused),
+        Ok((state, observed)) => {
+            if !supported_process_start_time(pid, &observed) {
+                bail!("observed process incarnation is unsupported or malformed; liveness is uncertain");
+            }
+            if matches!(state, 'Z' | 'X') {
+                Ok(ProcessIdentityState::Gone)
+            } else if observed == expected_start_time {
+                Ok(ProcessIdentityState::Live)
+            } else {
+                Ok(ProcessIdentityState::Reused)
+            }
+        }
         Err(error) if vanished_identity_error(&error) => Ok(ProcessIdentityState::Gone),
         Err(error) => Err(error),
     }
+}
+
+pub(crate) fn supported_process_start_time(pid: u32, token: &str) -> bool {
+    if pid == 0 || token.len() > MAX_IDENTIFIER_BYTES || !token.is_ascii() {
+        return false;
+    }
+    let mut parts = token.split(':');
+    if parts.next() != Some("linux-v2") {
+        return false;
+    }
+    let (Some(recorded_pid), Some(boot_id), Some(start_ticks), None) =
+        (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    recorded_pid == pid.to_string()
+        && canonical_linux_boot_id(boot_id)
+        && start_ticks
+            .parse::<u64>()
+            .is_ok_and(|value| value.to_string() == start_ticks)
+}
+
+fn canonical_linux_boot_id(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    bytes.len() == 36
+        && bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || (b'a'..=b'f').contains(byte)
+            }
+        })
+        && bytes
+            .iter()
+            .any(|byte| matches!(*byte, b'1'..=b'9' | b'a'..=b'f'))
 }
 
 fn vanished_identity_error(error: &anyhow::Error) -> bool {
@@ -1152,8 +1199,19 @@ pub fn process_start_time(pid: u32) -> Result<String> {
 
 #[cfg(target_os = "linux")]
 fn process_identity(pid: u32) -> Result<(char, String)> {
+    process_identity_with_reader(pid, |path| Ok(std::fs::read_to_string(path)?))
+}
+
+#[cfg(target_os = "linux")]
+fn process_identity_with_reader(
+    pid: u32,
+    mut read: impl FnMut(&Path) -> Result<String>,
+) -> Result<(char, String)> {
+    if pid == 0 {
+        bail!("process identity requires a positive PID");
+    }
     let path = PathBuf::from("/proc").join(pid.to_string()).join("stat");
-    let stat = std::fs::read_to_string(&path)
+    let stat = read(&path)
         .with_context(|| format!("failed to read process identity {}", path.display()))?;
     let fields = stat
         .rsplit_once(") ")
@@ -1170,31 +1228,19 @@ fn process_identity(pid: u32) -> Result<(char, String)> {
     let token = token
         .parse::<u64>()
         .context("process start-time field is not an integer")?;
-    let boot_time = linux_boot_time()?;
-    Ok((state, format!("{boot_time}:{token}")))
-}
-
-#[cfg(target_os = "linux")]
-fn linux_boot_time() -> Result<u64> {
-    let stat = std::fs::read_to_string("/proc/stat")
-        .context("failed to read Linux boot-time identity /proc/stat")?;
-    parse_linux_boot_time(&stat)
-}
-
-#[cfg(target_os = "linux")]
-fn parse_linux_boot_time(stat: &str) -> Result<u64> {
-    let value = stat
-        .lines()
-        .find_map(|line| line.strip_prefix("btime "))
-        .context("Linux /proc/stat omits the btime field")?;
-    let boot_time = value
-        .trim()
-        .parse::<u64>()
-        .context("Linux /proc/stat btime field is not an integer")?;
-    if boot_time == 0 {
-        bail!("Linux /proc/stat btime field is zero");
+    // A boot-source read failure is not evidence that /proc/<pid>/stat vanished.
+    // Deliberately omit its I/O error chain so ENOENT/ESRCH cannot authorize cleanup.
+    let boot_id = read(Path::new("/proc/sys/kernel/random/boot_id"))
+        .map_err(|_| anyhow::anyhow!("Linux boot UUID identity is unavailable"))?;
+    let boot_id = boot_id.strip_suffix('\n').unwrap_or(&boot_id);
+    if !canonical_linux_boot_id(boot_id) {
+        bail!("Linux boot UUID identity is malformed");
     }
-    Ok(boot_time)
+    let incarnation = format!("linux-v2:{pid}:{boot_id}:{token}");
+    if !supported_process_start_time(pid, &incarnation) {
+        bail!("Linux process incarnation is malformed");
+    }
+    Ok((state, incarnation))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1407,7 +1453,7 @@ mod tests {
         assert_ne!(missing_stat.kind(), std::io::ErrorKind::NotFound);
         let state = process_state_with_probes(
             77,
-            "boot:1",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:1",
             |_| Ok(true),
             |_| Err(anyhow::Error::new(missing_stat).context("failed to read /proc/77/stat")),
         )?;
@@ -1419,7 +1465,7 @@ mod tests {
     fn identity_probe_preserves_permission_and_reused_pid_failures() -> Result<()> {
         let denied = process_state_with_probes(
             77,
-            "boot:1",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:1",
             |_| Ok(true),
             |_| {
                 Err(
@@ -1431,9 +1477,14 @@ mod tests {
         assert!(denied.is_err());
         let reused = process_state_with_probes(
             77,
-            "boot:1",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:1",
             |_| Ok(true),
-            |_| Ok(('S', "boot:2".to_string())),
+            |_| {
+                Ok((
+                    'S',
+                    "linux-v2:77:11111111-2222-3333-4444-555555555555:2".to_string(),
+                ))
+            },
         )?;
         assert_eq!(reused, ProcessIdentityState::Reused);
         Ok(())
@@ -1635,16 +1686,193 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
+    fn identity_stat_fixture(ticks: u64) -> String {
+        format!("77 (fixture name) S {} {ticks}", vec!["0"; 18].join(" "))
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_process_identity_ignores_wall_boot_time_changes() -> Result<()> {
+        let stat = identity_stat_fixture(456);
+        let mut tokens = Vec::new();
+        for wall_btime in [12345, 12347] {
+            let mut reads = Vec::new();
+            let (_, token) = process_identity_with_reader(77, |path| {
+                reads.push(path.to_path_buf());
+                match path.to_str() {
+                    Some("/proc/77/stat") => Ok(stat.clone()),
+                    Some("/proc/sys/kernel/random/boot_id") => {
+                        Ok("11111111-2222-3333-4444-555555555555\n".into())
+                    }
+                    Some("/proc/stat") => Ok(format!("btime {wall_btime}\n")),
+                    _ => bail!("unexpected identity source"),
+                }
+            })?;
+            assert_eq!(
+                reads,
+                vec![
+                    PathBuf::from("/proc/77/stat"),
+                    PathBuf::from("/proc/sys/kernel/random/boot_id")
+                ]
+            );
+            tokens.push(token);
+        }
+        assert_eq!(tokens[0], tokens[1]);
+        assert!(supported_process_start_time(77, &tokens[0]));
+        Ok(())
+    }
+
+    #[test]
+    fn supported_incarnations_bind_pid_boot_and_full_start_ticks() -> Result<()> {
+        let recorded = "linux-v2:77:11111111-2222-3333-4444-555555555555:456";
+        assert!(supported_process_start_time(77, recorded));
+        assert!(!supported_process_start_time(78, recorded));
+        for observed in [
+            "linux-v2:77:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:456",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:457",
+        ] {
+            assert_eq!(
+                process_state_with_probes(
+                    77,
+                    recorded,
+                    |_| Ok(true),
+                    |_| { Ok(('S', observed.into())) }
+                )?,
+                ProcessIdentityState::Reused
+            );
+        }
+        assert_eq!(
+            process_state_with_probes(
+                77,
+                recorded,
+                |_| Ok(true),
+                |_| { Ok(('S', recorded.into())) }
+            )?,
+            ProcessIdentityState::Live
+        );
+        for observed in [
+            "123:456",
+            "linux-v3:77:11111111-2222-3333-4444-555555555555:456",
+            "linux-v2:78:11111111-2222-3333-4444-555555555555:456",
+        ] {
+            assert!(process_state_with_probes(
+                77,
+                recorded,
+                |_| Ok(true),
+                |_| { Ok(('S', observed.into())) }
+            )
+            .is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_recorded_incarnations_refuse_before_process_probes() {
+        for token in [
+            "123:456",
+            "linux-v2:0:11111111-2222-3333-4444-555555555555:456",
+            "linux-v2:077:11111111-2222-3333-4444-555555555555:456",
+            "linux-v2:77:00000000-0000-0000-0000-000000000000:456",
+            "linux-v2:77:AAAAAAAA-BBBB-CCCC-DDDD-EEEEEEEEEEEE:456",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:0456",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:18446744073709551616",
+            "linux-v2:77:11111111-2222-3333-4444-555555555555:456:extra",
+        ] {
+            assert!(process_state_with_probes(
+                77,
+                token,
+                |_| panic!("unsupported record must not probe existence"),
+                |_| panic!("unsupported record must not read identity")
+            )
+            .is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn boot_source_failures_are_uncertain_but_missing_process_stat_is_gone() -> Result<()> {
+        let recorded = "linux-v2:77:11111111-2222-3333-4444-555555555555:456";
+        for kind in [
+            std::io::ErrorKind::NotFound,
+            std::io::ErrorKind::PermissionDenied,
+        ] {
+            let error = process_identity_with_reader(77, |path| {
+                if path == Path::new("/proc/77/stat") {
+                    Ok(identity_stat_fixture(456))
+                } else {
+                    Err(std::io::Error::from(kind).into())
+                }
+            })
+            .unwrap_err();
+            assert!(!vanished_identity_error(&error));
+            assert!(process_state_with_probes(77, recorded, |_| Ok(true), |_| Err(error)).is_err());
+        }
+        for boot in ["malformed", "00000000-0000-0000-0000-000000000000\n"] {
+            assert!(process_identity_with_reader(77, |path| {
+                if path == Path::new("/proc/77/stat") {
+                    Ok(identity_stat_fixture(456))
+                } else {
+                    Ok(boot.into())
+                }
+            })
+            .is_err());
+        }
+        for error in [
+            std::io::Error::from(std::io::ErrorKind::NotFound),
+            std::io::Error::from_raw_os_error(libc::ESRCH),
+        ] {
+            let mut error = Some(error);
+            let identity = process_identity_with_reader(77, |_| {
+                Err(error.take().expect("one process-stat read").into())
+            });
+            assert_eq!(
+                process_state_with_probes(77, recorded, |_| Ok(true), |_| identity)?,
+                ProcessIdentityState::Gone
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn legacy_registry_identity_stays_uncertain_without_pruning_or_signalling() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let record = AgentProcessRecord {
+            pid: std::process::id(),
+            process_start_time: "123:456".into(),
+            role: "worker".into(),
+            run_id: "run-legacy-identity".into(),
+            task_id: "task-legacy-identity".into(),
+            parent: None,
+            repo: registry.repo().to_path_buf(),
+            argv: vec!["fixture".into()],
+            launch_timestamp_ms: 1,
+            mechanical_executor: None,
+        };
+        registry.replace_records(vec![record.clone()])?;
+        let registry_path = registry.repo().join(".maco/agents/registry.json");
+        let before = std::fs::read(&registry_path)?;
+        let inspections = registry.inspect()?;
+        assert_eq!(inspections.len(), 1);
+        assert_eq!(inspections[0].identity, AgentIdentityLiveness::Uncertain);
+        assert!(registry.list(&AgentListFilter::default()).is_err());
+        assert!(terminate_process(&record, Duration::from_millis(10)).is_err());
+        assert_eq!(std::fs::read(&registry_path)?, before);
+        assert_eq!(registry.snapshot_all()?, vec![record]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
     fn linux_process_start_time_is_boot_scoped() -> Result<()> {
         let token = process_start_time(std::process::id())?;
-        let (boot_time, start_ticks) = token
-            .split_once(':')
-            .context("boot-scoped process identity separator")?;
-        assert_eq!(boot_time.parse::<u64>()?, linux_boot_time()?);
-        assert!(start_ticks.parse::<u64>()? > 0);
-        assert_eq!(parse_linux_boot_time("cpu 1 2 3\nbtime 12345\n")?, 12345);
-        assert!(parse_linux_boot_time("cpu 1 2 3\n").is_err());
+        assert!(supported_process_start_time(std::process::id(), &token));
+        let parts = token.split(':').collect::<Vec<_>>();
+        assert_eq!(parts[0], "linux-v2");
+        assert_eq!(parts[1], std::process::id().to_string());
+        let boot_id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")?;
+        assert_eq!(parts[2], boot_id.strip_suffix('\n').unwrap_or(&boot_id));
+        assert!(parts[3].parse::<u64>()? > 0);
         Ok(())
     }
 
@@ -1764,9 +1992,13 @@ mod tests {
     #[test]
     fn terminate_process_does_not_signal_a_reused_pid() -> Result<()> {
         let current_pid = std::process::id();
+        let token = process_start_time(current_pid)?;
+        let (incarnation, ticks) = token
+            .rsplit_once(':')
+            .context("current incarnation ticks")?;
         let record = AgentProcessRecord {
             pid: current_pid,
-            process_start_time: "0:1".to_string(),
+            process_start_time: format!("{incarnation}:{}", ticks.parse::<u64>()? ^ 1),
             role: "worker".to_string(),
             run_id: "run-reused".to_string(),
             task_id: "reused".to_string(),

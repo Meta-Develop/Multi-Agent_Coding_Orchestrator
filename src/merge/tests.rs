@@ -4422,3 +4422,216 @@ while :; do sleep 1; done\n",
         }
     }
 }
+
+#[test]
+fn arbitration_error_scratch_cleanup_requires_classified_quiescence() -> Result<()> {
+    struct FailingRunner {
+        quiescence: Option<bool>,
+        scratch: Mutex<Option<PathBuf>>,
+    }
+    impl ArbitrationRunner for FailingRunner {
+        fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
+            let scratch = request
+                .output_last_message_path
+                .parent()
+                .unwrap()
+                .to_path_buf();
+            fs::write(
+                scratch.join("possible-writer-output"),
+                b"retained failure evidence",
+            )?;
+            *self.scratch.lock().unwrap() = Some(scratch);
+            let error = anyhow!("injected runner failure");
+            match self.quiescence {
+                Some(scratch_quiescent) => {
+                    Err(error.context(ArbitrationRunnerFailure { scratch_quiescent }))
+                }
+                None => Err(error),
+            }
+        }
+    }
+    for (run_id, quiescence, retained) in [
+        ("scratch-unknown", None, true),
+        ("scratch-not-quiescent", Some(false), true),
+        ("scratch-quiescent", Some(true), false),
+    ] {
+        let temp = tempfile::tempdir()?;
+        WorktreeManager::init_repository(temp.path(), "main")?;
+        let prepared = fake_arbitration_prepared(
+            temp.path(),
+            [
+                ArbitrationSide::Agent {
+                    id: "agent-a".to_string(),
+                },
+                ArbitrationSide::Agent {
+                    id: "agent-b".to_string(),
+                },
+            ],
+            [ARBITRATION_PATCH_A.to_vec(), ARBITRATION_PATCH_B.to_vec()],
+        );
+        fs::create_dir(&prepared.input.neutral_worktree.path)?;
+        let neutral_marker = prepared
+            .input
+            .neutral_worktree
+            .path
+            .join("preserved-neutral");
+        fs::write(&neutral_marker, b"neutral state")?;
+        let environment = FakeArbitrationEnvironment {
+            prepared,
+            candidate_diff: ARBITRATION_PATCH_BOTH.to_vec(),
+            validation_status: ValidationStatus::Passed,
+        };
+        let runner = FailingRunner {
+            quiescence,
+            scratch: Mutex::new(None),
+        };
+        let error = arbitrate_merge_with_environment(
+            fake_arbitration_options(temp.path(), run_id),
+            &runner,
+            &environment,
+        )
+        .expect_err("runner failure cannot produce arbitration acceptance");
+        assert!(
+            error.to_string().contains("injected runner failure")
+                || error
+                    .chain()
+                    .any(|cause| cause.to_string() == "injected runner failure")
+        );
+        let scratch = runner
+            .scratch
+            .lock()
+            .unwrap()
+            .clone()
+            .expect("runner reached incoming scratch");
+        assert_eq!(scratch.exists(), retained, "{run_id}");
+        assert_eq!(
+            scratch.join("possible-writer-output").exists(),
+            retained,
+            "{run_id}"
+        );
+        assert_eq!(fs::read(neutral_marker)?, b"neutral state");
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn selected_merge_review_fixture(
+    repo: &Path,
+) -> (ExternalArbitrationRunner, ArbitrationRunnerRequest) {
+    (
+        ExternalArbitrationRunner {
+            codex_bin: PathBuf::from("unlaunchable-merge-review-sentinel"),
+            timeout: Duration::from_secs(17),
+            machine_global_config: repo.join("unused-machine-global.json"),
+            machine_global_runtime_root_id: "fixture-runtime".to_string(),
+        },
+        ArbitrationRunnerRequest {
+            prompt_path: repo.join("prompt.md"),
+            output_schema_path: repo.join("schema.json"),
+            output_last_message_path: repo.join("incoming/proposal.json"),
+            json_log_path: repo.join("incoming/arbiter.jsonl"),
+            neutral_worktree_path: repo.join("neutral"),
+            hidden_primary_root: repo.to_path_buf(),
+            run_id: "fresh-selected-merge-review".to_string(),
+            arbiter_id: "neutral-review-auditor".to_string(),
+        },
+    )
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_merge_review_plan_and_empty_account_catalog_refuse_without_authority() -> Result<()> {
+    use crate::selection::routing_policy::{
+        bind_routing_policy, load_routing_policy, validate_selected_launch,
+    };
+    use crate::supervise::{SupervisorAdmissionConfig, SupervisorAdmissionPolicyInput};
+    let temp = tempfile::tempdir()?;
+    WorktreeManager::init_repository(temp.path(), "main")?;
+    let (runner, request) = selected_merge_review_fixture(temp.path());
+    let plan = merge_arbiter_selection_plan(&runner, &request)?;
+    assert!(plan.task.contains(&request.run_id));
+    assert!(plan.task.contains("both source proposals"));
+    assert_eq!(plan.child_timeout_seconds, runner.timeout.as_secs());
+    assert_eq!(plan.assignments.len(), 1);
+    assert_eq!(plan.assignments[0].id, request.arbiter_id);
+    assert_eq!(plan.assignments[0].role, AgentRole::Auditor);
+    assert!(plan.role_models.is_empty());
+    let frozen = load_routing_policy(temp.path())?;
+    let _policy = bind_routing_policy(Some(frozen.clone()))?;
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        temp.path(),
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )?;
+    let objective = crate::objective_profile::resolve_objective_profile(temp.path(), None)?;
+    let error = crate::supervise::select_account_review_auditor(
+        &plan,
+        &frozen,
+        &[],
+        &admission,
+        &objective,
+    )
+    .expect_err("empty account catalog must refuse before selection");
+    let expected =
+        "normal intake requires a selected account with observed supported model/effort metadata";
+    assert!(error.chain().any(|cause| cause.to_string() == expected));
+    assert!(validate_selected_launch(
+        AgentRole::Auditor.as_str(),
+        "unselected-runtime",
+        "unselected-model",
+        "unselected-effort",
+    )
+    .is_err());
+    assert!(!request.output_last_message_path.exists());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn selected_merge_shared_completion_refuses_public_success_and_retains_original_error() -> Result<()>
+{
+    use crate::external_agent::{CapturedOutput, ExternalAgentRun, ExternalProgramTrust};
+    let temp = tempfile::tempdir()?;
+    let (runner, request) = selected_merge_review_fixture(temp.path());
+    let command = prepare_merge_arbiter_command(&runner, &request)?;
+    let mut run = ExternalAgentRun {
+        command: vec!["public-success-claim".to_string()],
+        cwd: command.cwd.clone(),
+        timeout_seconds: 17,
+        exit_code: Some(0),
+        duration_ms: 1,
+        timed_out: false,
+        process_tree: None,
+        side_effects: None,
+        publishable: true,
+        program_trust: ExternalProgramTrust::ExplicitCustom,
+        codex_permissions: None,
+        stdout: CapturedOutput::default(),
+        stderr: CapturedOutput::default(),
+        error: Some("original synthetic runtime refusal".to_string()),
+        output_last_message: Some(b"{}".to_vec()),
+        grok_stream_usage_evidence: None,
+        grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
+        codex_parent_evidence: None,
+    };
+    run.stdout.target_launch_attempted = true;
+    let error = qualified_selected_merge_output(&run, &command)
+        .expect_err("public success cannot qualify held merge output");
+    assert!(error.chain().any(|cause| cause
+        .to_string()
+        .contains("selected merge authority missing")));
+    assert!(error.chain().any(|cause| cause
+        .to_string()
+        .contains("original synthetic runtime refusal")));
+    assert!(
+        !error
+            .downcast_ref::<ArbitrationRunnerFailure>()
+            .context("missing settlement classification")?
+            .scratch_quiescent
+    );
+    let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
+    assert!(qualified_selected_merge_output(&restored, &command).is_err());
+    Ok(())
+}

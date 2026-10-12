@@ -609,10 +609,13 @@ pub(crate) mod tests {
             }))
             .is_err()
         );
-        let bound = WorktreeConfinementSnapshot::from_command(&command);
+        let bound = WorktreeConfinementSnapshot::from_command(&command, true);
         let mut tampered = command.clone();
         tampered.researcher_source_inputs[0].sha256 = "0".repeat(64);
-        assert_ne!(bound, WorktreeConfinementSnapshot::from_command(&tampered));
+        assert_ne!(
+            bound,
+            WorktreeConfinementSnapshot::from_command(&tampered, true)
+        );
         Ok(())
     }
 

@@ -229,7 +229,7 @@ fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result
             1 => parent.id = "foreign-parent".into(),
             2 => attempt = 0,
             3 => attempt = 2,
-            4 => runtime = SupervisorRuntime::Grok,
+            4 => runtime = SupervisorRuntime::Fake,
             5 => parent.worker_assignments[0].id = "second-worker".into(),
             6 => parent.worker_assignments.reverse(),
             7 => parent.assigned_paths.push(PathBuf::from("widened")),
@@ -301,6 +301,35 @@ fn fresh_worker_admission_accepts_omitted_runtime_projected_to_codex() -> Result
     })?;
     assert!(explicit.claim().is_err());
     assert!(explicit.claim_at(1).is_ok());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_selected_adapter_projection_retains_one_shot_identity() -> Result<()> {
+    for runtime in [
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ] {
+        let fixture = FreshFixture::new()?;
+        let mut parent = fixture.plan.assignments[0].clone();
+        parent.runtime = Some(runtime);
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            let binding = factory.claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &parent,
+                1,
+                runtime,
+            )?;
+            binding.verify_session(factory, "parent")?;
+            assert!(factory
+                .claim_fresh_worker_request_binding(&RunId::new("run")?, &parent, 1, runtime,)
+                .is_err());
+            Ok(())
+        })?;
+        assert!(fixture.claim_at(1).is_ok());
+    }
     Ok(())
 }
 
@@ -591,6 +620,70 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         run_sessions().lock().unwrap().remove(&self.directory);
     }
+}
+
+#[test]
+fn captured_control_uses_authenticated_inbox_and_retains_cancellation() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let cancellation = ProcessCancellation::new();
+    let server = fixture.start(false, cancellation.clone())?;
+    let body = json!({"version":1,"outcome":"yield_workers","run_id":"run",
+        "parent_id":"parent","parent_attempt":1,
+        "requests":[{"request_id":"r1","worker_id":"worker"},
+                    {"request_id":"r2","worker_id":"other"}]});
+    let mut forged = body.clone();
+    forged["requests"][0]["assigned_paths"] = json!(["foreign.rs"]);
+    assert!(crate::supervise::parent_broker::submit_captured_envelope(
+        &serde_json::to_vec(&forged)?,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )
+    .is_err());
+    let before = server.launch().forward_worker_request(
+        "run",
+        "parent",
+        &json!({
+            "operation":"worker_request_status","request_id":"r1"
+        }),
+        &|| cancellation.is_cancelled(),
+    );
+    assert!(before.is_err());
+    let bytes = serde_json::to_vec(&body)?;
+    crate::supervise::parent_broker::submit_captured_envelope(
+        &bytes,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )?;
+    for (request_id, worker_id) in [("r1", "worker"), ("r2", "other")] {
+        let status = server.launch().forward_worker_request(
+            "run",
+            "parent",
+            &json!({
+                "operation":"worker_request_status","request_id":request_id
+            }),
+            &|| cancellation.is_cancelled(),
+        )?;
+        assert_eq!(status["record"]["worker_id"], worker_id);
+        assert_eq!(status["record"]["status"], "queued");
+        assert_eq!(status["requires_reconciliation"], false);
+    }
+    cancellation.cancel();
+    assert!(crate::supervise::parent_broker::submit_captured_envelope(
+        &bytes,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )
+    .is_err());
+    Ok(())
 }
 
 fn exchange(

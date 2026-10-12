@@ -567,6 +567,9 @@ mod tests {
         assert!(spec
             .environment_removals()
             .contains(&"GROK_AUTH_PATH".to_string()));
+        assert!(spec
+            .environment_removals()
+            .contains(&"XAI_API_KEY".to_string()));
         Ok(())
     }
 
@@ -753,7 +756,9 @@ mod tests {
         let guard = activate_cam_grok_test_harness(harness);
         let sibling = std::thread::spawn(|| {
             let _no_socket = SocketEnvGuard::unset();
-            acquire_grok_launch_authority(None).is_err()
+            // Local CAM selection may legitimately exist without a socket.
+            // Test override isolation directly, not ambient account availability.
+            CAM_GROK_TEST_OVERRIDE.with(|cell| cell.borrow().is_none())
         })
         .join()
         .expect("join sibling");

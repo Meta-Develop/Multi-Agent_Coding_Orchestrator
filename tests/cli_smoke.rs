@@ -1502,7 +1502,11 @@ fn cli_orchestrate_reports_committed_agent_change_and_patch() -> Result<()> {
         // candidate patches may still be exported for inspection. Pin the
         // fail-closed boundary: a failed summary and no primary mutation.
         assert_eq!(summary["success"], false);
-        assert_eq!(summary["agents"][0]["status"], "failed");
+        assert_eq!(
+            summary["agents"][0]["status"], "failed",
+            "unexpected aggregate failure: {}",
+            summary["repo_validation"]
+        );
         assert!(summary["agents"][0]["error"].as_str().is_some());
         assert_eq!(
             fs::read_to_string(repo_path.join("README.md"))?,
@@ -2281,7 +2285,11 @@ fn run_json_regardless<const N: usize>(args: [&str; N]) -> Result<(Value, bool)>
 
 fn assert_orchestration_failed_closed(summary: &Value) -> Result<()> {
     assert_eq!(summary["success"], false);
-    assert_eq!(summary["agents"][0]["status"], "failed");
+    assert_eq!(
+        summary["agents"][0]["status"], "failed",
+        "unexpected aggregate failure: {}",
+        summary["repo_validation"]
+    );
     let error = summary["agents"][0]["error"]
         .as_str()
         .context("orchestration error")?;

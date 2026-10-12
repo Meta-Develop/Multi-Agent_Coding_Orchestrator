@@ -8,11 +8,13 @@ pub(super) fn validate_researcher_assignment(assignment: &OrchestratorAssignment
     {
         bail!("researcher '{}' requires read_only_researcher authority, no delegation and no licensed breakage", assignment.id);
     }
-    if assignment
-        .runtime
-        .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
-    {
-        bail!("researcher currently requires the Codex strict Linux read-only runtime");
+    if assignment.runtime.is_some_and(|runtime| {
+        !matches!(
+            runtime,
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+        )
+    }) {
+        bail!("researcher requires a supported strict Linux read-only runtime");
     }
     Ok(())
 }
@@ -21,11 +23,19 @@ pub(super) fn configure_researcher_command(
     command: ExternalAgentCommand,
     runtime: SupervisorRuntime,
 ) -> Result<ExternalAgentCommand> {
-    if !cfg!(target_os = "linux") || runtime != SupervisorRuntime::Codex {
-        bail!("researcher requires the Codex strict Linux read-only runtime");
+    if !cfg!(target_os = "linux")
+        || !matches!(
+            runtime,
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+        )
+    {
+        bail!("researcher requires a supported strict Linux read-only runtime");
     }
     if !command.worktree_control_exceptions.is_empty() {
         bail!("researcher cannot receive worktree control exceptions");
+    }
+    if runtime == SupervisorRuntime::GeminiCli && !command.uses_gemini_bridge() {
+        bail!("Gemini researcher requires the managed Gemini invocation");
     }
     if command
         .agent_lifecycle
@@ -137,6 +147,22 @@ pub(super) fn read_researcher_report(
     contents: Option<&[u8]>,
     display_path: &Path,
 ) -> Result<ParsedReport<OrchestratorReviewReport>> {
+    read_researcher_report_inner(contents, display_path, true)
+}
+
+/// Shape only: acceptance must additionally verify parent-held native custody.
+pub(super) fn read_researcher_native_report(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+) -> Result<ParsedReport<OrchestratorReviewReport>> {
+    read_researcher_report_inner(contents, display_path, false)
+}
+
+fn read_researcher_report_inner(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+    command_evidence: bool,
+) -> Result<ParsedReport<OrchestratorReviewReport>> {
     let contents = contents.context("missing descriptor-held researcher report")?;
     let parsed: ParsedReport<ResearcherReport> = parse_report_json(std::str::from_utf8(contents)?)
         .with_context(|| format!("invalid researcher report {}", display_path.display()))?;
@@ -151,7 +177,13 @@ pub(super) fn read_researcher_report(
     {
         bail!("researcher report must attest read-only, non-delegating, zero-diff execution");
     }
-    if report.status == ReviewStatus::Succeeded
+    if !command_evidence
+        && (!report.commands_run.is_empty() || !report.validation_results.is_empty())
+    {
+        bail!("native ReadFile research cannot claim shell command or check observations");
+    }
+    if command_evidence
+        && report.status == ReviewStatus::Succeeded
         && (!report.commands_run.iter().any(|command| {
             command.status == ReviewStatus::Succeeded
                 && command.exit_code == Some(0)
@@ -458,6 +490,40 @@ mod tests {
     }
 
     #[test]
+    fn gemini_researcher_native_shape_requires_read_only_attestations_without_shell_evidence(
+    ) -> Result<()> {
+        let mut native = evidence();
+        native["commands_run"] = json!([]);
+        native["validation_results"] = json!([]);
+        let path = Path::new("researcher-report.json");
+        assert!(read_researcher_native_report(Some(native.to_string().as_bytes()), path).is_ok());
+        // Shape acceptance alone grants no custody. The Codex transcript parser
+        // still refuses the same successful report without observed commands.
+        assert!(read_researcher_report(Some(native.to_string().as_bytes()), path).is_err());
+        for (key, value) in [
+            ("read_only", json!(false)),
+            ("no_further_delegation", json!(false)),
+            ("files_changed", json!(["src/lib.rs"])),
+            ("commands_run", evidence()["commands_run"].clone()),
+            (
+                "validation_results",
+                evidence()["validation_results"].clone(),
+            ),
+        ] {
+            let mut invalid = native.clone();
+            invalid[key] = value;
+            assert!(
+                read_researcher_native_report(Some(invalid.to_string().as_bytes()), path).is_err(),
+                "accepted {key}"
+            );
+        }
+        let mut plan = authored_plan();
+        plan["assignments"][0]["child_assignments"][0]["runtime"] = json!("gemini-cli");
+        assert!(parse_supervisor_plan_with_consultant(&plan.to_string()).is_ok());
+        Ok(())
+    }
+
+    #[test]
     fn researcher_observed_changes_fail_even_within_claimed_scope() -> Result<()> {
         let mut report =
             read_researcher_report(Some(evidence().to_string().as_bytes()), Path::new("report"))?
@@ -523,8 +589,28 @@ mod tests {
             .with_agent_lifecycle(".", "researcher", "research-run", "research")
         };
         assert!(configure_researcher_command(command(), SupervisorRuntime::Fake).is_err());
+        assert!(configure_researcher_command(command(), SupervisorRuntime::GeminiCli).is_err());
+        let gemini = || {
+            command().with_runtime_adapter(
+                RuntimeId::GeminiCli,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+            )
+        };
+        let configured_gemini =
+            configure_researcher_command(gemini(), SupervisorRuntime::GeminiCli);
         let configured = configure_researcher_command(command(), SupervisorRuntime::Codex);
         if cfg!(target_os = "linux") {
+            let configured_gemini = configured_gemini?;
+            assert_eq!(
+                configured_gemini.workspace_access,
+                WorkspaceAccess::ReadOnly
+            );
+            assert!(configured_gemini.worktree_control_exceptions.is_empty());
+            let wrong_role =
+                gemini().with_agent_lifecycle(".", "worker", "research-run", "research");
+            assert!(
+                configure_researcher_command(wrong_role, SupervisorRuntime::GeminiCli).is_err()
+            );
             let configured = configured?;
             assert_eq!(configured.workspace_access, WorkspaceAccess::ReadOnly);
             assert!(configured.worktree_control_exceptions.is_empty());
@@ -533,6 +619,7 @@ mod tests {
                 .windows(2)
                 .any(|pair| pair == [OsStr::new("--disable"), OsStr::new("multi_agent")]));
         } else {
+            assert!(configured_gemini.is_err());
             assert!(configured.is_err());
         }
         Ok(())

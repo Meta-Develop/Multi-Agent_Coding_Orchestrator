@@ -393,7 +393,9 @@ fn resolved_field_known(field: &GrokAcpParentResolvedField) -> Option<&str> {
 
 fn reasoning_effort_from_observed_label(label: &str) -> Option<ReasoningEffort> {
     Some(match label {
-        "minimal" | "low" => ReasoningEffort::Low,
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
         "medium" => ReasoningEffort::Medium,
         "high" => ReasoningEffort::High,
         "xhigh" => ReasoningEffort::Xhigh,
@@ -1227,6 +1229,8 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
         return None;
     }
     let requested_effort = match binding.requested_candidate.effort {
+        crate::selection::ReasoningEffort::None => "none",
+        crate::selection::ReasoningEffort::Minimal => "minimal",
         crate::selection::ReasoningEffort::Low => "low",
         crate::selection::ReasoningEffort::Medium => "medium",
         crate::selection::ReasoningEffort::High => "high",
@@ -1499,6 +1503,8 @@ mod tests {
         evidence.requested_model = Some(selected.candidate.model.clone());
         evidence.requested_effort = Some(
             match selected.candidate.effort {
+                ReasoningEffort::None => "none",
+                ReasoningEffort::Minimal => "minimal",
                 ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
@@ -3594,6 +3600,7 @@ mod tests {
             output_last_message: None,
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: None,
             codex_parent_evidence: None,
         }
     }

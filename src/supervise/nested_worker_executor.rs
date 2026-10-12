@@ -18,6 +18,31 @@ pub(super) struct NestedWorkerAttemptEvidence {
 }
 
 impl NestedWorkerAttemptEvidence {
+    /// Private supervisor producer for the separate isolated route. Its caller
+    /// seals the live request, independent lease, claim and actual settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_isolated_parts(
+        report: WorkerReport,
+        journals: WorkerExecutionJournalEvidenceSet,
+        artifacts: ChildAttemptArtifacts,
+        run: ExternalAgentRun,
+        observed_changed_paths: Vec<PathBuf>,
+        model_provenance: CompletedLaunchModelProvenance,
+        candidate_before: PrimaryWorktreeSnapshot,
+        candidate_after: PrimaryWorktreeSnapshot,
+    ) -> Self {
+        Self {
+            report,
+            journals,
+            artifacts,
+            run,
+            observed_changed_paths,
+            model_provenance,
+            candidate_before,
+            candidate_after,
+        }
+    }
+
     pub(super) fn report(&self) -> &WorkerReport {
         &self.report
     }
@@ -254,8 +279,8 @@ pub(super) fn execute_nested_worker_attempt(
         ),
         &context.budget_policy,
     );
-    if runtime != SupervisorRuntime::Codex {
-        bail!("nested executor currently requires the verified Codex launch path");
+    if runtime == SupervisorRuntime::Fake {
+        bail!("nested executor requires a real managed launch path");
     }
     subject.runtime = Some(runtime);
     let scratch_index = nested_scratch_index(
@@ -347,6 +372,13 @@ pub(super) fn execute_nested_worker_attempt(
         AssignmentPhase::Execution,
         &subject.assigned_paths,
     )?;
+    command = bind_selected_native_execution_workspace(
+        command,
+        &subject,
+        runtime,
+        &preflight.worktree.path,
+        true,
+    )?;
     let mut grant = admit_assignment_child_process_intent(
         context.options.run_id.as_str(),
         worker_id,
@@ -431,6 +463,14 @@ pub(super) fn execute_nested_worker_attempt(
         };
         // Whole-command admission must capture the final immutable live grant.
         bind_final_dispatch_live_budget(&mut command, &reservation)?;
+        if runtime == SupervisorRuntime::Grok {
+            command = authority.seal_nested_grok_worktree_confinement(
+                preflight,
+                permit,
+                worker_id,
+                command.clone(),
+            )?;
+        }
         let admission = authority.admit(worker_id, &command, runtime)?;
         record_shared_orchestration_event(
             context.artifacts,
@@ -1133,6 +1173,83 @@ mod tests {
             cancellation: cancellation.clone(),
             external_runner: &runner,
         };
+        if case == "grok-proof" {
+            let grok_binding = crate::account_authority::FrozenGrokSelectedBinding {
+                authority_id: Some("authority".into()),
+                provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.into(),
+                account_id: "account".into(),
+                account_incarnation: "incarnation".into(),
+                selection_revision: 5,
+            };
+            crate::account_authority::admit_grok_run_account_binding(
+                run_id.as_str(),
+                Some(grok_binding),
+            );
+            let mut command = ExternalAgentCommand::codex(
+                "grok",
+                &worktree.path,
+                run_dir.join("nested-proof-prompt.md"),
+                run_dir.join("nested-proof-events.jsonl"),
+                run_dir.join("nested-proof-report.json"),
+                Duration::from_secs(7),
+            )
+            .with_runtime_adapter(
+                SupervisorRuntime::Grok,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+            )
+            .with_model_selection(Some("grok-4.7".into()), Some("xhigh".into()))
+            .with_agent_lifecycle(&repo, "worker", run_id.as_str(), "worker")
+            .with_agent_parent("parent");
+            command.output_schema = Some(run_dir.join("schemas/worker-report.schema.json"));
+            command = configure_assignment_phase_command(
+                command,
+                AssignmentPhase::Execution,
+                &subject.assigned_paths,
+            )?;
+            command = bind_selected_grok_execution_workspace(
+                command,
+                &subject,
+                SupervisorRuntime::Grok,
+                &worktree.path,
+                true,
+            )?;
+            let grant = admit_assignment_child_process_intent(
+                run_id.as_str(),
+                "worker",
+                1,
+                Path::new("codex"),
+                command.model.as_deref(),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+            )?;
+            command = command
+                .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+                .with_worker_journal_artifact(
+                    "worker",
+                    run_dir.join("incoming"),
+                    run_dir.join("incoming/worker-journals/worker.jsonl"),
+                );
+            let authority = AssignmentAttemptAuthority::from_preflight(&context, &preflight, 1)?;
+            let mut permit = preflight.issue_nested_turn(1)?;
+            command = authority.seal_nested_grok_worktree_confinement(
+                &preflight,
+                &mut permit,
+                "worker",
+                command,
+            )?;
+            assert!(command
+                .verified_writable_capabilities_for_test(SupervisorRuntime::Grok)?
+                .admits_worktree_writable());
+            permit.revalidate(&preflight, 1)?;
+            let mut stale = command.clone();
+            stale.timeout += Duration::from_secs(1);
+            assert!(stale
+                .verified_writable_capabilities_for_test(SupervisorRuntime::Grok)
+                .is_err());
+            assert_eq!(sync_store.snapshot()?.len(), 1);
+            assert_eq!(manager.list_managed_verified()?.len(), 1);
+            crate::account_authority::admit_grok_run_account_binding(run_id.as_str(), None);
+            return Ok(());
+        }
         let claims_before = sync_store.snapshot()?;
         if case == "revoked" {
             sync_store.release(claim.token)?;
@@ -1359,6 +1476,15 @@ mod tests {
     )]
     fn nested_executor_happy_path_reuses_parent_and_rejects_replay() -> Result<()> {
         execution_fixture("happy")
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn nested_grok_proof_binds_live_parent_resources_and_serial_permit() -> Result<()> {
+        execution_fixture("grok-proof")
     }
 
     #[test]

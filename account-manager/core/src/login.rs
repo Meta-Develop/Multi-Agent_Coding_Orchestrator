@@ -1,8 +1,8 @@
 //! Shared explicit login lifecycle for managed accounts (MACO integration §5).
 //!
-//! Gemini, Codex, Claude, and Grok OAuth share the handle / idempotency /
-//! cancel path. Cursor and GitHub Copilot stay allow-listed on `login.start`
-//! and `NotImplemented` at the production port. Legacy synchronous
+//! Gemini, Codex, Claude, Grok, and Cursor OAuth share the handle / idempotency /
+//! cancel path. GitHub Copilot stays allow-listed on `login.start` and
+//! `NotImplemented` at the production port. Legacy synchronous
 //! `add_managed_account` remains unchanged.
 
 use std::collections::HashMap;
@@ -22,9 +22,9 @@ use crate::error::{Error, Result};
 use crate::model::{AuthKind, StoredAccountMetadata};
 use crate::providers::{
     claude_code::ClaudeCodeAdapter, codex_cli::CodexCliAdapter, complete_managed_login_account,
-    gemini_cli::GeminiCliAdapter, grok_cli::GrokCliAdapter, OAuthLoginRunError,
-    PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter, StoredAccountRegistry,
-    LOGIN_DEADLINE,
+    cursor::CursorAdapter, gemini_cli::GeminiCliAdapter, grok_cli::GrokCliAdapter,
+    OAuthLoginRunError, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
+    StoredAccountRegistry, LOGIN_DEADLINE,
 };
 
 /// Adapter seams used by [`LoginService::start`]: identity, pending-home
@@ -43,6 +43,7 @@ pub(crate) trait PendingOAuthLogin: ProviderAdapter + Send + Sync + 'static {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send;
 }
 
@@ -62,13 +63,20 @@ impl PendingOAuthLogin for GeminiCliAdapter {
         GeminiCliAdapter::finish_pending_oauth_login(self, home)
     }
 
-    fn run_pending_oauth_login(
+    async fn run_pending_oauth_login(
         &self,
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
-        GeminiCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+        handoff: Option<LoginUrlHandoff>,
+    ) -> std::result::Result<(), OAuthLoginRunError> {
+        match handoff {
+            Some(handoff) => {
+                self.run_pending_oauth_login_with_handoff(home, plan, cancel, handoff)
+                    .await
+            }
+            None => GeminiCliAdapter::run_pending_oauth_login(self, home, plan, cancel).await,
+        }
     }
 }
 
@@ -93,8 +101,9 @@ impl PendingOAuthLogin for CodexCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
-        CodexCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+        CodexCliAdapter::run_pending_oauth_login(self, home, plan, cancel, handoff)
     }
 }
 
@@ -119,6 +128,7 @@ impl PendingOAuthLogin for ClaudeCodeAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        _handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
         ClaudeCodeAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
@@ -145,8 +155,36 @@ impl PendingOAuthLogin for GrokCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
-        GrokCliAdapter::run_pending_oauth_login(self, home, plan, cancel)
+        GrokCliAdapter::run_pending_oauth_login(self, home, plan, cancel, handoff)
+    }
+}
+
+impl PendingOAuthLogin for CursorAdapter {
+    fn prepare_pending_oauth_home(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<PreparedPendingOAuthHome> {
+        CursorAdapter::prepare_pending_oauth_home(self, account)
+    }
+
+    fn clone_for_login_task(&self) -> Self {
+        CursorAdapter::clone_for_login_task(self)
+    }
+
+    fn finish_pending_oauth_login(&self, home: &Path) -> Result<()> {
+        CursorAdapter::finish_pending_oauth_login(self, home)
+    }
+
+    fn run_pending_oauth_login(
+        &self,
+        home: &Path,
+        plan: PendingOAuthHomePlan,
+        cancel: tokio::sync::watch::Receiver<bool>,
+        _handoff: Option<LoginUrlHandoff>,
+    ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
+        CursorAdapter::run_pending_oauth_login(self, home, plan, cancel)
     }
 }
 
@@ -188,6 +226,301 @@ pub struct LoginStatus {
     pub failure_reason: Option<String>,
 }
 
+/// Browser ownership for an explicit login. Existing callers remain automatic.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum LoginBrowserMode {
+    #[default]
+    Automatic,
+    CallerManaged,
+}
+
+/// Public authorization handoff, returned only for a live bound login.
+/// The OAuth code, PKCE verifier and tokens never enter this value.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LoginAuthorization {
+    pub authorization_url: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+pub(crate) struct ActiveLoginAuthorization {
+    pub public: LoginAuthorization,
+    pub valid_until: Instant,
+}
+
+/// In-memory producer capability bound to one operation, never the registry.
+pub(crate) struct LoginUrlHandoff {
+    publish: Box<dyn Fn(Option<ActiveLoginAuthorization>) -> bool + Send + Sync>,
+}
+
+impl LoginUrlHandoff {
+    pub(crate) fn new(
+        publish: impl Fn(Option<ActiveLoginAuthorization>) -> bool + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            publish: Box::new(publish),
+        }
+    }
+
+    pub(crate) fn publish(&self, authorization: ActiveLoginAuthorization) -> bool {
+        (self.publish)(Some(authorization))
+    }
+
+    pub(crate) fn invalidate(&self) {
+        (self.publish)(None);
+    }
+}
+
+impl Drop for LoginUrlHandoff {
+    fn drop(&mut self) {
+        self.invalidate();
+    }
+}
+
+/// Accept only public authorization requests from the supported native flows.
+/// Callback codes, tokens, custom issuers and arbitrary browser targets fail closed.
+pub fn vendor_authorization_url(provider: &str, line: &str) -> Option<String> {
+    let (host, path, callback_path) = match provider {
+        "codex-cli" => ("auth.openai.com", "/oauth/authorize", "/auth/callback"),
+        "grok-cli" => ("auth.x.ai", "/oauth2/authorize", "/callback"),
+        "gemini-cli" => (
+            "accounts.google.com",
+            "/o/oauth2/v2/auth",
+            "/oauth2callback",
+        ),
+        _ => return None,
+    };
+    let text = line.trim();
+    if text.len() > 8192 || text.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    let url = reqwest::Url::parse(text).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some(host)
+        || url.path() != path
+        || url.port().is_some_and(|port| port != 443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut parameters = HashMap::new();
+    for (key, value) in url.query_pairs() {
+        if !matches!(
+            key.as_ref(),
+            "response_type"
+                | "client_id"
+                | "redirect_uri"
+                | "scope"
+                | "state"
+                | "code_challenge"
+                | "code_challenge_method"
+                | "nonce"
+                | "audience"
+                | "originator"
+                | "id_token_add_organizations"
+                | "codex_cli_simplified_flow"
+                | "organization_id"
+                | "allowed_workspace_id"
+                | "principal_type"
+                | "principal_id"
+                | "referrer"
+                | "plan"
+                | "access_type"
+                | "prompt"
+                | "include_granted_scopes"
+        ) || parameters
+            .insert(key.into_owned(), value.into_owned())
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let parameter = |key: &str| parameters.get(key).map(String::as_str);
+    if parameter("response_type") != Some("code")
+        || parameter("code_challenge_method") != Some("S256")
+        || parameter("client_id").is_none_or(str::is_empty)
+        || parameter("state").is_none_or(str::is_empty)
+        || parameter("code_challenge").is_none_or(|value| {
+            value.len() != 43
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+    {
+        return None;
+    }
+    let redirect = reqwest::Url::parse(parameter("redirect_uri")?).ok()?;
+    if redirect.scheme() != "http"
+        || !matches!(redirect.host_str(), Some("localhost" | "127.0.0.1"))
+        || redirect.port().is_none()
+        || redirect.path() != callback_path
+        || !redirect.username().is_empty()
+        || redirect.password().is_some()
+        || redirect.query().is_some()
+        || redirect.fragment().is_some()
+    {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// Native CLI owns OAuth; only its public stderr URL crosses the login port.
+/// Unix is the supported managed authority route. No raw output is logged,
+/// returned, or retained beyond a bounded, zeroized in-memory line buffer.
+pub(crate) async fn run_vendor_oauth_handoff(
+    mut command: std::process::Command,
+    provider: &'static str,
+    mut cancel: tokio::sync::watch::Receiver<bool>,
+    handoff: LoginUrlHandoff,
+) -> std::result::Result<(), OAuthLoginRunError> {
+    #[cfg(not(unix))]
+    {
+        let _ = (&mut command, provider, &mut cancel, handoff);
+        Err(OAuthLoginRunError::Failed(Error::NotImplemented(
+            "native authorization handoff on this platform",
+        )))
+    }
+    #[cfg(unix)]
+    {
+        use std::io::{ErrorKind, Read};
+        use std::os::fd::AsRawFd;
+        use std::process::{Child, Stdio};
+        use zeroize::{Zeroize, Zeroizing};
+
+        struct OwnedChild {
+            child: Child,
+            reaped: bool,
+        }
+        impl Drop for OwnedChild {
+            fn drop(&mut self) {
+                if !self.reaped {
+                    let _ = self.child.kill();
+                    let _ = self.child.wait();
+                }
+            }
+        }
+        let failed = |reason: &str| OAuthLoginRunError::Failed(login_refused(provider, reason));
+        if *cancel.borrow() {
+            return Err(OAuthLoginRunError::Cancelled);
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .env("RUST_LOG", "off")
+            .env("NO_COLOR", "1")
+            // Native webbrowser honors BROWSER before WSL/desktop fallback.
+            // A fixed no-op prevents vendor auto-opening; the GUI owner opens
+            // the bound public action. No script, shell or URL logger is used.
+            .env("BROWSER", "/bin/true");
+        let child = command
+            .spawn()
+            .map_err(|_| failed("native login could not start"))?;
+        let mut owned = OwnedChild {
+            child,
+            reaped: false,
+        };
+        let mut stderr = owned
+            .child
+            .stderr
+            .take()
+            .ok_or_else(|| failed("native login output unavailable"))?;
+        let fd = stderr.as_raw_fd();
+        // Both calls operate only on the newly spawned owned child's pipe.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+        {
+            return Err(failed("native login output could not be bounded"));
+        }
+        let deadline = Instant::now() + LOGIN_DEADLINE;
+        let expires_at_unix_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .ok()
+            .and_then(|now| u64::try_from((now + LOGIN_DEADLINE).as_millis()).ok());
+        let mut bytes = Zeroizing::new([0_u8; 4096]);
+        let mut line = Zeroizing::new(Vec::with_capacity(8192));
+        let mut overflow = false;
+        let mut published = false;
+        let mut total = 0_usize;
+        loop {
+            if *cancel.borrow() {
+                return Err(OAuthLoginRunError::Cancelled);
+            }
+            if Instant::now() >= deadline {
+                return Err(failed("native login deadline expired"));
+            }
+            // Bound work per tick as well as retained bytes and total output.
+            for _ in 0..16 {
+                let count = match stderr.read(bytes.as_mut()) {
+                    Ok(0) => break,
+                    Ok(count) => count,
+                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                    Err(_) => return Err(failed("native login output could not be read")),
+                };
+                total += count;
+                if total > 256 * 1024 {
+                    return Err(failed("native login output exceeded its bound"));
+                }
+                for byte in &bytes[..count] {
+                    if *byte == b'\n' {
+                        if !overflow && !published {
+                            if let Some(url) = std::str::from_utf8(&line)
+                                .ok()
+                                .and_then(|text| vendor_authorization_url(provider, text))
+                            {
+                                if !handoff.publish(ActiveLoginAuthorization {
+                                    public: LoginAuthorization {
+                                        authorization_url: url,
+                                        expires_at_unix_ms,
+                                    },
+                                    valid_until: deadline,
+                                }) {
+                                    return Err(OAuthLoginRunError::Cancelled);
+                                }
+                                published = true;
+                            }
+                        }
+                        line.zeroize();
+                        overflow = false;
+                    } else if !overflow {
+                        if line.len() == 8192 {
+                            line.zeroize();
+                            overflow = true;
+                        } else {
+                            line.push(*byte);
+                        }
+                    }
+                }
+                bytes.zeroize();
+            }
+            if let Some(status) = owned
+                .child
+                .try_wait()
+                .map_err(|_| failed("native login state unavailable"))?
+            {
+                owned.reaped = true;
+                return if status.success() {
+                    Ok(())
+                } else {
+                    Err(failed("native login exited unsuccessfully"))
+                };
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(Duration::from_millis(20)) => {}
+                _ = cancel.changed() => {
+                    if *cancel.borrow() { return Err(OAuthLoginRunError::Cancelled); }
+                    if cancel.has_changed().is_err() { return Err(OAuthLoginRunError::Cancelled); }
+                }
+            }
+        }
+    }
+}
+
 /// Input for starting a managed-account login.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LoginStartRequest {
@@ -226,6 +559,7 @@ struct RequestFingerprint {
     account_id: String,
     label: String,
     auth_kind: AuthKind,
+    browser_mode: LoginBrowserMode,
 }
 
 struct LoginOperation {
@@ -234,13 +568,14 @@ struct LoginOperation {
     expire_cancel_sent: AtomicBool,
     state: Mutex<OperationState>,
     started_at: Instant,
+    browser_mode: LoginBrowserMode,
 }
 
-#[derive(Debug, Clone)]
 struct OperationState {
     public: LoginState,
     failure_reason: Option<String>,
     finished_at: Option<Instant>,
+    authorization: Option<ActiveLoginAuthorization>,
 }
 
 /// Retain finished operations for status recovery. Bound follows the provider's
@@ -271,7 +606,7 @@ impl LoginService {
         }
     }
 
-    /// Begin Gemini, Codex, Claude, or Grok OAuth login for a new pending
+    /// Begin Gemini, Codex, Claude, Grok, or Cursor OAuth login for a new pending
     /// account, or replay an idempotent start request.
     pub fn start(
         &self,
@@ -281,12 +616,39 @@ impl LoginService {
         self.start_pending_oauth(request, adapter)
     }
 
+    /// Explicit Gemini browser handoff; automatic remains the legacy default.
+    pub fn start_with_browser_mode(
+        &self,
+        request: LoginStartRequest,
+        adapter: &GeminiCliAdapter,
+        browser_mode: LoginBrowserMode,
+    ) -> Result<LoginStatus> {
+        self.start_pending_oauth_with_browser_mode(request, adapter, browser_mode)
+    }
+
     pub(crate) fn start_pending_oauth<A: PendingOAuthLogin>(
         &self,
         request: LoginStartRequest,
         adapter: &A,
     ) -> Result<LoginStatus> {
+        self.start_pending_oauth_with_browser_mode(request, adapter, LoginBrowserMode::Automatic)
+    }
+
+    pub(crate) fn start_pending_oauth_with_browser_mode<A: PendingOAuthLogin>(
+        &self,
+        request: LoginStartRequest,
+        adapter: &A,
+        browser_mode: LoginBrowserMode,
+    ) -> Result<LoginStatus> {
         validate_start_request(&request)?;
+        if browser_mode == LoginBrowserMode::CallerManaged
+            && !matches!(
+                request.provider_id.as_str(),
+                "gemini-cli" | "codex-cli" | "grok-cli"
+            )
+        {
+            return Err(Error::NotImplemented("caller-managed browser login"));
+        }
         // github-copilot is allow-listed; PendingOAuthLogin is not implemented.
         if request.provider_id == "github-copilot" {
             return Err(Error::NotImplemented("login.start"));
@@ -300,7 +662,7 @@ impl LoginService {
                 "only OAuth login is supported in this release",
             ));
         }
-        let fingerprint = RequestFingerprint::from(&request);
+        let fingerprint = RequestFingerprint::from(&request, browser_mode);
         self.reap_expired();
 
         let replay = {
@@ -403,8 +765,10 @@ impl LoginService {
                 public: LoginState::WaitingForUser,
                 failure_reason: None,
                 finished_at: None,
+                authorization: None,
             }),
             started_at: Instant::now(),
+            browser_mode,
         });
 
         {
@@ -495,7 +859,38 @@ impl LoginService {
             return Ok(operation.status(handle));
         }
         let _ = operation.cancel_tx.send(true);
+        operation.invalidate_authorization();
         Ok(operation.status(handle))
+    }
+
+    /// Read only the live URL belonging to the exact handle and incarnation.
+    pub fn authorization(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> Result<Option<LoginAuthorization>> {
+        self.reap_expired();
+        let inner = self.inner.lock().expect("login lock");
+        let Some(operation) = inner.operations.get(handle) else {
+            return Ok(None);
+        };
+        if operation.binding != *binding {
+            return Err(login_refused(
+                &binding.provider_id,
+                "login handle does not match the supplied account binding",
+            ));
+        }
+        let mut state = operation.state.lock().expect("state lock");
+        if *operation.cancel_tx.borrow()
+            || state.finished_at.is_some()
+            || state
+                .authorization
+                .as_ref()
+                .is_some_and(|url| Instant::now() >= url.valid_until)
+        {
+            state.authorization = None;
+        }
+        Ok(state.authorization.as_ref().map(|url| url.public.clone()))
     }
 
     fn remove_idempotency_key(&self, key: &str) {
@@ -507,6 +902,7 @@ impl LoginService {
         let mut inner = self.inner.lock().expect("login lock");
         for operation in inner.operations.values() {
             let _ = operation.cancel_tx.send(true);
+            operation.invalidate_authorization();
         }
         inner.tasks.clear();
     }
@@ -545,6 +941,30 @@ impl Drop for LoginService {
 }
 
 impl LoginOperation {
+    fn url_handoff(self: &Arc<Self>) -> LoginUrlHandoff {
+        let weak = Arc::downgrade(self);
+        LoginUrlHandoff::new(move |authorization| {
+            let Some(operation) = weak.upgrade() else {
+                return false;
+            };
+            let mut state = operation.state.lock().expect("state lock");
+            if authorization.as_ref().is_some_and(|url| {
+                operation.browser_mode != LoginBrowserMode::CallerManaged
+                    || *operation.cancel_tx.borrow()
+                    || state.finished_at.is_some()
+                    || Instant::now() >= url.valid_until
+            }) {
+                return false;
+            }
+            state.authorization = authorization;
+            true
+        })
+    }
+
+    fn invalidate_authorization(&self) {
+        self.state.lock().expect("state lock").authorization = None;
+    }
+
     fn status(&self, handle: &LoginHandle) -> LoginStatus {
         let state = self.state.lock().expect("state lock");
         LoginStatus {
@@ -567,6 +987,7 @@ impl LoginOperation {
 
     fn mark_ready(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         state.public = LoginState::Ready;
         state.failure_reason = None;
         state.finished_at = Some(Instant::now());
@@ -574,6 +995,7 @@ impl LoginOperation {
 
     fn mark_failed(&self, reason: String) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -584,6 +1006,7 @@ impl LoginOperation {
 
     fn mark_cancelled(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -594,6 +1017,7 @@ impl LoginOperation {
 
     fn mark_commit_outcome_unknown(&self) {
         let mut state = self.state.lock().expect("state lock");
+        state.authorization = None;
         if matches!(state.public, LoginState::Ready) {
             return;
         }
@@ -623,8 +1047,10 @@ async fn run_pending_oauth_task<A: PendingOAuthLogin>(
         plan: oauth_plan,
     } = prepared;
     operation.mark_in_progress();
+    let handoff = (operation.browser_mode == LoginBrowserMode::CallerManaged)
+        .then(|| operation.url_handoff());
     let oauth = adapter
-        .run_pending_oauth_login(&home, oauth_plan, cancel_rx)
+        .run_pending_oauth_login(&home, oauth_plan, cancel_rx, handoff)
         .await;
     match oauth {
         Ok(()) => {
@@ -664,6 +1090,7 @@ fn oauth_material_present(provider_id: &str, home: &Path) -> bool {
         "codex-cli" => home.join("auth.json").is_file(),
         "claude-code" => home.join(".credentials.json").is_file(),
         "grok-cli" => home.join("auth.json").is_file(),
+        "cursor" => home.join(".cursor/auth.json").is_file(),
         _ => false,
     }
 }
@@ -712,12 +1139,13 @@ fn commit_managed_login_after_oauth(
 }
 
 impl RequestFingerprint {
-    fn from(request: &LoginStartRequest) -> Self {
+    fn from(request: &LoginStartRequest, browser_mode: LoginBrowserMode) -> Self {
         Self {
             provider_id: request.provider_id.clone(),
             account_id: request.account_id.clone(),
             label: request.label.clone(),
             auth_kind: request.auth_kind,
+            browser_mode,
         }
     }
 }

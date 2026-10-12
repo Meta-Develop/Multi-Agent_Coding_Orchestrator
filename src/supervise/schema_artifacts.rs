@@ -1758,15 +1758,35 @@ fn accepted_task_cost_schema_value() -> serde_json::Value {
         ],
         "properties": {
             "incomplete_attempt_count": {"type": "integer", "minimum": 0},
+            "unknown_terminal_result_count": {"type": "integer", "minimum": 0, "default": 0},
             "complete_attempt_count": {"type": "integer", "minimum": 0},
             "complete_accepted_count": {"type": "integer", "minimum": 0},
-            "complete_total_cycle_cost_microunits": {"type": "integer", "minimum": 0},
+            "complete_total_cycle_cost_microunits": {
+                "type": "integer", "minimum": 0,
+                "description": "Known complete-cost subtotal; partial when costs or terminal results remain unresolved."
+            },
             "cost_per_accepted_task_microunits": {
                 "type": ["integer", "null"],
-                "minimum": 0
+                "minimum": 0,
+                "description": "Numeric only when all attempt costs and terminal results are complete and at least one task is accepted."
             }
         }
     })
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_task_cost_schema_preserves_optional_legacy_result_count() {
+    let schema = accepted_task_cost_schema_value();
+    assert_eq!(schema["additionalProperties"], json!(false));
+    let property = &schema["properties"]["unknown_terminal_result_count"];
+    assert_eq!(property["type"], json!("integer"));
+    assert_eq!(property["minimum"], json!(0));
+    assert_eq!(property["default"], json!(0));
+    assert!(!schema["required"]
+        .as_array()
+        .expect("required field list")
+        .contains(&json!("unknown_terminal_result_count")));
 }
 
 fn execution_usage_schema_value() -> serde_json::Value {

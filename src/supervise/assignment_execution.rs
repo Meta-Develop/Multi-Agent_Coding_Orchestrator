@@ -207,7 +207,10 @@ fn direct_assignment_report_is_valid(
     match role {
         AgentRole::ChildOrchestrator => Ok(read_child_report(contents, display_path).is_ok()),
         AgentRole::Worker => Ok(read_worker_report(contents, display_path).is_ok()),
-        AgentRole::Researcher => Ok(read_researcher_report(contents, display_path).is_ok()),
+        // Shape probing does not grant acceptance; the final runtime-specific
+        // consumer verifies either Codex command custody or Gemini native custody.
+        AgentRole::Researcher => Ok(read_researcher_report(contents, display_path).is_ok()
+            || read_researcher_native_report(contents, display_path).is_ok()),
         unsupported => bail!(
             "assignment role '{}' has no direct report parser contract",
             unsupported.as_str()
@@ -538,6 +541,14 @@ fn admit_assignment_role_category(
     resolution: &RoleModelResolution,
 ) -> Result<()> {
     let category = assignment.effective_role_category();
+    if launch_runtime != SupervisorRuntime::Fake
+        && crate::selection::routing_policy::current_routing_policy().is_some()
+    {
+        return validate_known_judgment_role_model(
+            assignment.role,
+            resolution.selection.model.as_deref(),
+        );
+    }
     match launch_runtime {
         // The fake runtime never executes a provider model. Catalog observation
         // may be `runtime_default` on the CLI path; still skip capability
@@ -595,15 +606,47 @@ fn bind_selected_runtime_launch(
 ) -> Result<BoundSelectedRuntimeLaunch> {
     if assignment.role == AgentRole::Researcher {
         validate_researcher_assignment(assignment)?;
-        if launch_runtime != SupervisorRuntime::Codex {
-            bail!("researcher requires the Codex strict Linux read-only runtime");
+        if !matches!(
+            launch_runtime,
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+        ) {
+            bail!("researcher requires a supported strict Linux read-only runtime");
         }
     }
     let configured = effective_role_model_selection(plan, assignment.role);
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
+    let loaded_route = crate::selection::routing_policy::current_routing_policy().is_some()
+        && launch_runtime != SupervisorRuntime::Fake;
+    if loaded_route {
+        crate::selection::routing_policy::validate_selected_launch(
+            assignment.role.as_str(),
+            launch_runtime.as_str(),
+            resolution
+                .selection
+                .model
+                .as_deref()
+                .context("selected launch has no model")?,
+            resolution
+                .selection
+                .reasoning_effort
+                .as_deref()
+                .context("selected launch has no effort")?,
+        )?;
+    }
     let model_provenance =
         CompletedLaunchModelProvenance::from_resolution(launch_runtime, &configured, &resolution);
-    if launch_runtime.is_adapter_subprocess() {
+    let gemini_read_only = launch_runtime == SupervisorRuntime::GeminiCli
+        && matches!(
+            assignment.role,
+            AgentRole::Researcher | AgentRole::Auditor | AgentRole::GateClassifier
+        )
+        && assignment.effective_role_category().is_read_only()
+        && assignment.worker_assignments.is_empty();
+    let managed_control_parent = assignment.role == AgentRole::ChildOrchestrator
+        && assignment.phase == AssignmentPhase::Execution
+        && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+        && !assignment.worker_assignments.is_empty();
+    if launch_runtime.is_adapter_subprocess() && !gemini_read_only && !loaded_route {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
@@ -612,18 +655,31 @@ fn bind_selected_runtime_launch(
             )
         })?;
     }
-    let is_writable_grok_terminal_worker = assignment.phase == AssignmentPhase::Execution
+    let is_writable_native_terminal_worker = assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if launch_runtime == SupervisorRuntime::Grok && !is_writable_grok_terminal_worker {
+    if matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok | SupervisorRuntime::ClaudeCode
+    ) && !is_writable_native_terminal_worker
+        && !managed_control_parent
+    {
+        let requirement = if launch_runtime == SupervisorRuntime::ClaudeCode {
+            crate::external_agent::WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
+        } else {
+            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+        };
         bail!(
             "{}: assignment '{}' must be an execution-phase, explicitly bound non-delegating terminal Worker with no nested assignments",
-            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            requirement,
             assignment.id
         );
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
+    if gemini_read_only || managed_control_parent {
+        command = command.with_workspace_access(WorkspaceAccess::ReadOnly);
+    }
     if launch_runtime.is_adapter_subprocess()
         || super::runtime_executables::captured_binding().is_some()
     {
@@ -648,19 +704,22 @@ fn bind_selected_runtime_launch(
             )
         })?;
         let bound_priors = super::prior_input::current_priors();
-        if let Some(priors) = &bound_priors {
-            let runtime = crate::runtime_adapter::AdapterId::from_runtime(launch_runtime).as_str();
-            if !priors
-                .models
-                .iter()
-                .any(|prior| prior.runtime == runtime && prior.model == model)
-            {
-                bail!(
+        if !loaded_route {
+            if let Some(priors) = &bound_priors {
+                let runtime =
+                    crate::runtime_adapter::AdapterId::from_runtime(launch_runtime).as_str();
+                if !priors
+                    .models
+                    .iter()
+                    .any(|prior| prior.runtime == runtime && prior.model == model)
+                {
+                    bail!(
                     "operator prior data has no dated prior for selected adapter model '{runtime}:{model}'"
                 );
+                }
             }
         }
-        if bound_priors.is_some() || recorded_model_is_weak_mechanical(&model) {
+        if loaded_route || bound_priors.is_some() || recorded_model_is_weak_mechanical(&model) {
             authorize_known_executor_role_model(
                 assignment.role,
                 Some(model.as_str()),
@@ -693,28 +752,44 @@ fn bind_selected_runtime_launch(
     })
 }
 
-fn bind_selected_grok_execution_workspace(
+fn bind_selected_native_execution_workspace(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
     launch_runtime: SupervisorRuntime,
     managed_worktree: &Path,
     writable_execution: bool,
 ) -> Result<ExternalAgentCommand> {
-    if launch_runtime != SupervisorRuntime::Grok {
+    if !matches!(
+        launch_runtime,
+        SupervisorRuntime::Grok
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli
+            | SupervisorRuntime::Cursor
+    ) {
         return Ok(command);
     }
-    let is_writable_grok_terminal_worker = writable_execution
+    if command.workspace_access != WorkspaceAccess::ReadWrite {
+        return Ok(command);
+    }
+    let is_writable_terminal_worker = writable_execution
         && assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
         && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
         && assignment.worker_assignments.is_empty();
-    if !is_writable_grok_terminal_worker
+    let terminal_worker_requirement = if launch_runtime == SupervisorRuntime::ClaudeCode {
+        crate::external_agent::WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
+    } else if launch_runtime == SupervisorRuntime::GeminiCli {
+        crate::external_agent::WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED
+    } else {
+        crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
+    };
+    if !is_writable_terminal_worker
         || command.writable_launch_target
             != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
     {
         bail!(
-            "{}: assignment '{}' selected Grok launch is not exactly bound to its writable managed child worktree",
-            crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED,
+            "{}: assignment '{}' selected native launch is not exactly bound to its writable managed child worktree",
+            terminal_worker_requirement,
             assignment.id
         );
     }
@@ -723,17 +798,35 @@ fn bind_selected_grok_execution_workspace(
     let command = command.with_writable_runtime_selection(
         &assignment.id,
         launch_runtime,
-        is_writable_grok_terminal_worker,
+        is_writable_terminal_worker,
     )?;
     command
         .selected_writable_capabilities(launch_runtime, Some(&assignment.id))
         .with_context(|| {
             format!(
-                "writable Grok assignment '{}' did not prove its exact selected launch contract",
+                "writable {} assignment '{}' did not prove its exact selected launch contract",
+                crate::runtime_adapter::AdapterId::from_runtime(launch_runtime),
                 assignment.id
             )
         })?;
     Ok(command)
+}
+
+#[cfg(test)]
+fn bind_selected_grok_execution_workspace(
+    command: ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    launch_runtime: SupervisorRuntime,
+    managed_worktree: &Path,
+    writable_execution: bool,
+) -> Result<ExternalAgentCommand> {
+    bind_selected_native_execution_workspace(
+        command,
+        assignment,
+        launch_runtime,
+        managed_worktree,
+        writable_execution,
+    )
 }
 
 #[cfg(test)]
@@ -779,7 +872,7 @@ pub(super) fn bind_selected_assignment_launch_with_duty_for_test(
         &launch_catalog,
         mechanical_duty,
     )?;
-    let command = bind_selected_grok_execution_workspace(
+    let command = bind_selected_native_execution_workspace(
         bound_launch.command,
         assignment,
         launch_runtime,
@@ -953,7 +1046,7 @@ pub(super) struct AssignmentExecutionPreflight<'a> {
 impl<'a> AssignmentExecutionPreflight<'a> {
     /// Burn the slot before checking the request. Failed construction and permit
     /// drop never authorize a replacement driver, including for another attempt.
-    fn issue_nested_turn(
+    pub(super) fn issue_nested_turn(
         &self,
         parent_attempt: usize,
     ) -> Result<NestedTurnExecutionPermit<'_, 'a>> {
@@ -983,13 +1076,13 @@ impl<'a> AssignmentExecutionPreflight<'a> {
 /// pins the exact preflight identity for the permit's lifetime, not just its labels.
 /// Shared lease observations (including a frozen inbox) are allowed; execution
 /// requires an exclusive borrow of this unique permit as well as the outcome.
-struct NestedTurnExecutionPermit<'owner, 'resources> {
+pub(super) struct NestedTurnExecutionPermit<'owner, 'resources> {
     preflight: &'owner AssignmentExecutionPreflight<'resources>,
     parent_attempt: usize,
 }
 
 impl NestedTurnExecutionPermit<'_, '_> {
-    fn revalidate(
+    pub(super) fn revalidate(
         &self,
         preflight: &AssignmentExecutionPreflight<'_>,
         parent_attempt: usize,
@@ -1007,6 +1100,445 @@ impl NestedTurnExecutionPermit<'_, '_> {
 fn prepare_assignment_execution<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
+) -> Result<AssignmentExecutionDisposition<AssignmentExecutionPreflight<'a>>> {
+    prepare_assignment_execution_with_claim(context, outcome, None)
+}
+
+#[cfg(test)]
+thread_local! {
+    static ISOLATED_TEST_REFUSE_SPAWN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Only a live frozen Execution-parent turn can supply these owned grants.
+/// Children use sibling worktrees; no parent lease or child-provided JSON grants launch authority.
+fn dispatch_isolated_parent_workers(
+    context: &AssignmentExecutionContext<'_, '_>,
+    parent_preflight: &AssignmentExecutionPreflight<'_>,
+    parent_attempt: usize,
+    grants: Vec<bound_parent_turn::IsolatedWorkerDispatchAuthority>,
+    outcome: &mut AssignmentExecutionOutcome,
+    policy: &AssignmentBudgetPolicy,
+) -> Result<Vec<bound_parent_turn::IsolatedWorkerAttemptEvidence>> {
+    let release_states = grants
+        .iter()
+        .map(|grant| {
+            (
+                grant.claim().clone(),
+                Arc::new(std::sync::atomic::AtomicU8::new(0)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let result = dispatch_isolated_parent_workers_inner(
+        context,
+        parent_preflight,
+        parent_attempt,
+        grants,
+        outcome,
+        policy,
+        &release_states,
+    );
+    if result.is_err() {
+        for (claim, disposition) in &release_states {
+            // 0: no runner entered; 1: actual returned capture settled and empty.
+            // 2: an entered runner without that proof; retain durable quarantine.
+            if disposition.load(Ordering::Acquire) == 2 {
+                outcome.external_containment_failed = true;
+                continue;
+            }
+            match context.sync_store.release(claim.token) {
+                Ok(released) => {
+                    outcome.claim_tokens.retain(|token| *token != claim.token);
+                    outcome.released_claims.push(released);
+                }
+                Err(error) => outcome.release_errors.push(format!(
+                    "isolated proven-unstarted or settled/quiescent claim release: {error:#}"
+                )),
+            }
+        }
+    }
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_isolated_parent_workers_inner(
+    context: &AssignmentExecutionContext<'_, '_>,
+    parent_preflight: &AssignmentExecutionPreflight<'_>,
+    parent_attempt: usize,
+    grants: Vec<bound_parent_turn::IsolatedWorkerDispatchAuthority>,
+    outcome: &mut AssignmentExecutionOutcome,
+    policy: &AssignmentBudgetPolicy,
+    release_states: &[(PathClaim, Arc<std::sync::atomic::AtomicU8>)],
+) -> Result<Vec<bound_parent_turn::IsolatedWorkerAttemptEvidence>> {
+    use crate::selection::routing_policy;
+    if context.execution_runtime != SupervisorExecutionRuntime::Verified
+        || context.execution_target.is_some()
+        || context.evidence_only_reaudit.is_some()
+        || parent_attempt == 0
+        || grants.len() < 2
+    {
+        bail!("isolated dispatch requires a live verified Execution-parent turn");
+    }
+    let frozen = routing_policy::current_routing_policy()
+        .context("isolated dispatch requires the frozen loaded routing policy")?;
+    if grants.len() > frozen.policy.tree.max_workers {
+        bail!("isolated authored worker set exceeds the loaded tree limit");
+    }
+    let mut subjects = Vec::new();
+    let mut schedule = context.assignment_schedule.to_vec();
+    let mut plan = context.plan.clone();
+    for (ordinal, grant) in grants.iter().enumerate() {
+        grant.revalidate(context, parent_preflight)?;
+        let worker = grant.worker();
+        if grant.identity().0 != ordinal + 1
+            || parent_preflight.assignment.worker_assignments.get(ordinal) != Some(worker)
+        {
+            bail!("isolated dispatch grant order differs from the frozen authored turn");
+        }
+        let subject = OrchestratorAssignment {
+            id: worker.id.clone(),
+            phase: AssignmentPhase::Execution,
+            runtime: Some(nested_worker_launch_runtime(
+                assignment_launch_runtime(&parent_preflight.assignment, context.options, policy),
+                policy,
+            )),
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: worker.selection_source,
+            assigned_paths: worker.assigned_paths.clone(),
+            semantic_symbols: worker.semantic_symbols.clone(),
+            semantic_modules: worker.semantic_modules.clone(),
+            task: worker
+                .task
+                .clone()
+                .or_else(|| parent_preflight.assignment.task.clone()),
+            worker_assignments: Vec::new(),
+            environment_requirements: parent_preflight
+                .assignment
+                .environment_requirements
+                .iter()
+                .chain(&worker.environment_requirements)
+                .cloned()
+                .collect(),
+            licensed_breakage: parent_preflight.assignment.licensed_breakage.clone(),
+            notes: parent_preflight.assignment.notes.clone(),
+            decision_refs: parent_preflight.assignment.decision_refs.clone(),
+        };
+        if subject.runtime == Some(SupervisorRuntime::Fake) {
+            bail!("isolated verified Worker cannot use the simulated runtime");
+        }
+        if plan.semantic_coordination == SemanticCoordinationMode::Block
+            && (!subject.semantic_modules.is_empty() || !subject.semantic_symbols.is_empty())
+        {
+            bail!("isolated semantic-block Worker requires a prepared semantic turn; no launch authorized");
+        }
+        let index = schedule.len();
+        schedule.push(AssignmentScheduleEntry {
+            assignment_id: subject.id.clone(),
+            parent_assignment_id: Some(parent_preflight.assignment.id.clone()),
+            depth: context
+                .assignment_schedule
+                .get(context.index)
+                .context("isolated parent schedule is missing")?
+                .depth
+                .checked_add(1)
+                .context("isolated tree depth overflow")?,
+            flattened_index: index,
+        });
+        if usize::from(schedule[index].depth) > frozen.policy.tree.max_depth {
+            bail!("isolated Worker depth exceeds the loaded tree limit");
+        }
+        plan.assignments.push(subject.clone());
+        subjects.push((index, subject));
+    }
+    let group_cancellation = context.cancellation.child_scope();
+    let mut results = std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for (ordinal, (grant, (index, subject))) in
+            grants.into_iter().zip(subjects.iter()).enumerate()
+        {
+            #[cfg(test)]
+            if ISOLATED_TEST_REFUSE_SPAWN.with(std::cell::Cell::get) {
+                group_cancellation.cancel();
+                drop(grant);
+                handles.push(Err(std::io::Error::other(
+                    "injected isolated thread creation refusal before runner entry",
+                )));
+                continue;
+            }
+            let release_state = release_states[ordinal].1.clone();
+            let prior_binding = super::prior_input::captured_binding();
+            let runtime_binding = super::runtime_executables::captured_binding();
+            let authorizations = routing_policy::captured_selected_authorizations();
+            let frozen = frozen.clone();
+            let cancellation = group_cancellation.clone();
+            let plan = &plan;
+            let schedule = &schedule;
+            handles.push(std::thread::Builder::new().spawn_scoped(scope, move || {
+                let _prior = super::prior_input::install_captured(prior_binding);
+                let _runtime = super::runtime_executables::install_captured(runtime_binding);
+                let mut child_outcome = AssignmentExecutionOutcome {
+                    gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                    ..AssignmentExecutionOutcome::default()
+                };
+                let result = (|| {
+                    let _policy = routing_policy::bind_routing_policy(Some(frozen))?;
+                    routing_policy::install_selected_authorizations(authorizations);
+                    let child_context = AssignmentExecutionContext {
+                        index: *index,
+                        concurrent_mode: true,
+                        plan,
+                        requested_plan: plan,
+                        budget_config: context.budget_config,
+                        consultant: context.consultant,
+                        assignment_metadata: context.assignment_metadata,
+                        assignment: subject,
+                        evidence_only_reaudit: None,
+                        options: context.options,
+                        repo: context.repo,
+                        run_dir: context.run_dir,
+                        dirs: context.dirs,
+                        execution_runtime: context.execution_runtime,
+                        execution_target: None,
+                        worktree_creation: context.worktree_creation,
+                        manager: context.manager,
+                        reused: false,
+                        sync_store: context.sync_store,
+                        semantic_store: context.semantic_store,
+                        prepared_semantic_token: None,
+                        prepared_semantic_findings: &[],
+                        prepared_semantic_signals: &[],
+                        prepared_semantic_failed: false,
+                        assignment_schedule: schedule,
+                        field_guide: context.field_guide,
+                        serial_semantic_warn_intents: None,
+                        semantic_block_order: None,
+                        semantic_block_gate: None,
+                        artifacts: context.artifacts,
+                        budget_ledger: context.budget_ledger,
+                        budget_policy: policy.clone(),
+                        admission_commit: None,
+                        runtime_model_catalog: context.runtime_model_catalog,
+                        cancellation: cancellation.clone(),
+                        external_runner: context.external_runner,
+                    };
+                    execute_isolated_worker_capture(
+                        &child_context,
+                        context,
+                        parent_preflight,
+                        parent_attempt,
+                        grant,
+                        &mut child_outcome,
+                        policy,
+                        &release_state,
+                    )
+                })();
+                if result.is_err() {
+                    cancellation.cancel();
+                }
+                (result, child_outcome)
+            }));
+        }
+        let mut results = Vec::new();
+        for handle in handles {
+            match handle {
+                Ok(handle) => match handle.join() {
+                    Ok(result) => results.push(result),
+                    Err(_) => {
+                        group_cancellation.cancel();
+                        results.push((
+                            Err(anyhow!(
+                                "isolated Worker thread panicked; held claims require recovery"
+                            )),
+                            AssignmentExecutionOutcome::fatal("isolated Worker thread panicked"),
+                        ));
+                    }
+                },
+                Err(error) => {
+                    group_cancellation.cancel();
+                    results.push((Err(error.into()), AssignmentExecutionOutcome::default()));
+                }
+            }
+        }
+        results
+    });
+    let mut completed = Vec::new();
+    let mut errors = Vec::new();
+    for (result, mut child) in results.drain(..) {
+        outcome.command_records.append(&mut child.command_records);
+        outcome.usage_samples.append(&mut child.usage_samples);
+        outcome.usage_incomplete |= child.usage_incomplete;
+        outcome.findings.append(&mut child.findings);
+        outcome.claim_tokens.append(&mut child.claim_tokens);
+        outcome.semantic_tokens.append(&mut child.semantic_tokens);
+        outcome.health_signals.append(&mut child.health_signals);
+        outcome
+            .pre_action_review_metrics
+            .append(&mut child.pre_action_review_metrics);
+        outcome.gate_denials.append(&mut child.gate_denials);
+        outcome.external_containment_failed |= child.external_containment_failed;
+        match result {
+            Ok(worker) => completed.push(worker),
+            Err(error) => errors.push(format!("{error:#}")),
+        }
+    }
+    if !errors.is_empty() {
+        context.cancellation.cancel();
+        outcome.assignment_failed = true;
+        bail!(
+            "isolated Worker set failed; no continuation or replay authorized: {}",
+            errors.join("; ")
+        );
+    }
+    Ok(completed)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_isolated_worker_capture(
+    child: &AssignmentExecutionContext<'_, '_>,
+    parent: &AssignmentExecutionContext<'_, '_>,
+    parent_preflight: &AssignmentExecutionPreflight<'_>,
+    _parent_attempt: usize,
+    grant: bound_parent_turn::IsolatedWorkerDispatchAuthority,
+    outcome: &mut AssignmentExecutionOutcome,
+    policy: &AssignmentBudgetPolicy,
+    release_state: &std::sync::atomic::AtomicU8,
+) -> Result<bound_parent_turn::IsolatedWorkerAttemptEvidence> {
+    grant.revalidate(parent, parent_preflight)?;
+    let mut preflight =
+        match prepare_assignment_execution_with_claim(child, outcome, Some(grant.claim()))? {
+            AssignmentExecutionDisposition::Continue(preflight) => preflight,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("isolated Worker preflight refused before dispatch")
+            }
+        };
+    grant.revalidate(parent, parent_preflight)?;
+    if preflight.child_base_head != parent_preflight.child_base_head
+        || preflight.worktree.path == parent_preflight.worktree.path
+    {
+        bail!("isolated Worker does not hold an independent sibling at the source HEAD");
+    }
+    let candidate_before =
+        primary_worktree_snapshot(&preflight.worktree.path, child.execution_runtime)?;
+    if candidate_before.inspection_problem().is_some() {
+        bail!("isolated candidate snapshot is incomplete");
+    }
+    let prepared = match prepare_child_attempt(
+        child,
+        outcome,
+        policy,
+        &preflight,
+        &parent_preflight.assignment.id,
+        1,
+        1,
+        &None,
+        &child
+            .dirs
+            .schemas
+            .join("orchestrator-review-report.schema.json"),
+        &child.dirs.schemas.join("worker-report.schema.json"),
+        &child.dirs.schemas.join("auditor-report.schema.json"),
+        None,
+    )? {
+        AssignmentExecutionDisposition::Continue(prepared) => prepared,
+        AssignmentExecutionDisposition::Complete => {
+            bail!("isolated Worker preparation refused before dispatch")
+        }
+    };
+    let capture_result = dispatch_and_capture_child_attempt_with_release_state(
+        child,
+        outcome,
+        &preflight,
+        &parent_preflight.assignment.id,
+        1,
+        prepared,
+        Some(release_state),
+    );
+    if capture_result.is_err() && release_state.load(Ordering::Acquire) == 2 {
+        child.cancellation.cancel();
+        outcome.external_containment_failed = true;
+        std::mem::forget(preflight);
+        return capture_result.map(|_| unreachable!());
+    }
+    let capture = capture_result?;
+    if !capture.external_run.scratch_quiescence_verified() {
+        child.cancellation.cancel();
+        outcome.external_containment_failed = true;
+        // Keep descriptor captures, scratch and sibling locks in quarantine.
+        // Durable claims stay active; no release, continuation or replay follows.
+        std::mem::forget(capture);
+        std::mem::forget(preflight);
+        bail!("isolated Worker returned without verified scratch quiescence; resources retained");
+    }
+    if child.cancellation.is_cancelled() {
+        bail!("isolated Worker was cancelled after its returned dispatch settled; no continuation authorized");
+    }
+    grant.revalidate(parent, parent_preflight)?;
+    let parsed = read_worker_report(
+        capture.external_run.output_last_message(),
+        &capture.attempt_artifacts.raw_report_relative,
+    )?;
+    let candidate_after =
+        primary_worktree_snapshot(&preflight.worktree.path, child.execution_runtime)?;
+    let changes = primary_integrity_changes(&candidate_before, &candidate_after);
+    if !primary_integrity_changes(
+        &capture.primary_before,
+        &primary_worktree_snapshot(child.repo, child.execution_runtime)?,
+    )
+    .is_empty()
+    {
+        bail!("isolated Worker changed the protected primary");
+    }
+    let journals = with_supervisor_artifacts(child.artifacts, |writer, journal| {
+        let journals = import_worker_execution_journals(
+            writer,
+            &preflight.assignment,
+            &capture.incoming_scratch,
+            &capture.external_run,
+        )?;
+        record_worker_journal_events(journal, writer, &preflight.assignment, &journals);
+        import_external_attempt_evidence(
+            writer,
+            ExternalAttemptEvidenceContext {
+                incoming_scratch: &capture.incoming_scratch,
+                capture_scratch: &capture.capture_scratch,
+                artifacts: &capture.attempt_artifacts,
+                external_run: &capture.external_run,
+                external_command: &capture.command,
+                raw_report_validated: !parsed.recovered,
+                runtime: capture.launch_runtime,
+            },
+        )?;
+        Ok(journals)
+    })?;
+    let lease = preflight
+        .worktree_write_lease
+        .take()
+        .context("isolated Worker lost its owned lease")?;
+    bound_parent_turn::IsolatedWorkerAttemptEvidence::seal(
+        parent,
+        parent_preflight,
+        grant,
+        lease,
+        1,
+        preflight.semantic_token,
+        parsed.report,
+        journals,
+        capture.attempt_artifacts,
+        capture.external_run,
+        capture.command,
+        capture.model_provenance,
+        changes.paths,
+        candidate_before,
+        candidate_after,
+        &capture.budget_reservation,
+        capture.usage_settlement,
+    )
+}
+
+fn prepare_assignment_execution_with_claim<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    subordinate_claim: Option<&PathClaim>,
 ) -> Result<AssignmentExecutionDisposition<AssignmentExecutionPreflight<'a>>> {
     let AssignmentExecutionContext {
         index,
@@ -1055,139 +1587,153 @@ fn prepare_assignment_execution<'a>(
         _ => None,
     };
     let mut effective_assignment = (*assignment).clone();
-    let claim = loop {
-        match sync_store.claim_paths_for_run(
-            &options.run_id,
-            &effective_assignment.id,
-            effective_assignment.assigned_paths.iter(),
-        ) {
-            Ok(claim) => {
-                if matches!(
-                    outcome
-                        .gate_tracker
-                        .as_ref()
-                        .and_then(GateCorrectionTracker::active_reason),
-                    Some(GateDenialReason::ClaimConflict)
-                ) {
-                    outcome
-                        .gate_tracker
-                        .as_mut()
-                        .context("gate correction tracker was not initialized")?
-                        .self_corrected(artifacts, &effective_assignment.id, journal_parent_id)?;
+    let claim = if let Some(claim) = subordinate_claim {
+        if claim.agent_id != effective_assignment.id
+            || claim.paths != effective_assignment.assigned_paths
+            || !sync_store.snapshot()?.contains(claim)
+        {
+            bail!("isolated preflight lost its exact held subordinate claim");
+        }
+        claim.clone()
+    } else {
+        loop {
+            match sync_store.claim_paths_for_run(
+                &options.run_id,
+                &effective_assignment.id,
+                effective_assignment.assigned_paths.iter(),
+            ) {
+                Ok(claim) => {
+                    if matches!(
+                        outcome
+                            .gate_tracker
+                            .as_ref()
+                            .and_then(GateCorrectionTracker::active_reason),
+                        Some(GateDenialReason::ClaimConflict)
+                    ) {
+                        outcome
+                            .gate_tracker
+                            .as_mut()
+                            .context("gate correction tracker was not initialized")?
+                            .self_corrected(
+                                artifacts,
+                                &effective_assignment.id,
+                                journal_parent_id,
+                            )?;
+                    }
+                    break claim;
                 }
-                break claim;
-            }
-            Err(error) => {
-                let conflicts =
-                    claim_conflict_details(sync_store, &effective_assignment.assigned_paths);
-                if conflicts.is_empty() {
+                Err(error) => {
+                    let conflicts =
+                        claim_conflict_details(sync_store, &effective_assignment.assigned_paths);
+                    if conflicts.is_empty() {
+                        outcome
+                            .health_signals
+                            .push(SwarmHealthSignal::ClaimAcquisitionFailed);
+                        outcome.findings.push(claim_failure_finding(
+                            sync_store,
+                            &effective_assignment,
+                            &error,
+                        ));
+                        outcome.assignment_failed = true;
+                        return Ok(AssignmentExecutionDisposition::Complete);
+                    }
                     outcome
                         .health_signals
-                        .push(SwarmHealthSignal::ClaimAcquisitionFailed);
-                    outcome.findings.push(claim_failure_finding(
-                        sync_store,
-                        &effective_assignment,
-                        &error,
-                    ));
-                    outcome.assignment_failed = true;
-                    return Ok(AssignmentExecutionDisposition::Complete);
-                }
-                outcome
-                    .health_signals
-                    .push(SwarmHealthSignal::ClaimAcquisitionDenied);
-                let conflicted_paths = conflicts
-                    .iter()
-                    .map(|conflict| conflict.path.clone())
-                    .collect::<BTreeSet<_>>()
-                    .into_iter()
-                    .collect::<Vec<_>>();
-                let correction_correlation_id = outcome
-                    .gate_tracker
-                    .as_ref()
-                    .context("gate correction tracker was not initialized")?
-                    .correlation_id_for_observation(&effective_assignment.id);
-                let denial = GateDenial::from_claim_conflict(
-                    correction_correlation_id,
-                    &effective_assignment.id,
-                    &conflicted_paths,
-                )
-                .context("failed to construct pre-launch claim-conflict denial")?;
-                if matches!(
-                    worktree_creation,
-                    SupervisorWorktreeCreation::PrimaryWorktree
-                ) {
-                    outcome
+                        .push(SwarmHealthSignal::ClaimAcquisitionDenied);
+                    let conflicted_paths = conflicts
+                        .iter()
+                        .map(|conflict| conflict.path.clone())
+                        .collect::<BTreeSet<_>>()
+                        .into_iter()
+                        .collect::<Vec<_>>();
+                    let correction_correlation_id = outcome
                         .gate_tracker
-                        .as_mut()
+                        .as_ref()
                         .context("gate correction tracker was not initialized")?
-                        .escalate(
-                            denial,
-                            artifacts,
-                            &effective_assignment.id,
-                            journal_parent_id,
-                        )?;
-                    outcome.findings.push(claim_failure_finding(
-                        sync_store,
-                        &effective_assignment,
-                        &error,
-                    ));
-                    outcome.assignment_failed = true;
-                    return Ok(AssignmentExecutionDisposition::Complete);
-                }
-                let Some(narrowed) =
-                    safely_narrow_claim_scope(&effective_assignment, &conflicted_paths)
-                else {
-                    outcome
-                        .gate_tracker
-                        .as_mut()
-                        .context("gate correction tracker was not initialized")?
-                        .escalate(
-                            denial,
-                            artifacts,
-                            &effective_assignment.id,
-                            journal_parent_id,
-                        )?;
-                    outcome.findings.push(claim_failure_finding(
-                        sync_store,
-                        &effective_assignment,
-                        &error,
-                    ));
-                    outcome.assignment_failed = true;
-                    return Ok(AssignmentExecutionDisposition::Complete);
-                };
-                let authorized_denial = outcome
-                    .gate_tracker
-                    .as_mut()
-                    .context("gate correction tracker was not initialized")?
-                    .authorize(
-                        denial,
-                        artifacts,
+                        .correlation_id_for_observation(&effective_assignment.id);
+                    let denial = GateDenial::from_claim_conflict(
+                        correction_correlation_id,
                         &effective_assignment.id,
-                        journal_parent_id,
-                        &mut outcome.health_signals,
-                    )?;
-                if authorized_denial.is_none() {
-                    outcome.findings.push(claim_failure_finding(
-                        sync_store,
+                        &conflicted_paths,
+                    )
+                    .context("failed to construct pre-launch claim-conflict denial")?;
+                    if matches!(
+                        worktree_creation,
+                        SupervisorWorktreeCreation::PrimaryWorktree
+                    ) {
+                        outcome
+                            .gate_tracker
+                            .as_mut()
+                            .context("gate correction tracker was not initialized")?
+                            .escalate(
+                                denial,
+                                artifacts,
+                                &effective_assignment.id,
+                                journal_parent_id,
+                            )?;
+                        outcome.findings.push(claim_failure_finding(
+                            sync_store,
+                            &effective_assignment,
+                            &error,
+                        ));
+                        outcome.assignment_failed = true;
+                        return Ok(AssignmentExecutionDisposition::Complete);
+                    }
+                    let Some(narrowed) =
+                        safely_narrow_claim_scope(&effective_assignment, &conflicted_paths)
+                    else {
+                        outcome
+                            .gate_tracker
+                            .as_mut()
+                            .context("gate correction tracker was not initialized")?
+                            .escalate(
+                                denial,
+                                artifacts,
+                                &effective_assignment.id,
+                                journal_parent_id,
+                            )?;
+                        outcome.findings.push(claim_failure_finding(
+                            sync_store,
+                            &effective_assignment,
+                            &error,
+                        ));
+                        outcome.assignment_failed = true;
+                        return Ok(AssignmentExecutionDisposition::Complete);
+                    };
+                    let authorized_denial = outcome
+                        .gate_tracker
+                        .as_mut()
+                        .context("gate correction tracker was not initialized")?
+                        .authorize(
+                            denial,
+                            artifacts,
+                            &effective_assignment.id,
+                            journal_parent_id,
+                            &mut outcome.health_signals,
+                        )?;
+                    if authorized_denial.is_none() {
+                        outcome.findings.push(claim_failure_finding(
+                            sync_store,
+                            &effective_assignment,
+                            &error,
+                        ));
+                        outcome.assignment_failed = true;
+                        return Ok(AssignmentExecutionDisposition::Complete);
+                    }
+                    effective_assignment = narrowed;
+                    if let Some(parked) = recheck_narrowed_assignment_preclaim(
+                        artifacts,
                         &effective_assignment,
-                        &error,
-                    ));
-                    outcome.assignment_failed = true;
-                    return Ok(AssignmentExecutionDisposition::Complete);
-                }
-                effective_assignment = narrowed;
-                if let Some(parked) = recheck_narrowed_assignment_preclaim(
-                    artifacts,
-                    &effective_assignment,
-                    &requested_plan.assignments,
-                    (repo, context.assignment_metadata),
-                    options.runtime,
-                    *execution_runtime,
-                    *worktree_creation,
-                )? {
-                    outcome.findings.extend(parked.findings);
-                    outcome.assignment_failed = true;
-                    return Ok(AssignmentExecutionDisposition::Complete);
+                        &requested_plan.assignments,
+                        (repo, context.assignment_metadata),
+                        options.runtime,
+                        *execution_runtime,
+                        *worktree_creation,
+                    )? {
+                        outcome.findings.extend(parked.findings);
+                        outcome.assignment_failed = true;
+                        return Ok(AssignmentExecutionDisposition::Complete);
+                    }
                 }
             }
         }
@@ -1682,6 +2228,10 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
             {
                 bail!("continuation requires one exact authored terminal Worker");
             }
+            let worker_runtime = parent_continuation_binding::verified_worker_completion_runtime(
+                evidence.model_provenance(),
+                evidence.run(),
+            )?;
             let report_bytes = evidence
                 .run()
                 .output_last_message()
@@ -1701,12 +2251,11 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                         .join(format!("attempt-{source_attempt}"))
                         .join(worker_id)
                         .join("prompt.md")
-                || evidence.model_provenance().launch_runtime != SupervisorRuntime::Codex
                 || !evidence.run().stdout.target_launch_attempted
                 || evidence.run().cwd != preflight.worktree.path
                 || !evidence.run().scratch_quiescence_verified()
-                || !external_process_completed(evidence.run(), SupervisorRuntime::Codex)
-                || !external_containment_verified(evidence.run(), SupervisorRuntime::Codex)
+                || !external_process_completed(evidence.run(), worker_runtime)
+                || !external_containment_verified(evidence.run(), worker_runtime)
                 || !evidence.run().sandbox_denials().is_empty()
                 || !evidence.run().gate_denials().is_empty()
                 || evidence.run().external_side_effect_state().is_some()
@@ -1858,7 +2407,7 @@ fn prepare_child_attempt<'a>(
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
     continuation: Option<&ParentContinuationLaunch<'_>>,
-) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+) -> Result<AssignmentExecutionDisposition<Box<PreparedChildAttempt<'a>>>> {
     let purpose = match continuation {
         None => ChildAttemptPurpose::Ordinary,
         Some(launch) => ChildAttemptPurpose::ManagedParentContinuation(launch),
@@ -1893,7 +2442,7 @@ fn prepare_managed_parent_initial_attempt<'a>(
     schema_path: &Path,
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
-) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+) -> Result<AssignmentExecutionDisposition<Box<PreparedChildAttempt<'a>>>> {
     prepare_child_attempt_with_purpose(
         context,
         outcome,
@@ -1924,7 +2473,7 @@ fn prepare_child_attempt_with_purpose<'a>(
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
     purpose: ChildAttemptPurpose<'_, '_>,
-) -> Result<AssignmentExecutionDisposition<PreparedChildAttempt<'a>>> {
+) -> Result<AssignmentExecutionDisposition<Box<PreparedChildAttempt<'a>>>> {
     let continuation = match purpose {
         ChildAttemptPurpose::ManagedParentContinuation(launch) => Some(launch),
         ChildAttemptPurpose::Ordinary | ChildAttemptPurpose::ManagedParentInitial => None,
@@ -1961,29 +2510,23 @@ fn prepare_child_attempt_with_purpose<'a>(
             bail!("yield continuation cannot be combined with corrective retry feedback");
         }
         continuation.revalidate(context, preflight, attempt)?;
-        if assignment_launch_runtime(assignment, options, budget_policy) != SupervisorRuntime::Codex
-        {
-            bail!("continuation preparation requires the verified Codex runtime");
+        if context.execution_runtime != SupervisorExecutionRuntime::Verified {
+            bail!("continuation preparation requires verified managed execution");
         }
     }
-    if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
-        if context.execution_runtime != SupervisorExecutionRuntime::Verified
+    if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial)
+        && (context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
             || attempt != 1
             || assignment.role != AgentRole::ChildOrchestrator
             || assignment.phase != AssignmentPhase::Execution
             || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
-            || assignment.worker_assignments.is_empty()
-        {
-            bail!(
-                "managed parent initial preparation requires a verified execution-phase delegating ChildOrchestrator with authored workers on attempt 1 and no execution target or evidence-only reaudit"
-            );
-        }
-        if assignment_launch_runtime(assignment, options, budget_policy) != SupervisorRuntime::Codex
-        {
-            bail!("managed parent initial preparation requires the verified Codex runtime");
-        }
+            || assignment.worker_assignments.is_empty())
+    {
+        bail!(
+            "managed parent initial preparation requires a verified execution-phase delegating ChildOrchestrator with authored workers on attempt 1 and no execution target or evidence-only reaudit"
+        );
     }
     if let Some(expected) = context.worktree_creation.expected_source_head() {
         let observed = current_head_oid(&preflight.worktree.path)?;
@@ -2121,6 +2664,9 @@ fn prepare_child_attempt_with_purpose<'a>(
             options.run_id.as_str(),
             attempt,
             field_guide,
+            crate::runtime_adapter::AdapterId::parse(launch_runtime.as_str())
+                .context("managed parent runtime has no adapter descriptor")?
+                .managed_parent_control_protocol(),
         )?
     } else if let Some(source) = evidence_only_reaudit {
         let preserved_base = source
@@ -2330,7 +2876,14 @@ fn prepare_child_attempt_with_purpose<'a>(
         apply_canonical_environment_requirements(command, &preflight.environment_requirements);
     command = if assignment.role == AgentRole::Researcher {
         configure_researcher_command(command, launch_runtime)?
-    } else if evidence_only_reaudit.is_some() || managed_parent {
+    } else if evidence_only_reaudit.is_some()
+        || managed_parent
+        || (launch_runtime == SupervisorRuntime::GeminiCli
+            && matches!(
+                assignment.role,
+                AgentRole::Auditor | AgentRole::GateClassifier
+            ))
+    {
         configure_read_only_auditor_command(command)?
     } else {
         configure_assignment_phase_command(command, assignment_phase, &assignment.assigned_paths)?
@@ -2339,7 +2892,7 @@ fn prepare_child_attempt_with_purpose<'a>(
         command = command.with_read_only_input_file(worktree.path.join(&input.path));
     }
     command.researcher_source_inputs = source_inputs;
-    if managed_parent {
+    if managed_parent && launch_runtime == SupervisorRuntime::Codex {
         command = command.with_codex_native_delegation_disabled();
         command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
             command.with_codex_managed_worker_requests()
@@ -2353,7 +2906,7 @@ fn prepare_child_attempt_with_purpose<'a>(
         }
         None => crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
     });
-    command = bind_selected_grok_execution_workspace(
+    command = bind_selected_native_execution_workspace(
         command,
         assignment,
         launch_runtime,
@@ -2605,7 +3158,7 @@ fn prepare_child_attempt_with_purpose<'a>(
             return Err(error);
         }
     }
-    Ok(AssignmentExecutionDisposition::Continue(
+    Ok(AssignmentExecutionDisposition::Continue(Box::new(
         PreparedChildAttempt {
             attempt_artifacts,
             corrective_retry_used,
@@ -2622,7 +3175,7 @@ fn prepare_child_attempt_with_purpose<'a>(
             budget_reservation,
             pre_action_review_context,
         },
-    ))
+    )))
 }
 
 // Owned dispatch evidence, not a final report or authority to accept a yield.
@@ -2639,6 +3192,7 @@ struct CapturedChildAttempt<'a> {
     incoming_scratch: ArtifactScratchDirectory,
     capture_scratch: ArtifactScratchDirectory,
     budget_reservation: DispatchBudgetReservation<'a>,
+    usage_settlement: DispatchUsageSettlement,
     launch_runtime: SupervisorRuntime,
     environment_blocked: bool,
     attempt_containment_verified: bool,
@@ -2795,10 +3349,12 @@ impl<'turn, 'context, 'writer, 'resources>
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
             || preflight.assignment.role != AgentRole::ChildOrchestrator
-            || parent.model_provenance.launch_runtime != SupervisorRuntime::Codex
         {
-            bail!("nested serial handoff requires a verified managed Codex parent attempt");
+            bail!("nested serial handoff requires a verified managed parent attempt");
         }
+        parent
+            .command
+            .managed_parent_control_transport(parent.model_provenance.launch_runtime)?;
         Self::verify_parent_quiescence(&parent, preflight)?;
         let parent_admission = admit_parent_turn_command(
             AssignmentAttemptAuthority::from_preflight(context, preflight, parent_attempt)?,
@@ -2989,7 +3545,7 @@ fn verify_imported_managed_child_candidate(
 
 #[derive(Debug, Clone, Copy)]
 struct ManagedChildMaterializationGate {
-    codex_supervisor: bool,
+    bound_managed_git_boundary: bool,
     verified_execution: bool,
     process_completed: bool,
     containment_verified: bool,
@@ -3075,7 +3631,7 @@ fn bind_assignment_messaging_unless_managed_readonly<'a>(
 
 impl ManagedChildMaterializationGate {
     fn eligible(self) -> bool {
-        self.codex_supervisor
+        self.bound_managed_git_boundary
             && self.verified_execution
             && self.process_completed
             && self.containment_verified
@@ -3097,7 +3653,7 @@ fn dispatch_and_collect_child_attempt<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     journal_parent_id: &str,
     attempt: usize,
-    prepared: PreparedChildAttempt<'a>,
+    prepared: Box<PreparedChildAttempt<'a>>,
 ) -> Result<CollectedChildAttempt<'a>> {
     let captured = dispatch_and_capture_child_attempt(
         context,
@@ -3116,8 +3672,29 @@ fn dispatch_and_capture_child_attempt<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     journal_parent_id: &str,
     attempt: usize,
-    prepared: PreparedChildAttempt<'a>,
-) -> Result<CapturedChildAttempt<'a>> {
+    prepared: Box<PreparedChildAttempt<'a>>,
+) -> Result<Box<CapturedChildAttempt<'a>>> {
+    dispatch_and_capture_child_attempt_with_release_state(
+        context,
+        outcome,
+        preflight,
+        journal_parent_id,
+        attempt,
+        prepared,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_and_capture_child_attempt_with_release_state<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    journal_parent_id: &str,
+    attempt: usize,
+    prepared: Box<PreparedChildAttempt<'a>>,
+    release_state: Option<&std::sync::atomic::AtomicU8>,
+) -> Result<Box<CapturedChildAttempt<'a>>> {
     let AssignmentExecutionContext {
         assignment_metadata,
         options,
@@ -3277,8 +3854,11 @@ fn dispatch_and_capture_child_attempt<'a>(
                 &assignment.id,
                 &mut command,
             )?;
-            let external_run_result =
-                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            if let Some(state) = release_state {
+                state.store(2, Ordering::Release);
+            }
+            let external_run_result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(
+                || {
                     if let Some(review_context) = review_context.as_ref() {
                         let mut review_journal = SupervisorPreActionJournalSink {
                             artifacts,
@@ -3296,21 +3876,44 @@ fn dispatch_and_capture_child_attempt<'a>(
                     } else {
                         external_runner(&command, cancellation, None)
                     }
-                })) {
-                    Ok(run) => Ok(run),
-                    Err(payload) => {
-                        drop(incoming_output_root);
-                        drop(capture_output_root);
-                        with_supervisor_artifacts(artifacts, |writer, _| {
-                            discard_invocation_scratches(
-                                writer,
-                                &incoming_scratch,
-                                &capture_scratch,
-                            )
-                        })?;
-                        std::panic::resume_unwind(payload);
+                },
+            )) {
+                Ok(run) => Ok(run),
+                Err(payload) => {
+                    if release_state.is_some() {
+                        outcome.external_containment_failed = true;
+                        outcome.usage_incomplete = true;
+                        cancellation.cancel();
+                        let missing = budget_reservation
+                            .ledger
+                            .reconcile_for_runtime_if_configured(
+                                budget_reservation.reservation.id,
+                                UsageMeasurement::Missing,
+                                Some(runtime_name(launch_runtime)),
+                            );
+                        if missing.is_ok() {
+                            budget_reservation.state = DispatchBudgetReservationState::Settled;
+                        }
+                        std::mem::forget((
+                            incoming_output_root,
+                            capture_output_root,
+                            incoming_scratch,
+                            capture_scratch,
+                            budget_reservation,
+                            command,
+                            messaging_server,
+                        ));
+                        drop(payload);
+                        bail!("isolated runner panicked with unknown containment; resources quarantined; missing usage settlement: {missing:?}");
                     }
-                };
+                    drop(incoming_output_root);
+                    drop(capture_output_root);
+                    with_supervisor_artifacts(artifacts, |writer, _| {
+                        discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+                    })?;
+                    std::panic::resume_unwind(payload);
+                }
+            };
             drop(messaging_server);
             external_run_result
         }
@@ -3332,7 +3935,44 @@ fn dispatch_and_capture_child_attempt<'a>(
                 &assignment.id,
                 &mut command,
             )?;
-            let external_run = external_runner(&command, cancellation, None);
+            if let Some(state) = release_state {
+                state.store(2, Ordering::Release);
+            }
+            let external_run = if release_state.is_some() {
+                match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    external_runner(&command, cancellation, None)
+                })) {
+                    Ok(run) => run,
+                    Err(payload) => {
+                        outcome.external_containment_failed = true;
+                        outcome.usage_incomplete = true;
+                        cancellation.cancel();
+                        let missing = budget_reservation
+                            .ledger
+                            .reconcile_for_runtime_if_configured(
+                                budget_reservation.reservation.id,
+                                UsageMeasurement::Missing,
+                                Some(runtime_name(launch_runtime)),
+                            );
+                        if missing.is_ok() {
+                            budget_reservation.state = DispatchBudgetReservationState::Settled;
+                        }
+                        std::mem::forget((
+                            incoming_output_root,
+                            capture_output_root,
+                            incoming_scratch,
+                            capture_scratch,
+                            budget_reservation,
+                            command,
+                            messaging_server,
+                        ));
+                        drop(payload);
+                        bail!("isolated runner panicked with unknown containment; resources quarantined; missing usage settlement: {missing:?}");
+                    }
+                }
+            } else {
+                external_runner(&command, cancellation, None)
+            };
             drop(messaging_server);
             Ok(external_run)
         }
@@ -3361,6 +4001,18 @@ fn dispatch_and_capture_child_attempt<'a>(
         .as_ref()
         .ok()
         .map(|run| budget_reservation.settle_bound_runtime(run, &command));
+    if usage_settlement
+        .as_ref()
+        .is_some_and(|result| result.is_ok())
+        && budget_reservation.state == DispatchBudgetReservationState::Settled
+        && external_run_result.as_ref().is_ok_and(|run| {
+            run.scratch_quiescence_verified() && external_containment_verified(run, launch_runtime)
+        })
+    {
+        if let Some(state) = release_state {
+            state.store(1, Ordering::Release);
+        }
+    }
     // Retain returned continuation bytes before checkpoints, settlement diagnostics,
     // or envelope validation can return early. This does not authorize or clean scratch.
     let returned_evidence = match &external_run_result {
@@ -3373,6 +4025,23 @@ fn dispatch_and_capture_child_attempt<'a>(
                 run,
             );
             if !run.scratch_quiescence_verified() {
+                if release_state.is_some() {
+                    // Isolated continuation owns a separate failure disposition.
+                    // Keep every real returned resource alive; its controller must
+                    // retain the source turn and sibling evidence as quarantine.
+                    outcome.external_containment_failed = true;
+                    cancellation.cancel();
+                    std::mem::forget((
+                        external_run_result,
+                        incoming_output_root,
+                        capture_output_root,
+                        incoming_scratch,
+                        capture_scratch,
+                        budget_reservation,
+                        command,
+                    ));
+                    bail!("isolated managed continuation lacks verified scratch quiescence; returned resources quarantined; evidence import: {imported:?}");
+                }
                 // All capture, scratch and reservation owners remain in this frame.
                 // As with an attached initial parent, do not detach a possibly live writer.
                 eprintln!(
@@ -3388,6 +4057,8 @@ fn dispatch_and_capture_child_attempt<'a>(
     // reservation's Missing-on-drop fallback. Retain it until settlement is attempted.
     let completion_checkpoint =
         record_dispatch_checkpoint(artifacts, false, true, &assignment.id, attempt);
+    // Keep the owned capture on the heap across checkpoint/error result moves.
+    // Deep supervisor cascades must fit the ordinary production thread stack.
     let captured_result = (|| {
         let external_run = match external_run_result {
             Ok(run) => run,
@@ -3471,7 +4142,7 @@ fn dispatch_and_capture_child_attempt<'a>(
                 &command,
                 launch_runtime,
             ));
-        Ok(CapturedChildAttempt {
+        Ok(Box::new(CapturedChildAttempt {
             attempt_artifacts,
             corrective_retry_used,
             model_provenance,
@@ -3482,10 +4153,11 @@ fn dispatch_and_capture_child_attempt<'a>(
             incoming_scratch,
             capture_scratch,
             budget_reservation,
+            usage_settlement,
             launch_runtime,
             environment_blocked,
             attempt_containment_verified,
-        })
+        }))
     })();
     let captured_result = match (captured_result, completion_checkpoint) {
         (result, Ok(())) => result,
@@ -3543,7 +4215,7 @@ const MAX_ATTACHED_PARENT_DIAGNOSTIC_CHARS: usize = 1024;
 /// a new lease and does not itself keep that preflight alive; the production caller must.
 #[allow(dead_code)]
 struct AttachedParentCapture<'budget, 'turn> {
-    prepared: PreparedChildAttempt<'budget>,
+    prepared: Box<PreparedChildAttempt<'budget>>,
     endpoint: WorkerInboxShutdown<'turn>,
     external_run: Option<ExternalAgentRun>,
     diagnostics: Vec<String>,
@@ -3580,16 +4252,13 @@ fn attached_parent_runner_panic_diagnostic(payload: &(dyn std::any::Any + Send))
 #[allow(dead_code)]
 fn abandon_unstarted_attached_parent<'a>(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
-    prepared: PreparedChildAttempt<'a>,
+    prepared: Box<PreparedChildAttempt<'a>>,
 ) -> Result<()> {
-    let PreparedChildAttempt {
-        incoming_scratch,
-        capture_scratch,
-        incoming_output_root,
-        capture_output_root,
-        mut budget_reservation,
-        ..
-    } = prepared;
+    let incoming_scratch = prepared.incoming_scratch;
+    let capture_scratch = prepared.capture_scratch;
+    let incoming_output_root = prepared.incoming_output_root;
+    let capture_output_root = prepared.capture_output_root;
+    let mut budget_reservation = prepared.budget_reservation;
     budget_reservation.settle_not_started()?;
     drop(incoming_output_root);
     drop(capture_output_root);
@@ -3611,14 +4280,16 @@ fn require_attached_parent_dispatch<'a>(
         || preflight.assignment.role != AgentRole::ChildOrchestrator
         || preflight.assignment.phase != AssignmentPhase::Execution
         || preflight.assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
-        || prepared.launch_runtime != SupervisorRuntime::Codex
-        || prepared.model_provenance.launch_runtime != SupervisorRuntime::Codex
+        || prepared.launch_runtime != prepared.model_provenance.launch_runtime
         || preflight.assignment.worker_assignments.is_empty()
     {
         bail!(
-            "attached parent dispatch requires verified Codex execution of a delegating child orchestrator in the execution phase with authored worker assignments and no execution target or evidence-only reaudit"
+            "attached parent dispatch requires verified managed execution of a delegating child orchestrator in the execution phase with authored worker assignments and no execution target or evidence-only reaudit"
         );
     }
+    prepared
+        .command
+        .managed_parent_control_transport(prepared.launch_runtime)?;
     Ok(())
 }
 
@@ -3809,15 +4480,16 @@ fn observe_returned_attached_parent_run<'a>(
 }
 
 #[allow(dead_code, clippy::too_many_arguments)]
+#[inline(never)]
 fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
     context: &AssignmentExecutionContext<'budget, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
     journal_parent_id: &str,
     attempt: usize,
-    mut prepared: PreparedChildAttempt<'budget>,
+    mut prepared: Box<PreparedChildAttempt<'budget>>,
     endpoint: WorkerInboxEndpoint<'turn>,
-) -> Result<AttachedParentCapture<'budget, 'turn>> {
+) -> Result<Box<AttachedParentCapture<'budget, 'turn>>> {
     if let Err(error) = require_attached_parent_dispatch(context, preflight, &prepared) {
         abandon_unstarted_attached_parent(context.artifacts, prepared)?;
         return Err(error);
@@ -3998,8 +4670,59 @@ fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
             external_runner(&prepared.command, cancellation, None)
         }
     }));
-    let shutdown = endpoint.shutdown_retaining();
     let mut diagnostics = Vec::new();
+    // Only descriptor-held, completed, confined output can propose inbox requests.
+    // The authenticated freeze below remains the authority for later Worker launches.
+    if let Ok(run) = &run_result {
+        let submitted = (|| -> Result<()> {
+            if prepared
+                .command
+                .managed_parent_control_transport(prepared.launch_runtime)?
+                != crate::selection::routing_policy::ControlTransport::SupervisorCapturedEnvelope
+            {
+                return Ok(());
+            }
+            if let Some(refusal) = attached_parent_quiescence_refusal(
+                run,
+                prepared.launch_runtime,
+                &preflight.worktree.path,
+            ) {
+                bail!("{refusal}");
+            }
+            if run.environment_blocked()
+                || !run.sandbox_denials().is_empty()
+                || !run.gate_denials().is_empty()
+                || run.external_side_effect_state().is_some()
+            {
+                bail!("captured parent control has refused environment or side-effect evidence");
+            }
+            ensure_clean_primary(&preflight.worktree.path, context.execution_runtime)?;
+            let primary_after = primary_worktree_snapshot(context.repo, context.execution_runtime)?;
+            if primary_after.inspection_problem().is_some()
+                || !primary_integrity_changes(&prepared.primary_before, &primary_after).is_empty()
+            {
+                bail!("captured parent control changed primary integrity");
+            }
+            let bytes = run
+                .output_last_message()
+                .context("captured parent control needs held final output")?;
+            super::parent_broker::submit_captured_envelope(
+                bytes,
+                context.options.run_id.as_str(),
+                &preflight.assignment,
+                attempt,
+                &endpoint.launch(),
+                &|| cancellation.is_cancelled(),
+            )
+        })();
+        if let Err(error) = submitted {
+            push_attached_parent_diagnostic(
+                &mut diagnostics,
+                format!("captured parent control refused: {error:#}"),
+            );
+        }
+    }
+    let shutdown = endpoint.shutdown_retaining();
     note_attached_endpoint_shutdown(
         &mut diagnostics,
         &shutdown,
@@ -4041,19 +4764,19 @@ fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
             None
         }
     };
-    Ok(AttachedParentCapture {
+    Ok(Box::new(AttachedParentCapture {
         prepared,
         endpoint: shutdown,
         external_run,
         diagnostics,
-    })
+    }))
 }
 
 /// Supervisor-observed attached parent. This is still not an ordinary collection:
 /// it owns the prepared attempt and returned run, not a review report or journal import.
 #[allow(dead_code)]
 struct InspectedAttachedParent<'budget> {
-    prepared: PreparedChildAttempt<'budget>,
+    prepared: Box<PreparedChildAttempt<'budget>>,
     external_run: ExternalAgentRun,
     primary_after: PrimaryWorktreeSnapshot,
     primary_integrity_changes: PrimaryIntegrityChanges,
@@ -4074,12 +4797,13 @@ enum AttachedParentInspection<'budget, 'turn> {
     Refused(Box<AttachedParentCapture<'budget, 'turn>>),
 }
 
+#[inline(never)]
 fn refuse_attached_parent_inspection<'budget, 'turn>(
-    mut capture: AttachedParentCapture<'budget, 'turn>,
+    mut capture: Box<AttachedParentCapture<'budget, 'turn>>,
     diagnostic: impl Into<String>,
 ) -> AttachedParentInspection<'budget, 'turn> {
     push_attached_parent_diagnostic(&mut capture.diagnostics, diagnostic);
-    AttachedParentInspection::Refused(Box::new(capture))
+    AttachedParentInspection::Refused(capture)
 }
 
 fn attached_parent_inspection_snapshot<'budget, 'turn>(
@@ -4145,10 +4869,11 @@ fn attached_parent_inspection_snapshot<'budget, 'turn>(
 /// Success moves the prepared attempt, returned run, and frozen inbox; it does
 /// not collect an ordinary report or materialize Git.
 #[allow(dead_code)]
+#[inline(never)]
 fn inspect_attached_parent_capture<'budget, 'turn>(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
-    capture: AttachedParentCapture<'budget, 'turn>,
+    capture: Box<AttachedParentCapture<'budget, 'turn>>,
 ) -> AttachedParentInspection<'budget, 'turn> {
     let primary_after = match attached_parent_inspection_snapshot(context, preflight, &capture) {
         Ok(snapshot) => snapshot,
@@ -4167,7 +4892,7 @@ fn inspect_attached_parent_capture<'budget, 'turn>(
         endpoint,
         external_run,
         diagnostics: _,
-    } = capture;
+    } = *capture;
     let external_run = match external_run {
         Some(run) => run,
         None => unreachable!("missing returned run already refused"),
@@ -4214,7 +4939,7 @@ struct ManagedParentCollection {
 /// Validated final parent held until initial evidence import succeeds.
 /// Construction stays inside preparation; this value is not deserialized.
 struct PreparedManagedParentFinal<'budget> {
-    captured: CapturedChildAttempt<'budget>,
+    captured: Box<CapturedChildAttempt<'budget>>,
     collection: ManagedParentCollection,
 }
 
@@ -4241,15 +4966,14 @@ fn require_managed_parent_final_capture(
 ) -> Result<()> {
     let command = &captured.command;
     if preflight.assignment.role != AgentRole::ChildOrchestrator
-        || captured.launch_runtime != SupervisorRuntime::Codex
-        || captured.model_provenance.launch_runtime != SupervisorRuntime::Codex
+        || captured.launch_runtime != captured.model_provenance.launch_runtime
         || command.workspace_access != WorkspaceAccess::ReadOnly
-        || !command.codex_native_delegation_is_disabled()
     {
         bail!(
-            "managed parent final collection requires a read-only Codex child_orchestrator command with native delegation disabled"
+            "managed parent final collection requires a verified read-only child_orchestrator command"
         );
     }
+    command.managed_parent_control_transport(captured.launch_runtime)?;
     if let Some(refusal) = attached_parent_quiescence_refusal(
         &captured.external_run,
         captured.launch_runtime,
@@ -4332,12 +5056,12 @@ fn merge_completed_worker_journals(
 fn prepare_managed_parent_final_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
-    captured: CapturedChildAttempt<'a>,
+    captured: Box<CapturedChildAttempt<'a>>,
     continuation: &ParentContinuationLaunch<'_>,
     completed: &bound_parent_turn::BoundNestedWorkerEvidence<'_, '_>,
     source_attempt: usize,
     current: &WorkerInboxTurn<'_>,
-) -> Result<PreparedManagedParentFinal<'a>> {
+) -> Result<Box<PreparedManagedParentFinal<'a>>> {
     let (parsed, journals) = {
         let (_view, workers) = revalidate_managed_parent_final(
             context,
@@ -4371,7 +5095,7 @@ fn prepare_managed_parent_final_attempt<'a>(
         .candidate_snapshots()
         .1
         .clone();
-    Ok(PreparedManagedParentFinal {
+    Ok(Box::new(PreparedManagedParentFinal {
         captured,
         collection: ManagedParentCollection {
             parsed,
@@ -4379,14 +5103,223 @@ fn prepare_managed_parent_final_attempt<'a>(
             expected_candidate,
             authorizes_materialization: true,
         },
-    })
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_managed_parent_isolated_final_attempt<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    captured: Box<CapturedChildAttempt<'a>>,
+    continuation: &ParentContinuationLaunch<'_>,
+    completed: &bound_parent_turn::BoundIsolatedWorkers<'_, '_>,
+    source_attempt: usize,
+    current: &WorkerInboxTurn<'_>,
+) -> Result<Box<PreparedManagedParentFinal<'a>>> {
+    continuation.revalidate(context, preflight, continuation.binding().3)?;
+    let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
+    require_managed_parent_final_capture(context, preflight, &captured)?;
+    let parsed = parent_continuation_response::read_parent_continuation_final_report(
+        captured.external_run.output_last_message(),
+        &captured.attempt_artifacts.raw_report_relative,
+        continuation,
+    )?;
+    if !parsed.report.audit_reports.is_empty()
+        || parsed.report.review_lens_aggregate.is_some()
+        || parsed.report.worker_reports.len() != workers.len()
+        || parsed
+            .report
+            .worker_reports
+            .iter()
+            .zip(workers)
+            .any(|(supplied, worker)| supplied != worker.report())
+    {
+        bail!("isolated parent final report substitutes the actual ordered Worker captures");
+    }
+    let mut journals = WorkerExecutionJournalEvidenceSet::default();
+    for worker in workers {
+        let id = worker.report().id.clone();
+        if worker.journals().len() != 1 || journals.contains_key(&id) {
+            bail!("isolated parent journal set is not exact and unique");
+        }
+        journals.insert(
+            id.clone(),
+            worker
+                .journals()
+                .get(&id)
+                .context("isolated Worker journal missing")?
+                .clone(),
+        );
+    }
+    Ok(Box::new(PreparedManagedParentFinal {
+        captured,
+        collection: ManagedParentCollection {
+            parsed,
+            journals,
+            expected_candidate: completed.parent_candidate().clone(),
+            authorizes_materialization: false,
+        },
+    }))
+}
+
+/// Capture every held sibling before releasing child claims. The parent's union
+/// claim and independent leases remain held for supervisor-only integration.
+#[allow(clippy::too_many_arguments)]
+fn collect_prepared_managed_parent_isolated_final<'a>(
+    context: &AssignmentExecutionContext<'a, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    mut prepared: Box<PreparedManagedParentFinal<'a>>,
+    completed: &bound_parent_turn::BoundIsolatedWorkers<'_, '_>,
+    source_attempt: usize,
+    current: &WorkerInboxTurn<'_>,
+) -> Result<CollectedChildAttempt<'a>> {
+    require_managed_parent_final_capture(context, preflight, &prepared.captured)?;
+    let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
+    if report_failed(&prepared.collection.parsed.report) {
+        bail!("isolated parent rejected its Worker set; integration is not authorized");
+    }
+    if context.cancellation.is_cancelled()
+        || primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
+            != prepared.collection.expected_candidate
+    {
+        bail!("isolated parent candidate changed before final materialization handoff");
+    }
+    let source_head = preflight.child_base_head;
+    let primary_head = current_head_oid(context.repo)?;
+    let mut candidates = Vec::new();
+    for worker in workers {
+        if !worker.run().publishable
+            || !external_process_completed(worker.run(), worker.model_provenance().launch_runtime)
+            || !external_containment_verified(
+                worker.run(),
+                worker.model_provenance().launch_runtime,
+            )
+        {
+            bail!(
+                "isolated integration requires actual publishable, completed, contained captures"
+            );
+        }
+        let captured = crate::merge::capture_exact_base_worktree_with_write_lease(
+            context.repo,
+            &worker.report().id,
+            &worker.report().assigned_paths,
+            worker.lease(),
+            source_head,
+        )?;
+        if captured.changed_paths != worker.report().files_changed {
+            bail!("isolated tree paths differ from the held Worker report");
+        }
+        candidates.push((worker, captured));
+    }
+    completed.revalidate(context, preflight, source_attempt, current)?;
+    // This is the sole terminal handoff; durable spent grants forbid replay.
+    // The parent union still covers every child scope while all leases stay held.
+    completed.release_completed_claims(context, preflight, source_attempt, current)?;
+    let primary = crate::git_repository::open(context.repo)?;
+    let base = primary.find_commit(source_head)?.tree()?;
+    let mut aggregate_oid = base.id();
+    for (worker, captured) in candidates {
+        context
+            .manager
+            .verify_write_execution_lease(&worker.report().id, worker.lease())?;
+        if context.cancellation.is_cancelled()
+            || primary_worktree_snapshot(worker.lease().path(), context.execution_runtime)?
+                != *worker.candidate_snapshots().1
+        {
+            bail!("isolated child drifted at the exact materialization handoff");
+        }
+        crate::external_agent::materialize_managed_child_git_commit(
+            context.repo,
+            worker.lease().path(),
+            primary_head,
+            source_head,
+            &worker.report().assigned_paths,
+            &captured.changed_paths,
+            captured.snapshot_tree,
+        )?;
+        let imported = collect_and_import_managed_child_git_commit(
+            context.repo,
+            worker.lease().path(),
+            primary_head,
+            source_head,
+            &worker.report().assigned_paths,
+        )?;
+        if imported.head_tree_oid != captured.snapshot_tree
+            || imported.final_changed_paths != captured.changed_paths
+        {
+            bail!("isolated imported commit differs from the exact held candidate tree");
+        }
+        let aggregate = primary.find_tree(aggregate_oid)?;
+        let child = primary.find_tree(imported.head_tree_oid)?;
+        let mut merged = primary.merge_trees(&base, &aggregate, &child, None)?;
+        if merged.has_conflicts() {
+            bail!("isolated scoped candidate integration has conflicts");
+        }
+        aggregate_oid = merged.write_tree_to(&primary)?;
+    }
+    let aggregate = primary.find_tree(aggregate_oid)?;
+    let diff = primary.diff_tree_to_tree(Some(&base), Some(&aggregate), None)?;
+    let paths = normalize_paths(
+        diff.deltas()
+            .filter_map(|delta| {
+                delta
+                    .new_file()
+                    .path()
+                    .or_else(|| delta.old_file().path())
+                    .map(Path::to_path_buf)
+            })
+            .collect(),
+    )?;
+    if paths != prepared.collection.parsed.report.files_changed
+        || paths.iter().any(|path| {
+            !preflight
+                .assignment
+                .assigned_paths
+                .iter()
+                .any(|scope| path_is_covered_by_claim(path, scope))
+        })
+    {
+        bail!("isolated aggregate differs from the final parent report or union scope");
+    }
+    if context.cancellation.is_cancelled()
+        || !context.sync_store.snapshot()?.contains(&preflight.claim)
+        || primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
+            != prepared.collection.expected_candidate
+    {
+        bail!("isolated aggregate lost its held parent candidate or union claim");
+    }
+    context.manager.verify_write_execution_lease(
+        &preflight.assignment.id,
+        preflight
+            .worktree_write_lease
+            .as_ref()
+            .context("isolated parent lease missing")?,
+    )?;
+    let parent = crate::git_repository::open(&preflight.worktree.path)?;
+    let parent_aggregate = parent.find_tree(aggregate_oid)?;
+    let mut checkout = git2::build::CheckoutBuilder::new();
+    checkout.safe().recreate_missing(true).update_index(false);
+    parent.checkout_tree(parent_aggregate.as_object(), Some(&mut checkout))?;
+    let after = primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?;
+    let changes = primary_integrity_changes(&prepared.collection.expected_candidate, &after);
+    if after.inspection_problem().is_some()
+        || changes.paths != paths
+        || !primary_integrity_changes_outside_scope(&changes, &preflight.assignment.assigned_paths)
+            .is_empty()
+    {
+        bail!("isolated aggregate checkout failed the exact parent scope binding");
+    }
+    prepared.collection.expected_candidate = after;
+    prepared.collection.authorizes_materialization = true;
+    collect_prepared_managed_parent_final(context, outcome, preflight, prepared)
 }
 
 fn collect_prepared_managed_parent_final<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
-    prepared: PreparedManagedParentFinal<'a>,
+    prepared: Box<PreparedManagedParentFinal<'a>>,
 ) -> Result<CollectedChildAttempt<'a>> {
     collect_captured_child_attempt(
         context,
@@ -4403,7 +5336,7 @@ fn collect_ordinary_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
-    captured: CapturedChildAttempt<'a>,
+    captured: Box<CapturedChildAttempt<'a>>,
 ) -> Result<CollectedChildAttempt<'a>> {
     collect_captured_child_attempt(context, outcome, preflight, captured, None)
 }
@@ -4412,12 +5345,11 @@ fn collect_captured_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     preflight: &AssignmentExecutionPreflight<'_>,
-    captured: CapturedChildAttempt<'a>,
+    captured: Box<CapturedChildAttempt<'a>>,
     managed_parent: Option<ManagedParentCollection>,
 ) -> Result<CollectedChildAttempt<'a>> {
     let AssignmentExecutionContext {
         assignment_metadata,
-        options,
         repo,
         execution_runtime,
         artifacts,
@@ -4435,21 +5367,19 @@ fn collect_captured_child_attempt<'a>(
             ),
             None => (None, None, None, false),
         };
-    let CapturedChildAttempt {
-        attempt_artifacts,
-        corrective_retry_used,
-        model_provenance,
-        external_run,
-        command,
-        primary_before,
-        primary_scope_before,
-        incoming_scratch,
-        capture_scratch,
-        budget_reservation,
-        launch_runtime,
-        environment_blocked,
-        attempt_containment_verified,
-    } = captured;
+    let attempt_artifacts = captured.attempt_artifacts;
+    let corrective_retry_used = captured.corrective_retry_used;
+    let model_provenance = captured.model_provenance;
+    let external_run = captured.external_run;
+    let command = captured.command;
+    let primary_before = captured.primary_before;
+    let primary_scope_before = captured.primary_scope_before;
+    let incoming_scratch = captured.incoming_scratch;
+    let capture_scratch = captured.capture_scratch;
+    let budget_reservation = captured.budget_reservation;
+    let launch_runtime = captured.launch_runtime;
+    let environment_blocked = captured.environment_blocked;
+    let attempt_containment_verified = captured.attempt_containment_verified;
     let raw_report_validated = if parsed.is_some() {
         true
     } else {
@@ -4557,7 +5487,8 @@ fn collect_captured_child_attempt<'a>(
         collect_child_report_for_runtime(report_collection, launch_runtime)
     };
     let materialization_gate = ManagedChildMaterializationGate {
-        codex_supervisor: options.runtime == SupervisorRuntime::Codex,
+        bound_managed_git_boundary:
+            crate::external_agent::bind_existing_managed_child_git_boundary(&worktree.path).is_ok(),
         verified_execution: *execution_runtime == SupervisorExecutionRuntime::Verified,
         process_completed: external_process_completed(&external_run, launch_runtime),
         containment_verified: attempt_containment_verified,
@@ -5484,12 +6415,8 @@ fn prepare_parent_auditor<'a>(
     };
     let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
     let assignment_reasoning_effort = context.assignment_metadata.reasoning_effort(&assignment.id);
-    let resolved_auditor_effort = resolve_reasoning_effort(
-        AgentRole::Auditor,
-        assignment_reasoning_effort,
-        lens.backend.reasoning_effort(),
-        0,
-    );
+    let resolved_auditor_effort =
+        resolve_review_lens_reasoning_effort(lens, assignment_reasoning_effort);
     let RenderedPromptWithMeasurements {
         prompt: auditor_prompt,
         mut measurements,
@@ -5503,6 +6430,11 @@ fn prepare_parent_auditor<'a>(
         },
         lens_index,
     )?;
+    let auditor_prompt = if launch_runtime == SupervisorRuntime::GeminiCli {
+        auditor_prompt + "\nThe selected runtime is managed Gemini with native ReadFile only. Use the complete parent-supplied review packet. Shell, WriteFile, Edit, delegation and ambient repository discovery are unavailable. Return commands_run=[]; validation_results may state review conclusions with command=[] only. MACO validates native custody and the selected personal authority independently.\n"
+    } else {
+        auditor_prompt
+    };
     measurements.record_final_launch_prompt_bytes(&auditor_prompt)?;
     let auditor_prompt_relative = dirs.relative(&auditor_prompt_path)?;
     let measurements_relative = prompt_measurements_relative(&auditor_prompt_relative);
@@ -5755,8 +6687,11 @@ fn bind_final_dispatch_live_budget(
     command: &mut ExternalAgentCommand,
     reservation: &DispatchBudgetReservation<'_>,
 ) -> Result<()> {
-    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
-        && command.uses_live_app_server_budget()
+    if (reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex)
+        && command.uses_live_app_server_budget())
+        || (reservation.state
+            == DispatchBudgetReservationState::Reserved(SupervisorRuntime::GeminiCli)
+            && command.uses_gemini_bridge())
     {
         let grant = reservation
             .ledger
@@ -5765,6 +6700,19 @@ fn bind_final_dispatch_live_budget(
             bail!("final dispatch live token grant was stopped or released");
         }
         command.bind_live_token_grant(grant);
+    }
+    if reservation.state == DispatchBudgetReservationState::Reserved(SupervisorRuntime::ClaudeCode)
+        && command.uses_live_claude_managed_worker_budget()
+    {
+        let grant = reservation
+            .ledger
+            .live_token_grant(reservation.reservation.id)?;
+        if grant.as_ref().is_some_and(|grant| grant.stopped()) {
+            bail!("final dispatch live token grant was stopped or released");
+        }
+        command
+            .bind_claude_managed_reservation(reservation.reservation.id.get(), grant)
+            .map_err(anyhow::Error::msg)?;
     }
     Ok(())
 }
@@ -6708,478 +7656,484 @@ fn execute_supervisor_assignment_inner(
         AssignmentExecutionDisposition::Continue(preflight) => preflight,
         AssignmentExecutionDisposition::Complete => return Ok(()),
     };
-    let journal_parent_id = preflight.journal_parent_id;
-    let assignment = &preflight.assignment;
-    // Chosen once from the initial resolved runtime. Retries must not reselect
-    // this assignment onto Native after a managed parent cycle has started.
-    let managed_parent_cycle = context.execution_runtime == SupervisorExecutionRuntime::Verified
-        && context.execution_target.is_none()
-        && context.evidence_only_reaudit.is_none()
-        && assignment.role == AgentRole::ChildOrchestrator
-        && assignment.phase == AssignmentPhase::Execution
-        && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
-        && !assignment.worker_assignments.is_empty()
-        && assignment_launch_runtime(assignment, options, &context.budget_policy)
-            == SupervisorRuntime::Codex;
-    let final_report_name = format!("{}.json", assignment.id);
-    let final_report_relative = PathBuf::from("reports").join(&final_report_name);
-    let final_report_path = dirs.reports.join(&final_report_name);
-    let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
-    let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
-    let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
+    let result = (|| -> Result<()> {
+        let journal_parent_id = preflight.journal_parent_id;
+        let assignment = &preflight.assignment;
+        // Chosen once from the initial resolved runtime. Retries must not reselect
+        // this assignment onto Native after a managed parent cycle has started.
+        let managed_parent_cycle = context.execution_runtime
+            == SupervisorExecutionRuntime::Verified
+            && context.execution_target.is_none()
+            && context.evidence_only_reaudit.is_none()
+            && assignment.role == AgentRole::ChildOrchestrator
+            && assignment.phase == AssignmentPhase::Execution
+            && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+            && !assignment.worker_assignments.is_empty();
+        let final_report_name = format!("{}.json", assignment.id);
+        let final_report_relative = PathBuf::from("reports").join(&final_report_name);
+        let final_report_path = dirs.reports.join(&final_report_name);
+        let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
+        let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
+        let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
 
-    let mut retry_feedback: Option<ChildAttemptCorrection> = None;
-    let mut active_budget_policy = context.budget_policy.clone();
-    let mut attempt_history = Vec::new();
-    let mut structural_attempt = 1usize;
-    let mut warning_streak: Option<crate::loop_guard::LoopGuardTracker> = None;
-    let max_attempts = usize::from(plan.max_child_retries)
-        .saturating_add(usize::from(plan.max_gate_corrections))
-        .saturating_add(1);
-    let mut next_attempt = 1usize;
-    let mut auditor_attempt = 0usize;
-    let mut completed_parent_review_cycles = initial_completed_parent_review_cycles(context)?;
-    let (
-        child_report,
-        completed_candidate_inspection,
-        completed_assignment_containment,
-        completed_launch_model_provenance,
-    ) = 'gate_controller: loop {
-        let mut child_result = None;
-        let mut child_containment_verified = false;
-        let mut child_gate_terminal = false;
-        let first_attempt = next_attempt;
-        for attempt in first_attempt..=max_attempts {
-            next_attempt = attempt.saturating_add(1);
-            if attempt > 1 {
-                let retry_count = u32::try_from(attempt.saturating_sub(1))
-                    .context("assignment retry count does not fit selector input")?;
-                let decisions = active_budget_policy.reselect(
-                    options.runtime,
-                    runtime_model_catalog,
-                    SelectorReselectionRequest {
-                        roles: &[assignment.role],
-                        assignment_id: Some(&assignment.id),
+        let mut retry_feedback: Option<ChildAttemptCorrection> = None;
+        let mut active_budget_policy = context.budget_policy.clone();
+        let mut attempt_history = Vec::new();
+        let mut structural_attempt = 1usize;
+        let mut warning_streak: Option<crate::loop_guard::LoopGuardTracker> = None;
+        let max_attempts = usize::from(plan.max_child_retries)
+            .saturating_add(usize::from(plan.max_gate_corrections))
+            .saturating_add(1);
+        let mut next_attempt = 1usize;
+        let mut auditor_attempt = 0usize;
+        let mut completed_parent_review_cycles = initial_completed_parent_review_cycles(context)?;
+        let (
+            child_report,
+            completed_candidate_inspection,
+            completed_assignment_containment,
+            completed_launch_model_provenance,
+        ) = 'gate_controller: loop {
+            let mut child_result = None;
+            let mut child_containment_verified = false;
+            let mut child_gate_terminal = false;
+            let first_attempt = next_attempt;
+            for attempt in first_attempt..=max_attempts {
+                next_attempt = attempt.saturating_add(1);
+                if attempt > 1 {
+                    let retry_count = u32::try_from(attempt.saturating_sub(1))
+                        .context("assignment retry count does not fit selector input")?;
+                    let decisions = active_budget_policy.reselect(
+                        options.runtime,
+                        runtime_model_catalog,
+                        SelectorReselectionRequest {
+                            roles: &[assignment.role],
+                            assignment_id: Some(&assignment.id),
+                            attempt,
+                            primary_cause: SupervisorSelectionEventCause::Retry,
+                            retry_count,
+                            budget_signal: crate::selection::BudgetSignal::Continue,
+                            environment_rejections: &[],
+                        },
+                    )?;
+                    outcome.selection_decisions.extend(decisions);
+                }
+                let prepared = match if managed_parent_cycle {
+                    prepare_managed_parent_initial_attempt(
+                        context,
+                        outcome,
+                        &active_budget_policy,
+                        &preflight,
+                        journal_parent_id,
                         attempt,
-                        primary_cause: SupervisorSelectionEventCause::Retry,
-                        retry_count,
-                        budget_signal: crate::selection::BudgetSignal::Continue,
-                        environment_rejections: &[],
-                    },
-                )?;
-                outcome.selection_decisions.extend(decisions);
-            }
-            let prepared = match if managed_parent_cycle {
-                prepare_managed_parent_initial_attempt(
-                    context,
-                    outcome,
-                    &active_budget_policy,
-                    &preflight,
-                    journal_parent_id,
-                    attempt,
-                    max_attempts,
-                    &retry_feedback,
-                    &schema_path,
-                    &worker_schema_path,
-                    &auditor_schema_path,
-                )
-            } else {
-                prepare_child_attempt(
-                    context,
-                    outcome,
-                    &active_budget_policy,
-                    &preflight,
-                    journal_parent_id,
-                    attempt,
-                    max_attempts,
-                    &retry_feedback,
-                    &schema_path,
-                    &worker_schema_path,
-                    &auditor_schema_path,
-                    None,
-                )
-            }? {
-                AssignmentExecutionDisposition::Continue(prepared) => prepared,
-                AssignmentExecutionDisposition::Complete => return Ok(()),
-            };
-            let attempted_launch_model_provenance = prepared.model_provenance.clone();
-            let requested_effort = prepared.command.reasoning_effort.clone();
-            let account_observe = active_budget_policy.account_observe_environment_decision();
-            let collected = match if managed_parent_cycle {
-                managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
-                    context,
-                    outcome,
-                    &preflight,
-                    journal_parent_id,
-                    attempt,
-                    prepared,
-                    &active_budget_policy,
-                    max_attempts,
-                    &schema_path,
-                    &worker_schema_path,
-                    &auditor_schema_path,
-                )
-            } else {
-                dispatch_and_collect_child_attempt(
-                    context,
-                    outcome,
-                    &preflight,
-                    journal_parent_id,
-                    attempt,
-                    prepared,
-                )
-            } {
-                Ok(collected) => collected,
-                Err(error) => {
-                    record_child_attempt_outcome_with_account_observe(
-                        artifacts,
-                        &options.run_id,
-                        &assignment.id,
+                        max_attempts,
+                        &retry_feedback,
+                        &schema_path,
+                        &worker_schema_path,
+                        &auditor_schema_path,
+                    )
+                } else {
+                    prepare_child_attempt(
+                        context,
+                        outcome,
+                        &active_budget_policy,
+                        &preflight,
+                        journal_parent_id,
                         attempt,
-                        assignment.role,
-                        &outcome.selection_decisions,
-                        &active_budget_policy.initial_selector_decisions,
-                        runtime_name(attempted_launch_model_provenance.launch_runtime),
-                        attempted_launch_model_provenance.launched_model.as_deref(),
-                        requested_effort.as_deref(),
-                        context.execution_runtime == SupervisorExecutionRuntime::Verified,
-                        false,
-                        context.execution_runtime,
+                        max_attempts,
+                        &retry_feedback,
+                        &schema_path,
+                        &worker_schema_path,
+                        &auditor_schema_path,
                         None,
-                        &plan.model_pricing,
-                        Some(attempt_parent_phase_continuation_from_count(
-                            completed_parent_review_cycles,
-                        )),
-                        account_observe,
-                    )?;
-                    return Err(error);
-                }
-            };
-            let attempted_launch_model_provenance = collected.model_provenance.clone();
-            let attempt_external_run = collected.external_run.clone();
-            let disposition = match decide_child_attempt(
-                context,
-                outcome,
-                &preflight,
-                journal_parent_id,
-                attempt,
-                &mut structural_attempt,
-                &mut retry_feedback,
-                &mut attempt_history,
-                &mut warning_streak,
-                collected,
-            ) {
-                Ok(disposition) => disposition,
-                Err(error) => {
-                    record_child_attempt_outcome_with_account_observe(
-                        artifacts,
-                        &options.run_id,
-                        &assignment.id,
+                    )
+                }? {
+                    AssignmentExecutionDisposition::Continue(prepared) => prepared,
+                    AssignmentExecutionDisposition::Complete => return Ok(()),
+                };
+                let attempted_launch_model_provenance = prepared.model_provenance.clone();
+                let requested_effort = prepared.command.reasoning_effort.clone();
+                let account_observe = active_budget_policy.account_observe_environment_decision();
+                let collected = match if managed_parent_cycle {
+                    managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
+                        context,
+                        outcome,
+                        &preflight,
+                        journal_parent_id,
                         attempt,
-                        assignment.role,
-                        &outcome.selection_decisions,
-                        &active_budget_policy.initial_selector_decisions,
-                        runtime_name(attempted_launch_model_provenance.launch_runtime),
-                        attempted_launch_model_provenance.launched_model.as_deref(),
-                        requested_effort.as_deref(),
-                        context.execution_runtime == SupervisorExecutionRuntime::Verified,
-                        false,
-                        context.execution_runtime,
-                        Some(&attempt_external_run),
-                        &plan.model_pricing,
-                        Some(attempt_parent_phase_continuation_from_count(
-                            completed_parent_review_cycles,
-                        )),
-                        account_observe,
-                    )?;
-                    return Err(error);
-                }
-            };
-            let mut recorded_attempt = record_child_attempt_outcome_with_account_observe(
-                artifacts,
-                &options.run_id,
-                &assignment.id,
-                attempt,
-                assignment.role,
-                &outcome.selection_decisions,
-                &active_budget_policy.initial_selector_decisions,
-                runtime_name(attempted_launch_model_provenance.launch_runtime),
-                attempted_launch_model_provenance.launched_model.as_deref(),
-                requested_effort.as_deref(),
-                context.execution_runtime == SupervisorExecutionRuntime::Verified,
-                matches!(&disposition, ChildAttemptDisposition::Retry),
-                context.execution_runtime,
-                Some(&attempt_external_run),
-                &plan.model_pricing,
-                Some(attempt_parent_phase_continuation_from_count(
-                    completed_parent_review_cycles,
-                )),
-                account_observe,
-            )?;
-            match disposition {
-                ChildAttemptDisposition::Retry => {
-                    persist_proven_worker_attempt_bypassed_parent_review(
-                        artifacts,
-                        &mut recorded_attempt,
-                    )?;
-                    continue;
-                }
-                ChildAttemptDisposition::Finish {
-                    report,
-                    containment_verified,
-                    gate_terminal,
-                } => {
-                    child_result =
-                        Some((report, attempted_launch_model_provenance, recorded_attempt));
-                    child_containment_verified = containment_verified;
-                    child_gate_terminal = gate_terminal;
-                    break;
+                        prepared,
+                        &active_budget_policy,
+                        max_attempts,
+                        &schema_path,
+                        &worker_schema_path,
+                        &auditor_schema_path,
+                    )
+                } else {
+                    dispatch_and_collect_child_attempt(
+                        context,
+                        outcome,
+                        &preflight,
+                        journal_parent_id,
+                        attempt,
+                        prepared,
+                    )
+                } {
+                    Ok(collected) => collected,
+                    Err(error) => {
+                        record_child_attempt_outcome_with_account_observe(
+                            artifacts,
+                            &options.run_id,
+                            &assignment.id,
+                            attempt,
+                            assignment.role,
+                            &outcome.selection_decisions,
+                            &active_budget_policy.initial_selector_decisions,
+                            runtime_name(attempted_launch_model_provenance.launch_runtime),
+                            attempted_launch_model_provenance.launched_model.as_deref(),
+                            requested_effort.as_deref(),
+                            context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                            false,
+                            context.execution_runtime,
+                            None,
+                            &plan.model_pricing,
+                            Some(attempt_parent_phase_continuation_from_count(
+                                completed_parent_review_cycles,
+                            )),
+                            account_observe,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                let attempted_launch_model_provenance = collected.model_provenance.clone();
+                let attempt_external_run = collected.external_run.clone();
+                let disposition = match decide_child_attempt(
+                    context,
+                    outcome,
+                    &preflight,
+                    journal_parent_id,
+                    attempt,
+                    &mut structural_attempt,
+                    &mut retry_feedback,
+                    &mut attempt_history,
+                    &mut warning_streak,
+                    collected,
+                ) {
+                    Ok(disposition) => disposition,
+                    Err(error) => {
+                        record_child_attempt_outcome_with_account_observe(
+                            artifacts,
+                            &options.run_id,
+                            &assignment.id,
+                            attempt,
+                            assignment.role,
+                            &outcome.selection_decisions,
+                            &active_budget_policy.initial_selector_decisions,
+                            runtime_name(attempted_launch_model_provenance.launch_runtime),
+                            attempted_launch_model_provenance.launched_model.as_deref(),
+                            requested_effort.as_deref(),
+                            context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                            false,
+                            context.execution_runtime,
+                            Some(&attempt_external_run),
+                            &plan.model_pricing,
+                            Some(attempt_parent_phase_continuation_from_count(
+                                completed_parent_review_cycles,
+                            )),
+                            account_observe,
+                        )?;
+                        return Err(error);
+                    }
+                };
+                let mut recorded_attempt = record_child_attempt_outcome_with_account_observe(
+                    artifacts,
+                    &options.run_id,
+                    &assignment.id,
+                    attempt,
+                    assignment.role,
+                    &outcome.selection_decisions,
+                    &active_budget_policy.initial_selector_decisions,
+                    runtime_name(attempted_launch_model_provenance.launch_runtime),
+                    attempted_launch_model_provenance.launched_model.as_deref(),
+                    requested_effort.as_deref(),
+                    context.execution_runtime == SupervisorExecutionRuntime::Verified,
+                    matches!(&disposition, ChildAttemptDisposition::Retry),
+                    context.execution_runtime,
+                    Some(&attempt_external_run),
+                    &plan.model_pricing,
+                    Some(attempt_parent_phase_continuation_from_count(
+                        completed_parent_review_cycles,
+                    )),
+                    account_observe,
+                )?;
+                match disposition {
+                    ChildAttemptDisposition::Retry => {
+                        persist_proven_worker_attempt_bypassed_parent_review(
+                            artifacts,
+                            &mut recorded_attempt,
+                        )?;
+                        continue;
+                    }
+                    ChildAttemptDisposition::Finish {
+                        report,
+                        containment_verified,
+                        gate_terminal,
+                    } => {
+                        child_result =
+                            Some((report, attempted_launch_model_provenance, recorded_attempt));
+                        child_containment_verified = containment_verified;
+                        child_gate_terminal = gate_terminal;
+                        break;
+                    }
                 }
             }
-        }
 
-        let Some((mut child_report, child_launch_model_provenance, mut terminal_attempt_outcome)) =
-            child_result
-        else {
-            let error = anyhow!(
-                "child orchestrator '{}' did not produce a collected report after retries",
-                assignment.id
-            );
-            record_isolated_assignment_failure(
-                outcome,
-                assignment,
-                "child report collection",
-                &error,
-            );
-            return Ok(());
-        };
-        if plan.max_child_retries > 0 {
-            append_child_attempt_history(&mut child_report, &attempt_history);
-        }
-        let pre_auditor_candidate = if child_containment_verified {
-            if preflight.primary_scope_baseline.is_some() {
-                if !child_report.decomposition_completions.is_empty() {
-                    let error = anyhow!(
+            let Some((
+                mut child_report,
+                child_launch_model_provenance,
+                mut terminal_attempt_outcome,
+            )) = child_result
+            else {
+                let error = anyhow!(
+                    "child orchestrator '{}' did not produce a collected report after retries",
+                    assignment.id
+                );
+                record_isolated_assignment_failure(
+                    outcome,
+                    assignment,
+                    "child report collection",
+                    &error,
+                );
+                return Ok(());
+            };
+            if plan.max_child_retries > 0 {
+                append_child_attempt_history(&mut child_report, &attempt_history);
+            }
+            let pre_auditor_candidate = if child_containment_verified {
+                if preflight.primary_scope_baseline.is_some() {
+                    if !child_report.decomposition_completions.is_empty() {
+                        let error = anyhow!(
                         "primary-worktree execution does not support megafile decomposition evidence"
                     );
-                    reject_supervisor_candidate_binding(
-                        &mut child_report,
-                        &final_report_path,
-                        &error,
-                    );
-                    None
-                } else if !report_failed(&child_report) {
-                    inspect_assignment_candidate(context, &preflight).ok()
-                } else {
-                    None
-                }
-            } else {
-                let lease = preflight
-                    .worktree_write_lease
-                    .as_ref()
-                    .context("managed decomposition candidate has no worktree lease")?;
-                match bind_supervisor_decomposition_candidate(
-                    repo,
-                    assignment,
-                    &mut child_report,
-                    lease,
-                    context.worktree_creation.expected_source_head(),
-                ) {
-                    Ok(Some(inspection)) => Some(inspection),
-                    Ok(None) if !report_failed(&child_report) => {
-                        inspect_assignment_candidate(context, &preflight).ok()
-                    }
-                    Ok(None) => None,
-                    Err(error) => {
                         reject_supervisor_candidate_binding(
                             &mut child_report,
                             &final_report_path,
                             &error,
                         );
                         None
+                    } else if !report_failed(&child_report) {
+                        inspect_assignment_candidate(context, &preflight).ok()
+                    } else {
+                        None
+                    }
+                } else {
+                    let lease = preflight
+                        .worktree_write_lease
+                        .as_ref()
+                        .context("managed decomposition candidate has no worktree lease")?;
+                    match bind_supervisor_decomposition_candidate(
+                        repo,
+                        assignment,
+                        &mut child_report,
+                        lease,
+                        context.worktree_creation.expected_source_head(),
+                    ) {
+                        Ok(Some(inspection)) => Some(inspection),
+                        Ok(None) if !report_failed(&child_report) => {
+                            inspect_assignment_candidate(context, &preflight).ok()
+                        }
+                        Ok(None) => None,
+                        Err(error) => {
+                            reject_supervisor_candidate_binding(
+                                &mut child_report,
+                                &final_report_path,
+                                &error,
+                            );
+                            None
+                        }
                     }
                 }
-            }
-        } else {
-            None
-        };
-        let parent_held_out =
-            if let Some(authority) = &context.assignment_metadata.parent_validation {
-                let evidence = authority.validate_candidate(
-                    context,
-                    &preflight,
-                    pre_auditor_candidate.as_ref(),
-                )?;
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    writer.write_json(
-                        Path::new("reports").join(format!("{}-held-out.json", assignment.id)),
-                        &evidence,
-                        ArtifactFileDisposition::PrivateEvidence,
-                    )?;
-                    Ok(())
-                })?;
-                for command in &evidence.commands {
-                    child_report.validation_results.push(ValidationResult {
-                        name: format!("parent held-out: {}", command.id),
-                        status: if command.observation.status
-                            == crate::merge::held_out::CommandObservationStatus::Passed
-                        {
-                            ReviewStatus::Succeeded
-                        } else {
-                            ReviewStatus::Failed
-                        },
-                        command: command.argv.clone(),
-                        message: Some(format!(
-                            "parent-bound observation {}: {:?}",
-                            command.command_sha256, command.observation.status
-                        )),
-                    });
-                }
-                if !evidence.passed() {
-                    child_report.status = ReviewStatus::Failed;
-                    child_report.accepted = false;
-                    child_report.rejected = true;
-                }
-                Some(evidence)
             } else {
                 None
             };
-        if let Some(source) = context.evidence_only_reaudit {
-            let binding_matches = pre_auditor_candidate.as_ref().is_some_and(|inspection| {
-                inspection.binding == source.operation.preserved_candidate_binding
-            });
-            if !binding_matches {
-                let denial = GateDenial::new(
-                    gate_correlation_id(&assignment.id, 1),
-                    GateDenialReason::MergeRemediation {
-                        blocker: GateApplyBlocker::StaleBase,
-                    },
-                    VerifiedGateContext::new(
-                        &assignment.id,
-                        GateCheckSource::ValidationBinding,
-                        &assignment.assigned_paths,
-                    )?,
-                )
-                .context("failed to construct evidence-only content-binding denial")?;
-                outcome
-                    .gate_tracker
-                    .as_mut()
-                    .context("gate correction tracker was not initialized")?
-                    .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
-                child_report.status = ReviewStatus::Failed;
-                child_report.accepted = false;
-                child_report.rejected = true;
-                child_report.findings.push(Finding {
+            let parent_held_out =
+                if let Some(authority) = &context.assignment_metadata.parent_validation {
+                    let evidence = authority.validate_candidate(
+                        context,
+                        &preflight,
+                        pre_auditor_candidate.as_ref(),
+                    )?;
+                    with_supervisor_artifacts(artifacts, |writer, _| {
+                        writer.write_json(
+                            Path::new("reports").join(format!("{}-held-out.json", assignment.id)),
+                            &evidence,
+                            ArtifactFileDisposition::PrivateEvidence,
+                        )?;
+                        Ok(())
+                    })?;
+                    for command in &evidence.commands {
+                        child_report.validation_results.push(ValidationResult {
+                            name: format!("parent held-out: {}", command.id),
+                            status: if command.observation.status
+                                == crate::merge::held_out::CommandObservationStatus::Passed
+                            {
+                                ReviewStatus::Succeeded
+                            } else {
+                                ReviewStatus::Failed
+                            },
+                            command: command.argv.clone(),
+                            message: Some(format!(
+                                "parent-bound observation {}: {:?}",
+                                command.command_sha256, command.observation.status
+                            )),
+                        });
+                    }
+                    if !evidence.passed() {
+                        child_report.status = ReviewStatus::Failed;
+                        child_report.accepted = false;
+                        child_report.rejected = true;
+                    }
+                    Some(evidence)
+                } else {
+                    None
+                };
+            if let Some(source) = context.evidence_only_reaudit {
+                let binding_matches = pre_auditor_candidate.as_ref().is_some_and(|inspection| {
+                    inspection.binding == source.operation.preserved_candidate_binding
+                });
+                if !binding_matches {
+                    let denial = GateDenial::new(
+                        gate_correlation_id(&assignment.id, 1),
+                        GateDenialReason::MergeRemediation {
+                            blocker: GateApplyBlocker::StaleBase,
+                        },
+                        VerifiedGateContext::new(
+                            &assignment.id,
+                            GateCheckSource::ValidationBinding,
+                            &assignment.assigned_paths,
+                        )?,
+                    )
+                    .context("failed to construct evidence-only content-binding denial")?;
+                    outcome
+                        .gate_tracker
+                        .as_mut()
+                        .context("gate correction tracker was not initialized")?
+                        .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
+                    child_report.status = ReviewStatus::Failed;
+                    child_report.accepted = false;
+                    child_report.rejected = true;
+                    child_report.findings.push(Finding {
                     severity: FindingSeverity::Error,
                     message:
                         "evidence-only report stage changed or lost the preserved candidate binding"
                             .to_string(),
                     paths: assignment.assigned_paths.clone(),
                 });
-                child_gate_terminal = true;
+                    child_gate_terminal = true;
+                }
             }
-        }
-        if assignment.role == AgentRole::ChildOrchestrator {
-            with_supervisor_artifacts(artifacts, |writer, _| {
-                write_child_report(writer, &final_report_relative, &child_report)
-            })?;
-        }
+            if assignment.role == AgentRole::ChildOrchestrator {
+                with_supervisor_artifacts(artifacts, |writer, _| {
+                    write_child_report(writer, &final_report_relative, &child_report)
+                })?;
+            }
 
-        let mut assignment_containment_verified = child_containment_verified;
-        let mut auditor_primary_integrity_failed = false;
-        let mut auditor_sandbox_denied = false;
-        let mut auditor_environment_blocked = false;
-        let parent_review_required = child_containment_verified
-            && !child_gate_terminal
-            && parent_auditor_required(assignment, &child_report);
-        let review_cycle_slot =
-            review_cycle_slot_for_completed_dispatched_cycles(completed_parent_review_cycles);
-        let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
-            &assignment.id,
-            terminal_attempt_outcome.attempt,
-            review_cycle_slot,
-        );
-        let mut parent_review_dispatched = false;
-        if parent_review_required {
-            parent_review_dispatched = true;
-            let transcript_relative = attempt_history
-                .last()
-                .map(|history| history.raw_stdout_path.as_path())
-                .context("successful child attempt has no retained transcript evidence")?;
-            let child_transcript = with_supervisor_artifacts(artifacts, |writer, _| {
-                read_authenticated_review_transcript(writer, transcript_relative)
-            })?;
-            let review_base = context
-                .evidence_only_reaudit
-                .and_then(|source| {
-                    source
-                        .operation
-                        .preserved_candidate_binding
-                        .primary_head
-                        .as_deref()
-                })
-                .map(str::parse::<Oid>)
-                .transpose()
-                .context("preserved candidate binding primary HEAD is invalid")?
-                .unwrap_or(preflight.child_base_head);
-            let diff = if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
-                let current = capture_primary_scope_snapshot(
-                    repo,
-                    &assignment.assigned_paths,
-                    false,
-                    context.execution_runtime,
+            let mut assignment_containment_verified = child_containment_verified;
+            let mut auditor_primary_integrity_failed = false;
+            let mut auditor_sandbox_denied = false;
+            let mut auditor_environment_blocked = false;
+            let parent_review_required = child_containment_verified
+                && !child_gate_terminal
+                && parent_auditor_required(assignment, &child_report);
+            let review_cycle_slot =
+                review_cycle_slot_for_completed_dispatched_cycles(completed_parent_review_cycles);
+            let mut review_cost_binding = ParentWorkerAttemptReviewCostBinding::bind(
+                &assignment.id,
+                terminal_attempt_outcome.attempt,
+                review_cycle_slot,
+            );
+            let mut parent_review_dispatched = false;
+            if parent_review_required {
+                parent_review_dispatched = true;
+                let transcript_relative = attempt_history
+                    .last()
+                    .map(|history| history.raw_stdout_path.as_path())
+                    .context("successful child attempt has no retained transcript evidence")?;
+                let child_transcript = with_supervisor_artifacts(artifacts, |writer, _| {
+                    read_authenticated_review_transcript(writer, transcript_relative)
+                })?;
+                let review_base = context
+                    .evidence_only_reaudit
+                    .and_then(|source| {
+                        source
+                            .operation
+                            .preserved_candidate_binding
+                            .primary_head
+                            .as_deref()
+                    })
+                    .map(str::parse::<Oid>)
+                    .transpose()
+                    .context("preserved candidate binding primary HEAD is invalid")?
+                    .unwrap_or(preflight.child_base_head);
+                let diff = if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
+                    let current = capture_primary_scope_snapshot(
+                        repo,
+                        &assignment.assigned_paths,
+                        false,
+                        context.execution_runtime,
+                    )?;
+                    render_primary_scope_diff(baseline, &current)?
+                } else {
+                    collect_diff_since_base(
+                        &preflight.worktree.path,
+                        &review_base,
+                        REVIEW_LENS_REQUEST_LIMIT_BYTES,
+                    )?
+                };
+                let output_report = serde_json::to_string(&child_report)
+                    .context("failed to serialize child output report for review lenses")?;
+                let review_bindings = supervisor_review_lens_binding_material(
+                    assignment,
+                    &child_report,
+                    pre_auditor_candidate.as_ref(),
+                    parent_held_out.as_ref(),
                 )?;
-                render_primary_scope_diff(baseline, &current)?
-            } else {
-                collect_diff_since_base(
-                    &preflight.worktree.path,
-                    &review_base,
-                    REVIEW_LENS_REQUEST_LIMIT_BYTES,
-                )?
-            };
-            let output_report = serde_json::to_string(&child_report)
-                .context("failed to serialize child output report for review lenses")?;
-            let review_bindings = supervisor_review_lens_binding_material(
-                assignment,
-                &child_report,
-                pre_auditor_candidate.as_ref(),
-                parent_held_out.as_ref(),
-            )?;
-            let sources = crate::review::BoundedReviewLensRequestSources {
-                child_transcript: &child_transcript,
-                authoritative_transcript_path: transcript_relative,
-                diff: &diff,
-                output_report: &output_report,
-                bindings: &review_bindings,
-            };
-            let required_coverage =
-                supervisor_review_coverage_requirement(assignment, &child_report);
-            let active_plan = active_budget_policy.apply(plan);
-            let auditor_launch_runtime = active_budget_policy
-                .selected_runtime_for(AgentRole::Auditor)
-                .unwrap_or(options.runtime);
-            let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
-            let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
-            review_cost_binding.begin_stacked_parent_review_lenses(active_plan.review_lenses.len());
-            let mut assignment_complete_after_review = false;
-            let mut review_stack_error: Option<anyhow::Error> = None;
-            'review_lenses: for (lens_index, lens) in active_plan.review_lenses.iter().enumerate() {
-                let expected_request =
-                    match crate::review::build_bounded_review_lens_request(lens, sources) {
-                        Ok(expected_request) => expected_request,
-                        Err(error) => {
-                            review_stack_error = Some(error);
-                            break 'review_lenses;
-                        }
-                    };
-                let runtime_validation = validate_review_lens_runtime_selection(
-                    lens,
-                    auditor_launch_runtime,
-                    runtime_model_catalog,
-                );
-                if let Err(error) = runtime_validation {
-                    review_cost_binding.record_parent_auditor_lens_undispatched();
-                    child_report.findings.push(Finding {
+                let sources = crate::review::BoundedReviewLensRequestSources {
+                    child_transcript: &child_transcript,
+                    authoritative_transcript_path: transcript_relative,
+                    diff: &diff,
+                    output_report: &output_report,
+                    bindings: &review_bindings,
+                };
+                let required_coverage =
+                    supervisor_review_coverage_requirement(assignment, &child_report);
+                let active_plan = active_budget_policy.apply(plan);
+                let auditor_launch_runtime = active_budget_policy
+                    .selected_runtime_for(AgentRole::Auditor)
+                    .unwrap_or(options.runtime);
+                let mut expected_requests = Vec::with_capacity(active_plan.review_lenses.len());
+                let mut verdicts = Vec::with_capacity(active_plan.review_lenses.len());
+                review_cost_binding
+                    .begin_stacked_parent_review_lenses(active_plan.review_lenses.len());
+                let mut assignment_complete_after_review = false;
+                let mut review_stack_error: Option<anyhow::Error> = None;
+                'review_lenses: for (lens_index, lens) in
+                    active_plan.review_lenses.iter().enumerate()
+                {
+                    let expected_request =
+                        match crate::review::build_bounded_review_lens_request(lens, sources) {
+                            Ok(expected_request) => expected_request,
+                            Err(error) => {
+                                review_stack_error = Some(error);
+                                break 'review_lenses;
+                            }
+                        };
+                    let runtime_validation = validate_review_lens_runtime_selection(
+                        lens,
+                        auditor_launch_runtime,
+                        runtime_model_catalog,
+                    );
+                    if let Err(error) = runtime_validation {
+                        review_cost_binding.record_parent_auditor_lens_undispatched();
+                        child_report.findings.push(Finding {
                         severity: FindingSeverity::Error,
                         message: format!(
                             "review lens '{}' could not be dispatched with its configured runtime selection: {error:#}",
@@ -7187,133 +8141,154 @@ fn execute_supervisor_assignment_inner(
                         ),
                         paths: assignment.assigned_paths.clone(),
                     });
-                    match ReviewLensVerdict::for_lens(
-                        lens,
-                        expected_request.request_binding.clone(),
-                        ReviewLensVerdictStatus::ProceduralFailure,
-                        ReviewLensCoverage::default(),
-                        Vec::new(),
+                        match ReviewLensVerdict::for_lens(
+                            lens,
+                            expected_request.request_binding.clone(),
+                            ReviewLensVerdictStatus::ProceduralFailure,
+                            ReviewLensCoverage::default(),
+                            Vec::new(),
+                        ) {
+                            Ok(verdict) => verdicts.push(verdict),
+                            Err(error) => {
+                                review_stack_error = Some(error);
+                                break 'review_lenses;
+                            }
+                        }
+                        expected_requests.push(expected_request);
+                        continue;
+                    }
+                    let prepared_auditor = match prepare_parent_auditor(
+                        context,
+                        outcome,
+                        &preflight,
+                        journal_parent_id,
+                        &mut child_report,
+                        &mut auditor_attempt,
+                        ParentAuditorLensExecution {
+                            budget_policy: &active_budget_policy,
+                            lens,
+                            lens_index,
+                            expected_request: &expected_request,
+                            required_coverage: &required_coverage,
+                        },
                     ) {
-                        Ok(verdict) => verdicts.push(verdict),
+                        Ok(ParentAuditorPreparation::Ready(prepared)) => prepared,
+                        Ok(ParentAuditorPreparation::AssignmentComplete) => {
+                            assignment_complete_after_review = true;
+                            break 'review_lenses;
+                        }
+                        Ok(ParentAuditorPreparation::GateComplete { verdict }) => {
+                            review_cost_binding.mark_parent_review_stack_short_circuited();
+                            expected_requests.push(expected_request);
+                            verdicts.push(verdict);
+                            for remaining_lens in
+                                active_plan.review_lenses.iter().skip(lens_index + 1)
+                            {
+                                match crate::review::build_bounded_review_lens_request(
+                                    remaining_lens,
+                                    sources,
+                                ) {
+                                    Ok(remaining_request) => {
+                                        match ReviewLensVerdict::for_lens(
+                                            remaining_lens,
+                                            remaining_request.request_binding.clone(),
+                                            ReviewLensVerdictStatus::ProceduralFailure,
+                                            ReviewLensCoverage::default(),
+                                            Vec::new(),
+                                        ) {
+                                            Ok(remaining_verdict) => {
+                                                verdicts.push(remaining_verdict);
+                                                expected_requests.push(remaining_request);
+                                            }
+                                            Err(error) => {
+                                                review_stack_error = Some(error);
+                                                break 'review_lenses;
+                                            }
+                                        }
+                                    }
+                                    Err(error) => {
+                                        review_stack_error = Some(error);
+                                        break 'review_lenses;
+                                    }
+                                }
+                            }
+                            break 'review_lenses;
+                        }
+                        Err(error) => {
+                            review_stack_error = Some(error);
+                            break 'review_lenses;
+                        }
+                    };
+                    let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
+                        journal_parent_id,
+                        auditor_attempt,
+                        review_cost_binding: &mut review_cost_binding,
+                        dated_plan_pricing: &active_plan.model_pricing,
+                    };
+                    match dispatch_and_collect_parent_auditor(
+                        context,
+                        outcome,
+                        &preflight,
+                        &mut child_report,
+                        prepared_auditor,
+                        &mut auditor_dispatch_frame,
+                    ) {
+                        Ok(auditor_collection) => {
+                            assignment_containment_verified &=
+                                auditor_collection.containment_verified;
+                            auditor_primary_integrity_failed |=
+                                auditor_collection.primary_integrity_failed;
+                            auditor_sandbox_denied |= auditor_collection.sandbox_denied;
+                            auditor_environment_blocked |= auditor_collection.environment_blocked;
+                            expected_requests.push(expected_request);
+                            verdicts.push(auditor_collection.verdict);
+                        }
                         Err(error) => {
                             review_stack_error = Some(error);
                             break 'review_lenses;
                         }
                     }
-                    expected_requests.push(expected_request);
-                    continue;
                 }
-                let prepared_auditor = match prepare_parent_auditor(
-                    context,
-                    outcome,
-                    &preflight,
-                    journal_parent_id,
-                    &mut child_report,
-                    &mut auditor_attempt,
-                    ParentAuditorLensExecution {
-                        budget_policy: &active_budget_policy,
-                        lens,
-                        lens_index,
-                        expected_request: &expected_request,
-                        required_coverage: &required_coverage,
-                    },
+                if assignment_complete_after_review || review_stack_error.is_some() {
+                    return persist_review_cycle_attribution_or_chain_primary(
+                        artifacts,
+                        &review_cost_binding,
+                        &mut terminal_attempt_outcome,
+                        &mut completed_parent_review_cycles,
+                        if assignment_complete_after_review {
+                            None
+                        } else {
+                            review_stack_error
+                        },
+                    );
+                }
+                let aggregate = match aggregate_active_parent_review_lenses(
+                    &active_plan,
+                    &expected_requests,
+                    required_coverage,
+                    verdicts,
                 ) {
-                    Ok(ParentAuditorPreparation::Ready(prepared)) => prepared,
-                    Ok(ParentAuditorPreparation::AssignmentComplete) => {
-                        assignment_complete_after_review = true;
-                        break 'review_lenses;
-                    }
-                    Ok(ParentAuditorPreparation::GateComplete { verdict }) => {
-                        review_cost_binding.mark_parent_review_stack_short_circuited();
-                        expected_requests.push(expected_request);
-                        verdicts.push(verdict);
-                        for remaining_lens in active_plan.review_lenses.iter().skip(lens_index + 1)
-                        {
-                            match crate::review::build_bounded_review_lens_request(
-                                remaining_lens,
-                                sources,
-                            ) {
-                                Ok(remaining_request) => {
-                                    match ReviewLensVerdict::for_lens(
-                                        remaining_lens,
-                                        remaining_request.request_binding.clone(),
-                                        ReviewLensVerdictStatus::ProceduralFailure,
-                                        ReviewLensCoverage::default(),
-                                        Vec::new(),
-                                    ) {
-                                        Ok(remaining_verdict) => {
-                                            verdicts.push(remaining_verdict);
-                                            expected_requests.push(remaining_request);
-                                        }
-                                        Err(error) => {
-                                            review_stack_error = Some(error);
-                                            break 'review_lenses;
-                                        }
-                                    }
-                                }
-                                Err(error) => {
-                                    review_stack_error = Some(error);
-                                    break 'review_lenses;
-                                }
-                            }
-                        }
-                        break 'review_lenses;
-                    }
+                    Ok(aggregate) => aggregate,
                     Err(error) => {
-                        review_stack_error = Some(error);
-                        break 'review_lenses;
+                        return persist_review_cycle_attribution_or_chain_primary(
+                            artifacts,
+                            &review_cost_binding,
+                            &mut terminal_attempt_outcome,
+                            &mut completed_parent_review_cycles,
+                            Some(error),
+                        );
                     }
                 };
-                let mut auditor_dispatch_frame = ParentAuditorDispatchFrame {
-                    journal_parent_id,
-                    auditor_attempt,
-                    review_cost_binding: &mut review_cost_binding,
-                    dated_plan_pricing: &active_plan.model_pricing,
-                };
-                match dispatch_and_collect_parent_auditor(
-                    context,
-                    outcome,
-                    &preflight,
-                    &mut child_report,
-                    prepared_auditor,
-                    &mut auditor_dispatch_frame,
-                ) {
-                    Ok(auditor_collection) => {
-                        assignment_containment_verified &= auditor_collection.containment_verified;
-                        auditor_primary_integrity_failed |=
-                            auditor_collection.primary_integrity_failed;
-                        auditor_sandbox_denied |= auditor_collection.sandbox_denied;
-                        auditor_environment_blocked |= auditor_collection.environment_blocked;
-                        expected_requests.push(expected_request);
-                        verdicts.push(auditor_collection.verdict);
-                    }
-                    Err(error) => {
-                        review_stack_error = Some(error);
-                        break 'review_lenses;
-                    }
-                }
-            }
-            if assignment_complete_after_review || review_stack_error.is_some() {
-                return persist_review_cycle_attribution_or_chain_primary(
-                    artifacts,
-                    &review_cost_binding,
-                    &mut terminal_attempt_outcome,
-                    &mut completed_parent_review_cycles,
-                    if assignment_complete_after_review {
-                        None
-                    } else {
-                        review_stack_error
-                    },
-                );
-            }
-            let aggregate = match aggregate_active_parent_review_lenses(
-                &active_plan,
-                &expected_requests,
-                required_coverage,
-                verdicts,
-            ) {
-                Ok(aggregate) => aggregate,
-                Err(error) => {
+                if let Err(error) = with_supervisor_artifacts(artifacts, |writer, journal| {
+                    record_gate_correction_event_strict(
+                        journal,
+                        writer,
+                        &assignment.id,
+                        Some(journal_parent_id),
+                        OrchestrationRole::Auditor,
+                        json!({"review_lens_aggregate": &aggregate}),
+                    )
+                }) {
                     return persist_review_cycle_attribution_or_chain_primary(
                         artifacts,
                         &review_cost_binding,
@@ -7322,107 +8297,115 @@ fn execute_supervisor_assignment_inner(
                         Some(error),
                     );
                 }
-            };
-            if let Err(error) = with_supervisor_artifacts(artifacts, |writer, journal| {
-                record_gate_correction_event_strict(
-                    journal,
-                    writer,
-                    &assignment.id,
-                    Some(journal_parent_id),
-                    OrchestrationRole::Auditor,
-                    json!({"review_lens_aggregate": &aggregate}),
-                )
-            }) {
-                return persist_review_cycle_attribution_or_chain_primary(
+                if aggregate.decision != ReviewAggregationDecision::Accept {
+                    child_report.status = ReviewStatus::Failed;
+                    child_report.accepted = false;
+                    child_report.rejected = true;
+                    child_report.findings.push(Finding {
+                        severity: FindingSeverity::Error,
+                        message: format!(
+                            "stacked review-lens gate did not accept: {:?}",
+                            aggregate.decision
+                        ),
+                        paths: assignment.assigned_paths.clone(),
+                    });
+                }
+                child_report.review_lens_aggregate = Some(aggregate);
+                finalize_parent_review_cycle_attribution_for_worker_attempt(
                     artifacts,
                     &review_cost_binding,
                     &mut terminal_attempt_outcome,
                     &mut completed_parent_review_cycles,
-                    Some(error),
-                );
-            }
-            if aggregate.decision != ReviewAggregationDecision::Accept {
-                child_report.status = ReviewStatus::Failed;
-                child_report.accepted = false;
-                child_report.rejected = true;
-                child_report.findings.push(Finding {
-                    severity: FindingSeverity::Error,
-                    message: format!(
-                        "stacked review-lens gate did not accept: {:?}",
-                        aggregate.decision
-                    ),
-                    paths: assignment.assigned_paths.clone(),
-                });
-            }
-            child_report.review_lens_aggregate = Some(aggregate);
-            finalize_parent_review_cycle_attribution_for_worker_attempt(
-                artifacts,
-                &review_cost_binding,
-                &mut terminal_attempt_outcome,
-                &mut completed_parent_review_cycles,
-            )?;
-        }
-        match decide_parent_auditor_gate(
-            context,
-            outcome,
-            &preflight,
-            journal_parent_id,
-            &final_report_path,
-            child_containment_verified,
-            assignment_containment_verified,
-            auditor_primary_integrity_failed,
-            auditor_sandbox_denied,
-            auditor_environment_blocked,
-            pre_auditor_candidate,
-            child_report,
-            &mut retry_feedback,
-        )? {
-            ParentAuditorGateDisposition::Retry => {
-                record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
-                warning_streak = None;
-                continue 'gate_controller;
-            }
-            ParentAuditorGateDisposition::Complete {
-                report,
-                candidate,
-                containment_verified,
-            } => {
-                if !parent_review_dispatched && !parent_auditor_required(assignment, &report) {
-                    persist_proven_no_parent_review_cycle_costs(
-                        artifacts,
-                        &mut terminal_attempt_outcome,
-                    )?;
-                }
-                persist_parent_terminal_assignment_outcome(
-                    artifacts,
-                    &mut terminal_attempt_outcome,
-                    &report,
-                    child_gate_terminal,
-                    auditor_environment_blocked,
-                    auditor_sandbox_denied,
-                    auditor_primary_integrity_failed,
                 )?;
-                break 'gate_controller (
+            }
+            match decide_parent_auditor_gate(
+                context,
+                outcome,
+                &preflight,
+                journal_parent_id,
+                &final_report_path,
+                child_containment_verified,
+                assignment_containment_verified,
+                auditor_primary_integrity_failed,
+                auditor_sandbox_denied,
+                auditor_environment_blocked,
+                pre_auditor_candidate,
+                child_report,
+                &mut retry_feedback,
+            )? {
+                ParentAuditorGateDisposition::Retry => {
+                    record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
+                    warning_streak = None;
+                    continue 'gate_controller;
+                }
+                ParentAuditorGateDisposition::Complete {
                     report,
                     candidate,
                     containment_verified,
-                    child_launch_model_provenance,
-                );
+                } => {
+                    if !parent_review_dispatched && !parent_auditor_required(assignment, &report) {
+                        persist_proven_no_parent_review_cycle_costs(
+                            artifacts,
+                            &mut terminal_attempt_outcome,
+                        )?;
+                    }
+                    persist_parent_terminal_assignment_outcome(
+                        artifacts,
+                        &mut terminal_attempt_outcome,
+                        &report,
+                        child_gate_terminal,
+                        auditor_environment_blocked,
+                        auditor_sandbox_denied,
+                        auditor_primary_integrity_failed,
+                    )?;
+                    break 'gate_controller (
+                        report,
+                        candidate,
+                        containment_verified,
+                        child_launch_model_provenance,
+                    );
+                }
             }
-        }
-    };
-    publish_assignment_report(
-        context,
-        outcome,
-        &preflight,
-        Some(&completed_launch_model_provenance),
-        journal_parent_id,
-        &final_report_relative,
-        &final_report_path,
-        child_report,
-        completed_candidate_inspection,
-        completed_assignment_containment,
-    )
+        };
+        publish_assignment_report(
+            context,
+            outcome,
+            &preflight,
+            Some(&completed_launch_model_provenance),
+            journal_parent_id,
+            &final_report_relative,
+            &final_report_path,
+            child_report,
+            completed_candidate_inspection,
+            completed_assignment_containment,
+        )
+    })();
+    if outcome.external_containment_failed
+        && managed_isolated_descendants_active(context, &preflight)
+    {
+        // The controller can only borrow this preflight. Retain its real parent
+        // write lease and controls whenever a quarantined descendant/source is
+        // still live; durable claims alone are not process/lease ownership.
+        std::mem::forget(preflight);
+    }
+    result
+}
+
+fn managed_isolated_descendants_active(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+) -> bool {
+    !preflight.assignment.worker_assignments.is_empty()
+        && context.sync_store.snapshot().map_or(true, |claims| {
+            claims.iter().any(|claim| {
+                claim.token != preflight.claim.token
+                    && preflight
+                        .assignment
+                        .worker_assignments
+                        .iter()
+                        .any(|worker| worker.id == claim.agent_id)
+            })
+        })
 }
 
 #[cfg(test)]
@@ -7613,7 +8596,23 @@ mod decomposition_tests {
     static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
     #[cfg(target_os = "linux")]
-    fn verify_prepared_researcher_messaging_prompt(with_source_inputs: bool) -> Result<()> {
+    fn verify_prepared_researcher_messaging_prompt(
+        with_source_inputs: bool,
+        dispatch_case: Option<&str>,
+    ) -> Result<()> {
+        let runtime = if dispatch_case.is_some_and(|case| case != "codex") {
+            SupervisorRuntime::GeminiCli
+        } else {
+            SupervisorRuntime::Codex
+        };
+        let _model_overlay = if runtime == SupervisorRuntime::GeminiCli {
+            Some(install_test_fixture_models(&[(
+                "gemini-read-only-live-binding-fixture",
+                ModelCapabilityClass::GeneralJudgment,
+            )])?)
+        } else {
+            None
+        };
         let temp = tempfile::tempdir()?;
         let repo = temp.path().join("repo");
         Repository::init(&repo)?;
@@ -7636,6 +8635,15 @@ mod decomposition_tests {
                 "task": "Inspect README.md. No writes or delegation."
             }]
         });
+        if dispatch_case.is_some() {
+            plan_value["child_timeout_seconds"] = json!(300);
+        }
+        if runtime == SupervisorRuntime::GeminiCli {
+            plan_value["assignments"][0]["runtime"] = json!("gemini-cli");
+            plan_value["role_models"]["researcher"]["model"] =
+                json!("gemini-read-only-live-binding-fixture");
+            plan_value["role_models"]["researcher"]["reasoning_effort"] = json!(null);
+        }
         if with_source_inputs {
             plan_value["assignments"][0]["source_inputs"] = serde_json::json!([{
                 "path": "README.md",
@@ -7649,10 +8657,10 @@ mod decomposition_tests {
         let options = SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: temp.path().join("plan.json"),
-            run_id: RunId::new("researcher-prompt-order")?,
+            run_id: RunId::new("researcher-prompt-order-run")?,
             parent_node: None,
             codex_bin: PathBuf::from("unused-codex"),
-            runtime: SupervisorRuntime::Codex,
+            runtime,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
@@ -7688,9 +8696,41 @@ mod decomposition_tests {
         let sync_store = SyncStore::open(&repo)?;
         let semantic_store = SemanticIntentStore::open(&repo)?;
         let field_guide = SupervisorFieldGuidePrompt::empty()?;
-        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
-        let runtime_model_catalog =
-            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: dispatch_case.map(|_| 220_000),
+            ..Default::default()
+        })?;
+        let mut assignment_metadata = loaded.assignment_metadata.clone();
+        if dispatch_case.is_some() {
+            let authority_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                RunId::new("ordinary-read-only-deadline")?,
+                "test",
+            )?));
+            assignment_metadata.parent_validation = Some(held_out::ParentValidationAuthority::new(
+                held_out::HeldOutRunBinding {
+                    manifest_sha256: "a".repeat(64),
+                    profile_sha256: "b".repeat(64),
+                    profile_id: "profile".into(),
+                    repetition: 0,
+                    experiment_run_id: "ordinary-read-only-deadline".into(),
+                    supervisor_run_id: options.run_id.as_str().into(),
+                    assignment_id: assignment.id.clone(),
+                    baseline_head: "c".repeat(40),
+                    baseline_tree: "d".repeat(40),
+                },
+                Vec::new(),
+                Instant::now() + Duration::from_secs(180),
+                1,
+                authority_writer,
+            ));
+        }
+        let runtime_model_catalog = if runtime == SupervisorRuntime::GeminiCli {
+            RuntimeModelCatalog::OperatorDeclared
+        } else {
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?)
+        };
         let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id, None);
         assert!(
             journal.is_some(),
@@ -7703,7 +8743,38 @@ mod decomposition_tests {
             autonomy_kpis: &mut autonomy_kpis,
             checkpoint: None,
         });
-        let runner = unused_external_runner;
+        let runner_calls = std::sync::atomic::AtomicUsize::new(0);
+        let original_grant = Mutex::new(None);
+        let runner = |command: &ExternalAgentCommand,
+                      _cancellation: &ProcessCancellation,
+                      _review: Option<ExternalPreActionReviewRuntime<'_>>| {
+            assert!(dispatch_case.is_some());
+            runner_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            assert!(command.assignment_messaging_launch().is_some());
+            assert!(
+                command.timeout > Duration::ZERO && command.timeout <= Duration::from_secs(180)
+            );
+            assert_eq!(
+                command.live_token_grant_for_test(),
+                original_grant.lock().unwrap().as_ref()
+            );
+            assert_eq!(
+                command.live_token_grant_for_test().unwrap().tokens(),
+                220_000
+            );
+            // Exercise the real runner's first immutable-binding refusal. Never
+            // produce provider success or enter auth/executable/child setup.
+            let mut changed = command.clone();
+            changed.timeout += Duration::from_secs(1);
+            let rejected = run_external_agent_nonpublishable_simulation(&changed);
+            assert!(rejected
+                .error
+                .as_deref()
+                .unwrap()
+                .contains("live token grant launch binding changed"));
+            assert!(!rejected.stdout.target_launch_attempted);
+            rejected
+        };
         let context = AssignmentExecutionContext {
             index: 0,
             concurrent_mode: false,
@@ -7712,7 +8783,7 @@ mod decomposition_tests {
             execution_target: None,
             budget_config: &budget_config,
             consultant: &loaded.consultant,
-            assignment_metadata: &loaded.assignment_metadata,
+            assignment_metadata: &assignment_metadata,
             assignment,
             evidence_only_reaudit: None,
             options: &options,
@@ -7802,6 +8873,52 @@ mod decomposition_tests {
         let measurements: PromptMeasurementsArtifact =
             serde_json::from_slice(&fs::read(measurements_path)?)?;
         assert_eq!(measurements.prompts[0].full_bytes, before_binding.len());
+        if let Some(case) = dispatch_case {
+            assert_eq!(prepared.command.timeout, Duration::from_secs(300));
+            assert!(prepared.command.live_token_grant_for_test().is_none());
+            let grant = budget_ledger
+                .live_token_grant(prepared.budget_reservation.reservation.id)?
+                .context("original fixture reservation must have a live hard grant")?;
+            *original_grant.lock().unwrap() = Some(grant.clone());
+            if case == "stopped" {
+                grant.exhaust();
+            } else if case == "released" {
+                budget_ledger.release(prepared.budget_reservation.reservation.id)?;
+            }
+            let dispatched = dispatch_and_capture_child_attempt(
+                &context,
+                &mut outcome,
+                &preflight,
+                options.run_id.as_str(),
+                1,
+                prepared,
+            );
+            if matches!(case, "stopped" | "released") {
+                assert!(dispatched.is_err());
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+            } else {
+                let captured = dispatched?;
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+                assert!(captured
+                    .external_run
+                    .error
+                    .as_deref()
+                    .unwrap()
+                    .contains("live token grant launch binding changed"));
+                assert!(!captured.external_run.publishable);
+                drop(captured);
+            }
+            assert_eq!(
+                assignment_metadata
+                    .parent_validation
+                    .as_ref()
+                    .unwrap()
+                    .dispatches()?,
+                1
+            );
+            assert_eq!(budget_ledger.report()?.active_reservations, 0);
+            return Ok(());
+        }
         // Use the production binder and its strict EOF verifier, not a rendered
         // imitation. Stop before dispatch: no external process or provider runs.
         let _server = bind_assignment_messaging_for_external_child_launch(
@@ -7819,13 +8936,23 @@ mod decomposition_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
-        verify_prepared_researcher_messaging_prompt(true)
+        verify_prepared_researcher_messaging_prompt(true, None)
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn prepared_researcher_without_source_inputs_preserves_messaging_appendix() -> Result<()> {
-        verify_prepared_researcher_messaging_prompt(false)
+        verify_prepared_researcher_messaging_prompt(false, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ordinary_read_only_dispatch_final_grant_survives_parent_timeout_and_refuses_stop_release_mutation(
+    ) -> Result<()> {
+        for case in ["codex", "gemini", "stopped", "released"] {
+            verify_prepared_researcher_messaging_prompt(false, Some(case))?;
+        }
+        Ok(())
     }
 
     fn initialize_child_dispatch_messaging_session(
@@ -10330,7 +11457,7 @@ mod decomposition_tests {
             incoming_output_root,
             capture_output_root,
             ..
-        } = prepared;
+        } = *prepared;
         drop(incoming_output_root);
         drop(capture_output_root);
         with_supervisor_artifacts(&artifacts, |writer, _| {
@@ -10388,7 +11515,7 @@ mod decomposition_tests {
             incoming_output_root: staging_incoming_output_root,
             capture_output_root: staging_capture_output_root,
             ..
-        } = prepared_staging;
+        } = *prepared_staging;
         drop(staging_incoming_output_root);
         drop(staging_capture_output_root);
         with_supervisor_artifacts(&artifacts, |writer, _| {
@@ -11500,7 +12627,7 @@ done
 
     fn eligible_managed_child_materialization_gate() -> ManagedChildMaterializationGate {
         ManagedChildMaterializationGate {
-            codex_supervisor: true,
+            bound_managed_git_boundary: true,
             verified_execution: true,
             process_completed: true,
             containment_verified: true,
@@ -12270,7 +13397,7 @@ done
         )?;
         command.cwd = primary.clone();
         command.workspace_access = WorkspaceAccess::ReadOnly;
-        let command = bind_selected_grok_execution_workspace(
+        let command = bind_selected_native_execution_workspace(
             command,
             &assignment,
             runtime,
@@ -12510,9 +13637,11 @@ done
     }
 
     #[test]
-    fn writable_grok_supervisor_admission_names_missing_stale_and_inexact_selection() -> Result<()>
-    {
-        fn admission_error(command: &ExternalAgentCommand) -> String {
+    fn writable_grok_supervisor_admission_preserves_generic_model_effort_and_refuses_missing_stale_contracts(
+    ) -> Result<()> {
+        fn admission(
+            command: &ExternalAgentCommand,
+        ) -> Result<Option<crate::external_agent::WorktreeWritableAdmission>> {
             let assigned_paths = vec![PathBuf::from("README.md")];
             let worktree = WorktreeRecord {
                 name: "grok-worker".to_string(),
@@ -12524,20 +13653,22 @@ done
                 agent_id: "grok-worker".to_string(),
                 paths: assigned_paths.clone(),
             };
+            worktree_writable_admission_record(
+                "grok-worker",
+                &assigned_paths,
+                1,
+                &worktree,
+                &claim,
+                std::slice::from_ref(&claim),
+                command,
+                SupervisorRuntime::Grok,
+                AssignmentPhase::Execution,
+            )
+        }
+        fn admission_error(command: &ExternalAgentCommand) -> String {
             format!(
                 "{:#}",
-                worktree_writable_admission_record(
-                    "grok-worker",
-                    &assigned_paths,
-                    1,
-                    &worktree,
-                    &claim,
-                    std::slice::from_ref(&claim),
-                    command,
-                    SupervisorRuntime::Grok,
-                    AssignmentPhase::Execution,
-                )
-                .expect_err("invalid writable Grok selection must fail closed")
+                admission(command).expect_err("invalid selected contract must fail closed")
             )
         }
 
@@ -12554,15 +13685,25 @@ done
             .clone()
             .with_model_selection(Some("grok".to_string()), Some("xhigh".to_string()))
             .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
-        assert!(admission_error(&generic)
-            .contains(crate::external_agent::WRITABLE_GROK_EXACT_MODEL_REQUIRED));
+        assert!(
+            admission(&generic)?.is_some(),
+            "safe selected slug must retain its protocol contract"
+        );
 
         let non_xhigh = exact
             .clone()
             .with_model_selection(Some("grok-4.6".to_string()), Some("high".to_string()))
             .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
-        assert!(admission_error(&non_xhigh)
-            .contains(crate::external_agent::WRITABLE_GROK_XHIGH_EFFORT_REQUIRED));
+        assert!(
+            admission(&non_xhigh)?.is_some(),
+            "canonical selected effort must not be clamped to a preference floor"
+        );
+        let invalid_effort = non_xhigh
+            .clone()
+            .with_model_selection(Some("grok-4.6".into()), Some("deep".into()))
+            .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
+        assert!(admission_error(&invalid_effort)
+            .contains(crate::external_agent::WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED));
 
         let mut stale = exact.clone().with_writable_runtime_selection(
             "grok-worker",
@@ -13174,6 +14315,87 @@ done
     }
 
     #[test]
+    fn claude_settlement_uses_private_raw_counters_and_never_reservation_pricing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let plan = worker_plan("requested-claude-label");
+        let budget = SupervisorBudgetConfig::default();
+        let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+        let command = quota_usage_command(temp.path())
+            .with_runtime_adapter(
+                SupervisorRuntime::ClaudeCode,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(
+                    SupervisorRuntime::ClaudeCode,
+                ),
+            )
+            .with_model_selection(
+                Some("requested-claude-label".to_string()),
+                Some("high".to_string()),
+            );
+        let stream = [
+            json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"observed-claude-model","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+            json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+            json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"observed-claude-model"}}),
+            json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"done","modelUsage":{"observed-claude-model":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::ClaudeCode),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected Claude budget refusal: {refusal:?}")
+            }
+        };
+        reservation.mark_invoked_for_runtime(SupervisorRuntime::ClaudeCode)?;
+        let mut run = injected_verified_run(&command);
+        run.set_claude_native_stream_for_test(&stream, false, false);
+        let settlement = reservation.settle_bound_runtime(&run, &command)?;
+        assert_eq!(settlement.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            Some(25)
+        );
+        assert_eq!(settlement.model.as_deref(), Some("observed-claude-model"));
+        assert_eq!(settlement.cost_usd, None);
+        assert!(settlement.reliable_usage().is_none());
+
+        let mut partial_reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::Worker, SupervisorRuntime::ClaudeCode),
+            &command,
+        )? {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                bail!("unexpected partial Claude budget refusal: {refusal:?}")
+            }
+        };
+        partial_reservation.mark_invoked_for_runtime(SupervisorRuntime::ClaudeCode)?;
+        let mut interrupted = injected_verified_run(&command);
+        interrupted.set_claude_native_stream_for_test(&stream, false, true);
+        let partial = partial_reservation.settle_bound_runtime(&interrupted, &command)?;
+        assert_eq!(partial.reliability, DispatchUsageReliability::Estimated);
+        assert_eq!(
+            partial.observed_usage.map(|usage| usage.total_tokens),
+            Some(25)
+        );
+        assert_eq!(partial.cost_usd, None);
+        Ok(())
+    }
+
+    #[test]
     fn invoked_drop_persists_missing_usage_to_retained_runtime_for_next_run() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let repo = temp.path().join("repo");
@@ -13653,12 +14875,7 @@ done
             ),
             "{missing_duty}"
         );
-        assert!(
-            !missing_duty.contains(crate::external_agent::WRITABLE_GROK_EXACT_MODEL_REQUIRED),
-            "missing duty must be refused by executor authorize before the Grok exact-model gate: {missing_duty}"
-        );
-
-        let with_duty = bind_selected_assignment_launch_with_duty_for_test(
+        let (runtime, with_duty) = bind_selected_assignment_launch_with_duty_for_test(
             launch_fixture_command(),
             &assignment,
             &policy,
@@ -13666,25 +14883,17 @@ done
             &launch_fixture_options(SupervisorRuntime::Codex),
             &catalog,
             Some(MechanicalTerminalDuty::FormatPreselectedFiles),
-        )
-        .expect_err(
-            "non-Grok fixture + medium must remain refused by the exact Grok writable contract",
+        )?;
+        assert_eq!(runtime, SupervisorRuntime::Grok);
+        assert_eq!(
+            with_duty.model.as_deref(),
+            Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE)
         );
-        let exact_model = format!("{with_duty:#}");
-        assert!(
-            exact_model.contains(crate::external_agent::WRITABLE_GROK_EXACT_MODEL_REQUIRED),
-            "{exact_model}"
-        );
-        assert!(
-            exact_model.contains("writable Grok requires exact model 'grok-4.6'"),
-            "{exact_model}"
-        );
-        assert!(
-            !exact_model.contains(
-                "no trusted typed planner/runtime authority or exact-operation executor exists"
-            ),
-            "typed duty was supplied; refusal must be the Grok exact-model gate, not missing-duty authorize: {exact_model}"
-        );
+        assert_eq!(with_duty.reasoning_effort.as_deref(), Some("medium"));
+        assert!(with_duty
+            .selected_writable_capabilities(runtime, Some(&assignment.id))?
+            .writable_launch_refusal(with_duty.writable_launch_target)
+            .is_none());
         drop(overlay);
         Ok(())
     }
@@ -14469,7 +15678,7 @@ done
             incoming_output_root,
             capture_output_root,
             ..
-        } = prepared;
+        } = *prepared;
         drop(incoming_output_root);
         drop(capture_output_root);
         with_supervisor_artifacts(&artifacts, |writer, _| {

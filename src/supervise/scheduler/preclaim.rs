@@ -116,6 +116,14 @@ struct RequestedPreclaimDirective {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum RequestedPreclaimVerificationContract {
+    DirectExplicitNewFileCreation {
+        assigned_path: String,
+        execution_assignment: RequestedPreclaimAssignmentBinding,
+    },
+    DirectExistingGitVisibleRegularFileEdit {
+        assigned_path: String,
+        execution_assignment: RequestedPreclaimAssignmentBinding,
+    },
     ExplicitNewFileCreation {
         assigned_path: String,
         planning_assignment: RequestedPreclaimAssignmentBinding,
@@ -615,6 +623,15 @@ fn requested_explicit_new_file_contract(
     repo_map: &RepoMap,
     risk_report: &SemanticRiskReport,
 ) -> bool {
+    if requested_direct_file_contract(
+        assignment,
+        requested_assignments,
+        repo_map,
+        risk_report,
+        false,
+    ) {
+        return true;
+    }
     let Some(requested) = unique_requested_assignment(requested_assignments, &assignment.id) else {
         return false;
     };
@@ -728,6 +745,15 @@ fn requested_existing_regular_file_edit_contract(
     repo_map: &RepoMap,
     risk_report: &SemanticRiskReport,
 ) -> bool {
+    if requested_direct_file_contract(
+        assignment,
+        requested_assignments,
+        repo_map,
+        risk_report,
+        true,
+    ) {
+        return true;
+    }
     if requested_assignments.len() != 2 {
         return false;
     }
@@ -820,6 +846,90 @@ fn requested_existing_regular_file_edit_contract(
         && execution.licensed_breakage.is_none()
         && crate::artifacts::state_auth::sha256_hex(execution_task.as_bytes())
             == execution_assignment.task_sha256
+}
+
+/// A direct route authenticates the actual sole Worker instead of inventing a planning identity.
+fn requested_direct_file_contract(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo_map: &RepoMap,
+    risk_report: &SemanticRiskReport,
+    existing: bool,
+) -> bool {
+    if requested_assignments.len() != 1 || requested_assignments.first() != Some(assignment) {
+        return false;
+    }
+    let Some(contract) = requested_verification_contract(assignment.notes.as_deref()) else {
+        return false;
+    };
+    let (assigned_path, binding) = match (&contract, existing) {
+        (
+            RequestedPreclaimVerificationContract::DirectExplicitNewFileCreation {
+                assigned_path,
+                execution_assignment,
+            },
+            false,
+        )
+        | (
+            RequestedPreclaimVerificationContract::DirectExistingGitVisibleRegularFileEdit {
+                assigned_path,
+                execution_assignment,
+            },
+            true,
+        ) => (assigned_path, execution_assignment),
+        _ => return false,
+    };
+    let Some(target) = safe_requested_contract_path(assigned_path) else {
+        return false;
+    };
+    let Some(task) = assignment.task.as_deref() else {
+        return false;
+    };
+    if binding.id != assignment.id
+        || binding.phase != AssignmentPhase::Execution
+        || binding.role != AgentRole::Worker
+        || binding.role_category != RoleCategory::NonDelegatingTerminalWorker
+        || assignment.phase != binding.phase
+        || assignment.role != binding.role
+        || assignment.role_category != Some(binding.role_category)
+        || assignment.assigned_paths.as_slice() != [target.as_path()]
+        || !assignment.semantic_symbols.is_empty()
+        || !assignment.semantic_modules.is_empty()
+        || !assignment.worker_assignments.is_empty()
+        || !assignment.environment_requirements.is_empty()
+        || assignment.licensed_breakage.is_some()
+        || crate::artifacts::state_auth::sha256_hex(task.as_bytes()) != binding.task_sha256
+        || !risk_report.errors.is_empty()
+        || !risk_is_bound_to_assignment(risk_report, std::slice::from_ref(&target))
+    {
+        return false;
+    }
+    if existing {
+        return super::super::plan_api::explicit_existing_file_edit_verification_task(
+            task, &target,
+        ) && mapped_git_visible_readable_regular_file(repo_map, &target);
+    }
+    if explicit_new_file_task_target(task).as_ref() != Some(&target)
+        || repo_map.entries.iter().any(|entry| entry.path == target)
+    {
+        return false;
+    }
+    let mut parent = target.parent();
+    while let Some(path) = parent {
+        if path.as_os_str().is_empty() {
+            break;
+        }
+        if repo_map
+            .entries
+            .iter()
+            .find(|entry| entry.path == path)
+            .is_some_and(|entry| entry.kind != RepoEntryKind::Directory)
+        {
+            return false;
+        }
+        parent = path.parent();
+    }
+    true
 }
 
 fn mapped_git_visible_regular_file_size(repo_map: &RepoMap, target: &Path) -> Option<u64> {

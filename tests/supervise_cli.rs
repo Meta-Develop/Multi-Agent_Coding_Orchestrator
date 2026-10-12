@@ -1853,8 +1853,7 @@ fn supervise_run_rejects_zero_bound_before_reserving_state_and_accepts_one() -> 
     ])?;
     assert!(zero_stderr.contains("--max-concurrent-children must be at least 1"));
     assert!(!repo_path.join(".maco/o2/runs/bounded-zero").exists());
-    assert!(!temp
-        .path()
+    assert!(!repo_path
         .join(".maco/worktrees/repo/bounded-child")
         .exists());
     let repo = Repository::open(&repo_path)?;
@@ -2268,7 +2267,7 @@ fn supervise_run_refuses_clean_stale_reused_child_worktree_before_execution() ->
     );
     assert_eq!(
         child_path,
-        temp.path().join(".maco/worktrees/repo/child-clean")
+        repo_path.join(".maco/worktrees/repo/child-clean")
     );
     assert!(child_path.is_dir());
     fs::write(repo_path.join("README.md"), "# advanced\n")?;

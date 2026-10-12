@@ -588,6 +588,35 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
         crate::supervise::scheduler::set_live_grant_admission_observer(sender);
     }
     let receiver = std::sync::Mutex::new(receiver);
+    // Admission notification precedes final live-grant binding. Hold the scheduler
+    // at that existing hook until the first runner proves its full grant is bound,
+    // so the next scheduler observation measures contention rather than setup.
+    let (first_grant_ready_tx, first_grant_ready_rx) =
+        std::sync::mpsc::channel::<Result<(), &'static str>>();
+    let first_grant_ready_rx = std::sync::Mutex::new(first_grant_ready_rx);
+    let _first_grant_hook = (!interleave_review).then(|| {
+        let first_grant_ready_tx = first_grant_ready_tx.clone();
+        install_budget_admission_test_hook(
+            run_id,
+            Arc::new(move |stage, owner| match stage {
+                "admission_committed" if owner == "research-0" => {
+                    first_grant_ready_rx
+                        .lock()
+                        .unwrap()
+                        .recv()
+                        .expect("first grant preparation lifecycle remains connected")
+                        .expect("first runner reached its bound live grant");
+                }
+                "assignment_finished" if owner == "research-0" => {
+                    let _ = first_grant_ready_tx.send(Err("first assignment exited before runner"));
+                }
+                "scheduler_finished" => {
+                    let _ = first_grant_ready_tx.send(Err("scheduler exited before runner"));
+                }
+                _ => {}
+            }),
+        )
+    });
     // Setup includes real containment/worktree preparation. Synchronize on its
     // completion (or an explicit participant exit), not a wall-clock guess.
     // Only the actual live-grant contention below has a ten-second deadline.
@@ -700,6 +729,7 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
             // Hold the first turn until the real scheduler has inspected its full
             // reservation. Without the wait fix, it permanently denies the second child.
             if !interleave_review {
+                first_grant_ready_tx.send(Ok(())).unwrap();
                 assert_eq!(
                     receiver
                         .lock()

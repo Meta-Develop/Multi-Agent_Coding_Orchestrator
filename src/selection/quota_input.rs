@@ -218,6 +218,7 @@ mod tests {
             models: vec![CatalogModel {
                 model: "fixture-model".to_string(),
                 available: true,
+                access: None,
                 supported_efforts: vec![ReasoningEffort::High],
                 capabilities: CandidateCapabilities {
                     task_classes: ["localized_code_change".to_string()].into_iter().collect(),

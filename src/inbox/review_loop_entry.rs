@@ -287,6 +287,7 @@ pub fn select_critical_independent_auditor(
         models.push(CatalogModel {
             model: prior.model.clone(),
             available: available_models.contains(&prior.model),
+            access: None,
             supported_efforts,
             capabilities: CandidateCapabilities {
                 task_classes: prior

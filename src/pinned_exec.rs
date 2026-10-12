@@ -33,6 +33,10 @@ type RawFd = i32;
 pub(crate) const PINNED_EXEC_REQUEST_VERSION: u8 = 1;
 pub(crate) const HIDDEN_PINNED_EXEC_ARGUMENT: &str = "--maco-internal-pinned-exec-v1";
 pub(crate) const PINNED_EXEC_DESCRIPTOR_NAME: &str = "pinned-exec-request-v1";
+// v1 remains byte-identical for implicit-current-helper callers. v2 adds the
+// source-bound main helper to the same digest-protected request.
+const SOURCE_BOUND_REQUEST_VERSION: u8 = 2;
+const SOURCE_BOUND_HELPER_ARGUMENT: &str = "--maco-internal-source-bound-pinned-exec-v1";
 const REQUEST_MAGIC: &[u8] = b"MACO-PINNED-EXEC\0";
 const SHA256_BYTES: usize = 32;
 const SHA256_HEX_BYTES: usize = SHA256_BYTES * 2;
@@ -49,6 +53,267 @@ const COPY_BUFFER_BYTES: usize = 64 * 1024;
 pub(crate) struct PinnedDirectExecutable {
     source: ExecutableBinding,
     script: Option<ScriptBinding>,
+    main_helper: Option<SourceBoundMainHelper>,
+}
+
+/// A reviewed main binary from the same frozen source as its controller. The
+/// binary digest is supplied by the independent package receipt; it is never
+/// inferred from a name, version label, PATH, or the test controller.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct SourceBoundMainHelper {
+    executable: ExecutableBinding,
+    source_sha256: [u8; SHA256_BYTES],
+    package: MainHelperPackageIdentity,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+struct MainHelperPackageIdentity {
+    declaration_identity: [u64; 4],
+    declaration_sha256: [u8; SHA256_BYTES],
+    manifest_identity: [u64; 4],
+}
+
+#[cfg(target_os = "linux")]
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MainHelperDeclaration {
+    schema: String,
+    binary_sha256: String,
+    source_manifest_sha256: String,
+    main_entry_sha256: String,
+}
+
+impl fmt::Debug for SourceBoundMainHelper {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("SourceBoundMainHelper(<redacted binding>)")
+    }
+}
+
+impl SourceBoundMainHelper {
+    /// Explicit qualification input: the supplied digests must also match the
+    /// protected package declaration and actual manifest bytes.
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn capture(
+        path: &Path,
+        binary_sha256: &str,
+        source_sha256: &str,
+    ) -> io::Result<Self> {
+        let expected_binary = decode_sha256_hex(binary_sha256.as_bytes())?;
+        let expected_source = decode_sha256_hex(source_sha256.as_bytes())?;
+        let helper = Self::capture_packaged(path)?;
+        if !constant_time_eq(&helper.executable.sha256, &expected_binary)
+            || !constant_time_eq(&helper.source_sha256, &expected_source)
+        {
+            return Err(invalid_data(
+                "source-bound main helper did not match its qualification receipt",
+            ));
+        }
+        Ok(helper)
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn capture_qualification_environment() -> io::Result<Self> {
+        let path = env::var_os("MACO_CURSOR_MAIN_HELPER_FOR_TEST")
+            .ok_or_else(|| invalid_input("qualification omitted its packaged main helper"))?;
+        let binary = env::var("MACO_CURSOR_MAIN_HELPER_SHA256_FOR_TEST")
+            .map_err(|_| invalid_input("qualification omitted its reviewed main binary digest"))?;
+        let source = env::var("MACO_CURSOR_MAIN_HELPER_SOURCE_SHA256_FOR_TEST")
+            .map_err(|_| invalid_input("qualification omitted its frozen main source digest"))?;
+        Self::capture(Path::new(&path), &binary, &source)
+    }
+
+    /// Normal production invocation derives the exact package from the loaded
+    /// main. No PATH search, ambient configuration or libtest fallback occurs.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capture_current_packaged() -> io::Result<Self> {
+        let current = env::current_exe()
+            .map_err(|error| opaque_io(error, "could not resolve the source-bound main helper"))?;
+        let helper = Self::capture_packaged(&current)?;
+        helper.validate_loaded_image()?;
+        Ok(helper)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn capture_packaged(path: &Path) -> io::Result<Self> {
+        validate_source_bound_helper_path(path)?;
+        let prefix = path
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| invalid_input("source-bound main helper omitted its package"))?;
+        let declaration_path = prefix.join("share/maco/main-helper.json");
+        let manifest_path = prefix.join("share/maco/source-manifest.json");
+        let (declaration_bytes, declaration_identity) =
+            read_helper_package_file(&declaration_path)?;
+        let declaration = validate_main_helper_declaration(&declaration_bytes)?;
+        let source_sha256 = decode_sha256_hex(declaration.source_manifest_sha256.as_bytes())?;
+        validate_compiled_source_binding(&source_sha256)?;
+        let (manifest_bytes, manifest_identity) = read_helper_package_file(&manifest_path)?;
+        if !constant_time_eq(&sha256(&manifest_bytes)?, &source_sha256) {
+            return Err(invalid_data(
+                "main helper manifest bytes did not match its declaration",
+            ));
+        }
+        let expected_binary = decode_sha256_hex(declaration.binary_sha256.as_bytes())?;
+        let (executable, prefix_bytes) = capture_executable_binding(path)?;
+        if executable.path != executable.argv0
+            || !prefix_bytes.starts_with(b"\x7fELF")
+            || !constant_time_eq(&executable.sha256, &expected_binary)
+        {
+            return Err(invalid_data(
+                "source-bound main helper binary did not match its package",
+            ));
+        }
+        validate_source_bound_helper_path(path)?;
+        Ok(Self {
+            executable,
+            source_sha256,
+            package: MainHelperPackageIdentity {
+                declaration_identity,
+                declaration_sha256: sha256(&declaration_bytes)?,
+                manifest_identity,
+            },
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn revalidate(&self) -> io::Result<PathBuf> {
+        let path = PathBuf::from(OsString::from_vec(self.executable.path.clone()));
+        let current = Self::capture_packaged(&path)?;
+        if current != *self {
+            return Err(invalid_data(
+                "source-bound main helper or package identity changed",
+            ));
+        }
+        Ok(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_current(&self) -> io::Result<()> {
+        self.validate_loaded_image()?;
+        self.revalidate().map(|_| ())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_loaded_image(&self) -> io::Result<()> {
+        let current = env::current_exe()
+            .map_err(|error| opaque_io(error, "could not resolve the source-bound main helper"))?;
+        if current.as_os_str().as_bytes() != self.executable.path {
+            return Err(invalid_data("source-bound main helper invocation changed"));
+        }
+        // /proc/self/exe is the kernel's loaded-image identity, not a filesystem
+        // helper alias. A renamed/replaced main must not bind its replacement.
+        let loaded = fs::metadata("/proc/self/exe")
+            .map_err(|error| opaque_io(error, "could not inspect the loaded main helper"))?;
+        if loaded.uid() != 0
+            || metadata_identity(&loaded) != (self.executable.device, self.executable.inode)
+            || permission_mode(&loaded) != self.executable.mode
+            || loaded.len() != self.executable.length
+        {
+            return Err(invalid_data(
+                "loaded main helper identity did not match its package",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn validate_main_helper_declaration(bytes: &[u8]) -> io::Result<MainHelperDeclaration> {
+    let declaration: MainHelperDeclaration = serde_json::from_slice(bytes)
+        .map_err(|_| invalid_data("main helper package declaration was malformed"))?;
+    if declaration.schema != "maco-source-bound-main-helper-v1" {
+        return Err(invalid_data(
+            "main helper package declaration schema was unsupported",
+        ));
+    }
+    decode_sha256_hex(declaration.binary_sha256.as_bytes())?;
+    decode_sha256_hex(declaration.source_manifest_sha256.as_bytes())?;
+    let entry_digest = decode_sha256_hex(declaration.main_entry_sha256.as_bytes())?;
+    if !constant_time_eq(&entry_digest, &sha256(include_bytes!("bin/maco.rs"))?) {
+        return Err(invalid_data(
+            "main helper entry source did not match its controller",
+        ));
+    }
+    Ok(declaration)
+}
+
+#[cfg(target_os = "linux")]
+fn helper_package_file_identity(metadata: &fs::Metadata) -> [u64; 4] {
+    [
+        metadata.dev(),
+        metadata.ino(),
+        u64::from(permission_mode(metadata)),
+        metadata.len(),
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn read_helper_package_file(path: &Path) -> io::Result<(Vec<u8>, [u64; 4])> {
+    validate_source_bound_package_path(path, false)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| opaque_io(error, "could not open main helper package metadata"))?;
+    let before = file
+        .metadata()
+        .map_err(|error| opaque_io(error, "could not inspect main helper package metadata"))?;
+    if !before.is_file()
+        || before.uid() != 0
+        || permission_mode(&before) & 0o6022 != 0
+        || before.len() == 0
+        || before.len() > MAX_DESCRIPTOR_BYTES as u64
+    {
+        return Err(invalid_data(
+            "main helper package metadata was not immutable and bounded",
+        ));
+    }
+    let identity = helper_package_file_identity(&before);
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file)
+        .take(MAX_DESCRIPTOR_BYTES as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| opaque_io(error, "could not read main helper package metadata"))?;
+    let after = file
+        .metadata()
+        .map_err(|error| opaque_io(error, "could not re-inspect main helper package metadata"))?;
+    let named = fs::symlink_metadata(path)
+        .map_err(|error| opaque_io(error, "could not re-inspect main helper package path"))?;
+    if after.uid() != 0
+        || named.uid() != 0
+        || named.file_type().is_symlink()
+        || helper_package_file_identity(&after) != identity
+        || helper_package_file_identity(&named) != identity
+        || bytes.len() as u64 != before.len()
+        || bytes.len() > MAX_DESCRIPTOR_BYTES
+    {
+        return Err(invalid_data(
+            "main helper package metadata changed during capture",
+        ));
+    }
+    validate_source_bound_package_path(path, false)?;
+    Ok((bytes, identity))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_compiled_source_binding(expected: &[u8; SHA256_BYTES]) -> io::Result<()> {
+    validate_source_binding(expected, option_env!("MACO_SOURCE_MANIFEST_SHA256"))
+}
+
+#[cfg(target_os = "linux")]
+fn validate_source_binding(
+    expected: &[u8; SHA256_BYTES],
+    compiled: Option<&str>,
+) -> io::Result<()> {
+    let compiled =
+        compiled.ok_or_else(|| invalid_data("main helper source binding is unavailable"))?;
+    let actual = decode_sha256_hex(compiled.as_bytes())?;
+    if !constant_time_eq(expected, &actual) {
+        return Err(invalid_data(
+            "main helper source binding did not match its controller",
+        ));
+    }
+    Ok(())
 }
 
 impl fmt::Debug for PinnedDirectExecutable {
@@ -143,6 +408,7 @@ pub(crate) struct VerifiedPinnedExecRequest {
     script: Option<ScriptBinding>,
     arguments: Vec<Vec<u8>>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
+    main_helper: Option<SourceBoundMainHelper>,
 }
 
 impl fmt::Debug for VerifiedPinnedExecRequest {
@@ -310,12 +576,43 @@ impl PinnedDirectExecutable {
                 })
             }
         };
-        Ok(Self { source, script })
+        Ok(Self {
+            source,
+            script,
+            main_helper: None,
+        })
     }
 
     #[cfg(all(test, target_os = "linux"))]
     pub(crate) fn capture_for_test(path: &Path) -> io::Result<Self> {
         Self::capture_source(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn capture_with_main_helper(
+        path: &Path,
+        helper: SourceBoundMainHelper,
+    ) -> io::Result<Self> {
+        helper.revalidate()?;
+        let mut pinned = Self::capture_source(path)?;
+        pinned.main_helper = Some(helper);
+        Ok(pinned)
+    }
+
+    pub(crate) fn validated_launch_helper_path(&self) -> io::Result<PathBuf> {
+        #[cfg(target_os = "linux")]
+        if let Some(helper) = &self.main_helper {
+            return helper.revalidate();
+        }
+        validated_current_helper_path()
+    }
+
+    pub(crate) fn hidden_helper_argument(&self) -> &'static str {
+        if self.main_helper.is_some() {
+            SOURCE_BOUND_HELPER_ARGUMENT
+        } else {
+            HIDDEN_PINNED_EXEC_ARGUMENT
+        }
     }
 
     pub(crate) fn matches_program(&self, program: &Path) -> io::Result<bool> {
@@ -340,7 +637,11 @@ impl PinnedDirectExecutable {
             let arguments = validate_and_copy_arguments(arguments)?;
             let mut bytes = Vec::with_capacity(512);
             bytes.extend_from_slice(REQUEST_MAGIC);
-            bytes.push(PINNED_EXEC_REQUEST_VERSION);
+            bytes.push(if self.main_helper.is_some() {
+                SOURCE_BOUND_REQUEST_VERSION
+            } else {
+                PINNED_EXEC_REQUEST_VERSION
+            });
             encode_binding(&mut bytes, &self.source)?;
             match &self.script {
                 Some(script) => {
@@ -359,6 +660,18 @@ impl PinnedDirectExecutable {
             for (name, value) in &environment {
                 write_bounded_bytes(&mut bytes, name, "environment name")?;
                 write_bytes_allow_empty(&mut bytes, value)?;
+            }
+            if let Some(helper) = &self.main_helper {
+                helper.revalidate()?;
+                encode_binding(&mut bytes, &helper.executable)?;
+                bytes.extend_from_slice(&helper.source_sha256);
+                for value in helper.package.declaration_identity {
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
+                bytes.extend_from_slice(&helper.package.declaration_sha256);
+                for value in helper.package.manifest_identity {
+                    bytes.extend_from_slice(&value.to_be_bytes());
+                }
             }
             if bytes.len() > MAX_DESCRIPTOR_BYTES {
                 return Err(file_too_large(
@@ -435,7 +748,11 @@ pub(crate) fn decode_verified_descriptor(
     {
         let mut cursor = DescriptorCursor::new(descriptor);
         cursor.require_exact(REQUEST_MAGIC)?;
-        if cursor.read_u8()? != PINNED_EXEC_REQUEST_VERSION {
+        let version = cursor.read_u8()?;
+        if !matches!(
+            version,
+            PINNED_EXEC_REQUEST_VERSION | SOURCE_BOUND_REQUEST_VERSION
+        ) {
             return Err(invalid_data(
                 "unsupported pinned executable descriptor version",
             ));
@@ -505,6 +822,31 @@ pub(crate) fn decode_verified_descriptor(
                 "pinned executable environment exceeded its aggregate bound",
             ));
         }
+        let main_helper = if version == SOURCE_BOUND_REQUEST_VERSION {
+            let executable = decode_binding(&mut cursor)?;
+            validate_binding(&executable)?;
+            let source_sha256 = cursor.read_array()?;
+            let mut declaration_identity = [0u64; 4];
+            for value in &mut declaration_identity {
+                *value = cursor.read_u64()?;
+            }
+            let declaration_sha256 = cursor.read_array()?;
+            let mut manifest_identity = [0u64; 4];
+            for value in &mut manifest_identity {
+                *value = cursor.read_u64()?;
+            }
+            Some(SourceBoundMainHelper {
+                executable,
+                source_sha256,
+                package: MainHelperPackageIdentity {
+                    declaration_identity,
+                    declaration_sha256,
+                    manifest_identity,
+                },
+            })
+        } else {
+            None
+        };
         cursor.require_end()?;
         validate_binding(&source)?;
         if let Some(script) = &script {
@@ -518,6 +860,7 @@ pub(crate) fn decode_verified_descriptor(
             script,
             arguments,
             environment,
+            main_helper,
         })
     }
     #[cfg(not(target_os = "linux"))]
@@ -537,7 +880,8 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
     let Some(marker) = arguments.next() else {
         return Ok(false);
     };
-    if marker != OsStr::new(HIDDEN_PINNED_EXEC_ARGUMENT) {
+    let source_bound = marker == OsStr::new(SOURCE_BOUND_HELPER_ARGUMENT);
+    if marker != OsStr::new(HIDDEN_PINNED_EXEC_ARGUMENT) && !source_bound {
         return Ok(false);
     }
     #[cfg(target_os = "linux")]
@@ -551,9 +895,17 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
         if arguments.next().is_some() {
             return Err(invalid_input("pinned helper received unexpected arguments"));
         }
-        validated_current_helper_path()?;
+        if source_bound {
+            let current = env::current_exe().map_err(|error| {
+                opaque_io(error, "could not resolve the source-bound main helper")
+            })?;
+            validate_source_bound_helper_path(&current)?;
+        } else {
+            validated_current_helper_path()?;
+        }
         validate_current_environment()?;
         let request = load_verified_descriptor_and_remove(Path::new(&descriptor_path), &digest)?;
+        request.validate_helper_mode(source_bound)?;
         execute_verified_request(request)?;
         Err(io::Error::other(
             "pinned helper execution returned unexpectedly",
@@ -567,6 +919,16 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
 }
 
 impl VerifiedPinnedExecRequest {
+    #[cfg(target_os = "linux")]
+    fn validate_helper_mode(&self, source_bound: bool) -> io::Result<()> {
+        if self.main_helper.is_some() != source_bound {
+            return Err(invalid_data(
+                "pinned helper mode did not match its descriptor",
+            ));
+        }
+        Ok(())
+    }
+
     pub(crate) fn prepare_exec_plan(&self, script_fd: RawFd) -> io::Result<PreparedPinnedExecPlan> {
         #[cfg(target_os = "linux")]
         {
@@ -761,6 +1123,9 @@ fn validate_current_environment() -> io::Result<()> {
 
 #[cfg(target_os = "linux")]
 fn execute_verified_request(request: VerifiedPinnedExecRequest) -> io::Result<()> {
+    if let Some(helper) = &request.main_helper {
+        helper.validate_current()?;
+    }
     match request.script.as_ref() {
         None => {
             let executable = materialize_sealed(&request.source)?;
@@ -1028,6 +1393,106 @@ fn metadata_identity(metadata: &fs::Metadata) -> (u64, u64) {
 #[cfg(target_os = "linux")]
 fn permission_mode(metadata: &fs::Metadata) -> u32 {
     metadata.permissions().mode() & 0o7777
+}
+
+#[cfg(target_os = "linux")]
+fn validate_source_bound_helper_path(path: &Path) -> io::Result<()> {
+    validate_source_bound_helper_layout(path)?;
+    validate_source_bound_package_path(path, true)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_source_bound_package_path(path: &Path, executable: bool) -> io::Result<()> {
+    let mut current = PathBuf::from("/");
+    validate_helper_component(&current, 0, false)?;
+    let components = path.components().skip(1).collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let std::path::Component::Normal(component) = component else {
+            return Err(invalid_input(
+                "source-bound main helper path was not normalized",
+            ));
+        };
+        current.push(component);
+        if current == Path::new("/nix/store") {
+            let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                opaque_io(error, "could not inspect source-bound helper store anchor")
+            })?;
+            if !source_bound_store_anchor_allowed(
+                metadata.uid(),
+                permission_mode(&metadata),
+                metadata.is_dir(),
+                metadata.file_type().is_symlink(),
+            ) {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "source-bound helper store anchor was not protected",
+                ));
+            }
+        } else {
+            let final_component = index + 1 == components.len();
+            if final_component && !executable {
+                let metadata = fs::symlink_metadata(&current).map_err(|error| {
+                    opaque_io(error, "could not inspect main helper package path")
+                })?;
+                if metadata.file_type().is_symlink()
+                    || !metadata.is_file()
+                    || metadata.uid() != 0
+                    || permission_mode(&metadata) & 0o6022 != 0
+                {
+                    return Err(invalid_data(
+                        "main helper package file was not root-owned and immutable",
+                    ));
+                }
+            } else {
+                validate_helper_component(&current, 0, final_component)?;
+            }
+        }
+    }
+    let metadata = fs::symlink_metadata(path)
+        .map_err(|error| opaque_io(error, "could not inspect source-bound main helper"))?;
+    if permission_mode(&metadata) & 0o6000 != 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "source-bound main helper had privilege bits",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_source_bound_helper_layout(path: &Path) -> io::Result<()> {
+    validate_path_bytes(path.as_os_str().as_bytes())?;
+    let relative = path
+        .strip_prefix("/nix/store")
+        .map_err(|_| invalid_input("source-bound main helper was outside its package anchor"))?;
+    let components = relative.components().collect::<Vec<_>>();
+    if components.len() != 3
+        || !matches!(components[0], std::path::Component::Normal(_))
+        || components[1] != std::path::Component::Normal(OsStr::new("bin"))
+        || components[2] != std::path::Component::Normal(OsStr::new("maco"))
+        || Path::new("/nix/store").join(relative).as_os_str() != path.as_os_str()
+        || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
+    {
+        return Err(invalid_input(
+            "source-bound main helper did not have the exact package layout",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn source_bound_store_anchor_allowed(
+    owner: u32,
+    mode: u32,
+    directory: bool,
+    symlink: bool,
+) -> bool {
+    owner == 0
+        && directory
+        && !symlink
+        && mode & 0o002 == 0
+        && (mode & 0o020 == 0 || mode & 0o1000 != 0)
+        && mode & 0o6000 == 0
 }
 
 #[cfg(target_os = "linux")]
@@ -1835,6 +2300,234 @@ mod tests {
             hex_encode(&sha256(b"abc").expect("sha256")),
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_bound_main_helper_requires_exact_compiled_source() {
+        let source = sha256(b"frozen source manifest").expect("source digest");
+        assert!(validate_source_binding(&source, None).is_err());
+        assert!(validate_source_binding(&source, Some("unbound")).is_err());
+        assert!(
+            validate_source_binding(&source, Some(&hex_encode(&source).to_uppercase())).is_err()
+        );
+        let other = sha256(b"different source manifest").expect("other source digest");
+        assert!(validate_source_binding(&source, Some(&hex_encode(&other))).is_err());
+        validate_source_binding(&source, Some(&hex_encode(&source))).expect("same source");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_bound_main_helper_declaration_requires_exact_schema_and_main_entry() {
+        let source = hex_encode(&sha256(b"frozen manifest").expect("source digest"));
+        let binary = hex_encode(&sha256(b"binary digest parser fixture").expect("binary digest"));
+        let entry = hex_encode(&sha256(include_bytes!("bin/maco.rs")).expect("entry digest"));
+        let declaration = serde_json::json!({
+            "schema": "maco-source-bound-main-helper-v1", "binary_sha256": binary,
+            "source_manifest_sha256": source, "main_entry_sha256": entry,
+        });
+        validate_main_helper_declaration(&serde_json::to_vec(&declaration).expect("json"))
+            .expect("exact declaration shape");
+        for field in [
+            "binary_sha256",
+            "source_manifest_sha256",
+            "main_entry_sha256",
+        ] {
+            let mut missing = declaration.clone();
+            missing.as_object_mut().expect("object").remove(field);
+            assert!(
+                validate_main_helper_declaration(&serde_json::to_vec(&missing).expect("json"))
+                    .is_err()
+            );
+            let mut malformed = declaration.clone();
+            malformed[field] = serde_json::json!("malformed");
+            assert!(validate_main_helper_declaration(
+                &serde_json::to_vec(&malformed).expect("json")
+            )
+            .is_err());
+        }
+        let mut unknown = declaration.clone();
+        unknown["fallback"] = serde_json::json!(true);
+        assert!(
+            validate_main_helper_declaration(&serde_json::to_vec(&unknown).expect("json")).is_err()
+        );
+        let mut wrong_schema = declaration.clone();
+        wrong_schema["schema"] = serde_json::json!("unsupported");
+        assert!(validate_main_helper_declaration(
+            &serde_json::to_vec(&wrong_schema).expect("json")
+        )
+        .is_err());
+        let mut wrong_entry = declaration;
+        wrong_entry["main_entry_sha256"] = serde_json::json!(source);
+        assert!(
+            validate_main_helper_declaration(&serde_json::to_vec(&wrong_entry).expect("json"))
+                .is_err()
+        );
+        assert!(validate_main_helper_declaration(b"not json").is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_bound_main_helper_store_rule_is_exact_and_root_owned() {
+        let correct = Path::new("/nix/store/package/bin/maco");
+        validate_source_bound_helper_layout(correct).expect("exact layout");
+        for wrong in [
+            "/home/example/bin/maco",
+            "/nix/store-other/package/bin/maco",
+            "/nix/store/package/bin/libtest",
+            "/nix/store/package/nested/bin/maco",
+            "/nix/store/package/../other/bin/maco",
+            "/nix/store/package/./bin/maco",
+            "/nix//store/package/bin/maco",
+            "/nix/store/package/bin/maco/",
+        ] {
+            assert!(
+                validate_source_bound_helper_layout(Path::new(wrong)).is_err(),
+                "{wrong}"
+            );
+        }
+        assert!(source_bound_store_anchor_allowed(0, 0o1775, true, false));
+        assert!(source_bound_store_anchor_allowed(0, 0o0755, true, false));
+        for (owner, mode, directory, symlink) in [
+            (1000, 0o1775, true, false),
+            (0, 0o0775, true, false),
+            (0, 0o1777, true, false),
+            (0, 0o1775, false, false),
+            (0, 0o1775, true, true),
+            (0, 0o3775, true, false),
+        ] {
+            assert!(!source_bound_store_anchor_allowed(
+                owner, mode, directory, symlink
+            ));
+        }
+        // The default helper policy still rejects a writable ancestor. A
+        // user-owned libtest executable cannot qualify through the new policy.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let anchor = temp.path().join("anchor");
+        fs::create_dir(&anchor).expect("anchor");
+        let helper = anchor.join("maco");
+        executable(&helper, b"test-only path metadata");
+        fs::set_permissions(&anchor, fs::Permissions::from_mode(0o1775)).expect("sticky anchor");
+        let owner = fs::symlink_metadata(&anchor).expect("metadata").uid();
+        assert!(validate_helper_path_from_anchor(&helper, &anchor, owner).is_err());
+        assert!(
+            validate_source_bound_helper_path(&env::current_exe().expect("libtest path")).is_err()
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_bound_main_helper_descriptor_preserves_git_binding_and_rejects_mode_substitution() {
+        // This is parser coverage, not a qualified or executed main helper.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let program = temp.path().join("git");
+        executable(&program, b"descriptor fixture");
+        let pinned = PinnedDirectExecutable::capture_for_test(&program).expect("capture fixture");
+        let arguments = [
+            OsString::from("diff"),
+            OsString::from("--check"),
+            OsString::from("--"),
+            OsString::from("assigned.txt"),
+        ];
+        let encoded = pinned
+            .encode_descriptor(&arguments, &[])
+            .expect("v1 encode");
+        assert_eq!(
+            encoded.bytes()[REQUEST_MAGIC.len()],
+            PINNED_EXEC_REQUEST_VERSION
+        );
+        let original =
+            decode_verified_descriptor(encoded.bytes(), OsStr::new(&encoded.digest_hex()))
+                .expect("v1 decode");
+        original.validate_helper_mode(false).expect("implicit mode");
+        assert!(original.validate_helper_mode(true).is_err());
+        let mut bytes = encoded.bytes().to_vec();
+        bytes[REQUEST_MAGIC.len()] = SOURCE_BOUND_REQUEST_VERSION;
+        // Append exactly the new v2 fields to the otherwise unchanged v1
+        // Git request. No fixture capability is released to the launcher.
+        encode_binding(&mut bytes, &pinned.source).expect("helper metadata field");
+        let source = sha256(b"frozen source manifest").expect("source digest");
+        bytes.extend_from_slice(&source);
+        for value in [1u64, 2, 0o444, 3] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        bytes.extend_from_slice(&sha256(b"declaration").expect("declaration digest"));
+        for value in [1u64, 4, 0o444, 5] {
+            bytes.extend_from_slice(&value.to_be_bytes());
+        }
+        let digest = hex_encode(&sha256(&bytes).expect("descriptor digest"));
+        let request = decode_verified_descriptor(&bytes, OsStr::new(&digest)).expect("v2 decode");
+        assert_eq!(request.source, original.source);
+        assert!(request.script == original.script);
+        assert_eq!(request.arguments, original.arguments);
+        assert_eq!(request.environment, original.environment);
+        assert_eq!(
+            request
+                .main_helper
+                .as_ref()
+                .expect("explicit helper")
+                .source_sha256,
+            source
+        );
+        request.validate_helper_mode(true).expect("explicit mode");
+        assert!(request.validate_helper_mode(false).is_err());
+        assert!(request
+            .main_helper
+            .as_ref()
+            .expect("helper")
+            .revalidate()
+            .is_err());
+        *bytes.last_mut().expect("source digest byte") ^= 1;
+        assert!(decode_verified_descriptor(&bytes, OsStr::new(&digest)).is_err());
+        bytes.pop();
+        let truncated_digest = hex_encode(&sha256(&bytes).expect("truncated digest"));
+        assert!(decode_verified_descriptor(&bytes, OsStr::new(&truncated_digest)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_bound_helper_open_binding_rejects_replacement_symlink_and_content_drift() {
+        // Exercise the same no-follow/hash/metadata primitive used during
+        // helper revalidation, without granting root trust to a fixture.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = temp.path().join("maco");
+        executable(&path, b"original executable");
+        let (binding, _) = capture_executable_binding(&path).expect("capture identity");
+        let mut file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&path)
+            .expect("open binding");
+        verify_open_binding(&file, &binding).expect("unchanged metadata");
+        let (hash, _, _) =
+            hash_reader_with_prefix(&mut file, MAX_EXECUTABLE_BYTES).expect("hash unchanged");
+        assert_eq!(hash, binding.sha256);
+        let old = temp.path().join("old");
+        fs::rename(&path, &old).expect("move old");
+        executable(&path, b"original executable");
+        let replacement = File::open(&path).expect("replacement");
+        assert!(verify_open_binding(&replacement, &binding).is_err());
+        fs::remove_file(&path).expect("remove replacement");
+        std::os::unix::fs::symlink(&old, &path).expect("symlink");
+        assert!(OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&path)
+            .is_err());
+        assert!(validate_helper_path_from_anchor(
+            &path,
+            temp.path(),
+            fs::metadata(temp.path()).expect("owner").uid()
+        )
+        .is_err());
+        fs::remove_file(&path).expect("remove symlink");
+        fs::rename(&old, &path).expect("restore inode");
+        fs::write(&path, b"modified executable").expect("same-length content drift");
+        let mut changed = File::open(&path).expect("changed inode");
+        verify_open_binding(&changed, &binding).expect("same metadata");
+        let (hash, _, _) =
+            hash_reader_with_prefix(&mut changed, MAX_EXECUTABLE_BYTES).expect("hash drift");
+        assert_ne!(hash, binding.sha256);
     }
 
     #[cfg(target_os = "linux")]

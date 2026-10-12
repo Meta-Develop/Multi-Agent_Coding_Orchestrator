@@ -55,6 +55,7 @@ fn catalog(
             .map(|(model, efforts, long_context)| CatalogModel {
                 model: (*model).to_string(),
                 available: true,
+                access: None,
                 supported_efforts: efforts.to_vec(),
                 capabilities: capabilities(task_class, authority, *long_context),
             })
@@ -194,6 +195,312 @@ pub(crate) fn base_input() -> SelectionInput {
         },
         debug_override: None,
         operational_observations: None,
+    }
+}
+
+pub(crate) fn loaded_policy_test_receipt() -> anyhow::Result<routing_policy::RoutingPolicyReceipt> {
+    use super::routing_policy::*;
+    let temp = tempfile::tempdir()?;
+    Ok(RoutingPolicyReceipt {
+        frozen: load_routing_policy(temp.path())?,
+        role: "worker".into(),
+        features: TaskRoutingFeatures {
+            scope_paths: 1,
+            scope_modules: 0,
+            complexity: 0,
+            risk: 0,
+            horizon: 0,
+            context_tokens: 0,
+            dependency_edges: 0,
+            independent_groups: 1,
+            evidence: vec!["test scope".into()],
+        },
+    })
+}
+
+fn single_current_prior_input() -> SelectionInput {
+    let mut input = base_input();
+    input.catalogs.truncate(1);
+    input.catalogs[0].models.truncate(1);
+    input.catalogs[0].models[0].supported_efforts = [ReasoningEffort::High].into_iter().collect();
+    let prior = input
+        .priors
+        .models
+        .iter_mut()
+        .find(|prior| {
+            prior.runtime == input.catalogs[0].runtime
+                && prior.model == input.catalogs[0].models[0].model
+        })
+        .expect("current fixture prior");
+    prior.prohibited = false;
+    prior.prohibited_authority_roles.clear();
+    prior.prohibition_reason = Some("current operator evaluation prohibition".into());
+    input
+}
+
+#[test]
+fn loaded_policy_preserves_current_model_wide_prohibition() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for routing in [None, Some(&receipt)] {
+        let mut input = single_current_prior_input();
+        let permitted = select_with_loaded_routing_policy(&input, &[], routing)?;
+        assert!(
+            permitted.choice.is_some(),
+            "permitted control must remain selectable"
+        );
+        let candidate = permitted.choice.as_ref().unwrap().candidate.clone();
+        let prior = input
+            .priors
+            .models
+            .iter_mut()
+            .find(|prior| prior.runtime == candidate.runtime && prior.model == candidate.model)
+            .unwrap();
+        prior.prohibited = true;
+        let prohibited = select_with_loaded_routing_policy(&input, &[], routing)?;
+        assert!(prohibited.choice.is_none());
+        assert!(!prohibited.candidate_set[0].eligible);
+        assert!(prohibited.candidate_set[0].score.is_none());
+        let reasons = &prohibited.candidate_set[0].ineligibility_reasons;
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.code == IneligibilityCode::PolicyProhibited)
+                .count(),
+            1
+        );
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.code == IneligibilityCode::PolicyProhibited
+                && reason.detail == "current operator evaluation prohibition"));
+    }
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_preserves_current_role_prohibition_and_permitted_role() -> anyhow::Result<()> {
+    let mut receipt = loaded_policy_test_receipt()?;
+    let mut input = single_current_prior_input();
+    input.catalogs[0].models[0]
+        .capabilities
+        .authority_roles
+        .insert(AuthorityRole::ReviewAuditor);
+    input
+        .priors
+        .models
+        .iter_mut()
+        .find(|prior| {
+            prior.runtime == input.catalogs[0].runtime
+                && prior.model == input.catalogs[0].models[0].model
+        })
+        .unwrap()
+        .prohibited_authority_roles
+        .insert(AuthorityRole::ReviewAuditor);
+    let permitted = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(
+        permitted.choice.is_some(),
+        "role-specific prohibition must not exclude a permitted role"
+    );
+    assert!(!permitted.candidate_set[0]
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited));
+    input.task.authority_role = AuthorityRole::ReviewAuditor;
+    receipt.role = "auditor".into();
+    let prohibited = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(prohibited.choice.is_none());
+    assert!(!prohibited.candidate_set[0].eligible);
+    assert!(prohibited.candidate_set[0].score.is_none());
+    assert!(prohibited.candidate_set[0]
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited));
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_unknown_model_none_effort_is_honest_and_exactly_authorized() -> anyhow::Result<()>
+{
+    use super::routing_policy::*;
+    let temp = tempfile::tempdir()?;
+    let frozen = load_routing_policy(temp.path())?;
+    let receipt = RoutingPolicyReceipt {
+        frozen: frozen.clone(),
+        role: "worker".into(),
+        features: TaskRoutingFeatures {
+            scope_paths: 1,
+            scope_modules: 0,
+            complexity: 0,
+            risk: 0,
+            horizon: 0,
+            context_tokens: 0,
+            dependency_edges: 0,
+            independent_groups: 1,
+            evidence: vec!["test scope".into()],
+        },
+    };
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(decision.candidate_set.iter().all(|entry| !entry
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited)));
+    let chosen = decision
+        .choice
+        .as_ref()
+        .expect("unknown model policy choice");
+    assert_eq!(chosen.candidate.effort, ReasoningEffort::None);
+    let evidence = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == chosen.candidate)
+        .and_then(|entry| entry.loaded_policy_evidence.as_ref())
+        .expect("explicit unknown evidence");
+    assert_eq!(evidence.quality_basis_points, None);
+    assert_eq!(evidence.expected_accepted_cycle_cost_microunits, None);
+    assert_eq!(evidence.samples, 0);
+    assert!(evidence.uncertainty_penalty > 0);
+    let _binding = bind_routing_policy(Some(frozen))?;
+    assert!(validate_selected_launch("worker", "codex", &chosen.candidate.model, "none").is_err());
+    seal_selected_candidate("worker", &decision)?;
+    validate_selected_launch("worker", "codex", &chosen.candidate.model, "none")?;
+    for (role, runtime, model, effort) in [
+        ("auditor", "codex", chosen.candidate.model.as_str(), "none"),
+        ("worker", "grok", chosen.candidate.model.as_str(), "none"),
+        ("worker", "codex", "unselected-model", "none"),
+        ("worker", "codex", chosen.candidate.model.as_str(), "high"),
+    ] {
+        assert!(validate_selected_launch(role, runtime, model, effort).is_err());
+    }
+    input.catalogs[0].models[0].available = false;
+    assert!(
+        select_with_loaded_routing_policy(&input, &[], Some(&receipt))?
+            .choice
+            .is_none()
+    );
+    input.catalogs[0].models[0].available = true;
+    input.pools[0].admission_open = false;
+    assert!(
+        select_with_loaded_routing_policy(&input, &[], Some(&receipt))?
+            .choice
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_catalog_access_absence_preserves_wire_digest_and_replay() {
+    let input = base_input();
+    let legacy_bytes = serde_json::to_vec(&input).unwrap();
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
+    for catalog in legacy["catalogs"].as_array().unwrap() {
+        for model in catalog["models"].as_array().unwrap() {
+            assert!(model.get("access").is_none());
+            assert_eq!(model.as_object().unwrap().len(), 4);
+        }
+    }
+    let restored: SelectionInput = serde_json::from_slice(&legacy_bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&restored).unwrap(), legacy_bytes);
+    assert!(restored
+        .catalogs
+        .iter()
+        .all(|catalog| { catalog.models.iter().all(|model| model.access.is_none()) }));
+    let decision = select(&input).unwrap();
+    let replayed = select(&restored).unwrap();
+    assert_eq!(decision, replayed);
+    let catalog_bytes = serde_json::to_vec(&decision.normalized_input.catalogs).unwrap();
+    assert_eq!(
+        decision.input_digests.catalogs.value,
+        crate::artifacts::state_auth::sha256_hex(&catalog_bytes)
+    );
+    assert_eq!(decision.schema_version, 4);
+}
+
+#[test]
+fn typed_catalog_access_survives_normalization_and_changes_digests() {
+    use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+    let mut input = base_input();
+    let runtime = input.catalogs[0].runtime.clone();
+    let model = input.catalogs[0].models[0].model.clone();
+    input.catalogs[0].models[0].access = Some(ModelAccessOutcome::UnknownAccess);
+    let unknown = select(&input).unwrap();
+    input.catalogs[0].models[0].access = Some(ModelAccessOutcome::Available);
+    let available = select(&input).unwrap();
+    for (decision, access) in [
+        (&unknown, ModelAccessOutcome::UnknownAccess),
+        (&available, ModelAccessOutcome::Available),
+    ] {
+        let retained = decision
+            .normalized_input
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.runtime == runtime)
+            .unwrap()
+            .models
+            .iter()
+            .find(|entry| entry.model == model)
+            .unwrap();
+        assert_eq!(retained.access, Some(access));
+        assert!(retained.available);
+        let candidates: Vec<_> = decision
+            .candidate_set
+            .iter()
+            .filter(|entry| entry.candidate.runtime == runtime && entry.candidate.model == model)
+            .collect();
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|entry| !entry
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| reason.code == IneligibilityCode::CatalogUnavailable)));
+    }
+    assert_ne!(
+        unknown.input_digests.catalogs,
+        available.input_digests.catalogs
+    );
+    assert_ne!(
+        unknown.input_digests.normalized_input,
+        available.input_digests.normalized_input
+    );
+}
+
+#[test]
+fn explicit_catalog_access_never_overrides_eligibility_refusal() {
+    use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+    for (eligible, access) in [
+        (true, ModelAccessOutcome::Unavailable),
+        (false, ModelAccessOutcome::Available),
+    ] {
+        let mut input = base_input();
+        let runtime = input.catalogs[0].runtime.clone();
+        let model = input.catalogs[0].models[0].model.clone();
+        input.catalogs[0].models[0].available = eligible;
+        input.catalogs[0].models[0].access = Some(access);
+        let decision = select(&input).unwrap();
+        let candidates: Vec<_> = decision
+            .candidate_set
+            .iter()
+            .filter(|entry| entry.candidate.runtime == runtime && entry.candidate.model == model)
+            .collect();
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|entry| !entry.eligible
+            && entry
+                .ineligibility_reasons
+                .iter()
+                .any(|reason| reason.code == IneligibilityCode::CatalogUnavailable)));
+        assert!(decision.choice.as_ref().is_none_or(|choice| {
+            choice.candidate.runtime != runtime || choice.candidate.model != model
+        }));
     }
 }
 
@@ -2040,6 +2347,7 @@ fn prohibited_debug_override_is_rejected_and_fails_closed() {
     input.catalogs[0].models.push(CatalogModel {
         model: "gpt-5.6-terra".to_string(),
         available: true,
+        access: None,
         supported_efforts: vec![ReasoningEffort::High],
         capabilities: capabilities("localized_code_change", AuthorityRole::TerminalLeaf, false),
     });

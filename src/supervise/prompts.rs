@@ -236,8 +236,8 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
     Ok(format!(
         r#"- Append one JSON line directly to the exact precreated journal before each action: {{command,cwd,start_timestamp,end_timestamp,changed_paths}}; use absolute cwd, nonempty RFC3339 timestamps, and canonical repo-relative paths. Never reconstruct at the end.
-- If the parent supplies a bound MACO `supervise journal-append` operation, use that exact executable, journal path and precreated --device/--inode binding. Pass the original command argv after `--`, with the complete apply_patch payload as one argument, and each changed path with `--changed-path`. Never hand-escape JSON with printf/echo, discover a replacement identity, use PATH to select another appender, or repair a failed append. Report WorkerExecutionJournalRecordError and stop on failure. The appender is record transport, not an action to recursively journal.
-- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. On empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths, report WorkerExecutionJournalRecordError and stop. No prose/Markdown.
+- If bound: exact MACO exe/journal/precreated dev/inode; original argv after --; full apply_patch one arg; --changed-path each. No hand JSON/new identity/PATH/repair; don't journal helper.
+- It is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Append error, empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths: WorkerExecutionJournalRecordError; stop. No prose/Markdown.
 - WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
 - Preserve the full apply_patch record:
 {apply_patch_journal_example}"#
@@ -1031,6 +1031,7 @@ pub(super) fn render_managed_parent_initial_prompt(
     run_id: &str,
     parent_attempt: usize,
     field_guide: &SupervisorFieldGuidePrompt,
+    transport: crate::selection::routing_policy::ControlTransport,
 ) -> Result<RenderedPromptWithMeasurements> {
     if run_id.is_empty() {
         bail!(
@@ -1075,7 +1076,7 @@ pub(super) fn render_managed_parent_initial_prompt(
         claim_context,
         ..
     } = context;
-    let cacheable_prefix = managed_parent_initial_yield_prefix();
+    let cacheable_prefix = managed_parent_initial_yield_prefix(transport);
     let role_prefix = supervise_role_prefix(
         SupervisePromptRole::O1ChildOrchestrator,
         &assignment.id,
@@ -1124,7 +1125,7 @@ Final yield object for this attempt:
 - run_id={run_id}
 - parent_id={parent_id}
 - parent_attempt={parent_attempt}
-- requests must use the request_id and worker_id pairs listed above, in that order, after each pair is acknowledged
+- requests must use the request_id and worker_id pairs listed above, in that order, following the selected transport's receipt rules
 "#,
         cacheable_prefix = cacheable_prefix,
         role_prefix = role_prefix,
@@ -1170,7 +1171,22 @@ fn managed_parent_continuation_worker_boundary() -> &'static str {
     "The dynamic tool maco_worker_request is absent on this continuation. Do not submit or relaunch Worker requests through a shell or socket. Assigned read-only verification commands remain allowed, including the authorized read-only combined unittest command."
 }
 
-fn managed_parent_initial_yield_prefix() -> &'static str {
+fn managed_parent_initial_yield_prefix(
+    transport: crate::selection::routing_policy::ControlTransport,
+) -> &'static str {
+    if transport == crate::selection::routing_policy::ControlTransport::SupervisorCapturedEnvelope {
+        return r#"You are the managed parent for one execution-phase child orchestrator assignment.
+Source and Git are read-only. Do not edit files, stage, commit, push, merge, or change Git metadata.
+Do not use native delegation, raw provider CLI launches, worker journals, shells, sockets, or network requests to schedule workers.
+This transport has no dynamic worker-request tool and provides no acknowledgment during this turn.
+Propose every authored worker exactly once in the authored order using r1, r2, and so on as request_id.
+Return one flat JSON object: version=1, outcome=yield_workers, run_id, parent_id, parent_attempt,
+requests=[{request_id,worker_id},...]. Do not include paths, credentials, budgets, or new workers.
+The supervisor validates this proposal after verified read-only completion and quiescence,
+then queues authenticated receipts. Only its frozen receipt authority can launch workers.
+Do not claim queued receipts, worker completion, or acceptance in this proposal.
+"#;
+    }
     r#"You are the managed parent for one execution-phase child orchestrator assignment.
 Source and Git are read-only. Do not edit files, stage, commit, push, merge, or change Git metadata.
 Do not use Native SubAgent, spawn_agent, a raw provider CLI, or nested MACO worker launches.
@@ -1324,10 +1340,19 @@ fn render_researcher_prompt(
     runtime: SupervisorRuntime,
 ) -> Result<RenderedPromptWithMeasurements> {
     validate_researcher_assignment(context.assignment)?;
-    if runtime != SupervisorRuntime::Codex || context.execution_target.is_some() {
-        bail!("researcher requires a managed Codex read-only worktree");
+    if !matches!(
+        runtime,
+        SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+    ) || context.execution_target.is_some()
+    {
+        bail!("researcher requires a supported managed read-only worktree");
     }
     let prefix = "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect the assigned scope and return evidence in a ResearcherReport. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. On successful inspection set status=succeeded, accepted=true, rejected=false. Execute the requested inspection command directly; do not manually add /bin/bash -lc or any other shell wrapper to the tool invocation. The host adds its own wrapper. Record every actual command execution exactly once in commands_run. The command field is a JSON array containing exactly one string: the complete executed host command, including the host-added wrapper, not merely its inner script. Set cwd to the exact absolute working directory. For a successful exit set command status=succeeded and exit_code=0. Set timeout_seconds=0 and duration_ms=0, timed_out=false, stdout=\"\", stderr=\"\"; do not claim unobserved command metadata. Each validation_result must reference a distinct successful commands_run entry using the same one-element command array and status=succeeded. Every findings entry must be a JSON object with severity (info, warning, or error), message (a string), and paths (an array); never use a bare string. If a required command tool is unavailable, do not invent an inspection: preserve every command already executed in commands_run and each valid validation_result; use empty arrays only when no such evidence exists. Return status=failed, accepted=false, rejected=true, and a typed error finding with paths=[] explaining the tool failure. Set environment_failures=[] unless an observed failure matches an existing typed category. Never emit status=blocked. Include findings, remaining risk and next safe action. The parent independently checks the host command transcript and audits the evidence.\n";
+    let prefix = if runtime == SupervisorRuntime::GeminiCli {
+        "You are a terminal read-only Researcher. Do not delegate, spawn agents, edit files, mutate Git, or claim acceptance authority. Inspect every assigned path using only native read_file and return a ResearcherReport. The parent records native tool begin/completion and validates the held journal after quiescence. Shell, WriteFile, Edit, checks and delegation are unavailable. Set commands_run=[] and validation_results=[]; never fabricate shell transcripts or check outcomes. Set role=researcher, read_only=true, no_further_delegation=true. files_changed, worker_reports, audit_reports and decomposition_completions must be empty. On successful inspection set status=succeeded, accepted=true, rejected=false. If required inspection is unavailable, return status=failed, accepted=false, rejected=true with the observed cause. Do not emit status=blocked. Include findings objects with severity, message and paths, remaining_risk and next_safe_action.\n"
+    } else {
+        prefix
+    };
     let prefix = format!(
         "{prefix}Return every required ResearcherReport top-level field even when the command tool is unavailable: id, role, assigned_paths, semantic_symbols, semantic_modules, commands_run, environment_failures, files_changed, validation_results, findings, field_guide_entries, worker_reports, audit_reports, decomposition_completions, accepted, rejected, status, remaining_risk, next_safe_action, read_only, and no_further_delegation. Copy id, assigned_paths, semantic_symbols, and semantic_modules exactly from the Assignment JSON; do not infer or omit them. Use field_guide_entries=[] when no entries were observed.\n"
     );
@@ -1368,17 +1393,23 @@ fn consultation_prompt_section(consultant: &SupervisorConsultantPlan) -> String 
     if !consultant.enabled {
         return String::new();
     }
+    let explicit_inputs = if consultant.runtime == "gemini" {
+        " --consultant-bin <pinned-Gemini-executable> --model <explicit-selected-model> --token-budget <explicit-positive-finite-ceiling>"
+    } else {
+        ""
+    };
     format!(
         r#"
 CONSULTATION:
 - If you are blocked after a genuine attempt, you may ask a terminal read-only CONSULTANT for a cross-runtime second opinion.
-- Use `maco consult ask --runtime {runtime} --repo <this-child-worktree> --question <focused question> --context-path <repo-relative-path> ...`.
+- Use `maco consult ask --runtime {runtime}{explicit_inputs} --repo <this-child-worktree> --question <focused question> --context-path <repo-relative-path> ...`.
 - The consultation path is advisory and read-only. It must not create worktrees, claims, patches, or repository mutations.
 - Use at most {max_consultations} consultation(s) for this child assignment.
 - Record each consultation in OrchestratorReviewReport findings with the question summary and whether it unblocked you.
 - Consultant advice never overrides AGENTS.md, project rules, assigned ownership, validation requirements, or acceptance gates.
 "#,
         runtime = consultant.runtime.as_str(),
+        explicit_inputs = explicit_inputs,
         max_consultations = consultant.max_consultations
     )
 }
@@ -1868,41 +1899,11 @@ fn phase_aware_instruction_profile_section(
 }
 
 pub(super) fn provisional_default_role_model_selection(role: AgentRole) -> RoleModelSelection {
-    let (reasoning_effort, budget_degrade_models, on_exhausted) = match role {
-        AgentRole::Supervisor => (
-            "xhigh",
-            vec![ECONOMY_PROFILE_MODEL],
-            TerminalUnavailableModelFallback::RuntimeDefault,
-        ),
-        AgentRole::ChildOrchestrator | AgentRole::Auditor => (
-            "xhigh",
-            vec![ECONOMY_PROFILE_MODEL],
-            TerminalUnavailableModelFallback::RuntimeDefault,
-        ),
-        AgentRole::Worker | AgentRole::Researcher => (
-            "medium",
-            Vec::new(),
-            TerminalUnavailableModelFallback::RuntimeDefault,
-        ),
-        AgentRole::GateClassifier => (
-            "high",
-            Vec::new(),
-            TerminalUnavailableModelFallback::LocalDeterministicFake,
-        ),
-    };
+    let _ = role;
     RoleModelSelection {
-        model: Some(FRONTIER_PROFILE_MODEL.to_string()),
-        reasoning_effort: Some(reasoning_effort.to_string()),
-        unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
-            OrderedCatalogFallback {
-                models: Vec::new(),
-                budget_degrade_models: budget_degrade_models
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                on_exhausted,
-            },
-        ),
+        model: None,
+        reasoning_effort: None,
+        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     }
 }
 
@@ -1959,6 +1960,24 @@ pub(super) fn apply_role_model_selection(
         resolution.observation,
         runtime,
     )?;
+    if runtime != SupervisorRuntime::Fake
+        && crate::selection::routing_policy::current_routing_policy().is_some()
+    {
+        crate::selection::routing_policy::validate_selected_launch(
+            role.as_str(),
+            runtime.as_str(),
+            resolution
+                .selection
+                .model
+                .as_deref()
+                .context("selected role has no model")?,
+            resolution
+                .selection
+                .reasoning_effort
+                .as_deref()
+                .context("selected role has no effort")?,
+        )?;
+    }
     Ok(command.with_model_selection(
         resolution.selection.model,
         resolution.selection.reasoning_effort,
@@ -2008,10 +2027,7 @@ pub(super) fn apply_review_lens_model_selection(
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
     let ReviewLensBackendConfig::Model {
-        backend_id,
-        model,
-        reasoning_effort,
-        ..
+        backend_id, model, ..
     } = &lens.backend
     else {
         bail!("precomputed review lenses cannot be dispatched as model processes");
@@ -2023,14 +2039,17 @@ pub(super) fn apply_review_lens_model_selection(
             .with_model_selection(None, None));
     }
     validate_known_judgment_role_model(AgentRole::Auditor, Some(model))?;
-    let resolved_effort = resolve_reasoning_effort(
-        AgentRole::Auditor,
-        assignment_reasoning_effort,
-        reasoning_effort.as_deref(),
-        0,
-    );
+    let resolved_effort = resolve_review_lens_reasoning_effort(lens, assignment_reasoning_effort);
+    if crate::selection::routing_policy::current_routing_policy().is_some() {
+        crate::selection::routing_policy::validate_selected_launch(
+            AgentRole::Auditor.as_str(),
+            runtime.as_str(),
+            model,
+            &resolved_effort.resolved,
+        )?;
+    }
     Ok(command
-        .with_model_provider(Some(backend_id.clone()))
+        .with_model_provider((backend_id != "automatic").then(|| backend_id.clone()))
         .with_model_selection(Some(model.clone()), Some(resolved_effort.resolved)))
 }
 
@@ -3189,7 +3208,7 @@ mod regression_tests {
             Some("provider-alpha")
         );
         assert_eq!(diff_command.model.as_deref(), Some("model-alpha"));
-        assert_eq!(diff_command.reasoning_effort.as_deref(), Some("xhigh"));
+        assert_eq!(diff_command.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(
             report_command.model_provider.as_deref(),
             Some("provider-beta")
@@ -3212,7 +3231,7 @@ mod regression_tests {
             .any(|argument| argument == "model_provider=\"provider-alpha\""));
         assert!(diff_argv
             .iter()
-            .any(|argument| argument == "model_reasoning_effort=\"xhigh\""));
+            .any(|argument| argument == "model_reasoning_effort=\"high\""));
         assert!(report_argv
             .windows(2)
             .any(|pair| pair == ["-m", "model-beta"]));
@@ -3222,6 +3241,82 @@ mod regression_tests {
         assert!(report_argv
             .iter()
             .any(|argument| argument == "model_reasoning_effort=\"max\""));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_lens_dispatch_preserves_effort_and_fails_closed() -> Result<()> {
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+            FRONTIER_PROFILE_MODEL,
+        ])?);
+        let missing_catalog =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["unrelated-model"])?);
+        let make_command = || {
+            ExternalAgentCommand::codex(
+                "codex",
+                Path::new("/tmp/review-lens-test"),
+                Path::new("/tmp/review-lens-test/prompt.md"),
+                Path::new("/tmp/review-lens-test/log.jsonl"),
+                Path::new("/tmp/review-lens-test/report.json"),
+                Duration::from_secs(30),
+            )
+        };
+        let mut selected_lenses = default_supervisor_review_lenses();
+        for (lens, selected) in selected_lenses
+            .iter_mut()
+            .zip(["minimal", "medium", "ultra"])
+        {
+            if let ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } = &mut lens.backend
+            {
+                *model = FRONTIER_PROFILE_MODEL.into();
+                *reasoning_effort = Some(selected.into());
+            }
+        }
+        for lens in &selected_lenses {
+            let expected = lens.backend.reasoning_effort().context("selected effort")?;
+            let command = apply_review_lens_model_selection(
+                make_command(),
+                lens,
+                None,
+                SupervisorRuntime::Codex,
+                &catalog,
+            )?;
+            assert_eq!(command.reasoning_effort.as_deref(), Some(expected));
+            assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
+            assert!(crate::external_agent::command_argv(&command)
+                .iter()
+                .any(|argument| {
+                    argument.to_string_lossy() == format!("model_reasoning_effort=\"{expected}\"")
+                }));
+            assert!(apply_review_lens_model_selection(
+                make_command(),
+                lens,
+                None,
+                SupervisorRuntime::Codex,
+                &missing_catalog,
+            )
+            .is_err());
+            let mut incapable_lens = lens.clone();
+            if let ReviewLensBackendConfig::Model { model, .. } = &mut incapable_lens.backend {
+                *model = ECONOMY_PROFILE_MODEL.to_string();
+            }
+            let incapable_catalog =
+                RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+                    ECONOMY_PROFILE_MODEL,
+                ])?);
+            assert!(apply_review_lens_model_selection(
+                make_command(),
+                &incapable_lens,
+                None,
+                SupervisorRuntime::Codex,
+                &incapable_catalog,
+            )
+            .is_err());
+        }
         Ok(())
     }
 
@@ -3397,6 +3492,7 @@ mod regression_tests {
             "run-explicit-7",
             1,
             &field_guide,
+            crate::selection::routing_policy::ControlTransport::AdapterDynamicTool,
         )?;
         let prompt = &rendered.prompt;
         assert!(prompt.len() <= MAX_SUPERVISOR_PROMPT_BYTES);
@@ -3448,6 +3544,7 @@ mod regression_tests {
             "run-explicit-7",
             0,
             &field_guide,
+            crate::selection::routing_policy::ControlTransport::AdapterDynamicTool,
         )
         .is_err());
         let mut incompatible = assignment.clone();
@@ -3472,6 +3569,7 @@ mod regression_tests {
             "run-explicit-7",
             1,
             &field_guide,
+            crate::selection::routing_policy::ControlTransport::AdapterDynamicTool,
         )
         .is_err());
         Ok(())

@@ -1,5 +1,20 @@
 mod input_snapshot;
 pub(crate) use input_snapshot::ReadOnlyInputSnapshot;
+#[cfg(target_os = "linux")]
+mod claude;
+#[cfg(target_os = "linux")]
+pub(crate) use claude::CLAUDE_CHILD_LOOPBACK_BASE_URL;
+
+pub(crate) fn maybe_run_claude_helper_from_args() -> io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        claude::maybe_run_helper_from_args()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(false)
+    }
+}
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -14,12 +29,15 @@ use std::{
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc::{self, Receiver, SyncSender, TryRecvError, TrySendError},
-        Arc,
+        Arc, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 use thiserror::Error;
+
+#[cfg(all(test, target_os = "linux"))]
+use crate::pinned_exec;
 
 use crate::{
     agent_lifecycle::{
@@ -28,9 +46,7 @@ use crate::{
     },
     external_agent::EnvironmentFailure,
     mutation_taxonomy::ConsumedMechanicalExecutorProof,
-    pinned_exec::{
-        self, PinnedDirectExecutable, HIDDEN_PINNED_EXEC_ARGUMENT, PINNED_EXEC_DESCRIPTOR_NAME,
-    },
+    pinned_exec::{PinnedDirectExecutable, PINNED_EXEC_DESCRIPTOR_NAME},
 };
 
 mod nested_usage;
@@ -376,6 +392,8 @@ const SYSTEMD_SANDBOX_SHOW_PROPERTIES: &[&str] = &[
     "BindPaths",
     "InaccessiblePaths",
     "TemporaryFileSystem",
+    "RootDirectory",
+    "MountAPIVFS",
 ];
 #[cfg(target_os = "linux")]
 const SYSTEMD_GUARDIAN_SCRIPT: &str = r#"
@@ -425,6 +443,68 @@ fail_guardian() {
     exit 125
 }
 
+# Root rejection metadata never includes source, options, paths or arguments.
+fail_isolated_root() {
+    printf 'maco containment guardian root: results=%s shape=%s fstype=%s kernel_type=%s ro=%s\n' "$isolated_result_count" "$isolated_shape" "$isolated_fstype_metadata" "$isolated_kernel_metadata" "$isolated_read_only" >&2
+    fail_guardian "$1"
+}
+
+validate_isolated_root_report() {
+    isolated_result_count=0
+    isolated_shape=valid
+    isolated_source=
+    isolated_fstype=
+    isolated_options=
+    isolated_fstype_metadata=other
+    isolated_kernel_metadata=unknown
+    isolated_read_only=false
+    case "$isolated_kernel_type" in
+        ''|*[!0-9a-f]*|?????????????????*) ;;
+        *) isolated_kernel_metadata=$isolated_kernel_type ;;
+    esac
+    [ "$sandbox_path" = / ] || {
+        isolated_shape=malformed
+        fail_isolated_root "isolated root path was not exact root"
+    }
+    # Whitespace IFS accepts padding without glob expansion. A second observed row
+    # is always refused, never a fallback selection; the observed count is capped at 2.
+    while IFS=' 	' read -r root_source root_fstype root_options root_extra; do
+        isolated_result_count=$((isolated_result_count + 1))
+        [ "$isolated_result_count" -le 1 ] || break
+        isolated_source=$root_source
+        isolated_fstype=$root_fstype
+        isolated_options=$root_options
+        [ -n "$root_source" ] && [ -n "$root_fstype" ] && [ -n "$root_options" ] && [ -z "$root_extra" ] || isolated_shape=malformed
+    done <<ROOT_REPORT
+$isolated_root
+ROOT_REPORT
+    case "$isolated_fstype" in
+        tmpfs|ext4|overlay|rootfs|9p|squashfs|proc|xfs|btrfs) isolated_fstype_metadata=$isolated_fstype ;;
+    esac
+    case ",$isolated_options," in *,ro,*) isolated_read_only=true ;; esac
+    case ",$isolated_options," in *,rw,*) isolated_read_only=false ;; esac
+    [ "$isolated_result_count" = 1 ] && [ "$isolated_shape" = valid ] || fail_isolated_root "isolated root mount report was malformed"
+    [ "$isolated_fstype" = tmpfs ] || fail_isolated_root "isolated root was not backed by tmpfs"
+    [ "$isolated_kernel_type" = 1021994 ] || fail_isolated_root "isolated root kernel type did not match tmpfs"
+    [ "$isolated_read_only" = true ] || fail_isolated_root "isolated root was not read-only"
+}
+
+validate_sandbox_mount_options() {
+    # VFS-OPTIONS must be exactly one option-list row from the unshadowed backing.
+    # Never combine flags from older mounts or let embedded rows change report framing.
+    case "$sandbox_options" in
+        ''|*[!a-z0-9_,=.-]*|,*|*,|*,,*)
+            fail_guardian "sandbox mount options were not one well-formed row" ;;
+    esac
+    sandbox_read_only=false
+    sandbox_read_write=false
+    case ",$sandbox_options," in *,ro,*) sandbox_read_only=true ;; esac
+    case ",$sandbox_options," in *,rw,*) sandbox_read_write=true ;; esac
+    case "$sandbox_mode:$sandbox_read_only:$sandbox_read_write" in
+        ro:true:false|ro-mountpoint:true:false|rw:false:true|rw-mountpoint:false:true) ;;
+        *) fail_guardian "sandbox mount options did not match the declared access" ;;
+    esac
+}
 case "$target_environment_mode" in
     source|descriptor) ;;
     *) fail_guardian "invalid target environment mode" ;;
@@ -474,24 +554,14 @@ while [ "$sandbox_check_count" -gt 0 ]; do
     sandbox_path=$2
     shift 2
     if [ "$sandbox_mode" = isolated-root ]; then
+        # libmount's --uniq drops shadowed mounts at the same exact mountpoint.
         isolated_root=$(
-            "$findmnt_program" --raw --noheadings --output SOURCE,FSTYPE,VFS-OPTIONS --mountpoint "$sandbox_path"
+            "$findmnt_program" --raw --noheadings --uniq --output SOURCE,FSTYPE,VFS-OPTIONS --mountpoint "$sandbox_path"
         ) || fail_guardian "could not inspect isolated root mount"
-        isolated_source=${isolated_root%% *}
-        isolated_rest=${isolated_root#* }
-        isolated_fstype=${isolated_rest%% *}
-        isolated_options=${isolated_rest#* }
-        [ "$isolated_source" != "$isolated_root" ] || fail_guardian "isolated root mount report was malformed"
-        [ "$isolated_fstype" != "$isolated_rest" ] || fail_guardian "isolated root mount report was malformed"
-        [ "$isolated_fstype" = tmpfs ] || fail_guardian "isolated root was not backed by tmpfs"
-        isolated_read_only=false
-        for isolated_option_line in $isolated_options; do
-            case ",$isolated_option_line," in
-                *,ro,*) isolated_read_only=true ;;
-            esac
-        done
-        [ "$isolated_read_only" = true ] || fail_guardian "isolated root was not read-only"
-        printf 'isolated-root %s %s %s\n' "$isolated_source" "$isolated_fstype" "$isolated_options" >> "$sandbox_report" || fail_guardian "could not write isolated-root report"
+        isolated_kernel_type=$("$stat_program" -f -c '%t' -- "$sandbox_path") || isolated_kernel_type=unknown
+        validate_isolated_root_report
+        isolated_identity=$("$stat_program" -L -c '%d %i' -- "$sandbox_path") || fail_guardian "could not stat isolated root"
+        printf 'isolated-root %s %s %s %s\n' "$isolated_source" "$isolated_fstype" "$isolated_options" "$isolated_identity" >> "$sandbox_report" || fail_guardian "could not write isolated-root report"
         sandbox_check_count=$((sandbox_check_count - 1))
         continue
     fi
@@ -521,7 +591,17 @@ while [ "$sandbox_check_count" -gt 0 ]; do
         continue
     fi
     sandbox_identity=$("$stat_program" -L -c '%d %i' -- "$sandbox_path") || fail_guardian "could not stat sandbox path: $sandbox_path"
-    sandbox_options=$("$findmnt_program" --raw --noheadings --output VFS-OPTIONS --target "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    case "$sandbox_mode" in
+        ro|rw) sandbox_find_mode=--target ;;
+        ro-mountpoint|rw-mountpoint) sandbox_find_mode=--mountpoint ;;
+        *) fail_guardian "invalid sandbox mount-check mode: $sandbox_mode" ;;
+    esac
+    if [ "$sandbox_find_mode" = --mountpoint ]; then
+        sandbox_options=$("$findmnt_program" --list --uniq --noheadings --output VFS-OPTIONS --mountpoint "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    else
+        sandbox_options=$("$findmnt_program" --raw --noheadings --uniq --output VFS-OPTIONS --target "$sandbox_path") || fail_guardian "could not inspect sandbox mount: $sandbox_path"
+    fi
+    validate_sandbox_mount_options
     printf 'mounted %s %s\n' "$sandbox_identity" "$sandbox_options" >> "$sandbox_report" || fail_guardian "could not write mount report"
     sandbox_check_count=$((sandbox_check_count - 1))
 done
@@ -797,10 +877,24 @@ pub type ContainmentEvidence = ProcessTreeEvidence;
 #[serde(rename_all = "snake_case")]
 pub enum SideEffectConfinementProfileKind {
     StrictOfflineWorkspace,
+    GeminiOfflineBridge,
+    GeminiOnlineBridge,
+    CursorProviderlessOfflineUds,
     TrustedFixedNetwork,
     ExternalCodex,
+    ExternalClaude,
     ExternalGrok,
+    ExternalCursor,
     TrustedCompatibility,
+}
+
+#[cfg(target_os = "linux")]
+const fn is_gemini_bridge_kind(kind: SideEffectConfinementProfileKind) -> bool {
+    matches!(
+        kind,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge
+            | SideEffectConfinementProfileKind::GeminiOnlineBridge
+    )
 }
 
 /// Records whether the requested filesystem, socket, network, and resource policy was enforced.
@@ -918,22 +1012,22 @@ impl Eq for ExternalCodexWritableFileCapability {}
 
 #[cfg(target_os = "linux")]
 #[derive(Clone)]
-struct ExternalGrokReadOnlyFileCapability {
+struct ExternalManagedReadOnlyFileCapability {
     path: PathBuf,
     held_file: Arc<File>,
-    identity: ExternalGrokReadOnlyFileIdentity,
-    projection: ExternalGrokReadOnlyFileProjection,
+    identity: ExternalManagedReadOnlyFileIdentity,
+    projection: ExternalManagedReadOnlyFileProjection,
 }
 
 #[cfg(target_os = "linux")]
-impl ExternalGrokReadOnlyFileCapability {
+impl ExternalManagedReadOnlyFileCapability {
     fn new(
         path: PathBuf,
         held_file: Arc<File>,
-        projection: ExternalGrokReadOnlyFileProjection,
+        projection: ExternalManagedReadOnlyFileProjection,
     ) -> std::io::Result<Self> {
-        verify_external_grok_file_descriptor_is_read_only(&held_file)?;
-        let identity = external_grok_read_only_file_identity(&held_file.metadata()?)?;
+        verify_external_managed_file_descriptor_is_read_only(&held_file)?;
+        let identity = external_managed_read_only_file_identity(&held_file.metadata()?)?;
         let capability = Self {
             path,
             held_file,
@@ -954,15 +1048,15 @@ impl ExternalGrokReadOnlyFileCapability {
     }
 
     fn verify_path(&self) -> std::io::Result<()> {
-        verify_external_grok_file_descriptor_is_read_only(&self.held_file)?;
-        let held_identity = external_grok_read_only_file_identity(&self.held_file.metadata()?)?;
+        verify_external_managed_file_descriptor_is_read_only(&self.held_file)?;
+        let held_identity = external_managed_read_only_file_identity(&self.held_file.metadata()?)?;
         let observed_identity =
-            external_grok_read_only_file_identity(&fs::symlink_metadata(&self.path)?)?;
+            external_managed_read_only_file_identity(&fs::symlink_metadata(&self.path)?)?;
         if held_identity != self.identity || observed_identity != self.identity {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 format!(
-                    "ExternalGrok read-only file capability identity changed: {}",
+                    "managed-provider read-only file capability identity changed: {}",
                     self.path.display()
                 ),
             ));
@@ -970,29 +1064,33 @@ impl ExternalGrokReadOnlyFileCapability {
         Ok(())
     }
 
-    fn private_grok_home_target(&self, runtime_dir: &Path) -> Option<PathBuf> {
+    fn private_home_target(&self, runtime_dir: &Path) -> Option<PathBuf> {
         match &self.projection {
             #[cfg(test)]
-            ExternalGrokReadOnlyFileProjection::Direct => None,
-            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } => {
+            ExternalManagedReadOnlyFileProjection::Direct => None,
+            ExternalManagedReadOnlyFileProjection::PrivateGrokHome { file_name } => {
                 Some(runtime_dir.join(file_name))
+            }
+            ExternalManagedReadOnlyFileProjection::PrivateCursorHome => {
+                Some(runtime_dir.join(".cursor").join("auth.json"))
             }
         }
     }
 
-    fn is_private_grok_home_projection(&self) -> bool {
+    fn is_private_home_projection(&self) -> bool {
         matches!(
             &self.projection,
-            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { .. }
+            ExternalManagedReadOnlyFileProjection::PrivateGrokHome { .. }
+                | ExternalManagedReadOnlyFileProjection::PrivateCursorHome
         )
     }
 }
 
 #[cfg(target_os = "linux")]
-impl fmt::Debug for ExternalGrokReadOnlyFileCapability {
+impl fmt::Debug for ExternalManagedReadOnlyFileCapability {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         formatter
-            .debug_struct("ExternalGrokReadOnlyFileCapability")
+            .debug_struct("ExternalManagedReadOnlyFileCapability")
             .field("path", &self.path)
             .field("identity", &self.identity)
             .field("projection", &self.projection)
@@ -1001,7 +1099,7 @@ impl fmt::Debug for ExternalGrokReadOnlyFileCapability {
 }
 
 #[cfg(target_os = "linux")]
-impl PartialEq for ExternalGrokReadOnlyFileCapability {
+impl PartialEq for ExternalManagedReadOnlyFileCapability {
     fn eq(&self, other: &Self) -> bool {
         self.path == other.path
             && self.identity == other.identity
@@ -1010,20 +1108,124 @@ impl PartialEq for ExternalGrokReadOnlyFileCapability {
 }
 
 #[cfg(target_os = "linux")]
-impl Eq for ExternalGrokReadOnlyFileCapability {}
+impl Eq for ExternalManagedReadOnlyFileCapability {}
+
+#[cfg(target_os = "linux")]
+#[derive(Clone)]
+struct GeminiOnlineReadOnlyFileBinding {
+    source: PathBuf,
+    target: PathBuf,
+    held_file: Arc<File>,
+    identity: ExternalManagedReadOnlyFileIdentity,
+}
+
+#[cfg(target_os = "linux")]
+impl GeminiOnlineReadOnlyFileBinding {
+    fn resolver() -> std::io::Result<Self> {
+        let target = PathBuf::from("/etc/resolv.conf");
+        let source = fs::canonicalize(&target)?;
+        Self::new(source, target)
+    }
+
+    fn new(source: PathBuf, target: PathBuf) -> std::io::Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+
+        if target != Path::new("/etc/resolv.conf")
+            || !source.is_absolute()
+            || fs::canonicalize(&source)? != source
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver projection is not source-bound",
+            ));
+        }
+        let mut options = OpenOptions::new();
+        options
+            .read(true)
+            .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW);
+        let held_file = Arc::new(options.open(&source)?);
+        verify_external_managed_file_descriptor_is_read_only(&held_file)?;
+        let metadata = held_file.metadata()?;
+        if metadata.uid() != 0
+            || metadata.permissions().mode() & 0o022 != 0
+            || metadata.nlink() != 1
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver source is not a trusted root-owned file",
+            ));
+        }
+        let identity = external_managed_read_only_file_identity(&metadata)?;
+        let binding = Self {
+            source,
+            target,
+            held_file,
+            identity,
+        };
+        binding.verify_source()?;
+        Ok(binding)
+    }
+
+    fn verify_source(&self) -> std::io::Result<()> {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        verify_external_managed_file_descriptor_is_read_only(&self.held_file)?;
+        let held = self.held_file.metadata()?;
+        let named = fs::symlink_metadata(&self.source)?;
+        let held_identity = external_managed_read_only_file_identity(&held)?;
+        let named_identity = external_managed_read_only_file_identity(&named)?;
+        if held.uid() != 0
+            || held.permissions().mode() & 0o022 != 0
+            || held.nlink() != 1
+            || held_identity != self.identity
+            || named_identity != self.identity
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Gemini online resolver source identity changed",
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl fmt::Debug for GeminiOnlineReadOnlyFileBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("GeminiOnlineReadOnlyFileBinding")
+            .field("source", &self.source)
+            .field("target", &self.target)
+            .field("identity", &self.identity)
+            .finish_non_exhaustive()
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for GeminiOnlineReadOnlyFileBinding {
+    fn eq(&self, other: &Self) -> bool {
+        self.source == other.source
+            && self.target == other.target
+            && self.identity == other.identity
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Eq for GeminiOnlineReadOnlyFileBinding {}
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum ExternalGrokReadOnlyFileProjection {
+enum ExternalManagedReadOnlyFileProjection {
     #[cfg(test)]
     Direct,
     PrivateGrokHome {
         file_name: String,
     },
+    PrivateCursorHome,
 }
 
 #[cfg(target_os = "linux")]
-fn verify_external_grok_file_descriptor_is_read_only(file: &File) -> std::io::Result<()> {
+fn verify_external_managed_file_descriptor_is_read_only(file: &File) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
 
     // SAFETY: F_GETFL only reads status flags from this live descriptor.
@@ -1034,7 +1236,7 @@ fn verify_external_grok_file_descriptor_is_read_only(file: &File) -> std::io::Re
     if flags & libc::O_ACCMODE != libc::O_RDONLY {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "ExternalGrok read-only file capability requires a read-only held descriptor",
+            "managed-provider read-only file capability requires a read-only held descriptor",
         ));
     }
     Ok(())
@@ -1042,7 +1244,7 @@ fn verify_external_grok_file_descriptor_is_read_only(file: &File) -> std::io::Re
 
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExternalGrokReadOnlyFileIdentity {
+struct ExternalManagedReadOnlyFileIdentity {
     device: u64,
     inode: u64,
     owner: u32,
@@ -1051,18 +1253,18 @@ struct ExternalGrokReadOnlyFileIdentity {
 }
 
 #[cfg(target_os = "linux")]
-fn external_grok_read_only_file_identity(
+fn external_managed_read_only_file_identity(
     metadata: &fs::Metadata,
-) -> std::io::Result<ExternalGrokReadOnlyFileIdentity> {
+) -> std::io::Result<ExternalManagedReadOnlyFileIdentity> {
     use std::os::unix::fs::MetadataExt;
 
     if !metadata.file_type().is_file() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::PermissionDenied,
-            "ExternalGrok read-only file capability is not a regular file",
+            "managed-provider read-only file capability is not a regular file",
         ));
     }
-    Ok(ExternalGrokReadOnlyFileIdentity {
+    Ok(ExternalManagedReadOnlyFileIdentity {
         device: metadata.dev(),
         inode: metadata.ino(),
         owner: metadata.uid(),
@@ -1113,7 +1315,9 @@ struct WorkspaceSandboxConfig {
     #[cfg(target_os = "linux")]
     external_codex_writable_file_capabilities: Vec<ExternalCodexWritableFileCapability>,
     #[cfg(target_os = "linux")]
-    external_grok_read_only_file_capabilities: Vec<ExternalGrokReadOnlyFileCapability>,
+    external_managed_read_only_file_capabilities: Vec<ExternalManagedReadOnlyFileCapability>,
+    #[cfg(target_os = "linux")]
+    gemini_online_read_only_file_bindings: Vec<GeminiOnlineReadOnlyFileBinding>,
     writable_artifact_roots: Vec<PathBuf>,
     hidden_roots: Vec<PathBuf>,
     isolated_host_view: bool,
@@ -1132,7 +1336,9 @@ impl WorkspaceSandboxConfig {
             #[cfg(target_os = "linux")]
             external_codex_writable_file_capabilities: Vec::new(),
             #[cfg(target_os = "linux")]
-            external_grok_read_only_file_capabilities: Vec::new(),
+            external_managed_read_only_file_capabilities: Vec::new(),
+            #[cfg(target_os = "linux")]
+            gemini_online_read_only_file_bindings: Vec::new(),
             writable_artifact_roots: Vec::new(),
             hidden_roots: Vec::new(),
             isolated_host_view: false,
@@ -1186,13 +1392,31 @@ impl WorkspaceSandboxConfig {
         held_file: Arc<File>,
     ) -> std::io::Result<Self> {
         let path = file.into();
-        let capability = ExternalGrokReadOnlyFileCapability::new(
+        let capability = ExternalManagedReadOnlyFileCapability::new(
             path.clone(),
             held_file,
-            ExternalGrokReadOnlyFileProjection::Direct,
+            ExternalManagedReadOnlyFileProjection::Direct,
         )?;
         self.visible_read_only_files.push(path);
-        self.external_grok_read_only_file_capabilities
+        self.external_managed_read_only_file_capabilities
+            .push(capability);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_external_cursor_private_home_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        let path = file.into();
+        let capability = ExternalManagedReadOnlyFileCapability::new(
+            path.clone(),
+            held_file,
+            ExternalManagedReadOnlyFileProjection::PrivateCursorHome,
+        )?;
+        self.visible_read_only_files.push(path);
+        self.external_managed_read_only_file_capabilities
             .push(capability);
         Ok(self)
     }
@@ -1207,14 +1431,21 @@ impl WorkspaceSandboxConfig {
         let path = file.into();
         let file_name = file_name.into();
         validate_private_runtime_file_name(&file_name)?;
-        let capability = ExternalGrokReadOnlyFileCapability::new(
+        let capability = ExternalManagedReadOnlyFileCapability::new(
             path.clone(),
             held_file,
-            ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name },
+            ExternalManagedReadOnlyFileProjection::PrivateGrokHome { file_name },
         )?;
         self.visible_read_only_files.push(path);
-        self.external_grok_read_only_file_capabilities
+        self.external_managed_read_only_file_capabilities
             .push(capability);
+        Ok(self)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn with_gemini_online_resolver(mut self) -> std::io::Result<Self> {
+        self.gemini_online_read_only_file_bindings
+            .push(GeminiOnlineReadOnlyFileBinding::resolver()?);
         Ok(self)
     }
 
@@ -1309,6 +1540,33 @@ impl StrictOfflineWorkspaceProfile {
     }
 }
 
+/// Internal providerless Cursor qualification profile.
+///
+/// The contained process receives a private network namespace and may create only AF_UNIX client
+/// sockets. Its host view is empty apart from the immutable Nix store, the exact workspace, and
+/// the unit-owned private runtime directory containing the parent socket.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CursorProviderlessOfflineUdsProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl CursorProviderlessOfflineUdsProfile {
+    #[cfg(test)]
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite)
+                .with_visible_read_only_root("/nix/store")
+                .with_isolated_host_view(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+}
+
 /// Linux profile for a fixed trusted command that needs parent-process network access.
 ///
 /// This is an opaque capability: external callers can name it but cannot construct one.
@@ -1379,6 +1637,173 @@ impl TrustedFixedNetworkProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalCodexProfile {
     config: WorkspaceSandboxConfig,
+}
+
+/// Outer Linux profile for a managed Claude launch. The native CLI sees only its private
+/// loopback namespace; a package-internal helper forwards that loopback to one parent-owned Unix
+/// socket while retaining the ordinary workspace and policy-path boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaudeContainmentOwnerIdentity {
+    pub(crate) unit: String,
+    pub(crate) cgroup: String,
+}
+
+#[derive(Clone, Default)]
+pub(crate) struct ClaudeContainmentOwnerBinding(Arc<OnceLock<ClaudeContainmentOwnerIdentity>>);
+
+impl ClaudeContainmentOwnerBinding {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn bind(&self, identity: ClaudeContainmentOwnerIdentity) -> std::io::Result<()> {
+        if let Some(current) = self.0.get() {
+            return if current == &identity {
+                Ok(())
+            } else {
+                Err(std::io::Error::other(
+                    "Claude containment owner binding changed after preparation",
+                ))
+            };
+        }
+        self.0.set(identity).map_err(|_| {
+            std::io::Error::other("Claude containment owner binding raced during preparation")
+        })
+    }
+
+    pub(crate) fn identity(&self) -> Option<&ClaudeContainmentOwnerIdentity> {
+        self.0.get()
+    }
+}
+
+impl fmt::Debug for ClaudeContainmentOwnerBinding {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ClaudeContainmentOwnerBinding")
+            .field("bound", &self.0.get().is_some())
+            .finish()
+    }
+}
+
+impl PartialEq for ClaudeContainmentOwnerBinding {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for ClaudeContainmentOwnerBinding {}
+
+#[derive(Clone, PartialEq, Eq)]
+pub struct ExternalClaudeProfile {
+    config: WorkspaceSandboxConfig,
+    parent_relay_socket: PathBuf,
+    deadline_unix_millis: u64,
+    helper_registration_nonce: String,
+    containment_owner: ClaudeContainmentOwnerBinding,
+}
+
+impl fmt::Debug for ExternalClaudeProfile {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("ExternalClaudeProfile")
+            .field("config", &self.config)
+            .field("parent_relay_socket", &self.parent_relay_socket)
+            .field("deadline_unix_millis", &self.deadline_unix_millis)
+            .field("helper_registration_nonce", &"<redacted>")
+            .finish()
+    }
+}
+
+impl ExternalClaudeProfile {
+    pub(crate) fn read_only(
+        workspace_root: impl Into<PathBuf>,
+        parent_relay_socket: impl Into<PathBuf>,
+        deadline_unix_millis: u64,
+        helper_registration_nonce: impl Into<String>,
+        containment_owner: ClaudeContainmentOwnerBinding,
+    ) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+            parent_relay_socket: parent_relay_socket.into(),
+            deadline_unix_millis,
+            helper_registration_nonce: helper_registration_nonce.into(),
+            containment_owner,
+        }
+    }
+
+    pub(crate) fn read_write(
+        workspace_root: impl Into<PathBuf>,
+        parent_relay_socket: impl Into<PathBuf>,
+        deadline_unix_millis: u64,
+        helper_registration_nonce: impl Into<String>,
+        containment_owner: ClaudeContainmentOwnerBinding,
+    ) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+            parent_relay_socket: parent_relay_socket.into(),
+            deadline_unix_millis,
+            helper_registration_nonce: helper_registration_nonce.into(),
+            containment_owner,
+        }
+    }
+
+    pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_file(file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_write_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_codex_writable_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    fn parent_relay_socket(&self) -> &Path {
+        &self.parent_relay_socket
+    }
+
+    const fn deadline_unix_millis(&self) -> u64 {
+        self.deadline_unix_millis
+    }
+
+    fn helper_registration_nonce(&self) -> &str {
+        &self.helper_registration_nonce
+    }
+
+    fn containment_owner(&self) -> &ClaudeContainmentOwnerBinding {
+        &self.containment_owner
+    }
 }
 
 impl ExternalCodexProfile {
@@ -1481,6 +1906,76 @@ impl ExternalCodexProfile {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalGrokProfile {
     config: WorkspaceSandboxConfig,
+}
+
+/// Outer Linux profile for a managed Cursor ACP runtime. The networked vendor process receives
+/// only the exact workspace and private runtime capabilities assembled by `external_agent`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalCursorProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl ExternalCursorProfile {
+    pub(crate) fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+        }
+    }
+
+    pub(crate) fn read_write(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
+        }
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_private_cursor_auth_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_cursor_private_home_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_visible_read_write_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_write_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_write_file(file);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_visible_read_write_file_capability(
+        mut self,
+        file: impl Into<PathBuf>,
+        held_file: Arc<File>,
+    ) -> std::io::Result<Self> {
+        self.config = self
+            .config
+            .with_external_codex_writable_file_capability(file, held_file)?;
+        Ok(self)
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
 }
 
 impl ExternalGrokProfile {
@@ -1589,12 +2084,75 @@ impl ExternalGrokProfile {
     }
 }
 
+/// Only the owned Gemini launcher can construct this offline profile. It does
+/// not confer provider-network or writable-workspace authority.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiOfflineBridgeProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl GeminiOfflineBridgeProfile {
+    #[cfg(test)]
+    pub(crate) fn new(workspace: &Path, control: &Path, profile: &Path) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace, WorkspaceAccess::ReadOnly)
+                .with_isolated_host_view()
+                .with_visible_read_only_root(Path::new("/nix/store"))
+                .with_visible_read_only_root(control)
+                .with_writable_artifact_root(profile),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+}
+
+/// Managed Gemini Worker profile with a private Unix control channel and bounded
+/// provider network access. The candidate is the only writable workspace root.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GeminiOnlineBridgeProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl GeminiOnlineBridgeProfile {
+    pub(crate) fn new(
+        workspace: &Path,
+        workspace_access: WorkspaceAccess,
+        control: &Path,
+        profile: &Path,
+    ) -> std::io::Result<Self> {
+        let config = WorkspaceSandboxConfig::new(workspace, workspace_access)
+            .with_isolated_host_view()
+            .with_visible_read_only_root(Path::new("/nix/store"))
+            .with_visible_read_only_root(control)
+            .with_writable_artifact_root(profile);
+        #[cfg(target_os = "linux")]
+        let config = config.with_gemini_online_resolver()?;
+        Ok(Self { config })
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SideEffectConfinementProfile {
     StrictOfflineWorkspace(StrictOfflineWorkspaceProfile),
+    /// Source-bound Gemini bootstrap: offline, with one private Unix control channel.
+    GeminiOfflineBridge(GeminiOfflineBridgeProfile),
+    /// Selected-account Gemini Worker with verified online confinement.
+    GeminiOnlineBridge(GeminiOnlineBridgeProfile),
+    CursorProviderlessOfflineUds(CursorProviderlessOfflineUdsProfile),
     TrustedFixedNetwork(TrustedFixedNetworkProfile),
     ExternalCodex(ExternalCodexProfile),
+    ExternalClaude(ExternalClaudeProfile),
     ExternalGrok(ExternalGrokProfile),
+    ExternalCursor(ExternalCursorProfile),
     /// Explicit legacy compatibility. Results are never publishable.
     TrustedCompatibility,
 }
@@ -1602,23 +2160,43 @@ pub enum SideEffectConfinementProfile {
 impl SideEffectConfinementProfile {
     pub const fn kind(&self) -> SideEffectConfinementProfileKind {
         match self {
+            Self::GeminiOfflineBridge(_) => SideEffectConfinementProfileKind::GeminiOfflineBridge,
+            Self::GeminiOnlineBridge(_) => SideEffectConfinementProfileKind::GeminiOnlineBridge,
             Self::StrictOfflineWorkspace(_) => {
                 SideEffectConfinementProfileKind::StrictOfflineWorkspace
             }
+            Self::CursorProviderlessOfflineUds(_) => {
+                SideEffectConfinementProfileKind::CursorProviderlessOfflineUds
+            }
             Self::TrustedFixedNetwork(_) => SideEffectConfinementProfileKind::TrustedFixedNetwork,
             Self::ExternalCodex(_) => SideEffectConfinementProfileKind::ExternalCodex,
+            Self::ExternalClaude(_) => SideEffectConfinementProfileKind::ExternalClaude,
             Self::ExternalGrok(_) => SideEffectConfinementProfileKind::ExternalGrok,
+            Self::ExternalCursor(_) => SideEffectConfinementProfileKind::ExternalCursor,
             Self::TrustedCompatibility => SideEffectConfinementProfileKind::TrustedCompatibility,
         }
     }
 
     fn workspace_config(&self) -> Option<&WorkspaceSandboxConfig> {
         match self {
+            Self::GeminiOfflineBridge(profile) => Some(&profile.config),
+            Self::GeminiOnlineBridge(profile) => Some(&profile.config),
             Self::StrictOfflineWorkspace(profile) => Some(&profile.config),
+            Self::CursorProviderlessOfflineUds(profile) => Some(&profile.config),
             Self::TrustedFixedNetwork(profile) => Some(&profile.config),
             Self::ExternalCodex(profile) => Some(&profile.config),
+            Self::ExternalClaude(profile) => Some(&profile.config),
             Self::ExternalGrok(profile) => Some(&profile.config),
+            Self::ExternalCursor(profile) => Some(&profile.config),
             Self::TrustedCompatibility => None,
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn external_claude(&self) -> Option<&ExternalClaudeProfile> {
+        match self {
+            Self::ExternalClaude(profile) => Some(profile),
+            _ => None,
         }
     }
 }
@@ -1710,6 +2288,10 @@ pub struct ProcessSpec {
     /// Point GROK_HOME at the same owner-private RuntimeDirectory. Admitted host auth/config
     /// capabilities may be projected as read-only leaves below this otherwise writable home.
     pub private_runtime_grok_home: bool,
+    /// Point HOME at the owner-private RuntimeDirectory, force Cursor's documented file credential
+    /// store, and expose the unit-owned parent socket path. `ExternalCursor` may project its exact
+    /// auth leaf read-only; the providerless offline-UDS profile leaves the private home empty.
+    pub private_runtime_cursor_home: bool,
     /// Point CODEX_HOME at a parent-owned directory that outlives the transient unit so the
     /// parent can read Codex session evidence after exit. The caller must place it below a
     /// root the unit already binds read-write; the strict Linux backend fails closed otherwise.
@@ -1772,7 +2354,7 @@ impl PinnedDirectCommand {
                 "direct command changed after executable identity was pinned",
             ));
         }
-        pinned_exec::validated_current_helper_path().map(|_| ())
+        self.executable.validated_launch_helper_path().map(|_| ())
     }
 }
 
@@ -1803,6 +2385,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            private_runtime_cursor_home: false,
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
@@ -1842,6 +2425,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            private_runtime_cursor_home: false,
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
             private_runtime_files: Vec::new(),
@@ -1966,6 +2550,11 @@ impl ProcessSpec {
 
     pub const fn with_private_runtime_grok_home(mut self, enabled: bool) -> Self {
         self.private_runtime_grok_home = enabled;
+        self
+    }
+
+    pub const fn with_private_runtime_cursor_home(mut self, enabled: bool) -> Self {
+        self.private_runtime_cursor_home = enabled;
         self
     }
 
@@ -2096,6 +2685,86 @@ pub struct ProcessOutput {
     pub stderr: CapturedBytes,
     pub process_error: Option<String>,
     pub stdin_error: Option<String>,
+}
+
+/// In-memory proof only. No public constructor or wire representation exists.
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ReadOnlyFilesystemEvidence {
+    #[cfg(target_os = "linux")]
+    facts: Arc<AppliedReadOnlyFilesystem>,
+    #[cfg(not(target_os = "linux"))]
+    unavailable: std::convert::Infallible,
+}
+
+impl ReadOnlyFilesystemEvidence {
+    /// Digest of the delivered pinned executable/argv/environment descriptor, if present.
+    /// Available only through settled filesystem custody; not native-control/source authority.
+    pub(crate) fn pinned_descriptor_digest(&self) -> Option<&str> {
+        #[cfg(target_os = "linux")]
+        {
+            self.facts.pinned_descriptor_digest.as_deref()
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+}
+
+impl fmt::Debug for ReadOnlyFilesystemEvidence {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("ReadOnlyFilesystemEvidence(<redacted>)")
+    }
+}
+
+/// Keeps submission credentials private until the exact submitting caller matches.
+pub(crate) struct SettledProcessCapture {
+    output: ProcessOutput,
+    #[cfg(target_os = "linux")]
+    read_only: Option<Box<SettledReadOnlyFilesystem>>,
+}
+
+impl SettledProcessCapture {
+    pub(crate) fn into_output(self) -> ProcessOutput {
+        self.output
+    }
+
+    pub(crate) fn into_parts_for_spec(
+        self,
+        submitted: &ProcessSpec,
+    ) -> (ProcessOutput, Option<ReadOnlyFilesystemEvidence>) {
+        #[cfg(target_os = "linux")]
+        let evidence = self.read_only.and_then(|binding| {
+            if binding.submitted.as_ref() != submitted {
+                return None;
+            }
+            // Matching consumes both full specifications, including credential capabilities.
+            let VerifiedReadOnlyFilesystem { prepared, evidence } = *binding.verified;
+            drop(prepared);
+            Some(evidence)
+        });
+        #[cfg(not(target_os = "linux"))]
+        let evidence = {
+            let _ = submitted;
+            None
+        };
+        (self.output, evidence)
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct SettledReadOnlyFilesystem {
+    submitted: Box<ProcessSpec>,
+    verified: Box<VerifiedReadOnlyFilesystem>,
+}
+
+#[cfg(any(target_os = "linux", test))]
+fn filesystem_capture_ready(output: &ProcessOutput, cancelled: bool) -> bool {
+    output.status.is_some()
+        && !output.timed_out
+        && !cancelled
+        && output.process_error.is_none()
+        && output.stdin_error.is_none()
 }
 
 /// Result of one bounded interaction with a contained process.
@@ -2279,7 +2948,42 @@ pub fn run_process_cancellable(
     spec: ProcessSpec,
     cancellation: &ProcessCancellation,
 ) -> Result<ProcessOutput, ProcessRunError> {
-    run_process_cancellable_with_interaction(spec, cancellation, None)
+    run_process_cancellable_with_filesystem_evidence(spec, cancellation)
+        .map(SettledProcessCapture::into_output)
+}
+
+pub(crate) fn run_process_cancellable_with_filesystem_evidence(
+    spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+) -> Result<SettledProcessCapture, ProcessRunError> {
+    run_process_cancellable_with_interaction(spec, cancellation, None, None)
+}
+
+/// Runs one process after invoking a narrow owner callback while strict containment is attached
+/// and its target remains blocked at the execution gate.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn run_process_cancellable_with_start_gate<F>(
+    spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    prepare: F,
+) -> Result<ProcessOutput, ProcessRunError>
+where
+    F: FnMut(&ContainedProcessStartGate<'_>) -> Result<(), String>,
+{
+    run_process_cancellable_with_start_gate_and_filesystem_evidence(spec, cancellation, prepare)
+        .map(SettledProcessCapture::into_output)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn run_process_cancellable_with_start_gate_and_filesystem_evidence<F>(
+    spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    mut prepare: F,
+) -> Result<SettledProcessCapture, ProcessRunError>
+where
+    F: FnMut(&ContainedProcessStartGate<'_>) -> Result<(), String>,
+{
+    run_process_cancellable_with_interaction(spec, cancellation, None, Some(&mut prepare))
 }
 
 /// Runs one bounded interactive protocol inside the normal contained process lifecycle.
@@ -2307,7 +3011,9 @@ where
                 }),
         );
     };
-    let process = run_process_cancellable_with_interaction(spec, cancellation, Some(&mut adapter))?;
+    let process =
+        run_process_cancellable_with_interaction(spec, cancellation, Some(&mut adapter), None)?
+            .into_output();
     let interaction = interaction.ok_or_else(|| ProcessRunError::IoSetup {
         label: "interactive process".to_string(),
         command: "<redacted>".to_string(),
@@ -2321,12 +3027,61 @@ where
     })
 }
 
+/// Runs one bounded interactive protocol after an owner callback has attached
+/// launch-scoped state while the strictly contained child remains blocked.
+#[cfg(target_os = "linux")]
+pub(crate) fn run_process_interactive_with_start_gate<T, F, G>(
+    mut spec: ProcessSpec,
+    cancellation: &ProcessCancellation,
+    mut prepare: G,
+    mut handler: F,
+) -> Result<InteractiveProcessOutput<T>, ProcessRunError>
+where
+    F: FnMut(&mut ContainedProcessSession<'_>) -> Result<T, String>,
+    G: FnMut(&ContainedProcessStartGate<'_>) -> Result<(), String>,
+{
+    spec.stdin = StdinMode::Interactive;
+    let mut interaction = None;
+    let mut adapter = |session: &mut ContainedProcessSession<'_>| {
+        interaction = Some(
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(session)))
+                .unwrap_or_else(|_| {
+                    Err("contained interactive handler panicked; details redacted".to_string())
+                }),
+        );
+    };
+    let process = run_process_cancellable_with_interaction(
+        spec,
+        cancellation,
+        Some(&mut adapter),
+        Some(&mut prepare),
+    )?
+    .into_output();
+    let interaction = interaction.ok_or_else(|| ProcessRunError::IoSetup {
+        label: "interactive process".to_string(),
+        command: "<redacted>".to_string(),
+        source: std::io::Error::other(
+            "contained interactive handler was not invoked after successful setup",
+        ),
+    })?;
+    Ok(InteractiveProcessOutput {
+        process,
+        interaction,
+    })
+}
+
+type ProcessStartGateCallback<'callback> =
+    dyn for<'gate> FnMut(&ContainedProcessStartGate<'gate>) -> Result<(), String> + 'callback;
+
 fn run_process_cancellable_with_interaction(
     mut spec: ProcessSpec,
     cancellation: &ProcessCancellation,
     interaction: Option<&mut dyn FnMut(&mut ContainedProcessSession<'_>)>,
-) -> Result<ProcessOutput, ProcessRunError> {
+    mut start_gate: Option<&mut ProcessStartGateCallback<'_>>,
+) -> Result<SettledProcessCapture, ProcessRunError> {
     let started = Instant::now();
+    #[cfg(target_os = "linux")]
+    let submitted = Box::new(spec.clone());
     if interaction.is_some() != matches!(spec.stdin, StdinMode::Interactive) {
         return Err(ProcessRunError::IoSetup {
             label: spec.label.clone(),
@@ -2590,6 +3345,47 @@ fn run_process_cancellable_with_interaction(
             "containment start gate",
         ));
     }
+    if let Some(prepare) = start_gate.as_mut() {
+        let context =
+            attached_process_tree
+                .start_gate_context()
+                .ok_or_else(|| ProcessRunError::IoSetup {
+                    label: spec.label.clone(),
+                    command: command_display.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::Unsupported,
+                        "pre-start owner callback requires strict Linux systemd containment",
+                    ),
+                })?;
+        if let Err(error) =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| prepare(&context)))
+                .unwrap_or_else(|_| {
+                    Err("pre-start owner callback panicked; details redacted".to_string())
+                })
+        {
+            let cleanup = attached_process_tree.cleanup(
+                &mut child,
+                &spec.label,
+                "pre-start owner callback rollback",
+            );
+            let cleanup_error = append_error(
+                cleanup.error,
+                wait_for_child_cleanup(
+                    &mut child,
+                    &spec.label,
+                    "pre-start owner callback rollback",
+                ),
+            );
+            return Err(ProcessRunError::IoSetup {
+                label: spec.label.clone(),
+                command: command_display,
+                source: std::io::Error::other(
+                    append_error(Some(error), cleanup_error)
+                        .unwrap_or_else(|| "pre-start owner callback failed".to_string()),
+                ),
+            });
+        }
+    }
     if let Some(metadata) = &spec.agent_lifecycle {
         let pid = match attached_process_tree.agent_lifecycle_pid(
             &mut child,
@@ -2654,6 +3450,47 @@ fn run_process_cancellable_with_interaction(
             });
         }
     }
+    #[cfg(target_os = "linux")]
+    let private_peer_binding = if interaction.is_some()
+        && is_gemini_bridge_kind(spec.side_effects.kind())
+        && attached_process_tree.side_effects.is_verified()
+    {
+        let binding = match &mut attached_process_tree.backend {
+            ProcessTreeBackend::Systemd(unit) => unit
+                .target_pid(&mut child, operation_deadline, cancellation)
+                .and_then(|pid| {
+                    crate::agent_lifecycle::process_start_time(pid)
+                        .map(|start| (pid, start, unit.cgroup_path.clone()))
+                        .map_err(|error| std::io::Error::other(error.to_string()))
+                }),
+            _ => Err(std::io::Error::other(
+                "Gemini private peer requires verified systemd containment",
+            )),
+        };
+        match binding {
+            Ok(binding) => Some(binding),
+            Err(source) => {
+                let cleanup = attached_process_tree.cleanup(
+                    &mut child,
+                    &spec.label,
+                    "private peer PID capture rollback",
+                );
+                let cleanup_error = append_error(
+                    cleanup.error,
+                    wait_for_child_cleanup(
+                        &mut child,
+                        &spec.label,
+                        "private peer PID capture rollback",
+                    ),
+                );
+                let error =
+                    process_ownership_error(spec.label.clone(), command_display.clone(), source);
+                return Err(append_process_run_error_cleanup(error, cleanup_error));
+            }
+        }
+    } else {
+        None
+    };
     let mut process_tree = match attached_process_tree.release(
         &mut child,
         &spec.label,
@@ -2686,6 +3523,18 @@ fn run_process_cancellable_with_interaction(
                     command: command_display.clone(),
                     source,
                 })?;
+            #[cfg(target_os = "linux")]
+            if matches!(
+                spec.side_effects.kind(),
+                SideEffectConfinementProfileKind::GeminiOfflineBridge
+                    | SideEffectConfinementProfileKind::GeminiOnlineBridge
+            ) && process_tree.side_effects.is_verified()
+            {
+                // Capture the guardian-published target identity while the target is still held
+                // at the start gate. Waiting after release can consume the operation deadline
+                // before the private-channel handler starts.
+                session.peer_binding = private_peer_binding;
+            }
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&mut session)))
                 .is_err()
             {
@@ -2709,6 +3558,8 @@ fn run_process_cancellable_with_interaction(
     let mut process_error = None;
     let process_tree_evidence;
     let side_effect_evidence;
+    #[cfg(target_os = "linux")]
+    let mut settled_read_only = None;
 
     loop {
         let output_backlog = output_drainers.drain_ready();
@@ -2865,6 +3716,10 @@ fn run_process_cancellable_with_interaction(
                 &spec.label,
                 "normal process-tree finalization",
             );
+            #[cfg(target_os = "linux")]
+            {
+                settled_read_only = cleanup.read_only;
+            }
             process_tree_evidence = cleanup.process_tree;
             side_effect_evidence = cleanup.side_effects;
             process_error = append_error(process_error, cleanup.error);
@@ -2890,7 +3745,7 @@ fn run_process_cancellable_with_interaction(
     let (stdin_error, input_cleanup_error) = input_writer.into_result(&spec.label);
     process_error = append_error(process_error, input_cleanup_error);
 
-    Ok(ProcessOutput {
+    let output = ProcessOutput {
         status,
         duration: started.elapsed(),
         timed_out,
@@ -2900,6 +3755,22 @@ fn run_process_cancellable_with_interaction(
         stderr,
         process_error,
         stdin_error,
+    };
+    #[cfg(target_os = "linux")]
+    let read_only = if filesystem_capture_ready(&output, cancellation.is_cancelled()) {
+        settled_read_only.map(|verified| {
+            Box::new(SettledReadOnlyFilesystem {
+                submitted,
+                verified,
+            })
+        })
+    } else {
+        None
+    };
+    Ok(SettledProcessCapture {
+        output,
+        #[cfg(target_os = "linux")]
+        read_only,
     })
 }
 
@@ -3027,6 +3898,86 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             "private runtime GROK_HOME requires private HOME and strict ExternalGrok confinement",
         ));
     }
+    #[cfg(target_os = "linux")]
+    if let Some(profile) = spec.side_effects.external_claude() {
+        if spec.containment != ContainmentPolicy::Required || !spec.private_runtime_home {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude requires private HOME and strict containment",
+            ));
+        }
+        if profile.helper_registration_nonce().len() != 64
+            || !profile
+                .helper_registration_nonce()
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude helper registration nonce is malformed",
+            ));
+        }
+        let carries_relay_endpoint = match &spec.environment {
+            EnvironmentMode::ClearAndSet(environment)
+            | EnvironmentMode::InheritAndSet(environment) => {
+                environment.contains_key("ANTHROPIC_BASE_URL")
+            }
+            EnvironmentMode::Inherit => false,
+        };
+        if carries_relay_endpoint && spec.pinned_direct.is_none() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalClaude provider relay requires a pinned direct executable",
+            ));
+        }
+        validate_bounded_path(profile.parent_relay_socket(), "Claude parent relay socket")?;
+        let parent = profile.parent_relay_socket().parent().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Claude parent relay socket has no parent directory",
+            )
+        })?;
+        if !profile.parent_relay_socket().is_absolute()
+            || !profile
+                .config
+                .visible_read_only_roots
+                .iter()
+                .any(|root| parent == root)
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Claude parent relay socket is outside its exact read-only relay directory",
+            ));
+        }
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = fs::symlink_metadata(parent)?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        if metadata.file_type().is_symlink()
+            || !metadata.is_dir()
+            || metadata.uid() != effective_uid
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Claude parent relay directory is not private to the launch owner",
+            ));
+        }
+    }
+    if spec.private_runtime_cursor_home
+        && (!spec.private_runtime_home
+            || !matches!(
+                spec.side_effects.kind(),
+                SideEffectConfinementProfileKind::ExternalCursor
+                    | SideEffectConfinementProfileKind::CursorProviderlessOfflineUds
+            )
+            || spec.containment != ContainmentPolicy::Required)
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "private runtime Cursor HOME requires private HOME and ExternalCursor or providerless offline-UDS confinement",
+        ));
+    }
     if let Some(request) = &spec.nested_usage {
         if request.parent_span_id.is_empty()
             || request.parent_span_id.len() > MAX_PROCESS_LABEL_BYTES
@@ -3141,12 +4092,12 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
         validate_workspace_config_bounds(config)?;
         #[cfg(target_os = "linux")]
         if config
-            .external_grok_read_only_file_capabilities
+            .external_managed_read_only_file_capabilities
             .iter()
             .any(|capability| {
                 matches!(
                     &capability.projection,
-                    ExternalGrokReadOnlyFileProjection::PrivateGrokHome { .. }
+                    ExternalManagedReadOnlyFileProjection::PrivateGrokHome { .. }
                 )
             })
             && !spec.private_runtime_grok_home
@@ -3154,6 +4105,23 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "ExternalGrok private home projections require a private runtime GROK_HOME",
+            ));
+        }
+        #[cfg(target_os = "linux")]
+        if config
+            .external_managed_read_only_file_capabilities
+            .iter()
+            .any(|capability| {
+                matches!(
+                    &capability.projection,
+                    ExternalManagedReadOnlyFileProjection::PrivateCursorHome
+                )
+            })
+            && !spec.private_runtime_cursor_home
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "ExternalCursor auth projection requires a private runtime Cursor HOME",
             ));
         }
     }
@@ -3244,7 +4212,7 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                 ));
             }
         }
-        if config.external_grok_read_only_file_capabilities.len() > MAX_SANDBOX_PATHS_PER_CLASS {
+        if config.external_managed_read_only_file_capabilities.len() > MAX_SANDBOX_PATHS_PER_CLASS {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "ExternalGrok read-only file capabilities exceed their vector limit",
@@ -3252,7 +4220,7 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
         }
         let mut grok_capability_paths = BTreeSet::new();
         let mut grok_projection_names = BTreeSet::new();
-        for capability in &config.external_grok_read_only_file_capabilities {
+        for capability in &config.external_managed_read_only_file_capabilities {
             validate_bounded_path(&capability.path, "ExternalGrok read-only file capability")?;
             if !config.visible_read_only_files.contains(&capability.path)
                 || !grok_capability_paths.insert(&capability.path)
@@ -3264,8 +4232,8 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
             }
             match &capability.projection {
                 #[cfg(test)]
-                ExternalGrokReadOnlyFileProjection::Direct => {}
-                ExternalGrokReadOnlyFileProjection::PrivateGrokHome { file_name } => {
+                ExternalManagedReadOnlyFileProjection::Direct => {}
+                ExternalManagedReadOnlyFileProjection::PrivateGrokHome { file_name } => {
                     validate_private_runtime_file_name(file_name)?;
                     if !grok_projection_names.insert(file_name) {
                         return Err(std::io::Error::new(
@@ -3274,7 +4242,19 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                         ));
                     }
                 }
+                ExternalManagedReadOnlyFileProjection::PrivateCursorHome => {}
             }
+        }
+        if config.gemini_online_read_only_file_bindings.len() > 1 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Gemini online resolver projections exceed their exact bound",
+            ));
+        }
+        for binding in &config.gemini_online_read_only_file_bindings {
+            validate_bounded_path(&binding.source, "Gemini online resolver source")?;
+            validate_bounded_path(&binding.target, "Gemini online resolver target")?;
+            binding.verify_source()?;
         }
     }
     let total = 1usize
@@ -3284,6 +4264,16 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
         .and_then(|total| total.checked_add(config.visible_read_write_files.len()))
         .and_then(|total| total.checked_add(config.writable_artifact_roots.len()))
         .and_then(|total| total.checked_add(config.hidden_roots.len()))
+        .and_then(|total| {
+            #[cfg(target_os = "linux")]
+            {
+                total.checked_add(config.gemini_online_read_only_file_bindings.len())
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                Some(total)
+            }
+        })
         .ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -4246,6 +5236,67 @@ include!("process_runner/part2.rs");
 include!("process_runner/part3.rs");
 
 #[cfg(all(test, target_os = "linux"))]
+pub(crate) fn cursor_providerless_offline_uds_systemd_properties_for_test(
+    profile: CursorProviderlessOfflineUdsProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "providerless Cursor offline UDS profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8 * 1024,
+    )
+    .with_private_runtime_home(true)
+    .with_private_runtime_cursor_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::CursorProviderlessOfflineUds(
+        profile,
+    ));
+    validate_process_spec_bounds(&spec)?;
+    let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
+        io::Error::other("providerless Cursor test profile did not resolve a systemd sandbox")
+    })?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    Ok(command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn verify_cursor_providerless_offline_uds_filter_for_test(
+    value: &str,
+) -> io::Result<()> {
+    verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
+        value,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn verify_cursor_providerless_offline_uds_network_for_test(
+    private_network: &str,
+    address_families: &str,
+) -> io::Result<()> {
+    verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
+        &BTreeMap::from([
+            ("PrivateNetwork".to_string(), private_network.to_string()),
+            (
+                "RestrictAddressFamilies".to_string(),
+                address_families.to_string(),
+            ),
+        ]),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn external_codex_systemd_properties_for_test(
     profile: ExternalCodexProfile,
     program: &Path,
@@ -4261,6 +5312,36 @@ pub(crate) fn external_codex_systemd_properties_for_test(
     .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
     let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
         io::Error::other("external Codex test profile did not resolve a systemd sandbox")
+    })?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut command,
+        &sandbox,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    Ok(command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn external_claude_systemd_properties_for_test(
+    profile: ExternalClaudeProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "external Claude systemd profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8 * 1024,
+    )
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalClaude(profile));
+    let sandbox = resolve_systemd_sandbox(&spec)?.ok_or_else(|| {
+        io::Error::other("external Claude test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
     apply_systemd_sandbox_properties(
@@ -4314,12 +5395,182 @@ pub(crate) fn private_runtime_environment_for_test(
         spec.private_runtime_home,
         spec.private_runtime_codex_home,
         spec.private_runtime_grok_home,
+        spec.private_runtime_cursor_home,
         spec.staged_codex_home.as_deref(),
     )
 }
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod filesystem_capture_contract_tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn output() -> ProcessOutput {
+        ProcessOutput {
+            status: Some(ExitStatus::from_raw(0)),
+            duration: Duration::ZERO,
+            timed_out: false,
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
+            side_effects: SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::TrustedCompatibility,
+            ),
+            stdout: CapturedBytes::default(),
+            stderr: CapturedBytes::default(),
+            process_error: None,
+            stdin_error: None,
+        }
+    }
+
+    fn spec() -> ProcessSpec {
+        ProcessSpec::shell("capture contract", Shell::UnixSh, "true", "/workspace", 32)
+    }
+
+    // Synthetic private state tests ownership and matching, never native sandbox verification.
+    fn pending(spec: &ProcessSpec) -> Box<VerifiedReadOnlyFilesystem> {
+        Box::new(VerifiedReadOnlyFilesystem {
+            prepared: Box::new(spec.clone()),
+            evidence: ReadOnlyFilesystemEvidence {
+                facts: Arc::new(AppliedReadOnlyFilesystem {
+                    kind: SideEffectConfinementProfileKind::TrustedCompatibility,
+                    access: WorkspaceAccess::ReadOnly,
+                    current_dir: spec.current_dir.clone(),
+                    workspace_root: spec.current_dir.clone(),
+                    runtime_root: PathBuf::from("/private-runtime"),
+                    pinned_descriptor_digest: None,
+                    path_classes: vec![(2, PathBuf::from("/private-runtime"))],
+                    mounts: Vec::new(),
+                }),
+            },
+        })
+    }
+
+    fn capture(spec: &ProcessSpec) -> SettledProcessCapture {
+        SettledProcessCapture {
+            output: output(),
+            read_only: Some(Box::new(SettledReadOnlyFilesystem {
+                submitted: Box::new(spec.clone()),
+                verified: pending(spec),
+            })),
+        }
+    }
+
+    #[test]
+    fn identical_public_command_without_private_pin_is_refused() {
+        let program = env::current_exe().expect("test executable");
+        let base = ProcessSpec::direct(
+            "pin contract",
+            &program,
+            std::iter::empty::<OsString>(),
+            program.parent().expect("executable parent"),
+            32,
+        );
+        let executable = PinnedDirectExecutable::capture_for_test(&program)
+            .expect("capture existing executable");
+        let submitted = base
+            .clone()
+            .with_pinned_direct_executable(executable)
+            .expect("bind matching executable");
+        assert!(submitted.command == base.command);
+        assert!(submitted.current_dir == base.current_dir);
+        assert!(submitted != base);
+        let mut without_pin = submitted.clone();
+        without_pin.pinned_direct = None;
+        assert!(without_pin == base);
+        assert!(capture(&submitted)
+            .into_parts_for_spec(&submitted)
+            .1
+            .is_some());
+        let (output, evidence) = capture(&submitted).into_parts_for_spec(&base);
+        assert!(output.status.is_some());
+        assert!(evidence.is_none());
+    }
+
+    #[test]
+    fn public_verified_flags_and_absent_pending_cannot_issue_private_proof() {
+        let submitted = spec();
+        let capture = SettledProcessCapture {
+            output: output(),
+            read_only: None,
+        };
+        let (output, evidence) = capture.into_parts_for_spec(&submitted);
+        assert!(output.side_effects.is_verified());
+        assert!(evidence.is_none());
+        let mut absent = None;
+        assert!(take_fresh_read_only_filesystem(&mut absent, false, true, true).is_none());
+    }
+
+    #[test]
+    fn exact_submission_match_preserves_output_but_refuses_command_cwd_and_profile_drift() {
+        let submitted = spec();
+        assert!(capture(&submitted)
+            .into_parts_for_spec(&submitted)
+            .1
+            .is_some());
+        let mut changed = Vec::new();
+        let mut command = submitted.clone();
+        command.command = ProcessCommand::Direct {
+            program: PathBuf::from("/different-executable"),
+            args: vec![OsString::from("different-argument")],
+        };
+        changed.push(command);
+        let mut cwd = submitted.clone();
+        cwd.current_dir.push("different");
+        changed.push(cwd);
+        let mut profile = submitted.clone();
+        profile.side_effects = SideEffectConfinementProfile::TrustedCompatibility;
+        changed.push(profile);
+        let mut environment = submitted.clone();
+        environment.environment = EnvironmentMode::ClearAndSet(BTreeMap::new());
+        changed.push(environment);
+        for different in changed {
+            let (output, evidence) = capture(&submitted).into_parts_for_spec(&different);
+            assert!(output.status.is_some());
+            assert!(evidence.is_none());
+        }
+    }
+
+    #[test]
+    fn fresh_owned_cleanup_transfers_once_and_refuses_missing_ownership_or_error() {
+        let submitted = spec();
+        for (cleaned, owned, succeeded) in [
+            (true, true, true),
+            (false, false, true),
+            (false, true, false),
+        ] {
+            let mut value = Some(pending(&submitted));
+            assert!(
+                take_fresh_read_only_filesystem(&mut value, cleaned, owned, succeeded).is_none()
+            );
+            assert!(value.is_none());
+        }
+        let mut value = Some(pending(&submitted));
+        assert!(take_fresh_read_only_filesystem(&mut value, false, true, true).is_some());
+        assert!(take_fresh_read_only_filesystem(&mut value, false, true, true).is_none());
+    }
+
+    #[test]
+    fn final_readiness_refuses_timeout_cancellation_and_io_errors_without_requiring_exit_zero() {
+        assert!(filesystem_capture_ready(&output(), false));
+        assert!(!filesystem_capture_ready(&output(), true));
+        let mut timed_out = output();
+        timed_out.timed_out = true;
+        assert!(!filesystem_capture_ready(&timed_out, false));
+        let mut io = output();
+        io.process_error = Some("owned output did not settle".into());
+        assert!(!filesystem_capture_ready(&io, false));
+        let mut stdin = output();
+        stdin.stdin_error = Some("stdin write failed".into());
+        assert!(!filesystem_capture_ready(&stdin, false));
+        let mut failed_root = output();
+        failed_root.status = Some(ExitStatus::from_raw(7 << 8));
+        assert!(filesystem_capture_ready(&failed_root, false));
+    }
+}
 
 #[cfg(all(test, target_os = "linux"))]
 mod mechanical_executor_lifecycle_tests {

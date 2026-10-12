@@ -322,7 +322,7 @@ pub(super) fn import_worker_execution_journals(
     import_worker_execution_journals_at(writer, assignment, incoming_scratch, external_run, None)
 }
 
-pub(super) fn import_worker_execution_journals_at(
+pub(crate) fn import_worker_execution_journals_at(
     writer: &mut ArtifactRunWriter,
     assignment: &OrchestratorAssignment,
     incoming_scratch: &ArtifactScratchDirectory,
@@ -434,7 +434,7 @@ pub(super) fn import_worker_execution_journals_at(
     Ok(journals)
 }
 
-pub(super) fn parse_worker_execution_journal(
+pub(crate) fn parse_worker_execution_journal(
     bytes: &[u8],
     display_path: &Path,
 ) -> Result<Vec<WorkerExecutionJournalEntry>> {
@@ -487,7 +487,7 @@ pub(super) fn parse_worker_execution_journal(
 }
 
 #[derive(Debug, thiserror::Error)]
-pub(super) enum WorkerExecutionJournalRecordError {
+pub(crate) enum WorkerExecutionJournalRecordError {
     #[error(
         "worker execution journal record omitted command; corrective action: provide a nonempty command array before retrying the append"
     )]
@@ -553,7 +553,7 @@ fn validate_worker_execution_journal_record(
     Ok(())
 }
 
-pub(super) fn append_worker_execution_journal_record(
+pub(crate) fn append_worker_execution_journal_record(
     journal: &mut impl std::io::Write,
     entry: &WorkerExecutionJournalEntry,
 ) -> std::result::Result<(), WorkerExecutionJournalRecordError> {
@@ -2031,6 +2031,7 @@ pub(super) fn deterministic_fake_run(
         output_last_message: Some(output),
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     }
 }
@@ -2079,6 +2080,22 @@ pub(super) fn external_process_completed(
     run: &ExternalAgentRun,
     runtime: SupervisorRuntime,
 ) -> bool {
+    if runtime == SupervisorRuntime::GeminiCli {
+        let Some(evidence) = run.gemini_bridge_evidence() else {
+            return false;
+        };
+        return run.publishable
+            && run.exit_code == Some(0)
+            && !run.timed_out
+            && run.error.is_none()
+            && run.managed_gemini_selection_evidence().is_some()
+            && evidence.provider_released
+            && ((evidence.managed_worker_completed
+                && evidence.tool_mutation_observed
+                && !evidence.managed_read_only_completed)
+                || evidence.read_only_completion_valid(run))
+            && external_safety_verified(run, runtime);
+    }
     if runtime == SupervisorRuntime::Fake {
         return run.simulation_succeeded()
             && run.program_trust == ExternalProgramTrust::ExplicitCustom;
@@ -2091,6 +2108,12 @@ pub(super) fn external_process_completed(
             || run.authenticated_codex_evidence().is_none_or(|evidence| {
                 !evidence.model_mismatch && run.authenticated_codex_usage().is_some()
             }))
+        && (runtime != SupervisorRuntime::ClaudeCode
+            || (run.authenticated_claude_usage_complete()
+                && run.authenticated_claude_model().is_some()
+                && !run.stdout.raw_capture_truncated()))
+        && (runtime != SupervisorRuntime::Cursor
+            || cursor_managed_usage(run).is_some_and(|(_, complete)| complete))
         && run
             .authenticated_app_server_evidence()
             .is_none_or(|evidence| {
@@ -2100,6 +2123,42 @@ pub(super) fn external_process_completed(
             })
         && run.codex_auditor_effort_qualified()
         && external_safety_verified(run, runtime)
+}
+
+fn cursor_managed_usage(run: &ExternalAgentRun) -> Option<(Usage, bool)> {
+    let evidence = run.cursor_managed_parent_evidence.as_ref()?;
+    let counters = [
+        evidence.input_tokens,
+        evidence.output_tokens,
+        evidence.cache_read_tokens,
+        evidence.cache_write_tokens,
+    ];
+    if counters.iter().all(Option::is_none) {
+        return None;
+    }
+    // Preserve each observed bucket once. Missing counters contribute only a
+    // zero lower bound; they cannot establish complete invocation accounting.
+    let values = counters.map(|value| usize::try_from(value.unwrap_or(0)).unwrap_or(usize::MAX));
+    let input_tokens = values[0]
+        .saturating_add(values[2])
+        .saturating_add(values[3]);
+    let output_tokens = values[1];
+    let usage = Usage {
+        input_tokens,
+        output_tokens,
+        total_tokens: input_tokens.saturating_add(output_tokens),
+    };
+    let exact_total = counters.into_iter().try_fold(0_usize, |total, value| {
+        total.checked_add(usize::try_from(value?).ok()?)
+    });
+    let complete = evidence.peer_verified
+        && evidence.admitted_attempts != 0
+        && evidence.completed_attempts == evidence.admitted_attempts
+        && evidence.usage_attempts_covered == evidence.admitted_attempts
+        && evidence.usage_attempts_incomplete == 0
+        && evidence.usage_is_incomplete == Some(false)
+        && exact_total.is_some();
+    Some((usage, complete))
 }
 
 pub(super) fn external_usage_for_runtime(
@@ -2112,9 +2171,28 @@ pub(super) fn external_usage_for_runtime(
         // Codex-shaped counters or ACP cost ticks masquerading as tokens.
         run.authenticated_grok_usage(command)
             .map(|(usage, _)| usage)
+    } else if runtime == SupervisorRuntime::ClaudeCode {
+        run.authenticated_claude_usage()
+            .or_else(|| run.authenticated_claude_usage_lower_bound())
+    } else if runtime == SupervisorRuntime::Cursor {
+        // ACP raw events are not Codex JSONL. The managed parent retains the
+        // per-attempt floors and completeness independently of writable logs.
+        cursor_managed_usage(run).map(|(usage, _)| usage)
+    } else if runtime == SupervisorRuntime::GeminiCli {
+        // Gemini retains only a held total-token lower bound for ledger settlement;
+        // it cannot supply complete input/output usage through the Codex parser.
+        None
     } else {
         complete_external_codex_usage(run, command)
     }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn gemini_read_only_reporting_completion_requires_live_native_custody() -> Result<()> {
+    crate::external_agent::gemini_bridge::test_read_only_completion_consumer(|run| {
+        external_process_completed(run, SupervisorRuntime::GeminiCli)
+    })
 }
 
 pub(super) fn complete_external_codex_usage(
@@ -2639,6 +2717,7 @@ mod grok_stream_usage_evidence {
                 },
             )),
             grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: None,
             codex_parent_evidence: None,
         };
         let record = command_record_from_external_for_runtime(
@@ -2655,5 +2734,291 @@ mod grok_stream_usage_evidence {
             value["grok_stream_usage_evidence"]["status"],
             serde_json::json!("native")
         );
+    }
+
+    #[test]
+    fn claude_completion_refuses_private_evidence_without_whole_call_witness() {
+        let command = ExternalAgentCommand::codex(
+            "claude",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            RuntimeId::ClaudeCode,
+            RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+        );
+        let mut external_run = ExternalAgentRun {
+            command: vec!["claude".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            )),
+            side_effects: Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            )),
+            publishable: true,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: Some(b"done".to_vec()),
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: None,
+            codex_parent_evidence: None,
+        };
+        let stream = [
+            serde_json::json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"observed-claude-model","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+            serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+            serde_json::json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"observed-claude-model"}}),
+            serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"done","modelUsage":{"observed-claude-model":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+        ]
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).unwrap())
+        .collect::<Vec<_>>()
+        .join("\n")
+        .into_bytes();
+        external_run.set_claude_native_stream_for_test(&stream, false, false);
+        assert!(!external_process_completed(
+            &external_run,
+            SupervisorRuntime::ClaudeCode
+        ));
+        assert!(external_run
+            .authenticated_claude_usage_lower_bound()
+            .is_some());
+
+        let restored: ExternalAgentRun = serde_json::from_value(
+            serde_json::to_value(&external_run).expect("serialize live Claude run"),
+        )
+        .expect("deserialize public Claude run");
+        assert!(!external_process_completed(
+            &restored,
+            SupervisorRuntime::ClaudeCode
+        ));
+
+        external_run.set_claude_native_stream_for_test(&stream, false, true);
+        assert!(!external_process_completed(
+            &external_run,
+            SupervisorRuntime::ClaudeCode
+        ));
+    }
+}
+
+#[cfg(test)]
+mod cursor_managed_usage_evidence {
+    use super::*;
+    use crate::external_agent::CapturedOutput;
+    use crate::process_runner::{ContainmentBackend, SideEffectConfinementProfileKind};
+    use crate::runtime_adapter::{CursorManagedParentEvidence, RuntimeAdapterConfig};
+
+    fn fixture(command: &ExternalAgentCommand) -> ExternalAgentRun {
+        // Synthetic parent counters exercise settlement, not productive provider acceptance.
+        ExternalAgentRun {
+            command: vec!["cursor-agent".to_string()],
+            cwd: command.cwd.clone(),
+            timeout_seconds: 1,
+            exit_code: Some(0),
+            duration_ms: 1,
+            timed_out: false,
+            process_tree: Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            )),
+            side_effects: Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCursor,
+            )),
+            publishable: true,
+            program_trust: ExternalProgramTrust::ExplicitCustom,
+            codex_permissions: None,
+            stdout: CapturedOutput::default(),
+            stderr: CapturedOutput::default(),
+            error: None,
+            output_last_message: None,
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: Some(CursorManagedParentEvidence {
+                peer_verified: true,
+                admitted_attempts: 2,
+                completed_attempts: 2,
+                captured_events: 3,
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(2),
+                cache_write_tokens: Some(1),
+                usage_attempts_covered: 2,
+                usage_is_incomplete: Some(false),
+                ..Default::default()
+            }),
+            codex_parent_evidence: None,
+        }
+    }
+
+    fn settle(
+        ledger: &RunBudgetLedger,
+        run: &ExternalAgentRun,
+        command: &ExternalAgentCommand,
+    ) -> DispatchUsageSettlement {
+        let BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::Worker,
+                tokens: 64,
+                cost_usd: None,
+            })
+            .expect("Cursor token reservation")
+        else {
+            panic!("Cursor reservation was refused")
+        };
+        let mut held = DispatchBudgetReservation {
+            ledger,
+            reservation,
+            pricing: None,
+            model_pricing: BTreeMap::new(),
+            state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Cursor),
+        };
+        held.mark_invoked_for_runtime(SupervisorRuntime::Cursor)
+            .expect("bound Cursor invocation");
+        held.settle_bound_runtime(run, command)
+            .expect("Cursor settlement")
+    }
+
+    fn command(root: &Path) -> ExternalAgentCommand {
+        let command = ExternalAgentCommand::codex(
+            "cursor-agent",
+            root,
+            root.join("prompt.md"),
+            root.join("capture.jsonl"),
+            root.join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Cursor,
+            RuntimeAdapterConfig::defaults(RuntimeId::Cursor),
+        );
+        fs::write(
+            &command.json_log,
+            br#"{"type":"turn.completed","usage":{"input_tokens":90000,"output_tokens":90000}}"#,
+        )
+        .expect("conflicting mutable Codex-shaped log");
+        command
+    }
+
+    #[test]
+    fn cursor_settlement_uses_parent_buckets_and_keeps_token_only_dispatch_open() {
+        let temp = tempfile::tempdir().expect("Cursor usage fixture");
+        let command = command(temp.path());
+        let run = fixture(&command);
+        let expected = Usage {
+            input_tokens: 10,
+            output_tokens: 3,
+            total_tokens: 13,
+        };
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(200),
+            ..Default::default()
+        })
+        .unwrap();
+        let settled = settle(&ledger, &run, &command);
+        assert_eq!(settled.reliability, DispatchUsageReliability::Reliable);
+        assert_eq!(settled.reliable_usage(), Some(expected));
+        assert!(settled.cost_usd.is_none());
+        assert!(settled.model.is_none());
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 13);
+        assert_eq!(report.reserved.tokens, 0);
+        assert_eq!(report.active_reservations, 0);
+        assert!(report.usage_complete);
+        assert!(report.reasons.contains(&BudgetReason::MissingActualCost));
+        assert!(!report.reasons.contains(&BudgetReason::MissingProviderUsage));
+        assert!(report.new_dispatch_allowed);
+        assert!(matches!(
+            ledger.reserve(BudgetReservationRequest {
+                role: AgentRole::Auditor,
+                tokens: 64,
+                cost_usd: None,
+            }),
+            Ok(BudgetAdmission::Admitted { .. })
+        ));
+    }
+
+    #[test]
+    fn cursor_settlement_keeps_partial_failed_floors_without_log_fallback() {
+        let temp = tempfile::tempdir().expect("Cursor usage fixture");
+        let command = command(temp.path());
+        for case in [
+            "missing_bucket",
+            "incomplete",
+            "uncovered_attempt",
+            "timeout",
+            "missing_parent",
+        ] {
+            let mut run = fixture(&command);
+            run.cursor_managed_parent_evidence
+                .as_mut()
+                .unwrap()
+                .input_tokens = Some(101);
+            let mut expected = Some(107);
+            match case {
+                "missing_bucket" => {
+                    run.cursor_managed_parent_evidence
+                        .as_mut()
+                        .unwrap()
+                        .cache_write_tokens = None;
+                    expected = Some(106);
+                }
+                "incomplete" => {
+                    run.cursor_managed_parent_evidence
+                        .as_mut()
+                        .unwrap()
+                        .usage_is_incomplete = Some(true);
+                }
+                "uncovered_attempt" => {
+                    run.cursor_managed_parent_evidence
+                        .as_mut()
+                        .unwrap()
+                        .usage_attempts_covered = 1;
+                }
+                "timeout" => run.timed_out = true,
+                "missing_parent" => {
+                    run.cursor_managed_parent_evidence = None;
+                    expected = None;
+                }
+                _ => unreachable!(),
+            }
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(200),
+                ..Default::default()
+            })
+            .unwrap();
+            let settled = settle(&ledger, &run, &command);
+            assert_eq!(
+                settled.observed_usage.map(|usage| usage.total_tokens),
+                expected,
+                "{case}"
+            );
+            assert_eq!(
+                settled.reliability,
+                if expected.is_some() {
+                    DispatchUsageReliability::Estimated
+                } else {
+                    DispatchUsageReliability::Missing
+                },
+                "{case}"
+            );
+            assert!(settled.reliable_usage().is_none(), "{case}");
+            assert!(settled.cost_usd.is_none(), "{case}");
+            let report = ledger.report().unwrap();
+            assert_eq!(report.consumed.tokens, expected.unwrap_or(64), "{case}");
+            assert!(!report.usage_complete, "{case}");
+            assert!(!report.new_dispatch_allowed, "{case}");
+        }
     }
 }

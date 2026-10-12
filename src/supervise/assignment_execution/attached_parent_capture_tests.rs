@@ -20,7 +20,7 @@ pub(super) fn exercise<'budget>(
     context: &AssignmentExecutionContext<'budget, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
-    prepared: PreparedChildAttempt<'budget>,
+    prepared: Box<PreparedChildAttempt<'budget>>,
 ) -> Result<()> {
     let incoming_scratch = prepared.incoming_scratch.path().to_path_buf();
     let capture_scratch = prepared.capture_scratch.path().to_path_buf();

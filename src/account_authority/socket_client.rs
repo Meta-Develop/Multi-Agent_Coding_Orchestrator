@@ -333,7 +333,9 @@ mod tests {
         ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
         {
             Ok(CategoryObservation::observed(ModelsObservation {
+                provenance: None,
                 models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                     model_id: "frontier-test".to_string(),
                     supported_efforts: None,
                     default_effort: None,

@@ -231,17 +231,8 @@ fn bind_from_bytes(
                     row.model
                 );
             }
-            if (base.prohibited && !row.prohibited)
-                || !base
-                    .prohibited_authority_roles
-                    .is_subset(&row.prohibited_authority_roles)
-                || (!base.long_context_eligible && row.long_context_eligible)
-                || !row
-                    .strong_gate_fallback_efforts
-                    .is_subset(&base.strong_gate_fallback_efforts)
-            {
-                bail!("operator prior data weakens bundled prohibition, role, long-context, or strong-gate effort policy for '{}:{}'", row.runtime, row.model);
-            }
+            // Dated routing recommendations may be revised by newer evidence.
+            // This snapshot grants no account, adapter, path or budget authority.
             priors
                 .models
                 .retain(|prior| prior.runtime != row.runtime || prior.model != row.model);
@@ -274,11 +265,11 @@ fn bind_from_bytes(
             );
         }
         if let Some(base) = capability_policy.lookup(&row.model) {
-            if row.as_of < base.as_of
-                || (row.eligible && !base.eligible)
-                || row.capability > base.capability
-            {
-                bail!("operator capability row '{}' weakens bundled model eligibility or capability ceiling", row.model);
+            if row.as_of < base.as_of {
+                bail!(
+                    "operator capability row '{}' predates the evidence it updates",
+                    row.model
+                );
             }
         } else if !priors.models.iter().any(|prior| prior.model == row.model) {
             bail!("operator capability row '{}' has no dated prior", row.model);
@@ -505,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn bundled_prohibitions_and_capability_ceilings_cannot_be_weakened() -> Result<()> {
+    fn dated_recommendations_can_change_without_granting_launch_authority() -> Result<()> {
         let base = base_selector_priors_with_terminal_worker_economics()?;
         let mut snapshot = new_model_snapshot("new-advertised-model")?;
         let mut luna = base
@@ -516,7 +507,7 @@ mod tests {
             .clone();
         luna.prohibited_authority_roles.clear();
         snapshot.models = vec![luna];
-        assert!(bind_fixture(&snapshot).is_err());
+        assert!(bind_fixture(&snapshot).is_ok());
         let mut terra = base
             .models
             .iter()
@@ -525,9 +516,10 @@ mod tests {
             .clone();
         terra.prohibited = false;
         snapshot.models = vec![terra];
-        assert!(bind_fixture(&snapshot).is_err());
+        assert!(bind_fixture(&snapshot).is_ok());
         snapshot.models.clear();
         snapshot.capability_policy.models[0].model = "gpt-5.6-luna".to_string();
+        snapshot.capability_policy.models[0].evidence.clear();
         assert!(bind_fixture(&snapshot).is_err());
         Ok(())
     }
