@@ -14,6 +14,18 @@ from pathlib import Path
 from typing import Sequence
 
 SHARDS = ("autopilot", "supervise", "rest")
+REST_SAFETY_PREFLIGHTS = (
+    "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
+    "runtime_adapter::cursor_managed_parent::tests::assignment_authority_admits_exact_write_read_and_parent_owned_check",
+)
+SAFETY_PREFLIGHTS = {
+    "rest": REST_SAFETY_PREFLIGHTS,
+    "supervise": (
+        "supervise::selection_bridge::tests::account_observe_unknown_models_fail_closed",
+        "supervise::selection_bridge::tests::automatic_empty_role_models_resolve_all_roles_from_eligible_catalog",
+        "supervise::assignment_execution::attached_parent_capture_tests::attached_capture_bookkeeping_and_shutdown_errors_retain_owners",
+    ),
+}
 
 
 def parse_inventory(output: str) -> list[str]:
@@ -61,6 +73,31 @@ def enumerate_tests(runner: Sequence[str], names: Sequence[str] | None = None) -
     return parse_inventory(result.stdout)
 
 
+def run_safety_preflights(runner: Sequence[str], selected: Sequence[str], shard: str) -> int:
+    for name in SAFETY_PREFLIGHTS[shard]:
+        if name not in selected or enumerate_tests(runner, [name]) != [name]:
+            raise ValueError(f"safety preflight must select exactly one {shard} test: {name}")
+        print(json.dumps({f"{shard}_safety_preflight": name}, sort_keys=True), flush=True)
+        result = subprocess.run(
+            [*runner, "--exact", "--nocapture", "--", name],
+            check=False, capture_output=True, text=True,
+        )
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        if result.returncode != 0:
+            return result.returncode
+        summaries = re.findall(
+            r"^test result: ok\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+            r"(\d+) measured; \d+ filtered out; finished in .+$",
+            result.stdout, re.MULTILINE,
+        )
+        if summaries != [("1", "0", "0", "0")]:
+            raise ValueError(f"safety preflight did not execute exactly one nonignored test: {name}")
+        if "skipping Nix-store-dependent Gemini online profile test" in result.stdout + result.stderr:
+            raise ValueError(f"safety preflight returned through its missing-Nix skip: {name}")
+    return 0
+
+
 def run_shard(runner: Sequence[str], shard: str) -> int:
     if shard not in SHARDS:
         raise ValueError(f"unknown library shard: {shard}")
@@ -86,6 +123,10 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
         ),
         flush=True,
     )
+    if shard in SAFETY_PREFLIGHTS:
+        preflight_status = run_safety_preflights(runner, selected, shard)
+        if preflight_status != 0:
+            return preflight_status
     return subprocess.run(command, check=False).returncode
 
 

@@ -108,15 +108,165 @@ class LibraryShardTests(unittest.TestCase):
         self.assertIn("needs.linux-library.result", gate)
         self.assertIn("needs.linux-integration.result", gate)
 
-    def test_gate_rejects_failed_cancelled_and_skipped_matrix_or_integration(self):
+    def test_rest_preflights_run_exactly_before_full_shard_without_full_nocapture(self):
+        inventory = sorted([*INVENTORY, *shards.REST_SAFETY_PREFLIGHTS])
+        selected = shards.partition_inventory(inventory)["rest"]
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
+        with mock.patch.object(shards.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, listing(inventory)),
+                subprocess.CompletedProcess([], 0, listing(selected)),
+                subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[:1])),
+                subprocess.CompletedProcess([], 0, summary, ""),
+                subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[1:])),
+                subprocess.CompletedProcess([], 0, summary, ""),
+                subprocess.CompletedProcess([], 0),
+            ]
+            self.assertEqual(shards.run_shard(["harness"], "rest"), 0)
+            self.assertEqual(run.call_count, 7)
+            for index, name in zip([3, 5], shards.REST_SAFETY_PREFLIGHTS):
+                self.assertEqual(run.call_args_list[index].args[0], ["harness", "--exact", "--nocapture", "--", name])
+            self.assertEqual(run.call_args.args[0], shards.test_command(["harness"], selected))
+            self.assertNotIn("--nocapture", run.call_args.args[0])
+
+    def test_rest_preflight_failure_stops_before_full_shard(self):
+        inventory = sorted([*INVENTORY, *shards.REST_SAFETY_PREFLIGHTS])
+        selected = shards.partition_inventory(inventory)["rest"]
+        for failed_index in [0, 1]:
+            with self.subTest(failed_index=failed_index), mock.patch.object(shards.subprocess, "run") as run:
+                responses = [
+                    subprocess.CompletedProcess([], 0, listing(inventory)),
+                    subprocess.CompletedProcess([], 0, listing(selected)),
+                ]
+                for index, name in enumerate(shards.REST_SAFETY_PREFLIGHTS):
+                    responses.append(subprocess.CompletedProcess([], 0, listing([name])))
+                    responses.append(subprocess.CompletedProcess(
+                        [], 101 if index == failed_index else 0,
+                        "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+                        "typed failure boundary\n" if index == failed_index else "",
+                    ))
+                    if index == failed_index:
+                        break
+                run.side_effect = responses
+                self.assertEqual(shards.run_shard(["harness"], "rest"), 101)
+                self.assertEqual(run.call_count, 2 + 2 * (failed_index + 1))
+                self.assertNotIn(shards.test_command(["harness"], selected), [call.args[0] for call in run.call_args_list])
+
+    def test_rest_preflight_refuses_missing_or_overlapping_exact_selection(self):
+        name = shards.REST_SAFETY_PREFLIGHTS[0]
+        with mock.patch.object(shards.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                shards.run_safety_preflights(["harness"], [], "rest")
+            run.assert_not_called()
+        for observed in [[], [name + "_longer"], [name, name + "_longer"]]:
+            with self.subTest(observed=observed), mock.patch.object(shards.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, listing(observed))
+                with self.assertRaises(ValueError):
+                    shards.run_safety_preflights(["harness"], shards.REST_SAFETY_PREFLIGHTS, "rest")
+                self.assertEqual(run.call_count, 1)
+
+    def test_rest_preflight_refuses_zero_ignored_missing_or_duplicate_execution_summaries(self):
+        good = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n"
+        for output in [good.replace("1 passed", "0 passed"), good.replace("0 ignored", "1 ignored"), "", good + good]:
+            with self.subTest(output=output), mock.patch.object(shards.subprocess, "run") as run:
+                run.side_effect = [
+                    subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[:1])),
+                    subprocess.CompletedProcess([], 0, output, ""),
+                ]
+                with self.assertRaises(ValueError):
+                    shards.run_safety_preflights(["harness"], shards.REST_SAFETY_PREFLIGHTS, "rest")
+                self.assertEqual(run.call_count, 2)
+
+    def test_rest_preflight_refuses_positive_harness_summary_after_fixture_skip(self):
+        with mock.patch.object(shards.subprocess, "run") as run:
+            run.side_effect = [
+                subprocess.CompletedProcess([], 0, listing(shards.REST_SAFETY_PREFLIGHTS[:1])),
+                subprocess.CompletedProcess([], 0,
+                    "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s\n",
+                    "skipping Nix-store-dependent Gemini online profile test\n"),
+            ]
+            with self.assertRaises(ValueError):
+                shards.run_safety_preflights(["harness"], shards.REST_SAFETY_PREFLIGHTS, "rest")
+            self.assertEqual(run.call_count, 2)
+
+    def test_supervise_preflight_runs_exactly_once_and_stops_full_shard_on_failure(self):
+        names = shards.SAFETY_PREFLIGHTS["supervise"]
+        self.assertEqual(names, (
+            "supervise::selection_bridge::tests::account_observe_unknown_models_fail_closed",
+            "supervise::selection_bridge::tests::automatic_empty_role_models_resolve_all_roles_from_eligible_catalog",
+            "supervise::assignment_execution::attached_parent_capture_tests::attached_capture_bookkeeping_and_shutdown_errors_retain_owners",
+        ))
+        inventory = sorted([*INVENTORY, *names])
+        selected = shards.partition_inventory(inventory)["supervise"]
+        summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
+        for failed_index in [None, 0, 1, 2]:
+            with self.subTest(failed_index=failed_index), mock.patch.object(shards.subprocess, "run") as run:
+                responses = [
+                    subprocess.CompletedProcess([], 0, listing(inventory)),
+                    subprocess.CompletedProcess([], 0, listing(selected)),
+                ]
+                for index, name in enumerate(names):
+                    responses.append(subprocess.CompletedProcess([], 0, listing([name])))
+                    responses.append(subprocess.CompletedProcess(
+                        [], 101 if index == failed_index else 0, summary, "",
+                    ))
+                    if index == failed_index:
+                        break
+                if failed_index is None:
+                    responses.append(subprocess.CompletedProcess([], 0))
+                run.side_effect = responses
+                status = 0 if failed_index is None else 101
+                self.assertEqual(shards.run_shard(["harness"], "supervise"), status)
+                completed_preflights = len(names) if failed_index is None else failed_index + 1
+                self.assertEqual(run.call_count, 2 + 2 * completed_preflights + (1 if failed_index is None else 0))
+                for index, name in enumerate(names[:completed_preflights]):
+                    self.assertEqual(
+                        run.call_args_list[2 + 2 * index].args[0],
+                        ["harness", "--list", "--format", "terse", "--exact", "--", name],
+                    )
+                    self.assertEqual(
+                        run.call_args_list[3 + 2 * index].args[0],
+                        ["harness", "--exact", "--nocapture", "--", name],
+                    )
+                full_command = shards.test_command(["harness"], selected)
+                if failed_index is None:
+                    self.assertEqual(run.call_args.args[0], full_command)
+                    self.assertNotIn("--nocapture", run.call_args.args[0])
+                else:
+                    self.assertNotIn(full_command, [call.args[0] for call in run.call_args_list])
+
+    def test_gate_rejects_failed_cancelled_and_skipped_package_matrix_or_integration(self):
+        bash = shutil.which("bash")
+        self.assertIsNotNone(bash)
+        self.assertTrue(pathlib.Path(bash).is_absolute())
+        creationflags = (
+            subprocess.CREATE_NO_WINDOW | subprocess.BELOW_NORMAL_PRIORITY_CLASS
+            if os.name == "nt" else 0
+        )
         source = WORKFLOW.read_text(encoding="utf-8")
         gate = source.split("  linux-gate:", 1)[1].split("  portable-build:", 1)[0]
         script = textwrap.dedent(gate.split("        run: |\n", 1)[1])
-        for library in ["success", "failure", "cancelled", "skipped"]:
-            for integration in ["success", "failure", "cancelled", "skipped"]:
-                env = dict(os.environ, LIBRARY_RESULT=library, INTEGRATION_RESULT=integration)
-                result = subprocess.run(["bash", "-c", script], env=env, capture_output=True)
-                self.assertEqual(result.returncode == 0, library == integration == "success")
+        for package in ["success", "failure", "cancelled", "skipped"]:
+            for library in ["success", "failure", "cancelled", "skipped"]:
+                for integration in ["success", "failure", "cancelled", "skipped"]:
+                    with self.subTest(package=package, library=library, integration=integration):
+                        env = dict(
+                            os.environ,
+                            PACKAGE_RESULT=package,
+                            LIBRARY_RESULT=library,
+                            INTEGRATION_RESULT=integration,
+                        )
+                        result = subprocess.run(
+                            [bash, "-c", script],
+                            env=env,
+                            capture_output=True,
+                            stdin=subprocess.DEVNULL,
+                            creationflags=creationflags,
+                        )
+                        self.assertEqual(
+                            result.returncode == 0,
+                            package == library == integration == "success",
+                        )
 
     def test_wrapper_keeps_metadata_verification_and_delegation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -169,10 +319,35 @@ mod autopilot {
 mod supervise {
     #[test] fn first() {}
     #[test] #[ignore] fn ignored() { panic!("must remain ignored"); }
+    mod selection_bridge {
+        mod tests {
+            // Empty bodies verify wrapper selection only, not real selector semantics.
+            #[test] fn account_observe_unknown_models_fail_closed() {}
+            #[test] fn automatic_empty_role_models_resolve_all_roles_from_eligible_catalog() {}
+        }
+    }
+    mod assignment_execution {
+        mod attached_parent_capture_tests {
+            // Empty body verifies wrapper selection only, not real ownership semantics.
+            #[test] fn attached_capture_bookkeeping_and_shutdown_errors_retain_owners() {}
+        }
+    }
 }
 mod future {
     mod autopilot { #[test] fn nested() {} }
     #[test] fn supervise_lookalike() {}
+}
+mod process_runner {
+    mod tests {
+        #[test] fn gemini_online_profile_projects_only_the_trusted_resolver_file() {}
+    }
+}
+mod runtime_adapter {
+    mod cursor_managed_parent {
+        mod tests {
+            #[test] fn assignment_authority_admits_exact_write_read_and_parent_owned_check() {}
+        }
+    }
 }
 #[test] fn root_test() {}
 """, encoding="utf-8")
@@ -180,7 +355,7 @@ mod future {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 7)
+            self.assertEqual(len(inventory), 12)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -206,7 +381,7 @@ mod future {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 7', result.stdout)
+                self.assertIn('"total": 12', result.stdout)
 
 
 if __name__ == "__main__":
