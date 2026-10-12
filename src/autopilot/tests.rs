@@ -2336,14 +2336,41 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
     skip_without_containment!();
     let fixture = IsolatedLicensedAutopilot::new("autopilot-licensed-follow-up-refused");
     let repo = &fixture.repo;
-    supervise::set_before_generated_follow_up_plan_load_hook(|path| {
+    let generated_plan_repo = repo.to_path_buf();
+    supervise::set_before_generated_follow_up_plan_load_hook(move |path| {
         let bytes = fs::read(path).expect("read persisted Autopilot generated plan");
-        let mut value: Value =
+        let mut drifted: supervise::GeneratedFollowUpSupervisorPlan =
             serde_json::from_slice(&bytes).expect("decode Autopilot generated plan");
-        value["assignments"][0]["assigned_paths"] = json!(["src/client.rs", "src/expanded.rs"]);
+        let frozen = drifted
+            .resolved_routing_policy
+            .clone()
+            .expect("generated fixture carries its frozen routing policy");
+        assert!(
+            crate::selection::routing_policy::current_routing_policy().as_ref() == Some(&frozen),
+            "the caller must retain the generated fixture's exact frozen policy"
+        );
+        assert!(drifted.task_routing_assessment.is_some());
+        drifted.assignments[0].assigned_paths = vec![
+            PathBuf::from("src/client.rs"),
+            PathBuf::from("src/expanded.rs"),
+        ];
+        // Keep the expanded document valid so the immutable queued-plan check,
+        // rather than a stale assessment, must refuse its permission expansion.
+        drifted.task_routing_assessment = Some(
+            supervise::GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                &drifted.ordinary_plan(),
+                &frozen,
+            )
+            .expect("assess the expanded fixture through the real frozen-policy estimator"),
+        );
+        supervise::validate_generated_follow_up_plan_document_in_repo(
+            &drifted,
+            Some(&generated_plan_repo),
+        )
+        .expect("expanded fixture must pass the ordinary loader before queued-plan comparison");
         fs::write(
             path,
-            serde_json::to_vec_pretty(&value).expect("encode drifted Autopilot generated plan"),
+            serde_json::to_vec_pretty(&drifted).expect("encode drifted Autopilot generated plan"),
         )
         .expect("mutate persisted Autopilot generated plan");
     });
@@ -2357,14 +2384,26 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
     assert!(!report.generated_follow_up_dispatch_performed);
     assert!(report.primary_worktree_untouched);
     assert!(!report.auto_merge_performed);
-    assert!(report.gate_denials.iter().any(|denial| {
-        matches!(
-            denial.reason,
-            GateDenialReason::ApprovalReview {
-                denial: ApprovalReviewDenial::PermissionExpansion
-            }
-        )
-    }));
+    assert!(
+        report.gate_denials.iter().any(|denial| {
+            matches!(
+                denial.reason,
+                GateDenialReason::ApprovalReview {
+                    denial: ApprovalReviewDenial::PermissionExpansion
+                }
+            )
+        }),
+        "expected PermissionExpansion; denial_count={}, approval_denials={:?}",
+        report.gate_denials.len(),
+        report
+            .gate_denials
+            .iter()
+            .filter_map(|denial| match &denial.reason {
+                GateDenialReason::ApprovalReview { denial } => Some(*denial),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+    );
     let reader = ArtifactRunReader::open(repo, RunArtifactFamily::Autopilot, &report.run_id)
         .expect("open refused injected Autopilot artifacts");
     let cascade = serde_json::from_slice::<supervise::SupervisorCascadeOutcome>(
