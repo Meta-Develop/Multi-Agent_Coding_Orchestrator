@@ -76,7 +76,7 @@ impl ManagedLoginService {
             LoginBackend::InProcess(service) => {
                 let mode = if matches!(
                     request.provider_id.as_str(),
-                    "gemini-cli" | "codex-cli" | "grok-cli"
+                    "gemini-cli" | "codex-cli" | "grok-cli" | "cursor"
                 ) {
                     LoginBrowserMode::CallerManaged
                 } else {
@@ -485,5 +485,108 @@ mod tests {
             }
             let _ = managed.cancel(&started.handle, &started.binding);
         });
+    }
+
+    #[test]
+    fn cursor_gui_start_requests_caller_managed_and_exposes_only_bound_owner_action() {
+        struct InertLogin {
+            seen: std::sync::Mutex<Option<(LoginStartRequest, LoginBrowserMode)>>,
+            status: LoginStatus,
+            authorization: LoginAuthorization,
+        }
+        impl LoginPort for InertLogin {
+            fn start(&self, _request: LoginStartRequest) -> Result<LoginStatus> {
+                panic!("GUI must use the mode-aware port");
+            }
+            fn start_with_browser_mode(
+                &self,
+                request: LoginStartRequest,
+                mode: LoginBrowserMode,
+            ) -> Result<LoginStatus> {
+                *self.seen.lock().expect("seen") = Some((request, mode));
+                Ok(self.status.clone())
+            }
+            fn authorization(
+                &self,
+                handle: &LoginHandle,
+                binding: &LoginAccountBinding,
+            ) -> Result<Option<LoginAuthorization>> {
+                assert_eq!(handle, &self.status.handle);
+                assert_eq!(binding, &self.status.binding);
+                Ok(Some(self.authorization.clone()))
+            }
+            fn status(
+                &self,
+                _handle: &LoginHandle,
+                _binding: &LoginAccountBinding,
+            ) -> Result<LoginStatus> {
+                panic!("unused inert fixture port");
+            }
+            fn cancel(
+                &self,
+                _handle: &LoginHandle,
+                _binding: &LoginAccountBinding,
+            ) -> Result<LoginStatus> {
+                panic!("unused inert fixture port");
+            }
+        }
+        let status = LoginStatus {
+            handle: login_handle_from_json("cursor-owner-handle"),
+            binding: LoginAccountBinding {
+                provider_id: "cursor".into(),
+                account_id: "work".into(),
+                account_incarnation: "a".repeat(32),
+            },
+            state: LoginState::WaitingForUser,
+            failure_reason: None,
+        };
+        let url = format!("https://cursor.com/loginDeepControl?challenge={}&uuid=01234567-89ab-4cde-8fab-0123456789ab&mode=login&redirectTarget=cli", "A".repeat(43));
+        let port = Arc::new(InertLogin {
+            seen: std::sync::Mutex::new(None),
+            status: status.clone(),
+            authorization: LoginAuthorization {
+                authorization_url: url.clone(),
+                expires_at_unix_ms: None,
+            },
+        });
+        let managed = ManagedLoginService::new(LoginBackend::InProcess(port.clone()));
+        let request = LoginStartRequest {
+            provider_id: "cursor".into(),
+            account_id: "work".into(),
+            label: "Work".into(),
+            auth_kind: AuthKind::OAuth,
+            idempotency_key: "cursor-owner-action".into(),
+        };
+        let view = managed
+            .start(request.clone())
+            .expect("inert mode-aware start");
+        assert_eq!(
+            *port.seen.lock().expect("seen"),
+            Some((request, LoginBrowserMode::CallerManaged))
+        );
+        assert_eq!(
+            current_authorization_url(&view, &status.handle, &status.binding)
+                .expect("validated owner action"),
+            url
+        );
+        let mut stale = status.binding.clone();
+        stale.account_incarnation = "b".repeat(32);
+        assert!(current_authorization_url(&view, &status.handle, &stale).is_err());
+        assert!(current_authorization_url(
+            &view,
+            &login_handle_from_json("stale"),
+            &status.binding
+        )
+        .is_err());
+        let mut expired = view.clone();
+        expired
+            .authorization
+            .as_mut()
+            .expect("authorization")
+            .expires_at_unix_ms = Some(0);
+        assert!(current_authorization_url(&expired, &status.handle, &status.binding).is_err());
+        let mut cancelled = view;
+        cancelled.status.state = LoginState::Cancelled;
+        assert!(current_authorization_url(&cancelled, &status.handle, &status.binding).is_err());
     }
 }

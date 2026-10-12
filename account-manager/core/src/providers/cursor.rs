@@ -250,6 +250,7 @@ impl CursorAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<crate::login::LoginUrlHandoff>,
     ) -> std::result::Result<(), super::OAuthLoginRunError> {
         if *cancel.borrow() {
             return Err(super::OAuthLoginRunError::Cancelled);
@@ -259,6 +260,18 @@ impl CursorAdapter {
         }
         if self.test_oauth_watch_cancel_driver {
             return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        if let Some(handoff) = handoff {
+            if self.home.is_some() {
+                return Err(super::OAuthLoginRunError::Failed(config_write(
+                    "refusing a native authorization handoff against an injected home",
+                )));
+            }
+            let command = self
+                .login_command(home)
+                .map_err(super::OAuthLoginRunError::Failed)?;
+            return crate::login::run_vendor_oauth_handoff(command, PROVIDER_ID, cancel, handoff)
+                .await;
         }
         if self.login_runner.is_none() {
             return self.run_login_cancellable(home, &mut cancel).await;
@@ -1188,5 +1201,36 @@ mod tests {
             error,
             Error::NotImplemented("cursor::activate_account")
         ));
+    }
+
+    #[test]
+    fn login_command_keeps_managed_home_and_browser_suppression() {
+        let dir = tempfile::tempdir().expect("owned fixture");
+        let root = fs::canonicalize(dir.path()).expect("fresh trusted root");
+        let home = root.join("managed-home");
+        let adapter = CursorAdapter::default()
+            .with_program(root.join("never-executed-cursor"))
+            .with_working_directory(&root);
+        let command = adapter.login_command(&home).expect("command only");
+        assert_eq!(
+            command.get_args().collect::<Vec<_>>(),
+            [std::ffi::OsStr::new("login")]
+        );
+        assert_eq!(command.get_current_dir(), Some(root.as_path()));
+        let env: std::collections::HashMap<_, _> = command.get_envs().collect();
+        assert_eq!(env[std::ffi::OsStr::new("HOME")], Some(home.as_os_str()));
+        assert_eq!(
+            env[std::ffi::OsStr::new("CURSOR_CONFIG_DIR")],
+            Some(home.join(".cursor").as_os_str())
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("AGENT_CLI_CREDENTIAL_STORE")],
+            Some(std::ffi::OsStr::new("file"))
+        );
+        assert_eq!(
+            env[std::ffi::OsStr::new("NO_OPEN_BROWSER")],
+            Some(std::ffi::OsStr::new("1"))
+        );
+        assert_eq!(env[std::ffi::OsStr::new("CURSOR_API_KEY")], None);
     }
 }

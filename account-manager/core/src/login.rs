@@ -182,9 +182,9 @@ impl PendingOAuthLogin for CursorAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         cancel: tokio::sync::watch::Receiver<bool>,
-        _handoff: Option<LoginUrlHandoff>,
+        handoff: Option<LoginUrlHandoff>,
     ) -> impl std::future::Future<Output = std::result::Result<(), OAuthLoginRunError>> + Send {
-        CursorAdapter::run_pending_oauth_login(self, home, plan, cancel)
+        CursorAdapter::run_pending_oauth_login(self, home, plan, cancel, handoff)
     }
 }
 
@@ -282,6 +282,9 @@ impl Drop for LoginUrlHandoff {
 /// Accept only public authorization requests from the supported native flows.
 /// Callback codes, tokens, custom issuers and arbitrary browser targets fail closed.
 pub fn vendor_authorization_url(provider: &str, line: &str) -> Option<String> {
+    if provider == "cursor" {
+        return cursor_authorization_url(line);
+    }
     let (host, path, callback_path) = match provider {
         "codex-cli" => ("auth.openai.com", "/oauth/authorize", "/auth/callback"),
         "grok-cli" => ("auth.x.ai", "/oauth2/authorize", "/callback"),
@@ -368,9 +371,70 @@ pub fn vendor_authorization_url(provider: &str, line: &str) -> Option<String> {
     Some(url.to_string())
 }
 
-/// Native CLI owns OAuth; only its public stderr URL crosses the login port.
+// Cursor's native login uses a public challenge/UUID poll flow, not a loopback
+// OAuth redirect. Only the default CLI target from that flow is an owner action;
+// the private verifier and token/poll responses never cross this port.
+fn cursor_authorization_url(line: &str) -> Option<String> {
+    let text = line.trim();
+    if text.len() > 8192 || text.bytes().any(|byte| byte.is_ascii_control()) {
+        return None;
+    }
+    let text = text
+        .strip_prefix("Open a browser and navigate to this link: ")
+        .unwrap_or(text);
+    let url = reqwest::Url::parse(text).ok()?;
+    if url.scheme() != "https"
+        || url.host_str() != Some("cursor.com")
+        || url.path() != "/loginDeepControl"
+        || url.port().is_some_and(|port| port != 443)
+        || !url.username().is_empty()
+        || url.password().is_some()
+        || url.fragment().is_some()
+    {
+        return None;
+    }
+    let mut parameters = HashMap::new();
+    for (key, value) in url.query_pairs() {
+        if !matches!(
+            key.as_ref(),
+            "challenge" | "uuid" | "mode" | "redirectTarget"
+        ) || parameters
+            .insert(key.into_owned(), value.into_owned())
+            .is_some()
+        {
+            return None;
+        }
+    }
+    let parameter = |key: &str| parameters.get(key).map(String::as_str);
+    let uuid = parameter("uuid")?;
+    let uuid_bytes = uuid.as_bytes();
+    if parameter("mode") != Some("login")
+        || parameter("redirectTarget") != Some("cli")
+        || parameter("challenge").is_none_or(|value| {
+            value.len() != 43
+                || !value
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+        })
+        || uuid_bytes.len() != 36
+        || !uuid_bytes.iter().enumerate().all(|(index, byte)| {
+            if matches!(index, 8 | 13 | 18 | 23) {
+                *byte == b'-'
+            } else {
+                byte.is_ascii_digit() || matches!(byte, b'a'..=b'f')
+            }
+        })
+        || uuid_bytes[14] != b'4'
+        || !matches!(uuid_bytes[19], b'8' | b'9' | b'a' | b'b')
+    {
+        return None;
+    }
+    Some(url.to_string())
+}
+
+/// Native CLI owns login; only its validated public URL crosses the login port.
 /// Unix is the supported managed authority route. No raw output is logged,
-/// returned, or retained beyond a bounded, zeroized in-memory line buffer.
+/// returned, or retained beyond bounded, zeroized in-memory line buffers.
 pub(crate) async fn run_vendor_oauth_handoff(
     mut command: std::process::Command,
     provider: &'static str,
@@ -387,7 +451,7 @@ pub(crate) async fn run_vendor_oauth_handoff(
     #[cfg(unix)]
     {
         use std::io::{ErrorKind, Read};
-        use std::os::fd::AsRawFd;
+        use std::os::fd::{AsRawFd, OwnedFd};
         use std::process::{Child, Stdio};
         use zeroize::{Zeroize, Zeroizing};
 
@@ -409,7 +473,13 @@ pub(crate) async fn run_vendor_oauth_handoff(
         }
         command
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            // Cursor prints its NO_OPEN_BROWSER action to stdout. Keep the
+            // other native flows' existing stdout-discard behavior unchanged.
+            .stdout(if provider == "cursor" {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
             .stderr(Stdio::piped())
             .env("RUST_LOG", "off")
             .env("NO_COLOR", "1")
@@ -424,17 +494,40 @@ pub(crate) async fn run_vendor_oauth_handoff(
             child,
             reaped: false,
         };
-        let mut stderr = owned
+        struct LoginOutput {
+            pipe: std::fs::File,
+            line: Zeroizing<Vec<u8>>,
+            overflow: bool,
+        }
+        let stderr = owned
             .child
             .stderr
             .take()
             .ok_or_else(|| failed("native login output unavailable"))?;
-        let fd = stderr.as_raw_fd();
-        // Both calls operate only on the newly spawned owned child's pipe.
-        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-        if flags == -1 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
-        {
-            return Err(failed("native login output could not be bounded"));
+        let mut pipes = vec![std::fs::File::from(OwnedFd::from(stderr))];
+        if provider == "cursor" {
+            let stdout = owned
+                .child
+                .stdout
+                .take()
+                .ok_or_else(|| failed("native login output unavailable"))?;
+            pipes.push(std::fs::File::from(OwnedFd::from(stdout)));
+        }
+        let mut outputs = Vec::with_capacity(pipes.len());
+        for pipe in pipes {
+            let fd = pipe.as_raw_fd();
+            // Both calls operate only on a newly spawned owned child's pipe.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+            if flags == -1
+                || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1
+            {
+                return Err(failed("native login output could not be bounded"));
+            }
+            outputs.push(LoginOutput {
+                pipe,
+                line: Zeroizing::new(Vec::with_capacity(8192)),
+                overflow: false,
+            });
         }
         let deadline = Instant::now() + LOGIN_DEADLINE;
         let expires_at_unix_ms = std::time::SystemTime::now()
@@ -442,8 +535,6 @@ pub(crate) async fn run_vendor_oauth_handoff(
             .ok()
             .and_then(|now| u64::try_from((now + LOGIN_DEADLINE).as_millis()).ok());
         let mut bytes = Zeroizing::new([0_u8; 4096]);
-        let mut line = Zeroizing::new(Vec::with_capacity(8192));
-        let mut overflow = false;
         let mut published = false;
         let mut total = 0_usize;
         loop {
@@ -454,49 +545,51 @@ pub(crate) async fn run_vendor_oauth_handoff(
                 return Err(failed("native login deadline expired"));
             }
             // Bound work per tick as well as retained bytes and total output.
-            for _ in 0..16 {
-                let count = match stderr.read(bytes.as_mut()) {
-                    Ok(0) => break,
-                    Ok(count) => count,
-                    Err(error) if error.kind() == ErrorKind::WouldBlock => break,
-                    Err(error) if error.kind() == ErrorKind::Interrupted => continue,
-                    Err(_) => return Err(failed("native login output could not be read")),
-                };
-                total += count;
-                if total > 256 * 1024 {
-                    return Err(failed("native login output exceeded its bound"));
-                }
-                for byte in &bytes[..count] {
-                    if *byte == b'\n' {
-                        if !overflow && !published {
-                            if let Some(url) = std::str::from_utf8(&line)
-                                .ok()
-                                .and_then(|text| vendor_authorization_url(provider, text))
-                            {
-                                if !handoff.publish(ActiveLoginAuthorization {
-                                    public: LoginAuthorization {
-                                        authorization_url: url,
-                                        expires_at_unix_ms,
-                                    },
-                                    valid_until: deadline,
-                                }) {
-                                    return Err(OAuthLoginRunError::Cancelled);
+            for output in &mut outputs {
+                for _ in 0..16 {
+                    let count = match output.pipe.read(bytes.as_mut()) {
+                        Ok(0) => break,
+                        Ok(count) => count,
+                        Err(error) if error.kind() == ErrorKind::WouldBlock => break,
+                        Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+                        Err(_) => return Err(failed("native login output could not be read")),
+                    };
+                    total += count;
+                    if total > 256 * 1024 {
+                        return Err(failed("native login output exceeded its bound"));
+                    }
+                    for byte in &bytes[..count] {
+                        if *byte == b'\n' {
+                            if !output.overflow && !published {
+                                if let Some(url) = std::str::from_utf8(&output.line)
+                                    .ok()
+                                    .and_then(|text| vendor_authorization_url(provider, text))
+                                {
+                                    if !handoff.publish(ActiveLoginAuthorization {
+                                        public: LoginAuthorization {
+                                            authorization_url: url,
+                                            expires_at_unix_ms,
+                                        },
+                                        valid_until: deadline,
+                                    }) {
+                                        return Err(OAuthLoginRunError::Cancelled);
+                                    }
+                                    published = true;
                                 }
-                                published = true;
+                            }
+                            output.line.zeroize();
+                            output.overflow = false;
+                        } else if !output.overflow {
+                            if output.line.len() == 8192 {
+                                output.line.zeroize();
+                                output.overflow = true;
+                            } else {
+                                output.line.push(*byte);
                             }
                         }
-                        line.zeroize();
-                        overflow = false;
-                    } else if !overflow {
-                        if line.len() == 8192 {
-                            line.zeroize();
-                            overflow = true;
-                        } else {
-                            line.push(*byte);
-                        }
                     }
+                    bytes.zeroize();
                 }
-                bytes.zeroize();
             }
             if let Some(status) = owned
                 .child
@@ -644,7 +737,7 @@ impl LoginService {
         if browser_mode == LoginBrowserMode::CallerManaged
             && !matches!(
                 request.provider_id.as_str(),
-                "gemini-cli" | "codex-cli" | "grok-cli"
+                "gemini-cli" | "codex-cli" | "grok-cli" | "cursor"
             )
         {
             return Err(Error::NotImplemented("caller-managed browser login"));

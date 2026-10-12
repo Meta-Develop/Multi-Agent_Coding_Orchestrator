@@ -292,7 +292,7 @@ impl AuthorityClient {
     pub(crate) fn login_start(&self, request: LoginStartRequest) -> Result<LoginIpcStatus> {
         let caller_managed = matches!(
             request.provider_id.as_str(),
-            "gemini-cli" | "codex-cli" | "grok-cli"
+            "gemini-cli" | "codex-cli" | "grok-cli" | "cursor"
         );
         let mut payload = json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -1638,53 +1638,62 @@ mod tests {
 
         #[test]
         fn remote_login_requests_owner_browser_and_preserves_bound_authorization() {
-            let (_guard, root) = private_tempdir();
-            let socket = root.join("authority.sock");
-            let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
-            let client = AuthorityClient::connect(&socket).unwrap();
-            let binding = json!({"providerId":"codex-cli","accountId":"work","accountIncarnation":"a".repeat(32)});
-            let authorization =
-                json!({"authorizationUrl":"https://auth.openai.com/authorize?state=test-sentinel"});
-            let expected_binding = binding.clone();
-            let expected_authorization = authorization.clone();
-            let server = thread::spawn(move || {
-                let (mut stream, _) = listener.accept().unwrap();
-                let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
-                let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
-                crate::account_authority::decode_request(&request)
-                    .expect("existing strict protocol accepts browserMode");
-                let request: Value = serde_json::from_slice(&request).unwrap();
-                assert_eq!(request["browserMode"], "caller-managed");
-                let result = json!({"handle":"test-handle", "binding":binding, "state":"waiting-for-user",
+            for provider in ["codex-cli", "cursor"] {
+                let (_guard, root) = private_tempdir();
+                let socket = root.join("authority.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let client = AuthorityClient::connect(&socket).unwrap();
+                let binding = json!({"providerId":provider,"accountId":"work","accountIncarnation":"a".repeat(32)});
+                let url = if provider == "cursor" {
+                    format!("https://cursor.com/loginDeepControl?challenge={}&uuid=01234567-89ab-4cde-8fab-0123456789ab&mode=login&redirectTarget=cli", "A".repeat(43))
+                } else {
+                    "https://auth.openai.com/authorize?state=test-sentinel".to_string()
+                };
+                let authorization = json!({"authorizationUrl":url});
+                let expected_binding = binding.clone();
+                let expected_authorization = authorization.clone();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
+                    let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
+                    crate::account_authority::decode_request(&request)
+                        .expect("existing strict protocol accepts browserMode");
+                    let request: Value = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request["browserMode"], "caller-managed");
+                    assert_eq!(request["providerId"], provider);
+                    assert_eq!(request["accountId"], "work");
+                    assert_eq!(request["authKind"], "oauth");
+                    let result = json!({"handle":"test-handle", "binding":binding, "state":"waiting-for-user",
                     "authorization":authorization});
-                let response =
-                    AuthorityResponse::result(request["requestId"].as_str().unwrap(), result);
-                write_framed(
-                    &mut stream,
-                    &serde_json::to_vec(&response).unwrap(),
-                    deadline,
-                )
-                .unwrap();
-            });
-            let status = client
-                .login_start(LoginStartRequest {
-                    provider_id: "codex-cli".into(),
-                    account_id: "work".into(),
-                    label: "Work".into(),
-                    auth_kind: AuthKind::OAuth,
-                    idempotency_key: "test-request".into(),
-                })
-                .unwrap();
-            assert_eq!(
-                serde_json::to_value(&status.binding).unwrap(),
-                expected_binding
-            );
-            assert_eq!(
-                serde_json::to_value(status.authorization.as_ref().unwrap()).unwrap(),
-                expected_authorization
-            );
-            assert!(!format!("{status:?}").contains("test-sentinel"));
-            server.join().unwrap();
+                    let response =
+                        AuthorityResponse::result(request["requestId"].as_str().unwrap(), result);
+                    write_framed(
+                        &mut stream,
+                        &serde_json::to_vec(&response).unwrap(),
+                        deadline,
+                    )
+                    .unwrap();
+                });
+                let status = client
+                    .login_start(LoginStartRequest {
+                        provider_id: provider.into(),
+                        account_id: "work".into(),
+                        label: "Work".into(),
+                        auth_kind: AuthKind::OAuth,
+                        idempotency_key: "test-request".into(),
+                    })
+                    .unwrap();
+                assert_eq!(
+                    serde_json::to_value(&status.binding).unwrap(),
+                    expected_binding
+                );
+                assert_eq!(
+                    serde_json::to_value(status.authorization.as_ref().unwrap()).unwrap(),
+                    expected_authorization
+                );
+                assert!(!format!("{status:?}").contains("test-sentinel"));
+                server.join().unwrap();
+            }
         }
     }
 }

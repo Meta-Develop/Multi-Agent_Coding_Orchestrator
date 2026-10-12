@@ -158,6 +158,11 @@ impl LoginPort for GeminiLoginPort {
                 &GrokCliAdapter::default(),
                 browser_mode,
             ),
+            "cursor" => self.service.start_pending_oauth_with_browser_mode(
+                request,
+                &self.cursor,
+                browser_mode,
+            ),
             _ => Err(crate::error::Error::NotImplemented(
                 "caller-managed browser login",
             )),
