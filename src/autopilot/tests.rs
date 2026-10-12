@@ -55,6 +55,7 @@ fn isolated_autopilot_run_name(label: &str) -> String {
 #[cfg(target_os = "linux")]
 struct IsolatedLicensedAutopilot {
     _lock: MutexGuard<'static, ()>,
+    _cam_socket: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
     temp: tempfile::TempDir,
     repo: PathBuf,
     run_name: String,
@@ -71,6 +72,11 @@ impl IsolatedLicensedAutopilot {
         let repo = create_committed_autopilot_repo(temp.path());
         Self {
             _lock: lock,
+            // Injected runners do not use the persistent CAM authority service.
+            _cam_socket:
+                crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                    None,
+                ),
             temp,
             repo,
             run_name,
