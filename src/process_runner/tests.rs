@@ -3967,12 +3967,22 @@ fn gemini_isolated_host_view_allows_only_candidate_descendant_masks() {
 #[cfg(target_os = "linux")]
 #[test]
 fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    if !Path::new("/nix/store").is_dir() {
-        eprintln!("skipping Nix-store-dependent Gemini online profile test");
-        return;
-    }
+    // This test checks file binding and mount projection, not DNS contents or a
+    // provider launch. Reuse the reviewed root-owned Nix input instead of the
+    // host resolver, which systemd-resolved may legitimately own as a nonroot uid.
+    let path = env::var_os("PATH").expect("run with the reviewed Nix helper closure in PATH");
+    let resolver_source = fs::canonicalize(
+        required_trusted_nix_store_executable("env", &path)
+            .expect("reviewed root-owned Nix input must be available; never skip this regression"),
+    )
+    .expect("canonical Nix resolver projection fixture");
+    let resolver_binding = GeminiOnlineReadOnlyFileBinding::new(
+        resolver_source.clone(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .expect("trusted root-owned resolver projection fixture");
 
     let temp = tempfile::tempdir().expect("tempdir");
     let workspace = temp.path().join("workspace");
@@ -3983,9 +3993,17 @@ fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
     }
     let program = workspace.join("probe");
     fs::write(&program, "probe\n").expect("workspace program");
-    let confinement =
-        GeminiOnlineBridgeProfile::new(&workspace, WorkspaceAccess::ReadWrite, &control, &profile)
-            .expect("trusted host resolver projection");
+    // Assemble only the test profile with the validated fixture binding. The
+    // production constructor must keep resolving the fixed /etc/resolv.conf.
+    let mut config = WorkspaceSandboxConfig::new(&workspace, WorkspaceAccess::ReadWrite)
+        .with_isolated_host_view()
+        .with_visible_read_only_root(Path::new("/nix/store"))
+        .with_visible_read_only_root(&control)
+        .with_writable_artifact_root(&profile);
+    config
+        .gemini_online_read_only_file_bindings
+        .push(resolver_binding);
+    let confinement = GeminiOnlineBridgeProfile { config };
     let spec = ProcessSpec::direct(
         "Gemini online resolver projection",
         &program,
@@ -4001,10 +4019,7 @@ fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
         .expect("Gemini online sandbox config");
     assert_eq!(sandbox.gemini_online_read_only_file_bindings.len(), 1);
     let binding = &sandbox.gemini_online_read_only_file_bindings[0];
-    assert_eq!(
-        binding.source,
-        fs::canonicalize("/etc/resolv.conf").unwrap()
-    );
+    assert_eq!(binding.source, resolver_source);
     assert_eq!(binding.target, Path::new("/etc/resolv.conf"));
     binding
         .verify_source()
@@ -4024,6 +4039,10 @@ fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
     assert!(arguments
         .iter()
         .any(|argument| *argument == OsStr::new(&expected_binding)));
+    let expected_read_only_target = systemd_path_property("ReadOnlyPaths=", &binding.target, false);
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new(&expected_read_only_target)));
     assert!(arguments
         .iter()
         .any(|argument| *argument == OsStr::new("--property=PrivateNetwork=no")));
@@ -4040,6 +4059,29 @@ fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
         PathBuf::from("/etc/resolv.conf"),
     )
     .is_err());
+
+    // Isolate the owner refusal from the existing group/world-writable control.
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o644))
+        .expect("mode-safe nonroot resolver fixture");
+    let metadata = fs::metadata(&untrusted).expect("nonroot resolver fixture metadata");
+    assert!(metadata.is_file());
+    assert_ne!(
+        metadata.uid(),
+        0,
+        "run in the existing nonroot CI user scope"
+    );
+    assert_eq!(metadata.permissions().mode() & 0o022, 0);
+    assert_eq!(metadata.nlink(), 1);
+    let error = GeminiOnlineReadOnlyFileBinding::new(
+        fs::canonicalize(&untrusted).unwrap(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .expect_err("a mode-safe nonroot-owned resolver must remain untrusted");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        error.to_string(),
+        "Gemini online resolver source is not a trusted root-owned file"
+    );
 }
 
 #[cfg(target_os = "linux")]
