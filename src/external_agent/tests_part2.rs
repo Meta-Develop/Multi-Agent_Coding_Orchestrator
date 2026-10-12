@@ -664,6 +664,10 @@
 
         #[test]
         fn verified_absolute_trusted_codex_runs_external_codex_version_preflight() -> Result<()> {
+            let _cam_socket =
+                crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                    None,
+                );
             let temp = tempfile::tempdir()?;
             create_mandatory_control_roots(temp.path())?;
             let target_marker = temp.path().join("actual-target-ran");

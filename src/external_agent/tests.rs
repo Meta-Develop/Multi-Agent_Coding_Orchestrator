@@ -169,7 +169,7 @@ fn cursor_providerless_offline_uds_profile_is_exact_and_rejects_foreign_endpoint
         .iter()
         .any(|argument| argument.contains("AF_INET") || argument.contains("AF_INET6")));
     assert!(properties.iter().any(|argument| {
-        argument == &format!("--property=InaccessiblePaths={}", hidden.display())
+        argument == &format!("--property=InaccessiblePaths=-{}", hidden.display())
     }));
 
     crate::process_runner::verify_cursor_providerless_offline_uds_network_for_test(
@@ -8544,12 +8544,7 @@ fn claude_profile_masks_native_and_wsl_managed_policy_before_target_start() -> R
             || property == &format!("--property=BindPaths=\"{}\"", child_config_home.display())
     }));
     assert!(properties.iter().any(|property| {
-        property == &format!("--property=InaccessiblePaths={}", managed_root.display())
-            || property
-                == &format!(
-                    "--property=InaccessiblePaths=\"{}\"",
-                    managed_root.display()
-                )
+        property == &format!("--property=InaccessiblePaths=-{}", managed_root.display())
     }));
     assert!(!properties.iter().any(|property| {
         property == &format!("--property=BindPaths={}", managed_root.display())

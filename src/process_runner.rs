@@ -1150,6 +1150,13 @@ impl GeminiOnlineReadOnlyFileBinding {
             || metadata.permissions().mode() & 0o022 != 0
             || metadata.nlink() != 1
         {
+            #[cfg(test)]
+            eprintln!(
+                "Gemini online resolver trust failure: canonical_source={source:?}, uid={}, mode={:o}, nlink={}",
+                metadata.uid(),
+                metadata.permissions().mode(),
+                metadata.nlink(),
+            );
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
                 "Gemini online resolver source is not a trusted root-owned file",
@@ -5258,11 +5265,11 @@ pub(crate) fn cursor_providerless_offline_uds_systemd_properties_for_test(
         io::Error::other("providerless Cursor test profile did not resolve a systemd sandbox")
     })?;
     let mut command = Command::new("systemd-run");
-    apply_systemd_sandbox_properties(
-        &mut command,
-        &sandbox,
-        Path::new("/run/user/1000/maco-test-runtime"),
-    );
+    let runtime_dir = Path::new("/run/user/1000/maco-test-runtime");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, runtime_dir);
+    command
+        .arg(systemd_path_property("BindPaths=", runtime_dir, false))
+        .arg(systemd_path_property("ReadWritePaths=", runtime_dir, false));
     Ok(command
         .get_args()
         .map(|argument| argument.to_string_lossy().into_owned())
