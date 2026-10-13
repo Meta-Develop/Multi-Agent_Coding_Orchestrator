@@ -969,7 +969,7 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
     fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
     fs::write(
         repo_path.join("src/lib.rs"),
-        "pub struct Shared;\npub struct Gamma;\n",
+        "pub struct Alpha;\npub struct Shared;\npub struct Gamma;\n",
     )
     .expect("write injected Rust source");
     commit_injected_repository(&repo_path, "add semantic conflict fixture");
@@ -984,6 +984,25 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
     let mut plan = injected_multi_plan(assignments.clone(), 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     let options = injected_options(&repo_path, temp.path(), "semantic-block-isolation");
+    let mut metadata = SupervisorPlanMetadata::default();
+    let collision = match bind_assessed_injected_plan(&plan, &repo_path, &mut metadata) {
+        Ok(_) => panic!("intake must reject the authored Shared overlap"),
+        Err(error) => error,
+    };
+    assert!(format!("{collision:#}").contains("overlap semantic symbol 'Shared'"));
+
+    // Runtime isolation needs an admitted plan and a conflict with an active intent.
+    assignments[0].semantic_symbols = vec!["Alpha".to_string()];
+    plan.assignments = assignments.clone();
+    let semantic_store =
+        SemanticIntentStore::open(&repo_path).expect("open semantic fixture store");
+    let mut request = SemanticIntentRequest::new("external-semantic-owner");
+    request.symbols = vec!["Shared".to_string()];
+    let external_intent = semantic_store
+        .claim(request)
+        .expect("retain conflicting Shared intent");
+    assert!(external_intent.persisted);
+    assert!(!external_intent.has_blocking_conflicts);
     let state = Arc::new((Mutex::new(SemanticConflictState::default()), Condvar::new()));
     let runner = {
         let assignments = assignments.clone();
@@ -1026,6 +1045,15 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
         )
     }
     .expect("semantic Block conflict remains assignment-local");
+    assert_eq!(
+        semantic_store
+            .snapshot()
+            .expect("snapshot retained semantic intent"),
+        vec![external_intent.intent.clone()]
+    );
+    semantic_store
+        .release(external_intent.intent.token)
+        .expect("release external Shared intent");
     assert!(!report.success);
     assert_eq!(
         report
