@@ -159,7 +159,14 @@ fn assert_endpoint_closed(launch: &AssignmentMessagingLaunch) -> Result<()> {
         .environment_for("run", "parent")?
         .into_iter()
         .collect();
-    assert!(TcpStream::connect(env[ENV_MESSAGE_ENDPOINT].as_str()).is_err());
+    if let Ok(stream) = TcpStream::connect(env[ENV_MESSAGE_ENDPOINT].as_str()) {
+        panic!(
+            "endpoint={} local_addr={:?} peer_addr={:?}",
+            env[ENV_MESSAGE_ENDPOINT].as_str(),
+            stream.local_addr(),
+            stream.peer_addr()
+        );
+    }
     Ok(())
 }
 
