@@ -9260,6 +9260,7 @@ mod selection_policy_tests {
                     prepared_selection_fixture()?;
                 let mut worker = super::terminal_worker_assignment("codex-reviewed-worker");
                 worker.runtime = Some(SupervisorRuntime::Codex);
+                worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
                 plan.assignments = vec![worker];
                 let _routing_policy =
                     crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
@@ -9674,6 +9675,7 @@ mod selection_policy_tests {
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
             plan.assignments = vec![super::terminal_worker_assignment("observed-model-worker")];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
             let _routing_policy =
                 crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
@@ -9744,6 +9746,7 @@ mod selection_policy_tests {
             plan.assignments = vec![super::terminal_worker_assignment(
                 "unselected-account-worker",
             )];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
             let _routing_policy =
                 crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(

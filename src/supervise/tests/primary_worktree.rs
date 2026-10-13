@@ -103,10 +103,12 @@ fn primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim() 
 }
 
 fn run_primary_with_runner(
-    loaded: LoadedSupervisorPlan,
+    mut loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
     runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
+    let _routing_policy =
+        bind_assessed_injected_plan(&loaded.plan, &options.repo, &mut loaded.plan_metadata)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     run_supervisor_plan_with_runner_and_creation(
         loaded,

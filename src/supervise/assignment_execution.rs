@@ -10023,6 +10023,12 @@ mod decomposition_tests {
         use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
 
         const REVIEW_COST_MICROUNITS: u64 = 41;
+        const FIXTURE_MODEL_ID: &str = "grok-parent-review-cost-fixture";
+        let _capability = crate::supervise::model_policy::install_test_fixture_models(&[(
+            FIXTURE_MODEL_ID,
+            crate::supervise::model_policy::ModelCapabilityClass::CriticalJudgment,
+        )])
+        .expect("install grok-parent-review-cost-fixture capability overlay");
 
         let temp = tempfile::tempdir().expect("temporary phase fixture");
         let grok_bin = temp.path().join("bin").join("grok");
@@ -10053,7 +10059,7 @@ mod decomposition_tests {
             notes: None,
             decision_refs: Vec::new(),
         };
-        let plan = SupervisorPlan {
+        let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
             task: "parent review cost gate wiring".to_string(),
             task_file: None,
@@ -10070,6 +10076,15 @@ mod decomposition_tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: vec![assignment.clone()],
         };
+        let mut auditor_selection = configured_role_model_selection(&plan, AgentRole::Auditor);
+        auditor_selection.model = Some(FIXTURE_MODEL_ID.into());
+        plan.role_models
+            .insert(AgentRole::Auditor, auditor_selection);
+        if let ReviewLensBackendConfig::Model { model, .. } = &mut plan.review_lenses[0].backend {
+            *model = FIXTURE_MODEL_ID.to_string();
+        } else {
+            panic!("parent review cost fixture requires a model-backed first lens");
+        }
         let budget_config = SupervisorBudgetConfig::default();
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();

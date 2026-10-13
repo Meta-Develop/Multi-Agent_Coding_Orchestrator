@@ -2220,7 +2220,8 @@ mod tests {
         plan.assignments
             .push(serde_json::from_value(serde_json::json!({
                 "id": "assignment-1", "phase": "execution", "role": "worker",
-                "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR]
+                "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR],
+                "role_category": "non_delegating_terminal_worker"
             }))?);
         let mut metadata = SupervisorPlanMetadata::default();
         let routing_policy =
