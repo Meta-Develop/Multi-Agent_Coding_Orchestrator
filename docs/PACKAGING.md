@@ -15,10 +15,12 @@ builds the release `maco` binary with the Rust toolchain selected by
 `rust-toolchain.toml`.
 
 On Linux the same locked root-workspace build also includes the existing
-`coding-agent-manager` binary `account-authority`. The output contains
-`bin/maco`, `bin/account-authority`, and `source-manifest.json` beside `bin/`.
-It also installs identical manifest bytes at `share/maco/source-manifest.json`
-and the protected main declaration at `share/maco/main-helper.json`.
+`coding-agent-manager` binaries `account-authority` and `cam-grok-setup`.
+The output contains all three binaries under `bin/`, with
+`source-manifest.json` beside that directory. It also installs identical
+manifest bytes at `share/maco/source-manifest.json`, the protected main
+declaration at `share/maco/main-helper.json`, and a setup declaration at
+`share/maco/grok-setup-helper.json`.
 Darwin retains the `maco`-only output. The app and default package still select
 `maco`; packaging does not start an authority or provider.
 
@@ -45,8 +47,15 @@ package writes a deterministic declaration with exactly four fields:
 }
 ```
 
-The main remains a regular native ELF, not a wrapper or symlink. Both manifest
-copies and the declaration are regular, bounded files installed with mode
+The setup declaration has schema `maco-source-bound-grok-setup-helper-v1`
+and exactly `binary_sha256`, `source_manifest_sha256`, and `setup_entry_sha256`
+in addition to `schema`. It binds the final setup ELF, the same source manifest,
+and immutable `account-manager/core/src/bin/grok_setup.rs`. Packaging checks
+its metadata-only `--help` route without preparing an account or starting
+vendor login.
+
+The main and setup binaries are regular native ELFs. Both manifest copies and
+the declarations are regular, bounded files installed with mode
 0444. The Linux install check verifies these hashes, exact declaration fields,
 ELF header, CLI version/revision/state, helper `--help`, and identical manifest
 copies. Store finalization supplies root ownership after the build user exits;
@@ -77,7 +86,11 @@ The producer exports the complete public runtime closure with standard
 `nix-store --export` and uploads only that payload and its public JSON receipt.
 Independent producer outputs bind the artifact ID, receipt/payload hashes,
 selected checkout revision, lockfile, exact store roots, installed manifest,
-final main ELF and entry source. The three library shards and integration job
+final main ELF and entry source. The producer also validates the setup
+declaration and exposes the final setup ELF hash as `grok_setup_sha256`.
+The existing closure receipt schema and consumer checks are preserved; the
+payload covers the setup binary and its declaration in the same package root.
+The three library shards and integration job
 download that exact artifact in the same run. They verify hashes before parsing
 the receipt or importing into a real Nix store, retain normal signature/trust
 policy, and check protected ancestry, final bytes and checkout source entries.
