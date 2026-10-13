@@ -8,6 +8,28 @@ const LICENSED_SIGNATURE_B: &str =
     "error[E0425]: cannot find function crate::api::server_symbol in dependent server";
 
 #[cfg(target_os = "linux")]
+fn persist_assessed_injected_source_plan(
+    plan: &SupervisorPlan,
+    repo: &Path,
+    plan_file: &Path,
+) -> crate::selection::routing_policy::RoutingPolicyGuard {
+    let mut metadata = SupervisorPlanMetadata::default();
+    let routing_policy = bind_assessed_injected_plan(plan, repo, &mut metadata)
+        .expect("bind assessed injected licensed source plan");
+    let mut document = serde_json::to_value(plan).expect("serialize supervisor plan");
+    document["resolved_routing_policy"] = serde_json::to_value(&metadata.resolved_routing_policy)
+        .expect("serialize resolved routing policy");
+    document["task_routing_assessment"] = serde_json::to_value(&metadata.task_routing_assessment)
+        .expect("serialize task routing assessment");
+    fs::write(
+        plan_file,
+        serde_json::to_vec_pretty(&document).expect("serialize supervisor plan"),
+    )
+    .expect("write assessed licensed source plan");
+    routing_policy
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispatch() {
     skip_without_containment!();
@@ -82,8 +104,11 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
         write_injected_usage(command, 0, 1);
         injected_verified_run(command)
     };
-    let loaded = load_supervisor_plan_file_with_consultant(&plan_file, None)
+    let mut loaded = load_supervisor_plan_file_with_consultant(&plan_file, None)
         .expect("load parent-owned source plan");
+    let _routing_policy =
+        bind_assessed_injected_plan(&loaded.plan, &repo, &mut loaded.plan_metadata)
+            .expect("bind assessed injected licensed source plan");
     let catalog = test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
         .expect("fixture runtime catalog");
     let report = run_supervisor_plan_with_runner_and_creation(
@@ -1571,11 +1596,7 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
     .expect("hold the same isolated injected CAM observation across cascade rounds");
     let run_id = RunId::new("licensed-cascade-depth-two").expect("cascade source run id");
     let plan_file = temp.path().join("licensed-cascade-depth-two.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize licensed cascade source plan"),
-    )
-    .expect("write licensed cascade source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
@@ -1737,11 +1758,7 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
     let run_id = RunId::new("licensed-cascade-exact-plan-refusal")
         .expect("exact-plan refusal source run id");
     let plan_file = temp.path().join("licensed-cascade-exact-plan-refusal.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize exact-plan refusal source"),
-    )
-    .expect("write exact-plan refusal source");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
@@ -1886,11 +1903,7 @@ fn run_generated_round_last_moment_mutation(
     .expect("hold the same isolated injected CAM observation across source and generated rounds");
     let run_id = RunId::new(run_name).expect("last-moment gate source run id");
     let plan_file = temp.path().join(format!("{run_name}.json"));
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize last-moment gate source plan"),
-    )
-    .expect("write last-moment gate source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let retention = secure_machine_global_retention(temp.path(), run_name);
     let machine_global_config = retention.config.clone();
     let machine_global_config_before =
@@ -2182,11 +2195,7 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
     let run_id = RunId::new("licensed-cascade-initial-retention-deleted")
         .expect("initial deleted-retention source run id");
     let plan_file = temp.path().join("initial-retention-deleted.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize initial deleted-retention source plan"),
-    )
-    .expect("write initial deleted-retention source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let retention =
         secure_machine_global_retention(temp.path(), "licensed-cascade-initial-retention-deleted");
     let config = retention.config.clone();
@@ -2994,11 +3003,7 @@ fn licensed_cascade_partial_fan_in_preserves_successful_sibling_across_failure_a
     let source_run_id =
         RunId::new("licensed-cascade-partial-sibling").expect("partial sibling source run id");
     let plan_file = temp.path().join("licensed-cascade-partial-sibling.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize partial sibling source plan"),
-    )
-    .expect("write partial sibling source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let source_options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
