@@ -1554,8 +1554,7 @@ fn validate_native_seals(file: &File, length: u64) -> io::Result<()> {
     let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
     if !metadata.is_file()
         || metadata.len() != length
-        || length < 4
-        || length > MAX_EXECUTABLE_BYTES
+        || !(4..=MAX_EXECUTABLE_BYTES).contains(&length)
         || permission_mode(&metadata) != 0o500
         || seals < 0
         || seals & required != required
@@ -3080,13 +3079,11 @@ mod tests {
             .open("/proc")
             .expect("child proc anchor");
         let relative = CString::new(format!("{pid}/uid_map")).expect("fixed relative path");
-        assert_eq!(
-            open_controller_proc_entry(&root, &relative, libc::O_RDONLY)
-                .err()
-                .expect("bind mount must refuse")
-                .raw_os_error(),
-            Some(libc::EXDEV)
-        );
+        let error = match open_controller_proc_entry(&root, &relative, libc::O_RDONLY) {
+            Err(error) => error,
+            Ok(_) => panic!("bind mount must refuse"),
+        };
+        assert_eq!(error.raw_os_error(), Some(libc::EXDEV));
         assert!(validate_controller_root_namespace().is_err());
         println!("proc-substitution-refused");
     }
@@ -3214,13 +3211,11 @@ mod tests {
                 "synthetic cancellation",
             ))
         };
-        assert_eq!(
-            materialize_sealed_checked(&pinned.source, &mut cancelled)
-                .err()
-                .expect("refusal")
-                .kind(),
-            io::ErrorKind::Interrupted
-        );
+        let error = match materialize_sealed_checked(&pinned.source, &mut cancelled) {
+            Err(error) => error,
+            Ok(_) => panic!("refusal"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         let mut checkpoints = 0;
         let mut during_copy = || {
             checkpoints += 1;
@@ -3233,13 +3228,11 @@ mod tests {
                 Ok(())
             }
         };
-        assert_eq!(
-            materialize_sealed_checked(&pinned.source, &mut during_copy)
-                .err()
-                .expect("copy refused")
-                .kind(),
-            io::ErrorKind::Interrupted
-        );
+        let error = match materialize_sealed_checked(&pinned.source, &mut during_copy) {
+            Err(error) => error,
+            Ok(_) => panic!("copy refused"),
+        };
+        assert_eq!(error.kind(), io::ErrorKind::Interrupted);
         executable(&path, b"\x7fELFdifferent bytes");
         assert!(materialize_sealed(&pinned.source).is_err());
     }
