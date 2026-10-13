@@ -4203,7 +4203,7 @@ impl<'a> ParentConcurrentFixtureCustody<'a> {
             repo: repo.path().to_path_buf(),
             repo_identity: repo.identity().clone(),
             ready,
-            run: options.run_id.to_string(),
+            run: options.run_id.as_str().to_owned(),
             inputs: concurrent_custody_inputs(plan, frozen, assessment)?,
             witness_identity: crate::safe_state::FileIdentity {
                 device: file_metadata.dev(),

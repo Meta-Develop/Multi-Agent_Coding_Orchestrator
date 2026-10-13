@@ -537,14 +537,16 @@ fn selected_concurrent_injected_fixture<'a>(
     plan: &SupervisorPlan,
     options: &SupervisorRunOptions,
     owner: &'a tempfile::TempDir,
-) -> Result<scheduler::SelectedConcurrentFixtureGuard<'a>> {
+) -> Result<super::scheduler::SelectedConcurrentFixtureGuard<'a>> {
     let RuntimeModelCatalog::Codex(catalog) = test_runtime_model_catalog(plan, options.runtime)?
     else {
         bail!("selected concurrent fixture requires an actual supplied Codex catalog");
     };
     let mut metadata = SupervisorPlanMetadata::default();
     let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
-    scheduler::install_selected_concurrent_fixture(plan, options, &catalog, metadata, owner, policy)
+    super::scheduler::install_selected_concurrent_fixture(
+        plan, options, &catalog, metadata, owner, policy,
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -553,21 +555,21 @@ fn selected_concurrent_parent_custody<'a>(
     options: &SupervisorRunOptions,
     owner: &'a tempfile::TempDir,
     ready: &Path,
-) -> Result<scheduler::ParentConcurrentFixtureCustody<'a>> {
+) -> Result<super::scheduler::ParentConcurrentFixtureCustody<'a>> {
     let RuntimeModelCatalog::Codex(_catalog) = test_runtime_model_catalog(plan, options.runtime)?
     else {
         bail!("inherited concurrent fixture requires an actual supplied Codex catalog");
     };
     let mut metadata = SupervisorPlanMetadata::default();
     let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
-    scheduler::ParentConcurrentFixtureCustody::create(
+    super::scheduler::ParentConcurrentFixtureCustody::create(
         plan, options, &metadata, owner, ready, policy,
     )
 }
 
 #[cfg(target_os = "linux")]
 struct InheritedSelectedConcurrentFixture {
-    custody: scheduler::InheritedConcurrentFixtureRoot,
+    custody: super::scheduler::InheritedConcurrentFixtureRoot,
     registry_owner: tempfile::TempDir,
     catalog: CodexRuntimeModelCatalog,
     metadata: Option<SupervisorPlanMetadata>,
@@ -588,7 +590,7 @@ fn selected_concurrent_inherited_fixture(
     };
     let mut metadata = SupervisorPlanMetadata::default();
     let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
-    let custody = scheduler::InheritedConcurrentFixtureRoot::open(
+    let custody = super::scheduler::InheritedConcurrentFixtureRoot::open(
         plan, options, &metadata, root, ready, witness,
     )?;
     // Only a fresh registry subdirectory is child-owned, never the inherited root.
@@ -609,7 +611,7 @@ impl InheritedSelectedConcurrentFixture {
         &mut self,
         plan: &SupervisorPlan,
         options: &SupervisorRunOptions,
-    ) -> Result<scheduler::SelectedConcurrentFixtureGuard<'_>> {
+    ) -> Result<super::scheduler::SelectedConcurrentFixtureGuard<'_>> {
         let metadata = self
             .metadata
             .take()
@@ -618,7 +620,7 @@ impl InheritedSelectedConcurrentFixture {
             .policy
             .take()
             .context("inherited fixture policy already consumed")?;
-        scheduler::install_selected_inherited_concurrent_fixture(
+        super::scheduler::install_selected_inherited_concurrent_fixture(
             plan,
             options,
             &self.catalog,

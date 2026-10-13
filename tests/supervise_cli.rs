@@ -1002,7 +1002,7 @@ fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result
     )?;
     let repo = Repository::open(&repo_path)?;
     commit_all(&repo, "ignore policy tree")?;
-    assert!(repo.status_should_ignore(".agents/skills/agent-orchestration/SKILL.md")?);
+    assert!(repo.status_should_ignore(Path::new(".agents/skills/agent-orchestration/SKILL.md"))?);
     assert!(repo
         .index()?
         .get_path(Path::new(".agents/skills/agent-orchestration/SKILL.md"), 0)
