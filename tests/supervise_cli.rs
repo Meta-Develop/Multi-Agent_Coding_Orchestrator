@@ -857,7 +857,26 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         1024
     );
     let plan_path = temp.path().join("generated-plan.json");
-    fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
+    let input_plan_bytes = serde_json::to_vec_pretty(&plan)?;
+    fs::write(&plan_path, &input_plan_bytes).context("write generated plan")?;
+
+    // The run receipt includes parsed Worker defaults and the effective CLI ceiling.
+    let mut expected_executed_plan = plan.clone();
+    for worker in expected_executed_plan["assignments"][0]["worker_assignments"]
+        .as_array_mut()
+        .context("generated Worker assignments")?
+    {
+        assert!(worker.get("kind").is_none());
+        worker["kind"] = Value::String("ordinary".to_string());
+    }
+    assert!(expected_executed_plan["run_budget"]
+        .get("hard_tokens")
+        .is_none());
+    assert!(expected_executed_plan["run_budget"]
+        .get("soft_tokens")
+        .is_none());
+    expected_executed_plan["run_budget"]["hard_tokens"] = Value::from(100000);
+    expected_executed_plan["run_budget"]["soft_tokens"] = Value::from(100000);
 
     let output = command_with_test_machine_global_binding(
         BIN,
@@ -890,6 +909,7 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         output.status.success(),
         "fake-backed budget run failed: stdout={stdout} stderr={stderr}"
     );
+    assert_eq!(fs::read(&plan_path)?, input_plan_bytes);
     let report: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("parse max-tokens run JSON: stdout={stdout} stderr={stderr}"))?;
     assert_eq!(report["success"], true);
@@ -908,7 +928,7 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         executed_plan["run_budget"]["role_token_reservations"],
         plan["run_budget"]["role_token_reservations"]
     );
-    assert_eq!(executed_plan, plan);
+    assert_eq!(executed_plan, expected_executed_plan);
     assert_eq!(Repository::open(&repo_path)?.head()?.target(), head_before);
     assert_eq!(fs::read(repo.path().join("index"))?, index_before);
     assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);

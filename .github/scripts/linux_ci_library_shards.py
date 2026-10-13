@@ -211,6 +211,9 @@ def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[s
             line for line in result.stdout.splitlines()
             if line.startswith("test ") and not line.startswith("test result:")
         ]
+        # Accept the selected body's single libtest 60-second warning only before its result.
+        if body_lines[:1] == [f"test {name} has been running for over 60 seconds"]:
+            body_lines = body_lines[1:]
         terminal = (
             len(summary_lines) == 1 and len(body_lines) == 1
             and result.stdout.rstrip().splitlines()[-1:] == summary_lines

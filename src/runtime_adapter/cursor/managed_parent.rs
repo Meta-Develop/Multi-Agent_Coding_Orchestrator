@@ -668,6 +668,57 @@ enum OfflineCheckObservedExactRefusal {
     Unknown,
     ManifestDigestRefusal,
     ProtectedPathRefusal,
+    ProtectedComponentRefusal {
+        component: crate::pinned_exec::ProtectedHelperComponentRole,
+        symlink: bool,
+        owner_mismatch: bool,
+        writable: bool,
+    },
+}
+
+#[cfg(test)]
+fn observed_protected_component_refusal(stderr: &[u8]) -> OfflineCheckObservedExactRefusal {
+    use crate::pinned_exec::ProtectedHelperComponentRole::*;
+    use OfflineCheckObservedExactRefusal::*;
+
+    let Some(component_and_flags) = stderr.strip_prefix(
+        b"Error: fixed helper path was not owner-controlled and immutable; component=",
+    ) else {
+        return Unknown;
+    };
+    let components: [(crate::pinned_exec::ProtectedHelperComponentRole, &[u8]); 7] = [
+        (FilesystemRoot, b"FilesystemRoot"),
+        (NixRoot, b"NixRoot"),
+        (PackageRoot, b"PackageRoot"),
+        (PackageBin, b"PackageBin"),
+        (PackageExecutable, b"PackageExecutable"),
+        (PackageShare, b"PackageShare"),
+        (PackageMetadataDirectory, b"PackageMetadataDirectory"),
+    ];
+    for (component, label) in components {
+        let Some(flags) = component_and_flags.strip_prefix(label) else {
+            continue;
+        };
+        // Whole suffix equality closes every bit, separator, final newline and end-of-input.
+        // All-zero flags cannot describe the preserved refusal predicate.
+        let (symlink, owner_mismatch, writable) = match flags {
+            b"; symlink=0; owner_mismatch=0; writable=1\n" => (false, false, true),
+            b"; symlink=0; owner_mismatch=1; writable=0\n" => (false, true, false),
+            b"; symlink=0; owner_mismatch=1; writable=1\n" => (false, true, true),
+            b"; symlink=1; owner_mismatch=0; writable=0\n" => (true, false, false),
+            b"; symlink=1; owner_mismatch=0; writable=1\n" => (true, false, true),
+            b"; symlink=1; owner_mismatch=1; writable=0\n" => (true, true, false),
+            b"; symlink=1; owner_mismatch=1; writable=1\n" => (true, true, true),
+            _ => return Unknown,
+        };
+        return ProtectedComponentRefusal {
+            component,
+            symlink,
+            owner_mismatch,
+            writable,
+        };
+    }
+    Unknown
 }
 
 #[cfg(test)]
@@ -739,7 +790,7 @@ fn offline_check_failure_diagnostic(
                 b"Error: fixed helper path was not owner-controlled and immutable\n" => {
                     OfflineCheckObservedExactRefusal::ProtectedPathRefusal
                 }
-                _ => OfflineCheckObservedExactRefusal::Unknown,
+                _ => observed_protected_component_refusal(stderr.as_bytes()),
             }
         };
     format!(
@@ -1846,6 +1897,123 @@ mod tests {
             ] {
                 check_exact(Vec::new(), false, framed, false, "Unknown");
             }
+        }
+
+        // Exercise the actual helper's pure role/message producer and the strict consumer.
+        // These synthetic path inputs are never opened or executed, and never appear in output.
+        use crate::pinned_exec::ProtectedHelperComponentRole::*;
+        let components = [
+            (FilesystemRoot, "FilesystemRoot", "/"),
+            (NixRoot, "NixRoot", "/nix"),
+            (
+                PackageRoot,
+                "PackageRoot",
+                "/nix/store/synthetic-private-package",
+            ),
+            (
+                PackageBin,
+                "PackageBin",
+                "/nix/store/synthetic-private-package/bin",
+            ),
+            (
+                PackageExecutable,
+                "PackageExecutable",
+                "/nix/store/synthetic-private-package/bin/maco",
+            ),
+            (
+                PackageShare,
+                "PackageShare",
+                "/nix/store/synthetic-private-package/share",
+            ),
+            (
+                PackageMetadataDirectory,
+                "PackageMetadataDirectory",
+                "/nix/store/synthetic-private-package/share/maco",
+            ),
+        ];
+        for (component, label, path) in components {
+            for symlink in [false, true] {
+                for owner_mismatch in [false, true] {
+                    for writable in [false, true] {
+                        let message =
+                            crate::pinned_exec::protected_helper_component_refusal_message_for_test(
+                                Path::new(path),
+                                symlink,
+                                owner_mismatch,
+                                writable,
+                            );
+                        assert_eq!(message, format!(
+                            "fixed helper path was not owner-controlled and immutable; component={label}; symlink={}; owner_mismatch={}; writable={}",
+                            u8::from(symlink), u8::from(owner_mismatch), u8::from(writable),
+                        ));
+                        let refusal = format!("Error: {message}\n").into_bytes();
+                        if !symlink && !owner_mismatch && !writable {
+                            check_exact(Vec::new(), false, refusal, false, "Unknown");
+                            continue;
+                        }
+                        let expected = format!(
+                            "{:?}",
+                            OfflineCheckObservedExactRefusal::ProtectedComponentRefusal {
+                                component,
+                                symlink,
+                                owner_mismatch,
+                                writable,
+                            }
+                        );
+                        check_exact(Vec::new(), false, refusal.clone(), false, &expected);
+                        check_exact(secret.to_vec(), false, refusal.clone(), false, "Unknown");
+                        check_exact(refusal.clone(), false, Vec::new(), false, "Unknown");
+                        check_exact(Vec::new(), true, refusal.clone(), false, "Unknown");
+                        check_exact(Vec::new(), false, refusal.clone(), true, "Unknown");
+                        for framed in [
+                            [secret.as_slice(), refusal.as_slice()].concat(),
+                            [refusal.as_slice(), secret.as_slice()].concat(),
+                            [secret.as_slice(), refusal.as_slice(), secret.as_slice()].concat(),
+                            [refusal.as_slice(), b"extra line\n"].concat(),
+                            [refusal.as_slice(), b"\xff"].concat(),
+                            [refusal.as_slice(), refusal.as_slice()].concat(),
+                            [refusal.as_slice(), refusals[1].0].concat(),
+                            vec![b'z'; refusal.len()],
+                        ] {
+                            check_exact(Vec::new(), false, framed, false, "Unknown");
+                        }
+                    }
+                }
+            }
+        }
+        for path in [
+            "/nix/store",
+            "/nix/store-other/synthetic-private-package/bin/maco",
+            "/nix/store/synthetic-private-package/nested/bin/maco",
+            "/nix/store/synthetic-private-package/./bin/maco",
+            "/synthetic-private-path",
+            "relative-private-path",
+        ] {
+            let message = crate::pinned_exec::protected_helper_component_refusal_message_for_test(
+                Path::new(path),
+                false,
+                true,
+                false,
+            );
+            assert_eq!(
+                message,
+                "fixed helper path was not owner-controlled and immutable"
+            );
+            check_exact(
+                Vec::new(),
+                false,
+                format!("Error: {message}\n").into_bytes(),
+                false,
+                "ProtectedPathRefusal",
+            );
+        }
+        for invalid in [
+            b"Error: fixed helper path was not owner-controlled and immutable; component=PrivateRole; symlink=0; owner_mismatch=1; writable=0\n".as_slice(),
+            b"Error: fixed helper path was not owner-controlled and immutable; component=NixRoot; symlink=2; owner_mismatch=0; writable=0\n".as_slice(),
+            b"Error: fixed helper path was not owner-controlled and immutable; component=NixRoot; symlink=0; owner_mismatch=1; writable=0; private=suffix\n".as_slice(),
+            b"Error: fixed helper path was not owner-controlled and immutable; component=NixRoot; symlink=0; owner_mismatch=1; writable=0".as_slice(),
+        ] {
+            check_exact(Vec::new(), false, invalid.to_vec(), false, "Unknown");
         }
     }
 

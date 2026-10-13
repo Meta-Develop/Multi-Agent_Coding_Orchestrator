@@ -186,13 +186,17 @@ pub(super) fn exercise<'budget>(
         parent.external_run.output_last_message = Some(serde_json::to_vec(&report)?);
     }
     // Neither good nor bad filesystem report bytes may replace the held capture.
-    fs::write(
-        context
-            .run_dir
-            .join(&parent.prepared.attempt_artifacts.raw_report_relative),
-        b"{\"outcome\":\"final_report\"}",
+    let report_path = context
+        .run_dir
+        .join(&parent.prepared.attempt_artifacts.raw_report_relative);
+    let _report_parent = crate::safe_state::SafeRoot::open_or_create(
+        report_path
+            .parent()
+            .context("retained report artifact parent")?,
     )
-    .context("substitute retained report artifact without replacing the held capture")?;
+    .context("create private retained report artifact directory")?;
+    fs::write(&report_path, b"{\"outcome\":\"final_report\"}")
+        .context("substitute retained report artifact without replacing the held capture")?;
     // Only this negative substitutes an authentic ordinary endpoint after capture.
     // Every positive retains the exact endpoint admitted before parent dispatch.
     let ordinary_endpoint = if case == "bound-ordinary-endpoint" {

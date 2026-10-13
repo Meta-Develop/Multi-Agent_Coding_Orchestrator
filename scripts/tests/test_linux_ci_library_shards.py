@@ -46,6 +46,10 @@ def causal_output(name, failed=False):
         "0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
     )
 
+# Actual job115111506303 stdout, log lines1269-1274; only transport timestamps removed.
+# This is a parser fixture, not a rerun or a claim about other Rust cases.
+CAPTURED_MANAGED_CYCLE_STDOUT = 'running 1 test\ntest supervise::assignment_execution::managed_parent_controller_tests::managed_cycle_isolated_workers_overlap_and_import_exact_union has been running for over 60 seconds\ntest supervise::assignment_execution::managed_parent_controller_tests::managed_cycle_isolated_workers_overlap_and_import_exact_union ... ok\n\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 4534 filtered out; finished in 70.73s\n\n'
+
 class LibraryShardTests(unittest.TestCase):
     def test_partition_is_disjoint_complete_stable_and_includes_new_modules(self):
         partitions = shards.partition_inventory(INVENTORY)
@@ -329,6 +333,77 @@ class LibraryShardTests(unittest.TestCase):
                     self.assertNotIn(full_command, [call.args[0] for call in run.call_args_list])
                 else:
                     self.assertEqual(run.call_args, mock.call(full_command, check=False))
+
+    def test_causal_diagnostic_accepts_captured_progress_and_retains_broad_failure_gate(self):
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        inventory = sorted([*INVENTORY, *shards.SAFETY_PREFLIGHTS["supervise"], *names])
+        selected = shards.partition_inventory(inventory)["supervise"]
+        self.assertIn(f"test {names[1]} has been running for over 60 seconds\n", CAPTURED_MANAGED_CYCLE_STDOUT)
+        for failed_index in [None, 0, 1]:
+            statuses = [101 if i == failed_index else 0 for i in range(4)]
+            outputs = [causal_output(name, status == 101) for name, status in zip(names, statuses)]
+            outputs[1] = CAPTURED_MANAGED_CYCLE_STDOUT
+            if failed_index == 1:
+                outputs[1] = outputs[1].replace("... ok", "... FAILED").replace(
+                    "test result: ok. 1 passed; 0 failed;", "test result: FAILED. 0 passed; 1 failed;"
+                )
+            out = io.StringIO()
+            with self.subTest(failed_index=failed_index), mock.patch.object(shards, "enumerate_tests", side_effect=[inventory, selected, *[[n] for n in names]]) as enumerate_tests, mock.patch.object(shards, "run_safety_preflights", return_value=0), mock.patch.object(shards, "run_supervise_diagnostics", return_value=0), mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+                run.side_effect = [
+                    subprocess.CompletedProcess([], status, output, "")
+                    for status, output in zip(statuses, outputs)
+                ] + ([] if failed_index is not None else [subprocess.CompletedProcess([], 0)])
+                self.assertEqual(shards.run_shard(["harness"], "supervise"), int(failed_index is not None))
+                self.assertEqual(enumerate_tests.call_args_list, [
+                    mock.call(["harness"]), mock.call(["harness"], selected),
+                    *[mock.call(["harness"], [name]) for name in names],
+                ])
+                self.assertEqual(run.call_count, 4 + int(failed_index is None))
+                for index, name in enumerate(names):
+                    self.assertEqual(run.call_args_list[index], mock.call(
+                        ["harness", "--exact", "--", name], check=False, capture_output=True, text=True,
+                    ))
+                report = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith('{"broad_allowed"')]
+                self.assertEqual(len(report), 1)
+                self.assertTrue(report[0]["complete"])
+                self.assertEqual([case["name"] for case in report[0]["supervise_causal_cases"]], list(names))
+                self.assertEqual([case["outcome"] for case in report[0]["supervise_causal_cases"]], ["FAIL" if status else "PASS" for status in statuses])
+                self.assertEqual(report[0]["broad_allowed"], failed_index is None)
+                broad = shards.test_command(["harness"], selected)
+                if failed_index is None:
+                    self.assertEqual(run.call_args, mock.call(broad, check=False))
+                else:
+                    self.assertNotIn(broad, [call.args[0] for call in run.call_args_list])
+
+    def test_causal_diagnostic_refuses_wrong_duplicate_or_misordered_progress(self):
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        output = CAPTURED_MANAGED_CYCLE_STDOUT
+        warning = f"test {names[1]} has been running for over 60 seconds\n"
+        terminal = f"test {names[1]} ... ok\n"
+        invalid = [
+            output.replace(warning, warning.replace(names[1], names[0])),
+            output.replace(warning, warning.replace(names[1], names[1] + "_longer")),
+            output.replace(warning, warning.replace("60", "61")),
+            output.replace(warning, warning.replace("60", "sixty")),
+            output.replace(warning, warning + warning),
+            output.replace(warning + terminal, terminal + warning),
+            output.replace(terminal, ""),
+            output.replace(terminal, terminal + terminal),
+            output.replace(terminal, terminal.replace(names[1], names[0])),
+            output.replace(terminal, terminal.replace("... ok", "... ignored")),
+            output + warning,
+        ]
+        for malformed in invalid:
+            with self.subTest(output=malformed), mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                run.side_effect = [
+                    subprocess.CompletedProcess([], 0, listing([names[0]]), ""),
+                    subprocess.CompletedProcess([], 101, causal_output(names[0], True), ""),
+                    subprocess.CompletedProcess([], 0, listing([names[1]]), ""),
+                    subprocess.CompletedProcess([], 0, malformed, ""),
+                ]
+                with self.assertRaises(ValueError):
+                    shards.run_supervise_causal_diagnostics(["harness"], names)
+                self.assertEqual(run.call_count, 4)
 
     def test_supervise_diagnostics_refuse_non_single_body_and_continue_remaining_cases(self):
         names = shards.SUPERVISE_DIAGNOSTICS

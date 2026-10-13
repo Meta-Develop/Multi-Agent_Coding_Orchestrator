@@ -1404,7 +1404,12 @@ fn validate_source_bound_helper_path(path: &Path) -> io::Result<()> {
 #[cfg(target_os = "linux")]
 fn validate_source_bound_package_path(path: &Path, executable: bool) -> io::Result<()> {
     let mut current = PathBuf::from("/");
-    validate_helper_component(&current, 0, false)?;
+    validate_helper_component_with_role(
+        &current,
+        0,
+        false,
+        Some(ProtectedHelperComponentRole::FilesystemRoot),
+    )?;
     let components = path.components().skip(1).collect::<Vec<_>>();
     for (index, component) in components.iter().enumerate() {
         let std::path::Component::Normal(component) = component else {
@@ -1444,7 +1449,12 @@ fn validate_source_bound_package_path(path: &Path, executable: bool) -> io::Resu
                     ));
                 }
             } else {
-                validate_helper_component(&current, 0, final_component)?;
+                validate_helper_component_with_role(
+                    &current,
+                    0,
+                    final_component,
+                    source_bound_helper_component_role(&current),
+                )?;
             }
         }
     }
@@ -1524,7 +1534,124 @@ fn validate_helper_path_from_anchor(path: &Path, anchor: &Path, owner: u32) -> i
 }
 
 #[cfg(target_os = "linux")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ProtectedHelperComponentRole {
+    FilesystemRoot,
+    NixRoot,
+    PackageRoot,
+    PackageBin,
+    PackageExecutable,
+    PackageShare,
+    PackageMetadataDirectory,
+}
+
+#[cfg(target_os = "linux")]
+impl ProtectedHelperComponentRole {
+    fn label(self) -> &'static str {
+        match self {
+            Self::FilesystemRoot => "FilesystemRoot",
+            Self::NixRoot => "NixRoot",
+            Self::PackageRoot => "PackageRoot",
+            Self::PackageBin => "PackageBin",
+            Self::PackageExecutable => "PackageExecutable",
+            Self::PackageShare => "PackageShare",
+            Self::PackageMetadataDirectory => "PackageMetadataDirectory",
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn source_bound_helper_component_role(path: &Path) -> Option<ProtectedHelperComponentRole> {
+    use std::path::Component;
+    use ProtectedHelperComponentRole::*;
+
+    if !path.is_absolute() || path.components().collect::<PathBuf>().as_os_str() != path.as_os_str()
+    {
+        return None;
+    }
+    if path == Path::new("/") {
+        return Some(FilesystemRoot);
+    }
+    if path == Path::new("/nix") {
+        return Some(NixRoot);
+    }
+    let components = path
+        .strip_prefix("/nix/store")
+        .ok()?
+        .components()
+        .collect::<Vec<_>>();
+    match components.as_slice() {
+        [Component::Normal(_)] => Some(PackageRoot),
+        [Component::Normal(_), kind] if *kind == Component::Normal(OsStr::new("bin")) => {
+            Some(PackageBin)
+        }
+        [Component::Normal(_), kind] if *kind == Component::Normal(OsStr::new("share")) => {
+            Some(PackageShare)
+        }
+        [Component::Normal(_), kind, leaf]
+            if *kind == Component::Normal(OsStr::new("bin"))
+                && *leaf == Component::Normal(OsStr::new("maco")) =>
+        {
+            Some(PackageExecutable)
+        }
+        [Component::Normal(_), kind, leaf]
+            if *kind == Component::Normal(OsStr::new("share"))
+                && *leaf == Component::Normal(OsStr::new("maco")) =>
+        {
+            Some(PackageMetadataDirectory)
+        }
+        _ => None,
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protected_helper_component_refusal_message(
+    component: Option<ProtectedHelperComponentRole>,
+    symlink: bool,
+    owner_mismatch: bool,
+    writable: bool,
+) -> String {
+    let Some(component) = component else {
+        return "fixed helper path was not owner-controlled and immutable".to_owned();
+    };
+    // Only closed labels and predicate bits leave the helper. No pathname, metadata value,
+    // or underlying error is rendered. The shared validator has no invocation-stage context.
+    format!(
+        "fixed helper path was not owner-controlled and immutable; component={}; symlink={}; owner_mismatch={}; writable={}",
+        component.label(),
+        u8::from(symlink),
+        u8::from(owner_mismatch),
+        u8::from(writable),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn protected_helper_component_refusal_message_for_test(
+    path: &Path,
+    symlink: bool,
+    owner_mismatch: bool,
+    writable: bool,
+) -> String {
+    protected_helper_component_refusal_message(
+        source_bound_helper_component_role(path),
+        symlink,
+        owner_mismatch,
+        writable,
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn validate_helper_component(path: &Path, owner: u32, final_component: bool) -> io::Result<()> {
+    validate_helper_component_with_role(path, owner, final_component, None)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_helper_component_with_role(
+    path: &Path,
+    owner: u32,
+    final_component: bool,
+    component: Option<ProtectedHelperComponentRole>,
+) -> io::Result<()> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| opaque_io(error, "could not inspect fixed helper path"))?;
     if metadata.file_type().is_symlink()
@@ -1533,7 +1660,12 @@ fn validate_helper_component(path: &Path, owner: u32, final_component: bool) -> 
     {
         return Err(io::Error::new(
             io::ErrorKind::PermissionDenied,
-            "fixed helper path was not owner-controlled and immutable",
+            protected_helper_component_refusal_message(
+                component,
+                metadata.file_type().is_symlink(),
+                metadata.uid() != owner,
+                permission_mode(&metadata) & 0o022 != 0,
+            ),
         ));
     }
     if final_component {
