@@ -269,11 +269,12 @@ fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_se
         injected_verified_run(command)
     };
 
-    let error = run_supervisor_plan_with_runner(
+    let error = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect_err("rebound supervisor final slot must fail closed");
