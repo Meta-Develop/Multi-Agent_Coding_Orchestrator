@@ -2957,7 +2957,10 @@ mod tests {
     #[cfg(target_os = "linux")]
     use std::{
         fs::OpenOptions,
-        os::unix::{ffi::OsStringExt, fs::PermissionsExt},
+        os::{
+            fd::{AsRawFd, FromRawFd, RawFd},
+            unix::{ffi::OsStringExt, fs::PermissionsExt},
+        },
     };
 
     #[cfg(target_os = "linux")]
@@ -2973,9 +2976,44 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn write_proc_fixture_mapping(path: &std::ffi::CStr, bytes: &[u8]) -> io::Result<()> {
-        // Used only between fork and exec: raw syscalls and prebuilt bytes,
-        // with no allocator, locks, environment access or Rust file buffering.
+    const PROC_FIXTURE_STAGE_UNSHARE: u8 = b'u';
+    #[cfg(target_os = "linux")]
+    const PROC_FIXTURE_STAGE_SETGROUPS: u8 = b's';
+    #[cfg(target_os = "linux")]
+    const PROC_FIXTURE_STAGE_UID_MAP: u8 = b'i';
+    #[cfg(target_os = "linux")]
+    const PROC_FIXTURE_STAGE_GID_MAP: u8 = b'g';
+    #[cfg(target_os = "linux")]
+    const PROC_FIXTURE_STAGE_MOUNT: u8 = b'm';
+    #[cfg(target_os = "linux")]
+    const PROC_FIXTURE_STAGE_PREPARED: u8 = b'p';
+
+    #[cfg(target_os = "linux")]
+    fn write_proc_fixture_stage(stage_fd: RawFd, stage: u8) -> io::Result<()> {
+        let bytes = [stage];
+        // SAFETY: stage_fd is the inherited CLOEXEC diagnostic write end; bytes
+        // remains readable for one byte. No allocator, lock, env, or path I/O.
+        let count = unsafe { libc::write(stage_fd, bytes.as_ptr().cast(), 1) };
+        if count < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if count != 1 {
+            return Err(io::Error::from_raw_os_error(libc::EIO));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_proc_fixture_mapping(
+        path: &std::ffi::CStr,
+        bytes: &[u8],
+        stage_fd: RawFd,
+        stage: u8,
+    ) -> io::Result<()> {
+        // Used only between fork and exec: raw syscalls, prebuilt bytes, and a
+        // one-byte diagnostic write. No allocator, locks, environment access or
+        // Rust file buffering. Stage is written before the mapping open.
+        write_proc_fixture_stage(stage_fd, stage)?;
         // SAFETY: path is a live C string; open returns a new owned descriptor.
         let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
         if fd < 0 {
@@ -3002,15 +3040,36 @@ mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    fn prepare_proc_substitution_fixture(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+    fn prepare_proc_substitution_fixture(
+        uid_map: &[u8],
+        gid_map: &[u8],
+        stage_fd: RawFd,
+    ) -> io::Result<()> {
         // SAFETY: invoked only in this test's owned, single-threaded pre-exec
         // child. The parent's user/mount namespace and proc view are untouched.
+        write_proc_fixture_stage(stage_fd, PROC_FIXTURE_STAGE_UNSHARE)?;
         if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
             return Err(io::Error::last_os_error());
         }
-        write_proc_fixture_mapping(c"/proc/self/setgroups", b"deny")?;
-        write_proc_fixture_mapping(c"/proc/self/uid_map", uid_map)?;
-        write_proc_fixture_mapping(c"/proc/self/gid_map", gid_map)?;
+        write_proc_fixture_mapping(
+            c"/proc/self/setgroups",
+            b"deny",
+            stage_fd,
+            PROC_FIXTURE_STAGE_SETGROUPS,
+        )?;
+        write_proc_fixture_mapping(
+            c"/proc/self/uid_map",
+            uid_map,
+            stage_fd,
+            PROC_FIXTURE_STAGE_UID_MAP,
+        )?;
+        write_proc_fixture_mapping(
+            c"/proc/self/gid_map",
+            gid_map,
+            stage_fd,
+            PROC_FIXTURE_STAGE_GID_MAP,
+        )?;
+        write_proc_fixture_stage(stage_fd, PROC_FIXTURE_STAGE_MOUNT)?;
         // SAFETY: fixed mount propagation operation applies only in the new
         // owned mount namespace; no filesystem or source is supplied.
         if unsafe {
@@ -3025,7 +3084,72 @@ mod tests {
         {
             return Err(io::Error::last_os_error());
         }
+        write_proc_fixture_stage(stage_fd, PROC_FIXTURE_STAGE_PREPARED)?;
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn open_proc_fixture_stage_pipe() -> io::Result<(File, File)> {
+        let mut fds = [-1; 2];
+        // SAFETY: pipe2 writes two new owned descriptors into fds on success.
+        if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: pipe2 succeeded; each descriptor is uniquely owned here.
+        Ok(unsafe { (File::from_raw_fd(fds[0]), File::from_raw_fd(fds[1])) })
+    }
+
+    #[cfg(target_os = "linux")]
+    fn read_proc_fixture_last_stage(fd: RawFd) -> Option<u8> {
+        // SAFETY: fd is the parent-owned diagnostic read end.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return None;
+        }
+        // SAFETY: O_NONBLOCK applies only to this owned read end.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            return None;
+        }
+        let mut buf = [0u8; 8];
+        let mut filled = 0usize;
+        for _ in 0..buf.len() {
+            if filled >= buf.len() {
+                break;
+            }
+            // SAFETY: fd is the owned read end; buf[filled..] is writable.
+            let count =
+                unsafe { libc::read(fd, buf[filled..].as_mut_ptr().cast(), buf.len() - filled) };
+            if count < 0 {
+                let error = io::Error::last_os_error();
+                match error.raw_os_error() {
+                    Some(libc::EINTR) => continue,
+                    _ => break,
+                }
+            }
+            if count == 0 {
+                break;
+            }
+            filled += count as usize;
+        }
+        if filled == 0 {
+            None
+        } else {
+            Some(buf[filled - 1])
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn proc_fixture_stage_label(stage: Option<u8>) -> &'static str {
+        match stage {
+            Some(PROC_FIXTURE_STAGE_UNSHARE) => "unshare",
+            Some(PROC_FIXTURE_STAGE_SETGROUPS) => "setgroups mapping",
+            Some(PROC_FIXTURE_STAGE_UID_MAP) => "uid mapping",
+            Some(PROC_FIXTURE_STAGE_GID_MAP) => "gid mapping",
+            Some(PROC_FIXTURE_STAGE_MOUNT) => "private mount",
+            Some(PROC_FIXTURE_STAGE_PREPARED) => "prepared",
+            Some(_) => "unknown",
+            None => "none",
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -3130,14 +3254,27 @@ mod tests {
             .env_clear()
             .env("MACO_PROC_SUBSTITUTION_CHILD", "1")
             .stdin(std::process::Stdio::null());
-        // SAFETY: the closure calls only raw namespace/mapping syscalls and
-        // uses bytes built before fork. No allocator or inherited lock is used.
+        let (stage_read, stage_write) =
+            open_proc_fixture_stage_pipe().expect("owned diagnostic pipe");
+        let stage_fd = stage_write.as_raw_fd();
+        // SAFETY: the closure calls only raw namespace/mapping syscalls, one-byte
+        // writes to the inherited CLOEXEC diagnostic fd, and bytes built before
+        // fork. No allocator or inherited lock is used.
         unsafe {
             child.pre_exec(move || {
-                prepare_proc_substitution_fixture(uid_map.as_bytes(), gid_map.as_bytes())
+                prepare_proc_substitution_fixture(uid_map.as_bytes(), gid_map.as_bytes(), stage_fd)
             });
         }
-        let result = child.output().expect("owned isolated proc refusal child");
+        let spawn = child.output();
+        drop(stage_write);
+        let last_stage = read_proc_fixture_last_stage(stage_read.as_raw_fd());
+        let result = match spawn {
+            Ok(result) => result,
+            Err(error) => panic!(
+                "owned isolated proc refusal child: last stage {}: {error}",
+                proc_fixture_stage_label(last_stage),
+            ),
+        };
         assert!(
             result.status.success(),
             "isolated proc refusal child failed"
