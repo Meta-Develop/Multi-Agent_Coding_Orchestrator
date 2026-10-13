@@ -118,7 +118,7 @@ class LibraryShardTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 45", library)
         self.assertNotIn("continue-on-error", library)
         self.assertIn('run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"', library)
-        self.assertEqual(library.count("if: matrix.shard == 'rest'"), 4)
+        self.assertEqual(library.count("if: matrix.shard == 'rest'"), 5)
         gate = source.split("  linux-gate:", 1)[1].split("  portable-build:", 1)[0]
         self.assertIn("if: always()", gate)
         self.assertIn("needs.linux-library.result", gate)

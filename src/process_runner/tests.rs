@@ -3187,6 +3187,7 @@ fn systemd_unit_fixture(runtime: &Path, helper_search_path: Option<OsString>) ->
         sandbox_report_path: runtime.join("sandbox-mount-report"),
         owner_channel: None,
         pending_environment: None,
+        prepared_native_entry: None,
         pending_runtime_files: Vec::new(),
         runtime_file_paths: Vec::new(),
         staged_codex_home: None,
