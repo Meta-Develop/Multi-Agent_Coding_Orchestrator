@@ -549,6 +549,45 @@ fn selected_concurrent_injected_fixture<'a>(
     )
 }
 
+fn run_supervisor_plan_with_selected_concurrent_injected_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let SupervisorExecutionRuntime::NonpublishableSimulation = execution_runtime else {
+            bail!("selected concurrent injected fixture helper requires NonpublishableSimulation");
+        };
+        let _fixture = selected_concurrent_injected_fixture(&plan, &options, owner)?;
+        let serialized_runner = std::sync::Mutex::new(external_runner);
+        super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            consultant,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner;
+        run_supervisor_plan_with_runner(
+            plan,
+            consultant,
+            options,
+            execution_runtime,
+            external_runner,
+        )
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn selected_concurrent_parent_custody<'a>(
     plan: &SupervisorPlan,
