@@ -22,6 +22,12 @@ fn authenticated_source_head_binds_real_child_base_at_admission() {
         }
         let assignment = injected_assignment(false);
         let plan = injected_plan(assignment.clone(), 0);
+        let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+            &temp,
+            &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+                .expect("supplied positive fixture catalog"),
+        )
+        .expect("hold one isolated injected CAM observation for this source scenario");
         let plan_file = temp.path().join("source-base-plan.json");
         fs::write(
             &plan_file,

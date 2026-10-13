@@ -60,6 +60,13 @@ fn primary_worktree_outside_scope_mutation_fails_integrity_and_releases_claim() 
     let (temp, repo) = injected_primary_repository();
     let assignment = primary_assignment(false);
     let loaded = validated_primary_loaded(assignment.clone());
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let options = injected_options(&repo, temp.path(), "primary-outside-scope");
     let runner_repo = repo.clone();
     let dispatches = AtomicUsize::new(0);
@@ -171,6 +178,13 @@ fn dirty_primary_scope_refuses_before_dispatch_and_releases_claim() {
 
     let assignment = primary_assignment(false);
     let loaded = validated_primary_loaded(assignment.clone());
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let options = injected_options(&repo, temp.path(), "primary-dirty-scope");
     let dispatches = AtomicUsize::new(0);
     let runner = |_: &ExternalAgentCommand,
@@ -209,6 +223,13 @@ fn bounded_primary_command_run_mutates_scope_holds_and_releases_claim_and_marks_
     let (temp, repo) = injected_primary_repository();
     let assignment = primary_assignment(false);
     let loaded = validated_primary_loaded(assignment.clone());
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let options = injected_options(&repo, temp.path(), "primary-bounded-command");
     let dispatches = AtomicUsize::new(0);
     let runner_repo = repo.clone();

@@ -902,6 +902,13 @@ fn verified_claim_conflict_parks_when_narrowing_drops_the_mapped_test_path() {
         &temp,
         "verified-claim-conflict-lost-test-path",
     );
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, options.runtime)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let store = SyncStore::open(&repo_path).expect("open injected sync store");
     let conflicting_claim = store
         .claim_paths(
@@ -973,6 +980,13 @@ fn verified_claim_conflict_claims_when_narrowing_keeps_the_mapped_test_path() {
         &temp,
         "verified-claim-conflict-kept-test-path",
     );
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, options.runtime)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let store = SyncStore::open(&repo_path).expect("open injected sync store");
     let conflicting_claim = store
         .claim_paths("other-owner", [PathBuf::from("README.md")].iter())

@@ -4062,6 +4062,106 @@ impl Drop for CamObserveTestGuard {
     }
 }
 
+// Explicit nonlive account input for the positive injected Verified fixtures.
+// Unknown access stays unknown; the ordinary policy and selector remain authoritative.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct PositiveInjectedCamFixtureGuard<'a> {
+    _cam: CamObserveTestGuard,
+    _owner: &'a tempfile::TempDir,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_positive_injected_cam_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    supplied: &RuntimeModelCatalog,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    use coding_agent_manager_lib::account_authority::{
+        validate_observed_models, ModelAccessOutcome, ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("positive injected CAM fixture must not replace an existing observation control");
+    }
+    let RuntimeModelCatalog::Codex(catalog) = supplied else {
+        bail!("positive injected CAM fixture requires its supplied Codex catalog");
+    };
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let mut models = Vec::new();
+    for prior in priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex" && catalog.contains(&prior.model))
+    {
+        // The caller explicitly opts into this synthetic menu. Reuse its existing
+        // fixture priors (including held overlays), never invent a vendor default.
+        let supported = match catalog.effort_metadata(&prior.model) {
+            Some(metadata) => metadata
+                .supported
+                .clone()
+                .context("fixture catalog has unknown supported efforts")?,
+            None => prior
+                .class_fit
+                .iter()
+                .map(|fit| fit.effort.as_str().to_string())
+                .chain(
+                    prior
+                        .authority_evidence
+                        .iter()
+                        .map(|evidence| evidence.effort.as_str().to_string()),
+                )
+                .chain(
+                    prior
+                        .strong_gate_fallback_efforts
+                        .iter()
+                        .map(|effort| effort.as_str().to_string()),
+                )
+                .collect::<BTreeSet<_>>(),
+        };
+        if supported.is_empty() {
+            continue;
+        }
+        models.push(ObservedModel {
+            model_id: prior.model.clone(),
+            supported_efforts: Some(supported.into_iter().collect()),
+            default_effort: catalog
+                .effort_metadata(&prior.model)
+                .and_then(|metadata| metadata.default.clone()),
+            access: ModelAccessOutcome::UnknownAccess,
+        });
+    }
+    let models = ModelsObservation {
+        models,
+        provenance: None,
+    };
+    validate_observed_models(&models).map_err(anyhow::Error::msg)?;
+
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "codex-cli",
+        "synthetic-positive-injected",
+        "Synthetic fixture only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("codex-cli", "synthetic-positive-injected")?;
+    registry.select_complete_revision("codex-cli", "synthetic-positive-injected", None)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
+}
+
 // A repository-root loan for this one real libtest child. This is fixture custody,
 // never an account, process-launch, selection or publication grant.
 #[cfg(all(test, target_os = "linux"))]
@@ -8439,6 +8539,8 @@ mod selection_policy_tests {
         }];
         let requested_plan = plan.clone();
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
+        #[cfg(target_os = "linux")]
+        let _cam = install_positive_injected_cam_fixture(&temporary, &catalog)?;
         let options =
             predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
 

@@ -648,6 +648,12 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         .expect("Codex selector catalog"),
     );
     let catalog = Ok(catalog);
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        catalog.as_ref().expect("successful supplied fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation for both profiles");
     let admission = SupervisorAdmissionPolicyInput::resolve(
         &repo_path,
         1,
@@ -2799,6 +2805,9 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     let run_id = options.run_id.clone();
     let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
         .expect("construct selector-backed Codex catalog with a deterministic runner-up");
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(&temp, &catalog)
+        .expect("hold isolated injected CAM observation with the same selector fixture");
     let mut child_commands = Vec::new();
     let mut observed_turns = Vec::new();
     let mut child_report = injected_child_report(&assignment);
@@ -5371,6 +5380,13 @@ fn empty_scope_invalid_parks_without_worker_launch_while_sibling_still_dispatche
 
     let loaded = parse_supervisor_plan_with_consultant(&empty_scope_invalid_plan_json(true))
         .expect("empty-scope mixed plan must pass production plan validation");
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let viable = loaded
         .plan
         .assignments

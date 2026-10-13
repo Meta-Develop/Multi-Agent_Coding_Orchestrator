@@ -3285,6 +3285,12 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let mut options = injected_options(
         &repo_path,
         temp.path(),

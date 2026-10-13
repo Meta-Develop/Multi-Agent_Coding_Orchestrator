@@ -2212,6 +2212,9 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
     let plan = test_plan(vec![assignment]);
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
         .expect("construct deterministic Codex selector catalog");
+    #[cfg(target_os = "linux")]
+    let _cam = install_positive_injected_cam_fixture(&_temp, &catalog)
+        .expect("hold isolated injected CAM observation");
     let mut options = test_options(&repo, "verified-operator-claim");
     options.runtime = SupervisorRuntime::Codex;
 

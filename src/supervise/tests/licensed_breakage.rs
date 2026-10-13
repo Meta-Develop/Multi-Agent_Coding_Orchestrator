@@ -14,6 +14,12 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
     let (temp, repo) = injected_repository();
     let assignment = licensed_assignment();
     let plan = injected_plan(assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation for the complete source lifecycle");
     let run_id = RunId::new("inbox-pr-source-generic-resume").expect("bound source run id");
     let plan_file = temp.path().join("inbox-pr-source-plan.json");
     fs::write(
@@ -1557,6 +1563,12 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation across cascade rounds");
     let run_id = RunId::new("licensed-cascade-depth-two").expect("cascade source run id");
     let plan_file = temp.path().join("licensed-cascade-depth-two.json");
     fs::write(
@@ -1716,6 +1728,12 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation before the intended plan-drift refusal");
     let run_id = RunId::new("licensed-cascade-exact-plan-refusal")
         .expect("exact-plan refusal source run id");
     let plan_file = temp.path().join("licensed-cascade-exact-plan-refusal.json");
@@ -1860,6 +1878,12 @@ fn run_generated_round_last_moment_mutation(
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation across source and generated rounds");
     let run_id = RunId::new(run_name).expect("last-moment gate source run id");
     let plan_file = temp.path().join(format!("{run_name}.json"));
     fs::write(
@@ -1973,6 +1997,7 @@ fn run_generated_round_last_moment_mutation(
     let machine_global_config_after = fs::read(&machine_global_config).ok();
     let queue_observations = queue_observations.borrow().clone();
 
+    drop(_cam);
     GeneratedRoundLastMomentScenario {
         _temp: temp,
         repo,
@@ -2148,6 +2173,12 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation before the intended retention refusal");
     let run_id = RunId::new("licensed-cascade-initial-retention-deleted")
         .expect("initial deleted-retention source run id");
     let plan_file = temp.path().join("initial-retention-deleted.json");
@@ -2954,6 +2985,12 @@ fn licensed_cascade_partial_fan_in_preserves_successful_sibling_across_failure_a
     let follow_up_a = licensed_follow_up_assignment_for_ordinal(1);
     let follow_up_b = licensed_follow_up_assignment_for_ordinal(2);
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation through cascade failure and resume");
     let source_run_id =
         RunId::new("licensed-cascade-partial-sibling").expect("partial sibling source run id");
     let plan_file = temp.path().join("licensed-cascade-partial-sibling.json");
