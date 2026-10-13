@@ -254,6 +254,25 @@ jobs:
         if: matrix.shard == 'rest'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Verify sealed native entry regressions before managed runtime checks
+        if: matrix.shard == 'rest'
+        run: |
+          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh python3 - <<'PY'
+          import runpy
+
+          shards = runpy.run_path(".github/scripts/linux_ci_library_shards.py")
+          cases = (
+              "pinned_exec::tests::mechanical_native_data_refuses_unsealed_drift_scripts_and_false_host_maps",
+              "pinned_exec::tests::mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds",
+          )
+          shards["SAFETY_PREFLIGHTS"]["sealed-native-entry"] = cases
+          raise SystemExit(shards["run_safety_preflights"](
+              ["cargo", "+1.94.1", "test", "--locked", "--lib", "--"],
+              cases,
+              "sealed-native-entry",
+          ))
+          PY
+
       - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 

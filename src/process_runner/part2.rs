@@ -653,6 +653,61 @@ enum PreparedContainmentBackend {
 }
 
 impl PreparedProcessTree {
+    fn prepare_native_entry(
+        &mut self,
+        spec: &ProcessSpec,
+        deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let PreparedContainmentBackend::Systemd(unit) = &mut self.backend {
+            if matches!(spec.stdin, StdinMode::Null) {
+                if let Some(pinned) = &spec.pinned_direct {
+                    let mut checkpoint = || {
+                        if cancellation.is_cancelled() {
+                            return Err(io::Error::new(
+                                io::ErrorKind::Interrupted,
+                                "sealed native preparation was cancelled",
+                            ));
+                        }
+                        if deadline.is_some_and(|value| Instant::now() >= value) {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                "sealed native preparation exceeded the operation deadline",
+                            ));
+                        }
+                        Ok(())
+                    };
+                    unit.prepared_native_entry = pinned
+                        .executable
+                        .prepare_native_entry(&mut checkpoint)?
+                        .map(Arc::new);
+                }
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (spec, deadline, cancellation);
+        Ok(())
+    }
+
+    fn configure_stdin(&self, command: &mut Command, stdin: &StdinMode) -> io::Result<()> {
+        #[cfg(target_os = "linux")]
+        if let PreparedContainmentBackend::Systemd(unit) = &self.backend {
+            if let Some(entry) = &unit.prepared_native_entry {
+                if !matches!(stdin, StdinMode::Null) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "sealed native entry requires the original null stdin",
+                    ));
+                }
+                command.stdin(Stdio::from(entry.relay_file()?));
+                return Ok(());
+            }
+        }
+        configure_stdin(command, stdin);
+        Ok(())
+    }
+
     fn prepare(
         policy: ContainmentPolicy,
         side_effect_profile: &SideEffectConfinementProfile,

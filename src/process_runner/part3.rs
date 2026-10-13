@@ -250,6 +250,8 @@ struct SystemdUnit {
     sandbox_report_path: PathBuf,
     owner_channel: Option<File>,
     pending_environment: Option<EnvironmentMode>,
+    // Kept outside PrivateUsers through gate release, result and cleanup.
+    prepared_native_entry: Option<Arc<crate::pinned_exec::PreparedNativeEntry>>,
     pending_runtime_files: Vec<PrivateRuntimeFile>,
     runtime_file_paths: Vec<PathBuf>,
     staged_codex_home: Option<PathBuf>,
@@ -551,6 +553,7 @@ impl SystemdUnit {
             sandbox_report_path,
             owner_channel: None,
             pending_environment: None,
+            prepared_native_entry: None,
             pending_runtime_files: Vec::new(),
             runtime_file_paths: Vec::new(),
             staged_codex_home: None,
@@ -635,7 +638,12 @@ impl SystemdUnit {
                 bytes,
                 destination: PrivateRuntimeFileDestination::RuntimeDirectory,
             });
-            Some((helper, digest, pinned.executable.hidden_helper_argument()))
+            let marker = if self.prepared_native_entry.is_some() {
+                crate::pinned_exec::SEALED_NATIVE_HELPER_ARGUMENT
+            } else {
+                pinned.executable.hidden_helper_argument()
+            };
+            Some((helper, digest, marker))
         } else {
             None
         };
@@ -1140,6 +1148,7 @@ impl SystemdUnit {
                             prepared: prepared.prepared,
                             evidence: ReadOnlyFilesystemEvidence {
                                 facts: prepared.facts,
+                                native_entry: self.prepared_native_entry.clone(),
                             },
                         })
                     });
@@ -1203,6 +1212,21 @@ impl SystemdUnit {
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
         let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        if let Some(entry) = &self.prepared_native_entry {
+            entry.revalidate()?;
+            if cancellation.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "sealed native start gate was cancelled",
+                ));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "sealed native start gate exceeded the operation deadline",
+                ));
+            }
+        }
         if let Some(sandbox) = &self.sandbox {
             // The verified read-only mount owns the inode now. Remove the private
             // host pathname before releasing any target; retain only read handles.
@@ -1378,12 +1402,22 @@ impl SystemdUnit {
                 ),
             };
         }
-        let error = self.kill_and_verify(label, context).err().map(|error| {
+        let mut error = self.kill_and_verify(label, context).err().map(|error| {
             format!(
                 "{label} {context} could not verify empty systemd containment unit {}: {error}",
                 self.name
             )
         });
+        if let Some(entry) = &self.prepared_native_entry {
+            if let Err(source) = entry.revalidate() {
+                error = append_error(
+                    error,
+                    Some(format!(
+                        "{label} {context} sealed native parent custody changed: {source}"
+                    )),
+                );
+            }
+        }
         if error.is_none() && self.observed_owned {
             self.cleaned = true;
             self.remove_runtime_files();

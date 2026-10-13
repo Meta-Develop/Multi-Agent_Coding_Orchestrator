@@ -2699,6 +2699,8 @@ pub struct ProcessOutput {
 pub(crate) struct ReadOnlyFilesystemEvidence {
     #[cfg(target_os = "linux")]
     facts: Arc<AppliedReadOnlyFilesystem>,
+    #[cfg(target_os = "linux")]
+    native_entry: Option<Arc<crate::pinned_exec::PreparedNativeEntry>>,
     #[cfg(not(target_os = "linux"))]
     unavailable: std::convert::Infallible,
 }
@@ -2748,6 +2750,13 @@ impl SettledProcessCapture {
             // Matching consumes both full specifications, including credential capabilities.
             let VerifiedReadOnlyFilesystem { prepared, evidence } = *binding.verified;
             drop(prepared);
+            if evidence
+                .native_entry
+                .as_ref()
+                .is_some_and(|entry| entry.revalidate().is_err())
+            {
+                return None;
+            }
             Some(evidence)
         });
         #[cfg(not(target_os = "linux"))]
@@ -3216,6 +3225,28 @@ fn run_process_cancellable_with_interaction(
         operation_deadline,
         cancellation,
     )?;
+    if let Err(source) =
+        prepared_process_tree.prepare_native_entry(&spec, operation_deadline, cancellation)
+    {
+        // Preserve the ordinary pre-spawn cancellation/deadline classification.
+        ensure_not_cancelled(
+            cancellation,
+            &spec.label,
+            &command_display,
+            "sealed native preparation",
+        )?;
+        ensure_setup_budget(
+            operation_deadline,
+            &spec.label,
+            &command_display,
+            "sealed native preparation",
+        )?;
+        return Err(containment_setup_error(
+            spec.label.clone(),
+            command_display.clone(),
+            source,
+        ));
+    }
     let mut command = prepared_process_tree
         .build_command(&spec)
         .map_err(|source| {
@@ -3227,8 +3258,18 @@ fn run_process_cancellable_with_interaction(
         &command_display,
         "containment and I/O setup",
     )?;
-    configure_stdin(&mut command, &spec.stdin);
+    prepared_process_tree
+        .configure_stdin(&mut command, &spec.stdin)
+        .map_err(|source| {
+            containment_setup_error(spec.label.clone(), command_display.clone(), source)
+        })?;
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    ensure_setup_budget(
+        operation_deadline,
+        &spec.label,
+        &command_display,
+        "stdin relay setup",
+    )?;
     ensure_not_cancelled(
         cancellation,
         &spec.label,
@@ -5442,6 +5483,7 @@ mod filesystem_capture_contract_tests {
         Box::new(VerifiedReadOnlyFilesystem {
             prepared: Box::new(spec.clone()),
             evidence: ReadOnlyFilesystemEvidence {
+                native_entry: None,
                 facts: Arc::new(AppliedReadOnlyFilesystem {
                     kind: SideEffectConfinementProfileKind::TrustedCompatibility,
                     access: WorkspaceAccess::ReadOnly,

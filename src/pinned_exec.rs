@@ -37,6 +37,8 @@ pub(crate) const PINNED_EXEC_DESCRIPTOR_NAME: &str = "pinned-exec-request-v1";
 // source-bound main helper to the same digest-protected request.
 const SOURCE_BOUND_REQUEST_VERSION: u8 = 2;
 const SOURCE_BOUND_HELPER_ARGUMENT: &str = "--maco-internal-source-bound-pinned-exec-v1";
+// Unprivileged FD execution only. This mode cannot attest host-root provenance.
+pub(crate) const SEALED_NATIVE_HELPER_ARGUMENT: &str = "--maco-internal-sealed-native-exec-v1";
 const REQUEST_MAGIC: &[u8] = b"MACO-PINNED-EXEC\0";
 const SHA256_BYTES: usize = 32;
 const SHA256_HEX_BYTES: usize = SHA256_BYTES * 2;
@@ -71,6 +73,392 @@ struct MainHelperPackageIdentity {
     declaration_identity: [u64; 4],
     declaration_sha256: [u8; SHA256_BYTES],
     manifest_identity: [u64; 4],
+}
+
+// Decoded data is image continuity, never a parent capability. In particular,
+// canonical wire + a self-computed digest cannot construct SourceBoundMainHelper.
+#[derive(Clone, PartialEq, Eq)]
+struct MainHelperImageBinding {
+    executable: ExecutableBinding,
+    source_sha256: [u8; SHA256_BYTES],
+    package: MainHelperPackageIdentity,
+}
+
+impl MainHelperImageBinding {
+    #[cfg(target_os = "linux")]
+    fn revalidate(&self) -> io::Result<PathBuf> {
+        let path = PathBuf::from(OsString::from_vec(self.executable.path.clone()));
+        let actual = SourceBoundMainHelper::capture_packaged(&path)?;
+        if actual.executable != self.executable
+            || actual.source_sha256 != self.source_sha256
+            || actual.package != self.package
+        {
+            return Err(invalid_data("main helper image continuity changed"));
+        }
+        Ok(path)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn validate_current(&self) -> io::Result<()> {
+        // Legacy v2 still performs the original strict root/package/loaded-image
+        // validation. It does not promote this decoded snapshot into authority.
+        let path = self.revalidate()?;
+        let actual = SourceBoundMainHelper::capture_packaged(&path)?;
+        actual.validate_current()?;
+        if actual.executable != self.executable
+            || actual.source_sha256 != self.source_sha256
+            || actual.package != self.package
+        {
+            return Err(invalid_data("main helper image continuity changed"));
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+struct HeldProtectedObject {
+    path: PathBuf,
+    file: File,
+    identity: [u64; 5],
+    directory: bool,
+}
+
+#[cfg(target_os = "linux")]
+struct HostRootCustody {
+    namespace: File,
+    namespace_identity: (u64, u64),
+    objects: Vec<HeldProtectedObject>,
+}
+
+#[cfg(target_os = "linux")]
+impl HostRootCustody {
+    fn capture(helper: &SourceBoundMainHelper) -> io::Result<Self> {
+        validate_controller_root_namespace()?;
+        // This kernel magic link is intentional; it is not a caller path.
+        let namespace = File::open("/proc/self/ns/user")?;
+        let namespace_identity = metadata_identity(&namespace.metadata()?);
+        let executable = PathBuf::from(OsString::from_vec(helper.executable.path.clone()));
+        let prefix = executable
+            .parent()
+            .and_then(Path::parent)
+            .ok_or_else(|| invalid_input("main helper package omitted its prefix"))?;
+        let paths = [
+            executable.clone(),
+            prefix.join("share/maco/main-helper.json"),
+            prefix.join("share/maco/source-manifest.json"),
+        ];
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/")?;
+        let mut objects = vec![held_protected_object(PathBuf::from("/"), root, true)?];
+        for path in paths {
+            let components = path.components().skip(1).collect::<Vec<_>>();
+            let mut parent = 0;
+            let mut current = PathBuf::from("/");
+            for (index, component) in components.iter().enumerate() {
+                let std::path::Component::Normal(name) = component else {
+                    return Err(invalid_input("protected package path was not normalized"));
+                };
+                current.push(name);
+                if let Some(existing) = objects.iter().position(|entry| entry.path == current) {
+                    parent = existing;
+                    continue;
+                }
+                let directory = index + 1 != components.len();
+                let name = CString::new(name.as_bytes())
+                    .map_err(|_| invalid_input("protected component contained NUL"))?;
+                let flags = libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | if directory {
+                        libc::O_PATH | libc::O_DIRECTORY
+                    } else {
+                        libc::O_RDONLY | libc::O_NONBLOCK
+                    };
+                // SAFETY: parent is a live held directory, name is one normal
+                // NUL-terminated component; openat returns a new owned FD.
+                let fd =
+                    unsafe { libc::openat(objects[parent].file.as_raw_fd(), name.as_ptr(), flags) };
+                if fd < 0 {
+                    return Err(opaque_last_os_error(
+                        "could not hold protected package component",
+                    ));
+                }
+                // SAFETY: successful openat returned a new descriptor owned here.
+                let file = unsafe { File::from_raw_fd(fd) };
+                objects.push(held_protected_object(current.clone(), file, directory)?);
+                parent = objects.len() - 1;
+            }
+        }
+        let custody = Self {
+            namespace,
+            namespace_identity,
+            objects,
+        };
+        custody.revalidate()?;
+        helper.revalidate()?;
+        Ok(custody)
+    }
+
+    fn revalidate(&self) -> io::Result<()> {
+        validate_controller_root_namespace()?;
+        if metadata_identity(&self.namespace.metadata()?) != self.namespace_identity
+            || metadata_identity(&fs::metadata("/proc/self/ns/user")?) != self.namespace_identity
+        {
+            return Err(invalid_data("controller user namespace changed"));
+        }
+        for entry in &self.objects {
+            let held = entry.file.metadata()?;
+            let named = fs::symlink_metadata(&entry.path)?;
+            if protected_object_identity(&held, entry.directory) != entry.identity
+                || protected_object_identity(&named, entry.directory) != entry.identity
+                || !protected_object_allowed(&entry.path, &held, entry.directory)
+                || !protected_object_allowed(&entry.path, &named, entry.directory)
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "held protected package identity changed",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn protected_object_identity(metadata: &fs::Metadata, directory: bool) -> [u64; 5] {
+    [
+        metadata.dev(),
+        metadata.ino(),
+        u64::from(permission_mode(metadata)),
+        u64::from(metadata.uid()),
+        if directory { 0 } else { metadata.len() },
+    ]
+}
+
+#[cfg(target_os = "linux")]
+fn protected_object_allowed(path: &Path, metadata: &fs::Metadata, directory: bool) -> bool {
+    if path == Path::new("/nix/store") {
+        return source_bound_store_anchor_allowed(
+            metadata.uid(),
+            permission_mode(metadata),
+            metadata.is_dir(),
+            metadata.file_type().is_symlink(),
+        );
+    }
+    metadata.uid() == 0
+        && !metadata.file_type().is_symlink()
+        && permission_mode(metadata) & 0o022 == 0
+        && if directory {
+            metadata.is_dir()
+        } else {
+            metadata.is_file() && permission_mode(metadata) & 0o6000 == 0
+        }
+}
+
+#[cfg(target_os = "linux")]
+fn held_protected_object(
+    path: PathBuf,
+    file: File,
+    directory: bool,
+) -> io::Result<HeldProtectedObject> {
+    let metadata = file.metadata()?;
+    if !protected_object_allowed(&path, &metadata, directory) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "protected package object was not host-root owned and immutable",
+        ));
+    }
+    Ok(HeldProtectedObject {
+        identity: protected_object_identity(&metadata, directory),
+        path,
+        file,
+        directory,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn controller_has_full_identity_map(bytes: &[u8]) -> bool {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return false;
+    };
+    let mut lines = text.lines();
+    let Some(line) = lines.next() else {
+        return false;
+    };
+    if lines.next().is_some() {
+        return false;
+    }
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    fields.len() == 3 && fields[0] == "0" && fields[1] == "0" && fields[2] == "4294967295"
+}
+
+#[cfg(target_os = "linux")]
+fn open_controller_proc_entry(
+    root: &File,
+    path: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> io::Result<File> {
+    // Linux openat2 UAPI: three u64 fields, with no extension or creation mode.
+    #[repr(C)]
+    struct OpenHow {
+        flags: u64,
+        mode: u64,
+        resolve: u64,
+    }
+    let how = OpenHow {
+        flags: (flags | libc::O_NOFOLLOW | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        // NO_XDEV includes same-filesystem bind mounts. Keep the magic-link
+        // restriction explicit; BENEATH alone is not its lasting contract.
+        resolve: 0x01 | 0x02 | 0x04 | 0x08,
+    };
+    // SAFETY: root owns the directory FD; path and the initialized C-layout
+    // structure remain live for this synchronous kernel lookup.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            root.as_raw_fd(),
+            path.as_ptr(),
+            std::ptr::from_ref(&how),
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd < 0 {
+        // Unsupported, blocked, raced or substituted lookups all refuse. There
+        // is deliberately no open/openat fallback or weakened resolve retry.
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful openat2 returned a new descriptor owned here.
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+
+#[cfg(target_os = "linux")]
+fn validate_controller_proc_root(root: &File) -> io::Result<()> {
+    let metadata = root.metadata()?;
+    // SAFETY: statfs is plain C storage; fstatfs initializes it through a valid
+    // writable pointer while root owns the borrowed descriptor.
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(root.as_raw_fd(), &mut filesystem) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // PROC_ROOT_INO is 1; procfs creates this immutable root directory itself.
+    // A proc PID directory, comm inode or ordinary directory is not an anchor.
+    if !metadata.is_dir()
+        || metadata.ino() != 1
+        || metadata.uid() != 0
+        || permission_mode(&metadata) & 0o022 != 0
+        || filesystem.f_type != libc::PROC_SUPER_MAGIC
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "controller proc root was not a protected kernel procfs root",
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn open_controller_uid_map(root: &File, expected_pid: u32) -> io::Result<File> {
+    validate_controller_proc_root(root)?;
+    // O_PATH|O_NOFOLLOW returns the final self link itself. No link or mount
+    // is traversed; readlinkat on that held inode asks the kernel for its TGID
+    // in this proc instance's PID namespace, not a caller-supplied wire PID.
+    let subject = open_controller_proc_entry(root, c"self", libc::O_PATH)?;
+    if !subject.metadata()?.file_type().is_symlink() {
+        return Err(invalid_data("controller proc self was not the kernel link"));
+    }
+    let mut target = [0_u8; 32];
+    // SAFETY: subject is the held final symlink; empty-path readlinkat reads
+    // that descriptor and target is a live, bounded writable buffer.
+    let count = unsafe {
+        libc::syscall(
+            libc::SYS_readlinkat,
+            subject.as_raw_fd(),
+            c"".as_ptr(),
+            target.as_mut_ptr().cast::<libc::c_char>(),
+            target.len(),
+        )
+    };
+    if count < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let expected = expected_pid.to_string();
+    if count as usize != expected.len() || &target[..count as usize] != expected.as_bytes() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "controller proc subject did not match the current syscall PID",
+        ));
+    }
+    let path = CString::new(format!("{expected}/uid_map"))
+        .map_err(|_| invalid_input("controller proc subject was not a decimal PID"))?;
+    let file = open_controller_proc_entry(root, &path, libc::O_RDONLY | libc::O_NONBLOCK)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.dev() != root.metadata()?.dev() {
+        return Err(invalid_data("controller UID map was not its procfs file"));
+    }
+    Ok(file)
+}
+
+#[cfg(target_os = "linux")]
+fn validate_controller_root_namespace() -> io::Result<()> {
+    // The trusted root anchor and protected self lookup bind the fixed map
+    // inode to this actual task even with an inherited ancestor proc mount.
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open("/proc")?;
+    // SAFETY: getpid is a read-only syscall with no pointer arguments. Use the
+    // direct syscall, as with readlinkat above, without a libc path fallback.
+    let pid = unsafe { libc::syscall(libc::SYS_getpid) };
+    let pid = u32::try_from(pid)
+        .ok()
+        .filter(|pid| *pid != 0)
+        .ok_or_else(|| invalid_data("controller syscall PID was invalid"))?;
+    let mut file = open_controller_uid_map(&root, pid)?;
+    let mut bytes = Vec::new();
+    Read::by_ref(&mut file).take(257).read_to_end(&mut bytes)?;
+    if bytes.len() > 256 || !controller_has_full_identity_map(&bytes) {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            "sealed native authority requires the outside host-root UID context",
+        ));
+    }
+    Ok(())
+}
+
+/// Parent-only custody. No decoder/raw-FD constructor or wire representation.
+#[cfg(target_os = "linux")]
+pub(crate) struct PreparedNativeEntry {
+    helper: SourceBoundMainHelper,
+    custody: HostRootCustody,
+    image: SealedExecutable,
+}
+
+#[cfg(target_os = "linux")]
+impl PartialEq for PreparedNativeEntry {
+    fn eq(&self, other: &Self) -> bool {
+        // Equality of cloned custody is identity of the issued capability,
+        // never equality of a reconstructible wire snapshot or FD number.
+        std::ptr::eq(self, other)
+    }
+}
+#[cfg(target_os = "linux")]
+impl Eq for PreparedNativeEntry {}
+
+#[cfg(target_os = "linux")]
+impl PreparedNativeEntry {
+    pub(crate) fn revalidate(&self) -> io::Result<()> {
+        self.custody.revalidate()?;
+        self.helper.revalidate()?;
+        validate_native_seals(&self.image.file, self.image.length)?;
+        Ok(())
+    }
+
+    pub(crate) fn relay_file(&self) -> io::Result<File> {
+        self.revalidate()?;
+        self.image.file.try_clone()
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -408,7 +796,7 @@ pub(crate) struct VerifiedPinnedExecRequest {
     script: Option<ScriptBinding>,
     arguments: Vec<Vec<u8>>,
     environment: Vec<(Vec<u8>, Vec<u8>)>,
-    main_helper: Option<SourceBoundMainHelper>,
+    main_helper: Option<MainHelperImageBinding>,
 }
 
 impl fmt::Debug for VerifiedPinnedExecRequest {
@@ -597,6 +985,33 @@ impl PinnedDirectExecutable {
         let mut pinned = Self::capture_source(path)?;
         pinned.main_helper = Some(helper);
         Ok(pinned)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn prepare_native_entry(
+        &self,
+        checkpoint: &mut dyn FnMut() -> io::Result<()>,
+    ) -> io::Result<Option<PreparedNativeEntry>> {
+        let Some(helper) = &self.main_helper else {
+            return Ok(None);
+        };
+        if self.script.is_some() {
+            return Ok(None);
+        }
+        checkpoint()?;
+        helper.revalidate()?;
+        let custody = HostRootCustody::capture(helper)?;
+        checkpoint()?;
+        let image = materialize_sealed_checked(&self.source, checkpoint)?;
+        validate_native_seals(&image.file, self.source.length)?;
+        let prepared = PreparedNativeEntry {
+            helper: helper.clone(),
+            custody,
+            image,
+        };
+        prepared.revalidate()?;
+        checkpoint()?;
+        Ok(Some(prepared))
     }
 
     pub(crate) fn validated_launch_helper_path(&self) -> io::Result<PathBuf> {
@@ -835,7 +1250,7 @@ pub(crate) fn decode_verified_descriptor(
             for value in &mut manifest_identity {
                 *value = cursor.read_u64()?;
             }
-            Some(SourceBoundMainHelper {
+            Some(MainHelperImageBinding {
                 executable,
                 source_sha256,
                 package: MainHelperPackageIdentity {
@@ -881,7 +1296,8 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
         return Ok(false);
     };
     let source_bound = marker == OsStr::new(SOURCE_BOUND_HELPER_ARGUMENT);
-    if marker != OsStr::new(HIDDEN_PINNED_EXEC_ARGUMENT) && !source_bound {
+    let mechanical_native = marker == OsStr::new(SEALED_NATIVE_HELPER_ARGUMENT);
+    if marker != OsStr::new(HIDDEN_PINNED_EXEC_ARGUMENT) && !source_bound && !mechanical_native {
         return Ok(false);
     }
     #[cfg(target_os = "linux")]
@@ -894,6 +1310,15 @@ pub(crate) fn maybe_run_helper_from_args() -> io::Result<bool> {
             .ok_or_else(|| invalid_input("pinned helper omitted its descriptor digest"))?;
         if arguments.next().is_some() {
             return Err(invalid_input("pinned helper received unexpected arguments"));
+        }
+        if mechanical_native {
+            validate_current_environment()?;
+            let request =
+                load_verified_descriptor_and_remove(Path::new(&descriptor_path), &digest)?;
+            execute_mechanical_native(request)?;
+            return Err(io::Error::other(
+                "sealed native execution returned unexpectedly",
+            ));
         }
         if source_bound {
             let current = env::current_exe().map_err(|error| {
@@ -1122,6 +1547,96 @@ fn validate_current_environment() -> io::Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+fn validate_native_seals(file: &File, length: u64) -> io::Result<()> {
+    let metadata = file.metadata()?;
+    let required = libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: the live file is owned/borrowed for this read-only query.
+    let seals = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GET_SEALS) };
+    if !metadata.is_file()
+        || metadata.len() != length
+        || length < 4
+        || length > MAX_EXECUTABLE_BYTES
+        || permission_mode(&metadata) != 0o500
+        || seals < 0
+        || seals & required != required
+    {
+        return Err(invalid_data(
+            "native entry descriptor was not sealed and bounded",
+        ));
+    }
+    use std::os::unix::fs::FileExt;
+    let mut prefix = [0; 4];
+    file.read_exact_at(&mut prefix, 0)?;
+    if &prefix != b"\x7fELF" {
+        return Err(invalid_data("native entry was not ELF"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn receive_native_image(
+    request: &VerifiedPinnedExecRequest,
+    fd: RawFd,
+) -> io::Result<SealedExecutable> {
+    if request.script.is_some() {
+        return Err(invalid_input("mechanical native mode refuses scripts"));
+    }
+    // Duplicate before replacing fd0; the original guardian copies must close
+    // on final exec too. A raw/sealed FD is execution data, not host authority.
+    // SAFETY: fcntl duplicates the supplied FD or fails; no memory is accessed.
+    let duplicate = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 5) };
+    if duplicate < 0 {
+        return Err(opaque_last_os_error(
+            "could not retain native entry descriptor",
+        ));
+    }
+    // SAFETY: the successful fcntl returned a new owned descriptor.
+    let mut file = unsafe { File::from_raw_fd(duplicate) };
+    validate_native_seals(&file, request.source.length)?;
+    file.seek(SeekFrom::Start(0))?;
+    let digest = hash_reader(&mut file, request.source.length)?;
+    if !constant_time_eq(&digest, &request.source.sha256) {
+        return Err(invalid_data(
+            "native entry bytes did not match the exact request",
+        ));
+    }
+    Ok(SealedExecutable {
+        file,
+        length: request.source.length,
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn execute_mechanical_native(request: VerifiedPinnedExecRequest) -> io::Result<()> {
+    let image = receive_native_image(&request, libc::STDIN_FILENO)?;
+    let plan = request.prepare_exec_plan(-1)?;
+    use std::os::unix::fs::FileTypeExt;
+    let null = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW)
+        .open("/dev/null")?;
+    let metadata = null.metadata()?;
+    if !metadata.file_type().is_char_device() || metadata.rdev() != libc::makedev(1, 3) {
+        return Err(invalid_data("native target stdin was not the null device"));
+    }
+    // SAFETY: null is a live read handle; dup2 restores true Null stdin.
+    if unsafe { libc::dup2(null.as_raw_fd(), libc::STDIN_FILENO) } < 0 {
+        return Err(opaque_last_os_error(
+            "could not restore native target null stdin",
+        ));
+    }
+    // Kernel close-on-exec covers the relayed stdin/fd4 image copies, owner FIFO,
+    // descriptor-read handles and our retained image. No fallback leaks FDs.
+    // SAFETY: close_range with CLOEXEC changes FD flags, not the open images.
+    if unsafe { libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 4u32) } != 0 {
+        return Err(opaque_last_os_error(
+            "could not seal native exec descriptor lifetime",
+        ));
+    }
+    fexecve_sealed(&image, plan.argv(), &request.environment)
+}
+
+#[cfg(target_os = "linux")]
 fn execute_verified_request(request: VerifiedPinnedExecRequest) -> io::Result<()> {
     if let Some(helper) = &request.main_helper {
         helper.validate_current()?;
@@ -1210,6 +1725,15 @@ fn fexecve_sealed(
 
 #[cfg(target_os = "linux")]
 pub(crate) fn materialize_sealed(binding: &ExecutableBinding) -> io::Result<SealedExecutable> {
+    materialize_sealed_checked(binding, &mut || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn materialize_sealed_checked(
+    binding: &ExecutableBinding,
+    checkpoint: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<SealedExecutable> {
+    checkpoint()?;
     validate_binding(binding)?;
     let source_path = PathBuf::from(OsString::from_vec(binding.path.clone()));
     let mut source = OpenOptions::new()
@@ -1242,7 +1766,8 @@ pub(crate) fn materialize_sealed(binding: &ExecutableBinding) -> io::Result<Seal
         ));
     }
 
-    let copied_hash = copy_and_hash(&mut source, &mut destination, binding.length)?;
+    let copied_hash =
+        copy_and_hash_checked(&mut source, &mut destination, binding.length, checkpoint)?;
     if !constant_time_eq(&copied_hash, &binding.sha256) {
         return Err(invalid_data(
             "pinned executable content changed before sealing",
@@ -1272,7 +1797,13 @@ pub(crate) fn materialize_sealed(binding: &ExecutableBinding) -> io::Result<Seal
     destination
         .seek(SeekFrom::Start(0))
         .map_err(|error| opaque_io(error, "could not rewind sealed executable"))?;
-    let verified_hash = hash_reader(&mut destination, binding.length)?;
+    let (verified_hash, _, verified_length) =
+        hash_reader_with_prefix_checked(&mut destination, binding.length, checkpoint)?;
+    if verified_length != binding.length {
+        return Err(invalid_data(
+            "hashed executable length did not match its binding",
+        ));
+    }
     if !constant_time_eq(&verified_hash, &binding.sha256) {
         return Err(invalid_data(
             "sealed executable digest did not match its binding",
@@ -2115,7 +2646,12 @@ impl<'a> DescriptorCursor<'a> {
 }
 
 #[cfg(target_os = "linux")]
-fn copy_and_hash(source: &mut File, destination: &mut File, expected: u64) -> io::Result<[u8; 32]> {
+fn copy_and_hash_checked(
+    source: &mut File,
+    destination: &mut File,
+    expected: u64,
+    checkpoint: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<[u8; 32]> {
     source
         .seek(SeekFrom::Start(0))
         .map_err(|error| opaque_io(error, "could not rewind pinned executable source"))?;
@@ -2123,6 +2659,7 @@ fn copy_and_hash(source: &mut File, destination: &mut File, expected: u64) -> io
     let mut total = 0u64;
     let mut buffer = [0u8; COPY_BUFFER_BYTES];
     loop {
+        checkpoint()?;
         let read = source
             .read(&mut buffer)
             .map_err(|error| opaque_io(error, "could not read pinned executable source"))?;
@@ -2163,11 +2700,21 @@ fn hash_reader(reader: &mut File, expected: u64) -> io::Result<[u8; 32]> {
 
 #[cfg(target_os = "linux")]
 fn hash_reader_with_prefix(reader: &mut File, max: u64) -> io::Result<([u8; 32], Vec<u8>, u64)> {
+    hash_reader_with_prefix_checked(reader, max, &mut || Ok(()))
+}
+
+#[cfg(target_os = "linux")]
+fn hash_reader_with_prefix_checked(
+    reader: &mut File,
+    max: u64,
+    checkpoint: &mut dyn FnMut() -> io::Result<()>,
+) -> io::Result<([u8; 32], Vec<u8>, u64)> {
     let mut hasher = Sha256::new();
     let mut prefix = Vec::with_capacity(MAX_SHEBANG_BYTES.saturating_add(1));
     let mut total = 0u64;
     let mut buffer = [0u8; COPY_BUFFER_BYTES];
     loop {
+        checkpoint()?;
         let read = reader
             .read(&mut buffer)
             .map_err(|error| opaque_io(error, "could not hash executable content"))?;
@@ -2424,6 +2971,393 @@ mod tests {
         file.write_all(bytes).expect("write executable fixture");
         file.set_permissions(fs::Permissions::from_mode(0o755))
             .expect("chmod executable fixture");
+    }
+
+    #[cfg(target_os = "linux")]
+    fn write_proc_fixture_mapping(path: &std::ffi::CStr, bytes: &[u8]) -> io::Result<()> {
+        // Used only between fork and exec: raw syscalls and prebuilt bytes,
+        // with no allocator, locks, environment access or Rust file buffering.
+        // SAFETY: path is a live C string; open returns a new owned descriptor.
+        let fd = unsafe { libc::open(path.as_ptr(), libc::O_WRONLY | libc::O_CLOEXEC) };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: fd is owned here and bytes remains readable for its length.
+        let count = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+        let error = if count < 0 {
+            Some(io::Error::last_os_error())
+        } else if count as usize != bytes.len() {
+            Some(io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            None
+        };
+        // SAFETY: close consumes only the descriptor opened above.
+        let closed = unsafe { libc::close(fd) };
+        if let Some(error) = error {
+            return Err(error);
+        }
+        if closed != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn prepare_proc_substitution_fixture(uid_map: &[u8], gid_map: &[u8]) -> io::Result<()> {
+        // SAFETY: invoked only in this test's owned, single-threaded pre-exec
+        // child. The parent's user/mount namespace and proc view are untouched.
+        if unsafe { libc::unshare(libc::CLONE_NEWUSER | libc::CLONE_NEWNS) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        write_proc_fixture_mapping(c"/proc/self/setgroups", b"deny")?;
+        write_proc_fixture_mapping(c"/proc/self/uid_map", uid_map)?;
+        write_proc_fixture_mapping(c"/proc/self/gid_map", gid_map)?;
+        // SAFETY: fixed mount propagation operation applies only in the new
+        // owned mount namespace; no filesystem or source is supplied.
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                c"/".as_ptr(),
+                std::ptr::null(),
+                libc::MS_REC | libc::MS_PRIVATE,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_proc_substitution_fixture() {
+        // This isolated child does not exec again. Its own comm therefore
+        // supplies the same writable procfs object as the retained sibling in
+        // the counterexample, without another process or a keeper protocol.
+        fs::write("/proc/self/comm", b"0 0 4294967295").expect("owned child comm");
+        let pid = std::process::id();
+        let source = CString::new(format!("/proc/{pid}/comm")).expect("fixed source");
+        let target = CString::new(format!("/proc/{pid}/uid_map")).expect("fixed target");
+        // SAFETY: both fixed paths name only this owned child's proc entries.
+        // Propagation is private and the mount dies with the child namespace.
+        assert_eq!(
+            unsafe {
+                libc::mount(
+                    source.as_ptr(),
+                    target.as_ptr(),
+                    std::ptr::null(),
+                    libc::MS_BIND,
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "isolated proc substitution setup failed"
+        );
+        let mut substituted = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(OsStr::from_bytes(target.as_bytes()))
+            .expect("substituted proc inode");
+        // Demonstrate the exact old accepting premises on real descriptors,
+        // not a fabricated statfs value or only a map-string parser fixture.
+        // SAFETY: statfs is plain C storage initialized by fstatfs below.
+        let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+        // SAFETY: substituted owns the FD and filesystem is writable storage.
+        assert_eq!(
+            unsafe { libc::fstatfs(substituted.as_raw_fd(), &mut filesystem) },
+            0
+        );
+        assert_eq!(filesystem.f_type, libc::PROC_SUPER_MAGIC);
+        let mut bytes = Vec::new();
+        Read::by_ref(&mut substituted)
+            .take(257)
+            .read_to_end(&mut bytes)
+            .expect("bounded map bytes");
+        assert!(controller_has_full_identity_map(&bytes));
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/proc")
+            .expect("child proc anchor");
+        let relative = CString::new(format!("{pid}/uid_map")).expect("fixed relative path");
+        assert_eq!(
+            open_controller_proc_entry(&root, &relative, libc::O_RDONLY)
+                .err()
+                .expect("bind mount must refuse")
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        assert!(validate_controller_root_namespace().is_err());
+        println!("proc-substitution-refused");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mechanical_native_data_refuses_unsealed_drift_scripts_and_false_host_maps() {
+        const TEST: &str = "pinned_exec::tests::mechanical_native_data_refuses_unsealed_drift_scripts_and_false_host_maps";
+        const CHILD_ARGV0: &str = "/maco-proc-substitution-fixture";
+        let child_argv0 = env::args_os().next() == Some(OsString::from(CHILD_ARGV0));
+        if child_argv0 || env::var_os("MACO_PROC_SUBSTITUTION_CHILD").is_some() {
+            assert!(child_argv0);
+            assert_eq!(
+                env::var_os("MACO_PROC_SUBSTITUTION_CHILD"),
+                Some(OsString::from("1"))
+            );
+            exercise_proc_substitution_fixture();
+            return;
+        }
+        let root = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open("/proc")
+            .expect("genuine proc root");
+        let pid = std::process::id();
+        open_controller_uid_map(&root, pid).expect("actual syscall PID and kernel self agree");
+        assert!(open_controller_uid_map(&root, pid.checked_add(1).expect("bounded PID")).is_err());
+        let wrong_root = open_controller_proc_entry(
+            &root,
+            &CString::new(pid.to_string()).expect("decimal PID"),
+            libc::O_PATH | libc::O_DIRECTORY,
+        )
+        .expect("real proc PID directory");
+        assert!(validate_controller_proc_root(&wrong_root).is_err());
+        use std::os::unix::process::CommandExt;
+        // SAFETY: these identity syscalls read only this owned test process.
+        let uid_map = format!("0 {} 1\n", unsafe { libc::getuid() });
+        // SAFETY: getgid reads the current process's real group identity.
+        let gid_map = format!("0 {} 1\n", unsafe { libc::getgid() });
+        let mut child = std::process::Command::new(env::current_exe().expect("libtest executable"));
+        child
+            .arg0(CHILD_ARGV0)
+            .args(["--exact", TEST, "--nocapture"])
+            .env_clear()
+            .env("MACO_PROC_SUBSTITUTION_CHILD", "1")
+            .stdin(std::process::Stdio::null());
+        // SAFETY: the closure calls only raw namespace/mapping syscalls and
+        // uses bytes built before fork. No allocator or inherited lock is used.
+        unsafe {
+            child.pre_exec(move || {
+                prepare_proc_substitution_fixture(uid_map.as_bytes(), gid_map.as_bytes())
+            });
+        }
+        let result = child.output().expect("owned isolated proc refusal child");
+        assert!(
+            result.status.success(),
+            "isolated proc refusal child failed"
+        );
+        let stdout = std::str::from_utf8(&result.stdout).expect("fixed child output");
+        assert_eq!(
+            stdout
+                .lines()
+                .filter(|line| *line == "proc-substitution-refused")
+                .count(),
+            1
+        );
+        assert_eq!(
+            stdout
+                .matches("test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;")
+                .count(),
+            1
+        );
+        assert!(controller_has_full_identity_map(
+            b"         0          0 4294967295\n"
+        ));
+        for bytes in [
+            b"".as_slice(),
+            b"0 1000 1\n",
+            b"0 0 1\n",
+            b"0 0 4294967296\n",
+            b"0\n0\n4294967295\n",
+            b"0 0 4294967295\n1 1 1\n",
+            b"secret 0 0 4294967295",
+            b"0 0 4294967295\nextra",
+            b"0 0 4294967295\xff",
+        ] {
+            assert!(!controller_has_full_identity_map(bytes));
+        }
+        let temp = tempfile::tempdir().expect("owned fixture");
+        let path = temp.path().join("native");
+        executable(&path, b"\x7fELFbounded fixture");
+        let pinned = PinnedDirectExecutable::capture_for_test(&path).expect("image binding");
+        // A real image and canonical self-authored descriptor still cannot
+        // issue parent custody: this pin has no genuine SourceBoundMainHelper.
+        assert!(pinned
+            .prepare_native_entry(&mut || Ok(()))
+            .expect("no authority")
+            .is_none());
+        let encoded = pinned
+            .encode_descriptor(&[OsString::from("original argument")], &[])
+            .expect("data");
+        let request =
+            decode_verified_descriptor(encoded.bytes(), OsStr::new(&encoded.digest_hex()))
+                .expect("wire data");
+        let ordinary = File::open(&path).expect("unsealed file");
+        assert!(receive_native_image(&request, ordinary.as_raw_fd()).is_err());
+        let sealed = materialize_sealed(&pinned.source).expect("sealed data");
+        let received =
+            receive_native_image(&request, sealed.as_raw_fd()).expect("image continuity");
+        // SAFETY: received owns a live descriptor; F_GETFD only reads flags.
+        let flags = unsafe { libc::fcntl(received.as_raw_fd(), libc::F_GETFD) };
+        assert!(flags >= 0 && flags & libc::FD_CLOEXEC != 0);
+        let mut drift = request.clone();
+        drift.source.sha256[0] ^= 1;
+        assert!(receive_native_image(&drift, sealed.as_raw_fd()).is_err());
+        let mut script = request.clone();
+        script.script = Some(ScriptBinding {
+            interpreter: request.source.clone(),
+            interpreter_argument: None,
+        });
+        assert!(receive_native_image(&script, sealed.as_raw_fd()).is_err());
+        let mut cancelled = || {
+            Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "synthetic cancellation",
+            ))
+        };
+        assert_eq!(
+            materialize_sealed_checked(&pinned.source, &mut cancelled)
+                .err()
+                .expect("refusal")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        let mut checkpoints = 0;
+        let mut during_copy = || {
+            checkpoints += 1;
+            if checkpoints >= 3 {
+                Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "synthetic mid-copy cancellation",
+                ))
+            } else {
+                Ok(())
+            }
+        };
+        assert_eq!(
+            materialize_sealed_checked(&pinned.source, &mut during_copy)
+                .err()
+                .expect("copy refused")
+                .kind(),
+            io::ErrorKind::Interrupted
+        );
+        executable(&path, b"\x7fELFdifferent bytes");
+        assert!(materialize_sealed(&pinned.source).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds() {
+        const TEST: &str = "pinned_exec::tests::mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds";
+        let target_argv0 = env::args_os().next() == Some(OsString::from("/native-contract-argv0"));
+        if target_argv0 || env::var_os("MACO_NATIVE_CONTRACT_TARGET").is_some() {
+            // Either target discriminator enters mandatory assertions, not a
+            // success fallback. Lost environment must fail rather than recurse.
+            assert!(env::var_os("MACO_NATIVE_CONTRACT_TARGET").is_some());
+            assert_eq!(
+                env::args_os().collect::<Vec<_>>(),
+                [
+                    OsString::from("/native-contract-argv0"),
+                    OsString::from("--exact"),
+                    OsString::from(TEST),
+                    OsString::from("--nocapture")
+                ]
+            );
+            assert_eq!(
+                env::var("MACO_NATIVE_CONTRACT_VALUE").expect("explicit value"),
+                "bounded value"
+            );
+            assert!(env::var_os("MACO_NATIVE_CONTRACT_CHILD").is_none());
+            assert!(env::var_os("HOME").is_none());
+            let mut byte = [0];
+            assert_eq!(io::stdin().read(&mut byte).expect("null stdin"), 0);
+            let relay = env::var("MACO_NATIVE_CONTRACT_RELAY").expect("test image identity");
+            for fd in [4, 51] {
+                // SAFETY: plain stat storage is initialized by fstat for the
+                // numeric FD; failure must be EBADF, never an ignored error.
+                let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
+                if unsafe { libc::fstat(fd, &mut metadata) } == 0 {
+                    assert_ne!(
+                        format!("{}:{}", metadata.st_dev, metadata.st_ino),
+                        relay,
+                        "an inherited native image copy survived exec"
+                    );
+                } else {
+                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
+                }
+            }
+            println!("mechanical-native-contract-ok");
+            return;
+        }
+        if let Some(path) = env::var_os("MACO_NATIVE_CONTRACT_CHILD") {
+            // Reproduce the guardian's non-CLOEXEC stdin copy and an extra
+            // relayed copy. Both must disappear in the final native image.
+            // SAFETY: only this owned isolated test child is affected; stdin is
+            // the relayed image and the named FD slots are synthetic copies.
+            assert_eq!(unsafe { libc::dup2(0, 4) }, 4);
+            assert_eq!(unsafe { libc::dup2(0, 51) }, 51);
+            let digest = env::var_os("MACO_NATIVE_CONTRACT_DIGEST").expect("exact digest");
+            let request = load_verified_descriptor_and_remove(Path::new(&path), &digest)
+                .expect("private descriptor");
+            execute_mechanical_native(request)
+                .expect("native exec must replace this isolated test child");
+            panic!("mechanical native exec returned");
+        }
+        let temp = tempfile::tempdir().expect("held request owner");
+        let executable = env::current_exe().expect("libtest executable");
+        let pinned = PinnedDirectExecutable::capture_for_test(&executable).expect("native image");
+        let args = [
+            OsString::from("--exact"),
+            OsString::from(TEST),
+            OsString::from("--nocapture"),
+        ];
+        let image = materialize_sealed(&pinned.source).expect("sealed libtest image");
+        let relay_metadata = image.file.metadata().expect("test image metadata");
+        let environment = [
+            (
+                OsString::from("MACO_NATIVE_CONTRACT_RELAY"),
+                OsString::from(format!("{}:{}", relay_metadata.dev(), relay_metadata.ino())),
+            ),
+            (
+                OsString::from("MACO_NATIVE_CONTRACT_TARGET"),
+                OsString::from("1"),
+            ),
+            (
+                OsString::from("MACO_NATIVE_CONTRACT_VALUE"),
+                OsString::from("bounded value"),
+            ),
+        ];
+        let encoded = pinned
+            .encode_descriptor(&args, &environment)
+            .expect("exact request");
+        let mut request =
+            decode_verified_descriptor(encoded.bytes(), OsStr::new(&encoded.digest_hex()))
+                .expect("data");
+        request.source.argv0 = b"/native-contract-argv0".to_vec();
+        // Encode the original argv0 into the request using the same encoder.
+        let mut test_pin = pinned.clone();
+        test_pin.source.argv0 = request.source.argv0;
+        let encoded = test_pin
+            .encode_descriptor(&args, &environment)
+            .expect("explicit argv0");
+        let path = temp.path().join(PINNED_EXEC_DESCRIPTOR_NAME);
+        fs::write(&path, encoded.bytes()).expect("owned descriptor");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
+        let result = std::process::Command::new(&executable)
+            .args(["--exact", TEST, "--nocapture"])
+            .env_clear()
+            .env("MACO_NATIVE_CONTRACT_CHILD", &path)
+            .env("MACO_NATIVE_CONTRACT_DIGEST", encoded.digest_hex())
+            .stdin(std::process::Stdio::from(
+                image.file.try_clone().expect("relay image"),
+            ))
+            .output()
+            .expect("owned provider-free child");
+        assert!(
+            result.status.success(),
+            "provider-free mechanical native contract failed"
+        );
+        assert!(String::from_utf8_lossy(&result.stdout).contains("mechanical-native-contract-ok"));
+        assert!(!path.exists(), "request was consumed by identity");
     }
 
     #[test]
