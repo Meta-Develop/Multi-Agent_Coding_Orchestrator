@@ -1,5 +1,6 @@
 import importlib.util
 import io
+import json
 import os
 import pathlib
 import re
@@ -34,6 +35,16 @@ INVENTORY = [
 def listing(names):
     return "".join(f"{name}: test\n" for name in names)
 
+
+
+def causal_output(name, failed=False):
+    status = "FAILED" if failed else "ok"
+    passed, failures = (0, 1) if failed else (1, 0)
+    return (
+        f"running 1 test\ntest {name} ... {status}\n\n"
+        f"test result: {status}. {passed} passed; {failures} failed; "
+        "0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
+    )
 
 class LibraryShardTests(unittest.TestCase):
     def test_partition_is_disjoint_complete_stable_and_includes_new_modules(self):
@@ -203,7 +214,7 @@ class LibraryShardTests(unittest.TestCase):
         selected = shards.partition_inventory(inventory)["supervise"]
         summary = "test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
         for failed_index in [None, 0, 1, 2]:
-            with self.subTest(failed_index=failed_index), mock.patch.object(shards.subprocess, "run") as run, mock.patch.object(shards, "run_supervise_diagnostics", return_value=0) as diagnostics:
+            with self.subTest(failed_index=failed_index), mock.patch.object(shards.subprocess, "run") as run, mock.patch.object(shards, "run_supervise_diagnostics", return_value=0) as diagnostics, mock.patch.object(shards, "run_supervise_causal_diagnostics", return_value=0) as causal:
                 responses = [
                     subprocess.CompletedProcess([], 0, listing(inventory)),
                     subprocess.CompletedProcess([], 0, listing(selected)),
@@ -236,8 +247,10 @@ class LibraryShardTests(unittest.TestCase):
                     self.assertEqual(run.call_args.args[0], full_command)
                     self.assertNotIn("--nocapture", run.call_args.args[0])
                     diagnostics.assert_called_once_with(["harness"], selected)
+                    causal.assert_called_once_with(["harness"], selected)
                 else:
                     diagnostics.assert_not_called()
+                    causal.assert_not_called()
                     self.assertNotIn(full_command, [call.args[0] for call in run.call_args_list])
 
     def test_supervise_diagnostics_collect_all_three_before_blocking_full_shard(self):
@@ -253,7 +266,7 @@ class LibraryShardTests(unittest.TestCase):
         bad = "test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 9 filtered out; finished in 0.01s\n"
         for statuses in [(0, 0, 0), (101, 0, 0), (0, 101, 0), (0, 0, 101), (101, 101, 101), (124, 0, 0)]:
             out, err = io.StringIO(), io.StringIO()
-            with self.subTest(statuses=statuses), mock.patch.object(shards, "enumerate_tests", side_effect=[inventory, selected]), mock.patch.object(shards, "run_safety_preflights", return_value=0) as safety, mock.patch.object(shards, "_capture_supervise_diagnostic") as capture, mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
+            with self.subTest(statuses=statuses), mock.patch.object(shards, "enumerate_tests", side_effect=[inventory, selected]), mock.patch.object(shards, "run_safety_preflights", return_value=0) as safety, mock.patch.object(shards, "_capture_supervise_diagnostic") as capture, mock.patch.object(shards.subprocess, "run") as run, mock.patch.object(shards, "run_supervise_causal_diagnostics", return_value=0) as causal, mock.patch("sys.stdout", out), mock.patch("sys.stderr", err):
                 responses = []
                 for name, status in zip(names, statuses):
                     responses.extend([
@@ -274,10 +287,48 @@ class LibraryShardTests(unittest.TestCase):
                     self.assertIn(name, out.getvalue())
                 if any(statuses):
                     run.assert_not_called()
+                    causal.assert_not_called()
                     self.assertIn("fixture panic boundary", err.getvalue())
                 else:
+                    causal.assert_called_once_with(["harness"], selected)
                     run.assert_called_once_with(shards.test_command(["harness"], selected), check=False)
                     self.assertNotIn("--nocapture", run.call_args.args[0])
+
+
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        self.assertEqual(names, (
+            "supervise::assignment_execution::bound_parent_turn_tests::bound_nested_evidence_rejects_forged_widened_failed_and_cancelled_results",
+            "supervise::assignment_execution::managed_parent_controller_tests::managed_cycle_isolated_workers_overlap_and_import_exact_union",
+            "supervise::scheduler::decomposition_tests::budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts",
+            "supervise::tests::scheduler::claim_and_semantic_block_conflicts_fail_only_the_affected_assignment",
+        ))
+        inventory = sorted([*INVENTORY, *shards.SAFETY_PREFLIGHTS["supervise"], *names])
+        selected = shards.partition_inventory(inventory)["supervise"]
+        for statuses in [(0, 0, 0, 0), (101, 0, 0, 0), (0, 101, 0, 0), (0, 0, 101, 0), (0, 0, 0, 101), (101, 101, 101, 101)]:
+            out = io.StringIO()
+            with self.subTest(causal_statuses=statuses), mock.patch.object(shards, "enumerate_tests", side_effect=[inventory, selected, *[[n] for n in names]]), mock.patch.object(shards, "run_safety_preflights", return_value=0), mock.patch.object(shards, "run_supervise_diagnostics", return_value=0), mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", out), mock.patch("sys.stderr", io.StringIO()):
+                run.side_effect = [
+                    subprocess.CompletedProcess([], status, causal_output(name, status == 101), "")
+                    for name, status in zip(names, statuses)
+                ] + ([] if any(statuses) else [subprocess.CompletedProcess([], 0)])
+                self.assertEqual(shards.run_shard(["harness"], "supervise"), int(any(statuses)))
+                self.assertEqual(run.call_count, 4 + int(not any(statuses)))
+                for index, name in enumerate(names):
+                    self.assertEqual(run.call_args_list[index], mock.call(
+                        ["harness", "--exact", "--", name],
+                        check=False, capture_output=True, text=True,
+                    ))
+                report = [json.loads(line) for line in out.getvalue().splitlines() if line.startswith('{"broad_allowed"')]
+                self.assertEqual(len(report), 1)
+                self.assertTrue(report[0]["complete"])
+                self.assertEqual([case["name"] for case in report[0]["supervise_causal_cases"]], list(names))
+                self.assertEqual([case["returncode"] for case in report[0]["supervise_causal_cases"]], list(statuses))
+                self.assertEqual(report[0]["broad_allowed"], not any(statuses))
+                full_command = shards.test_command(["harness"], selected)
+                if any(statuses):
+                    self.assertNotIn(full_command, [call.args[0] for call in run.call_args_list])
+                else:
+                    self.assertEqual(run.call_args, mock.call(full_command, check=False))
 
     def test_supervise_diagnostics_refuse_non_single_body_and_continue_remaining_cases(self):
         names = shards.SUPERVISE_DIAGNOSTICS
@@ -292,6 +343,50 @@ class LibraryShardTests(unittest.TestCase):
                 ]
                 self.assertEqual(shards.run_supervise_diagnostics(["harness"], names), 1)
                 self.assertEqual(capture.call_count, 6)
+
+
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        good = causal_output(names[0])
+        bad = causal_output(names[0], True)
+        invalid = [
+            (0, ""), (0, good.replace("1 passed", "0 passed")),
+            (0, good.replace("0 ignored", "1 ignored")),
+            (0, good.replace("0 measured", "1 measured")),
+            (0, good.replace("1 passed", "2 passed")), (0, good + good),
+            (0, good.replace(names[0], names[0] + "_longer")),
+            (0, good.replace("... ok", "... ignored")),
+            (0, good.replace(f"test {names[0]} ... ok", "")),
+            (0, good + f"test {names[1]} ... ok\n"),
+            (0, good + "test result: unrecognized\n"),
+            (0, "test result: unrecognized\n" + good),
+            (0, good + "nonterminal output\n"),
+            (0, good + f"test {names[1]} ... unrecognized\n"),
+            (101, good), (0, bad), (2, bad), (124, bad), (-9, bad),
+        ]
+        for status, output in invalid:
+            with self.subTest(causal_status=status, output=output), mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                run.side_effect = [
+                    subprocess.CompletedProcess([], 0, listing([names[0]]), ""),
+                    subprocess.CompletedProcess([], status, output, ""),
+                ]
+                with self.assertRaises(ValueError):
+                    shards.run_supervise_causal_diagnostics(["harness"], names)
+                self.assertEqual(run.call_count, 2)
+        for invalid_index in [1, 2, 3]:
+            with self.subTest(invalid_after_completed_failure=invalid_index), mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+                run.side_effect = [
+                    result for index, name in enumerate(names[:invalid_index + 1]) for result in [
+                        subprocess.CompletedProcess([], 0, listing([name]), ""),
+                        subprocess.CompletedProcess([], 101 if index < invalid_index else 2, causal_output(name, True), ""),
+                    ]
+                ]
+                with self.assertRaises(ValueError):
+                    shards.run_supervise_causal_diagnostics(["harness"], names)
+                self.assertEqual(run.call_count, 2 * (invalid_index + 1))
+        with mock.patch.object(shards.subprocess, "run", side_effect=OSError("fixture infrastructure failure")) as run:
+            with self.assertRaises(OSError):
+                shards.run_supervise_causal_diagnostics(["harness"], names)
+            self.assertEqual(run.call_count, 1)
 
     def test_supervise_diagnostics_refuse_inexact_inventory_without_running_that_body(self):
         names = shards.SUPERVISE_DIAGNOSTICS
@@ -312,6 +407,37 @@ class LibraryShardTests(unittest.TestCase):
             self.assertEqual(shards.run_supervise_diagnostics(["harness"], []), 1)
             capture.assert_not_called()
 
+
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        for observed in [[], [names[0] + "_longer"], [names[0], names[0] + "_longer"], [names[0], names[0]], ["malformed inventory"]]:
+            with self.subTest(causal_inventory=observed), mock.patch.object(shards.subprocess, "run") as run:
+                run.return_value = subprocess.CompletedProcess([], 0, listing(observed) if observed != ["malformed inventory"] else "running 1 test\n", "")
+                with self.assertRaises(ValueError):
+                    shards.run_supervise_causal_diagnostics(["harness"], names)
+                self.assertEqual(run.call_count, 1)
+        with mock.patch.object(shards.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                shards.run_supervise_causal_diagnostics(["harness"], [])
+            run.assert_not_called()
+        with mock.patch.object(shards.subprocess, "run", side_effect=subprocess.CalledProcessError(101, ["harness"])) as run:
+            with self.assertRaises(subprocess.CalledProcessError):
+                shards.run_supervise_causal_diagnostics(["harness"], names)
+            self.assertEqual(run.call_count, 1)
+
+
+        with mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            run.side_effect = [
+                result for name in names[:3] for result in [
+                    subprocess.CompletedProcess([], 0, listing([name]), ""),
+                    subprocess.CompletedProcess([], 0, causal_output(name), ""),
+                ]
+            ] + [subprocess.CompletedProcess([], 0, listing([names[3] + "_longer"]), "")]
+            with self.assertRaises(ValueError):
+                shards.run_supervise_causal_diagnostics(["harness"], names)
+            self.assertEqual(run.call_count, 7)
+            self.assertNotIn(["harness", "--exact", "--", names[3]],
+                             [call.args[0] for call in run.call_args_list])
+
     def test_supervise_diagnostic_timeout_kills_only_its_new_process_group_without_retry(self):
         command = ["harness", "--exact", "--nocapture", "--", shards.SUPERVISE_DIAGNOSTICS[0]]
         with mock.patch.object(shards.subprocess, "Popen") as popen, mock.patch.object(shards.os, "killpg", create=True) as killpg, mock.patch.object(shards.signal, "SIGKILL", 9, create=True):
@@ -326,6 +452,25 @@ class LibraryShardTests(unittest.TestCase):
             killpg.assert_called_once_with(1234, 9)
             self.assertEqual((result.returncode, result.stdout, result.stderr),
                              (124, "partial stdout", "partial stderr"))
+
+
+        names = shards.SUPERVISE_CAUSAL_DIAGNOSTICS
+        with mock.patch.object(shards.subprocess, "Popen") as popen, mock.patch.object(shards.os, "killpg", create=True) as killpg, mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()), mock.patch("sys.stderr", io.StringIO()):
+            run.side_effect = [
+                result for name in names for result in [
+                    subprocess.CompletedProcess([], 0, listing([name]), ""),
+                    subprocess.CompletedProcess([], 0, causal_output(name), ""),
+                ]
+            ]
+            self.assertEqual(shards.run_supervise_causal_diagnostics(["harness"], names), 0)
+            self.assertEqual(run.call_count, 8)
+            popen.assert_not_called()
+            killpg.assert_not_called()
+            for call in run.call_args_list:
+                self.assertNotIn("timeout", call.kwargs)
+                self.assertNotIn("start_new_session", call.kwargs)
+                self.assertNotIn("--nocapture", call.args[0])
+                self.assertNotIn("--ignored", call.args[0])
 
     def test_gate_rejects_failed_cancelled_and_skipped_package_matrix_or_integration(self):
         bash = shutil.which("bash")
@@ -420,13 +565,31 @@ mod supervise {
         }
     }
     mod tests {
+        mod scheduler {
+            // Empty body verifies wrapper selection only, not concurrency semantics.
+            #[test] fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {}
+        }
         mod plan_runtime {
             #[test] fn no_override_selects_single_slug_effort_profile_for_every_role() {}
+        }
+    }
+    mod scheduler {
+        mod decomposition_tests {
+            // Empty body verifies wrapper selection only, not budget semantics.
+            #[test] fn budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts() {}
         }
     }
     mod assignment_execution {
         mod decomposition_tests {
             #[test] fn auditor_runtime_override_preserves_active_heterogeneous_lens_contract() {}
+        }
+        mod bound_parent_turn_tests {
+            // Empty body verifies wrapper selection only, not evidence semantics.
+            #[test] fn bound_nested_evidence_rejects_forged_widened_failed_and_cancelled_results() {}
+        }
+        mod managed_parent_controller_tests {
+            // Empty body verifies wrapper selection only, not worker cleanup semantics.
+            #[test] fn managed_cycle_isolated_workers_overlap_and_import_exact_union() {}
         }
         mod attached_parent_capture_tests {
             // Empty body verifies wrapper selection only, not real ownership semantics.
@@ -458,7 +621,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 16)
+            self.assertEqual(len(inventory), 20)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -484,7 +647,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 16', result.stdout)
+                self.assertIn('"total": 20', result.stdout)
 
 
 if __name__ == "__main__":

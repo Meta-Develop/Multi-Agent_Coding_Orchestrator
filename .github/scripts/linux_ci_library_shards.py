@@ -39,6 +39,13 @@ SUPERVISE_DIAGNOSTICS = (
 # Each of three cases gets one inventory query and at most one body, with no retry.
 SUPERVISE_DIAGNOSTIC_TIMEOUT_SECONDS = 30
 
+SUPERVISE_CAUSAL_DIAGNOSTICS = (
+    "supervise::assignment_execution::bound_parent_turn_tests::bound_nested_evidence_rejects_forged_widened_failed_and_cancelled_results",
+    "supervise::assignment_execution::managed_parent_controller_tests::managed_cycle_isolated_workers_overlap_and_import_exact_union",
+    "supervise::scheduler::decomposition_tests::budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts",
+    "supervise::tests::scheduler::claim_and_semantic_block_conflicts_fail_only_the_affected_assignment",
+)
+
 
 def parse_inventory(output: str) -> list[str]:
     names: list[str] = []
@@ -174,6 +181,60 @@ def run_supervise_diagnostics(runner: Sequence[str], selected: Sequence[str]) ->
     return 1 if failed else 0
 
 
+
+def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[str]) -> int:
+    # Natural completion only: the existing hosted-job limit bounds a hung case.
+    # Aggregate completed one-body failures; malformed/infra outcomes fail closed.
+    cases = []
+    for name in SUPERVISE_CAUSAL_DIAGNOSTICS:
+        if name not in selected or enumerate_tests(runner, [name]) != [name]:
+            raise ValueError(f"causal diagnostic must select exactly one supervise test: {name}")
+        print(json.dumps({"supervise_causal_diagnostic": name}, sort_keys=True), flush=True)
+        result = subprocess.run(
+            [*runner, "--exact", "--", name],
+            check=False, capture_output=True, text=True,
+        )
+        print(result.stdout, end="", flush=True)
+        print(result.stderr, end="", file=sys.stderr, flush=True)
+        summaries = re.findall(
+            r"^test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; (\d+) ignored; "
+            r"(\d+) measured; \d+ filtered out; finished in .+$",
+            result.stdout, re.MULTILINE,
+        )
+        bodies = re.findall(
+            r"^test (.+) \.\.\. (ok|FAILED|ignored)$", result.stdout, re.MULTILINE,
+        )
+        summary_lines = [
+            line for line in result.stdout.splitlines() if line.startswith("test result:")
+        ]
+        body_lines = [
+            line for line in result.stdout.splitlines()
+            if line.startswith("test ") and not line.startswith("test result:")
+        ]
+        terminal = (
+            len(summary_lines) == 1 and len(body_lines) == 1
+            and result.stdout.rstrip().splitlines()[-1:] == summary_lines
+        )
+        passed = (
+            terminal and result.returncode == 0
+            and summaries == [("ok", "1", "0", "0", "0")]
+            and bodies == [(name, "ok")]
+        )
+        failed = (
+            terminal and result.returncode == 101
+            and summaries == [("FAILED", "0", "1", "0", "0")]
+            and bodies == [(name, "FAILED")]
+        )
+        if not (passed or failed):
+            raise ValueError(f"causal diagnostic lacks a genuine completed nonignored one-body result: {name}")
+        cases.append({"name": name, "returncode": result.returncode,
+                      "outcome": "PASS" if passed else "FAIL"})
+        print(json.dumps({"supervise_causal_result": cases[-1]}, sort_keys=True), flush=True)
+    status = int(any(case["outcome"] == "FAIL" for case in cases))
+    print(json.dumps({"supervise_causal_cases": cases, "complete": True,
+                      "broad_allowed": status == 0}, sort_keys=True), flush=True)
+    return status
+
 def run_shard(runner: Sequence[str], shard: str) -> int:
     if shard not in SHARDS:
         raise ValueError(f"unknown library shard: {shard}")
@@ -207,6 +268,9 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
         diagnostic_status = run_supervise_diagnostics(runner, selected)
         if diagnostic_status != 0:
             return diagnostic_status
+        causal_status = run_supervise_causal_diagnostics(runner, selected)
+        if causal_status != 0:
+            return causal_status
     return subprocess.run(command, check=False).returncode
 
 
