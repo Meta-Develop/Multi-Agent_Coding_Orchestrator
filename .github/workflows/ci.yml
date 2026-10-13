@@ -254,6 +254,10 @@ jobs:
         if: matrix.shard == 'rest'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Allow root libtest userns on GitHub-hosted Ubuntu
+        if: matrix.shard == 'rest'
+        run: bash .github/scripts/configure-github-hosted-root-libtest-userns.sh
+
       - name: Verify sealed native entry regressions before managed runtime checks
         if: matrix.shard == 'rest'
         run: |
