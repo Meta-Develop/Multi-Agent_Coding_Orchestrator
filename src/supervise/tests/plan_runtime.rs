@@ -651,7 +651,9 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
     #[cfg(target_os = "linux")]
     let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
         &temp,
-        catalog.as_ref().expect("successful supplied fixture catalog"),
+        catalog
+            .as_ref()
+            .expect("successful supplied fixture catalog"),
     )
     .expect("hold isolated injected CAM observation for both profiles");
     let admission = SupervisorAdmissionPolicyInput::resolve(
@@ -3422,8 +3424,7 @@ fn assignment_scoped_prompt_resolution_skips_irrelevant_cross_runtime_worker() {
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
-    let mut child_selection =
-        configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
     child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
     plan.role_models
         .insert(AgentRole::ChildOrchestrator, child_selection);
@@ -3518,8 +3519,7 @@ fn assignment_scoped_prompt_resolution_resolves_same_runtime_nested_worker() {
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
-    let mut child_selection =
-        configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
     child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
     plan.role_models
         .insert(AgentRole::ChildOrchestrator, child_selection);

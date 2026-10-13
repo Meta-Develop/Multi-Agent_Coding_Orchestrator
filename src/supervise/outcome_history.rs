@@ -2155,7 +2155,9 @@ mod tests {
         Ok(())
     }
 
-    fn automatic_selector_for_this_run(repo: &Path) -> Result<(
+    fn automatic_selector_for_this_run(
+        repo: &Path,
+    ) -> Result<(
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         CandidateKey,
@@ -2215,10 +2217,11 @@ mod tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: Vec::new(),
         };
-        plan.assignments.push(serde_json::from_value(serde_json::json!({
-            "id": "assignment-1", "phase": "execution", "role": "worker",
-            "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR]
-        }))?);
+        plan.assignments
+            .push(serde_json::from_value(serde_json::json!({
+                "id": "assignment-1", "phase": "execution", "role": "worker",
+                "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR]
+            }))?);
         let mut metadata = SupervisorPlanMetadata::default();
         let routing_policy =
             crate::supervise::bind_assessed_injected_plan(&plan, repo, &mut metadata)?;

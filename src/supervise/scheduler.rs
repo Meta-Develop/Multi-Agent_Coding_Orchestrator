@@ -9261,11 +9261,8 @@ mod selection_policy_tests {
                 let mut worker = super::terminal_worker_assignment("codex-reviewed-worker");
                 worker.runtime = Some(SupervisorRuntime::Codex);
                 plan.assignments = vec![worker];
-                let _routing_policy = crate::supervise::bind_assessed_injected_plan(
-                    &plan,
-                    &repo,
-                    &mut metadata,
-                )?;
+                let _routing_policy =
+                    crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
                 let initial = initialize_supervisor_selection_from_prepared_metadata(
                     &mut plan,
                     &mut metadata,
@@ -9677,11 +9674,8 @@ mod selection_policy_tests {
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
             plan.assignments = vec![super::terminal_worker_assignment("observed-model-worker")];
-            let _routing_policy = crate::supervise::bind_assessed_injected_plan(
-                &plan,
-                &repo,
-                &mut plan_metadata,
-            )?;
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,
@@ -9747,12 +9741,11 @@ mod selection_policy_tests {
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
-            plan.assignments = vec![super::terminal_worker_assignment("unselected-account-worker")];
-            let _routing_policy = crate::supervise::bind_assessed_injected_plan(
-                &plan,
-                &repo,
-                &mut plan_metadata,
-            )?;
+            plan.assignments = vec![super::terminal_worker_assignment(
+                "unselected-account-worker",
+            )];
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,

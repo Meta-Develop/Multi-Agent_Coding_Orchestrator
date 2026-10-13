@@ -896,8 +896,7 @@ mod tests {
         let mut plan = plan(parent.clone());
         let mut worker_selection = configured_role_model_selection(&plan, AgentRole::Worker);
         worker_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
-        plan.role_models
-            .insert(AgentRole::Worker, worker_selection);
+        plan.role_models.insert(AgentRole::Worker, worker_selection);
         if case.starts_with("live-") {
             plan.child_timeout_seconds = 300;
         }

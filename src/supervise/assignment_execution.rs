@@ -3827,7 +3827,11 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         let messaging_server = if launch_runtime == SupervisorRuntime::Fake {
             None
         } else {
-            bind_assignment_messaging_unless_managed_readonly(context, &assignment.id, &mut command)?
+            bind_assignment_messaging_unless_managed_readonly(
+                context,
+                &assignment.id,
+                &mut command,
+            )?
         };
         record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
         bind_final_dispatch_live_budget(&mut command, &budget_reservation)?;
@@ -3970,15 +3974,13 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             drop(messaging_server);
             Ok(external_run)
         }
-        SupervisorRuntime::Fake => {
-            deterministic_fake_child_run(
-                &command,
-                assignment,
-                assignment_metadata,
-                preflight.claim.token.get(),
-                preflight.semantic_token,
-            )
-        }
+        SupervisorRuntime::Fake => deterministic_fake_child_run(
+            &command,
+            assignment,
+            assignment_metadata,
+            preflight.claim.token.get(),
+            preflight.semantic_token,
+        ),
     };
     // Settle returned provider observations exactly once before any fallible
     // completion, journal, or reporting work. Keep the result until capture handling.
