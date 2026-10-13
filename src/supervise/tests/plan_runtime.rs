@@ -3422,6 +3422,11 @@ fn assignment_scoped_prompt_resolution_skips_irrelevant_cross_runtime_worker() {
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
+    let mut child_selection =
+        configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
     let assignment = plan.assignments[0].clone();
     let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
 
@@ -3513,6 +3518,11 @@ fn assignment_scoped_prompt_resolution_resolves_same_runtime_nested_worker() {
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
+    let mut child_selection =
+        configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
     let mut assignment = plan.assignments[0].clone();
     assignment.worker_assignments.push(WorkerAssignment {
         id: "nested-worker".to_string(),
