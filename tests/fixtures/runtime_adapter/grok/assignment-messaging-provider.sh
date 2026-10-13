@@ -5,6 +5,8 @@
 # Probe path and phase/filter live in an embedded manifest under the admitted worktree (verified
 # ExternalGrok clears arbitrary MACO_TEST_* parent env). Parent helper is subprocess-isolated.
 set -eu
+[ "${1:-}" = "--no-auto-update" ] || exit 2
+shift
 
 prompt_file=0
 model=0

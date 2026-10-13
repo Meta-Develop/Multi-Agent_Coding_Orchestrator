@@ -3,7 +3,7 @@
 //! The launch descriptor fixes headless output, tool approval, and the
 //! inner-sandbox posture; the NDJSON parser accepts only bounded, terminally
 //! complete event streams.
-//! Catalog membership still comes only from one bounded `grok models`
+//! Catalog membership still comes only from one bounded `grok --no-auto-update models`
 //! observation or from the typed constructed-entry injection seam. Policy code
 //! may classify returned slugs, but this adapter does not embed a live model
 //! list or infer authority from a model name.
@@ -171,6 +171,7 @@ impl GrokRuntimeDescriptor {
     /// Canonical argv template. Dynamic values occupy whole argv elements.
     pub fn immutable_argument_template(self) -> Vec<String> {
         [
+            "--no-auto-update",
             "--prompt-file",
             "{prompt}",
             "--model",
@@ -219,6 +220,7 @@ impl GrokAcpRuntimeDescriptor {
 
     pub fn immutable_argument_template(self) -> Vec<String> {
         [
+            "--no-auto-update",
             "--sandbox",
             self.sandbox_profile,
             "--disable-web-search",
@@ -1270,11 +1272,11 @@ pub struct GrokCatalogCommandSpec {
 }
 
 impl GrokCatalogCommandSpec {
-    /// Construct the stable catalog request `grok models`.
+    /// Construct the stable catalog request `grok --no-auto-update models`.
     pub fn new(current_dir: impl Into<PathBuf>) -> Self {
         Self {
             program: PathBuf::from(TRUSTED_SYSTEM_GROK_EXECUTABLE),
-            args: vec![OsString::from("models")],
+            args: vec![OsString::from("--no-auto-update"), OsString::from("models")],
             current_dir: current_dir.into(),
             environment: BTreeMap::from([
                 ("NO_COLOR".to_string(), "1".to_string()),
@@ -1340,7 +1342,7 @@ pub trait GrokCatalogCommandRunner {
     fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput>;
 }
 
-/// Screened production runner for one bounded `grok models` observation.
+/// Screened production runner for one bounded `grok --no-auto-update models` observation.
 ///
 /// The runner resolves the executable, screens the environment, requests
 /// verified process-tree cleanup and a Grok-compatible side-effect profile,
@@ -2249,6 +2251,7 @@ mod tests {
         assert_eq!(
             GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(),
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "{prompt}",
                 "--model",
@@ -2274,6 +2277,7 @@ mod tests {
         assert_eq!(
             GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
             [
+                "--no-auto-update",
                 "--sandbox",
                 "strict",
                 "--disable-web-search",
@@ -2718,7 +2722,10 @@ mod tests {
         let spec = GrokCatalogCommandSpec::new("/workspace");
         assert_eq!(spec.program(), Path::new(default_grok_executable()));
         assert!(spec.program().is_absolute());
-        assert_eq!(spec.args(), [OsString::from("models")]);
+        assert_eq!(
+            spec.args(),
+            [OsString::from("--no-auto-update"), OsString::from("models")]
+        );
         assert_eq!(
             spec.environment(),
             &BTreeMap::from([

@@ -1,5 +1,7 @@
 #!/bin/sh
 set -eu
+[ "${1:-}" = "--no-auto-update" ] || exit 2
+shift
 
 prompt_file=0
 model=0

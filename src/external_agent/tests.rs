@@ -709,6 +709,9 @@ fn admitted_verified_grok_cam_command_with_setup(
         &program,
         r#"#!/bin/sh
 set -eu
+no_auto_update="${1:-}"
+[ "$no_auto_update" = "--no-auto-update" ]
+shift
 [ "$#" -eq 18 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
@@ -6937,6 +6940,7 @@ fn grok_acp_runtime_adapter_argv_uses_contained_agent_stdio() {
     assert_eq!(
         argv,
         [
+            "--no-auto-update",
             "--sandbox",
             "strict",
             "--disable-web-search",
@@ -7044,7 +7048,7 @@ fn write_fake_grok_acp_stdio_provider(workspace: &Path, mode: &str) -> Result<Pa
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\nMODE={mode}\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
+            "#!/bin/sh\nset -eu\nMODE={mode}\n[ \"${{1:-}}\" = --no-auto-update ] || exit 3\nshift\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
         ),
     )?;
     #[cfg(unix)]
@@ -8052,6 +8056,7 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     assert_eq!(
         grok_argv,
         [
+            "--no-auto-update",
             "--prompt-file",
             "/run/prompt.md",
             "--model",
@@ -8132,6 +8137,7 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
     assert_eq!(
         argv,
         [
+            "--no-auto-update",
             "--prompt-file",
             "/run/prompt.md",
             "--model",
@@ -8153,6 +8159,7 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
         ]
     );
     for fixed in [
+        "--no-auto-update",
         "--output-format",
         "streaming-json",
         "--sandbox",
@@ -8791,6 +8798,7 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
     assert_eq!(
         acp_argv,
         [
+            "--no-auto-update",
             "--sandbox",
             "strict",
             "--disable-web-search",
@@ -9114,6 +9122,9 @@ fn writable_grok_run_external_agent_helper() -> Result<()> {
         &program,
         r#"#!/bin/sh
 set -eu
+no_auto_update="${1:-}"
+[ "$no_auto_update" = "--no-auto-update" ]
+shift
 [ "$#" -eq 18 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
@@ -9133,7 +9144,7 @@ set -eu
 [ "$HOME" = "$GROK_HOME" ]
 [ -r "$GROK_HOME/auth.json" ]
 [ ! -e "$GROK_HOME/ambient-secret" ]
-printf '%s\n' 'request-begin' "$@" 'request-end' >&2
+printf '%s\n' 'request-begin' "$no_auto_update" "$@" 'request-end' >&2
 printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
@@ -9246,6 +9257,7 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         .contains(&canonical_incoming));
 
     let expected_request = vec![
+        "--no-auto-update".to_string(),
         "--prompt-file".to_string(),
         prompt.to_str().context("UTF-8 prompt path")?.to_string(),
         "--model".to_string(),

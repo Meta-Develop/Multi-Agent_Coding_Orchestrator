@@ -2904,6 +2904,7 @@ fn grok_47_xhigh_acp_keeps_immutable_argv_but_refuses_capability_elevation() {
     assert_eq!(
         launch.argv,
         [
+            "--no-auto-update",
             "--sandbox",
             "strict",
             "--disable-web-search",
@@ -2972,6 +2973,11 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
         .is_none());
 
     let mut mutations = Vec::new();
+    let mut missing_no_auto_update = canonical.clone();
+    missing_no_auto_update
+        .argument_template
+        .retain(|argument| argument != "--no-auto-update");
+    mutations.push(missing_no_auto_update);
     let mut missing_no_subagents = canonical.clone();
     missing_no_subagents
         .argument_template

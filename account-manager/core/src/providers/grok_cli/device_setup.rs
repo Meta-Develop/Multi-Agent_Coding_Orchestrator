@@ -187,7 +187,7 @@ fn prepare_after_absence_check(
         .ok_or_else(|| config_write("managed home is not UTF-8"))?;
     let quoted = format!("'{}'", path.replace('\'', "'\"'\"'"));
     Ok(format!(
-        "GROK_HOME={quoted}\nRun in your own terminal:\nenv -u GROK_AUTH_PATH GROK_HOME={quoted} grok login --device-auth\n"
+        "GROK_HOME={quoted}\nRun in your own terminal:\nenv -u GROK_AUTH_PATH GROK_HOME={quoted} grok --no-auto-update login --device-auth\n"
     ))
 }
 

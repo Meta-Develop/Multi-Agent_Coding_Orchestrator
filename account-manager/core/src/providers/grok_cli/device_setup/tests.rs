@@ -87,7 +87,7 @@ fn prepare_is_pending_private_no_login_no_default_copy_and_only_owner_instructio
         0o700
     );
     let quote = format!("'{}'", home.to_str().unwrap().replace('\'', "'\"'\"'"));
-    assert_eq!(output, format!("GROK_HOME={quote}\nRun in your own terminal:\nenv -u GROK_AUTH_PATH GROK_HOME={quote} grok login --device-auth\n"));
+    assert_eq!(output, format!("GROK_HOME={quote}\nRun in your own terminal:\nenv -u GROK_AUTH_PATH GROK_HOME={quote} grok --no-auto-update login --device-auth\n"));
     assert_eq!(
         fs::read(&fixture.ordinary_auth).unwrap(),
         b"FAKE-default-home-must-not-be-read-or-copied"

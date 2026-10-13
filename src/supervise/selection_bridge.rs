@@ -7900,7 +7900,13 @@ mod tests {
             Path::new(crate::runtime_adapter::grok::default_grok_executable())
         );
         assert!(specs[0].program().is_absolute());
-        assert_eq!(specs[0].args(), &[std::ffi::OsString::from("models")]);
+        assert_eq!(
+            specs[0].args(),
+            &[
+                std::ffi::OsString::from("--no-auto-update"),
+                std::ffi::OsString::from("models"),
+            ]
+        );
         assert_eq!(specs[0].current_dir(), Path::new("/workspace"));
         Ok(())
     }

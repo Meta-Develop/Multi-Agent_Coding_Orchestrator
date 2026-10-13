@@ -4,6 +4,8 @@
 # confinement exposes this one executable, not sibling interpreters or helpers.
 # Synthetic model/cost only — not production account economics.
 set -eu
+[ "${1:-}" = "--no-auto-update" ] || exit 2
+shift
 
 MODE="${MACO_WRITABLE_GROK_ACP_FIXTURE_MODE:-success}"
 SESSION="maco-fixture-acp-session"

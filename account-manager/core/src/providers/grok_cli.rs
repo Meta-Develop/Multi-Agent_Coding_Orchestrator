@@ -213,6 +213,7 @@ impl GrokCliAdapter {
                 .resolved_working_directory()
                 .map_err(super::OAuthLoginRunError::Failed)?;
             command
+                .arg("--no-auto-update")
                 .arg("login")
                 .current_dir(cwd)
                 .env("GROK_HOME", home)
@@ -362,6 +363,7 @@ impl GrokCliAdapter {
             })?
         } else {
             Command::new(self.program())
+                .arg("--no-auto-update")
                 .arg("login")
                 .current_dir(self.resolved_working_directory()?)
                 .env("GROK_HOME", managed_home)
@@ -1300,6 +1302,7 @@ impl ProviderAdapter for GrokCliAdapter {
         let _operation = HomeOperationGuard::acquire(&home)?;
         gate_managed_home(&home, true)?;
         Ok(LaunchSpec::new(self.program())
+            .arg("--no-auto-update")
             .current_dir(self.resolved_working_directory()?)
             .set_plain_env("GROK_HOME", home.as_os_str())
             .remove_env("GROK_AUTH_PATH")
