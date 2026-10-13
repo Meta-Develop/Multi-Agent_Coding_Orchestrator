@@ -663,6 +663,14 @@ enum OfflineCheckObservedMessageCategory {
 }
 
 #[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+enum OfflineCheckObservedExactRefusal {
+    Unknown,
+    ManifestDigestRefusal,
+    ProtectedPathRefusal,
+}
+
+#[cfg(test)]
 fn offline_check_failure_diagnostic(
     stdout: &crate::process_runner::CapturedBytes,
     stderr: &crate::process_runner::CapturedBytes,
@@ -718,8 +726,24 @@ fn offline_check_failure_diagnostic(
             observed = category;
         }
     }
+    // Whole captured-message equality is still only an untrusted observation.
+    // No private prefix/suffix, truncation, or output on another stream is admitted.
+    let observed_exact_refusal =
+        if stdout.is_truncated() || stderr.is_truncated() || !stdout.as_bytes().is_empty() {
+            OfflineCheckObservedExactRefusal::Unknown
+        } else {
+            match stderr.as_bytes() {
+                b"Error: main helper manifest bytes did not match its declaration\n" => {
+                    OfflineCheckObservedExactRefusal::ManifestDigestRefusal
+                }
+                b"Error: fixed helper path was not owner-controlled and immutable\n" => {
+                    OfflineCheckObservedExactRefusal::ProtectedPathRefusal
+                }
+                _ => OfflineCheckObservedExactRefusal::Unknown,
+            }
+        };
     format!(
-        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={observed:?}",
+        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={observed:?}, observed_exact_public_refusal={observed_exact_refusal:?}",
         stdout.as_bytes().len(),
         stderr.as_bytes().len(),
     )
@@ -1732,7 +1756,7 @@ mod tests {
                 assert_eq!(
                     rendered,
                     format!(
-                        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={expected_category}",
+                        "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category={expected_category}, observed_exact_public_refusal=Unknown",
                         stdout.as_bytes().len(),
                         stderr.as_bytes().len(),
                     )
@@ -1759,8 +1783,70 @@ mod tests {
         let stderr = CapturedBytes::from_bytes_for_test(
             b"pinned executable metadata did not match its binding".to_vec(),
         );
-        assert!(offline_check_failure_diagnostic(&stdout, &stderr)
-            .ends_with("observed_opaque_message_category=PinnedSource"));
+        assert!(offline_check_failure_diagnostic(&stdout, &stderr).ends_with(
+            "observed_opaque_message_category=PinnedSource, observed_exact_public_refusal=Unknown"
+        ));
+
+        // Exercise the disclosure boundary with complete public messages and hostile framing.
+        // No output bytes or arbitrary suffix can become part of the rendered diagnostic.
+        let check_exact = |stdout_bytes: Vec<u8>,
+                           stdout_truncated: bool,
+                           stderr_bytes: Vec<u8>,
+                           stderr_truncated: bool,
+                           expected: &str| {
+            let stdout =
+                CapturedBytes::from_bytes_with_truncation_for_test(stdout_bytes, stdout_truncated);
+            let stderr =
+                CapturedBytes::from_bytes_with_truncation_for_test(stderr_bytes, stderr_truncated);
+            let rendered = offline_check_failure_diagnostic(&stdout, &stderr);
+            assert_eq!(
+                rendered,
+                format!(
+                    "managed Cursor offline check captured-output diagnostic: retained_stdout_bytes={}, retained_stderr_bytes={}, observed_opaque_message_category=Unknown, observed_exact_public_refusal={expected}",
+                    stdout.as_bytes().len(),
+                    stderr.as_bytes().len(),
+                )
+            );
+            if expected == "Unknown" {
+                assert_eq!(
+                    rendered,
+                    offline_check_failure_diagnostic(
+                        &CapturedBytes::from_bytes_for_test(vec![b'x'; stdout.as_bytes().len()]),
+                        &CapturedBytes::from_bytes_for_test(vec![b'y'; stderr.as_bytes().len()]),
+                    )
+                );
+            }
+        };
+        check_exact(Vec::new(), false, Vec::new(), false, "Unknown");
+        let refusals: [(&[u8], &str); 2] = [
+            (
+                b"Error: main helper manifest bytes did not match its declaration\n",
+                "ManifestDigestRefusal",
+            ),
+            (
+                b"Error: fixed helper path was not owner-controlled and immutable\n",
+                "ProtectedPathRefusal",
+            ),
+        ];
+        for (refusal, expected) in refusals {
+            check_exact(Vec::new(), false, refusal.to_vec(), false, expected);
+            check_exact(secret.to_vec(), false, refusal.to_vec(), false, "Unknown");
+            check_exact(refusal.to_vec(), false, Vec::new(), false, "Unknown");
+            check_exact(Vec::new(), true, refusal.to_vec(), false, "Unknown");
+            check_exact(Vec::new(), false, refusal.to_vec(), true, "Unknown");
+            for framed in [
+                [secret.as_slice(), refusal].concat(),
+                [refusal, secret.as_slice()].concat(),
+                [secret.as_slice(), refusal, secret.as_slice()].concat(),
+                [refusal, b"extra line\n".as_slice()].concat(),
+                [refusal, b"\xff".as_slice()].concat(),
+                [refusal, refusal].concat(),
+                [refusals[0].0, refusals[1].0].concat(),
+                vec![b'z'; refusal.len()],
+            ] {
+                check_exact(Vec::new(), false, framed, false, "Unknown");
+            }
+        }
     }
 
     fn test_budget() -> OperationBudget {
