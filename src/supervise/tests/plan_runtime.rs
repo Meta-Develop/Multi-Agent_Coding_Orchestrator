@@ -193,7 +193,11 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .attach_quota_config(&repo_path, options.run_id.as_str(), &quota_config)
         .expect("attach quota config to shared run budget ledger");
     let resolved_profile = default_resolved_objective_profile();
-    let selection = initialize_supervisor_selection_with_quota(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual quota-refresh task");
+    let selection = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
@@ -204,6 +208,9 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             context: Some(&quota_context),
             ledger: Some(&budget_ledger),
         },
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize automatic live quota selection");
     assert!(selection.selection_preflight_failure.is_none());

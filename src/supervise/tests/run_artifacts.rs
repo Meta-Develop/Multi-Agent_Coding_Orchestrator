@@ -367,13 +367,21 @@ fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
         source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
     };
 
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &advertised,
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("select roles for repeated Grok assignments");
     bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)
@@ -436,13 +444,21 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
             .expect("default objective binding"),
         source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
     };
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &AdvertisedCatalogSet::empty(),
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize selector evidence fixture");
     let initial = resolution
@@ -691,13 +707,21 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     switched.runtime_startup_micros = Some(1_200);
     record_live_invocation(switched).expect("record switched invocation");
 
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &AdvertisedCatalogSet::empty(),
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize selector evidence fixture");
     let initial = resolution

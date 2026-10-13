@@ -8517,15 +8517,22 @@ mod selection_policy_tests {
             SupervisorAdmissionConfig::default(),
             SupervisorAdmissionConfig::default(),
         )?;
+        let mut plan_metadata = SupervisorPlanMetadata::default();
+        let _routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
         let mut bridge_plan = plan.clone();
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let bridge_resolution = initialize_supervisor_selection(
+        let bridge_resolution = initialize_supervisor_selection_with_assessment(
             &mut bridge_plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
             Some(&resolved_objective_profile),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            plan_metadata.task_routing_assessment.as_ref(),
         )?;
         assert_eq!(bridge_plan.role_models, original_role_models);
         assert!(bridge_resolution.selection_preflight_failure.is_some());
@@ -8549,7 +8556,7 @@ mod selection_policy_tests {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),
                 assignment_metadata: AssignmentMetadata::new(),
-                plan_metadata: SupervisorPlanMetadata::default(),
+                plan_metadata,
             },
             options,
             1,
@@ -9152,6 +9159,11 @@ mod selection_policy_tests {
                 let mut worker = super::terminal_worker_assignment("codex-reviewed-worker");
                 worker.runtime = Some(SupervisorRuntime::Codex);
                 plan.assignments = vec![worker];
+                let _routing_policy = crate::supervise::bind_assessed_injected_plan(
+                    &plan,
+                    &repo,
+                    &mut metadata,
+                )?;
                 let initial = initialize_supervisor_selection_from_prepared_metadata(
                     &mut plan,
                     &mut metadata,
@@ -9562,6 +9574,12 @@ mod selection_policy_tests {
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("observed-model-worker")];
+            let _routing_policy = crate::supervise::bind_assessed_injected_plan(
+                &plan,
+                &repo,
+                &mut plan_metadata,
+            )?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,
@@ -9627,6 +9645,12 @@ mod selection_policy_tests {
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("unselected-account-worker")];
+            let _routing_policy = crate::supervise::bind_assessed_injected_plan(
+                &plan,
+                &repo,
+                &mut plan_metadata,
+            )?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,

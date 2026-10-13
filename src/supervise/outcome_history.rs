@@ -2155,11 +2155,12 @@ mod tests {
         Ok(())
     }
 
-    fn automatic_selector_for_this_run() -> Result<(
+    fn automatic_selector_for_this_run(repo: &Path) -> Result<(
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         CandidateKey,
         TaskProfile,
+        crate::selection::routing_policy::RoutingPolicyGuard,
     )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -2214,17 +2215,28 @@ mod tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: Vec::new(),
         };
+        plan.assignments.push(serde_json::from_value(serde_json::json!({
+            "id": "assignment-1", "phase": "execution", "role": "worker",
+            "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR]
+        }))?);
+        let mut metadata = SupervisorPlanMetadata::default();
+        let routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, repo, &mut metadata)?;
         let resolved = ResolvedObjectiveProfile {
             profile: crate::objective_profile::default_objective_profile().binding()?,
             source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
         };
-        let resolution = initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection_with_assessment(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
             Some(&resolved),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            metadata.task_routing_assessment.as_ref(),
         )?;
         let state = resolution
             .automatic_state
@@ -2246,6 +2258,7 @@ mod tests {
             state,
             candidate,
             worker.provenance.normalized_input.task.clone(),
+            routing_policy,
         ))
     }
 
@@ -2329,10 +2342,11 @@ mod tests {
 
     #[test]
     fn this_run_terminal_accept_moves_reselect_posterior() -> Result<()> {
-        let (catalog, state, candidate, task) = automatic_selector_for_this_run()?;
         let temp = tempfile::TempDir::new()?;
         let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
         std::fs::create_dir_all(&attempts)?;
+        let (catalog, state, candidate, task, _routing_policy) =
+            automatic_selector_for_this_run(temp.path())?;
         let mut evidence = unset_terminal_parent_result(fixture());
         evidence.run_id = "this-run-terminal-accept".to_string();
         evidence.selection = Some(AttemptSelectionBinding {
@@ -2400,10 +2414,11 @@ mod tests {
 
     #[test]
     fn this_run_exclusions_surface_on_reselect_provenance() -> Result<()> {
-        let (catalog, mut state, candidate, task) = automatic_selector_for_this_run()?;
         let temp = tempfile::TempDir::new()?;
         let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
         std::fs::create_dir_all(&attempts)?;
+        let (catalog, mut state, candidate, task, _routing_policy) =
+            automatic_selector_for_this_run(temp.path())?;
         let mut evidence = unset_terminal_parent_result(fixture());
         evidence.run_id = "this-run-exclusions".to_string();
         evidence.selection = Some(AttemptSelectionBinding {
