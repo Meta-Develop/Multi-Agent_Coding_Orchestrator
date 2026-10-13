@@ -3821,9 +3821,31 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             }
         }
     }
-    if let Err(error) = bind_final_dispatch_live_budget(&mut command, &budget_reservation)
-        .and_then(|()| super::runtime_executables::validate_launch(&command))
-    {
+    // Messaging is part of the immutable launch binding. Finish fallible setup
+    // before sealing the live grant or recording a provider invocation.
+    let messaging_server = match (|| -> Result<_> {
+        let messaging_server = if launch_runtime == SupervisorRuntime::Fake {
+            None
+        } else {
+            bind_assignment_messaging_unless_managed_readonly(context, &assignment.id, &mut command)?
+        };
+        record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
+        bind_final_dispatch_live_budget(&mut command, &budget_reservation)?;
+        super::runtime_executables::validate_launch(&command)?;
+        Ok(messaging_server)
+    })() {
+        Ok(server) => server,
+        Err(error) => {
+            drop(incoming_output_root);
+            drop(capture_output_root);
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
+            })?;
+            return Err(error);
+        }
+    };
+    if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
+        drop(messaging_server);
         drop(incoming_output_root);
         drop(capture_output_root);
         with_supervisor_artifacts(artifacts, |writer, _| {
@@ -3840,20 +3862,6 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             };
             // All fallible pre-dispatch preparation is complete. Mark
             // invocation only at the external-runner call boundary.
-            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
-                drop(incoming_output_root);
-                drop(capture_output_root);
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-                })?;
-                return Err(error);
-            }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
-                context,
-                &assignment.id,
-                &mut command,
-            )?;
             if let Some(state) = release_state {
                 state.store(2, Ordering::Release);
             }
@@ -3921,20 +3929,6 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli => {
-            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
-                drop(incoming_output_root);
-                drop(capture_output_root);
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-                })?;
-                return Err(error);
-            }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
-            let messaging_server = bind_assignment_messaging_unless_managed_readonly(
-                context,
-                &assignment.id,
-                &mut command,
-            )?;
             if let Some(state) = release_state {
                 state.store(2, Ordering::Release);
             }
@@ -3977,15 +3971,6 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             Ok(external_run)
         }
         SupervisorRuntime::Fake => {
-            if let Err(error) = budget_reservation.mark_invoked_for_runtime(launch_runtime) {
-                drop(incoming_output_root);
-                drop(capture_output_root);
-                with_supervisor_artifacts(artifacts, |writer, _| {
-                    discard_invocation_scratches(writer, &incoming_scratch, &capture_scratch)
-                })?;
-                return Err(error);
-            }
-            record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
             deterministic_fake_child_run(
                 &command,
                 assignment,
