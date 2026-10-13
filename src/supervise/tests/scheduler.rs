@@ -337,13 +337,18 @@ fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run two disjoint assignments");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
@@ -562,13 +567,18 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
                 NonZeroUsize::new(8).expect("test capacity is non-zero"),
             ));
     assert_eq!(serial_bound, 1);
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        serial_bound,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            serial_bound,
+            &runner,
+        )
+    }
     .expect("run serial overlapping assignments");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -636,13 +646,18 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
             injected_verified_run(command)
         };
 
-        let report = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            max_concurrent_children,
-            &runner,
-        )
+        let report = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+        }
         .expect("run deterministic semantic warn preview");
         assert!(report.success, "unexpected failed report: {report:#?}");
         let warnings = report
@@ -686,13 +701,18 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
         write_injected_assignment_report(command, assignment);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("serial warn early failure remains reportable");
     sync_store
         .release(external_claim.token)
@@ -747,13 +767,18 @@ fn semantic_resolution_failure_does_not_stop_healthy_assignment_at_any_bound() {
             }
         };
 
-        let report = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            max_concurrent_children,
-            &runner,
-        )
+        let report = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+        }
         .expect("semantic resolution failure remains assignment-local");
         assert!(!report.success);
         assert_eq!(
@@ -834,13 +859,18 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run deterministic semantic Block scheduling");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -890,13 +920,18 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("claim conflict remains assignment-local");
     sync_store
         .release(external_claim.token)
@@ -978,13 +1013,18 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("semantic Block conflict remains assignment-local");
     assert!(!report.success);
     assert_eq!(
@@ -1014,6 +1054,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
     const HOLDER_REPO_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_REPO";
     const HOLDER_ROOT_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_ROOT";
     const HOLDER_READY_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_READY";
+    const HOLDER_CUSTODY_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_CUSTODY";
 
     if std::env::var_os(HOLDER_PROCESS_ENV).is_some() {
         let repo_path = PathBuf::from(
@@ -1025,9 +1066,18 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         let ready = PathBuf::from(
             std::env::var_os(HOLDER_READY_ENV).expect("holder subprocess ready marker"),
         );
+        let witness = PathBuf::from(
+            std::env::var_os(HOLDER_CUSTODY_ENV).expect("holder subprocess custody witness"),
+        );
         let assignment = injected_named_assignment("interrupted-scope", "README.md");
         let plan = injected_multi_plan(vec![assignment], 0);
         let options = injected_options(&repo_path, &root, "externally-terminated-run");
+        let mut selected_fixture =
+            selected_concurrent_inherited_fixture(&plan, &options, &root, &ready, &witness)
+                .expect("validate explicit inherited parent fixture custody");
+        let _selected_fixture = selected_fixture
+            .install(&plan, &options)
+            .expect("hold explicit inherited selected concurrent fixture");
         let runner = move |_command: &ExternalAgentCommand| -> ExternalAgentRun {
             fs::write(&ready, b"claim acquired\n").expect("publish holder readiness");
             loop {
@@ -1057,6 +1107,15 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
 
     let (temp, repo_path) = injected_repository();
     let ready = temp.path().join("issue-51-supervise-holder-ready");
+    let holder_plan = injected_multi_plan(
+        vec![injected_named_assignment("interrupted-scope", "README.md")],
+        0,
+    );
+    let holder_options = injected_options(&repo_path, temp.path(), "externally-terminated-run");
+    // Borrow the actual parent owner before KillOnDrop so every unwind reaps first.
+    let holder_custody =
+        selected_concurrent_parent_custody(&holder_plan, &holder_options, &temp, &ready)
+            .expect("hold original parent fixture custody until child reap");
     let holder = std::process::Command::new(
         std::env::current_exe().expect("resolve current supervise test executable"),
     )
@@ -1069,6 +1128,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         .env(HOLDER_REPO_ENV, &repo_path)
         .env(HOLDER_ROOT_ENV, temp.path())
         .env(HOLDER_READY_ENV, &ready)
+        .env(HOLDER_CUSTODY_ENV, holder_custody.witness_path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -1118,6 +1178,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
     holder_process
         .wait()
         .expect("reap supervise holder process");
+    drop(holder_custody);
 
     let leftover = store
         .status_snapshot()
@@ -1140,13 +1201,19 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         write_injected_assignment_report(command, &blocked_assignment);
         injected_verified_run(command)
     };
-    let blocked = run_supervisor_plan_with_concurrent_runner(
-        blocked_plan,
-        SupervisorConsultantPlan::default(),
-        blocked_options,
-        1,
-        &blocked_runner,
-    )
+    let blocked = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&blocked_plan, &blocked_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            blocked_plan,
+            SupervisorConsultantPlan::default(),
+            blocked_options,
+            1,
+            &blocked_runner,
+        )
+    }
     .expect("retained claim produces a reportable typed refusal");
     let conflict = blocked
         .findings
@@ -1182,17 +1249,155 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         write_injected_assignment_report(command, &recovered_assignment);
         injected_verified_run(command)
     };
-    let recovered = run_supervisor_plan_with_concurrent_runner(
-        recovered_plan,
-        SupervisorConsultantPlan::default(),
-        recovered_options,
-        1,
-        &recovered_runner,
-    )
+    let recovered = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&recovered_plan, &recovered_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            recovered_plan,
+            SupervisorConsultantPlan::default(),
+            recovered_options,
+            1,
+            &recovered_runner,
+        )
+    }
     .expect("reacquisition after explicit disposition succeeds");
     assert!(recovered.success, "recovered run failed: {recovered:#?}");
     assert_eq!(recovered.released_claims.len(), 1);
     assert_eq!(recovered.released_claims[0].agent_id, "recovered-retry");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_concurrent_custody_refuses_forged_stale_and_rebound_inputs() {
+    fn require_custody_refusal(
+        result: Result<InheritedSelectedConcurrentFixture>,
+        expected: &'static str,
+    ) -> anyhow::Error {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("{expected}"),
+        }
+    }
+
+    let (temp, repo_path) = injected_repository();
+    let ready = temp.path().join("issue-51-supervise-holder-ready");
+    let plan = injected_multi_plan(
+        vec![injected_named_assignment("interrupted-scope", "README.md")],
+        0,
+    );
+    let options = injected_options(&repo_path, temp.path(), "externally-terminated-run");
+    let custody = selected_concurrent_parent_custody(&plan, &options, &temp, &ready)
+        .expect("create actual held custody for validator refusal controls");
+    assert!(
+        !ready.exists(),
+        "custody must not fabricate callback readiness"
+    );
+    let witness = custody.witness_path().to_path_buf();
+    // The creator is this process, not our actual parent: a held lock alone is insufficient.
+    let wrong_parent = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "same-process custody must not impersonate an inherited parent",
+    );
+    assert!(wrong_parent
+        .to_string()
+        .contains("parent incarnation differs"));
+
+    let mut changed_plan = plan.clone();
+    changed_plan.task.push_str(" changed fixture input");
+    let changed = require_custody_refusal(
+        selected_concurrent_inherited_fixture(
+            &changed_plan,
+            &options,
+            temp.path(),
+            &ready,
+            &witness,
+        ),
+        "changed plan must fail before inherited selection",
+    );
+    assert!(changed.to_string().contains("input binding differs"));
+    let changed_run = injected_options(&repo_path, temp.path(), "mismatched-inherited-run");
+    assert!(selected_concurrent_inherited_fixture(
+        &plan,
+        &changed_run,
+        temp.path(),
+        &ready,
+        &witness
+    )
+    .is_err());
+    let foreign_ready = temp.path().join("not-the-holder-ready");
+    assert!(selected_concurrent_inherited_fixture(
+        &plan,
+        &options,
+        temp.path(),
+        &foreign_ready,
+        &witness
+    )
+    .is_err());
+
+    let original_witness = fs::read(&witness).expect("retain public custody witness bytes");
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&original_witness).expect("parse custody control");
+    // SAFETY: getppid reads only this test process's actual parent PID.
+    forged["parent_pid"] = json!(unsafe { libc::getppid() });
+    forged["parent_incarnation"] = json!("unsupported-fixture-incarnation");
+    fs::write(
+        &witness,
+        serde_json::to_vec(&forged).expect("encode forged incarnation control"),
+    )
+    .expect("write forged incarnation control without replacing inode");
+    let unsupported = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "unsupported parent incarnation must fail",
+    );
+    assert!(unsupported
+        .to_string()
+        .contains("parent incarnation differs"));
+    forged = serde_json::from_slice(&original_witness).expect("restore witness control value");
+    forged["inputs"][1] = json!("not-the-frozen-policy-digest");
+    fs::write(
+        &witness,
+        serde_json::to_vec(&forged).expect("encode policy mismatch control"),
+    )
+    .expect("write policy mismatch control without replacing inode");
+    let wrong_policy = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "different frozen policy binding must fail",
+    );
+    assert!(wrong_policy.to_string().contains("input binding differs"));
+    fs::write(&witness, b"{").expect("write malformed witness control");
+    assert!(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness)
+            .is_err()
+    );
+    fs::write(&witness, &original_witness).expect("restore original witness before path controls");
+
+    let saved_witness = temp.path().join("saved-concurrent-custody.json");
+    fs::rename(&witness, &saved_witness).expect("retain actual witness before symlink control");
+    std::os::unix::fs::symlink(&saved_witness, &witness)
+        .expect("create witness symlink refusal control");
+    assert!(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness)
+            .is_err()
+    );
+    fs::remove_file(&witness).expect("remove only test symlink control");
+    fs::rename(&saved_witness, &witness).expect("restore original held witness identity");
+
+    drop(custody);
+    let stale = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "an unheld stale witness must fail before selection",
+    );
+    assert!(stale.to_string().contains("custody is not held"));
+    assert!(
+        !ready.exists(),
+        "all refusal controls retain absent readiness"
+    );
+    assert!(
+        repo_path.is_dir(),
+        "borrowed custody never deletes the parent repository"
+    );
 }
 
 #[test]
@@ -1270,13 +1475,18 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run retry slot scheduler");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -1334,13 +1544,18 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("normal child failure remains a finalized report");
     assert!(!report.success);
     assert!(report.breaker_trip.is_none());
@@ -1370,13 +1585,19 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
         injected_verified_run(command)
     };
 
-    let failed_report = run_supervisor_plan_with_concurrent_runner(
-        failed_plan,
-        SupervisorConsultantPlan::default(),
-        failed_options,
-        1,
-        &failed_runner,
-    )
+    let failed_report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&failed_plan, &failed_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            failed_plan,
+            SupervisorConsultantPlan::default(),
+            failed_options,
+            1,
+            &failed_runner,
+        )
+    }
     .expect("nonaccepted run remains reportable");
 
     assert!(!failed_report.success);
@@ -1396,13 +1617,19 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
         write_injected_assignment_report(command, &followup_assignment);
         injected_verified_run(command)
     };
-    let followup_report = run_supervisor_plan_with_concurrent_runner(
-        followup_plan,
-        SupervisorConsultantPlan::default(),
-        followup_options,
-        1,
-        &followup_runner,
-    )
+    let followup_report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&followup_plan, &followup_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            followup_plan,
+            SupervisorConsultantPlan::default(),
+            followup_options,
+            1,
+            &followup_runner,
+        )
+    }
     .expect("followup run reacquires released path");
 
     assert!(
@@ -1437,13 +1664,18 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
     };
     install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
 
-    let _report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let _report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("checkpoint failure remains reportable after terminal finalization");
 
     let (_checkpoint, snapshot) =
@@ -1474,13 +1706,18 @@ fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
     };
     set_force_degraded_checkpoint_finalization();
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("degraded finalization remains reportable");
 
     assert!(report.success, "degraded finalization report: {report:#?}");
@@ -1538,13 +1775,18 @@ fn assert_scheduler_assignment_runner_cancellation_scopes_isolated(max_concurren
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        max_concurrent_children,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            max_concurrent_children,
+            &runner,
+        )
+    }
     .expect("assignment runner scope isolation fixture remains reportable");
 
     assert!(
@@ -1638,13 +1880,18 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
 
     let supervisor_handle = thread::spawn(move || {
         let _injection_cleanup = injection_cleanup;
-        let result = run_supervisor_plan_with_concurrent_cancellable_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_cancellable_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         (temp, result)
     });
     let supervisor_thread = SupervisorThreadGuard::new(
@@ -1726,13 +1973,18 @@ fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("serial scheduling error remains reportable after collecting completed work");
 
     assert!(!report.success);
@@ -1786,13 +2038,18 @@ fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
     };
     install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
 
-    let _report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let _report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("concurrent checkpoint failure remains reportable after terminal finalization");
 
     let (_checkpoint, snapshot) = open_supervisor_checkpoint(&repo_path, &run_id)
@@ -1907,13 +2164,18 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
     };
 
     let supervisor_handle = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_cancellable_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_cancellable_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         (temp, result)
     });
     let mut supervisor_thread = SupervisorThreadGuard::new(
@@ -2090,13 +2352,18 @@ fn contained_nonzero_child_failure_does_not_stop_pending_unrelated_assignment() 
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("contained child failure remains reportable");
     assert!(!report.success);
     assert_eq!(
@@ -2183,23 +2450,48 @@ fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !abort.child_a_returned {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                abort.release_child_b = true;
+                condvar.notify_all();
+                drop(abort);
+                let _ = supervisor_thread.join();
+                panic!("fatal scheduler fixture supervisor completed before child-a callback");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         abort = condvar
-            .wait(abort)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(abort, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!abort.child_c_started);
     assert!(matches!(
@@ -2296,13 +2588,18 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("fatal containment result remains reportable");
 
     assert!(!report.success);
@@ -2386,23 +2683,48 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !release.child_a_returned {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                release.release_child_b = true;
+                condvar.notify_all();
+                drop(release);
+                let _ = supervisor_thread.join();
+                panic!("claim release fixture supervisor completed before child-a callback");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         release = condvar
-            .wait(release)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(release, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!release.child_c_started);
     assert!(matches!(
@@ -2499,23 +2821,48 @@ fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment()
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut panic_state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !panic_state.child_a_panicking {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                panic_state.release_child_b = true;
+                condvar.notify_all();
+                drop(panic_state);
+                let _ = supervisor_thread.join();
+                panic!("panic after claim fixture supervisor completed before child-a callback");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         panic_state = condvar
-            .wait(panic_state)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(panic_state, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!panic_state.child_c_started);
     assert!(matches!(

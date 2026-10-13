@@ -1,4 +1,11 @@
 use super::*;
+use crate::supervise::messaging_bridge::{
+    with_supervisor_messaging_session,
+    worker_requests::{
+        frozen::{WorkerInboxEndpoint, WorkerInboxResources, WorkerInboxTurn},
+        WorkerRequestInbox,
+    },
+};
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -41,7 +48,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             | "attached-capture-unquiescent"
             | "attached-capture-errors"
     );
-    let _cam_authority = attached_capture.then(|| {
+    let bound_parent = case.starts_with("bound-");
+    let unbound_parent = !case.starts_with("managed-cycle-") && !attached_capture && !bound_parent;
+    let _cam_authority = (attached_capture || bound_parent || unbound_parent).then(|| {
         crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
             None,
         )
@@ -110,16 +119,18 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             "auditor":{"model":"gpt-5.6-sol", "reasoning_effort":"high"}
         }
     }))?;
-    let run_id = if case.starts_with("managed-cycle-") || attached_capture {
-        RunId::new(format!(
-            "nested-driver-test-{}",
-            crate::artifacts::state_auth::random_identifier()?
-        ))?
-    } else {
-        RunId::new("nested-driver-test")?
-    };
+    let run_id =
+        if case.starts_with("managed-cycle-") || attached_capture || bound_parent || unbound_parent
+        {
+            RunId::new(format!(
+                "nested-driver-test-{}",
+                crate::artifacts::state_auth::random_identifier()?
+            ))?
+        } else {
+            RunId::new("nested-driver-test")?
+        };
     #[cfg(target_os = "linux")]
-    if case.starts_with("managed-cycle-") || attached_capture {
+    if case.starts_with("managed-cycle-") || attached_capture || bound_parent || unbound_parent {
         crate::account_authority::record_observed_codex_selection(
             Some(run_id.as_str()),
             crate::account_authority::CODEX_CLI_PROVIDER_ID,
@@ -309,6 +320,48 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             .insert("child_orchestrator".into(), parent_preference);
         frozen.sha256 =
             crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+        // The parent coordinates these authored terminal Workers; it is not a
+        // third independent task, and their disjoint scopes remain separate.
+        let assignments = plan
+            .assignments
+            .iter()
+            .flat_map(|parent| {
+                parent.worker_assignments.iter().map(move |worker| {
+                    Ok(crate::planning::TaskAssignmentProposal {
+                        id: worker.id.clone(),
+                        task: worker
+                            .task
+                            .clone()
+                            .context("isolated fixture requires its authored Worker task")?,
+                        fragment_ids: vec![worker.id.clone()],
+                        assigned_paths: worker.assigned_paths.clone(),
+                        semantic_symbols: worker.semantic_symbols.clone(),
+                        semantic_modules: worker.semantic_modules.clone(),
+                        decision_dependencies: parent
+                            .decision_refs
+                            .iter()
+                            .map(|reference| reference.question_key().to_owned())
+                            .collect(),
+                    })
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let disjointness = crate::planning::task_assignment_disjointness(&assignments)?;
+        let proposal = crate::planning::TaskDecompositionProposal {
+            fragments: assignments
+                .iter()
+                .map(|assignment| crate::planning::TaskSpecFragment {
+                    id: assignment.id.clone(),
+                    text: assignment.task.clone(),
+                })
+                .collect(),
+            assignments,
+            coverage_gaps: Vec::new(),
+            diagnostics: Default::default(),
+            disjointness,
+        };
+        let assessment =
+            super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
         let guard = bind_routing_policy(Some(frozen))?;
         plan.role_models.clear();
         let admission = SupervisorAdmissionPolicyInput::resolve_with_quota(
@@ -319,7 +372,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             None,
         )?;
         let selected =
-            super::super::selection_bridge::initialize_supervisor_selection_with_history(
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
                 &mut plan,
                 SupervisorRuntime::Codex,
                 &catalog,
@@ -328,7 +381,8 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 Some(&crate::objective_profile::default_resolved_objective_profile()?),
                 super::super::selection_bridge::SupervisorQuotaSelectionInput::default(),
                 None,
-                None,
+                &[],
+                Some(&assessment),
             )?;
         assert!(
             selected.selection_preflight_failure.is_none(),
@@ -391,7 +445,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             subject
         };
         calls.lock().unwrap().push(subject.id.clone());
-        if attached_capture {
+        if attached_capture || ((bound_parent || unbound_parent) && subject.id == "parent") {
             let identity = command.agent_lifecycle.as_ref().unwrap();
             assert_eq!(identity.run_id, run_id.as_str());
             assert_eq!(identity.task_id, parent.id);
@@ -488,7 +542,12 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         let mut simulated = command.clone();
         simulated.model = None;
         let mut fake_subject = subject.clone();
-        if (case.starts_with("managed-cycle-") || attached_capture) && subject.id == "parent" {
+        if (case.starts_with("managed-cycle-")
+            || attached_capture
+            || bound_parent
+            || unbound_parent)
+            && subject.id == "parent"
+        {
             fake_subject.worker_assignments.clear();
         }
         if case.starts_with("managed-cycle-") && subject.id != "parent" {
@@ -519,6 +578,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         if case == "attached-capture-success"
             || case == "attached-capture-errors"
             || case.starts_with("managed-cycle-")
+            || (bound_parent && subject.id == "parent")
         {
             run.stdout = crate::external_agent::CapturedOutput::from_captured_bytes_for_test(
                 &crate::process_runner::CapturedBytes::from_bytes_for_test(
@@ -557,6 +617,14 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 executable_identity: "fixture".into(),
             });
         if subject.id == "parent" {
+            if bound_parent {
+                run.output_last_message = Some(
+                    serde_json::to_vec(&super::bound_parent_turn_tests::yield_report(
+                        run_id.as_str(),
+                    ))
+                    .unwrap(),
+                );
+            }
             if case.starts_with("yield-") || case.starts_with("continuation-") {
                 let mut report = json!({
                     "version":1, "outcome":"yield_workers", "run_id":run_id.as_str(),
@@ -842,10 +910,59 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         cancellation: cancellation.clone(),
         external_runner: &runner,
     };
+    // Keep the real initial-parent endpoint owner alive through collected-turn
+    // handoff; a matching launch value alone does not own its journal or service.
+    let unbound_binding = if unbound_parent {
+        Some(with_supervisor_messaging_session(&run_dir, |factory| {
+            factory.worker_request_binding(&run_id, &parent, 1, "generation")
+        })?)
+    } else {
+        None
+    };
+    let unbound_turn = unbound_binding
+        .as_ref()
+        .map(|binding| {
+            WorkerInboxTurn::new(
+                binding.clone(),
+                1,
+                WorkerInboxResources {
+                    repo: &repo,
+                    parent: &preflight.assignment,
+                    lease: preflight.worktree_write_lease.as_ref().unwrap(),
+                    claim: &preflight.claim,
+                    claims: &sync_store,
+                },
+            )
+        })
+        .transpose()?;
+    let unbound_endpoint = unbound_turn
+        .as_ref()
+        .map(|turn| {
+            WorkerInboxEndpoint::start(
+                &run_dir,
+                turn,
+                WorkerRequestInbox::create(
+                    crate::artifacts::repository_authenticator_key_only(&repo)?,
+                    unbound_binding
+                        .as_ref()
+                        .context("unbound parent lost its fresh inbox binding")?
+                        .clone(),
+                )?,
+                cancellation.clone(),
+            )
+        })
+        .transpose()?;
+    let unbound_launch = unbound_endpoint.as_ref().map(WorkerInboxEndpoint::launch);
     let mut outcome = AssignmentExecutionOutcome::default();
     ISOLATED_TEST_REFUSE_SPAWN.with(|flag| flag.set(case == "managed-cycle-isolated-unstarted"));
-    let Some(mut collected) =
-        prepare_and_collect_fixture_parent(case, &context, &preflight, &mut outcome, &calls)?
+    let Some(mut collected) = prepare_and_collect_fixture_parent(
+        case,
+        &context,
+        &preflight,
+        &mut outcome,
+        &calls,
+        unbound_launch.as_ref(),
+    )?
     else {
         if isolated {
             assert_eq!(
@@ -941,38 +1058,6 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         }
         assert_eq!(*calls.lock().unwrap(), ["parent"]);
         assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
-        assert_eq!(ledger.report()?.active_reservations, 0);
-        return Ok(());
-    }
-    if case.starts_with("bound-") {
-        super::bound_parent_turn_tests::exercise(
-            case,
-            &context,
-            &preflight,
-            &mut outcome,
-            &mut collected,
-        )?;
-        let expected = match case {
-            "bound-shared-driver"
-            | "bound-evidence-happy"
-            | "bound-evidence-edits"
-            | "bound-evidence-candidate-after"
-            | "bound-evidence-cancel-after"
-            | "bound-evidence-second-failure"
-            | "bound-evidence-claim-revoked" => vec!["parent", "worker-two", "worker"],
-            "bound-evidence-forged"
-            | "bound-evidence-widened"
-            | "bound-evidence-failure"
-            | "bound-evidence-cancel-during" => vec!["parent", "worker-two"],
-            case if case.starts_with("bound-evidence-handoff-") => vec!["parent", "worker-two"],
-            _ => vec!["parent"],
-        };
-        assert_eq!(*calls.lock().unwrap(), expected);
-        context.manager.verify_write_execution_lease(
-            &parent.id,
-            preflight.worktree_write_lease.as_ref().unwrap(),
-        )?;
-        assert_eq!(context.manager.list_managed_verified()?.len(), 1);
         assert_eq!(ledger.report()?.active_reservations, 0);
         return Ok(());
     }
@@ -1149,10 +1234,14 @@ fn prepare_and_collect_fixture_parent<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
     calls: &Mutex<Vec<String>>,
+    unbound_launch: Option<&crate::messaging::transport::AssignmentMessagingLaunch>,
 ) -> Result<Option<Box<CollectedChildAttempt<'a>>>> {
     let run_id = &context.options.run_id;
     let dirs = context.dirs;
-    if case.starts_with("managed-cycle-") || case.starts_with("attached-capture-") {
+    if case.starts_with("managed-cycle-")
+        || case.starts_with("attached-capture-")
+        || case.starts_with("bound-")
+    {
         let prepared = match prepare_managed_parent_initial_attempt(
             context,
             outcome,
@@ -1171,6 +1260,32 @@ fn prepare_and_collect_fixture_parent<'a>(
                 bail!("managed parent preparation unexpectedly completed")
             }
         };
+        if case.starts_with("bound-") {
+            super::bound_parent_turn_tests::exercise(case, context, preflight, outcome, prepared)?;
+            let expected = match case {
+                "bound-shared-driver"
+                | "bound-evidence-happy"
+                | "bound-evidence-edits"
+                | "bound-evidence-candidate-after"
+                | "bound-evidence-cancel-after"
+                | "bound-evidence-second-failure"
+                | "bound-evidence-claim-revoked" => vec!["parent", "worker-two", "worker"],
+                "bound-evidence-forged"
+                | "bound-evidence-widened"
+                | "bound-evidence-failure"
+                | "bound-evidence-cancel-during" => vec!["parent", "worker-two"],
+                case if case.starts_with("bound-evidence-handoff-") => vec!["parent", "worker-two"],
+                _ => vec!["parent"],
+            };
+            assert_eq!(*calls.lock().unwrap(), expected);
+            context.manager.verify_write_execution_lease(
+                &preflight.assignment.id,
+                preflight.worktree_write_lease.as_ref().unwrap(),
+            )?;
+            assert_eq!(context.manager.list_managed_verified()?.len(), 1);
+            assert_eq!(context.budget_ledger.report()?.active_reservations, 0);
+            return Ok(None);
+        }
         if case.starts_with("attached-capture-") {
             let result = super::attached_parent_capture_tests::exercise(
                 case, context, preflight, outcome, prepared,
@@ -1184,7 +1299,7 @@ fn prepare_and_collect_fixture_parent<'a>(
         )?;
         return Ok(None);
     }
-    let prepared = match prepare_child_attempt(
+    let mut prepared = match prepare_managed_parent_initial_attempt(
         context,
         outcome,
         &context.budget_policy,
@@ -1196,13 +1311,26 @@ fn prepare_and_collect_fixture_parent<'a>(
         &dirs.schemas.join("orchestrator-review-report.schema.json"),
         &dirs.schemas.join("worker-report.schema.json"),
         &dirs.schemas.join("auditor-report.schema.json"),
-        None,
     )? {
         AssignmentExecutionDisposition::Continue(prepared) => prepared,
         AssignmentExecutionDisposition::Complete => {
             bail!("parent preparation unexpectedly completed")
         }
     };
+    let launch = unbound_launch.context("unbound parent requires its held fresh inbox endpoint")?;
+    prepared.command = prepared
+        .command
+        .clone()
+        .with_assignment_messaging(launch.clone());
+    prepared
+        .command
+        .verify_assignment_messaging_protocol_instructions()?;
+    assert_eq!(prepared.command.assignment_messaging_launch(), Some(launch));
+    prepared.command_admission = Some(
+        super::managed_parent_controller::admit_attached_parent_initial_for_test(
+            context, preflight, &prepared,
+        )?,
+    );
     let collected = dispatch_and_collect_child_attempt(
         context,
         outcome,

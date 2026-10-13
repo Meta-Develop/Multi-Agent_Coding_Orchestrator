@@ -338,6 +338,14 @@ fn budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts() {
             ),
         },
     );
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: None,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
     let requested_plan = plan.clone();
     let mut assignment_metadata = AssignmentMetadata::new();
     assignment_metadata.insert(

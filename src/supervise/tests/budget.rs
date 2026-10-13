@@ -8,6 +8,70 @@ fn install_budget_fixture_models() -> InstalledModelCapabilityPolicy {
     .expect("budget fixture capability policy")
 }
 
+#[cfg(target_os = "linux")]
+fn bind_priced_budget_fixture_prior(
+    repo: &Path,
+) -> Result<crate::supervise::prior_input::OperatorPriorDataGuard> {
+    use crate::supervise::{
+        model_policy::{ModelCapabilityEvidence, ModelCapabilityPolicy},
+        prior_input::{bind_operator_prior_data, OperatorPriorSnapshot},
+    };
+    use std::io::Write;
+
+    let base =
+        crate::supervise::selection_bridge::base_selector_priors_with_terminal_worker_economics()?;
+    let mut prior = base
+        .models
+        .iter()
+        .find(|row| row.runtime == "codex" && row.model == FRONTIER_PROFILE_MODEL)
+        .cloned()
+        .context("budget fixture baseline profile")?;
+    prior.model = "priced-model".to_string();
+    prior.source_id = "synthetic-budget-profile".to_string();
+    prior.prior_scope = "budget fixture only; not measured provider/model evidence".to_string();
+    prior.limitations.push(
+        "synthetic nonlive budget profile; grants no account or launch authority".to_string(),
+    );
+    let snapshot = OperatorPriorSnapshot {
+        schema_version: 1,
+        dataset_id: "synthetic-budget-prior".to_string(),
+        revision: format!("{}+budget-fixture", base.revision),
+        published_on: base.published_on.clone(),
+        models: vec![prior],
+        capability_policy: ModelCapabilityPolicy {
+            id: "synthetic-budget-capability".to_string(),
+            version: 1,
+            source: "nonlive budget fixture only".to_string(),
+            models: vec![ModelCapabilityEvidence {
+                model: "priced-model".to_string(),
+                capability: ModelCapabilityClass::CriticalJudgment,
+                eligible: true,
+                evidence: "synthetic budget profile; not provider or account evidence".to_string(),
+                as_of: base.published_on,
+            }],
+        },
+    };
+    let relative_path = Path::new("budget-fixture-prior.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(repo.join(relative_path))?;
+    file.write_all(&serde_json::to_vec(&snapshot)?)?;
+    drop(file);
+    bind_operator_prior_data(repo, relative_path)
+}
+
+#[cfg(target_os = "linux")]
+fn priced_budget_fixture_profile() -> Result<(&'static str, ReasoningEffort)> {
+    let lenses = single_parent_acceptance_review_lenses();
+    let effort = lenses
+        .first()
+        .and_then(|lens| lens.backend.reasoning_effort())
+        .and_then(ReasoningEffort::parse)
+        .context("budget fixture authored acceptance effort")?;
+    Ok(("priced-model", effort))
+}
+
 #[test]
 fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     let legacy_source = json!({
@@ -472,6 +536,17 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
         temp.path(),
         "budget-concurrent-oversubscription",
     );
+    #[cfg(target_os = "linux")]
+    let _prior = bind_priced_budget_fixture_prior(&repo_path).expect("bind priced budget prior");
+    #[cfg(target_os = "linux")]
+    let _selection = crate::supervise::scheduler::install_selected_child_budget_fixture(
+        &plan,
+        &options,
+        &temp,
+        priced_budget_fixture_profile().expect("authored budget profile"),
+        2,
+    )
+    .expect("select authored budget Child and Auditor");
     let child_invocations = Arc::new(AtomicUsize::new(0));
     let runner = {
         let child_invocations = Arc::clone(&child_invocations);
@@ -583,6 +658,15 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
         "budget-live-grant-admission"
     };
     let options = injected_options(&repo_path, temp.path(), run_id);
+    let _prior = bind_priced_budget_fixture_prior(&repo_path).expect("bind priced budget prior");
+    let _selection = crate::supervise::scheduler::install_selected_researcher_budget_fixture(
+        &plan,
+        &options,
+        &temp,
+        priced_budget_fixture_profile().expect("authored budget profile"),
+        2,
+    )
+    .expect("select authored budget Researcher and Auditor");
     let (sender, receiver) = std::sync::mpsc::channel();
     if !interleave_review {
         crate::supervise::scheduler::set_live_grant_admission_observer(sender);
@@ -866,6 +950,9 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
         host_disk_per_child_mib: Some(512),
         ..SupervisorAdmissionConfig::default()
     };
+    #[cfg(target_os = "linux")]
+    let _selection = selected_concurrent_injected_fixture(&plan, &options, &temp)
+        .expect("select authored judgment budget fixture");
     let child_bindings = Arc::new(Mutex::new(BTreeMap::<String, (String, String)>::new()));
     let runner = {
         let child_bindings = Arc::clone(&child_bindings);

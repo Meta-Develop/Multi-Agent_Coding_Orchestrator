@@ -4062,6 +4062,1050 @@ impl Drop for CamObserveTestGuard {
     }
 }
 
+// A repository-root loan for this one real libtest child. This is fixture custody,
+// never an account, process-launch, selection or publication grant.
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_HOLDER_TEST: &str = "supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence";
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_CUSTODY_WITNESS: &str = "concurrent-holder-custody.json";
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_CUSTODY_LOCK: &str = "concurrent-holder-custody.lock";
+#[cfg(all(test, target_os = "linux"))]
+const MAX_CONCURRENT_CUSTODY_BYTES: u64 = 64 * 1024;
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConcurrentCustodyWitness {
+    version: u8,
+    test: String,
+    parent_pid: u32,
+    parent_incarnation: String,
+    root: PathBuf,
+    root_identity: crate::safe_state::FileIdentity,
+    repo: PathBuf,
+    repo_identity: crate::safe_state::FileIdentity,
+    // Readiness does not exist yet: bind its existing parent and future path only.
+    ready: PathBuf,
+    run: String,
+    inputs: [String; 3],
+    witness_identity: crate::safe_state::FileIdentity,
+    lock_identity: crate::safe_state::FileIdentity,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn concurrent_custody_inputs(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    assessment: &TaskRoutingAssessment,
+) -> Result<[String; 3]> {
+    assessment.validate_for_task(frozen, &plan.task)?;
+    Ok([
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(plan)?),
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(frozen)?),
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(assessment)?),
+    ])
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn verify_concurrent_custody_root(root: &crate::safe_state::SafeRoot) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    root.verify()?;
+    let metadata = std::fs::symlink_metadata(root.path())?;
+    // SAFETY: geteuid reads only the calling process's effective UID.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || *root.identity()
+            != (crate::safe_state::FileIdentity {
+                device: metadata.dev(),
+                file: metadata.ino(),
+            })
+    {
+        bail!("inherited concurrent fixture root is not the pinned private directory");
+    }
+    root.verify()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn concurrent_custody_ready(root: &crate::safe_state::SafeRoot, ready: &Path) -> Result<PathBuf> {
+    if ready.parent() != Some(root.path())
+        || ready.file_name() != Some(std::ffi::OsStr::new("issue-51-supervise-holder-ready"))
+    {
+        bail!("inherited concurrent fixture readiness path differs");
+    }
+    root.direct_child("issue-51-supervise-holder-ready")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct ParentConcurrentFixtureCustody<'a> {
+    witness: PathBuf,
+    _root: crate::safe_state::SafeRoot,
+    _repo: crate::safe_state::SafeRoot,
+    _lock: crate::safe_state::KernelStateLock,
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _owner: &'a tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl<'a> ParentConcurrentFixtureCustody<'a> {
+    pub(super) fn create(
+        plan: &SupervisorPlan,
+        options: &SupervisorRunOptions,
+        metadata: &SupervisorPlanMetadata,
+        owner: &'a tempfile::TempDir,
+        ready: &Path,
+        policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    ) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let root = crate::safe_state::SafeRoot::open_existing(owner.path())?;
+        verify_concurrent_custody_root(&root)?;
+        let repo = crate::safe_state::SafeRoot::open_existing(&options.repo)?;
+        if !repo.path().starts_with(root.path()) || options.runtime != SupervisorRuntime::Codex {
+            bail!("parent concurrent fixture requires its original owned Codex repository");
+        }
+        let ready = concurrent_custody_ready(&root, ready)?;
+        match std::fs::symlink_metadata(&ready) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("parent concurrent fixture readiness must still be absent"),
+        }
+        let frozen = metadata
+            .resolved_routing_policy
+            .as_ref()
+            .context("fixture frozen policy")?;
+        let assessment = metadata
+            .task_routing_assessment
+            .as_ref()
+            .context("fixture assessment")?;
+        if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen) {
+            bail!("parent concurrent fixture requires its held frozen policy");
+        }
+        let parent_pid = std::process::id();
+        let parent_incarnation = crate::agent_lifecycle::process_start_time(parent_pid)?;
+        let lock =
+            crate::safe_state::KernelStateLock::acquire_direct(&root, CONCURRENT_CUSTODY_LOCK)?;
+        let witness = root.direct_child(CONCURRENT_CUSTODY_WITNESS)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&witness)?;
+        let file_metadata = file.metadata()?;
+        let data = ConcurrentCustodyWitness {
+            version: 1,
+            test: CONCURRENT_HOLDER_TEST.to_string(),
+            parent_pid,
+            parent_incarnation,
+            root: root.path().to_path_buf(),
+            root_identity: root.identity().clone(),
+            repo: repo.path().to_path_buf(),
+            repo_identity: repo.identity().clone(),
+            ready,
+            run: options.run_id.to_string(),
+            inputs: concurrent_custody_inputs(plan, frozen, assessment)?,
+            witness_identity: crate::safe_state::FileIdentity {
+                device: file_metadata.dev(),
+                file: file_metadata.ino(),
+            },
+            lock_identity: lock.identity().clone(),
+        };
+        let bytes = serde_json::to_vec(&data)?;
+        if bytes.len() as u64 > MAX_CONCURRENT_CUSTODY_BYTES {
+            bail!("parent concurrent fixture custody witness exceeds its bound");
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        lock.verify_direct_binding(&root)?;
+        repo.verify()?;
+        verify_concurrent_custody_root(&root)?;
+        Ok(Self {
+            witness,
+            _root: root,
+            _repo: repo,
+            _lock: lock,
+            _policy: policy,
+            _owner: owner,
+        })
+    }
+
+    pub(super) fn witness_path(&self) -> &Path {
+        &self.witness
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+pub(super) struct InheritedConcurrentFixtureRoot {
+    root: crate::safe_state::SafeRoot,
+    repo: crate::safe_state::SafeRoot,
+    witness_path: PathBuf,
+    witness: ConcurrentCustodyWitness,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl InheritedConcurrentFixtureRoot {
+    fn read_witness(path: &Path) -> Result<ConcurrentCustodyWitness> {
+        use std::os::unix::fs::MetadataExt;
+        let mut identity = None;
+        let bytes = crate::safe_state::BoundedRegularReader::read_tree_no_follow_validated(
+            path,
+            MAX_CONCURRENT_CUSTODY_BYTES,
+            |metadata| {
+                // SAFETY: geteuid reads only the calling process's effective UID.
+                if metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o077 != 0
+                    || metadata.nlink() != 1
+                {
+                    bail!("inherited concurrent fixture witness is not private single-link data");
+                }
+                let observed = crate::safe_state::FileIdentity {
+                    device: metadata.dev(),
+                    file: metadata.ino(),
+                };
+                if identity.as_ref().is_some_and(|prior| prior != &observed) {
+                    bail!("inherited concurrent fixture witness identity changed");
+                }
+                identity = Some(observed);
+                Ok(())
+            },
+        )?;
+        let witness: ConcurrentCustodyWitness = serde_json::from_slice(&bytes)?;
+        if identity.as_ref() != Some(&witness.witness_identity) {
+            bail!("inherited concurrent fixture witness identity differs");
+        }
+        Ok(witness)
+    }
+
+    pub(super) fn open(
+        plan: &SupervisorPlan,
+        options: &SupervisorRunOptions,
+        metadata: &SupervisorPlanMetadata,
+        root: &Path,
+        ready: &Path,
+        witness_path: &Path,
+    ) -> Result<Self> {
+        let root = crate::safe_state::SafeRoot::open_existing(root)?;
+        let repo = crate::safe_state::SafeRoot::open_existing(&options.repo)?;
+        if witness_path != root.direct_child(CONCURRENT_CUSTODY_WITNESS)?
+            || !repo.path().starts_with(root.path())
+        {
+            bail!("inherited concurrent fixture paths are outside parent custody");
+        }
+        let witness = Self::read_witness(witness_path)?;
+        if witness.ready != concurrent_custody_ready(&root, ready)? {
+            bail!("inherited concurrent fixture readiness binding differs");
+        }
+        let inherited = Self {
+            root,
+            repo,
+            witness_path: witness_path.to_path_buf(),
+            witness,
+        };
+        inherited.verify(
+            plan,
+            &options.run_id,
+            &options.repo,
+            metadata
+                .resolved_routing_policy
+                .as_ref()
+                .context("fixture frozen policy")?,
+            metadata
+                .task_routing_assessment
+                .as_ref()
+                .context("fixture assessment")?,
+        )?;
+        Ok(inherited)
+    }
+
+    fn verify(
+        &self,
+        plan: &SupervisorPlan,
+        run: &RunId,
+        repo: &Path,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+        assessment: &TaskRoutingAssessment,
+    ) -> Result<()> {
+        use crate::safe_state::{BoundedRegularReader, ExistingExclusiveLock, KernelStateLock};
+        verify_concurrent_custody_root(&self.root)?;
+        self.repo.verify()?;
+        let witness = Self::read_witness(&self.witness_path)?;
+        if witness != self.witness
+            || witness.version != 1
+            || witness.test != CONCURRENT_HOLDER_TEST
+            || witness.root != self.root.path()
+            || witness.root_identity != *self.root.identity()
+            || witness.repo != self.repo.path()
+            || witness.repo_identity != *self.repo.identity()
+            || witness.repo != repo
+            || witness.run != run.as_str()
+            || witness.inputs != concurrent_custody_inputs(plan, frozen, assessment)?
+        {
+            bail!("inherited concurrent fixture input binding differs");
+        }
+        let lock_path = self.root.direct_child(CONCURRENT_CUSTODY_LOCK)?;
+        if BoundedRegularReader::identity(&lock_path)? != witness.lock_identity {
+            bail!("inherited concurrent fixture custody lock identity differs");
+        }
+        match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.root,
+            CONCURRENT_CUSTODY_LOCK,
+        )? {
+            ExistingExclusiveLock::Busy => {}
+            ExistingExclusiveLock::Missing | ExistingExclusiveLock::Acquired(_) => {
+                bail!("inherited concurrent fixture custody is not held");
+            }
+        }
+        if BoundedRegularReader::identity(&lock_path)? != witness.lock_identity {
+            bail!("inherited concurrent fixture custody lock identity changed");
+        }
+        // Busy is contention, not a PID proof. Check actual parentage/incarnation too.
+        // The parent-side borrowed owner and KillOnDrop/reap order hold the fixture loan.
+        // SAFETY: getppid reads only the calling process's actual parent PID.
+        let parent_pid = unsafe { libc::getppid() };
+        if parent_pid <= 0
+            || parent_pid as u32 != witness.parent_pid
+            || !crate::agent_lifecycle::supported_process_start_time(
+                witness.parent_pid,
+                &witness.parent_incarnation,
+            )
+            || crate::agent_lifecycle::process_start_time(witness.parent_pid)?
+                != witness.parent_incarnation
+        {
+            bail!("inherited concurrent fixture parent incarnation differs");
+        }
+        Ok(())
+    }
+}
+
+// Explicit, nonlive selection evidence for an opted-in injected concurrency fixture.
+// This does not grant process, account-login, worktree or publication authority.
+#[cfg(all(test, target_os = "linux"))]
+struct SelectedConcurrentFixture {
+    run: RunId,
+    repo: PathBuf,
+    plan: SupervisorPlan,
+    catalog: CodexRuntimeModelCatalog,
+    assessment: TaskRoutingAssessment,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+    inherited: Option<InheritedConcurrentFixtureRoot>,
+    budget_bootstrap: Option<ConcurrentBudgetBootstrap>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+struct ConcurrentBudgetBootstrap {
+    model: String,
+    effort: ReasoningEffort,
+    concurrency: usize,
+    prior: crate::selection::OperatorPriorDataProvenance,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static SELECTED_CONCURRENT_FIXTURE: RefCell<Option<SelectedConcurrentFixture>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedConcurrentFixtureGuard<'a> {
+    #[cfg(target_os = "linux")]
+    previous: Option<SelectedConcurrentFixture>,
+    #[cfg(target_os = "linux")]
+    _cam: CamObserveTestGuard,
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _owner: &'a tempfile::TempDir,
+    _inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedConcurrentFixtureGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct ConcurrentFixtureCodexObservation {
+    models: coding_agent_manager_lib::account_authority::ModelsObservation,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl coding_agent_manager_lib::providers::ProviderAdapter for ConcurrentFixtureCodexObservation {
+    fn id(&self) -> &'static str {
+        "codex-cli"
+    }
+
+    fn descriptor(&self) -> coding_agent_manager_lib::model::ProviderDescriptor {
+        use coding_agent_manager_lib::model::{
+            AuthKind, InstallState, Maturity, ProviderDescriptor,
+        };
+        ProviderDescriptor {
+            id: self.id().to_string(),
+            display_name: "Synthetic concurrent fixture (not a live provider)".to_string(),
+            vendor: "test".to_string(),
+            auth_kinds: vec![AuthKind::OAuth],
+            maturity: Maturity::Experimental,
+            install_state: InstallState::Unknown,
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn detect(&self) -> coding_agent_manager_lib::model::InstallState {
+        coding_agent_manager_lib::model::InstallState::Unknown
+    }
+
+    fn list_accounts(
+        &self,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::Account>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn activate_account(&self, _account: &str) -> coding_agent_manager_lib::error::Result<()> {
+        Err(coding_agent_manager_lib::error::Error::NotImplemented(
+            "synthetic concurrent fixture activation",
+        ))
+    }
+
+    fn quota_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::QuotaSnapshot>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn observe_models_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<
+        coding_agent_manager_lib::account_authority::CategoryObservation<
+            coding_agent_manager_lib::account_authority::ModelsObservation,
+        >,
+    > {
+        Ok(
+            coding_agent_manager_lib::account_authority::CategoryObservation::observed(
+                self.models.clone(),
+            ),
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_concurrent_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    install_selected_concurrent_fixture_with_custody(
+        plan, options, catalog, metadata, owner, policy, None,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_inherited_concurrent_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    registry_owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    inherited: &'a InheritedConcurrentFixtureRoot,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    install_selected_concurrent_fixture_with_custody(
+        plan,
+        options,
+        catalog,
+        metadata,
+        registry_owner,
+        policy,
+        Some(inherited),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_selected_concurrent_fixture_with_custody<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    {
+        let repo = options.repo.canonicalize()?;
+        let repo_owned = match inherited {
+            Some(custody) => {
+                custody.verify(
+                    plan,
+                    &options.run_id,
+                    &options.repo,
+                    metadata
+                        .resolved_routing_policy
+                        .as_ref()
+                        .context("fixture frozen policy")?,
+                    metadata
+                        .task_routing_assessment
+                        .as_ref()
+                        .context("fixture assessment")?,
+                )?;
+                repo == custody.repo.path()
+            }
+            None => repo.starts_with(owner.path().canonicalize()?),
+        };
+        if !repo_owned
+            || options.runtime != SupervisorRuntime::Codex
+            || plan.assignments.is_empty()
+            || plan.assignments.iter().any(|assignment| {
+                assignment.role != AgentRole::ChildOrchestrator
+                    || assignment.phase != AssignmentPhase::Execution
+                    || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+                    || !assignment.worker_assignments.is_empty()
+                    || assignment
+                        .runtime
+                        .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+            })
+        {
+            bail!(
+                "selected concurrent fixture requires owned ordinary Codex ChildOrchestrators without workers"
+            );
+        }
+        let frozen = metadata
+            .resolved_routing_policy
+            .context("fixture frozen policy")?;
+        let assessment = metadata
+            .task_routing_assessment
+            .context("fixture parsed assessment")?;
+        assessment.validate_for_task(&frozen, &plan.task)?;
+        if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen) {
+            bail!("selected concurrent fixture requires its held matching policy guard");
+        }
+        if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+            bail!("selected concurrent fixture must not replace an existing CAM control fixture");
+        }
+        // Use the caller's unchanged authored review contract, not a new model/effort default.
+        let mut lens_models = BTreeSet::new();
+        for lens in &plan.review_lenses {
+            let ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } = &lens.backend
+            else {
+                bail!("selected concurrent fixture requires an executable authored review lens");
+            };
+            let effort = reasoning_effort.as_ref().context("fixture review effort")?;
+            if !catalog.contains(model) {
+                bail!("fixture review model is absent from the actual supplied Codex catalog");
+            }
+            lens_models.insert((model.clone(), effort.clone()));
+        }
+        if lens_models.len() != 1 {
+            bail!(
+                "selected concurrent fixture requires one unchanged review model/effort contract"
+            );
+        }
+        let cam = install_concurrent_fixture_observations(owner, lens_models)?;
+        Ok(bind_selected_concurrent_fixture_inputs(
+            SelectedConcurrentFixture {
+                run: options.run_id.clone(),
+                repo,
+                plan: plan.clone(),
+                catalog: catalog.clone(),
+                assessment,
+                frozen,
+                inherited: inherited.cloned(),
+                budget_bootstrap: None,
+            },
+            cam,
+            policy,
+            owner,
+            inherited,
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_concurrent_fixture_observations(
+    owner: &tempfile::TempDir,
+    lens_models: BTreeSet<(String, String)>,
+) -> Result<CamObserveTestGuard> {
+    use coding_agent_manager_lib::account_authority::{
+        ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("selected concurrent fixture must not replace an existing CAM control fixture");
+    }
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "codex-cli",
+        "synthetic-concurrent",
+        "Synthetic only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("codex-cli", "synthetic-concurrent")?;
+    registry.select_complete_revision("codex-cli", "synthetic-concurrent", None)?;
+    let binding = registry
+        .selected_binding("codex-cli")?
+        .context("fixture selected account")?;
+    // These are deliberately synthetic, principal-bound fixture observations.
+    // The unchanged selector still validates access, priors, prohibitions and authority roles.
+    let models = ModelsObservation {
+        models: lens_models
+            .into_iter()
+            .map(|(model_id, effort)| ObservedModel {
+                model_id,
+                supported_efforts: Some(vec![effort.clone()]),
+                default_effort: Some(effort),
+                access: ModelAccessOutcome::Available,
+            })
+            .collect(),
+        provenance: Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some("2026-09-19T00:00:00Z".to_string()),
+            stale: false,
+            principal_binding: Some(binding),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        }),
+    };
+    coding_agent_manager_lib::account_authority::validate_observed_models(&models)
+        .map_err(anyhow::Error::msg)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(cam)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn bind_selected_concurrent_fixture_inputs<'a>(
+    fixture: SelectedConcurrentFixture,
+    cam: CamObserveTestGuard,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    owner: &'a tempfile::TempDir,
+    inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+) -> SelectedConcurrentFixtureGuard<'a> {
+    let previous = SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    SelectedConcurrentFixtureGuard {
+        previous,
+        _cam: cam,
+        _policy: policy,
+        _owner: owner,
+        _inherited: inherited,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_child_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    if plan.assignments.iter().any(|assignment| {
+        assignment.role != AgentRole::ChildOrchestrator
+            || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+    }) {
+        bail!(
+            "budget Child fixture requires only ChildOrchestrator/DelegatingCoordinator subjects"
+        );
+    }
+    install_selected_budget_fixture(plan, options, owner, profile, concurrency)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_researcher_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    if plan.assignments.iter().any(|assignment| {
+        assignment.role != AgentRole::Researcher
+            || assignment.effective_role_category() != RoleCategory::ReadOnlyResearcher
+    }) {
+        bail!("budget Researcher fixture requires only Researcher/ReadOnlyResearcher subjects");
+    }
+    install_selected_budget_fixture(plan, options, owner, profile, concurrency)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_selected_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    let repo = options.repo.canonicalize()?;
+    if !repo.starts_with(owner.path().canonicalize()?)
+        || options.runtime != SupervisorRuntime::Codex
+        || plan.assignments.is_empty()
+        || plan.assignments.iter().any(|assignment| {
+            assignment.phase != AssignmentPhase::Execution
+                || !assignment.worker_assignments.is_empty()
+                || assignment
+                    .runtime
+                    .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        })
+    {
+        bail!("budget fixture requires owned workerless Execution Codex subjects");
+    }
+    let RuntimeModelCatalog::Codex(catalog) =
+        super::test_runtime_model_catalog(plan, options.runtime)?
+    else {
+        bail!("budget fixture requires its actual supplied Codex catalog");
+    };
+    if !catalog.contains(profile.0) {
+        bail!("budget profile is absent from the actual supplied Codex catalog");
+    }
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = super::bind_assessed_injected_plan(plan, &repo, &mut metadata)?;
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("budget fixture frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("budget fixture assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    super::prior_input::require_binding_repo(&repo)?;
+    let prior = super::prior_input::current_provenance()
+        .context("budget fixture requires its bound synthetic prior")?;
+    let cam = install_concurrent_fixture_observations(
+        owner,
+        [(profile.0.to_string(), profile.1.as_str().to_string())]
+            .into_iter()
+            .collect(),
+    )?;
+    Ok(bind_selected_concurrent_fixture_inputs(
+        SelectedConcurrentFixture {
+            run: options.run_id.clone(),
+            repo,
+            plan: plan.clone(),
+            catalog,
+            assessment,
+            frozen,
+            inherited: None,
+            budget_bootstrap: Some(ConcurrentBudgetBootstrap {
+                model: profile.0.to_string(),
+                effort: profile.1,
+                concurrency,
+                prior,
+            }),
+        },
+        cam,
+        policy,
+        owner,
+        None,
+    ))
+}
+
+// Complete only the opted-in budget fixture at the normal preparation boundary.
+// Both bootstrap and final evaluation borrow the same resolved run inputs.
+#[cfg(all(test, target_os = "linux"))]
+fn complete_selected_budget_fixture(
+    plan: &mut SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+    history: Option<&super::outcome_history::FrozenOutcomeHistory>,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+) -> Result<()> {
+    let pending = SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+        slot.borrow().as_ref().and_then(|fixture| {
+            fixture.budget_bootstrap.as_ref().map(|bootstrap| {
+                (
+                    fixture.run.clone(),
+                    fixture.plan.clone(),
+                    fixture.assessment.clone(),
+                    fixture.frozen.clone(),
+                    bootstrap.clone(),
+                )
+            })
+        })
+    });
+    let Some((run, mut completed, assessment, frozen, bootstrap)) = pending else {
+        return Ok(());
+    };
+    if request.current_run != Some(&run)
+        || serde_json::to_vec(plan)? != serde_json::to_vec(&completed)?
+        || request.admission_policy_input.entrypoint_bound != bootstrap.concurrency
+        || request.quota.context.is_some()
+        || request.quota.ledger.is_some()
+        || history.is_some_and(|history| {
+            history.provenance.projected_attempt_count != 0
+                || !history.provenance.source_digests.is_empty()
+                || !history.provenance.exclusions.is_empty()
+        })
+        || super::prior_input::current_provenance().as_ref() != Some(&bootstrap.prior)
+        || observations.len() != 1
+        || observations[0].0 != SupervisorRuntime::Codex
+    {
+        bail!("budget bootstrap requires its unchanged no-history/no-quota run inputs");
+    }
+    super::prior_input::require_binding_repo(request.repo)?;
+    let objective = metadata
+        .resolved_objective_profile
+        .as_ref()
+        .context("budget fixture resolved run objective")?;
+    let features = super::selection_bridge::routing_features_with_assessment(
+        &completed,
+        Some(&assessment),
+        Some(&frozen),
+    )?;
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let observation = &observations[0].1;
+    let observation_digest =
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(observation)?);
+    let subject_role = completed.assignments[0].role;
+    let (subject_effort, auditor_effort) = {
+        // Temporary review authorization is restored before the completed fixture
+        // is stored; normal initialization must independently seal every role.
+        let _bootstrap_policy =
+            crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+        let (subject, subject_decision) =
+            super::selection_bridge::select_normal_account_intake_with_assessment(
+                &completed,
+                &frozen,
+                observations,
+                request.admission_policy_input,
+                objective,
+                history,
+                Some(&assessment),
+            )?;
+        let subject = subject.context("budget fixture subject selection refused")?;
+        let (auditor, auditor_decision) =
+            super::selection_bridge::select_account_review_auditor_with_assessment(
+                &completed,
+                &frozen,
+                observations,
+                request.admission_policy_input,
+                objective,
+                Some(&assessment),
+            )?;
+        let auditor = auditor.context("budget fixture auditor selection refused")?;
+        for (role, selected, decision) in [
+            (subject_role, &subject, &subject_decision),
+            (AgentRole::Auditor, &auditor, &auditor_decision),
+        ] {
+            let receipt = decision
+                .routing_policy
+                .as_ref()
+                .context("budget bootstrap policy receipt")?;
+            let choice = decision
+                .choice
+                .as_ref()
+                .context("budget bootstrap choice")?;
+            let task = super::selection_bridge::task_profile_with_assessment(
+                role,
+                Some(&assessment),
+                Some(&features),
+                Some(&frozen),
+            )?;
+            selected.validate_binding(&crate::selection::routing_policy::AccountBinding::from(
+                &observation.binding,
+            ))?;
+            if decision.status != crate::selection::DecisionStatus::Selected
+                || selected.candidate() != &choice.candidate
+                || selected.candidate().runtime != SupervisorRuntime::Codex.as_str()
+                || selected.candidate().model != bootstrap.model
+                || selected.candidate().effort.as_str() != bootstrap.effort.as_str()
+                || receipt.frozen != frozen
+                || receipt.role != role.as_str()
+                || receipt.features != features
+                || selected.policy_digest != frozen.sha256
+                || selected.task_features != features
+                || selected.catalog_digest != observation_digest
+                || selected.catalog_revision
+                    != format!("account-observe-sha256:{observation_digest}")
+                || decision.normalized_input.task != task
+                || decision.normalized_task != task
+                || decision.normalized_input.resolved_objective_profile != *objective
+                || decision.resolved_objective_profile != *objective
+                || decision.normalized_input.priors.dataset_id != priors.dataset_id
+                || decision.normalized_input.priors.revision != priors.revision
+                || decision.normalized_input.priors.published_on != priors.published_on
+                || decision.operator_prior_data.as_ref() != Some(&bootstrap.prior)
+                || decision.normalized_input.debug_override.is_some()
+                || decision.debug_override.is_some()
+                || !decision.normalized_input.outcomes.is_empty()
+                || !decision.candidate_set.iter().any(|evaluation| {
+                    evaluation.candidate == choice.candidate
+                        && evaluation.eligible
+                        && evaluation.ineligibility_reasons.is_empty()
+                })
+            {
+                bail!("budget bootstrap differs from its genuine role/account/policy decision");
+            }
+        }
+        (subject.candidate().effort, auditor.candidate().effort)
+    };
+    for (role, effort) in [
+        (subject_role, subject_effort),
+        (AgentRole::Auditor, auditor_effort),
+    ] {
+        let configured = completed
+            .role_models
+            .get_mut(&role)
+            .context("budget fixture requires its authored role preference")?;
+        if configured.model.as_deref() != Some(bootstrap.model.as_str())
+            || configured
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|existing| existing != effort.as_str())
+        {
+            bail!("budget fixture selection conflicts with its authored role preference");
+        }
+        if configured.reasoning_effort.is_none() {
+            configured.reasoning_effort = Some(effort.as_str().to_string());
+        }
+    }
+    for lens in &mut completed.review_lenses {
+        let ReviewLensBackendConfig::Model {
+            model,
+            reasoning_effort,
+            ..
+        } = &mut lens.backend
+        else {
+            bail!("budget fixture requires its authored executable review lenses");
+        };
+        if model.as_str() != bootstrap.model.as_str()
+            || reasoning_effort
+                .as_deref()
+                .is_some_and(|existing| existing != auditor_effort.as_str())
+        {
+            bail!("budget fixture selection conflicts with its authored review lens");
+        }
+        if reasoning_effort.is_none() {
+            *reasoning_effort = Some(auditor_effort.as_str().to_string());
+        }
+    }
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| -> Result<()> {
+        let mut slot = slot.borrow_mut();
+        let fixture = slot
+            .as_mut()
+            .context("budget fixture binding disappeared")?;
+        if fixture.run != run || fixture.budget_bootstrap.is_none() {
+            bail!("budget fixture binding changed during completion");
+        }
+        fixture.plan = completed.clone();
+        fixture.budget_bootstrap = None;
+        Ok(())
+    })?;
+    *plan = completed;
+    if !selected_concurrent_fixture_matches(plan, metadata, request)? {
+        bail!("completed budget fixture lost its exact binding");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn carry_selected_concurrent_fixture_metadata(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    metadata: &mut SupervisorPlanMetadata,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (plan, options, catalog, metadata);
+    #[cfg(target_os = "linux")]
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| -> Result<()> {
+        let slot = slot.borrow();
+        let Some(fixture) = slot
+            .as_ref()
+            .filter(|fixture| fixture.run == options.run_id)
+        else {
+            return Ok(());
+        };
+        if let Some(custody) = &fixture.inherited {
+            custody.verify(
+                &fixture.plan,
+                &fixture.run,
+                &fixture.repo,
+                &fixture.frozen,
+                &fixture.assessment,
+            )?;
+        }
+        if options.repo.canonicalize()? != fixture.repo
+            || options.runtime != SupervisorRuntime::Codex
+            || serde_json::to_vec(plan)? != serde_json::to_vec(&fixture.plan)?
+            || !matches!(catalog, RuntimeModelCatalog::Codex(actual) if actual == &fixture.catalog)
+            || metadata.task_routing_assessment.is_some()
+            || metadata.resolved_routing_policy.is_some()
+        {
+            bail!("selected concurrent fixture input differs from its explicit binding");
+        }
+        metadata.task_routing_assessment = Some(fixture.assessment.clone());
+        metadata.resolved_routing_policy = Some(fixture.frozen.clone());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn selected_concurrent_fixture_matches(
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+) -> Result<bool> {
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+        let slot = slot.borrow();
+        let Some(fixture) = slot.as_ref().filter(|fixture| request.current_run == Some(&fixture.run)) else {
+            return Ok(false);
+        };
+        if let Some(custody) = &fixture.inherited {
+            custody.verify(&fixture.plan, &fixture.run, &fixture.repo, &fixture.frozen, &fixture.assessment)?;
+        }
+        let mut expected_plan = fixture.plan.clone();
+        expected_plan.assignments = plan.assignments.clone();
+        if request.execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+            || request.runtime != SupervisorRuntime::Codex
+            || request.repo.canonicalize()? != fixture.repo
+            || !matches!(request.runtime_model_catalog, Ok(RuntimeModelCatalog::Codex(actual)) if actual == &fixture.catalog)
+            || metadata.resolved_routing_policy.as_ref() != Some(&fixture.frozen)
+            || serde_json::to_vec(&metadata.task_routing_assessment)? != serde_json::to_vec(&Some(&fixture.assessment))?
+            || metadata.evidence_only_reaudit.is_some()
+            || metadata.execution_target.is_some()
+            || metadata.normal_intake_selection.is_some()
+            || serde_json::to_vec(plan)? != serde_json::to_vec(&expected_plan)?
+        {
+            bail!("selected concurrent scheduler request differs from its fixture binding");
+        }
+        // Preclaim may remove blocked assignments. It must not add or alter any subject.
+        for assignment in &plan.assignments {
+            let expected = fixture.plan.assignments.iter().find(|item| item.id == assignment.id)
+                .context("selected concurrent preclaim subject is outside its fixture")?;
+            if serde_json::to_vec(assignment)? != serde_json::to_vec(expected)? {
+                bail!("selected concurrent preclaim subject differs from its fixture");
+            }
+        }
+        fixture.assessment.validate_for_task(&fixture.frozen, &plan.task)?;
+        Ok(true)
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn observe_selected_cam_binding(
     registry: &StoredAccountRegistry,
@@ -4754,6 +5798,9 @@ fn initialize_supervisor_selection_with_catalog_discovery(
     request: PreparedSupervisorSelectionRequest<'_>,
     discover_catalogs: impl FnOnce(&Path) -> Result<AdvertisedCatalogSet>,
 ) -> Result<SupervisorSelectionResolution> {
+    #[cfg(all(test, target_os = "linux"))]
+    let selected_concurrent_fixture =
+        selected_concurrent_fixture_matches(plan, plan_metadata, &request)?;
     let PreparedSupervisorSelectionRequest {
         repo,
         current_run,
@@ -4776,6 +5823,57 @@ fn initialize_supervisor_selection_with_catalog_discovery(
             resolve_objective_profile(repo, requested_objective_profile.as_deref())
                 .context("failed to resolve the supervisor objective profile")?,
         );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    if selected_concurrent_fixture {
+        // Explicit fixture evidence only; no ambient provider discovery or live-proof claim.
+        let account_observations =
+            account_observations_for_selection(runtime, current_run.map(RunId::as_str))?;
+        let history = current_run
+            .map(|run| load_frozen_outcome_history(repo, run))
+            .transpose()?;
+        let catalog = runtime_model_catalog
+            .as_ref()
+            .map_err(|_| anyhow!("selected fixture catalog failed"))?;
+        complete_selected_budget_fixture(
+            plan,
+            plan_metadata,
+            &PreparedSupervisorSelectionRequest {
+                repo,
+                current_run,
+                runtime,
+                execution_runtime,
+                runtime_model_catalog,
+                admission_policy_input,
+                quota,
+            },
+            history.as_ref(),
+            &account_observations,
+        )?;
+        let resolution = super::selection_bridge::initialize_supervisor_selection_with_assessment(
+            plan,
+            runtime,
+            catalog,
+            admission_policy_input,
+            &AdvertisedCatalogSet::empty(),
+            plan_metadata.resolved_objective_profile.as_ref(),
+            quota,
+            history.as_ref(),
+            &account_observations,
+            plan_metadata.task_routing_assessment.as_ref(),
+        )?;
+        if resolution.selection_preflight_failure.is_none() {
+            bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
+            freeze_selected_codex_launch_binding(current_run.map(RunId::as_str))?;
+            freeze_selected_secondary_managed_launch_bindings(
+                plan,
+                &resolution.decisions,
+                runtime,
+                current_run.map(RunId::as_str),
+            )?;
+        }
+        return Ok(resolution);
     }
     let legacy_nonpublishable_explicit_selection =
         uses_legacy_nonpublishable_explicit_selection(execution_runtime, plan);

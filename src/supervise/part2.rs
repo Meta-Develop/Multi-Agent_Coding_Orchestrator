@@ -597,6 +597,59 @@ fn run_supervisor_plan_with_runtime_model_catalog_and_runner(
 }
 
 #[cfg(test)]
+fn bind_assessed_injected_plan(
+    plan: &SupervisorPlan,
+    repo: &Path,
+    metadata: &mut SupervisorPlanMetadata,
+) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
+    let frozen = crate::selection::routing_policy::load_routing_policy(repo)?;
+    let mut paths = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut modules = BTreeSet::new();
+    let mut dependencies = BTreeSet::new();
+    for assignment in &plan.assignments {
+        paths.extend(assignment.assigned_paths.iter().cloned());
+        symbols.extend(assignment.semantic_symbols.iter().cloned());
+        modules.extend(assignment.semantic_modules.iter().cloned());
+        dependencies.extend(
+            assignment
+                .decision_refs
+                .iter()
+                .map(|reference| reference.question_key().to_owned()),
+        );
+        for worker in &assignment.worker_assignments {
+            paths.extend(worker.assigned_paths.iter().cloned());
+            symbols.extend(worker.semantic_symbols.iter().cloned());
+            modules.extend(worker.semantic_modules.iter().cloned());
+        }
+    }
+    // Declare one bounded fixture task over its actual scope union. The selector
+    // recounts final execution topology; this grants no account or launch authority.
+    let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(json!({
+        "fragments":[{"id":"injected-fixture", "text": &plan.task}],
+        "assignments":[{"id":"injected-fixture", "task": &plan.task,
+            "fragment_ids":["injected-fixture"], "assigned_paths":paths,
+            "semantic_symbols":symbols, "semantic_modules":modules,
+            "decision_dependencies":dependencies}],
+        "diagnostics":{"degraded":false, "notes":[]},
+        "disjointness":{"disjoint":true, "conflicts":[]}
+    }))?;
+    let assessment = task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+    let mut document = serde_json::to_value(plan)?;
+    document["resolved_routing_policy"] = serde_json::to_value(&frozen)?;
+    document["task_routing_assessment"] = serde_json::to_value(assessment)?;
+    let loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
+        &serde_json::to_string(&document)?,
+        Some(repo),
+    )?;
+    // Preserve the original plan, consultant, budget, lenses and assignment metadata.
+    // Only carry the parser-validated assessment and its exact frozen policy.
+    metadata.resolved_routing_policy = loaded.plan_metadata.resolved_routing_policy;
+    metadata.task_routing_assessment = loaded.plan_metadata.task_routing_assessment;
+    crate::selection::routing_policy::bind_routing_policy(metadata.resolved_routing_policy.clone())
+}
+
+#[cfg(test)]
 fn run_supervisor_plan_with_budget_catalog_and_runner(
     plan: SupervisorPlan,
     consultant: SupervisorConsultantPlan,
@@ -606,6 +659,24 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
+    let mut plan_metadata = SupervisorPlanMetadata {
+        run_budget,
+        ..SupervisorPlanMetadata::default()
+    };
+    // Simulation retains its existing legacy path. Explicit loaded-plan and
+    // catalog-failure controls do not receive an invented assessment.
+    let _routing_policy = if execution_runtime == SupervisorExecutionRuntime::Verified
+        && runtime_model_catalog.is_ok()
+        && !plan.assignments.is_empty()
+    {
+        Some(bind_assessed_injected_plan(
+            &plan,
+            &options.repo,
+            &mut plan_metadata,
+        )?)
+    } else {
+        None
+    };
     let serialized_runner = Mutex::new(external_runner);
     let worktree_creation = match execution_runtime {
         SupervisorExecutionRuntime::Verified => SupervisorWorktreeCreation::VerifiedTestOnly,
@@ -618,10 +689,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
             plan,
             consultant,
             assignment_metadata: AssignmentMetadata::new(),
-            plan_metadata: SupervisorPlanMetadata {
-                run_budget,
-                ..SupervisorPlanMetadata::default()
-            },
+            plan_metadata,
         },
         options,
         1,
@@ -685,15 +753,22 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
     external_runner: &(dyn Fn(&ExternalAgentCommand) -> ExternalAgentRun + Send + Sync),
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
+    let mut plan_metadata = SupervisorPlanMetadata {
+        run_budget,
+        ..SupervisorPlanMetadata::default()
+    };
+    scheduler::carry_selected_concurrent_fixture_metadata(
+        &plan,
+        &options,
+        &runtime_model_catalog,
+        &mut plan_metadata,
+    )?;
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
             consultant,
             assignment_metadata: AssignmentMetadata::new(),
-            plan_metadata: SupervisorPlanMetadata {
-                run_budget,
-                ..SupervisorPlanMetadata::default()
-            },
+            plan_metadata,
         },
         options,
         max_concurrent_children,
@@ -713,12 +788,19 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
+    let mut plan_metadata = SupervisorPlanMetadata::default();
+    scheduler::carry_selected_concurrent_fixture_metadata(
+        &plan,
+        &options,
+        &runtime_model_catalog,
+        &mut plan_metadata,
+    )?;
     run_supervisor_plan_with_runner_and_creation(
         LoadedSupervisorPlan {
             plan,
             consultant,
             assignment_metadata: AssignmentMetadata::new(),
-            plan_metadata: SupervisorPlanMetadata::default(),
+            plan_metadata,
         },
         options,
         max_concurrent_children,

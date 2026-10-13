@@ -41,15 +41,22 @@ fn submit(
     Ok(())
 }
 
-// Production collection does not attach a Worker inbox yet. Inject that future
-// collected-command/capture boundary explicitly, using a real authenticated IPC
-// endpoint and journal. This is not an E2E collector/dispatch activation test.
-pub(super) fn exercise(
+pub(super) fn yield_report(run: &str) -> serde_json::Value {
+    json!({"version":1, "outcome":"yield_workers",
+        "run_id":run, "parent_id":"parent", "parent_attempt":1,
+        "requests":[{"request_id":"z-first", "worker_id":"worker-two"},
+                    {"request_id":"a-second", "worker_id":"worker"}]})
+}
+
+// Keep the genuine prepared attempt, authenticated inbox and returned capture
+// together through inspection and bound consumption. The injected runner supplies
+// test evidence; this does not attest a live provider or sandbox invocation.
+pub(super) fn exercise<'budget>(
     case: &str,
-    context: &AssignmentExecutionContext<'_, '_>,
+    context: &AssignmentExecutionContext<'budget, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
-    parent: &mut CollectedChildAttempt<'_>,
+    mut prepared: Box<PreparedChildAttempt<'budget>>,
 ) -> Result<()> {
     let resources = || WorkerInboxResources {
         repo: context.repo,
@@ -71,19 +78,6 @@ pub(super) fn exercise(
         repository_authenticator_key_only(context.repo)?,
         binding.clone(),
     )?;
-    if case == "bound-recovered" {
-        drop(inbox);
-        let recovered =
-            WorkerRequestInbox::recover(repository_authenticator_key_only(context.repo)?, binding)?;
-        assert!(WorkerInboxEndpoint::start(
-            context.run_dir,
-            &turn,
-            recovered,
-            ProcessCancellation::new()
-        )
-        .is_err());
-        return Ok(());
-    }
     let endpoint =
         WorkerInboxEndpoint::start(context.run_dir, &turn, inbox, ProcessCancellation::new())?;
     let launch = endpoint.launch();
@@ -100,11 +94,73 @@ pub(super) fn exercise(
         "a-second",
         "worker",
     )?;
-    let frozen = endpoint.shutdown()?;
-    let mut report = json!({"version":1, "outcome":"yield_workers",
-        "run_id":context.options.run_id.as_str(), "parent_id":"parent", "parent_attempt":1,
-        "requests":[{"request_id":"z-first", "worker_id":"worker-two"},
-                    {"request_id":"a-second", "worker_id":"worker"}]});
+    prepared.command = prepared
+        .command
+        .clone()
+        .with_assignment_messaging(launch.clone());
+    prepared
+        .command
+        .verify_assignment_messaging_protocol_instructions()?;
+    assert_eq!(
+        prepared.command.assignment_messaging_launch(),
+        Some(&launch)
+    );
+    prepared.command_admission = Some(
+        super::managed_parent_controller::admit_attached_parent_initial_for_test(
+            context, preflight, &prepared,
+        )?,
+    );
+    let capture = dispatch_and_capture_attached_parent_attempt(
+        context,
+        outcome,
+        preflight,
+        context.options.run_id.as_str(),
+        1,
+        prepared,
+        endpoint,
+    )?;
+    let (mut parent, frozen) = match inspect_attached_parent_capture(context, preflight, capture) {
+        AttachedParentInspection::Ready { parent, frozen } => (parent, *frozen),
+        AttachedParentInspection::Refused(capture) => {
+            bail!(
+                "bound fixture parent inspection refused: {:?}",
+                capture.diagnostics
+            )
+        }
+    };
+    assert_eq!(
+        parent.prepared.command.assignment_messaging_launch(),
+        Some(&launch)
+    );
+    let lock_refusal = WorkerRequestInbox::recover(
+        repository_authenticator_key_only(context.repo)?,
+        binding.clone(),
+    )
+    .err()
+    .context("bound parent capture lost the live inbox journal owner")?;
+    assert!(matches!(
+        lock_refusal.downcast_ref::<crate::messaging::store::StoreError>(),
+        Some(crate::messaging::store::StoreError::WriterAlreadyActive { .. })
+    ));
+    if case == "bound-recovered" {
+        drop(frozen);
+        let recovered =
+            WorkerRequestInbox::recover(repository_authenticator_key_only(context.repo)?, binding)?;
+        assert!(WorkerInboxEndpoint::start(
+            context.run_dir,
+            &turn,
+            recovered,
+            ProcessCancellation::new()
+        )
+        .is_err());
+        return Ok(());
+    }
+    let mut report = yield_report(context.options.run_id.as_str());
+    let expected_capture = serde_json::to_vec(&report)?;
+    assert_eq!(
+        parent.external_run.output_last_message(),
+        Some(expected_capture.as_slice())
+    );
     match case {
         "bound-forged" => report["requests"][0]["request_id"] = json!("forged"),
         "bound-wrong-worker" => report["requests"][0]["worker_id"] = json!("foreign"),
@@ -117,17 +173,45 @@ pub(super) fn exercise(
         "bound-mixed-envelope" => report["report"] = json!({}),
         _ => {}
     }
-    parent.external_run.output_last_message = Some(serde_json::to_vec(&report)?);
+    if matches!(
+        case,
+        "bound-forged"
+            | "bound-wrong-worker"
+            | "bound-duplicate"
+            | "bound-missing"
+            | "bound-wrong-order"
+            | "bound-stale-yield"
+            | "bound-mixed-envelope"
+    ) {
+        parent.external_run.output_last_message = Some(serde_json::to_vec(&report)?);
+    }
     // Neither good nor bad filesystem report bytes may replace the held capture.
     fs::write(
         context
             .run_dir
-            .join(&parent.attempt_artifacts.raw_report_relative),
+            .join(&parent.prepared.attempt_artifacts.raw_report_relative),
         b"{\"outcome\":\"final_report\"}",
     )
-    .context("substitute retained report artifact after scratch cleanup")?;
-    if case != "bound-ordinary-endpoint" {
-        parent._command = parent._command.clone().with_assignment_messaging(launch);
+    .context("substitute retained report artifact without replacing the held capture")?;
+    // Only this negative substitutes an authentic ordinary endpoint after capture.
+    // Every positive retains the exact endpoint admitted before parent dispatch.
+    let ordinary_endpoint = if case == "bound-ordinary-endpoint" {
+        Some(
+            crate::supervise::messaging_bridge::start_assignment_messaging(
+                context.run_dir,
+                context.options.run_id.as_str(),
+                &preflight.assignment.id,
+            )?,
+        )
+    } else {
+        None
+    };
+    if let Some(endpoint) = &ordinary_endpoint {
+        parent.prepared.command = parent
+            .prepared
+            .command
+            .clone()
+            .with_assignment_messaging(endpoint.launch());
     }
     match case {
         "bound-restored" => {
@@ -179,8 +263,8 @@ pub(super) fn exercise(
         &turn
     };
     let attempt = if case == "bound-wrong-attempt" { 2 } else { 1 };
-    let result = bound_parent_turn::BoundParentTurnYield::bind(
-        context, preflight, attempt, parent, current, frozen,
+    let result = bound_parent_turn::BoundParentTurnYield::bind_inspected(
+        context, preflight, attempt, &parent, current, frozen,
     );
     let expected_error = match case {
         "bound-forged"
@@ -266,8 +350,8 @@ pub(super) fn exercise(
         // Even failure cannot produce another driver with a fresh outcome/attempt.
         for attempt in [1, 2] {
             let mut other = AssignmentExecutionOutcome::default();
-            assert!(NestedWorkerSerialDriver::from_collected_parent(
-                context, preflight, &mut other, attempt, parent
+            assert!(NestedWorkerSerialDriver::from_inspected_parent(
+                context, preflight, &mut other, attempt, &parent
             )
             .is_err());
         }
@@ -408,16 +492,16 @@ pub(super) fn exercise(
         );
         // Compile regression: the frozen turn still borrows this exact lease.
         // No move/drop/reconstruction of preflight or bound evidence is needed.
-        let mut driver = NestedWorkerSerialDriver::from_collected_parent(
-            context, preflight, outcome, 1, parent,
+        let mut driver = NestedWorkerSerialDriver::from_inspected_parent(
+            context, preflight, outcome, 1, &parent,
         )?;
         let mut other_outcome = AssignmentExecutionOutcome::default();
-        let error = NestedWorkerSerialDriver::from_collected_parent(
+        let error = NestedWorkerSerialDriver::from_inspected_parent(
             context,
             preflight,
             &mut other_outcome,
             1,
-            parent,
+            &parent,
         )
         .err()
         .context("second driver accepted a distinct outcome")?;
@@ -439,8 +523,8 @@ pub(super) fn exercise(
             assert!(error.to_string().contains("already been reserved"));
         }
         drop(driver);
-        assert!(NestedWorkerSerialDriver::from_collected_parent(
-            context, preflight, outcome, 1, parent,
+        assert!(NestedWorkerSerialDriver::from_inspected_parent(
+            context, preflight, outcome, 1, &parent,
         )
         .is_err());
         // These injected Workers make no edits. The pre-Worker candidate remains
