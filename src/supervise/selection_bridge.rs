@@ -1838,7 +1838,7 @@ pub(super) fn select_authored_review_lens(
             .context("lens quota source")?
             .runtime
             .clone();
-        apply_live_quota_selection_input(&mut input, context, quota.ledger, &source)?;
+        apply_live_quota_selection_input(&mut input, context, quota.ledger, source.as_str())?;
     } else if let Some(pool) = input
         .pools
         .iter_mut()
