@@ -595,6 +595,7 @@ fn sealed_mechanical_executor_duty(duty: MechanicalTerminalDuty) -> SealedMechan
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn bind_selected_runtime_launch(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -603,6 +604,7 @@ fn bind_selected_runtime_launch(
     launch_runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
     mechanical_duty: Option<MechanicalTerminalDuty>,
+    purpose: &ChildAttemptPurpose<'_, '_>,
 ) -> Result<BoundSelectedRuntimeLaunch> {
     if assignment.role == AgentRole::Researcher {
         validate_researcher_assignment(assignment)?;
@@ -642,7 +644,8 @@ fn bind_selected_runtime_launch(
         )
         && assignment.effective_role_category().is_read_only()
         && assignment.worker_assignments.is_empty();
-    let managed_control_parent = assignment.role == AgentRole::ChildOrchestrator
+    let managed_control_parent = purpose.is_managed_parent()
+        && assignment.role == AgentRole::ChildOrchestrator
         && assignment.phase == AssignmentPhase::Execution
         && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
         && !assignment.worker_assignments.is_empty();
@@ -871,6 +874,7 @@ pub(super) fn bind_selected_assignment_launch_with_duty_for_test(
         launch_runtime,
         &launch_catalog,
         mechanical_duty,
+        &ChildAttemptPurpose::Ordinary,
     )?;
     let command = bind_selected_native_execution_workspace(
         bound_launch.command,
@@ -2393,6 +2397,15 @@ enum ChildAttemptPurpose<'a, 'e> {
     ManagedParentContinuation(&'a ParentContinuationLaunch<'e>),
 }
 
+impl ChildAttemptPurpose<'_, '_> {
+    fn is_managed_parent(&self) -> bool {
+        matches!(
+            self,
+            Self::ManagedParentInitial | Self::ManagedParentContinuation(_)
+        )
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -2478,11 +2491,7 @@ fn prepare_child_attempt_with_purpose<'a>(
         ChildAttemptPurpose::ManagedParentContinuation(launch) => Some(launch),
         ChildAttemptPurpose::Ordinary | ChildAttemptPurpose::ManagedParentInitial => None,
     };
-    let managed_parent = matches!(
-        purpose,
-        ChildAttemptPurpose::ManagedParentInitial
-            | ChildAttemptPurpose::ManagedParentContinuation(_)
-    );
+    let managed_parent = purpose.is_managed_parent();
     let AssignmentExecutionContext {
         index,
         concurrent_mode,
@@ -2841,6 +2850,7 @@ fn prepare_child_attempt_with_purpose<'a>(
         launch_runtime,
         &launch_catalog,
         mechanical_duty,
+        &purpose,
     )?;
     command = bound_launch.command;
     let direct_report_schema_path = match continuation_schema.as_deref() {
@@ -13193,6 +13203,7 @@ done
             SupervisorRuntime::Fake,
             &RuntimeModelCatalog::LocalDeterministicFake,
             None,
+            &ChildAttemptPurpose::Ordinary,
         )?;
         assert_eq!(bound.command.model, None);
         assert_eq!(bound.model_provenance.configured_model, None);
