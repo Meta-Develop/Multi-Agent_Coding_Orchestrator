@@ -354,6 +354,7 @@ pub(super) fn execute_nested_worker_attempt(
         runtime,
         &catalog,
         metadata.mechanical_duty,
+        &ChildAttemptPurpose::Ordinary,
     )?;
     let mut command = bind_runtime_output_schema(bound.command, runtime, &schema)?;
     command = bind_runtime_read_only_schema_files(command, runtime, &[&schema]);
