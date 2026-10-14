@@ -567,8 +567,12 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
         .as_deref()
         .map(|authored| ReasoningEffort::parse(authored).context("fixture child effort"))
         .transpose()?;
-    if effort.is_none() && !matches!(plan.review_lenses.len(), 2 | 3) {
-        bail!("fixture child effort");
+    if effort.is_none() {
+        let admitted_missing_child_effort = matches!(plan.review_lenses.len(), 2 | 3)
+            || (plan.review_lenses.len() == 1 && plan.review_lenses[0].id == "parent-acceptance");
+        if !admitted_missing_child_effort {
+            bail!("fixture child effort");
+        }
     }
     // A lens contract can identify the existing uniform fixture shape, but it
     // never supplies the absent child effort. Only assessed selection below does.

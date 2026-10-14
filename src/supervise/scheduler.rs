@@ -4600,6 +4600,139 @@ impl coding_agent_manager_lib::providers::ProviderAdapter for ConcurrentFixtureC
     }
 }
 
+#[cfg(all(test, target_os = "linux"))]
+struct GrokReviewFixtureObservation {
+    models: coding_agent_manager_lib::account_authority::ModelsObservation,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl coding_agent_manager_lib::providers::ProviderAdapter for GrokReviewFixtureObservation {
+    fn id(&self) -> &'static str {
+        "grok-cli"
+    }
+
+    fn descriptor(&self) -> coding_agent_manager_lib::model::ProviderDescriptor {
+        use coding_agent_manager_lib::model::{
+            AuthKind, InstallState, Maturity, ProviderDescriptor,
+        };
+        ProviderDescriptor {
+            id: self.id().to_string(),
+            display_name: "Synthetic Grok review-cost fixture (not a live provider)".to_string(),
+            vendor: "test".to_string(),
+            auth_kinds: vec![AuthKind::OAuth],
+            maturity: Maturity::Experimental,
+            install_state: InstallState::Unknown,
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn detect(&self) -> coding_agent_manager_lib::model::InstallState {
+        coding_agent_manager_lib::model::InstallState::Unknown
+    }
+
+    fn list_accounts(
+        &self,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::Account>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn activate_account(&self, _account: &str) -> coding_agent_manager_lib::error::Result<()> {
+        Err(coding_agent_manager_lib::error::Error::NotImplemented(
+            "synthetic Grok review-cost fixture activation",
+        ))
+    }
+
+    fn quota_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::QuotaSnapshot>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn observe_models_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<
+        coding_agent_manager_lib::account_authority::CategoryObservation<
+            coding_agent_manager_lib::account_authority::ModelsObservation,
+        >,
+    > {
+        Ok(
+            coding_agent_manager_lib::account_authority::CategoryObservation::observed(
+                self.models.clone(),
+            ),
+        )
+    }
+}
+
+// A known-access observation for a synthetic selected account, never a live
+// Grok entitlement or billing claim. Normal observe/freeze and selector gates apply.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_grok_review_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    fixture_model: &str,
+    effort: ReasoningEffort,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    use coding_agent_manager_lib::account_authority::{
+        ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("Grok review fixture must not replace an existing CAM observation control");
+    }
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "grok-cli",
+        "synthetic-review-cost",
+        "Synthetic review-cost account only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("grok-cli", "synthetic-review-cost")?;
+    registry.select_complete_revision("grok-cli", "synthetic-review-cost", None)?;
+    let binding = registry
+        .selected_binding("grok-cli")?
+        .context("synthetic Grok review fixture selected account")?;
+    let models = ModelsObservation {
+        models: vec![ObservedModel {
+            model_id: fixture_model.to_string(),
+            default_effort: Some(effort.as_str().to_string()),
+            supported_efforts: Some(vec![effort.as_str().to_string()]),
+            access: ModelAccessOutcome::Available,
+        }],
+        provenance: Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some("2026-09-19T00:00:00Z".to_string()),
+            stale: false,
+            principal_binding: Some(binding),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        }),
+    };
+    coding_agent_manager_lib::account_authority::validate_observed_models(&models)
+        .map_err(anyhow::Error::msg)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        adapter: Box::new(GrokReviewFixtureObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
+}
+
 // Associate the licensed scenario's already-held genuine account with the exact
 // NonpublishableSimulation source run. No second CAM observer is installed.
 #[cfg(all(test, target_os = "linux"))]
@@ -4740,7 +4873,7 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
         || assignment.role != AgentRole::ChildOrchestrator
         || assignment.phase != AssignmentPhase::Execution
         || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
-        || assignment.worker_assignments.is_empty()
+        || (assignment.worker_assignments.is_empty() && plan.review_lenses.len() != 1)
         || assignment
             .runtime
             .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)

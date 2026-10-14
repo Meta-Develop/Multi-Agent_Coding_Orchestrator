@@ -10166,6 +10166,173 @@ mod decomposition_tests {
                 correction_correlation_id: "parent-gate-review-cost".to_string(),
             }),
         };
+        #[cfg(target_os = "linux")]
+        let (_review_fixture, review_initial_decisions, review_auditor_binding) = {
+            use super::super::prior_input::{bind_operator_prior_data, OperatorPriorSnapshot};
+            use std::io::Write;
+
+            let mut metadata = SupervisorPlanMetadata::default();
+            let policy = super::bind_assessed_injected_plan(&plan, &repo, &mut metadata)
+                .expect("bind parsed assessment and frozen policy for Grok parent review");
+            let frozen = metadata
+                .resolved_routing_policy
+                .as_ref()
+                .expect("review frozen policy");
+            let assessment = metadata
+                .task_routing_assessment
+                .as_ref()
+                .expect("review parsed assessment");
+            assessment
+                .validate_for_task(frozen, &plan.task)
+                .expect("validate real review task assessment");
+            let effort = ReasoningEffort::parse(
+                plan.review_lenses[0]
+                    .backend
+                    .reasoning_effort()
+                    .expect("authored review effort"),
+            )
+            .expect("known authored review effort");
+            let selector_effort: crate::selection::ReasoningEffort =
+                serde_json::from_value(serde_json::json!(effort.as_str()))
+                    .expect("selector review effort");
+            let base = super::super::selection_bridge::base_selector_priors_with_terminal_worker_economics()
+                .expect("retained selector prior evidence");
+            let mut prior = base
+                .models
+                .iter()
+                .find(|row| {
+                    base.measured_authority_eligibility(
+                        &row.model,
+                        crate::selection::AuthorityRole::ReviewAuditor,
+                    ) == crate::selection::MeasuredAuthorityEligibility::Eligible
+                        && row.class_fit.iter().any(|fit| {
+                            fit.task_class == "review_gate" && fit.effort == selector_effort
+                        })
+                        && (row.strong_gate_fallback_efforts.contains(&selector_effort)
+                            || row.authority_evidence.iter().any(|evidence| {
+                                evidence.role == crate::selection::AuthorityRole::ReviewAuditor
+                                    && evidence.task_class == "review_gate"
+                                    && evidence.effort == selector_effort
+                            }))
+                })
+                .cloned()
+                .expect("retained eligible ReviewAuditor profile at the original effort");
+            // ONE synthetic alias retains the original evidence, samples, quality,
+            // effort menu and prohibitions. No live Grok model or billing assertion.
+            prior.runtime = "grok".to_string();
+            prior.model = FIXTURE_MODEL_ID.to_string();
+            prior.source_id = "synthetic-grok-parent-review-cost-fixture".to_string();
+            prior.prior_scope = "nonlive parent-review cost attribution fixture only".to_string();
+            prior.limitations.push(
+                "synthetic alias; not measured Grok capability, live entitlement or billing"
+                    .to_string(),
+            );
+            let snapshot = OperatorPriorSnapshot {
+                schema_version: 1,
+                dataset_id: "synthetic-grok-review-cost-prior".to_string(),
+                revision: format!("{}+synthetic-grok-review-cost", base.revision),
+                published_on: base.published_on.clone(),
+                models: vec![prior],
+                capability_policy: super::super::model_policy::ModelCapabilityPolicy {
+                    id: "synthetic-grok-review-cost-capability".to_string(),
+                    version: 1,
+                    source: "nonlive review-cost fixture only".to_string(),
+                    models: vec![super::super::model_policy::ModelCapabilityEvidence {
+                        model: FIXTURE_MODEL_ID.to_string(),
+                        capability:
+                            super::super::model_policy::ModelCapabilityClass::CriticalJudgment,
+                        eligible: true,
+                        evidence: "synthetic fixture only; not live Grok capability evidence"
+                            .to_string(),
+                        as_of: base.published_on.clone(),
+                    }],
+                },
+            };
+            let relative = Path::new(".git/synthetic-grok-review-cost-prior.json");
+            let mut prior_file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(repo.join(relative))
+                .expect("exclusive fixture prior file");
+            prior_file
+                .write_all(&serde_json::to_vec(&snapshot).expect("serialize fixture prior"))
+                .expect("write fixture prior");
+            drop(prior_file);
+            let prior_guard = bind_operator_prior_data(&repo, relative)
+                .expect("bind labelled synthetic review prior");
+            let account_guard = super::super::scheduler::install_selected_grok_review_fixture(
+                &temp,
+                FIXTURE_MODEL_ID,
+                effort,
+            )
+            .expect("hold genuine synthetic selected Grok registry");
+            let observation = super::super::scheduler::account_observation_for_launch_runtime(
+                SupervisorRuntime::Grok,
+                Some(options.run_id.as_str()),
+            )
+            .expect("observe and normally freeze this run's Grok account")
+            .expect("selected Grok fixture observation");
+            let observations = [(SupervisorRuntime::Grok, observation)];
+            let admission = SupervisorAdmissionPolicyInput::resolve(
+                &repo,
+                1,
+                metadata.admission,
+                options.admission_overrides,
+            )
+            .expect("resolve actual review admission inputs");
+            let objective = resolve_objective_profile(&repo, metadata.objective_profile.as_deref())
+                .expect("resolve actual review objective");
+            let (selected, provenance) =
+                super::super::selection_bridge::select_account_review_auditor_with_assessment(
+                    &plan,
+                    frozen,
+                    &observations,
+                    &admission,
+                    &objective,
+                    Some(assessment),
+                )
+                .expect("normal assessed Grok Auditor selection");
+            let selected = selected.expect("Grok Auditor must pass unchanged selector gates");
+            selected
+                .validate_binding(&(&observations[0].1.binding).into())
+                .expect("current selected account binding");
+            assert_eq!(
+                provenance.status,
+                crate::selection::DecisionStatus::Selected
+            );
+            assert_eq!(
+                &provenance
+                    .choice
+                    .as_ref()
+                    .expect("authentic selected choice")
+                    .candidate,
+                selected.candidate()
+            );
+            assert_eq!(selected.candidate().model, FIXTURE_MODEL_ID);
+            assert_eq!(selected.candidate().effort.as_str(), effort.as_str());
+            let runtime =
+                super::super::selection_bridge::runtime_from_name(&selected.candidate().runtime)
+                    .expect("selected review runtime");
+            assert_eq!(runtime, SupervisorRuntime::Grok);
+            let selection = RoleModelSelection {
+                model: Some(selected.candidate().model.clone()),
+                reasoning_effort: Some(selected.candidate().effort.as_str().to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            };
+            let decisions = vec![SupervisorSelectionEvent {
+                assignment_id: None,
+                attempt: 0,
+                role: AgentRole::Auditor,
+                primary_cause: SupervisorSelectionEventCause::Initial,
+                provenance,
+            }];
+            // Tuple fields restore policy/prior while the account observer is held.
+            (
+                (policy, prior_guard, account_guard),
+                decisions,
+                (runtime, selection),
+            )
+        };
         let mut artifact_writer = ArtifactRunWriter::reserve(
             &repo,
             RunArtifactFamily::Supervise,
@@ -10407,8 +10574,19 @@ mod decomposition_tests {
             terminal_attempt_outcome.costs.execution_cost_microunits;
         let final_report_path = dirs.reports.join("phase-child.json");
         let mut grok_budget_policy = AssignmentBudgetPolicy::default();
+        #[cfg(not(target_os = "linux"))]
         grok_budget_policy
             .set_selected_runtime_for_test(AgentRole::Auditor, SupervisorRuntime::Grok);
+        #[cfg(target_os = "linux")]
+        {
+            let (runtime, selection) = review_auditor_binding;
+            grok_budget_policy.set_selector_binding_for_test(
+                AgentRole::Auditor,
+                runtime,
+                selection,
+            );
+            grok_budget_policy.initial_selector_decisions = review_initial_decisions;
+        }
         let grok_runtime_model_catalog = RuntimeModelCatalog::OperatorDeclared;
         let grok_context = AssignmentExecutionContext {
             index: child_context.index,
@@ -10796,6 +10974,15 @@ mod decomposition_tests {
                 "selection preflight failure: {:?}",
                 resolution.selection_preflight_failure
             );
+            for decision in &resolution.decisions {
+                if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+                    crate::selection::routing_policy::seal_selected_candidate(
+                        decision.role.as_str(),
+                        &decision.provenance,
+                    )
+                    .expect("seal selected candidate into held fixture policy");
+                }
+            }
             let mut selected_budget_policy = budget_policy;
             selected_budget_policy.initial_selector_decisions = resolution.decisions;
             (selected_concurrent_fixture, selected_budget_policy)
@@ -11157,6 +11344,15 @@ mod decomposition_tests {
                 "selection preflight failure: {:?}",
                 resolution.selection_preflight_failure
             );
+            for decision in &resolution.decisions {
+                if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+                    crate::selection::routing_policy::seal_selected_candidate(
+                        decision.role.as_str(),
+                        &decision.provenance,
+                    )
+                    .expect("seal selected candidate into held fixture policy");
+                }
+            }
             let mut selected_budget_policy = budget_policy;
             selected_budget_policy.initial_selector_decisions = resolution.decisions;
             (selected_concurrent_fixture, selected_budget_policy)
