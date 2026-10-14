@@ -14358,7 +14358,7 @@ done
         write_injected_usage(&command, 90000, 90000);
         let mut run = injected_verified_run(&command);
         run.side_effects = Some(SideEffectConfinementEvidence::Verified(
-            SideEffectConfinementProfileKind::ExternalCursor,
+            crate::process_runner::SideEffectConfinementProfileKind::ExternalCursor,
         ));
         run.cursor_managed_parent_evidence =
             Some(crate::runtime_adapter::CursorManagedParentEvidence {
