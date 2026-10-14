@@ -39,6 +39,9 @@ jobs:
       - name: Run repository portability unit tests
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Run Linux library shard partition unit tests
+        run: python3 -m unittest discover -s .github/scripts -p test_linux_ci_library_shards.py
+
       - name: Check tracked path portability
         run: python3 scripts/check_repository_portability.py
 
@@ -50,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise, rest]
+        shard: [autopilot, supervise-core, supervise-fixtures, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

@@ -3,13 +3,13 @@
 set -euo pipefail
 
 if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
-  printf '%s\n' "usage: $0 lib <autopilot|supervise|rest> | non-lib" >&2
+  printf '%s\n' "usage: $0 lib <autopilot|supervise-core|supervise-fixtures|rest> | non-lib" >&2
   exit 1
 fi
 
 partition="$1"
 case "${partition}:${2:-}" in
-  lib:autopilot | lib:supervise | lib:rest | non-lib:) ;;
+  lib:autopilot | lib:supervise-core | lib:supervise-fixtures | lib:rest | non-lib:) ;;
   *)
     printf '%s\n' "invalid partition: ${partition}" >&2
     exit 1

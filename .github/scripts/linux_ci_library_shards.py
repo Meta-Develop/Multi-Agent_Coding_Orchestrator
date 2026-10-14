@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-SHARDS = ("autopilot", "supervise", "rest")
+SHARDS = ("autopilot", "supervise-core", "supervise-fixtures", "rest")
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
     "runtime_adapter::cursor_managed_parent::tests::offline_check_failure_diagnostic_keeps_untrusted_output_private",
@@ -22,7 +22,7 @@ REST_SAFETY_PREFLIGHTS = (
 )
 SAFETY_PREFLIGHTS = {
     "rest": REST_SAFETY_PREFLIGHTS,
-    "supervise": (
+    "supervise-core": (
         "supervise::selection_bridge::tests::account_observe_unknown_models_fail_closed",
         "supervise::selection_bridge::tests::automatic_empty_role_models_resolve_all_roles_from_eligible_catalog",
         "supervise::assignment_execution::attached_parent_capture_tests::attached_capture_bookkeeping_and_shutdown_errors_retain_owners",
@@ -61,16 +61,50 @@ def parse_inventory(output: str) -> list[str]:
     return sorted(names)
 
 
+def expected_supervise_group(name: str) -> str:
+    if name.startswith("supervise::tests::"):
+        return "supervise-fixtures"
+    if name.startswith("supervise::"):
+        return "supervise-core"
+    raise ValueError(f"mandatory diagnostic is not a supervise case: {name}")
+
+
+def validate_mandatory_supervise_ownership(
+    inventory: Sequence[str], partitions: dict[str, list[str]]
+) -> None:
+    assigned: dict[str, str] = {}
+    for shard, group in partitions.items():
+        for name in group:
+            if name in assigned:
+                raise ValueError(f"duplicate shard ownership for {name}")
+            assigned[name] = shard
+    for name in (*SUPERVISE_DIAGNOSTICS, *SUPERVISE_CAUSAL_DIAGNOSTICS):
+        if name not in assigned:
+            raise ValueError(
+                f"mandatory supervise diagnostic missing from inventory: {name}"
+            )
+        owner = assigned[name]
+        expected = expected_supervise_group(name)
+        if owner != expected:
+            raise ValueError(
+                f"mandatory supervise diagnostic {name} owned by {owner}, expected {expected}"
+            )
+
+
 def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
     if not names or len(names) != len(set(names)):
         raise ValueError("library inventory must be nonempty and unique")
     partitions: dict[str, list[str]] = {shard: [] for shard in SHARDS}
     for name in sorted(names):
         # Match the root module, not an arbitrary substring in a test name.
-        owner = next(
-            (shard for shard in SHARDS[:-1] if name.startswith(f"{shard}::")),
-            "rest",
-        )
+        if name.startswith("autopilot::"):
+            owner = "autopilot"
+        elif name.startswith("supervise::tests::"):
+            owner = "supervise-fixtures"
+        elif name.startswith("supervise::"):
+            owner = "supervise-core"
+        else:
+            owner = "rest"
         partitions[owner].append(name)
     flattened = [name for group in partitions.values() for name in group]
     if len(flattened) != len(set(flattened)) or set(flattened) != set(names):
@@ -136,9 +170,13 @@ def _capture_supervise_diagnostic(command: Sequence[str]) -> subprocess.Complete
         return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
 
 
-def run_supervise_diagnostics(runner: Sequence[str], selected: Sequence[str]) -> int:
+def run_supervise_diagnostics(runner: Sequence[str], selected: Sequence[str], cases: Sequence[str] | None = None) -> int:
+    if cases is None:
+        cases = SUPERVISE_DIAGNOSTICS
+    if not cases:
+        return 0
     failed = False
-    for name in SUPERVISE_DIAGNOSTICS:
+    for name in cases:
         print(json.dumps({"supervise_diagnostic": name}, sort_keys=True), flush=True)
         if name not in selected:
             print("supervise diagnostic refused: name absent from shard inventory", flush=True)
@@ -182,11 +220,15 @@ def run_supervise_diagnostics(runner: Sequence[str], selected: Sequence[str]) ->
 
 
 
-def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[str]) -> int:
+def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[str], cases: Sequence[str] | None = None) -> int:
     # Natural completion only: the existing hosted-job limit bounds a hung case.
     # Aggregate completed one-body failures; malformed/infra outcomes fail closed.
-    cases = []
-    for name in SUPERVISE_CAUSAL_DIAGNOSTICS:
+    if cases is None:
+        cases = SUPERVISE_CAUSAL_DIAGNOSTICS
+    if not cases:
+        return 0
+    completed = []
+    for name in cases:
         if name not in selected or enumerate_tests(runner, [name]) != [name]:
             raise ValueError(f"causal diagnostic must select exactly one supervise test: {name}")
         print(json.dumps({"supervise_causal_diagnostic": name}, sort_keys=True), flush=True)
@@ -230,11 +272,11 @@ def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[s
         )
         if not (passed or failed):
             raise ValueError(f"causal diagnostic lacks a genuine completed nonignored one-body result: {name}")
-        cases.append({"name": name, "returncode": result.returncode,
+        completed.append({"name": name, "returncode": result.returncode,
                       "outcome": "PASS" if passed else "FAIL"})
-        print(json.dumps({"supervise_causal_result": cases[-1]}, sort_keys=True), flush=True)
-    status = int(any(case["outcome"] == "FAIL" for case in cases))
-    print(json.dumps({"supervise_causal_cases": cases, "complete": True,
+        print(json.dumps({"supervise_causal_result": completed[-1]}, sort_keys=True), flush=True)
+    status = int(any(case["outcome"] == "FAIL" for case in completed))
+    print(json.dumps({"supervise_causal_cases": completed, "complete": True,
                       "broad_allowed": status == 0}, sort_keys=True), flush=True)
     return status
 
@@ -267,11 +309,14 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
         preflight_status = run_safety_preflights(runner, selected, shard)
         if preflight_status != 0:
             return preflight_status
-    if shard == "supervise":
-        diagnostic_status = run_supervise_diagnostics(runner, selected)
+    if shard in ("supervise-core", "supervise-fixtures"):
+        validate_mandatory_supervise_ownership(inventory, partitions)
+        own_diagnostics = [name for name in SUPERVISE_DIAGNOSTICS if name in selected]
+        own_causal = [name for name in SUPERVISE_CAUSAL_DIAGNOSTICS if name in selected]
+        diagnostic_status = run_supervise_diagnostics(runner, selected, own_diagnostics)
         if diagnostic_status != 0:
             return diagnostic_status
-        causal_status = run_supervise_causal_diagnostics(runner, selected)
+        causal_status = run_supervise_causal_diagnostics(runner, selected, own_causal)
         if causal_status != 0:
             return causal_status
     return subprocess.run(command, check=False).returncode
