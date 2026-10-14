@@ -6212,6 +6212,7 @@ struct PreparedParentAuditor<'a> {
     auditor_budget_reservation: DispatchBudgetReservation<'a>,
     launch_runtime: SupervisorRuntime,
     scope_workspace: tempfile::TempDir,
+    selection_guard: Option<crate::selection::routing_policy::RoutingPolicyGuard>,
 }
 
 struct ParentAuditorLensExecution<'a> {
@@ -6378,6 +6379,65 @@ fn prepare_parent_auditor<'a>(
         return Ok(ParentAuditorPreparation::AssignmentComplete);
     }
     let auditor_id = review_lens_auditor_id(assignment, lens_index);
+    let assignment_reasoning_effort = context.assignment_metadata.reasoning_effort(&assignment.id);
+    let resolved_auditor_effort =
+        resolve_review_lens_reasoning_effort(lens, assignment_reasoning_effort);
+    let selection_guard = if launch_runtime == SupervisorRuntime::Fake {
+        None
+    } else {
+        #[cfg(not(target_os = "linux"))]
+        bail!("account-bound parent review requires managed Linux");
+        #[cfg(target_os = "linux")]
+        {
+            let baseline = budget_policy
+                .initial_selector_decisions
+                .iter()
+                .find(|event| event.role == AgentRole::Auditor)
+                .context("parent review requires the run's assessed Auditor decision")?;
+            let expected_binding = super::selection_bridge::frozen_review_account_binding(
+                launch_runtime,
+                options.run_id.as_str(),
+            )?;
+            // Observe without rewriting the run's frozen identity. Selection below
+            // rejects removal, incarnation/revision drift, stale models and access loss.
+            let observation =
+                super::scheduler::account_observation_for_launch_runtime(launch_runtime, None)?
+                    .context("parent review selected account observation disappeared")?;
+            let quota_context = live_quota_context_for_run(repo)?;
+            let selected = super::selection_bridge::select_authored_review_lens(
+                lens,
+                &resolved_auditor_effort.resolved,
+                launch_runtime,
+                runtime_model_catalog,
+                &baseline.provenance,
+                &observation,
+                &(&expected_binding).into(),
+                SupervisorQuotaSelectionInput {
+                    context: quota_context.as_ref(),
+                    ledger: quota_context.as_ref().map(|_| *budget_ledger),
+                },
+            )?;
+            let (guard, provenance) = selected.bind()?;
+            let decision = SupervisorSelectionEvent {
+                assignment_id: Some(auditor_id.clone()),
+                attempt: *auditor_attempt,
+                role: AgentRole::Auditor,
+                primary_cause: SupervisorSelectionEventCause::DebugOverride,
+                provenance,
+            };
+            with_supervisor_artifacts(artifacts, |writer, _| {
+                writer.append_json_line(
+                    "evidence/review_lens_selections.jsonl",
+                    &decision,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+                Ok(())
+            })?;
+            // Strict authenticated retention precedes preparation. These are not
+            // global role-reselection events: a lens must never replace that role.
+            Some(guard)
+        }
+    };
     let auditor_stem = if plan.max_gate_corrections > 0 {
         format!("{auditor_id}.attempt-{auditor_attempt}")
     } else {
@@ -6401,9 +6461,6 @@ fn prepare_parent_auditor<'a>(
         command_record_relative: PathBuf::from("logs").join(format!("{auditor_stem}.summary.json")),
     };
     let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
-    let assignment_reasoning_effort = context.assignment_metadata.reasoning_effort(&assignment.id);
-    let resolved_auditor_effort =
-        resolve_review_lens_reasoning_effort(lens, assignment_reasoning_effort);
     let RenderedPromptWithMeasurements {
         prompt: auditor_prompt,
         mut measurements,
@@ -6637,6 +6694,7 @@ fn prepare_parent_auditor<'a>(
     auditor_command =
         pin_cam_authority_socket_for_nested_maco_launch(auditor_command, launch_runtime);
     Ok(ParentAuditorPreparation::Ready(PreparedParentAuditor {
+        selection_guard,
         lens: lens.clone(),
         expected_request: expected_request.clone(),
         auditor_id,
@@ -6742,6 +6800,7 @@ fn dispatch_and_collect_parent_auditor(
     let cancellation = preflight.managed_process_cancellation.cancellation();
     let assignment = &preflight.assignment;
     let PreparedParentAuditor {
+        selection_guard: _selection_guard,
         lens,
         expected_request,
         auditor_id,

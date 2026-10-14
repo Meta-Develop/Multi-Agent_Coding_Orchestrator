@@ -533,6 +533,229 @@ fn injected_machine_global_retention(
 }
 
 #[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_plan_with_selected_nested_review_fixture(
+    mut plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    budget: SupervisorBudgetConfig,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    supplied_catalog: Option<RuntimeModelCatalog>,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    use super::model_policy::{ModelCapabilityEvidence, ModelCapabilityPolicy};
+    use super::prior_input::{bind_operator_prior_data, OperatorPriorSnapshot};
+    use std::io::Write;
+
+    if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+        || options.runtime != SupervisorRuntime::Codex
+        || !options
+            .repo
+            .canonicalize()?
+            .starts_with(owner.path().canonicalize()?)
+    {
+        bail!("nested review fixture requires owned Codex NonpublishableSimulation inputs");
+    }
+    let child = effective_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    let model = child
+        .model
+        .clone()
+        .context("fixture authored child model")?;
+    let effort = child
+        .reasoning_effort
+        .as_deref()
+        .and_then(ReasoningEffort::parse)
+        .context("fixture child effort")?;
+    let uniform = plan.review_lenses.len() == 3
+        && plan.review_lenses.iter().all(|lens| {
+            lens.backend.model() == model
+                && lens.backend.reasoning_effort() == Some(effort.as_str())
+        });
+    if !uniform {
+        plan.role_models
+            .get_mut(&AgentRole::ChildOrchestrator)
+            .context("fixture child preference")?
+            .reasoning_effort = child.reasoning_effort.clone();
+    }
+    // This is an authored preference only. The bootstrap and final initialization
+    // must independently obtain matching account/policy selector decisions.
+    if plan.role_models.contains_key(&AgentRole::Auditor) {
+        bail!("nested review fixture must not replace an authored Auditor preference");
+    }
+    plan.role_models.insert(
+        AgentRole::Auditor,
+        RoleModelSelection {
+            model: Some(model.clone()),
+            reasoning_effort: (!uniform).then(|| effort.as_str().to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    let actual_catalog = match supplied_catalog {
+        Some(catalog) => catalog,
+        None => test_runtime_model_catalog(&plan, options.runtime)?,
+    };
+    let RuntimeModelCatalog::Codex(catalog) = &actual_catalog else {
+        bail!("nested review fixture requires its actual supplied Codex catalog");
+    };
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = bind_assessed_injected_plan(&plan, &options.repo, &mut metadata)?;
+    let base = super::selection_bridge::base_selector_priors_with_terminal_worker_economics()?;
+    let baseline = base
+        .models
+        .iter()
+        .find(|row| row.runtime == "codex" && row.model == FRONTIER_PROFILE_MODEL)
+        .cloned()
+        .context("nested review fixture baseline prior")?;
+    let mut profiles = BTreeMap::<String, BTreeSet<String>>::new();
+    profiles
+        .entry(model.clone())
+        .or_default()
+        .insert(effort.as_str().to_string());
+    for lens in &plan.review_lenses {
+        profiles
+            .entry(lens.backend.model().to_string())
+            .or_default()
+            .insert(
+                lens.backend
+                    .reasoning_effort()
+                    .context("fixture explicit lens effort")?
+                    .to_string(),
+            );
+    }
+    let mut priors = Vec::new();
+    let mut capabilities = Vec::new();
+    for (model, efforts) in profiles {
+        let mut prior = baseline.clone();
+        prior.model = model.clone();
+        prior.source_id = "synthetic-nested-review-profile".to_string();
+        prior.prior_scope = "nonlive nested review fixture only".to_string();
+        prior.limitations.push(
+            "synthetic profile; not measured model evidence or account/launch authority"
+                .to_string(),
+        );
+        // Explicit synthetic eligibility for an authored high-effort review.
+        // Production policy and selector hard gates are not changed by this fixture.
+        for effort in efforts {
+            let effort: crate::selection::ReasoningEffort = serde_json::from_value(json!(effort))?;
+            if !prior
+                .class_fit
+                .iter()
+                .any(|row| row.task_class == "review_gate" && row.effort == effort)
+            {
+                let mut row = baseline
+                    .class_fit
+                    .iter()
+                    .find(|row| row.task_class == "review_gate")
+                    .cloned()
+                    .context("fixture baseline review evidence")?;
+                row.effort = effort;
+                prior
+                    .authority_evidence
+                    .push(crate::selection::AuthorityEvidencePrior {
+                        task_class: row.task_class.clone(),
+                        role: crate::selection::AuthorityRole::ReviewAuditor,
+                        effort,
+                        quality_basis_points: row.quality_basis_points,
+                        sample_size: row.sample_size,
+                    });
+                prior.class_fit.push(row);
+            }
+        }
+        priors.push(prior);
+        capabilities.push(ModelCapabilityEvidence {
+            model,
+            capability: ModelCapabilityClass::CriticalJudgment,
+            eligible: true,
+            evidence: "synthetic fixture only; no account or launch authority".to_string(),
+            as_of: base.published_on.clone(),
+        });
+    }
+    let snapshot = OperatorPriorSnapshot {
+        schema_version: 1,
+        dataset_id: "synthetic-nested-review-prior".to_string(),
+        revision: format!("{}+nested-review-fixture", base.revision),
+        published_on: base.published_on.clone(),
+        models: priors,
+        capability_policy: ModelCapabilityPolicy {
+            id: "synthetic-nested-review-capability".to_string(),
+            version: 1,
+            source: "nonlive nested review fixture only".to_string(),
+            models: capabilities,
+        },
+    };
+    let relative = Path::new("nested-review-fixture-prior.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(options.repo.join(relative))?;
+    file.write_all(&serde_json::to_vec(&snapshot)?)?;
+    drop(file);
+    let _prior = bind_operator_prior_data(&options.repo, relative)?;
+    let _fixture = super::scheduler::install_selected_nested_review_fixture(
+        &plan, &options, catalog, metadata, owner, policy, effort,
+    )?;
+    let mut plan_metadata = SupervisorPlanMetadata {
+        run_budget: budget,
+        ..SupervisorPlanMetadata::default()
+    };
+    super::scheduler::carry_selected_concurrent_fixture_metadata(
+        &plan,
+        &options,
+        &actual_catalog,
+        &mut plan_metadata,
+    )?;
+    let serialized_runner = std::sync::Mutex::new(external_runner);
+    super::run_supervisor_plan_with_runner_and_creation(
+        LoadedSupervisorPlan {
+            plan,
+            consultant,
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata,
+        },
+        options,
+        1,
+        execution_runtime,
+        SupervisorWorktreeCreation::TestOnly,
+        Ok(actual_catalog),
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_plan_with_selected_nested_review_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    budget: SupervisorBudgetConfig,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    supplied_catalog: Option<RuntimeModelCatalog>,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    // Match the existing fixture wrapper's unsupported-platform behavior; the
+    // Linux branch always requires its selected-account binding and assessment.
+    let _ = owner;
+    let catalog = match supplied_catalog {
+        Some(catalog) => catalog,
+        None => test_runtime_model_catalog(&plan, options.runtime)?,
+    };
+    run_supervisor_plan_with_budget_catalog_and_runner(
+        plan,
+        consultant,
+        budget,
+        options,
+        execution_runtime,
+        Ok(catalog),
+        external_runner,
+    )
+}
+
+#[cfg(target_os = "linux")]
 fn selected_concurrent_injected_fixture<'a>(
     plan: &SupervisorPlan,
     options: &SupervisorRunOptions,

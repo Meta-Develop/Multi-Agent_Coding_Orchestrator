@@ -1584,19 +1584,54 @@ fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
         gate.resolution_observation,
         EffortResolutionObservation::HardFloorClamped
     );
+    let ReviewLensBackendConfig::Model {
+        reasoning_effort: lens_source_effort,
+        ..
+    } = &plan.review_lenses[0].backend
+    else {
+        panic!("default review lens is model-backed");
+    };
+    assert_eq!(lens_source_effort.as_deref(), Some("low"));
+    let ReviewLensBackendConfig::Model {
+        reasoning_effort: effective_lens_effort,
+        ..
+    } = &effective.review_lenses[0].backend
+    else {
+        panic!("effective review lens is model-backed");
+    };
+    assert_eq!(effective_lens_effort.as_deref(), Some("low"));
+    // Duty resolution still clamps Auditor to the hard floor. Admission then stores the active lens effort.
+    let auditor_duty = resolve_reasoning_effort(
+        AgentRole::Auditor,
+        Some(ReasoningEffort::Low),
+        lens_source_effort.as_deref(),
+        0,
+    );
+    assert_eq!(auditor_duty.requested, Some(ReasoningEffort::Low));
+    assert_eq!(auditor_duty.resolved, "xhigh");
+    assert_eq!(
+        auditor_duty.observation,
+        EffortResolutionObservation::HardFloorClamped
+    );
+    let lens_index = 0;
     let auditor = controller
         .assignment_effort_bindings
         .iter()
-        .find(|binding| binding.role == AgentRole::Auditor)
-        .expect("auditor binding");
+        .find(|binding| {
+            binding.role == AgentRole::Auditor
+                && binding.duty_id == super::review_lens_auditor_id(&assignment, lens_index)
+        })
+        .expect("review lens 0 auditor binding");
+    assert_eq!(auditor.assignment_id, assignment.id);
     assert_eq!(
         auditor.requested_reasoning_effort,
         Some(ReasoningEffort::Low)
     );
-    assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+    assert_eq!(auditor.fallback_reasoning_effort, "low");
+    assert_eq!(auditor.resolved_reasoning_effort, "low");
     assert_eq!(
         auditor.resolution_observation,
-        EffortResolutionObservation::HardFloorClamped
+        EffortResolutionObservation::BudgetDegraded
     );
     let mut construction = test_report_construction(
         &plan,

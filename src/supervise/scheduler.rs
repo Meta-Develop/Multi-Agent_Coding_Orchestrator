@@ -4601,6 +4601,102 @@ impl coding_agent_manager_lib::providers::ProviderAdapter for ConcurrentFixtureC
 }
 
 #[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_nested_review_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    effort: ReasoningEffort,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment] = plan.assignments.as_slice() else {
+        bail!("nested review fixture requires one authored child");
+    };
+    if !repo.starts_with(owner.path().canonicalize()?)
+        || options.runtime != SupervisorRuntime::Codex
+        || assignment.role != AgentRole::ChildOrchestrator
+        || assignment.phase != AssignmentPhase::Execution
+        || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+        || assignment.worker_assignments.is_empty()
+        || assignment
+            .runtime
+            .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        || assignment.worker_assignments.iter().any(|worker| {
+            worker.role != AgentRole::Worker
+                || worker.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+                || worker.assigned_paths.is_empty()
+                || worker
+                    .assigned_paths
+                    .iter()
+                    .any(|path| !assignment.assigned_paths.contains(path))
+        })
+    {
+        bail!("nested review fixture requires an owned Codex child with bounded terminal workers");
+    }
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("nested review fixture frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("nested review fixture parsed assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen) {
+        bail!("nested review fixture requires its held matching policy guard");
+    }
+    let model = plan
+        .role_models
+        .get(&AgentRole::ChildOrchestrator)
+        .and_then(|selection| selection.model.as_ref())
+        .context("nested review fixture authored child model")?;
+    let mut models = BTreeSet::from([(model.clone(), effort.as_str().to_string())]);
+    if !catalog.contains(model) || !matches!(plan.review_lenses.len(), 2 | 3) {
+        bail!("nested review fixture requires its actual child catalog and two or three lenses");
+    }
+    for lens in &plan.review_lenses {
+        let ReviewLensBackendConfig::Model {
+            model,
+            reasoning_effort: Some(effort),
+            ..
+        } = &lens.backend
+        else {
+            bail!("nested review fixture requires unchanged executable review contracts");
+        };
+        if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
+            bail!("nested review fixture lens is absent from its supplied model/effort catalog");
+        }
+        models.insert((model.clone(), effort.clone()));
+    }
+    let uniform = models.len() == 1 && plan.review_lenses.len() == 3;
+    super::prior_input::require_binding_repo(&repo)?;
+    let prior = super::prior_input::current_provenance()
+        .context("nested review fixture requires its bound synthetic prior")?;
+    let cam = install_concurrent_fixture_observations(owner, models)?;
+    Ok(bind_selected_concurrent_fixture_inputs(
+        SelectedConcurrentFixture {
+            run: options.run_id.clone(),
+            repo,
+            plan: plan.clone(),
+            catalog: catalog.clone(),
+            assessment,
+            frozen,
+            inherited: None,
+            budget_bootstrap: uniform.then(|| ConcurrentBudgetBootstrap {
+                model: model.clone(),
+                effort,
+                concurrency: 1,
+                prior,
+            }),
+        },
+        cam,
+        policy,
+        owner,
+        None,
+    ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
 pub(super) fn install_selected_concurrent_fixture<'a>(
     plan: &SupervisorPlan,
     options: &SupervisorRunOptions,
@@ -5512,7 +5608,7 @@ pub(crate) fn account_observations_for_selection(
     }
 }
 
-fn account_observation_for_launch_runtime(
+pub(super) fn account_observation_for_launch_runtime(
     runtime: SupervisorRuntime,
     run_id: Option<&str>,
 ) -> Result<Option<AccountObserveResult>> {

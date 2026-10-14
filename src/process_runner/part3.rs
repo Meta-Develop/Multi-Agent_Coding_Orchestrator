@@ -1211,7 +1211,16 @@ impl SystemdUnit {
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
-        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        // Immutable-entry authenticity revalidation is required before FIFO release, but it
+        // must not consume the 3s platform start-gate grace. Enforce the original total
+        // operation deadline around that work, then start platform grace after it returns.
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "sealed native start gate was cancelled",
+            ));
+        }
+        enforce_total_operation_deadline(operation_deadline)?;
         if let Some(entry) = &self.prepared_native_entry {
             entry.revalidate()?;
             if cancellation.is_cancelled() {
@@ -1220,13 +1229,14 @@ impl SystemdUnit {
                     "sealed native start gate was cancelled",
                 ));
             }
-            if Instant::now() >= deadline {
-                return Err(io::Error::new(
+            enforce_total_operation_deadline(operation_deadline).map_err(|_| {
+                io::Error::new(
                     io::ErrorKind::TimedOut,
                     "sealed native start gate exceeded the operation deadline",
-                ));
-            }
+                )
+            })?;
         }
+        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
         if let Some(sandbox) = &self.sandbox {
             // The verified read-only mount owns the inode now. Remove the private
             // host pathname before releasing any target; retain only read handles.
@@ -2219,17 +2229,31 @@ fn systemd_runtime_max(timeout: Option<Duration>) -> std::io::Result<Duration> {
 }
 
 #[cfg(target_os = "linux")]
-fn bounded_operation_deadline(
-    platform_grace: Duration,
-    operation_deadline: Option<Instant>,
-) -> std::io::Result<Instant> {
-    let now = Instant::now();
-    if operation_deadline.is_some_and(|deadline| now >= deadline) {
+fn enforce_total_operation_deadline(operation_deadline: Option<Instant>) -> std::io::Result<()> {
+    if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "the total operation deadline was exhausted during containment setup",
         ));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_operation_deadline(
+    platform_grace: Duration,
+    operation_deadline: Option<Instant>,
+) -> std::io::Result<Instant> {
+    enforce_total_operation_deadline(operation_deadline)?;
+    clamp_platform_operation_deadline(Instant::now(), platform_grace, operation_deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_platform_operation_deadline(
+    now: Instant,
+    platform_grace: Duration,
+    operation_deadline: Option<Instant>,
+) -> std::io::Result<Instant> {
     let platform_deadline = now.checked_add(platform_grace).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -3932,4 +3956,31 @@ impl BoundedBuffer {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod start_gate_deadline_phase_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn platform_start_gate_grace_is_clamped_from_the_supplied_now() {
+        let now = Instant::now();
+        let remaining_total = now + Duration::from_secs(90);
+        let deadline =
+            clamp_platform_operation_deadline(now, SYSTEMD_OPERATION_GRACE, Some(remaining_total))
+                .expect("platform grace should fit inside Instant");
+        assert_eq!(deadline, now + SYSTEMD_OPERATION_GRACE);
+        assert!(deadline < remaining_total);
+    }
+
+    #[test]
+    fn remaining_total_operation_deadline_still_caps_platform_grace() {
+        let now = Instant::now();
+        let remaining_total = now + Duration::from_millis(250);
+        let deadline =
+            clamp_platform_operation_deadline(now, SYSTEMD_OPERATION_GRACE, Some(remaining_total))
+                .expect("short remaining total should still be representable");
+        assert_eq!(deadline, remaining_total);
+    }
 }

@@ -4819,6 +4819,29 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             } else {
                 "model-beta"
             };
+            let observed_effort = command.reasoning_effort.as_deref().unwrap();
+            crate::selection::routing_policy::validate_selected_launch(
+                "auditor",
+                "codex",
+                observed_model,
+                observed_effort,
+            )
+            .expect("current lens has exact selector authority before dispatch");
+            let (other_model, other_effort) = if name.contains("lens-0") {
+                ("model-beta", "xhigh")
+            } else {
+                ("model-alpha", "high")
+            };
+            assert!(
+                crate::selection::routing_policy::validate_selected_launch(
+                    "auditor",
+                    "codex",
+                    other_model,
+                    other_effort,
+                )
+                .is_err(),
+                "a different lens is not simultaneously authorized"
+            );
             retain_priced_single_turn_fixture(
                 &mut run,
                 command,
@@ -4828,12 +4851,14 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         }
         run
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
     .expect("run stacked review lenses");
@@ -4892,6 +4917,41 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open stacked-lens artifacts");
     let events = read_finalized_orchestration_events(&reader);
+    let selections = reader
+        .read("evidence/review_lens_selections.jsonl")
+        .expect("authenticated per-lens selection evidence");
+    let selections = std::str::from_utf8(&selections)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<SupervisorSelectionEvent>(line)
+                .expect("retained lens selector decision")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selections.len(),
+        2,
+        "each dispatched lens retains its selector decision"
+    );
+    for (selection, command) in selections.into_iter().zip(&lens_commands) {
+        let choice = selection.provenance.choice.as_ref().unwrap();
+        assert_eq!(
+            selection.provenance.status,
+            crate::selection::DecisionStatus::Selected
+        );
+        assert_eq!(
+            choice.candidate.model.as_str(),
+            command.model.as_deref().unwrap()
+        );
+        assert_eq!(
+            choice.candidate.effort.as_str(),
+            command.reasoning_effort.as_deref().unwrap()
+        );
+        assert_eq!(
+            selection.provenance.normalized_task.authority_role,
+            crate::selection::AuthorityRole::ReviewAuditor
+        );
+    }
     let aggregate_event = events
         .iter()
         .find(|event| {

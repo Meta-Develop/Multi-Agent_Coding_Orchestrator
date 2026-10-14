@@ -1151,14 +1151,14 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
         if plan.review_lenses == default_supervisor_review_lenses() {
             bind_automatic_review_lenses_to_auditor_selection(plan)?;
         } else {
-            validate_custom_review_lenses_against_auditor_selection(plan, runtime)?;
+            validate_custom_review_lens_contracts(plan)?;
         }
     } else if plan.review_lenses == default_supervisor_review_lenses() {
         if plan.role_models.contains_key(&AgentRole::Auditor) {
             bind_automatic_review_lenses_to_auditor_selection(plan)?;
         }
     } else {
-        validate_custom_review_lenses_against_auditor_selection(plan, runtime)?;
+        validate_custom_review_lens_contracts(plan)?;
     }
 
     let automatic_state = automatic
@@ -1639,18 +1639,15 @@ fn bind_automatic_review_lenses_to_auditor_selection(plan: &mut SupervisorPlan) 
     Ok(())
 }
 
-fn validate_custom_review_lenses_against_auditor_selection(
-    plan: &SupervisorPlan,
-    runtime: SupervisorRuntime,
-) -> Result<()> {
+fn validate_custom_review_lens_contracts(plan: &SupervisorPlan) -> Result<()> {
     let auditor = plan.role_models.get(&AgentRole::Auditor).context(
         "custom review lenses require an explicit selector-validated auditor role_models override",
     )?;
-    let auditor_model = auditor
+    auditor
         .model
         .as_deref()
         .context("selector-validated auditor override has no explicit model")?;
-    let auditor_effort = auditor
+    auditor
         .reasoning_effort
         .as_deref()
         .context("selector-validated auditor override has no explicit reasoning effort")?;
@@ -1660,22 +1657,19 @@ fn validate_custom_review_lenses_against_auditor_selection(
                 model,
                 reasoning_effort,
                 ..
-            } if model == auditor_model
-                && reasoning_effort.as_deref() == Some(auditor_effort) => {}
-            ReviewLensBackendConfig::Model {
-                model,
-                reasoning_effort,
-                ..
-            } => bail!(
-                "custom review lens '{}' runtime/model/effort '{}:{}:{}' does not exactly match selector-validated auditor triple '{}:{}:{}'",
-                lens.id,
-                runtime_name(runtime),
-                model,
-                reasoning_effort.as_deref().unwrap_or("<missing>"),
-                runtime_name(runtime),
-                auditor_model,
-                auditor_effort,
-            ),
+            } => {
+                if model.is_empty()
+                    || reasoning_effort
+                        .as_deref()
+                        .and_then(selector_effort_from_str)
+                        .is_none()
+                {
+                    bail!("custom review lens '{}' requires an explicit model and supported effort", lens.id);
+                }
+                // The generic Auditor selects the executor runtime and supplies the
+                // assessed run inputs. Each authored lens is independently evaluated
+                // and scoped to its own exact triple immediately before preparation.
+            }
             ReviewLensBackendConfig::Precomputed { .. } => bail!(
                 "custom precomputed review lens '{}' cannot be selector-bound safely because it has no executable reasoning-effort field",
                 lens.id
@@ -1683,6 +1677,221 @@ fn validate_custom_review_lenses_against_auditor_selection(
         }
     }
     Ok(())
+}
+
+/// Constructed only by evaluation of an authored lens against current account
+/// observations and the already assessed, frozen run input. It grants no budget,
+/// filesystem, account-login or publication authority.
+#[cfg(target_os = "linux")]
+pub(super) struct SelectedReviewLens {
+    decision: SelectionProvenance,
+    launch: crate::selection::routing_policy::SelectedLaunchRequest,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedReviewLens {
+    pub(super) fn bind(
+        self,
+    ) -> Result<(
+        crate::selection::routing_policy::RoutingPolicyGuard,
+        SelectionProvenance,
+    )> {
+        let receipt = self
+            .decision
+            .routing_policy
+            .as_ref()
+            .context("lens policy receipt")?;
+        if crate::selection::routing_policy::current_routing_policy().as_ref()
+            != Some(&receipt.frozen)
+        {
+            bail!("review lens frozen policy changed before binding");
+        }
+        // The existing guard saves the outer authorizations and restores them on
+        // every exit, including preparation refusal and dispatch unwinding.
+        let guard =
+            crate::selection::routing_policy::bind_routing_policy(Some(receipt.frozen.clone()))?;
+        crate::selection::routing_policy::seal_selected_candidate(
+            AgentRole::Auditor.as_str(),
+            &self.decision,
+        )?;
+        let candidate = &self
+            .decision
+            .choice
+            .as_ref()
+            .context("selected lens choice")?
+            .candidate;
+        if candidate != self.launch.candidate() {
+            bail!("review lens launch differs from its selector decision");
+        }
+        crate::selection::routing_policy::validate_selected_launch(
+            AgentRole::Auditor.as_str(),
+            &candidate.runtime,
+            &candidate.model,
+            candidate.effort.as_str(),
+        )?;
+        Ok((guard, self.decision))
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn frozen_review_account_binding(
+    runtime: SupervisorRuntime,
+    run: &str,
+) -> Result<coding_agent_manager_lib::account_authority::SelectedAccountBinding> {
+    use crate::account_authority as authority;
+    let binding =
+        match runtime {
+            SupervisorRuntime::Codex => match authority::codex_run_account_binding(run) {
+                Some(authority::CodexRunAccountBinding::Selected(binding)) => {
+                    Some(binding.to_selected_binding())
+                }
+                _ => None,
+            },
+            SupervisorRuntime::Grok => authority::grok_run_account_binding(run)
+                .map(|binding| binding.to_selected_binding()),
+            SupervisorRuntime::ClaudeCode => authority::claude_run_account_binding(run)
+                .map(|binding| binding.to_selected_binding()),
+            SupervisorRuntime::GeminiCli => authority::gemini_run_account_binding(run)
+                .map(|binding| binding.to_selected_binding()),
+            SupervisorRuntime::Cursor => authority::cursor_run_account_binding(run)
+                .map(|binding| binding.to_selected_binding()),
+            SupervisorRuntime::Fake => None,
+        };
+    binding.context("review lens requires the run's frozen selected account")
+}
+
+#[allow(clippy::too_many_arguments)]
+#[cfg(target_os = "linux")]
+pub(super) fn select_authored_review_lens(
+    lens: &ReviewLensConfig,
+    resolved_effort: &str,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    baseline: &SelectionProvenance,
+    observation: &AccountObserveResult,
+    expected_binding: &crate::selection::routing_policy::AccountBinding,
+    quota: SupervisorQuotaSelectionInput<'_>,
+) -> Result<SelectedReviewLens> {
+    if &crate::selection::routing_policy::AccountBinding::from(&observation.binding)
+        != expected_binding
+    {
+        bail!("review lens selected account changed from the frozen run binding");
+    }
+    let ReviewLensBackendConfig::Model {
+        model,
+        reasoning_effort: Some(effort),
+        ..
+    } = &lens.backend
+    else {
+        bail!("review lens requires an executable explicit model/effort contract");
+    };
+    if effort != resolved_effort {
+        bail!("review lens resolved effort differs from its authored contract");
+    }
+    super::prompts::validate_review_lens_runtime_selection(lens, runtime, catalog)?;
+    let receipt = baseline
+        .routing_policy
+        .as_ref()
+        .context("review lens requires an assessed Auditor decision")?;
+    if baseline.status != DecisionStatus::Selected
+        || receipt.role != AgentRole::Auditor.as_str()
+        || baseline.normalized_input.task.authority_role != AuthorityRole::ReviewAuditor
+        || baseline.normalized_input.task != baseline.normalized_task
+        || crate::selection::routing_policy::current_routing_policy().as_ref()
+            != Some(&receipt.frozen)
+        || baseline.operator_prior_data != super::prior_input::current_provenance()
+    {
+        bail!("review lens lost its assessed run/policy/prior binding");
+    }
+    // Reuse the real assessment projection, frozen objective, priors, history
+    // and constraints. No task morphology or authority is invented for a lens.
+    let mut input = baseline.normalized_input.clone();
+    input.catalogs =
+        catalogs_from_account_observation(observation, runtime, &input.task, &input.priors)?;
+    input
+        .constraints
+        .allowed_runtimes
+        .retain(|allowed| allowed == runtime.as_str());
+    if input.constraints.allowed_runtimes.is_empty() {
+        bail!("review lens runtime is outside the assessed run constraints");
+    }
+    input.debug_override = Some(DebugOverride {
+        candidate: CandidateKey {
+            runtime: runtime.as_str().to_string(),
+            model: model.clone(),
+            effort: selector_effort_from_str(effort).context("unsupported authored lens effort")?,
+        },
+        requested_by: "supervisor_plan.review_lenses".to_string(),
+        reason: format!(
+            "exact authored review lens '{}' after all hard eligibility gates",
+            lens.id
+        ),
+    });
+    input.constraints.allow_debug_override = true;
+    if input.quota_source.is_some() != quota.context.is_some() {
+        bail!("review lens operator quota binding changed");
+    }
+    if let Some(context) = quota.context {
+        let source = input
+            .quota_source
+            .as_ref()
+            .context("lens quota source")?
+            .runtime
+            .clone();
+        apply_live_quota_selection_input(&mut input, context, quota.ledger, &source)?;
+    } else if let Some(pool) = input
+        .pools
+        .iter_mut()
+        .find(|pool| pool.runtime == runtime.as_str())
+    {
+        if let Some(content) = observation
+            .quota
+            .as_ref()
+            .filter(|category| matches!(category.outcome, ObservationOutcome::Observed))
+            .and_then(|category| category.content.as_ref())
+        {
+            pool.pool_pressure_basis_points = observed_quota_pressure_basis_points(content);
+        }
+        pool.observation_revision = format!(
+            "account-observe-sha256:{}",
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(observation)?)
+        );
+    }
+    input.operational_observations = Some(live_operational_observations(&input));
+    let mut decision = select_with_live_switch_cost_for_policy(&input, Some(receipt))?;
+    decision.outcome_history = baseline.outcome_history.clone();
+    decision.operator_prior_data = baseline.operator_prior_data.clone();
+    let requested = &input
+        .debug_override
+        .as_ref()
+        .context("authored lens candidate")?
+        .candidate;
+    let choice = decision
+        .choice
+        .as_ref()
+        .filter(|choice| {
+            decision.status == DecisionStatus::Selected && &choice.candidate == requested
+        })
+        .with_context(|| {
+            format!(
+                "authored review lens '{}' was refused by the selector: {}; eligibility: {:?}",
+                lens.id,
+                decision.decision_reason,
+                decision
+                    .candidate_set
+                    .iter()
+                    .find(|entry| &entry.candidate == requested)
+                    .map(|entry| &entry.ineligibility_reasons),
+            )
+        })?;
+    let launch = crate::selection::routing_policy::SelectedLaunchRequest::from_observation(
+        choice.candidate.clone(),
+        observation,
+        &receipt.frozen,
+        receipt.features.clone(),
+        None,
+    )?;
+    Ok(SelectedReviewLens { decision, launch })
 }
 
 fn authored_override_runtime(
@@ -6195,7 +6404,8 @@ mod tests {
     }
 
     #[test]
-    fn custom_review_lens_must_match_selector_validated_auditor() -> Result<()> {
+    fn custom_review_lens_keeps_its_authored_triple_for_independent_dispatch_selection(
+    ) -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let auditor_prior = codex_prior_for(|prior| {
@@ -6219,17 +6429,207 @@ mod tests {
             information_scope: ReviewInformationScope::FullChildTranscript,
         }];
 
-        let error = initialize_supervisor_selection(
+        let authored = plan.review_lenses.clone();
+        let resolution = initialize_supervisor_selection(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &test_admission(),
             &AdvertisedCatalogSet::empty(),
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        assert_eq!(plan.review_lenses, authored);
+        let mut precomputed = plan.clone();
+        precomputed.review_lenses[0].backend = ReviewLensBackendConfig::Precomputed {
+            backend_id: "fixture".to_string(),
+            model: "fixture".to_string(),
+            evidence_kind: crate::review::ReviewLensEvidenceKind::ProcessEvidence,
+        };
+        assert!(validate_custom_review_lens_contracts(&precomputed).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn authored_review_lens_refusals_and_scope_exit_preserve_outer_authority() -> Result<()> {
+        use crate::selection::routing_policy::*;
+        use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+        let _fixture_policy = bind_fixture_routing_policy()?;
+        let plan = test_plan();
+        let (assessment, _, frozen) = fixture_task_assessment(&plan)?;
+        let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        let observation = qualified_account_fixture("codex-cli", FRONTIER_PROFILE_MODEL, "xhigh");
+        let observations = [(SupervisorRuntime::Codex, observation.clone())];
+        let (_, child) = select_normal_account_intake_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            None,
+            Some(&assessment),
+        )?;
+        seal_selected_candidate(AgentRole::ChildOrchestrator.as_str(), &child)?;
+        let (_, baseline) = select_account_review_auditor_with_assessment(
+            &plan,
+            &frozen,
+            &observations,
+            &test_admission(),
+            &default_resolved_profile(),
+            Some(&assessment),
+        )?;
+        let before = captured_selected_authorizations();
+        let catalog = codex_catalog()?;
+        let lens = ReviewLensConfig {
+            id: "scoped-account-review".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "openai".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::DiffOnly,
+        };
+        let expected = AccountBinding::from(&observation.binding);
+        for panic_after_binding in [false, true] {
+            let selected = select_authored_review_lens(
+                &lens,
+                "xhigh",
+                SupervisorRuntime::Codex,
+                &catalog,
+                &baseline,
+                &observation,
+                &expected,
+                SupervisorQuotaSelectionInput::default(),
+            )?;
+            let exited =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
+                    let (_scope, _) = selected.bind()?;
+                    validate_selected_launch("auditor", "codex", FRONTIER_PROFILE_MODEL, "xhigh")?;
+                    assert!(validate_selected_launch(
+                        "child_orchestrator",
+                        "codex",
+                        FRONTIER_PROFILE_MODEL,
+                        "xhigh"
+                    )
+                    .is_err());
+                    if panic_after_binding {
+                        panic!("fixture preparation unwind");
+                    }
+                    bail!("fixture preparation refusal")
+                }));
+            assert!(matches!(exited, Err(_) | Ok(Err(_))));
+            assert_eq!(captured_selected_authorizations(), before);
+        }
+        for refusal in [
+            "account-drift",
+            "access-loss",
+            "stale",
+            "unsupported-effort",
+            "ineligible-model",
+        ] {
+            let mut changed = observation.clone();
+            let mut changed_lens = lens.clone();
+            match refusal {
+                "account-drift" => changed.binding.selection_revision += 1,
+                "access-loss" => {
+                    changed
+                        .models
+                        .as_mut()
+                        .unwrap()
+                        .content
+                        .as_mut()
+                        .unwrap()
+                        .models[0]
+                        .access = ModelAccessOutcome::Unavailable
+                }
+                "stale" => changed.models.as_mut().unwrap().outcome = ObservationOutcome::Stale,
+                "unsupported-effort" => {
+                    let ReviewLensBackendConfig::Model {
+                        reasoning_effort, ..
+                    } = &mut changed_lens.backend
+                    else {
+                        unreachable!()
+                    };
+                    *reasoning_effort = Some("high".to_string());
+                }
+                "ineligible-model" => {
+                    let ReviewLensBackendConfig::Model { model, .. } = &mut changed_lens.backend
+                    else {
+                        unreachable!()
+                    };
+                    *model = ECONOMY_PROFILE_MODEL.to_string();
+                    changed
+                        .models
+                        .as_mut()
+                        .unwrap()
+                        .content
+                        .as_mut()
+                        .unwrap()
+                        .models[0]
+                        .model_id = ECONOMY_PROFILE_MODEL.to_string();
+                }
+                _ => unreachable!(),
+            }
+            let result = select_authored_review_lens(
+                &changed_lens,
+                changed_lens.backend.reasoning_effort().unwrap(),
+                SupervisorRuntime::Codex,
+                &catalog,
+                &baseline,
+                &changed,
+                &expected,
+                SupervisorQuotaSelectionInput::default(),
+            );
+            assert!(result.is_err(), "{refusal} must not grant lens authority");
+            assert_eq!(captured_selected_authorizations(), before);
+        }
+        let mut strict = frozen.clone();
+        strict.policy.default_role.minimum_effort = Some(SelectorEffort::Xhigh);
+        strict.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&strict.policy)?);
+        let _strict_policy = bind_routing_policy(Some(strict.clone()))?;
+        let (assessment, _) = fixture_task_assessment_for_policy(&plan, &strict)?;
+        let mut supported = observation.clone();
+        supported
+            .models
+            .as_mut()
+            .unwrap()
+            .content
+            .as_mut()
+            .unwrap()
+            .models[0]
+            .supported_efforts = Some(vec!["high".to_string(), "xhigh".to_string()]);
+        let (_, strict_baseline) = select_account_review_auditor_with_assessment(
+            &plan,
+            &strict,
+            &[(SupervisorRuntime::Codex, supported.clone())],
+            &test_admission(),
+            &default_resolved_profile(),
+            Some(&assessment),
+        )?;
+        let before = captured_selected_authorizations();
+        let mut high = lens.clone();
+        let ReviewLensBackendConfig::Model {
+            reasoning_effort, ..
+        } = &mut high.backend
+        else {
+            unreachable!()
+        };
+        *reasoning_effort = Some("high".to_string());
+        let error = select_authored_review_lens(
+            &high,
+            "high",
+            SupervisorRuntime::Codex,
+            &catalog,
+            &strict_baseline,
+            &supported,
+            &expected,
+            SupervisorQuotaSelectionInput::default(),
         )
-        .expect_err("mismatched custom review lens must fail closed");
-        assert!(error
-            .to_string()
-            .contains("does not exactly match selector-validated auditor triple"));
+        .err()
+        .context("loaded minimum must refuse an account-supported high-effort lens")?;
+        assert!(format!("{error:#}").contains("effort is below the loaded policy preference"));
+        assert_eq!(captured_selected_authorizations(), before);
         Ok(())
     }
 

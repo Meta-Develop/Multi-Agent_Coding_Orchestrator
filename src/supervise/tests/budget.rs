@@ -3282,12 +3282,14 @@ fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants
         write_injected_usage(command, 7, 3);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("three-lens dispatch");
