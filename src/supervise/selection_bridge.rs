@@ -10043,29 +10043,134 @@ mod tests {
     #[test]
     fn account_review_auditor_selects_grok_from_supported_unknown_access_catalog() -> Result<()> {
         use crate::selection::routing_policy::*;
+        use crate::supervise::model_policy::{
+            ModelCapabilityClass, ModelCapabilityEvidence, ModelCapabilityPolicy,
+        };
+        use crate::supervise::prior_input::{bind_operator_prior_data, OperatorPriorSnapshot};
         use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+        use std::io::Write;
+        use std::path::Path;
+        const FIXTURE_MODEL_ID: &str = "grok-review-account-fixture";
         let temp = tempfile::tempdir()?;
+        git2::Repository::init(temp.path())?;
         let frozen = load_routing_policy(temp.path())?;
         let _policy = bind_routing_policy(Some(frozen.clone()))?;
         let task = task_profile_for_role(AgentRole::Auditor);
+        let base = base_selector_priors_with_terminal_worker_economics()?;
+        let mut prior = base
+            .models
+            .iter()
+            .find(|row| {
+                base.measured_authority_eligibility(&row.model, AuthorityRole::ReviewAuditor)
+                    == selection::MeasuredAuthorityEligibility::Eligible
+                    && row.class_fit.iter().any(|fit| {
+                        fit.task_class == "review_gate"
+                            && (row.strong_gate_fallback_efforts.contains(&fit.effort)
+                                || row.authority_evidence.iter().any(|evidence| {
+                                    evidence.role == AuthorityRole::ReviewAuditor
+                                        && evidence.task_class == "review_gate"
+                                        && evidence.effort == fit.effort
+                                }))
+                    })
+            })
+            .cloned()
+            .context("retained eligible ReviewAuditor profile")?;
+        // ONE synthetic alias retains original evidence, samples, quality,
+        // effort menu and prohibitions. No live Grok model or billing assertion.
+        prior.runtime = runtime_name(SupervisorRuntime::Grok).to_string();
+        prior.model = FIXTURE_MODEL_ID.to_string();
+        prior.source_id = "synthetic-grok-review-account-fixture".to_string();
+        prior.prior_scope = "nonlive unknown-access review catalog fixture only".to_string();
+        prior.limitations.push(
+            "synthetic alias; not measured Grok capability, live entitlement or billing"
+                .to_string(),
+        );
+        let mut advertised_efforts = Vec::new();
+        for fit in &prior.class_fit {
+            if fit.task_class != "review_gate" {
+                continue;
+            }
+            let effort = fit.effort;
+            if !(prior.strong_gate_fallback_efforts.contains(&effort)
+                || prior.authority_evidence.iter().any(|evidence| {
+                    evidence.role == AuthorityRole::ReviewAuditor
+                        && evidence.task_class == "review_gate"
+                        && evidence.effort == effort
+                }))
+            {
+                continue;
+            }
+            if !advertised_efforts.contains(&effort) {
+                advertised_efforts.push(effort);
+            }
+        }
+        assert!(
+            !advertised_efforts.is_empty(),
+            "retained ReviewAuditor profile must advertise a review-gate effort menu"
+        );
+        let snapshot = OperatorPriorSnapshot {
+            schema_version: 1,
+            dataset_id: "synthetic-grok-review-account-prior".to_string(),
+            revision: format!("{}+synthetic-grok-review-account", base.revision),
+            published_on: base.published_on.clone(),
+            models: vec![prior],
+            capability_policy: ModelCapabilityPolicy {
+                id: "synthetic-grok-review-account-capability".to_string(),
+                version: 1,
+                source: "nonlive unknown-access review catalog fixture only".to_string(),
+                models: vec![ModelCapabilityEvidence {
+                    model: FIXTURE_MODEL_ID.to_string(),
+                    capability: ModelCapabilityClass::CriticalJudgment,
+                    eligible: true,
+                    evidence: "synthetic fixture only; not live Grok capability evidence"
+                        .to_string(),
+                    as_of: base.published_on.clone(),
+                }],
+            },
+        };
+        let relative = Path::new("synthetic-grok-review-account-prior.json");
+        let mut prior_file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(temp.path().join(relative))
+            .context("exclusive fixture prior file")?;
+        prior_file
+            .write_all(&serde_json::to_vec(&snapshot).context("serialize fixture prior")?)
+            .context("write fixture prior")?;
+        drop(prior_file);
+        let _prior_guard = bind_operator_prior_data(temp.path(), relative)
+            .context("bind labelled synthetic review prior")?;
         let priors = selector_priors_with_terminal_worker_economics()?;
-        // Reuse existing capability/effort data without granting account access.
+        // Reuse retained capability/effort data without granting account access.
         let models = priors
             .models
             .iter()
             .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Grok))
             .filter_map(|prior| catalog_model_from_prior(prior, &task, false))
-            .map(|model| ObservedModel {
-                model_id: model.model,
-                supported_efforts: Some(
-                    model
-                        .supported_efforts
-                        .iter()
-                        .map(|effort| effort.as_str().to_string())
-                        .collect(),
-                ),
-                default_effort: None,
-                access: ModelAccessOutcome::UnknownAccess,
+            .filter_map(|mut model| {
+                model
+                    .supported_efforts
+                    .retain(|effort| advertised_efforts.contains(effort));
+                if model.supported_efforts.is_empty() {
+                    return None;
+                }
+                let default_effort = if model.supported_efforts.len() == 1 {
+                    Some(model.supported_efforts[0].as_str().to_string())
+                } else {
+                    None
+                };
+                Some(ObservedModel {
+                    model_id: model.model,
+                    supported_efforts: Some(
+                        model
+                            .supported_efforts
+                            .iter()
+                            .map(|effort| effort.as_str().to_string())
+                            .collect(),
+                    ),
+                    default_effort,
+                    access: ModelAccessOutcome::UnknownAccess,
+                })
             })
             .collect::<Vec<_>>();
         assert!(
@@ -10132,6 +10237,13 @@ mod tests {
                     .all(|model| model.access == Some(ModelAccessOutcome::UnknownAccess))
         }));
         let candidate = selected.candidate();
+        assert_eq!(candidate.model, FIXTURE_MODEL_ID);
+        assert!(
+            advertised_efforts
+                .iter()
+                .any(|effort| effort.as_str() == candidate.effort.as_str()),
+            "selected review effort must be one advertised catalog menu member"
+        );
         validate_selected_launch(
             AgentRole::Auditor.as_str(),
             &candidate.runtime,
