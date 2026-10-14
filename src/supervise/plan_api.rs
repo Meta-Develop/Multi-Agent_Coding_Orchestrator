@@ -4320,11 +4320,10 @@ pub(super) fn supervisor_plan_value(
                     .context("normalized Worker did not serialize to an object")?
                     .insert("spec_fragment_ids".into(), serde_json::to_value(fragments)?);
             }
-            let Some(metadata) =
-                assignment_metadata.get(&(assignment.id.clone(), worker.id.clone()))
-            else {
-                continue;
-            };
+            let metadata = assignment_metadata
+                .get(&(assignment.id.clone(), worker.id.clone()))
+                .cloned()
+                .unwrap_or_default();
             let metadata_value = serde_json::to_value(metadata)
                 .context("failed to serialize worker assignment metadata")?;
             let worker_object = worker_value
@@ -7258,6 +7257,22 @@ mod diagnostics_emission_tests {
         assert!(assignment_tasks
             .iter()
             .all(|task| !task.contains("Planning inventory diagnostics:")));
+
+        let nested_workers = document["assignments"]
+            .as_array()
+            .expect("assignments")
+            .iter()
+            .flat_map(|assignment| {
+                assignment["worker_assignments"]
+                    .as_array()
+                    .expect("worker_assignments")
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert!(!nested_workers.is_empty());
+        assert!(nested_workers
+            .iter()
+            .all(|worker| worker["kind"] == "ordinary"));
 
         let serialized = serde_json::to_string(&document).expect("serialize");
         let reloaded = parse_supervisor_plan_with_consultant(&serialized).expect("reload");
