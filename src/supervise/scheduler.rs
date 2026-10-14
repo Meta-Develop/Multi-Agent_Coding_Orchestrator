@@ -8950,6 +8950,7 @@ mod selection_policy_tests {
 
         enum SchedulerObserveStubMode {
             ObservedModels,
+            ObservedSynthetic(ObservedModel),
             ObserveError,
         }
 
@@ -9006,7 +9007,7 @@ mod selection_policy_tests {
                 _account: &StoredAccountMetadata,
             ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
             {
-                match self.mode {
+                match &self.mode {
                     SchedulerObserveStubMode::ObservedModels => {
                         Ok(CategoryObservation::observed(ModelsObservation {
                             provenance: None,
@@ -9021,11 +9022,41 @@ mod selection_policy_tests {
                             }],
                         }))
                     }
+                    SchedulerObserveStubMode::ObservedSynthetic(model) => {
+                        Ok(CategoryObservation::observed(ModelsObservation {
+                            provenance: None,
+                            models: vec![model.clone()],
+                        }))
+                    }
                     SchedulerObserveStubMode::ObserveError => Err(CamError::ConfigRead {
                         provider: self.id.to_string(),
                         reason: "scheduler observe stub refused models".to_string(),
                     }),
                 }
+            }
+        }
+
+        fn synthetic_prior_observed_model(prior: &crate::selection::ModelPrior) -> ObservedModel {
+            let mut efforts = std::collections::BTreeSet::new();
+            for fit in &prior.class_fit {
+                efforts.insert(fit.effort.as_str().to_string());
+            }
+            for evidence in &prior.authority_evidence {
+                efforts.insert(evidence.effort.as_str().to_string());
+            }
+            for effort in &prior.strong_gate_fallback_efforts {
+                efforts.insert(effort.as_str().to_string());
+            }
+            ObservedModel {
+                access:
+                    coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
+                model_id: prior.model.clone(),
+                supported_efforts: if efforts.is_empty() {
+                    None
+                } else {
+                    Some(efforts.into_iter().collect())
+                },
+                default_effort: None,
             }
         }
 
@@ -9341,11 +9372,14 @@ mod selection_policy_tests {
             )?;
             let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
-                // No Codex account is selected: primary observation returns None.
-                // Any accidental secondary catalog observation fails this fixture.
+                // No Codex account is selected: primary observation returns None
+                // before adapter lookup. The selected Grok provider must observe
+                // through a matching stub id and the injected prior model menu.
                 adapter: Box::new(SchedulerObserveStub {
-                    id: "codex-cli",
-                    mode: SchedulerObserveStubMode::ObserveError,
+                    id: "grok-cli",
+                    mode: SchedulerObserveStubMode::ObservedSynthetic(
+                        synthetic_prior_observed_model(&grok_prior),
+                    ),
                 }),
                 advertised: Some(AdvertisedCatalogSet::with_grok(advertised)),
                 resolved_auditor: None,
@@ -9476,6 +9510,11 @@ mod selection_policy_tests {
                     .context("Auditor choice")?
                     .candidate
                     .runtime = "gemini-cli".to_string();
+                let gemini_prior = crate::selection::built_in_prior_dataset()?
+                    .models
+                    .into_iter()
+                    .find(|prior| prior.runtime == "gemini-cli" && !prior.prohibited)
+                    .context("synthetic Gemini prior for observe menu")?;
                 let expected = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<_> {
                     let mut cell = cell.borrow_mut();
                     let harness = cell.as_mut().unwrap();
@@ -9490,6 +9529,12 @@ mod selection_policy_tests {
                     harness
                         .registry
                         .select_complete_revision("gemini-cli", "review", None)?;
+                    harness.adapter = Box::new(SchedulerObserveStub {
+                        id: "gemini-cli",
+                        mode: SchedulerObserveStubMode::ObservedSynthetic(
+                            synthetic_prior_observed_model(&gemini_prior),
+                        ),
+                    });
                     harness.resolved_auditor = Some(auditor);
                     Ok((
                         authority_id_for(harness.registry.metadata_path()),
