@@ -319,11 +319,12 @@ fn injected_parent_auditor_primary_mutation_is_rejected() {
         }
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected auditor mutation");
@@ -418,11 +419,12 @@ fn injected_missing_child_or_auditor_and_failed_child_propagate_final_failure() 
             injected_verified_run(command)
         };
 
-        let report = run_supervisor_plan_with_runner(
+        let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect("collect injected missing or failed report");
@@ -481,11 +483,12 @@ fn injected_diff_reconciliation_rejects_unattributed_worker_diff() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected diff reconciliation");
@@ -528,11 +531,12 @@ fn injected_runner_rejects_missing_worker_execution_journal() {
         injected_verified_run_without_journals(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected missing journal");
@@ -579,11 +583,12 @@ fn injected_runner_rejects_unexpected_worker_journal_capture() {
         run
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("unexpected journal capture should produce a finalized rejection report");
@@ -629,11 +634,12 @@ fn injected_zero_worker_assignment_rejects_nonempty_worker_journal_capture_set()
         run
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("zero-worker unexpected capture should produce a finalized rejection report");

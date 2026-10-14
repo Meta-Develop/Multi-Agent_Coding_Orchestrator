@@ -1820,7 +1820,30 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 4);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "worker");
+    assert_eq!(
+        assignments[0]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!([
+            ".agents/scripts/o2-autopilot",
+            ".agents/skills/agent-orchestration/SKILL.md"
+        ])
+    );
+    let worker_task = assignments[0]["task"].as_str().expect("direct worker task");
+    assert!(worker_task.contains(".agents/skills/agent-orchestration/SKILL.md"));
+    assert!(worker_task.contains(".agents/scripts/o2-autopilot"));
+    assert!(worker_task.contains("Additional required workstream"));
+    assert_eq!(
+        assignments[0]["spec_fragment_ids"],
+        json!(["fragment-001", "fragment-002"])
+    );
     let scopes = assignments
         .iter()
         .map(|assignment| {
@@ -1834,10 +1857,10 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         scopes,
-        BTreeSet::from([
-            vec![".agents/scripts/o2-autopilot".to_string()],
-            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
-        ])
+        BTreeSet::from([vec![
+            ".agents/scripts/o2-autopilot".to_string(),
+            ".agents/skills/agent-orchestration/SKILL.md".to_string(),
+        ]])
     );
 }
 
@@ -1866,7 +1889,20 @@ fn plain_text_gitignored_policy_path_emits_workstream() {
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "worker");
+    assert_eq!(
+        assignments[0]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/SKILL.md"])
+    );
+    assert_eq!(assignments[0]["spec_fragment_ids"], json!(["fragment-001"]));
     let scopes = assignments
         .iter()
         .map(|assignment| {
@@ -5114,7 +5150,13 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
             .iter()
             .map(|assignment| assignment.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["assignment-001-planning", "assignment-001"]
+        vec!["assignment-001"]
+    );
+    assert_eq!(loaded.plan.assignments[0].phase, AssignmentPhase::Execution);
+    assert_eq!(loaded.plan.assignments[0].role, AgentRole::Worker);
+    assert_eq!(
+        loaded.plan.assignments[0].role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
     );
     assert_eq!(
         loaded.plan.assignments[0].assigned_paths,
@@ -5122,27 +5164,13 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     );
     assert!(loaded.plan.assignments[0].worker_assignments.is_empty());
     assert_eq!(
-        loaded.plan.assignments[1].assigned_paths,
-        vec![PathBuf::from("README.md")]
-    );
-    assert_eq!(loaded.plan.assignments[1].role, AgentRole::Worker);
-    assert!(loaded.plan.assignments[1].worker_assignments.is_empty());
-    assert_eq!(
         loaded.plan_metadata.assignment_schedule,
-        vec![
-            AssignmentScheduleEntry {
-                assignment_id: "assignment-001-planning".to_string(),
-                parent_assignment_id: None,
-                depth: 2,
-                flattened_index: 0,
-            },
-            AssignmentScheduleEntry {
-                assignment_id: "assignment-001".to_string(),
-                parent_assignment_id: Some("assignment-001-planning".to_string()),
-                depth: 3,
-                flattened_index: 1,
-            },
-        ]
+        vec![AssignmentScheduleEntry {
+            assignment_id: "assignment-001".to_string(),
+            parent_assignment_id: None,
+            depth: 2,
+            flattened_index: 0,
+        }]
     );
 
     let plan = temp.path().join("plan.json");
@@ -5329,17 +5357,36 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
         .expect("lower heuristic feedback re-plan");
 
     assert_eq!(session.replans_used(), 1);
-    assert_eq!(plan.assignments.len(), 2);
-    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001-planning");
-    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Planning);
-    assert_eq!(plan.assignments[1].id, "assignment-replan-01-001");
-    assert_eq!(plan.assignments[1].phase, AssignmentPhase::Execution);
+    assert!(session.completed_fragment_ids().contains("fragment-001"));
+    assert!(session
+        .completed_assignments()
+        .iter()
+        .any(|assignment| assignment.id == "assignment-001"));
+    assert!(session
+        .proposal()
+        .fragments
+        .iter()
+        .any(|fragment| fragment.id == "fragment-001"));
+    assert!(session
+        .proposal()
+        .fragments
+        .iter()
+        .any(|fragment| fragment.id == "fragment-002"));
+    assert_eq!(plan.assignments.len(), 1);
+    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001");
+    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Execution);
+    assert_eq!(plan.assignments[0].role, AgentRole::Worker);
+    assert_eq!(
+        plan.assignments[0].role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(plan.assignments[0].worker_assignments.is_empty());
     assert!(
-        plan.assignments[1]
+        plan.assignments[0]
             .assigned_paths
             .contains(&PathBuf::from("src/gamma.rs")),
         "remaining work should pick up the feedback path: {:?}",
-        plan.assignments[1].assigned_paths
+        plan.assignments[0].assigned_paths
     );
     assert!(plan
         .assignments

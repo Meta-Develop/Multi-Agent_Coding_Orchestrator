@@ -581,12 +581,12 @@ fn rebind_grok_phase_launch_and_writable_admission(
     bind_grok_fixture_writable_admission(command, assignment, binding)
 }
 
-fn bind_grok_fixture_writable_admission(
-    command: &mut ExternalAgentCommand,
+fn grok_fixture_writable_admission(
+    command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
     binding: &MessagingGrokWritableAdmissionBinding,
-) -> Result<()> {
-    let admission = super::worktree_writable_admission_record(
+) -> Result<crate::external_agent::WorktreeWritableAdmission> {
+    super::worktree_writable_admission_record(
         &assignment.id,
         &assignment.assigned_paths,
         1,
@@ -597,7 +597,15 @@ fn bind_grok_fixture_writable_admission(
         binding.runtime,
         assignment.phase,
     )?
-    .context("rebind writable Grok admission for messaging IPC phase")?;
+    .context("rebind writable Grok admission for messaging IPC phase")
+}
+
+fn bind_grok_fixture_writable_admission(
+    command: &mut ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    binding: &MessagingGrokWritableAdmissionBinding,
+) -> Result<()> {
+    let admission = grok_fixture_writable_admission(command, assignment, binding)?;
     *command = command
         .clone()
         .with_worktree_writable_confinement(admission);
@@ -757,7 +765,7 @@ fn build_admitted_grok_worker_command(
         assignment.run_id.as_str(),
         WORKER_ID,
     );
-    let (runtime, mut command) = bind_selected_assignment_launch_for_test(
+    let (runtime, command) = bind_selected_assignment_launch_for_test(
         initial_command,
         assignment.assignment,
         assignment.policy,
@@ -765,8 +773,6 @@ fn build_admitted_grok_worker_command(
         assignment.options,
         assignment.catalog,
     )?;
-    command.cwd = paths.primary.to_path_buf();
-    command.workspace_access = WorkspaceAccess::ReadOnly;
     let command =
         bind_runtime_output_schema(command, SupervisorRuntime::Grok, paths.worker_schema_path)?;
     let command = bind_selected_native_execution_workspace(
@@ -1315,11 +1321,11 @@ fn assignment_messaging_ipc_acceptance(
     if launch_kind == MessagingIpcLaunchKind::Simulated {
         // Simulation does not persist production writable admission. Use the same
         // authenticated claim without changing production-created artifact paths.
-        bind_grok_fixture_writable_admission(
-            &mut prepared.command,
+        prepared.worktree_writable_admission = Some(grok_fixture_writable_admission(
+            &prepared.command,
             assignment,
             &grok_admission_binding,
-        )?;
+        )?);
     }
     // This command has not launched yet. Keep the production-created report root,
     // journal paths and writable admission together for the actual dispatch.

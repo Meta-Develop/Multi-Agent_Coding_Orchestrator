@@ -339,6 +339,16 @@ pub fn supervisor_plan_document_from_task_planning_session(
     )
 }
 
+fn remaining_routing_proposal(
+    session: &planning::TaskPlanningSession,
+) -> planning::TaskDecompositionProposal {
+    let mut proposal = session.proposal().clone();
+    proposal
+        .fragments
+        .retain(|fragment| !session.completed_fragment_ids().contains(&fragment.id));
+    proposal
+}
+
 fn supervisor_plan_and_consultant_from_task_planning_session(
     goal: &str,
     spec: &str,
@@ -355,7 +365,7 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
                 goal,
                 spec,
                 task_file,
-                session.proposal().clone(),
+                remaining_routing_proposal(session),
                 repo,
             )
         }
@@ -1803,6 +1813,109 @@ mod task_routing_lowering_tests {
             .iter()
             .all(|assignment| assignment.role == AgentRole::Worker));
     }
+
+    #[test]
+    fn remaining_complete_feedback_replan_assesses_without_dropping_session_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git2::Repository::init(repo).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").unwrap();
+        std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").unwrap();
+        std::fs::write(repo.join("src/gamma.rs"), "pub fn gamma_task() {}\n").unwrap();
+        let config = planning::ProviderPlanningConfig::new("replan", "planner-model");
+        let spec = "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.";
+        let mut session = planning::propose_task_decomposition_with_optional_provider(
+            repo, "", spec, None, &config,
+        )
+        .unwrap();
+        let feedback = planning::TaskExecutionFeedback {
+            completed_assignment_ids: vec!["assignment-001".to_string()],
+            failed_assignment_ids: vec!["assignment-002".to_string()],
+            coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+            notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+        };
+        planning::replan_task_decomposition_from_feedback(repo, &mut session, &feedback).unwrap();
+        assert!(session.completed_fragment_ids().contains("fragment-001"));
+        assert!(session
+            .proposal()
+            .fragments
+            .iter()
+            .any(|fragment| fragment.id == "fragment-001"));
+        assert!(session
+            .completed_assignments()
+            .iter()
+            .any(|assignment| assignment.id == "assignment-001"));
+
+        let loaded = supervisor_plan_and_consultant_from_task_planning_session(
+            "",
+            spec,
+            None,
+            &session,
+            Some(repo),
+        )
+        .unwrap();
+        assert!(loaded.plan_metadata.resolved_routing_policy.is_some());
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        assessment
+            .validate_for_task(
+                loaded
+                    .plan_metadata
+                    .resolved_routing_policy
+                    .as_ref()
+                    .unwrap(),
+                &loaded.plan.task,
+            )
+            .unwrap();
+        assert!(!loaded
+            .plan_metadata
+            .spec_fragment_ids
+            .iter()
+            .any(|id| id == "fragment-001"));
+        assert!(loaded
+            .plan_metadata
+            .spec_fragment_ids
+            .iter()
+            .any(|id| id == "fragment-002"));
+        assert!(loaded.plan.assignments.iter().any(|assignment| {
+            assignment
+                .assigned_paths
+                .contains(&PathBuf::from("src/gamma.rs"))
+        }));
+        assert!(loaded
+            .plan
+            .assignments
+            .iter()
+            .all(|assignment| assignment.id != "assignment-001"));
+
+        let document = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        let parsed = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            parsed.plan_metadata.task_routing_assessment,
+            loaded.plan_metadata.task_routing_assessment
+        );
+        assert_eq!(
+            parsed.plan_metadata.resolved_routing_policy,
+            loaded.plan_metadata.resolved_routing_policy
+        );
+        assert!(session.completed_fragment_ids().contains("fragment-001"));
+        assert!(session
+            .proposal()
+            .fragments
+            .iter()
+            .any(|fragment| fragment.id == "fragment-001"));
+    }
 }
 
 const AUTHORITATIVE_NEW_FILE_DIAGNOSTIC: &str =
@@ -2491,10 +2604,11 @@ fn supervisor_plan_and_consultant_from_provider_session(
         .map(crate::selection::routing_policy::load_routing_policy)
         .transpose()?;
     let task = combined_goal_spec(goal, spec);
+    let remaining_proposal = remaining_routing_proposal(session);
     let task_routing_assessment = resolved_routing_policy
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
-        .map(|frozen| super::task_routing::assess_task_routing(&task, session.proposal(), frozen))
+        .map(|frozen| super::task_routing::assess_task_routing(&task, &remaining_proposal, frozen))
         .transpose()?;
     let roots = session.provider_assignment_tree();
     if roots.is_empty() {

@@ -716,7 +716,11 @@ fn supervise_plan_from_goal_emits_parent_gated_traceable_disjoint_workers() -> R
 }
 
 #[test]
-fn supervise_plan_from_goal_refuses_unscoped_prose_and_unmatched_fragments() -> Result<()> {
+fn supervise_plan_from_goal_emits_scoped_coverage_gaps_and_run_refuses_unassessed_intake(
+) -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_from_goal_emits_scoped_coverage_gaps_and_run_refuses_unassessed_intake"
+    );
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
     let goal_path = temp.path().join("incomplete-goal.md");
@@ -728,7 +732,13 @@ fn supervise_plan_from_goal_refuses_unscoped_prose_and_unmatched_fragments() -> 
          - Update the ok function in src/lib.rs.\n\
          - Explain the unmatched frobnicator.\n",
     )?;
-    let error = run_failure_stderr(&[
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target();
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
+
+    let plan = run_success_json(&[
         "supervise",
         "plan",
         "--from-goal",
@@ -737,11 +747,90 @@ fn supervise_plan_from_goal_refuses_unscoped_prose_and_unmatched_fragments() -> 
         path_str(&repo_path)?,
         "--json",
     ])?;
+    let assignments = plan["assignments"]
+        .as_array()
+        .context("generated assignments")?;
     assert!(
-        error.contains("task routing requires a complete, nondegraded decomposition"),
-        "unscoped introduction/frobnicator must fail complete-task assessment: {error}"
+        !assignments.is_empty(),
+        "scoped README/lib work must remain in the planning document: {plan}"
+    );
+    let mut assigned_paths = BTreeSet::new();
+    for assignment in assignments {
+        for path in assignment["assigned_paths"]
+            .as_array()
+            .context("assignment assigned_paths")?
+        {
+            assigned_paths.insert(
+                path.as_str()
+                    .context("assigned path must be a string")?
+                    .to_string(),
+            );
+        }
+        if let Some(workers) = assignment["worker_assignments"].as_array() {
+            for worker in workers {
+                for path in worker["assigned_paths"]
+                    .as_array()
+                    .context("worker assigned_paths")?
+                {
+                    assigned_paths.insert(
+                        path.as_str()
+                            .context("worker assigned path must be a string")?
+                            .to_string(),
+                    );
+                }
+            }
+        }
+    }
+    assert!(
+        assigned_paths.contains("README.md"),
+        "known README work must remain assigned: {assigned_paths:?}"
+    );
+    assert!(
+        assigned_paths.contains("src/lib.rs"),
+        "known lib work must remain assigned: {assigned_paths:?}"
+    );
+    let gap_ids = plan["coverage_gaps"]
+        .as_array()
+        .context("coverage gaps")?
+        .iter()
+        .map(|gap| {
+            gap["spec_fragment_id"]
+                .as_str()
+                .map(str::to_string)
+                .context("coverage gap spec_fragment_id")
+        })
+        .collect::<Result<Vec<_>>>()?;
+    assert_eq!(
+        gap_ids,
+        vec!["fragment-001".to_string(), "fragment-005".to_string()],
+        "intro prose is fragment-001 and unmatched frobnicator is fragment-005 with three scoped lines"
+    );
+    assert!(plan.get("task_routing_assessment").is_none());
+    assert!(plan.get("resolved_routing_policy").is_some());
+    assert!(!repo_path.join(".maco/o2").exists());
+
+    let error = run_failure_stderr(&[
+        "supervise",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "gap-goal-intake",
+        "--runtime",
+        "fake",
+        "--json",
+    ])?;
+    assert!(
+        error.contains("automatic task assessment is unassessed"),
+        "normal from-goal intake must fail closed on unassessed gap documents: {error}"
     );
     assert!(!repo_path.join(".maco/o2").exists());
+    assert_eq!(Repository::open(&repo_path)?.head()?.target(), head_before);
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
     Ok(())
 }
 

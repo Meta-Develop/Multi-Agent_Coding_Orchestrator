@@ -919,6 +919,79 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
     )
 }
 
+fn run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let SupervisorExecutionRuntime::NonpublishableSimulation = execution_runtime else {
+            bail!("selected default parent-acceptance fixture requires NonpublishableSimulation");
+        };
+        if options.runtime != SupervisorRuntime::Codex
+            || !plan.role_models.is_empty()
+            || serde_json::to_value(&plan.review_lenses)?
+                != serde_json::to_value(single_parent_acceptance_review_lenses())?
+        {
+            bail!("selected default parent-acceptance fixture requires its default Codex input contract");
+        }
+        let mut document = serde_json::to_value(&plan)?;
+        let mut metadata = SupervisorPlanMetadata::default();
+        {
+            // Retain the parsed assessment, then restore this temporary policy
+            // before creating the guard that owns the account and frozen policy.
+            let _assessment = bind_assessed_injected_plan(&plan, &options.repo, &mut metadata)?;
+            document["resolved_routing_policy"] =
+                serde_json::to_value(&metadata.resolved_routing_policy)?;
+            document["task_routing_assessment"] =
+                serde_json::to_value(&metadata.task_routing_assessment)?;
+        }
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &options.repo,
+                &mut document,
+                owner,
+            )?;
+        let plan: SupervisorPlan = serde_json::from_value(document)?;
+        let catalog = test_runtime_model_catalog(&plan, options.runtime)?;
+        // This existing binder admits bounded nested workers and carries the
+        // assessment into normal selection for this exact run and repository.
+        let _selected_source = super::scheduler::bind_selected_licensed_source_fixture(
+            &plan,
+            &options,
+            &catalog,
+            metadata,
+            &parent_acceptance,
+        )?;
+        let serialized_runner = std::sync::Mutex::new(external_runner);
+        super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            consultant,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner;
+        run_supervisor_plan_with_runner(
+            plan,
+            consultant,
+            options,
+            execution_runtime,
+            external_runner,
+        )
+    }
+}
+
 #[cfg(target_os = "linux")]
 fn selected_concurrent_injected_fixture<'a>(
     plan: &SupervisorPlan,

@@ -1004,12 +1004,22 @@ mod tests {
                 },
             ),
         );
-        Ok(fixture
+        let command = fixture
             .command("parent")?
             .with_workspace_access(WorkspaceAccess::ReadOnly)
             .with_model_selection(Some("fixture-model".into()), Some("fixture-effort".into()))
             .with_codex_native_delegation_disabled()
-            .with_codex_managed_readonly_continuation())
+            .with_codex_managed_readonly_continuation();
+        let grant = admit_assignment_child_process_intent(
+            fixture.run_id.as_str(),
+            "parent",
+            1,
+            Path::new("codex"),
+            command.model.as_deref(),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )?;
+        Ok(command
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant))
     }
 
     #[test]

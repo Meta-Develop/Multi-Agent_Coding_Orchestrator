@@ -10380,6 +10380,16 @@ mod decomposition_tests {
                 (runtime, selection),
             )
         };
+        #[cfg(target_os = "linux")]
+        if let ReviewLensBackendConfig::Model {
+            backend_id,
+            reasoning_effort,
+            ..
+        } = &mut plan.review_lenses[0].backend
+        {
+            *backend_id = runtime_name(review_auditor_binding.0).to_string();
+            *reasoning_effort = review_auditor_binding.1.reasoning_effort.clone();
+        }
         let mut artifact_writer = ArtifactRunWriter::reserve(
             &repo,
             RunArtifactFamily::Supervise,
@@ -13483,6 +13493,8 @@ done
         .expect_err("a mismatched worktree binding must fail closed");
         assert!(format!("{worktree_error:#}").contains("managed worktree"));
 
+        // Fake's registered static writable-unsupported row isolates the native-writable
+        // factor without the managed-account gate Cursor now requires first.
         let confinement_error = worktree_writable_admission_record(
             "child-a",
             &assigned_paths,
@@ -13491,7 +13503,7 @@ done
             &claim,
             std::slice::from_ref(&claim),
             &command,
-            SupervisorRuntime::Cursor,
+            SupervisorRuntime::Fake,
             AssignmentPhase::Execution,
         )
         .expect_err("unverified native confinement must fail closed");
@@ -14203,8 +14215,13 @@ done
             .clone()
             .with_model_selection(Some("grok-4.6".into()), Some("deep".into()))
             .with_writable_runtime_selection("grok-worker", SupervisorRuntime::Grok, true)?;
-        assert!(admission_error(&invalid_effort)
-            .contains(crate::external_agent::WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED));
+        let invalid_effort_error = admission_error(&invalid_effort);
+        assert!(
+            invalid_effort_error.contains(
+                "writable Grok requires a safe selected model and canonical native effort"
+            ),
+            "invalid deep must refuse at the canonical model/effort guard: {invalid_effort_error}"
+        );
 
         let mut stale = exact.clone().with_writable_runtime_selection(
             "grok-worker",

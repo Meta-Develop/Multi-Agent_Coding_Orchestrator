@@ -9053,6 +9053,9 @@ mod selection_policy_tests {
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
         #[cfg(target_os = "linux")]
         let _cam = install_positive_injected_cam_fixture(&temporary, &catalog)?;
+        let mut plan_metadata = SupervisorPlanMetadata::default();
+        let _routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
         let options =
             predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
 
@@ -9061,7 +9064,7 @@ mod selection_policy_tests {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),
                 assignment_metadata: AssignmentMetadata::new(),
-                plan_metadata: SupervisorPlanMetadata::default(),
+                plan_metadata,
             },
             &options,
             1,
@@ -9125,6 +9128,8 @@ mod selection_policy_tests {
                 .filter(|prior| prior.runtime == "codex")
                 .map(|prior| prior.model.clone()),
         )?);
+        #[cfg(target_os = "linux")]
+        let _cam = install_positive_injected_cam_fixture(&temporary, &catalog)?;
         let admission = SupervisorAdmissionPolicyInput::resolve(
             &repo,
             1,
