@@ -408,7 +408,10 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         .assignments
         .iter()
         .any(|assignment| !assignment.decision_dependencies.is_empty());
-    let (direct_worker, coordinated_workers) = if let Some(frozen) = &resolved_routing_policy {
+    let (direct_worker, coordinated_workers) = if let Some(frozen) = resolved_routing_policy
+        .as_ref()
+        .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
+    {
         let assessment = crate::selection::routing_policy::TaskRoutingFeatures {
             scope_paths: 0,
             scope_modules: 0,
@@ -444,8 +447,9 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
                     .all(|assignment| !assignment.assigned_paths.is_empty()),
         )
     } else {
-        // Document-only callers without a resolved repository keep the existing
-        // conservative graph. Never read an ambient repository's policy here.
+        // Document-only callers without a resolved repository, and incomplete
+        // or degraded proposals, keep the existing conservative graph. Never
+        // read an ambient repository's policy here.
         (false, false)
     };
     if coordinated_workers {

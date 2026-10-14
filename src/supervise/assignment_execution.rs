@@ -1282,7 +1282,9 @@ fn dispatch_isolated_parent_workers_inner(
             handles.push(std::thread::Builder::new().spawn_scoped(scope, move || {
                 #[cfg(all(test, target_os = "linux"))]
                 let _cam_observe_guard =
-                    super::scheduler::install_captured_cam_observe_test_harness(cam_observe_fixture);
+                    super::scheduler::install_captured_cam_observe_test_harness(
+                        cam_observe_fixture,
+                    );
                 let _prior = super::prior_input::install_captured(prior_binding);
                 let _runtime = super::runtime_executables::install_captured(runtime_binding);
                 let mut child_outcome = AssignmentExecutionOutcome {
@@ -2105,6 +2107,7 @@ struct PreparedChildAttempt<'a> {
     corrective_retry_used: bool,
     command: ExternalAgentCommand,
     command_admission: Option<AssignmentCommandAdmission>,
+    worktree_writable_admission: Option<crate::external_agent::WorktreeWritableAdmission>,
     model_provenance: CompletedLaunchModelProvenance,
     primary_before: PrimaryWorktreeSnapshot,
     primary_scope_before: Option<PrimaryScopeSnapshot>,
@@ -3055,6 +3058,7 @@ fn prepare_child_attempt_with_purpose<'a>(
     } else {
         None
     };
+    let mut worktree_writable_admission = None;
     if *execution_runtime == SupervisorExecutionRuntime::Verified
         && !context
             .worktree_creation
@@ -3075,7 +3079,6 @@ fn prepare_child_attempt_with_purpose<'a>(
             launch_runtime,
             assignment_phase,
         )? {
-            command = command.with_worktree_writable_confinement(admission.clone());
             let relative = PathBuf::from("assignments").join(format!(
                 "{}.attempt-{attempt}.worktree-writable-admission.json",
                 assignment.id
@@ -3100,6 +3103,7 @@ fn prepare_child_attempt_with_purpose<'a>(
                     assignment.id, attempt
                 )
             })?;
+            worktree_writable_admission = Some(admission);
         }
     }
     if let Some(signal) = &context.admission_commit {
@@ -3179,6 +3183,7 @@ fn prepare_child_attempt_with_purpose<'a>(
             corrective_retry_used,
             command,
             command_admission,
+            worktree_writable_admission,
             model_provenance: bound_launch.model_provenance,
             primary_before,
             primary_scope_before,
@@ -3723,6 +3728,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
     let attempt_artifacts = prepared.attempt_artifacts;
     let corrective_retry_used = prepared.corrective_retry_used;
     let mut command = prepared.command;
+    let mut worktree_writable_admission = prepared.worktree_writable_admission;
     let model_provenance = prepared.model_provenance;
     let primary_before = prepared.primary_before;
     let primary_scope_before = prepared.primary_scope_before;
@@ -3850,6 +3856,11 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         };
         record_dispatch_checkpoint(artifacts, false, false, &assignment.id, attempt)?;
         bind_final_dispatch_live_budget(&mut command, &budget_reservation)?;
+        if let Some(admission) = worktree_writable_admission.take() {
+            command = command
+                .clone()
+                .with_worktree_writable_confinement(admission);
+        }
         super::runtime_executables::validate_launch(&command)?;
         Ok(messaging_server)
     })() {

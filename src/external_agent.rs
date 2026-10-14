@@ -3563,8 +3563,8 @@ impl ExternalAgentCommand {
         self.worktree_writable_confinement = Some(WorktreeWritableConfinementProof {
             authority: WorktreeWritableConfinementAuthority::Direct(admission),
             selected_launch: self.writable_runtime_selection.clone(),
-            // Direct admission is sealed before the assignment-child process grant is
-            // attached. The grant has its own sealed validation at the process boundary.
+            // The assignment-child process grant has its own sealed validation at
+            // the process boundary, independent of this direct command snapshot.
             command: WorktreeConfinementSnapshot::from_command(&self, false),
         });
         self
@@ -5564,7 +5564,21 @@ mod grok_native_custody_tests {
         .with_agent_lifecycle("/repo", "worker", "run-direct", worker)
         .with_agent_parent("parent")
         .with_writable_runtime_selection(worker, RuntimeId::Grok, true)?
-        .with_worktree_writable_confinement(WorktreeWritableAdmission {
+        .with_worktree_writable_confinement(direct_writable_admission(worker));
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "run-direct",
+            worker,
+            3,
+            Path::new("codex"),
+            Some("grok-4.6"),
+            crate::mutation_taxonomy::ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )?;
+        Ok(command
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant))
+    }
+
+    fn direct_writable_admission(worker: &str) -> WorktreeWritableAdmission {
+        WorktreeWritableAdmission {
             version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
             assignment_id: worker.into(),
             attempt: 3,
@@ -5583,7 +5597,41 @@ mod grok_native_custody_tests {
                 workspace_access: WorkspaceAccess::ReadWrite,
                 side_effect_confinement: SideEffectConfinement::Verified,
             },
-        });
+        }
+    }
+
+    fn direct_writable_command_with_finalized_messaging_then_proof_and_late_grant(
+    ) -> Result<ExternalAgentCommand> {
+        let worker = "ordinary-worker";
+        let workspace = Path::new("/managed/ordinary-worker");
+        let mut command = ExternalAgentCommand::codex(
+            "/pinned/grok",
+            workspace,
+            "/private/prompt.md",
+            "/private/events.jsonl",
+            "/private/report.json",
+            Duration::from_secs(17),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Grok,
+            RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+        )
+        .with_model_selection(Some("grok-4.6".into()), Some("xhigh".into()))
+        .with_workspace_access(WorkspaceAccess::ReadWrite)
+        .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+        .with_agent_lifecycle("/repo", "worker", "run-direct", worker)
+        .with_agent_parent("parent")
+        .with_writable_runtime_selection(worker, RuntimeId::Grok, true)?;
+        command.timeout = command.timeout.min(Duration::from_secs(9));
+        let server = crate::messaging::transport::AssignmentMessagingServer::start(
+            "run-direct",
+            worker,
+            |_| Ok(serde_json::json!({})),
+        )?;
+        let command = command
+            .with_assignment_messaging(server.launch())
+            .with_worktree_writable_confinement(direct_writable_admission(worker));
+        drop(server);
         let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
             "run-direct",
             worker,
@@ -5929,6 +5977,72 @@ mod grok_native_custody_tests {
         assert!(forged_grant
             .verify_assignment_child_admission_identity()
             .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn direct_grok_confinement_accepts_finalized_messaging_timeout_then_proof_and_rejects_post_seal_drift(
+    ) -> Result<()> {
+        let command = direct_writable_command_with_finalized_messaging_then_proof_and_late_grant()?;
+        assert!(command
+            .verified_writable_capabilities(RuntimeId::Grok)?
+            .admits_worktree_writable());
+        command.verify_assignment_child_admission_identity()?;
+
+        for mutation in [
+            "messaging",
+            "timeout",
+            "lifecycle",
+            "account",
+            "socket",
+            "prompt",
+            "output",
+            "protocol",
+        ] {
+            let mut changed = command.clone();
+            match mutation {
+                "messaging" => {
+                    let drifted = crate::messaging::transport::AssignmentMessagingServer::start(
+                        "run-direct",
+                        "ordinary-worker",
+                        |_| Ok(serde_json::json!({})),
+                    )?;
+                    changed = changed.with_assignment_messaging(drifted.launch());
+                }
+                "timeout" => changed.timeout += Duration::from_secs(1),
+                "lifecycle" => changed.agent_lifecycle.as_mut().unwrap().task_id = "sibling".into(),
+                "account" => {
+                    changed.grok_run_account_binding = Some(FrozenGrokSelectedBinding {
+                        authority_id: Some("authority".into()),
+                        provider_id: "grok-cli".into(),
+                        account_id: "account".into(),
+                        account_incarnation: "incarnation".into(),
+                        selection_revision: 7,
+                    })
+                }
+                "socket" => {
+                    changed = changed
+                        .with_cam_authority_socket_pin(Some("/tmp/maco-authority.sock".into()))
+                }
+                "prompt" => changed.prompt = "/private/other-prompt.md".into(),
+                "output" => changed.output_last_message = "/private/other-report.json".into(),
+                "protocol" => {
+                    changed
+                        .runtime_adapter
+                        .as_mut()
+                        .unwrap()
+                        .grok_interaction_protocol =
+                        crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                changed
+                    .verified_writable_capabilities(RuntimeId::Grok)
+                    .is_err(),
+                "direct proof accepted {mutation} substitution"
+            );
+        }
         Ok(())
     }
 
