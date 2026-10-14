@@ -13432,22 +13432,13 @@ done
             Duration::from_secs(1),
         )
         .with_hidden_root(&primary);
-        let (runtime, mut command) = bind_selected_assignment_launch_for_test(
+        let (runtime, command) = bind_selected_assignment_launch_for_test(
             initial_command,
             &assignment,
             &policy,
             &plan,
             &launch_fixture_options(SupervisorRuntime::Codex),
             &catalog,
-        )?;
-        command.cwd = primary.clone();
-        command.workspace_access = WorkspaceAccess::ReadOnly;
-        let command = bind_selected_native_execution_workspace(
-            command,
-            &assignment,
-            runtime,
-            &managed_child,
-            true,
         )?;
 
         assert_eq!(runtime, SupervisorRuntime::Grok);
@@ -13525,7 +13516,16 @@ done
             let mut replaced = command.clone();
             replaced.cwd = primary.clone();
             replaced.workspace_access = WorkspaceAccess::ReadOnly;
-            let error = crate::external_agent::selected_grok_profile_projection_for_test(&replaced)
+            let rebound = bind_selected_native_execution_workspace(
+                replaced.clone(),
+                &assignment,
+                runtime,
+                &managed_child,
+                true,
+            )?;
+            assert_eq!(rebound.workspace_access, WorkspaceAccess::ReadOnly);
+            assert_eq!(rebound.cwd, primary);
+            let error = crate::external_agent::selected_grok_profile_projection_for_test(&rebound)
                 .err()
                 .context("selected Grok profile must reject a replaced read-only workspace")?;
             assert!(format!("{error:#}")

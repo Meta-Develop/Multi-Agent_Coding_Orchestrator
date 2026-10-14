@@ -3370,7 +3370,15 @@ mod tests {
             Ok(_) => panic!("copy refused"),
         };
         assert_eq!(error.kind(), io::ErrorKind::Interrupted);
-        executable(&path, b"\x7fELFdifferent bytes");
+        let mut drifted = OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&path)
+            .expect("open existing native fixture for in-place drift");
+        drifted
+            .write_all(b"\x7fELFdifferent bytes")
+            .expect("write drifted fixture bytes");
+        drop(drifted);
         assert!(materialize_sealed(&pinned.source).is_err());
     }
 

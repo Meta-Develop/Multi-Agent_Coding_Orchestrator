@@ -118,7 +118,18 @@ class LibraryShardTests(unittest.TestCase):
         self.assertIn("timeout-minutes: 45", library)
         self.assertNotIn("continue-on-error", library)
         self.assertIn('run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"', library)
-        self.assertEqual(library.count("if: matrix.shard == 'rest'"), 5)
+        self.assertEqual(library.count("if: matrix.shard == 'rest'"), 6)
+        userns = (
+            "- name: Allow root libtest userns on GitHub-hosted Ubuntu\n"
+            "        if: matrix.shard == 'rest'\n"
+            "        run: bash .github/scripts/configure-github-hosted-root-libtest-userns.sh"
+        )
+        self.assertEqual(library.count(userns), 1)
+        self.assertLess(library.index("- name: Lint all targets"), library.index(userns))
+        self.assertLess(
+            library.index(userns),
+            library.index("- name: Verify sealed native entry regressions"),
+        )
         gate = source.split("  linux-gate:", 1)[1].split("  portable-build:", 1)[0]
         self.assertIn("if: always()", gate)
         self.assertIn("needs.linux-library.result", gate)
