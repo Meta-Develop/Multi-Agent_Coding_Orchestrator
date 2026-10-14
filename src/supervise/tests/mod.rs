@@ -565,12 +565,22 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
     let effort = child
         .reasoning_effort
         .as_deref()
-        .and_then(ReasoningEffort::parse)
-        .context("fixture child effort")?;
+        .map(|authored| ReasoningEffort::parse(authored).context("fixture child effort"))
+        .transpose()?;
+    if effort.is_none() && !matches!(plan.review_lenses.len(), 2 | 3) {
+        bail!("fixture child effort");
+    }
+    // A lens contract can identify the existing uniform fixture shape, but it
+    // never supplies the absent child effort. Only assessed selection below does.
+    let uniform_effort = effort.map(ReasoningEffort::as_str).or_else(|| {
+        plan.review_lenses
+            .first()
+            .and_then(|lens| lens.backend.reasoning_effort())
+    });
     let uniform = plan.review_lenses.len() == 3
+        && uniform_effort.is_some()
         && plan.review_lenses.iter().all(|lens| {
-            lens.backend.model() == model
-                && lens.backend.reasoning_effort() == Some(effort.as_str())
+            lens.backend.model() == model && lens.backend.reasoning_effort() == uniform_effort
         });
     if !uniform {
         plan.role_models
@@ -580,17 +590,31 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
     }
     // This is an authored preference only. The bootstrap and final initialization
     // must independently obtain matching account/policy selector decisions.
-    if plan.role_models.contains_key(&AgentRole::Auditor) {
-        bail!("nested review fixture must not replace an authored Auditor preference");
-    }
-    plan.role_models.insert(
-        AgentRole::Auditor,
-        RoleModelSelection {
-            model: Some(model.clone()),
-            reasoning_effort: (!uniform).then(|| effort.as_str().to_string()),
-            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+    let auditor = RoleModelSelection {
+        model: Some(model.clone()),
+        reasoning_effort: if uniform {
+            None
+        } else {
+            effort.map(|effort| effort.as_str().to_string())
         },
-    );
+        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+    };
+    if let Some(authored) = plan.role_models.get(&AgentRole::Auditor) {
+        // The single-lens budget cases supply both process preferences explicitly.
+        // Retain them only when they match this fixture's exact selected profile.
+        if plan.review_lenses.len() != 1
+            || authored.model != auditor.model
+            || authored.reasoning_effort != auditor.reasoning_effort
+            || !matches!(
+                authored.unavailable_model_fallback,
+                UnavailableModelFallback::FailClosed
+            )
+        {
+            bail!("nested review fixture must not replace an authored Auditor preference");
+        }
+    } else {
+        plan.role_models.insert(AgentRole::Auditor, auditor);
+    }
     let actual_catalog = match supplied_catalog {
         Some(catalog) => catalog,
         None => test_runtime_model_catalog(&plan, options.runtime)?,
@@ -608,10 +632,12 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
         .cloned()
         .context("nested review fixture baseline prior")?;
     let mut profiles = BTreeMap::<String, BTreeSet<String>>::new();
+    // For an absent effort, retain the baseline's full existing prior menu.
+    // Do not add review evidence for an invented child effort.
     profiles
         .entry(model.clone())
         .or_default()
-        .insert(effort.as_str().to_string());
+        .extend(effort.map(|effort| effort.as_str().to_string()));
     for lens in &plan.review_lenses {
         profiles
             .entry(lens.backend.model().to_string())
@@ -692,6 +718,140 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
     file.write_all(&serde_json::to_vec(&snapshot)?)?;
     drop(file);
     let _prior = bind_operator_prior_data(&options.repo, relative)?;
+    let effort = match effort {
+        Some(effort) => effort,
+        None => {
+            let frozen = metadata
+                .resolved_routing_policy
+                .as_ref()
+                .context("default fixture frozen policy")?;
+            let assessment = metadata
+                .task_routing_assessment
+                .as_ref()
+                .context("default fixture parsed assessment")?;
+            assessment.validate_for_task(frozen, &plan.task)?;
+            let admission = SupervisorAdmissionPolicyInput::resolve(
+                &options.repo,
+                1,
+                metadata.admission,
+                SupervisorAdmissionConfig::default(),
+            )?;
+            let objective =
+                resolve_objective_profile(&options.repo, metadata.objective_profile.as_deref())?;
+            let history = super::outcome_history::load_frozen_outcome_history(
+                &options.repo,
+                &options.run_id,
+            )?;
+            let _bootstrap_account = super::scheduler::install_licensed_autopilot_account_fixture(
+                owner,
+                &actual_catalog,
+            )?;
+            let _bootstrap_policy =
+                crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+            let mut observation = super::scheduler::account_observation_for_launch_runtime(
+                SupervisorRuntime::Codex,
+                None,
+            )?
+            .context("default fixture selected account observation")?;
+            // Preserve the explicit model preference while selecting the missing
+            // effort from its complete genuine current record. Remove alternatives;
+            // never add access, effort, provenance or selected-account evidence.
+            let observed = observation
+                .models
+                .as_mut()
+                .filter(|category| {
+                    category.outcome
+                        == coding_agent_manager_lib::account_authority::ObservationOutcome::Observed
+                })
+                .and_then(|category| category.content.as_mut())
+                .context("default fixture observed model menu")?;
+            observed.models.retain(|row| row.model_id == model);
+            if observed.models.len() != 1 || !catalog.contains(&model) {
+                bail!("default fixture authored model lacks its unique current catalog record");
+            }
+            let observations = [(SupervisorRuntime::Codex, observation)];
+            let (subject, subject_decision) =
+                super::selection_bridge::select_normal_account_intake_with_assessment(
+                    &plan,
+                    frozen,
+                    &observations,
+                    &admission,
+                    &objective,
+                    Some(&history),
+                    Some(assessment),
+                )?;
+            let subject = subject.context("default fixture subject selection refused")?;
+            let (auditor, auditor_decision) =
+                super::selection_bridge::select_account_review_auditor_with_assessment(
+                    &plan,
+                    frozen,
+                    &observations,
+                    &admission,
+                    &objective,
+                    Some(assessment),
+                )?;
+            let auditor = auditor.context("default fixture Auditor selection refused")?;
+            for (role, selected, decision) in [
+                (AgentRole::ChildOrchestrator, &subject, &subject_decision),
+                (AgentRole::Auditor, &auditor, &auditor_decision),
+            ] {
+                let receipt = decision
+                    .routing_policy
+                    .as_ref()
+                    .context("default fixture selector policy receipt")?;
+                let choice = decision
+                    .choice
+                    .as_ref()
+                    .context("default fixture genuine selected choice")?;
+                selected.validate_binding(&(&observations[0].1.binding).into())?;
+                if decision.status != crate::selection::DecisionStatus::Selected
+                    || selected.candidate() != &choice.candidate
+                    || choice.candidate.runtime != SupervisorRuntime::Codex.as_str()
+                    || choice.candidate.model != model
+                    || receipt.frozen != *frozen
+                    || receipt.role != role.as_str()
+                    || selected.policy_digest != frozen.sha256
+                    || selected.task_features != receipt.features
+                    || decision.operator_prior_data != super::prior_input::current_provenance()
+                    || decision.normalized_input.debug_override.is_some()
+                    || !decision.candidate_set.iter().any(|candidate| {
+                        candidate.candidate == choice.candidate
+                            && candidate.eligible
+                            && candidate.ineligibility_reasons.is_empty()
+                    })
+                {
+                    bail!("default fixture profile differs from its genuine assessed selection");
+                }
+            }
+            let selected_effort = ReasoningEffort::parse(subject.candidate().effort.as_str())
+                .context("default fixture selected child effort")?;
+            // Keep authored Nones for the existing uniform bootstrap only when
+            // both selected profiles and the authored lenses actually match.
+            let uniform_selected_profile = uniform
+                && auditor.candidate().effort == subject.candidate().effort
+                && uniform_effort == Some(auditor.candidate().effort.as_str());
+            if !uniform_selected_profile {
+                // Resolve absent preferences only after genuine normal decisions.
+                // Heterogeneous lens triples are never changed by this bootstrap.
+                for (role, selected) in [
+                    (AgentRole::ChildOrchestrator, &subject),
+                    (AgentRole::Auditor, &auditor),
+                ] {
+                    let preference = plan
+                        .role_models
+                        .get_mut(&role)
+                        .context("default fixture authored role preference")?;
+                    if preference.reasoning_effort.is_some() {
+                        bail!("default fixture must not replace an explicit role effort");
+                    }
+                    preference.reasoning_effort =
+                        Some(selected.candidate().effort.as_str().to_string());
+                }
+            }
+            selected_effort
+        }
+    };
+
     let _fixture = super::scheduler::install_selected_nested_review_fixture(
         &plan, &options, catalog, metadata, owner, policy, effort,
     )?;

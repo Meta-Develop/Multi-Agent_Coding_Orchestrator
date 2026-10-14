@@ -285,6 +285,14 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let effort = plan.review_lenses[0]
+        .backend
+        .reasoning_effort()
+        .expect("authored acceptance effort")
+        .to_string();
+    for selection in plan.role_models.values_mut() {
+        selection.reasoning_effort = Some(effort.clone());
+    }
     let budget = injected_run_budget(None, Some(20), None, None, 10, 10);
     let options = injected_options(&repo_path, temp.path(), "budget-serial-exact-hard");
     let mut invocations = 0usize;
@@ -308,12 +316,14 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("run serial budget boundary");
@@ -1303,6 +1313,14 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let effort = plan.review_lenses[0]
+        .backend
+        .reasoning_effort()
+        .expect("authored acceptance effort")
+        .to_string();
+    for selection in plan.role_models.values_mut() {
+        selection.reasoning_effort = Some(effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-auditor-pre-runner-release";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -1329,12 +1347,14 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
         run
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize auditor pre-runner failure");
@@ -1434,6 +1454,14 @@ fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() 
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let effort = plan.review_lenses[0]
+        .backend
+        .reasoning_effort()
+        .expect("authored acceptance effort")
+        .to_string();
+    for selection in plan.role_models.values_mut() {
+        selection.reasoning_effort = Some(effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-auditor-runner-panic";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -1454,12 +1482,14 @@ fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() 
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize auditor runner panic");

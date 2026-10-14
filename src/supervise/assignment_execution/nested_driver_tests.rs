@@ -1511,7 +1511,14 @@ fn exercise_fixture_continuation(
             .exists());
         let prompt = fs::read_to_string(&prepared.attempt_artifacts.prompt_path)?;
         let initial = fs::read_to_string(&collected.attempt_artifacts.prompt_path)?;
-        assert!(initial.contains("Launch every supplied terminal worker"));
+        assert!(initial.contains("Source and Git are read-only"));
+        assert!(initial.contains(
+            "Do not use Native SubAgent, spawn_agent, a raw provider CLI, or nested MACO worker launches."
+        ));
+        assert!(initial.contains("maco_worker_request"));
+        assert!(initial.contains("outcome=yield_workers"));
+        assert!(initial.contains("request_id=r1 worker_id=worker"));
+        assert!(initial.contains("request_id=r2 worker_id=worker-two"));
         assert!(!prompt.contains("Launch every supplied terminal worker"));
         assert!(prompt.contains("Native SubAgent, spawn_agent, raw CLI/provider processes and nested MACO launches are forbidden"));
         assert!(prompt.contains(contract.summaries()));

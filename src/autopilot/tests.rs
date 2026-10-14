@@ -878,14 +878,15 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
 }
 
 #[cfg(target_os = "linux")]
-fn assessed_licensed_autopilot_supervisor_plan(
+fn assessed_licensed_autopilot_supervisor_plan<'a>(
     repo: &Path,
+    owner: &'a tempfile::TempDir,
 ) -> (
     Value,
     LicensedBreakageDeclaration,
     String,
     AutopilotProfile,
-    crate::selection::routing_policy::RoutingPolicyGuard,
+    supervise::InjectedSupervisorParentAcceptanceGuard<'a>,
 ) {
     let (mut plan, declaration, declaration_sha256) = licensed_autopilot_supervisor_plan();
     let assessed = supervise::supervisor_plan_document_from_goal_spec(
@@ -900,8 +901,9 @@ fn assessed_licensed_autopilot_supervisor_plan(
             .expect("goal/spec planning must emit bound task assessment metadata")
             .clone();
     }
-    let policy = supervise::bind_injected_supervisor_parent_acceptance_for_test(repo, &mut plan)
-        .expect("bind the licensed parent-acceptance lens through assessed selection");
+    let policy =
+        supervise::bind_injected_supervisor_parent_acceptance_for_test(repo, &mut plan, owner)
+            .expect("bind the licensed parent-acceptance lens through assessed selection");
     let effective: SupervisorPlan =
         serde_json::from_value(plan.clone()).expect("decode bound licensed source fixture");
     let profile = AutopilotProfile {
@@ -1210,23 +1212,22 @@ fn injected_cancelling_licensed_autopilot_runner(
 
 #[cfg(target_os = "linux")]
 fn run_injected_licensed_autopilot_cascade_result(
-    temp_root: &Path,
+    owner: &tempfile::TempDir,
     repo: &Path,
     run_name: &str,
 ) -> (Result<AutopilotFinalReport>, usize, usize) {
-    run_injected_licensed_autopilot_cascade_result_with_bounds(
-        temp_root, repo, run_name, None, None,
-    )
+    run_injected_licensed_autopilot_cascade_result_with_bounds(owner, repo, run_name, None, None)
 }
 
 #[cfg(target_os = "linux")]
 fn run_injected_licensed_autopilot_cascade_result_with_bounds(
-    temp_root: &Path,
+    owner: &tempfile::TempDir,
     repo: &Path,
     run_name: &str,
     max_child_dispatches: Option<usize>,
     cancellation: Option<ProcessCancellation>,
 ) -> (Result<AutopilotFinalReport>, usize, usize) {
+    let temp_root = owner.path();
     let outer_plan = temp_root.join(format!("{run_name}-autopilot.json"));
     fs::write(
         &outer_plan,
@@ -1243,7 +1244,7 @@ fn run_injected_licensed_autopilot_cascade_result_with_bounds(
     )
     .expect("write injected Autopilot outer plan");
     let (supervisor_plan, _declaration, declaration_sha256, profile, _routing_policy) =
-        assessed_licensed_autopilot_supervisor_plan(repo);
+        assessed_licensed_autopilot_supervisor_plan(repo, owner);
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
     let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));
     let mut runner = injected_licensed_autopilot_runner(
@@ -1279,12 +1280,12 @@ fn run_injected_licensed_autopilot_cascade_result_with_bounds(
 
 #[cfg(target_os = "linux")]
 fn run_injected_licensed_autopilot_cascade(
-    temp_root: &Path,
+    owner: &tempfile::TempDir,
     repo: &Path,
     run_name: &str,
 ) -> (AutopilotFinalReport, usize) {
     let (report, source_child_dispatches, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade_result(temp_root, repo, run_name);
+        run_injected_licensed_autopilot_cascade_result(owner, repo, run_name);
     assert_eq!(source_child_dispatches, 1);
     (
         report.expect("run injected licensed Autopilot cascade"),
@@ -1431,7 +1432,7 @@ fn autopilot_taxonomy_refuses_source_before_any_dispatch_with_exact_gate() {
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
-            fixture.temp_path(),
+            &fixture.temp,
             repo,
             run_name,
             None,
@@ -1491,7 +1492,7 @@ fn autopilot_max_zero_refuses_source_before_any_dispatch_and_leaves_no_state() {
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
-            fixture.temp_path(),
+            &fixture.temp,
             repo,
             run_name,
             Some(0),
@@ -1560,7 +1561,7 @@ fn autopilot_cancellation_after_source_gate_refuses_dispatch_and_finalizes_cance
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
-            fixture.temp_path(),
+            &fixture.temp,
             repo,
             run_name,
             None,
@@ -1628,7 +1629,7 @@ fn autopilot_source_child_cancellation_propagates_and_cleanly_unwinds() {
     )
     .expect("write cancelling Autopilot outer plan");
     let (supervisor_plan, _declaration, declaration_sha256, profile, _routing_policy) =
-        assessed_licensed_autopilot_supervisor_plan(repo);
+        assessed_licensed_autopilot_supervisor_plan(repo, &fixture.temp);
     let caller_cancellation = ProcessCancellation::new();
     let source_scheduler_cancellation_observed = Arc::new(AtomicBool::new(false));
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
@@ -1793,7 +1794,7 @@ fn autopilot_max_child_dispatches_refuses_first_follow_up_before_dispatch_and_re
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
         run_injected_licensed_autopilot_cascade_result_with_bounds(
-            fixture.temp_path(),
+            &fixture.temp,
             repo,
             run_name,
             Some(1),
@@ -1899,7 +1900,7 @@ fn autopilot_taxonomy_refuses_generated_follow_up_as_typed_outcome() {
     ]);
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade_result(fixture.temp_path(), repo, run_name);
+        run_injected_licensed_autopilot_cascade_result(&fixture.temp, repo, run_name);
     let report = report.expect("return taxonomy follow-up refusal report");
 
     assert_eq!(source_child_dispatches, 1);
@@ -1950,7 +1951,7 @@ fn bound_inbox_pr_gate_refuses_generated_follow_up_in_same_cascade() {
     let outer_run_id = RunId::new(run_name).expect("outer inbox run id");
     let plan_file = fixture.temp_path().join("bound-source-supervisor.json");
     let (plan, _declaration, declaration_sha256, _profile, _routing_policy) =
-        assessed_licensed_autopilot_supervisor_plan(repo);
+        assessed_licensed_autopilot_supervisor_plan(repo, &fixture.temp);
     fs::write(
         &plan_file,
         serde_json::to_vec_pretty(&plan).expect("serialize source supervisor plan"),
@@ -2192,7 +2193,7 @@ fn autopilot_authenticated_follow_up_dispatch_sets_boolean_after_real_gates() {
         .target()
         .expect("injected Autopilot HEAD oid");
     let (report, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade(fixture.temp_path(), repo, &fixture.run_name);
+        run_injected_licensed_autopilot_cascade(&fixture.temp, repo, &fixture.run_name);
 
     assert_eq!(follow_up_child_dispatches, 1);
     assert_eq!(report.status, AutopilotRunStatus::Succeeded, "{report:#?}");
@@ -2248,11 +2249,7 @@ fn autopilot_cascade_error_after_authenticated_follow_up_start_never_reports_fal
     supervise::set_interrupt_after_authenticated_follow_up_child_start();
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade_result(
-            fixture.temp_path(),
-            repo,
-            &fixture.run_name,
-        );
+        run_injected_licensed_autopilot_cascade_result(&fixture.temp, repo, &fixture.run_name);
     let report = report.expect("return an honest failed Autopilot report");
 
     assert_eq!(source_child_dispatches, 1);
@@ -2296,7 +2293,7 @@ fn autopilot_marker_without_child_checkpoint_refuses_a_false_final_report() {
     supervise::set_interrupt_after_follow_up_dispatch_started();
 
     let (report, source_child_dispatches, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade_result(fixture.temp_path(), repo, run_name);
+        run_injected_licensed_autopilot_cascade_result(&fixture.temp, repo, run_name);
     let error = report.expect_err("marker-only dispatch state must not finalize false");
 
     assert_eq!(source_child_dispatches, 1);
@@ -2376,7 +2373,7 @@ fn autopilot_generated_plan_refusal_keeps_dispatch_boolean_false() {
     });
 
     let (report, follow_up_child_dispatches) =
-        run_injected_licensed_autopilot_cascade(fixture.temp_path(), repo, &fixture.run_name);
+        run_injected_licensed_autopilot_cascade(&fixture.temp, repo, &fixture.run_name);
 
     assert_eq!(follow_up_child_dispatches, 0);
     assert_eq!(report.status, AutopilotRunStatus::Failed, "{report:#?}");
@@ -2448,7 +2445,7 @@ fn interrupted_autopilot_queue_resumes_through_supervise_without_duplicate_ident
     )
     .expect("write cross-entrypoint Autopilot plan");
     let (supervisor_plan, _declaration, declaration_sha256, profile, _routing_policy) =
-        assessed_licensed_autopilot_supervisor_plan(repo);
+        assessed_licensed_autopilot_supervisor_plan(repo, &fixture.temp);
     let retention = secure_autopilot_machine_global_retention(fixture.temp_path(), run_name);
     let source_child_dispatches = Arc::new(AtomicUsize::new(0));
     let follow_up_child_dispatches = Arc::new(AtomicUsize::new(0));

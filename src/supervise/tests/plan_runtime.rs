@@ -1162,25 +1162,25 @@ fn default_stacked_uncorrelated_review_lenses_return_three_distinct_scopes() {
         lenses[0].information_scope,
         ReviewInformationScope::FullChildTranscript
     );
-    assert_eq!(lenses[0].backend.backend_id(), "openai");
-    assert_eq!(lenses[0].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[0].backend.backend_id(), "automatic");
+    assert_eq!(lenses[0].backend.model(), "automatic");
+    assert_eq!(lenses[0].backend.reasoning_effort(), None);
     assert_eq!(lenses[1].id, "output-only");
     assert_eq!(
         lenses[1].information_scope,
         ReviewInformationScope::OutputReportOnly
     );
-    assert_eq!(lenses[1].backend.backend_id(), "openai");
-    assert_eq!(lenses[1].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[1].backend.backend_id(), "automatic");
+    assert_eq!(lenses[1].backend.model(), "automatic");
+    assert_eq!(lenses[1].backend.reasoning_effort(), None);
     assert_eq!(lenses[2].id, "diff-only");
     assert_eq!(
         lenses[2].information_scope,
         ReviewInformationScope::DiffOnly
     );
-    assert_eq!(lenses[2].backend.backend_id(), "openai");
-    assert_eq!(lenses[2].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].backend.backend_id(), "automatic");
+    assert_eq!(lenses[2].backend.model(), "automatic");
+    assert_eq!(lenses[2].backend.reasoning_effort(), None);
     assert_ne!(lenses[0].information_scope, lenses[1].information_scope);
     assert_ne!(lenses[0].information_scope, lenses[2].information_scope);
     assert_ne!(lenses[1].information_scope, lenses[2].information_scope);
@@ -1196,19 +1196,19 @@ fn default_supervisor_review_lenses_are_the_stacked_uncorrelated_scopes() {
         lenses[0].information_scope,
         ReviewInformationScope::FullChildTranscript
     );
-    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[0].backend.reasoning_effort(), None);
     assert_eq!(lenses[1].id, "output-only");
     assert_eq!(
         lenses[1].information_scope,
         ReviewInformationScope::OutputReportOnly
     );
-    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[1].backend.reasoning_effort(), None);
     assert_eq!(lenses[2].id, "diff-only");
     assert_eq!(
         lenses[2].information_scope,
         ReviewInformationScope::DiffOnly
     );
-    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].backend.reasoning_effort(), None);
 
     let omitted = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),

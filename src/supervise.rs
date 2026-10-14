@@ -329,10 +329,24 @@ pub(crate) use assignment_execution::configure_assignment_phase_command_for_test
 use assignment_execution::*;
 
 #[cfg(all(test, target_os = "linux"))]
-pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test(
+pub(crate) struct InjectedSupervisorParentAcceptanceGuard<'a> {
+    // Restore outer policy/role authority while the selected observer is still held.
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _account: scheduler::PositiveInjectedCamFixtureGuard<'a>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test<'a>(
     repo: &Path,
     document: &mut Value,
-) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
+    owner: &'a tempfile::TempDir,
+) -> Result<InjectedSupervisorParentAcceptanceGuard<'a>> {
+    if !repo
+        .canonicalize()?
+        .starts_with(owner.path().canonicalize()?)
+    {
+        bail!("licensed Autopilot selected fixture requires its owned repository");
+    }
     let mut loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
         &serde_json::to_string(document)?,
         Some(repo),
@@ -348,6 +362,7 @@ pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test(
     let mut catalog_plan = loaded.plan.clone();
     catalog_plan.review_lenses.clear();
     let catalog = test_runtime_model_catalog(&catalog_plan, SupervisorRuntime::Codex)?;
+    let account = scheduler::install_licensed_autopilot_account_fixture(owner, &catalog)?;
     loaded.plan.review_lenses = default_supervisor_review_lenses();
     let admission = SupervisorAdmissionPolicyInput::resolve(
         repo,
@@ -391,7 +406,10 @@ pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test(
     if test_runtime_model_catalog(&source_plan, SupervisorRuntime::Codex)? != catalog {
         bail!("licensed source fixture must retain the exact bootstrap catalog");
     }
-    Ok(policy)
+    Ok(InjectedSupervisorParentAcceptanceGuard {
+        _policy: policy,
+        _account: account,
+    })
 }
 
 mod plan_validation;

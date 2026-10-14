@@ -4611,9 +4611,27 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
     effort: ReasoningEffort,
 ) -> Result<SelectedConcurrentFixtureGuard<'a>> {
     let repo = options.repo.canonicalize()?;
-    let [assignment] = plan.assignments.as_slice() else {
-        bail!("nested review fixture requires one authored child");
+    let [assignment, pending @ ..] = plan.assignments.as_slice() else {
+        bail!("nested review fixture requires an authored nested child");
     };
+    // Single-lens budget lifecycle cases also retain one pending ordinary child.
+    // The existing two/three-lens fixtures still require exactly one nested child.
+    if !pending.is_empty()
+        && (plan.review_lenses.len() != 1
+            || pending.len() != 1
+            || pending.iter().any(|child| {
+                child.role != AgentRole::ChildOrchestrator
+                    || child.phase != AssignmentPhase::Execution
+                    || child.effective_role_category() != RoleCategory::DelegatingCoordinator
+                    || child.assigned_paths.is_empty()
+                    || !child.worker_assignments.is_empty()
+                    || child
+                        .runtime
+                        .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+            }))
+    {
+        bail!("single-lens nested review fixture permits only one pending ordinary Codex child");
+    }
     if !repo.starts_with(owner.path().canonicalize()?)
         || options.runtime != SupervisorRuntime::Codex
         || assignment.role != AgentRole::ChildOrchestrator
@@ -4651,8 +4669,8 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
         .and_then(|selection| selection.model.as_ref())
         .context("nested review fixture authored child model")?;
     let mut models = BTreeSet::from([(model.clone(), effort.as_str().to_string())]);
-    if !catalog.contains(model) || !matches!(plan.review_lenses.len(), 2 | 3) {
-        bail!("nested review fixture requires its actual child catalog and two or three lenses");
+    if !catalog.contains(model) || !matches!(plan.review_lenses.len(), 1..=3) {
+        bail!("nested review fixture requires its actual child catalog and one to three lenses");
     }
     for lens in &plan.review_lenses {
         let ReviewLensBackendConfig::Model {
@@ -4667,6 +4685,20 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
             bail!("nested review fixture lens is absent from its supplied model/effort catalog");
         }
         models.insert((model.clone(), effort.clone()));
+    }
+    // Retain a separately selected generic Auditor profile as well as the child
+    // and authored lenses. Equal-profile callers add the same existing set entry.
+    if let Some(auditor) = plan.role_models.get(&AgentRole::Auditor) {
+        if let Some(effort) = auditor.reasoning_effort.as_deref() {
+            let model = auditor
+                .model
+                .as_ref()
+                .context("nested review fixture resolved Auditor model")?;
+            if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
+                bail!("nested review fixture Auditor is absent from its supplied model/effort catalog");
+            }
+            models.insert((model.clone(), effort.to_string()));
+        }
     }
     let uniform = models.len() == 1 && plan.review_lenses.len() == 3;
     super::prior_input::require_binding_repo(&repo)?;
@@ -4867,10 +4899,18 @@ fn install_concurrent_fixture_observations(
     let models = ModelsObservation {
         models: lens_models
             .into_iter()
-            .map(|(model_id, effort)| ObservedModel {
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut models, (model, effort)| {
+                    models.entry(model).or_default().insert(effort);
+                    models
+                },
+            )
+            .into_iter()
+            .map(|(model_id, efforts)| ObservedModel {
                 model_id,
-                supported_efforts: Some(vec![effort.clone()]),
-                default_effort: Some(effort),
+                default_effort: (efforts.len() == 1).then(|| efforts.first().unwrap().clone()),
+                supported_efforts: Some(efforts.into_iter().collect()),
                 access: ModelAccessOutcome::Available,
             })
             .collect(),
@@ -4892,6 +4932,60 @@ fn install_concurrent_fixture_observations(
         _root: root,
     });
     Ok(cam)
+}
+
+// A nonlive selected account held across the licensed source and generated runs.
+// This supplies observations only; each real RunId must pass normal selection/freeze.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_licensed_autopilot_account_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    supplied: &RuntimeModelCatalog,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    let RuntimeModelCatalog::Codex(catalog) = supplied else {
+        bail!("licensed Autopilot fixture requires its actual Codex catalog");
+    };
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let mut models = BTreeSet::new();
+    for prior in priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex" && catalog.contains(&prior.model))
+    {
+        let supported = match catalog.effort_metadata(&prior.model) {
+            Some(metadata) => metadata
+                .supported
+                .clone()
+                .context("licensed fixture catalog has unknown supported efforts")?,
+            None => prior
+                .class_fit
+                .iter()
+                .map(|fit| fit.effort.as_str().to_string())
+                .chain(
+                    prior
+                        .authority_evidence
+                        .iter()
+                        .map(|evidence| evidence.effort.as_str().to_string()),
+                )
+                .chain(
+                    prior
+                        .strong_gate_fallback_efforts
+                        .iter()
+                        .map(|effort| effort.as_str().to_string()),
+                )
+                .collect(),
+        };
+        models.extend(
+            supported
+                .into_iter()
+                .map(|effort| (prior.model.clone(), effort)),
+        );
+    }
+    let cam = install_concurrent_fixture_observations(owner, models)?;
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
 }
 
 #[cfg(all(test, target_os = "linux"))]
