@@ -13471,6 +13471,7 @@ done
         assert_eq!(
             argv,
             [
+                "--no-auto-update".to_string(),
                 "--prompt-file".to_string(),
                 prompt.display().to_string(),
                 "--model".to_string(),
@@ -14335,7 +14336,12 @@ done
         ledger.attach_quota_config(&repo, "cross-runtime", &config)?;
         let plan = worker_plan("composer-2.5");
         let budget = SupervisorBudgetConfig::default();
-        let command = quota_usage_command(temp.path());
+        let command = quota_usage_command(temp.path()).with_runtime_adapter(
+            crate::runtime_adapter::RuntimeId::Cursor,
+            crate::runtime_adapter::RuntimeAdapterConfig::defaults(
+                crate::runtime_adapter::RuntimeId::Cursor,
+            ),
+        );
         let mut reservation = match reserve_dispatch_budget(
             &plan,
             &budget,
@@ -14349,8 +14355,25 @@ done
             }
         };
         reservation.mark_invoked_for_runtime(SupervisorRuntime::Cursor)?;
-        write_injected_usage(&command, 7, 3);
-        let run = injected_verified_run(&command);
+        write_injected_usage(&command, 90000, 90000);
+        let mut run = injected_verified_run(&command);
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCursor,
+        ));
+        run.cursor_managed_parent_evidence =
+            Some(crate::runtime_adapter::CursorManagedParentEvidence {
+                peer_verified: true,
+                admitted_attempts: 1,
+                completed_attempts: 1,
+                usage_attempts_covered: 1,
+                usage_attempts_incomplete: 0,
+                usage_is_incomplete: Some(false),
+                input_tokens: Some(7),
+                output_tokens: Some(3),
+                cache_read_tokens: Some(0),
+                cache_write_tokens: Some(0),
+                ..Default::default()
+            });
         let settlement = reservation.settle_bound_runtime(&run, &command)?;
         assert_eq!(
             settlement.reliable_usage().map(|usage| usage.total_tokens),
