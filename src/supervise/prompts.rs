@@ -3214,7 +3214,12 @@ mod regression_tests {
             Some("provider-beta")
         );
         assert_eq!(report_command.model.as_deref(), Some("model-beta"));
-        assert_eq!(report_command.reasoning_effort.as_deref(), Some("max"));
+        // Authored report_lens effort ("xhigh") precedes make_command's assignment fallback Max.
+        assert_eq!(
+            report_command.reasoning_effort.as_deref(),
+            Some("xhigh"),
+            "authored report lens effort xhigh precedes assignment fallback Max"
+        );
         let diff_argv = crate::external_agent::command_argv(&diff_command)
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
@@ -3238,9 +3243,12 @@ mod regression_tests {
         assert!(report_argv
             .iter()
             .any(|argument| argument == "model_provider=\"provider-beta\""));
-        assert!(report_argv
-            .iter()
-            .any(|argument| argument == "model_reasoning_effort=\"max\""));
+        assert!(
+            report_argv
+                .iter()
+                .any(|argument| argument == "model_reasoning_effort=\"xhigh\""),
+            "CLI reasoning effort must follow authored report lens xhigh, not fallback Max"
+        );
         Ok(())
     }
 
