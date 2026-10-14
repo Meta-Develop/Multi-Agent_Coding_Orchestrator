@@ -2075,7 +2075,12 @@ fn run_concurrent_assignment_schedule(
                     let selected_authorizations =
                         crate::selection::routing_policy::captured_selected_authorizations();
                     let runtime_binding = super::runtime_executables::captured_binding();
+                    #[cfg(all(test, target_os = "linux"))]
+                    let cam_observe_fixture = captured_cam_observe_test_harness();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
+                        #[cfg(all(test, target_os = "linux"))]
+                        let _cam_observe_guard =
+                            install_captured_cam_observe_test_harness(cam_observe_fixture);
                         #[cfg(test)]
                         let _test_completion = BudgetAdmissionTestCompletion {
                             run_id: context.options.run_id.as_str(),
@@ -4028,29 +4033,48 @@ fn cam_provider_id_for_supervisor_runtime(runtime: SupervisorRuntime) -> Option<
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct CamObserveTestHarness {
+pub(super) struct CamObserveTestHarness {
     registry: StoredAccountRegistry,
     adapter: Box<dyn coding_agent_manager_lib::providers::ProviderAdapter>,
+    secondary_adapter: Option<Box<dyn coding_agent_manager_lib::providers::ProviderAdapter>>,
     advertised: Option<AdvertisedCatalogSet>,
     resolved_auditor: Option<SupervisorSelectionEvent>,
     _root: tempfile::TempDir,
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct CamObserveTestGuard {
-    previous: Option<CamObserveTestHarness>,
+pub(super) struct CamObserveTestGuard {
+    previous: Option<Arc<CamObserveTestHarness>>,
+    _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
-    static CAM_OBSERVE_TEST_OVERRIDE: RefCell<Option<CamObserveTestHarness>> =
+    static CAM_OBSERVE_TEST_OVERRIDE: RefCell<Option<Arc<CamObserveTestHarness>>> =
         const { RefCell::new(None) };
 }
 
 #[cfg(all(test, target_os = "linux"))]
 fn activate_cam_observe_test_harness(harness: CamObserveTestHarness) -> CamObserveTestGuard {
-    let previous = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow_mut().replace(harness));
-    CamObserveTestGuard { previous }
+    install_captured_cam_observe_test_harness(Some(Arc::new(harness)))
+}
+
+// Share fixture custody, not an observation snapshot: Core re-reads the same
+// selected registry and invokes the same provider adapter on every observation.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn captured_cam_observe_test_harness() -> Option<Arc<CamObserveTestHarness>> {
+    CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_captured_cam_observe_test_harness(
+    harness: Option<Arc<CamObserveTestHarness>>,
+) -> CamObserveTestGuard {
+    let previous = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.replace(harness));
+    CamObserveTestGuard {
+        previous,
+        _thread_affinity: std::marker::PhantomData,
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4150,6 +4174,7 @@ pub(super) fn install_positive_injected_cam_fixture<'a>(
     registry.select_complete_revision("codex-cli", "synthetic-positive-injected", None)?;
     let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
         registry,
+        secondary_adapter: None,
         adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
         advertised: None,
         resolved_auditor: None,
@@ -4733,6 +4758,7 @@ pub(super) fn install_selected_grok_review_fixture<'a>(
         .map_err(anyhow::Error::msg)?;
     let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
         registry,
+        secondary_adapter: None,
         adapter: Box::new(GrokReviewFixtureObservation { models }),
         advertised: None,
         resolved_auditor: None,
@@ -5182,6 +5208,7 @@ fn install_concurrent_fixture_observations(
         .map_err(anyhow::Error::msg)?;
     let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
         registry,
+        secondary_adapter: None,
         adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
         advertised: None,
         resolved_auditor: None,
@@ -5976,19 +6003,21 @@ pub(super) fn account_observation_for_launch_runtime(
         {
             if let Some(result) = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
                 cell.borrow().as_ref().map(|harness| {
-                    observe_selected_cam_binding(
-                        &harness.registry,
-                        harness.adapter.as_ref(),
-                        provider_id,
+                    let adapter = harness
+                        .secondary_adapter
+                        .as_deref()
+                        .filter(|adapter| adapter.id() == provider_id)
+                        .unwrap_or(harness.adapter.as_ref());
+                    observe_selected_cam_binding(&harness.registry, adapter, provider_id).inspect(
+                        |observation| {
+                            freeze_observed_managed_selection_from_registry(
+                                run_id,
+                                provider_id,
+                                &harness.registry,
+                                observation.as_ref(),
+                            );
+                        },
                     )
-                    .inspect(|observation| {
-                        freeze_observed_managed_selection_from_registry(
-                            run_id,
-                            provider_id,
-                            &harness.registry,
-                            observation.as_ref(),
-                        );
-                    })
                 })
             }) {
                 return result;
@@ -8190,6 +8219,7 @@ mod selection_policy_tests {
     #[test]
     fn selector_override_is_applied_after_legacy_budget_mutations() {
         let mut plan = test_plan();
+        plan.review_lenses = single_parent_acceptance_review_lenses();
         plan.role_models.insert(
             AgentRole::ChildOrchestrator,
             role_selection("plan-child", "xhigh"),
@@ -8350,10 +8380,46 @@ mod selection_policy_tests {
             Some("ultra")
         );
         assert_eq!(active_plan.review_lenses.len(), 2);
-        assert!(active_plan
-            .review_lenses
-            .iter()
-            .all(|lens| { lens.backend.reasoning_effort() == Some("xhigh") }));
+        assert_eq!(active_plan.review_lenses[0].id, "parent-acceptance");
+        assert_eq!(
+            active_plan.review_lenses[0].information_scope,
+            ReviewInformationScope::FullChildTranscript
+        );
+        match &active_plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                backend_id,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(backend_id, "openai");
+                assert_eq!(model, "active-auditor");
+                assert_eq!(reasoning_effort.as_deref(), Some("ultra"));
+            }
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("selector-bound lens changed backend")
+            }
+        }
+        assert_eq!(active_plan.review_lenses[1].id, "active-effort-custom-lens");
+        assert_eq!(
+            active_plan.review_lenses[1].information_scope,
+            ReviewInformationScope::OutputReportOnly
+        );
+        match &active_plan.review_lenses[1].backend {
+            ReviewLensBackendConfig::Model {
+                backend_id,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(backend_id, "custom-provider");
+                assert_eq!(model, "custom-auditor");
+                assert_eq!(reasoning_effort.as_deref(), Some("ultra"));
+            }
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("independent custom lens changed backend")
+            }
+        }
 
         let mut controller = BudgetDegradationController::new(1);
         controller.record_assignment_effort_bindings(
@@ -8389,13 +8455,13 @@ mod selection_policy_tests {
             );
             assert_eq!(
                 auditor.requested_reasoning_effort,
-                Some(ReasoningEffort::Low)
+                Some(ReasoningEffort::Ultra)
             );
-            assert_eq!(auditor.fallback_reasoning_effort, "xhigh");
-            assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+            assert_eq!(auditor.fallback_reasoning_effort, "ultra");
+            assert_eq!(auditor.resolved_reasoning_effort, "ultra");
             assert_eq!(
                 auditor.resolution_observation,
-                EffortResolutionObservation::HardFloorClamped
+                EffortResolutionObservation::AssignmentOverride
             );
             assert!(auditor
                 .unavailable_reason
@@ -9350,6 +9416,7 @@ mod selection_policy_tests {
             }
             activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
+                secondary_adapter: None,
                 adapter: Box::new(SchedulerObserveStub {
                     id: "codex-cli",
                     mode,
@@ -9400,6 +9467,204 @@ mod selection_policy_tests {
                 ..SupervisorPlanMetadata::default()
             };
             Ok((temporary, repo, catalog, admission, plan, plan_metadata))
+        }
+
+        #[test]
+        fn captured_cam_fixture_keeps_child_custody_and_restores_destination() -> Result<()> {
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let parent_guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let captured = captured_cam_observe_test_harness().context("parent CAM fixture")?;
+            let root = captured._root.path().to_path_buf();
+            let registry_path = captured.registry.metadata_path().to_path_buf();
+            let expected = captured
+                .registry
+                .selected_binding("codex-cli")?
+                .context("parent selected Codex account")?;
+            let authority = authority_id_for(&registry_path);
+            let child_root = root.clone();
+            thread::scope(|scope| -> Result<()> {
+                scope
+                    .spawn(|| assert!(captured_cam_observe_test_harness().is_none()))
+                    .join()
+                    .map_err(|_| anyhow!("unrelated sibling panicked"))?;
+                // The capture, then the destination guard, must own the real
+                // registry and TempDir after the coordinator's guard is gone.
+                drop(parent_guard);
+                assert!(root.exists());
+                scope
+                    .spawn(move || -> Result<()> {
+                        assert!(captured_cam_observe_test_harness().is_none());
+                        let destination_guard =
+                            activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+                        let destination =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("destination selected account")?;
+                        let result = (|| -> Result<()> {
+                            let _inherited =
+                                install_captured_cam_observe_test_harness(Some(captured));
+                            let run = "captured-cam-child-owned-registry";
+                            let observed = account_observation_for_launch_runtime(
+                                SupervisorRuntime::Codex,
+                                Some(run),
+                            )?
+                            .context("inherited selected account")?;
+                            assert_eq!(observed.binding, expected);
+                            let Some(CodexRunAccountBinding::Selected(frozen)) =
+                                codex_run_account_binding(run)
+                            else {
+                                bail!("child observation did not freeze its genuine selection");
+                            };
+                            assert_eq!(frozen.to_selected_binding(), expected);
+                            assert_eq!(frozen.authority_id, authority);
+                            assert!(child_root.exists());
+                            assert!(registry_path.exists());
+                            bail!("injected child scope exit after genuine observation")
+                        })();
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            "injected child scope exit after genuine observation"
+                        );
+                        assert!(!child_root.exists());
+                        let restored =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("restored destination account")?;
+                        assert_eq!(restored.binding, destination.binding);
+                        drop(destination_guard);
+                        assert!(captured_cam_observe_test_harness().is_none());
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| anyhow!("inherited child panicked"))??;
+                Ok(())
+            })?;
+            assert!(!root.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn captured_cam_fixture_reobserves_drift_before_frozen_review() -> Result<()> {
+            let _cam = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            let mut worker = super::terminal_worker_assignment("captured-review-worker");
+            worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            plan.assignments = vec![worker];
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+            let run = RunId::new("captured-cam-live-review-drift")?;
+            let mut request = prepared_codex_request(&repo, &catalog, &admission);
+            request.current_run = Some(&run);
+            let initial = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut metadata,
+                request,
+            )?;
+            assert!(initial.selection_preflight_failure.is_none());
+            let baseline = initial
+                .decisions
+                .iter()
+                .find(|decision| decision.role == AgentRole::Auditor)
+                .context("genuine assessed Auditor decision")?
+                .clone();
+            let lens = plan
+                .review_lenses
+                .first()
+                .context("resolved review lens")?
+                .clone();
+            let effort = lens
+                .backend
+                .reasoning_effort()
+                .context("resolved fixture lens effort")?
+                .to_string();
+            let supplied_catalog = catalog
+                .as_ref()
+                .map_err(|_| anyhow!("fixture catalog is unavailable"))?;
+            let expected = super::super::super::selection_bridge::frozen_review_account_binding(
+                SupervisorRuntime::Codex,
+                run.as_str(),
+            )?;
+            let expected_account = (&expected).into();
+            let observed = account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                .context("original selected account observation")?;
+            // Establish the ordinary review contract before introducing drift.
+            super::super::super::selection_bridge::select_authored_review_lens(
+                &lens,
+                &effort,
+                SupervisorRuntime::Codex,
+                supplied_catalog,
+                &baseline.provenance,
+                &observed,
+                &expected_account,
+                SupervisorQuotaSelectionInput::default(),
+            )?;
+            let captured =
+                captured_cam_observe_test_harness().context("captured review fixture")?;
+            captured.registry.begin_add(
+                "codex-cli",
+                "changed",
+                "Synthetic changed account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            captured.registry.complete_add("codex-cli", "changed")?;
+            captured
+                .registry
+                .select_complete_revision("codex-cli", "changed", None)?;
+            let frozen = metadata
+                .resolved_routing_policy
+                .context("held frozen policy")?;
+            let prior = crate::supervise::prior_input::captured_binding();
+            thread::scope(|scope| -> Result<()> {
+                scope
+                    .spawn(move || -> Result<()> {
+                        let _cam = install_captured_cam_observe_test_harness(Some(captured));
+                        let _prior = crate::supervise::prior_input::install_captured(prior);
+                        let _policy =
+                            crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
+                        let observed =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("current selected account after capture")?;
+                        assert_eq!(observed.binding.provider_id, expected.provider_id);
+                        assert_eq!(observed.binding.account_id, "changed");
+                        assert_ne!(
+                            observed.binding.account_incarnation,
+                            expected.account_incarnation
+                        );
+                        assert_ne!(
+                            observed.binding.selection_revision,
+                            expected.selection_revision
+                        );
+                        assert_eq!(
+                            super::super::super::selection_bridge::frozen_review_account_binding(
+                                SupervisorRuntime::Codex,
+                                run.as_str(),
+                            )?,
+                            expected
+                        );
+                        let error =
+                            super::super::super::selection_bridge::select_authored_review_lens(
+                                &lens,
+                                &effort,
+                                SupervisorRuntime::Codex,
+                                supplied_catalog,
+                                &baseline.provenance,
+                                &observed,
+                                &expected_account,
+                                SupervisorQuotaSelectionInput::default(),
+                            )
+                            .err()
+                            .context("registry drift must refuse the frozen review contract")?;
+                        assert_eq!(
+                            error.to_string(),
+                            "review lens selected account changed from the frozen run binding"
+                        );
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| anyhow!("drift observation child panicked"))??;
+                Ok(())
+            })
         }
 
         #[test]
@@ -9600,6 +9865,7 @@ mod selection_policy_tests {
                 inject_grok_advertised_catalog, GrokModelCatalog, GrokModelCatalogEntry,
             };
             let (root, registry) = isolated_registry();
+            seed_complete_account(&registry, true);
             registry.begin_add(
                 "grok-cli",
                 "work",
@@ -9628,28 +9894,36 @@ mod selection_policy_tests {
             )?;
             let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
-                // No Codex account is selected: primary observation returns None
-                // before adapter lookup. The selected Grok provider must observe
-                // through a matching stub id and the injected prior model menu.
+                // Both isolated selected accounts use their exact provider's
+                // nonlive menu through normal Core observation and validation.
                 adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode: SchedulerObserveStubMode::ObservedModels,
+                }),
+                secondary_adapter: Some(Box::new(SchedulerObserveStub {
                     id: "grok-cli",
                     mode: SchedulerObserveStubMode::ObservedSynthetic(
                         synthetic_prior_observed_model(&grok_prior),
                     ),
-                }),
+                })),
                 advertised: Some(AdvertisedCatalogSet::with_grok(advertised)),
                 resolved_auditor: None,
                 _root: root,
             });
             let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
                 prepared_selection_fixture()?;
-            let worker = super::terminal_worker_assignment("ordinary-secondary");
+            let mut worker = super::terminal_worker_assignment("ordinary-secondary");
+            worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            worker.assigned_paths = vec![PathBuf::from("tests/ordinary-secondary.txt")];
             let mut parent = super::terminal_worker_assignment("parent-secondary");
             parent.role = AgentRole::ChildOrchestrator;
             parent.worker_assignments = vec![serde_json::from_value(serde_json::json!({
                 "id": "nested-secondary", "assigned_paths": [SELECTOR_TEST_TARGET]
             }))?];
             plan.assignments = vec![worker, parent];
+            plan.max_child_assignments = plan.assignments.len();
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
             let available = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut metadata,
@@ -9735,7 +10009,7 @@ mod selection_policy_tests {
         fn scheduler_secondary_metadata_preserves_identity_and_refuses_missing_selection(
         ) -> Result<()> {
             {
-                let _guard = activate_stub(false, SchedulerObserveStubMode::ObserveError);
+                let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
                 let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
                     prepared_selection_fixture()?;
                 let mut worker = super::terminal_worker_assignment("codex-reviewed-worker");
@@ -9766,14 +10040,24 @@ mod selection_policy_tests {
                     .context("Auditor choice")?
                     .candidate
                     .runtime = "gemini-cli".to_string();
-                let gemini_prior = crate::selection::built_in_prior_dataset()?
-                    .models
-                    .into_iter()
-                    .find(|prior| prior.runtime == "gemini-cli" && !prior.prohibited)
-                    .context("synthetic Gemini prior for observe menu")?;
+                // Nonlive transport menu only: retain the assessed choice's model
+                // and effort without asserting Gemini capability or entitlement.
+                let candidate = &auditor
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .context("Auditor choice for synthetic transport menu")?
+                    .candidate;
+                let synthetic_transport_menu = ObservedModel {
+                    model_id: candidate.model.clone(),
+                    supported_efforts: Some(vec![candidate.effort.as_str().to_string()]),
+                    default_effort: Some(candidate.effort.as_str().to_string()),
+                    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
+                };
                 let expected = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<_> {
                     let mut cell = cell.borrow_mut();
-                    let harness = cell.as_mut().unwrap();
+                    let harness = Arc::get_mut(cell.as_mut().unwrap())
+                        .context("CAM fixture setup requires exclusive observer custody")?;
                     harness.registry.begin_add(
                         "gemini-cli",
                         "review",
@@ -9785,12 +10069,12 @@ mod selection_policy_tests {
                     harness
                         .registry
                         .select_complete_revision("gemini-cli", "review", None)?;
-                    harness.adapter = Box::new(SchedulerObserveStub {
+                    harness.secondary_adapter = Some(Box::new(SchedulerObserveStub {
                         id: "gemini-cli",
                         mode: SchedulerObserveStubMode::ObservedSynthetic(
-                            synthetic_prior_observed_model(&gemini_prior),
+                            synthetic_transport_menu.clone(),
                         ),
-                    });
+                    }));
                     harness.resolved_auditor = Some(auditor);
                     Ok((
                         authority_id_for(harness.registry.metadata_path()),
@@ -9913,13 +10197,17 @@ mod selection_policy_tests {
                     crate::account_authority::gemini_run_account_binding(unchosen_run).is_none()
                 );
                 let _missing = activate_stub(false, SchedulerObserveStubMode::ObserveError);
-                CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
-                    cell.borrow_mut().as_mut().unwrap().resolved_auditor = resolution
+                CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<()> {
+                    let mut cell = cell.borrow_mut();
+                    let harness = Arc::get_mut(cell.as_mut().unwrap())
+                        .context("CAM fixture setup requires exclusive observer custody")?;
+                    harness.resolved_auditor = resolution
                         .decisions
                         .iter()
                         .find(|decision| decision.role == AgentRole::Auditor)
                         .cloned();
-                });
+                    Ok(())
+                })?;
                 let missing_run = RunId::new("synthetic-gemini-parent-auditor-missing-account")?;
                 plan.role_models.clear();
                 plan.review_lenses = default_supervisor_review_lenses();
@@ -9961,6 +10249,7 @@ mod selection_policy_tests {
                 let authority = authority_id_for(registry.metadata_path());
                 let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
                     registry,
+                    secondary_adapter: None,
                     adapter: Box::new(SchedulerObserveStub {
                         id: "codex-cli",
                         mode: SchedulerObserveStubMode::ObserveError,
@@ -10057,6 +10346,7 @@ mod selection_policy_tests {
                 )?;
                 let _missing = activate_cam_observe_test_harness(CamObserveTestHarness {
                     registry,
+                    secondary_adapter: None,
                     adapter: Box::new(SchedulerObserveStub {
                         id: "codex-cli",
                         mode: SchedulerObserveStubMode::ObserveError,
@@ -10217,6 +10507,7 @@ mod selection_policy_tests {
             seed_complete_account(&registry, false);
             let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
+                secondary_adapter: None,
                 adapter: Box::new(SchedulerObserveStub {
                     id: "codex-cli",
                     mode: SchedulerObserveStubMode::ObservedModels,

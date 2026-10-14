@@ -1021,7 +1021,11 @@ fn judgment_assignment_is_not_degraded_by_shared_worker_binding() {
         environment_requirements: Vec::new(),
         report_path: None,
     });
-    let plan = worker_degrade_plan(vec![seed_assignment.clone(), assignment.clone()]);
+    let mut plan = worker_degrade_plan(vec![seed_assignment.clone(), assignment.clone()]);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        plan.role_models[&AgentRole::Worker].clone(),
+    );
     let requested_plan = plan.clone();
     let mut metadata = AssignmentMetadata::new();
     insert_mechanical_metadata(&mut metadata, &seed_assignment.id);
@@ -2265,6 +2269,48 @@ fn trusted_requested_plan_claim_override_is_recorded_before_scheduler_claim_stat
     );
 }
 
+fn assessed_requested_preclaim_routing(
+    plan: &SupervisorPlan,
+) -> Result<(
+    TaskRoutingAssessment,
+    crate::selection::routing_policy::FrozenRoutingPolicy,
+)> {
+    use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+
+    assert_eq!(
+        plan.assignments.len(),
+        1,
+        "verified requested-plan override fixture binds one complete assignment"
+    );
+    let assignment = &plan.assignments[0];
+    let assignment_task = assignment
+        .task
+        .as_deref()
+        .expect("verified requested-plan override fixture requires assignment.task");
+
+    let policy: LoadedRoutingPolicy =
+        serde_json::from_str(include_str!("../../selection/data/routing-policy.json"))?;
+    policy.validate()?;
+    let frozen = FrozenRoutingPolicy {
+        sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+        policy,
+        source: "public-scheduler-selection-fixture".to_string(),
+    };
+    let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(
+        serde_json::json!({
+            "fragments":[{"id": assignment.id.as_str(), "text": &plan.task}],
+            "assignments":[{"id": assignment.id.as_str(), "task": assignment_task,
+                "fragment_ids":[assignment.id.as_str()], "assigned_paths": assignment.assigned_paths,
+                "semantic_symbols":[], "semantic_modules":[]}],
+            "diagnostics":{"degraded":false, "notes":[]},
+            "disjointness":{"disjoint":true, "conflicts":[]}
+        }),
+    )?;
+    let assessment =
+        super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+    Ok((assessment, frozen))
+}
+
 #[test]
 fn verified_preparation_uses_requested_plan_override_before_assignment_selection_or_claim() {
     let (_temp, repo) = test_repository();
@@ -2274,6 +2320,11 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
         r#"{"operator_override":{"disposition":"claim","rationale":"authenticated caller approved the ambiguous verification path"}}"#,
     ));
     let plan = test_plan(vec![assignment]);
+    let (assessment, frozen) = assessed_requested_preclaim_routing(&plan)
+        .expect("assess verified requested-plan override from public routing policy");
+    let _routing_policy =
+        crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))
+            .expect("bind verified public routing policy through preparation");
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
         .expect("construct deterministic Codex selector catalog");
     #[cfg(target_os = "linux")]
@@ -2287,7 +2338,11 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
             plan,
             consultant: SupervisorConsultantPlan::default(),
             assignment_metadata: AssignmentMetadata::new(),
-            plan_metadata: SupervisorPlanMetadata::default(),
+            plan_metadata: SupervisorPlanMetadata {
+                resolved_routing_policy: Some(frozen),
+                task_routing_assessment: Some(assessment),
+                ..SupervisorPlanMetadata::default()
+            },
         },
         &options,
         1,

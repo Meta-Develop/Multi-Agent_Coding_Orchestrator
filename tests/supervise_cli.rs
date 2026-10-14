@@ -866,7 +866,8 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         .as_array_mut()
         .context("generated Worker assignments")?
     {
-        assert!(worker.get("kind").is_none());
+        // Canonical plan JSON now emits default AssignmentKind::Ordinary as "ordinary".
+        assert_eq!(worker["kind"], "ordinary");
         worker["kind"] = Value::String("ordinary".to_string());
     }
     assert!(expected_executed_plan["run_budget"]

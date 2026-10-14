@@ -1272,12 +1272,17 @@ fn dispatch_isolated_parent_workers_inner(
             let release_state = release_states[ordinal].1.clone();
             let prior_binding = super::prior_input::captured_binding();
             let runtime_binding = super::runtime_executables::captured_binding();
+            #[cfg(all(test, target_os = "linux"))]
+            let cam_observe_fixture = super::scheduler::captured_cam_observe_test_harness();
             let authorizations = routing_policy::captured_selected_authorizations();
             let frozen = frozen.clone();
             let cancellation = group_cancellation.clone();
             let plan = &plan;
             let schedule = &schedule;
             handles.push(std::thread::Builder::new().spawn_scoped(scope, move || {
+                #[cfg(all(test, target_os = "linux"))]
+                let _cam_observe_guard =
+                    super::scheduler::install_captured_cam_observe_test_harness(cam_observe_fixture);
                 let _prior = super::prior_input::install_captured(prior_binding);
                 let _runtime = super::runtime_executables::install_captured(runtime_binding);
                 let mut child_outcome = AssignmentExecutionOutcome {

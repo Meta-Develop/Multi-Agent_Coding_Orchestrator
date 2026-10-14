@@ -18417,7 +18417,8 @@
                                     "routing_score_semantics": {
                                       "enum": [
                                         "legacy_baseline_plus_cost_proxy_adjustments_v1",
-                                        "loaded_policy_evidence_penalty_v1"
+                                        "loaded_policy_evidence_penalty_v1",
+                                        "loaded_policy_evidence_penalty_v2"
                                       ],
                                       "type": "string"
                                     },

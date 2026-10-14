@@ -367,6 +367,18 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
     }
 }
 
+fn goal_spec_proposal_admits_task_routing_assessment(
+    proposal: &planning::TaskDecompositionProposal,
+) -> bool {
+    !proposal.diagnostics.degraded
+        && proposal.fragments.iter().all(|fragment| {
+            proposal
+                .assignments
+                .iter()
+                .any(|assignment| assignment.fragment_ids.contains(&fragment.id))
+        })
+}
+
 fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     goal: &str,
     spec: &str,
@@ -389,6 +401,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     let task_routing_assessment = resolved_routing_policy
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
+        .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
         .map(|frozen| super::task_routing::assess_task_routing(&task, &proposal, frozen))
         .transpose()?;
     let has_declared_dependencies = proposal

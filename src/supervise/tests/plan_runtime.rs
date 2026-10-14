@@ -1541,6 +1541,8 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
             .collect::<Vec<_>>(),
         vec!["fragment-001", "fragment-004"]
     );
+    assert!(document.get("task_routing_assessment").is_none());
+    assert!(document.get("resolved_routing_policy").is_some());
 
     let repeated = supervisor_plan_document_from_goal_spec(
         repo,
@@ -1555,6 +1557,8 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("reparse generated plan");
     assert!(reparsed.assignment_metadata.workers.is_empty());
+    assert!(reparsed.plan_metadata.task_routing_assessment.is_none());
+    assert!(reparsed.plan_metadata.resolved_routing_policy.is_some());
     let schedule = &reparsed.plan_metadata.assignment_schedule;
     let mut outcomes = vec![None, None, None, None];
     assert_eq!(
@@ -1600,6 +1604,30 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("renormalize generated plan");
     assert_eq!(renormalized, document);
+
+    #[cfg(target_os = "linux")]
+    match super::super::scheduler::select_normal_intake(
+        repo,
+        &RunId::new("gap-unassessed-intake").expect("gap-unassessed-intake run id"),
+        &reparsed.plan,
+        reparsed
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .expect("frozen routing policy present"),
+        None,
+        super::super::scheduler::NormalIntakeConfig {
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            max_concurrent_children: 1,
+            objective_profile: None,
+        },
+    ) {
+        Ok(_) => panic!("unassessed gap document must refuse normal intake"),
+        Err(error) => assert!(
+            format!("{error:#}").contains("automatic task assessment is unassessed"),
+            "unexpected intake error: {error:#}"
+        ),
+    }
 
     let mut stripped = document;
     for assignment in stripped["assignments"]
