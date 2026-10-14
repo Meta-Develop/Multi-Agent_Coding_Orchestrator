@@ -10923,6 +10923,16 @@ mod decomposition_tests {
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
         );
+        for lens in &mut plan.review_lenses {
+            match &mut lens.backend {
+                crate::review::ReviewLensBackendConfig::Model { model, .. } => {
+                    *model = "gpt-5.6-sol".to_string();
+                }
+                crate::review::ReviewLensBackendConfig::Precomputed { .. } => {
+                    panic!("default stacked review lens must stay model-backed");
+                }
+            }
+        }
         let budget_config = SupervisorBudgetConfig::default();
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();

@@ -2026,6 +2026,10 @@ mod tests {
 
     #[test]
     fn assignment_authority_admits_exact_write_read_and_parent_owned_check() -> Result<()> {
+        let qualification_budget = || OperationBudget {
+            cancellation: ProcessCancellation::new(),
+            deadline: Instant::now() + Duration::from_secs(90),
+        };
         let temp = tempfile::tempdir()?;
         git2::Repository::init(temp.path())?;
         fs::write(temp.path().join("assigned.txt"), "before\n")?;
@@ -2037,7 +2041,7 @@ mod tests {
         // Missing qualification input is a failure, never a skip or stub.
         authority.bind_main_helper_git(
             SourceBoundMainHelper::capture_qualification_environment()?,
-            &test_budget(),
+            &qualification_budget(),
         )?;
         let mut state = SharedState {
             authority: Some(authority),
@@ -2062,7 +2066,7 @@ mod tests {
                 "cancelled": false
             }),
             &mut state,
-            &test_budget(),
+            &qualification_budget(),
         )?;
         assert_eq!(written.pointer("/result/fileSize"), Some(&Value::from(6)));
         assert_eq!(
@@ -2095,7 +2099,7 @@ mod tests {
                 "cancelled": false
             }),
             &mut state,
-            &test_budget(),
+            &qualification_budget(),
         )?;
         assert_eq!(
             checked.pointer("/result/command"),

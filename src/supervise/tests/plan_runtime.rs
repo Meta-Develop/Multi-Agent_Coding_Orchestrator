@@ -1617,7 +1617,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
 }
 
 #[test]
-fn authoritative_single_file_goal_lowers_to_one_planning_execution_pair() {
+fn authoritative_single_file_goal_lowers_to_one_direct_worker() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
@@ -1650,20 +1650,30 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 2);
-    assert_eq!(assignments[0]["id"], "assignment-001-planning");
-    assert_eq!(assignments[1]["id"], "assignment-001");
-    for assignment in assignments {
-        assert_eq!(assignment["assigned_paths"], json!(["RELEASE_NOTES.md"]));
-        assert_eq!(assignment["semantic_symbols"], json!([]));
-        assert_eq!(assignment["semantic_modules"], json!([]));
-    }
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "worker");
     assert_eq!(
-        document["assignment_schedule"]
-            .as_array()
-            .expect("assignment schedule")
-            .len(),
-        2
+        assignments[0]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!(["RELEASE_NOTES.md"])
+    );
+    assert_eq!(assignments[0]["semantic_symbols"], json!([]));
+    assert_eq!(assignments[0]["semantic_modules"], json!([]));
+    assert_eq!(
+        document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "assignment-001",
+                "depth": 2,
+                "flattened_index": 0
+            }
+        ])
     );
     assert!(document.get("coverage_gaps").is_none());
 }
@@ -1675,11 +1685,9 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
     let task = "In README.md, replace baseline with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
     let mut plan =
         supervisor_plan_from_goal_spec(&repo, "", task).expect("plan literal existing-file edit");
-    let [planning, execution] = plan.assignments.as_slice() else {
-        panic!("literal existing-file plan must contain one planning/execution pair");
+    let [execution] = plan.assignments.as_slice() else {
+        panic!("literal existing-file plan must contain one direct execution worker");
     };
-    assert_eq!(planning.phase, AssignmentPhase::Planning);
-    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
     assert_eq!(execution.phase, AssignmentPhase::Execution);
     assert_eq!(execution.role, AgentRole::Worker);
     assert_eq!(
@@ -1690,7 +1698,7 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
     assert!(execution
         .notes
         .as_deref()
-        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+        .is_some_and(|notes| notes.contains("direct_existing_git_visible_regular_file_edit")));
 
     plan.role_models.insert(
         AgentRole::Worker,
@@ -1700,7 +1708,7 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
-    let execution = plan.assignments[1].clone();
+    let execution = plan.assignments[0].clone();
     let resolved = runtime_resolved_prompt_plan(
         &plan,
         &execution,
@@ -1719,16 +1727,16 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
 
     let mut ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
         .expect("plan ordinary README task");
-    assert_eq!(ordinary.assignments[1].role, AgentRole::Worker);
-    assert!(ordinary.assignments[1].worker_assignments.is_empty());
-    assert!(!ordinary.assignments[1]
+    assert_eq!(ordinary.assignments[0].role, AgentRole::Worker);
+    assert!(ordinary.assignments[0].worker_assignments.is_empty());
+    assert!(!ordinary.assignments[0]
         .notes
         .as_deref()
         .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
     ordinary.role_models = plan.role_models.clone();
     let resolved = runtime_resolved_prompt_plan(
         &ordinary,
-        &ordinary.assignments[1],
+        &ordinary.assignments[0],
         SupervisorRuntime::Grok,
         SupervisorRuntime::Grok,
         &RuntimeModelCatalog::OperatorDeclared,
@@ -4720,10 +4728,18 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     skip_without_containment!();
-    let _capability = install_named_test_models(&["model-alpha", "model-beta"]);
+    let _capability = install_named_test_models(&["model-alpha", "model-beta", "child-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some("child-model".to_string()),
+            reasoning_effort: None,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
     plan.review_lenses = vec![
         ReviewLensConfig {
             id: "diff-security".to_string(),
@@ -4763,8 +4779,12 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     ]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog =
-        injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL, "model-alpha", "model-beta"]);
+    let catalog = injected_codex_runtime_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        "model-alpha",
+        "model-beta",
+        "child-model",
+    ]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -4829,7 +4849,8 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         Some("provider-alpha")
     );
     assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
-    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("xhigh"));
+    // Preserve each lens's exact selected effort.
+    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")

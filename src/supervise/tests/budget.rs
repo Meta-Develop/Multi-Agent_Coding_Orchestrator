@@ -3193,10 +3193,30 @@ fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_qui
 #[test]
 fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants() {
     skip_without_containment!();
+    let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.review_lenses = default_supervisor_review_lenses();
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some("unpriced-model".to_string()),
+            reasoning_effort: None,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
+    for lens in &mut plan.review_lenses {
+        if let ReviewLensBackendConfig::Model {
+            model,
+            reasoning_effort,
+            ..
+        } = &mut lens.backend
+        {
+            *model = "unpriced-model".to_string();
+            *reasoning_effort = Some("xhigh".to_string());
+        }
+    }
     let lenses = plan.review_lenses.clone();
     assert_eq!(lenses.len(), 3);
     let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
