@@ -3707,7 +3707,7 @@ fn verify_systemd_sandbox_properties(
     for path in [
         PathBuf::from(format!("/run/user/{uid}/bus")),
         PathBuf::from(format!("/run/user/{uid}/systemd")),
-        PathBuf::from("/nix/var/nix/daemon-socket/socket"),
+        PathBuf::from("/nix/var/nix/daemon-socket"),
     ] {
         require_inaccessible_property_path(sandbox, inaccessible, &path)?;
     }

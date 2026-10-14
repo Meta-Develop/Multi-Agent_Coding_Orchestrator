@@ -216,7 +216,9 @@ fn known_sensitive_socket_paths() -> Vec<PathBuf> {
         PathBuf::from("/run/credentials"),
         PathBuf::from("/run/secrets"),
         PathBuf::from("/run/keys"),
-        PathBuf::from("/nix/var/nix/daemon-socket/socket"),
+        // Mask the daemon-socket parent so systemd does not need to traverse the
+        // non-searchable directory to look up the leaf, and all children stay blocked.
+        PathBuf::from("/nix/var/nix/daemon-socket"),
     ]
     .into_iter()
     .collect()
