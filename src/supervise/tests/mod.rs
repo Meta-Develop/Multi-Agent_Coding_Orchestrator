@@ -601,6 +601,34 @@ fn selected_concurrent_parent_custody<'a>(
     };
     let mut metadata = SupervisorPlanMetadata::default();
     let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
+    // tempfile 3.27.0 only applies a directory mode when Builder::permissions is
+    // Some; the default TempDir may remain Managed-legal while custody create
+    // requires an owner-private root. Pin only this creator-owned fixture.
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let path = owner.path();
+        let before = fs::symlink_metadata(path)?;
+        if !before.is_dir() || before.file_type().is_symlink() {
+            bail!("inherited concurrent fixture owner is not a non-symlink directory");
+        }
+        // SAFETY: geteuid reads only the calling process's effective UID.
+        if before.uid() != unsafe { libc::geteuid() } {
+            bail!("inherited concurrent fixture owner is not owned by the current euid");
+        }
+        let mut permissions = before.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+        let after = fs::symlink_metadata(path)?;
+        if !after.is_dir()
+            || after.file_type().is_symlink()
+            || after.uid() != unsafe { libc::geteuid() }
+            || after.mode() & 0o077 != 0
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+        {
+            bail!("inherited concurrent fixture owner did not remain the pinned private directory");
+        }
+    }
     super::scheduler::ParentConcurrentFixtureCustody::create(
         plan, options, &metadata, owner, ready, policy,
     )

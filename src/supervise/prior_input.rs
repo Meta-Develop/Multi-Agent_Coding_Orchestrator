@@ -499,6 +499,8 @@ mod tests {
     fn dated_recommendations_can_change_without_granting_launch_authority() -> Result<()> {
         let base = base_selector_priors_with_terminal_worker_economics()?;
         let mut snapshot = new_model_snapshot("new-advertised-model")?;
+        let invalid_evidence_capability = snapshot.capability_policy.models[0].clone();
+        snapshot.capability_policy.models.clear();
         let mut luna = base
             .models
             .iter()
@@ -507,7 +509,22 @@ mod tests {
             .clone();
         luna.prohibited_authority_roles.clear();
         snapshot.models = vec![luna];
-        assert!(bind_fixture(&snapshot).is_ok());
+        {
+            let bound = bind_fixture(&snapshot);
+            assert!(bound.is_ok());
+            let _guard = bound?;
+            assert!(
+                validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-luna"))
+                    .is_err()
+            );
+            let shipped = super::super::model_policy::default_model_capability_policy();
+            assert_eq!(
+                current_capability_policy()
+                    .expect("advisory luna capability")
+                    .capability_for("gpt-5.6-luna"),
+                shipped.capability_for("gpt-5.6-luna")
+            );
+        }
         let mut terra = base
             .models
             .iter()
@@ -516,8 +533,24 @@ mod tests {
             .clone();
         terra.prohibited = false;
         snapshot.models = vec![terra];
-        assert!(bind_fixture(&snapshot).is_ok());
+        {
+            let bound = bind_fixture(&snapshot);
+            assert!(bound.is_ok());
+            let _guard = bound?;
+            assert!(
+                validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-terra"))
+                    .is_err()
+            );
+            let shipped = super::super::model_policy::default_model_capability_policy();
+            assert_eq!(
+                current_capability_policy()
+                    .expect("advisory terra capability")
+                    .capability_for("gpt-5.6-terra"),
+                shipped.capability_for("gpt-5.6-terra")
+            );
+        }
         snapshot.models.clear();
+        snapshot.capability_policy.models = vec![invalid_evidence_capability];
         snapshot.capability_policy.models[0].model = "gpt-5.6-luna".to_string();
         snapshot.capability_policy.models[0].evidence.clear();
         assert!(bind_fixture(&snapshot).is_err());

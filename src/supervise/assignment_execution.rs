@@ -11823,6 +11823,32 @@ mod decomposition_tests {
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
         );
+        // Publication reads the first lens model verbatim. "automatic" has no
+        // trusted capability, so the intake judge must already be resolved.
+        {
+            let intake_judge = &mut plan.review_lenses[0];
+            assert_eq!(intake_judge.id, "parent-acceptance");
+            assert_eq!(intake_judge.backend.model(), "automatic");
+            let backend_id = intake_judge.backend.backend_id().to_string();
+            let reasoning_effort = intake_judge.backend.reasoning_effort().map(str::to_string);
+            intake_judge.backend = crate::review::ReviewLensBackendConfig::Model {
+                backend_id,
+                model: "gpt-5.6-sol".to_string(),
+                reasoning_effort,
+            };
+            assert_eq!(intake_judge.backend.model(), "gpt-5.6-sol");
+            assert_eq!(
+                intake_judge.information_scope,
+                ReviewInformationScope::FullChildTranscript
+            );
+        }
+        assert_eq!(
+            model_capability_or_weak(Some(plan.review_lenses[0].backend.model())).capability,
+            ModelCapabilityClass::CriticalJudgment
+        );
+        assert!(plan.review_lenses[1..]
+            .iter()
+            .all(|lens| lens.backend.model() == "automatic"));
         let budget_config = SupervisorBudgetConfig::default();
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();
