@@ -4533,6 +4533,59 @@ fn reject_default_exclude_negations(
     Ok(())
 }
 
+fn io_root_error_kind(error: &anyhow::Error) -> Option<ErrorKind> {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+}
+
+fn ensure_optional_common_git_info_directory(common: &SafeRoot) -> Result<SafeRoot> {
+    common.verify()?;
+    match common.bind_existing_managed_direct_child_directory("info") {
+        Ok(reserved) => {
+            reserved.verify(common)?;
+            let info = SafeRoot::open_existing(reserved.path())?;
+            if info.identity() != reserved.identity() {
+                bail!("common Git info identity changed while binding it");
+            }
+            common.verify()?;
+            Ok(info)
+        }
+        Err(error) if io_root_error_kind(&error) == Some(ErrorKind::NotFound) => {
+            common.verify()?;
+            match common.reserve_direct_child_directory("info") {
+                Ok(reserved) => {
+                    reserved.verify(common)?;
+                    let info = SafeRoot::open_existing(reserved.path())?;
+                    if info.identity() != reserved.identity() {
+                        bail!("common Git info identity changed while creating it");
+                    }
+                    common.verify()?;
+                    Ok(info)
+                }
+                Err(error) if io_root_error_kind(&error) == Some(ErrorKind::AlreadyExists) => {
+                    common.verify()?;
+                    let reserved = common.bind_existing_managed_direct_child_directory("info")?;
+                    reserved.verify(common)?;
+                    let info = SafeRoot::open_existing(reserved.path())?;
+                    if info.identity() != reserved.identity() {
+                        bail!(
+                            "common Git info identity changed while binding a concurrent directory"
+                        );
+                    }
+                    common.verify()?;
+                    Ok(info)
+                }
+                Err(error) => {
+                    Err(error).context("failed to initialize optional common Git info directory")
+                }
+            }
+        }
+        Err(error) => Err(error).context("failed to bind common Git info directory"),
+    }
+}
+
 fn ensure_default_worktree_exclude(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
@@ -4612,7 +4665,24 @@ fn ensure_default_worktree_exclude(
         .filter(|(path, _)| path != Path::new(".gitignore"))
         .map(|(_, file)| file.as_ref().map_or(0, |file| file.contents().len()))
         .sum::<usize>();
-    let info = SafeRoot::open_existing(binding.common_dir().join("info"))?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    let common_root = SafeRoot::open_existing(binding.common_dir.path())?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    if common_root.identity() != common.identity()
+        || common_root.identity() != binding.common_dir.identity()
+        || common_root.path() != common.path()
+        || common_root.path() != binding.common_dir.path()
+    {
+        bail!(
+            "authenticated common Git directory identity changed while opening a managed SafeRoot"
+        );
+    }
+    let info = ensure_optional_common_git_info_directory(&common_root)?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    common_root.verify()?;
     let exclude = info.direct_child("exclude")?;
     let old_metadata = match fs::symlink_metadata(&exclude) {
         Ok(metadata) => Some(metadata),

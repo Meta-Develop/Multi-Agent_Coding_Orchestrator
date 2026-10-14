@@ -313,6 +313,48 @@ fn default_exclude_config_indirection_refuses_before_exclude_write() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn default_worktree_creation_initializes_missing_optional_git_info() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    let readme_oid = commit_readme(&repo).expect("initial commit");
+    let info = repo.commondir().join("info");
+    fs::remove_dir_all(&info).expect("remove template-free Git info from TempDir fixture");
+    assert!(!info.exists());
+    let manager = WorktreeManager::new(&repo_path);
+    let created = manager
+        .create(WorktreeCreateOptions {
+            agent_id: "missing-info".into(),
+            branch: None,
+            base: None,
+            worktree_root: None,
+        })
+        .expect("missing Git info must reach normal default worktree creation");
+    assert_eq!(created.path.parent().unwrap(), default_worktree_root(&repo));
+    assert!(created.path.exists());
+    assert!(info.is_dir());
+    assert_eq!(
+        fs::read(info.join("exclude")).expect("created exclude"),
+        append_default_worktree_exclude(b"", "/.maco/worktrees/repo/").unwrap()
+    );
+    assert_eq!(
+        repo.head()
+            .expect("primary head")
+            .peel_to_commit()
+            .expect("primary commit")
+            .id(),
+        readme_oid
+    );
+    assert!(
+        repo_path.join("README.md").is_file(),
+        "primary tracked README must remain"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn default_exclude_post_git_closing_fence_rejects_binding_races() {
     for changed in [
         ".git/config",
