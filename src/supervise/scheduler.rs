@@ -4600,6 +4600,109 @@ impl coding_agent_manager_lib::providers::ProviderAdapter for ConcurrentFixtureC
     }
 }
 
+// Associate the licensed scenario's already-held genuine account with the exact
+// NonpublishableSimulation source run. No second CAM observer is installed.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedLicensedSourceFixtureGuard<'scope, 'owner> {
+    previous: Option<SelectedConcurrentFixture>,
+    _parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedLicensedSourceFixtureGuard<'_, '_> {
+    fn drop(&mut self) {
+        SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn bind_selected_licensed_source_fixture<'scope, 'owner>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+) -> Result<SelectedLicensedSourceFixtureGuard<'scope, 'owner>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment] = plan.assignments.as_slice() else {
+        bail!("licensed source fixture requires exactly one original child");
+    };
+    let [lens] = plan.review_lenses.as_slice() else {
+        bail!("licensed source fixture requires its single parent-acceptance contract");
+    };
+    let RuntimeModelCatalog::Codex(catalog) = catalog else {
+        bail!("licensed source fixture requires its actual Codex catalog");
+    };
+    if options.runtime != SupervisorRuntime::Codex
+        || !repo.starts_with(parent_acceptance._account._owner.path().canonicalize()?)
+        || !plan.role_models.is_empty()
+        || assignment.role != AgentRole::ChildOrchestrator
+        || assignment.phase != AssignmentPhase::Execution
+        || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+        || assignment.assigned_paths.is_empty()
+        || assignment
+            .runtime
+            .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        || assignment.worker_assignments.iter().any(|worker| {
+            worker.role != AgentRole::Worker
+                || worker.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+                || worker.assigned_paths.is_empty()
+                || worker
+                    .assigned_paths
+                    .iter()
+                    .any(|path| !assignment.assigned_paths.contains(path))
+        })
+        || lens.id != "parent-acceptance"
+        || lens.information_scope != ReviewInformationScope::FullChildTranscript
+    {
+        bail!("licensed source fixture requires owned default-role Codex subjects and bounded workers");
+    }
+    let ReviewLensBackendConfig::Model {
+        model,
+        reasoning_effort: Some(effort),
+        ..
+    } = &lens.backend
+    else {
+        bail!("licensed source fixture requires its normally selected executable lens");
+    };
+    if !catalog.contains(model)
+        || ReasoningEffort::parse(effort).is_none()
+        || super::test_runtime_model_catalog(plan, options.runtime)?
+            != RuntimeModelCatalog::Codex(catalog.clone())
+    {
+        bail!("licensed source fixture must retain its complete actual catalog and lens effort");
+    }
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("licensed source frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("licensed source parsed assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen)
+        || !CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some())
+    {
+        bail!("licensed source fixture requires its held policy and selected-account observer");
+    }
+    let fixture = SelectedConcurrentFixture {
+        run: options.run_id.clone(),
+        repo,
+        plan: plan.clone(),
+        catalog: catalog.clone(),
+        assessment,
+        frozen,
+        inherited: None,
+        budget_bootstrap: None,
+    };
+    let previous = SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    Ok(SelectedLicensedSourceFixtureGuard {
+        previous,
+        _parent_acceptance: parent_acceptance,
+    })
+}
+
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn install_selected_nested_review_fixture<'a>(
     plan: &SupervisorPlan,

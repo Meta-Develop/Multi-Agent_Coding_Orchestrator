@@ -165,8 +165,10 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
     );
 }
 
-struct LicensedScenario {
-    _temp: tempfile::TempDir,
+struct LicensedScenario<'a> {
+    _temp: &'a tempfile::TempDir,
+    #[cfg(target_os = "linux")]
+    _parent_acceptance: crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a>,
     repo: PathBuf,
     run_id: RunId,
     report: SupervisorFinalReport,
@@ -794,18 +796,63 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     fixture
 }
 
-fn run_licensed_scenario(
+fn run_licensed_scenario<'a>(
+    owner: &'a tempfile::TempDir,
+    repo: PathBuf,
     assignment: OrchestratorAssignment,
     mut child: OrchestratorReviewReport,
     auditor_accepts_license: bool,
     run_name: &str,
-) -> LicensedScenario {
-    let (temp, repo) = injected_repository();
+) -> LicensedScenario<'a> {
     let plan = injected_plan(assignment.clone(), 0);
     let run_id = RunId::new(run_name).expect("valid licensed scenario run id");
+    let plan_file = owner.path().join(format!("{run_name}.json"));
+    #[cfg(target_os = "linux")]
+    let (plan, parent_acceptance, source_metadata) = {
+        let mut document =
+            serde_json::to_value(&plan).expect("serialize licensed scenario source plan");
+        let mut source_metadata = SupervisorPlanMetadata::default();
+        {
+            // Parse the actual source scope and freeze its policy before bootstrap.
+            // Drop this temporary binding before the retained parent guard is made.
+            let _assessment = bind_assessed_injected_plan(&plan, &repo, &mut source_metadata)
+                .expect("assess licensed scenario source plan");
+            document["resolved_routing_policy"] =
+                serde_json::to_value(&source_metadata.resolved_routing_policy)
+                    .expect("serialize licensed source frozen policy");
+            document["task_routing_assessment"] =
+                serde_json::to_value(&source_metadata.task_routing_assessment)
+                    .expect("serialize licensed source parsed assessment");
+        }
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &repo,
+                &mut document,
+                owner,
+            )
+            .expect("bind licensed Autopilot parent-acceptance fixture");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&document)
+                .expect("serialize bound licensed scenario source plan"),
+        )
+        .expect("write bound licensed scenario source plan");
+        let plan: SupervisorPlan = serde_json::from_value(document)
+            .expect("deserialize bound licensed scenario source plan");
+        (plan, parent_acceptance, source_metadata)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let plan = {
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&plan).expect("serialize licensed scenario source plan"),
+        )
+        .expect("write licensed scenario source plan");
+        plan
+    };
     let options = SupervisorRunOptions {
         repo: repo.clone(),
-        plan_file: temp.path().join(format!("{run_name}.json")),
+        plan_file,
         run_id: run_id.clone(),
         parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
@@ -815,7 +862,7 @@ fn run_licensed_scenario(
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
-        machine_global_retention: Some(injected_machine_global_retention(temp.path())),
+        machine_global_retention: Some(injected_machine_global_retention(owner.path())),
     };
     let declaration_sha256 = assignment
         .licensed_breakage
@@ -851,6 +898,33 @@ fn run_licensed_scenario(
         }
         injected_verified_run(command)
     };
+    #[cfg(target_os = "linux")]
+    let report = {
+        let catalog = test_runtime_model_catalog(&plan, options.runtime)
+            .expect("actual licensed source runtime catalog");
+        let _selected_source = super::super::scheduler::bind_selected_licensed_source_fixture(
+            &plan,
+            &options,
+            &catalog,
+            source_metadata,
+            &parent_acceptance,
+        )
+        .expect("bind assessed licensed source to its held selected account");
+        // Serial adaptation only; the original mutable runner and all its gates stay.
+        let serialized_runner = std::sync::Mutex::new(&mut runner);
+        super::super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+        .expect("run licensed breakage scenario")
+    };
+    #[cfg(not(target_os = "linux"))]
     let report = run_supervisor_plan_with_runner(
         plan,
         SupervisorConsultantPlan::default(),
@@ -860,7 +934,9 @@ fn run_licensed_scenario(
     )
     .expect("run licensed breakage scenario");
     LicensedScenario {
-        _temp: temp,
+        _temp: owner,
+        #[cfg(target_os = "linux")]
+        _parent_acceptance: parent_acceptance,
         repo,
         run_id,
         report,
@@ -870,9 +946,17 @@ fn run_licensed_scenario(
 #[test]
 fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-breakage-e2e");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-breakage-e2e",
+    );
 
     assert!(scenario.report.success, "{:#?}", scenario.report.findings);
     assert_eq!(scenario.report.generated_follow_up_tasks.len(), 1);
@@ -1150,9 +1234,12 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
 #[test]
 fn generated_follow_up_real_loader_rejects_stripped_required_section() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(
+        &owner,
+        repo,
         assignment,
         child,
         true,
@@ -1189,6 +1276,7 @@ fn generated_follow_up_real_loader_rejects_stripped_required_section() {
 #[test]
 fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let mut assignment = licensed_assignment();
     assignment.worker_assignments = vec![WorkerAssignment {
         id: "worker-a".to_string(),
@@ -1203,7 +1291,14 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
         report_path: None,
     }];
     let child = worker_dependent_failure_child(&assignment);
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-worker-breakage-gates");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-worker-breakage-gates",
+    );
 
     assert!(scenario.report.success, "{:#?}", scenario.report.findings);
     assert_eq!(scenario.report.generated_follow_up_tasks.len(), 1);
@@ -1221,9 +1316,17 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
 
 #[test]
 fn undeclared_breakage_keeps_validation_gate_failure_and_generates_nothing() {
+    let (owner, repo) = injected_repository();
     let assignment = injected_assignment(false);
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, false, "unlicensed-breakage-e2e");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "unlicensed-breakage-e2e",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1249,9 +1352,17 @@ fn undeclared_attribution_guard_is_directly_fail_capable() {
 
 #[test]
 fn failure_outside_declared_path_scope_is_not_licensed() {
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/outside.rs");
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-scope-enforcement");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-scope-enforcement",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1269,9 +1380,17 @@ fn failure_outside_declared_path_scope_is_not_licensed() {
 #[test]
 fn auditor_must_accept_exact_declaration_digest_before_tasks_exist() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, false, "licensed-auditor-refusal");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "licensed-auditor-refusal",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1292,7 +1411,15 @@ fn child_cannot_self_grant_license_or_generate_follow_up_authority() {
         migration_rationale: "self granted".to_string(),
         failures: Vec::new(),
     });
-    let scenario = run_licensed_scenario(assignment, child, false, "licensed-self-grant");
+    let (owner, repo) = injected_repository();
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "licensed-self-grant",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
