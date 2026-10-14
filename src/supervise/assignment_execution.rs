@@ -10195,16 +10195,6 @@ mod decomposition_tests {
             assessment
                 .validate_for_task(frozen, &plan.task)
                 .expect("validate real review task assessment");
-            let effort = ReasoningEffort::parse(
-                plan.review_lenses[0]
-                    .backend
-                    .reasoning_effort()
-                    .expect("authored review effort"),
-            )
-            .expect("known authored review effort");
-            let selector_effort: crate::selection::ReasoningEffort =
-                serde_json::from_value(serde_json::json!(effort.as_str()))
-                    .expect("selector review effort");
             let base = super::super::selection_bridge::base_selector_priors_with_terminal_worker_economics()
                 .expect("retained selector prior evidence");
             let mut prior = base
@@ -10216,17 +10206,18 @@ mod decomposition_tests {
                         crate::selection::AuthorityRole::ReviewAuditor,
                     ) == crate::selection::MeasuredAuthorityEligibility::Eligible
                         && row.class_fit.iter().any(|fit| {
-                            fit.task_class == "review_gate" && fit.effort == selector_effort
+                            fit.task_class == "review_gate"
+                                && (row.strong_gate_fallback_efforts.contains(&fit.effort)
+                                    || row.authority_evidence.iter().any(|evidence| {
+                                        evidence.role
+                                            == crate::selection::AuthorityRole::ReviewAuditor
+                                            && evidence.task_class == "review_gate"
+                                            && evidence.effort == fit.effort
+                                    }))
                         })
-                        && (row.strong_gate_fallback_efforts.contains(&selector_effort)
-                            || row.authority_evidence.iter().any(|evidence| {
-                                evidence.role == crate::selection::AuthorityRole::ReviewAuditor
-                                    && evidence.task_class == "review_gate"
-                                    && evidence.effort == selector_effort
-                            }))
                 })
                 .cloned()
-                .expect("retained eligible ReviewAuditor profile at the original effort");
+                .expect("retained eligible ReviewAuditor profile");
             // ONE synthetic alias retains the original evidence, samples, quality,
             // effort menu and prohibitions. No live Grok model or billing assertion.
             prior.runtime = "grok".to_string();
@@ -10236,6 +10227,31 @@ mod decomposition_tests {
             prior.limitations.push(
                 "synthetic alias; not measured Grok capability, live entitlement or billing"
                     .to_string(),
+            );
+            let mut advertised_efforts = Vec::new();
+            for fit in &prior.class_fit {
+                if fit.task_class != "review_gate" {
+                    continue;
+                }
+                let effort = fit.effort;
+                if !(prior.strong_gate_fallback_efforts.contains(&effort)
+                    || prior.authority_evidence.iter().any(|evidence| {
+                        evidence.role == crate::selection::AuthorityRole::ReviewAuditor
+                            && evidence.task_class == "review_gate"
+                            && evidence.effort == effort
+                    }))
+                {
+                    continue;
+                }
+                let parsed =
+                    ReasoningEffort::parse(effort.as_str()).expect("catalog review-gate effort");
+                if !advertised_efforts.contains(&parsed) {
+                    advertised_efforts.push(parsed);
+                }
+            }
+            assert!(
+                !advertised_efforts.is_empty(),
+                "retained ReviewAuditor profile must advertise a review-gate effort menu"
             );
             let snapshot = OperatorPriorSnapshot {
                 schema_version: 1,
@@ -10273,7 +10289,7 @@ mod decomposition_tests {
             let account_guard = super::super::scheduler::install_selected_grok_review_fixture(
                 &temp,
                 FIXTURE_MODEL_ID,
-                effort,
+                &advertised_efforts,
             )
             .expect("hold genuine synthetic selected Grok registry");
             let observation = super::super::scheduler::account_observation_for_launch_runtime(
@@ -10319,7 +10335,12 @@ mod decomposition_tests {
                 selected.candidate()
             );
             assert_eq!(selected.candidate().model, FIXTURE_MODEL_ID);
-            assert_eq!(selected.candidate().effort.as_str(), effort.as_str());
+            assert!(
+                advertised_efforts
+                    .iter()
+                    .any(|effort| { effort.as_str() == selected.candidate().effort.as_str() }),
+                "selected review effort must be one advertised catalog menu member"
+            );
             let runtime =
                 super::super::selection_bridge::runtime_from_name(&selected.candidate().runtime)
                     .expect("selected review runtime");

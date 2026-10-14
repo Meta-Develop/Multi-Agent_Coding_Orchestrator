@@ -4677,7 +4677,7 @@ impl coding_agent_manager_lib::providers::ProviderAdapter for GrokReviewFixtureO
 pub(super) fn install_selected_grok_review_fixture<'a>(
     owner: &'a tempfile::TempDir,
     fixture_model: &str,
-    effort: ReasoningEffort,
+    supported_efforts: &[ReasoningEffort],
 ) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
     use coding_agent_manager_lib::account_authority::{
         ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
@@ -4688,6 +4688,18 @@ pub(super) fn install_selected_grok_review_fixture<'a>(
     if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
         bail!("Grok review fixture must not replace an existing CAM observation control");
     }
+    let menu: BTreeSet<String> = supported_efforts
+        .iter()
+        .map(|effort| effort.as_str().to_string())
+        .collect();
+    if menu.is_empty() {
+        bail!("synthetic Grok review fixture requires a nonempty supported-effort menu");
+    }
+    let default_effort = if menu.len() == 1 {
+        menu.iter().next().cloned()
+    } else {
+        None
+    };
     let root = tempfile::tempdir_in(owner.path())?;
     let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
     registry.begin_add(
@@ -4705,8 +4717,8 @@ pub(super) fn install_selected_grok_review_fixture<'a>(
     let models = ModelsObservation {
         models: vec![ObservedModel {
             model_id: fixture_model.to_string(),
-            default_effort: Some(effort.as_str().to_string()),
-            supported_efforts: Some(vec![effort.as_str().to_string()]),
+            default_effort,
+            supported_efforts: Some(menu.into_iter().collect()),
             access: ModelAccessOutcome::Available,
         }],
         provenance: Some(ModelCatalogProvenance {
@@ -5034,17 +5046,25 @@ fn install_selected_concurrent_fixture_with_custody<'a>(
             || options.runtime != SupervisorRuntime::Codex
             || plan.assignments.is_empty()
             || plan.assignments.iter().any(|assignment| {
-                assignment.role != AgentRole::ChildOrchestrator
-                    || assignment.phase != AssignmentPhase::Execution
-                    || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
-                    || !assignment.worker_assignments.is_empty()
-                    || assignment
-                        .runtime
-                        .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+                let nested_workers = !assignment.worker_assignments.is_empty();
+                let runtime_ok = !assignment
+                    .runtime
+                    .is_some_and(|runtime| runtime != SupervisorRuntime::Codex);
+                let ordinary_child = assignment.role == AgentRole::ChildOrchestrator
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+                    && !nested_workers
+                    && runtime_ok;
+                let terminal_worker = assignment.role == AgentRole::Worker
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+                    && !nested_workers
+                    && runtime_ok;
+                !(ordinary_child || terminal_worker)
             })
         {
             bail!(
-                "selected concurrent fixture requires owned ordinary Codex ChildOrchestrators without workers"
+                "selected concurrent fixture requires owned ordinary Codex ChildOrchestrators without workers, or explicit Worker assignments with NonDelegatingTerminalWorker and no nested workers"
             );
         }
         let frozen = metadata

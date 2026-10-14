@@ -155,6 +155,73 @@ fn wait_for_fixture_thread_finish<T>(
     wait_for_fixture_condition(|| handle.is_finished(), test, run_id, stage, bound);
 }
 
+fn injected_named_terminal_worker_assignment(id: &str, path: &str) -> OrchestratorAssignment {
+    let mut assignment = injected_named_assignment(id, path);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignment
+}
+
+fn injected_direct_worker_report(assignment: &OrchestratorAssignment) -> WorkerReport {
+    WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "injected worker validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "none".to_string(),
+        next_safe_action: "review".to_string(),
+    }
+}
+
+fn write_injected_direct_worker_report(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+) {
+    write_injected_json(
+        &command.output_last_message,
+        &injected_direct_worker_report(assignment),
+    );
+}
+
+fn admission_schedule_metadata(plan: &SupervisorPlan) -> SupervisorPlanMetadata {
+    SupervisorPlanMetadata {
+        assignment_schedule: plan
+            .assignments
+            .iter()
+            .enumerate()
+            .map(|(flattened_index, assignment)| AssignmentScheduleEntry {
+                assignment_id: assignment.id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index,
+            })
+            .collect(),
+        ..SupervisorPlanMetadata::default()
+    }
+}
+
 struct UnwindCleanup<F: FnOnce()> {
     action: Option<F>,
 }
@@ -521,10 +588,11 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
-        injected_named_assignment("child-a", "src"),
-        injected_named_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
     ];
-    let plan = injected_multi_plan(assignments.clone(), 0);
+    let mut plan = injected_multi_plan(assignments.clone(), 0);
+    plan.semantic_coordination = SemanticCoordinationMode::Block;
     let options = injected_options(&repo_path, temp.path(), "serial-overlap-release");
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let runner = {
@@ -556,7 +624,7 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         }
     };
@@ -626,8 +694,8 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
             .expect("write injected Rust source");
         commit_injected_repository(&repo_path, "add semantic fixture");
         let mut assignments = vec![
-            injected_named_assignment("child-a", "README.md"),
-            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_terminal_worker_assignment("child-a", "README.md"),
+            injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
         ];
         for assignment in &mut assignments {
             assignment.semantic_symbols = vec!["Shared".to_string()];
@@ -642,7 +710,7 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         };
 
@@ -683,8 +751,8 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
         .claim_paths("external-owner", [PathBuf::from("README.md")])
         .expect("reserve first serial assignment path");
     let mut assignments = vec![
-        injected_named_assignment("child-a", "README.md"),
-        injected_named_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-a", "README.md"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
     ];
     for assignment in &mut assignments {
         assignment.semantic_symbols = vec!["Shared".to_string()];
@@ -698,7 +766,7 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
             .iter()
             .find(|assignment| assignment.id == id)
             .unwrap_or_else(|| panic!("missing assignment {id}"));
-        write_injected_assignment_report(command, assignment);
+        write_injected_direct_worker_report(command, assignment);
         injected_verified_run(command)
     };
     let report = {
@@ -821,9 +889,9 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
     .expect("write injected Rust source");
     commit_injected_repository(&repo_path, "add Block semantic fixture");
     let mut assignments = vec![
-        injected_named_assignment("child-a", "src"),
-        injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md"),
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-c", "README.md"),
     ];
     assignments[0].semantic_symbols = vec!["Alpha".to_string()];
     assignments[1].semantic_symbols = vec!["Beta".to_string()];
@@ -854,7 +922,7 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         }
     };
@@ -1675,10 +1743,11 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
 fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
-        injected_named_assignment("serial-terminal-a", "README.md"),
-        injected_named_assignment("serial-terminal-b", "README.md"),
+        injected_named_terminal_worker_assignment("serial-terminal-a", "README.md"),
+        injected_named_terminal_worker_assignment("serial-terminal-b", "README.md"),
     ];
-    let plan = injected_multi_plan(assignments.clone(), 0);
+    let mut plan = injected_multi_plan(assignments.clone(), 0);
+    plan.semantic_coordination = SemanticCoordinationMode::Block;
     let run_id = RunId::new("serial-terminal-before-release").expect("valid serial run id");
     let options = injected_options(&repo_path, temp.path(), run_id.as_str());
     let runner = move |command: &ExternalAgentCommand| {
@@ -1687,7 +1756,7 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
             .iter()
             .find(|assignment| assignment.id == id)
             .expect("serial checkpoint assignment");
-        write_injected_assignment_report(command, assignment);
+        write_injected_direct_worker_report(command, assignment);
         injected_verified_run(command)
     };
     install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
@@ -1719,6 +1788,65 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
     store
         .release(retained.token)
         .expect("release retained serial terminal claim");
+}
+
+#[test]
+fn plan_admission_still_refuses_off_worker_and_enabled_group_overlaps() {
+    let overlapping_workers = vec![
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+    ];
+    let off_plan = injected_multi_plan(overlapping_workers, 0);
+    assert_eq!(
+        off_plan.semantic_coordination,
+        SemanticCoordinationMode::Off
+    );
+    let off_metadata = admission_schedule_metadata(&off_plan);
+    let off_error = validate_supervisor_plan(off_plan, off_metadata)
+        .expect_err("Off controlled-worker overlap must still fail plan admission");
+    let off_message = format!("{off_error:#}");
+    assert!(
+        off_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "Off worker refusal must be the path-collision gate: {off_message}"
+    );
+
+    let mut child_orch_plan = injected_multi_plan(
+        vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+        ],
+        0,
+    );
+    child_orch_plan.semantic_coordination = SemanticCoordinationMode::Warn;
+    let child_error = validate_supervisor_plan(
+        child_orch_plan.clone(),
+        admission_schedule_metadata(&child_orch_plan),
+    )
+    .expect_err("Warn ChildOrchestrator overlap must still fail plan admission");
+    let child_message = format!("{child_error:#}");
+    assert!(
+        child_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "enabled ChildOrch refusal must be the path-collision gate: {child_message}"
+    );
+
+    let mut mixed_plan = injected_multi_plan(
+        vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+        ],
+        0,
+    );
+    mixed_plan.semantic_coordination = SemanticCoordinationMode::Block;
+    let mixed_error =
+        validate_supervisor_plan(mixed_plan.clone(), admission_schedule_metadata(&mixed_plan))
+            .expect_err(
+                "Block mixed ChildOrchestrator/Worker overlap must still fail plan admission",
+            );
+    let mixed_message = format!("{mixed_error:#}");
+    assert!(
+        mixed_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "enabled mixed-group refusal must be the path-collision gate: {mixed_message}"
+    );
 }
 
 #[test]
