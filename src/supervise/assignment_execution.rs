@@ -10684,6 +10684,21 @@ mod decomposition_tests {
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
         );
+        for lens in &mut plan.review_lenses {
+            match &mut lens.backend {
+                crate::review::ReviewLensBackendConfig::Model {
+                    model,
+                    reasoning_effort,
+                    ..
+                } => {
+                    *model = "gpt-5.6-sol".to_string();
+                    *reasoning_effort = Some("xhigh".to_string());
+                }
+                crate::review::ReviewLensBackendConfig::Precomputed { .. } => {
+                    panic!("parent acceptance review lens must stay model-backed");
+                }
+            }
+        }
         let budget_config = SupervisorBudgetConfig::default();
         let consultant = SupervisorConsultantPlan::default();
         let assignment_metadata = AssignmentMetadata::new();
@@ -10734,10 +10749,58 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let budget_policy = AssignmentBudgetPolicy::default();
-        let runtime_model_catalog = RuntimeModelCatalog::Codex(
-            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
-                .expect("fixture codex runtime model catalog"),
-        );
+        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+            .expect("fixture codex runtime model catalog");
+        #[cfg(target_os = "linux")]
+        let (_selected_concurrent_fixture, budget_policy) = {
+            let mut plan_metadata = SupervisorPlanMetadata::default();
+            let policy = super::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)
+                .expect("bind assessed injected plan");
+            let selected_concurrent_fixture =
+                super::scheduler::install_selected_concurrent_fixture(
+                    &plan,
+                    &options,
+                    &runtime_model_catalog_inner,
+                    plan_metadata.clone(),
+                    &temp,
+                    policy,
+                )
+                .expect("install selected concurrent fixture");
+            let admission_policy_input = SupervisorAdmissionPolicyInput::resolve(
+                &repo,
+                1,
+                plan_metadata.admission,
+                options.admission_overrides,
+            )
+            .expect("resolve supervisor admission policy input");
+            let runtime_model_catalog_acquisition = Ok(RuntimeModelCatalog::Codex(
+                runtime_model_catalog_inner.clone(),
+            ));
+            let resolution =
+                super::scheduler::initialize_supervisor_selection_from_prepared_metadata(
+                    &mut plan,
+                    &mut plan_metadata,
+                    super::scheduler::PreparedSupervisorSelectionRequest {
+                        repo: &repo,
+                        current_run: Some(&options.run_id),
+                        runtime: options.runtime,
+                        execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+                        runtime_model_catalog: &runtime_model_catalog_acquisition,
+                        admission_policy_input: &admission_policy_input,
+                        quota: Default::default(),
+                    },
+                )
+                .expect("initialize supervisor selection from prepared metadata");
+            assert!(
+                resolution.selection_preflight_failure.is_none(),
+                "selection preflight failure: {:?}",
+                resolution.selection_preflight_failure
+            );
+            let mut selected_budget_policy = budget_policy;
+            selected_budget_policy.initial_selector_decisions = resolution.decisions;
+            (selected_concurrent_fixture, selected_budget_policy)
+        };
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(runtime_model_catalog_inner);
         let cancellation = ProcessCancellation::new();
         let mut journal = initialize_orchestration_event_journal(
             &repo,
@@ -10984,8 +11047,13 @@ mod decomposition_tests {
         );
         for lens in &mut plan.review_lenses {
             match &mut lens.backend {
-                crate::review::ReviewLensBackendConfig::Model { model, .. } => {
+                crate::review::ReviewLensBackendConfig::Model {
+                    model,
+                    reasoning_effort,
+                    ..
+                } => {
                     *model = "gpt-5.6-sol".to_string();
+                    *reasoning_effort = Some("xhigh".to_string());
                 }
                 crate::review::ReviewLensBackendConfig::Precomputed { .. } => {
                     panic!("default stacked review lens must stay model-backed");
@@ -11042,10 +11110,58 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let budget_policy = AssignmentBudgetPolicy::default();
-        let runtime_model_catalog = RuntimeModelCatalog::Codex(
-            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
-                .expect("fixture codex runtime model catalog"),
-        );
+        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+            .expect("fixture codex runtime model catalog");
+        #[cfg(target_os = "linux")]
+        let (_selected_concurrent_fixture, budget_policy) = {
+            let mut plan_metadata = SupervisorPlanMetadata::default();
+            let policy = super::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)
+                .expect("bind assessed injected plan");
+            let selected_concurrent_fixture =
+                super::scheduler::install_selected_concurrent_fixture(
+                    &plan,
+                    &options,
+                    &runtime_model_catalog_inner,
+                    plan_metadata.clone(),
+                    &temp,
+                    policy,
+                )
+                .expect("install selected concurrent fixture");
+            let admission_policy_input = SupervisorAdmissionPolicyInput::resolve(
+                &repo,
+                1,
+                plan_metadata.admission,
+                options.admission_overrides,
+            )
+            .expect("resolve supervisor admission policy input");
+            let runtime_model_catalog_acquisition = Ok(RuntimeModelCatalog::Codex(
+                runtime_model_catalog_inner.clone(),
+            ));
+            let resolution =
+                super::scheduler::initialize_supervisor_selection_from_prepared_metadata(
+                    &mut plan,
+                    &mut plan_metadata,
+                    super::scheduler::PreparedSupervisorSelectionRequest {
+                        repo: &repo,
+                        current_run: Some(&options.run_id),
+                        runtime: options.runtime,
+                        execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
+                        runtime_model_catalog: &runtime_model_catalog_acquisition,
+                        admission_policy_input: &admission_policy_input,
+                        quota: Default::default(),
+                    },
+                )
+                .expect("initialize supervisor selection from prepared metadata");
+            assert!(
+                resolution.selection_preflight_failure.is_none(),
+                "selection preflight failure: {:?}",
+                resolution.selection_preflight_failure
+            );
+            let mut selected_budget_policy = budget_policy;
+            selected_budget_policy.initial_selector_decisions = resolution.decisions;
+            (selected_concurrent_fixture, selected_budget_policy)
+        };
+        let runtime_model_catalog = RuntimeModelCatalog::Codex(runtime_model_catalog_inner);
         let cancellation = ProcessCancellation::new();
         let mut journal = initialize_orchestration_event_journal(
             &repo,
