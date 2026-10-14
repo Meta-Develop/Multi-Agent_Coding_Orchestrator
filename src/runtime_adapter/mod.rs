@@ -1528,6 +1528,7 @@ mod tests {
         assert_eq!(
             config.argument_template,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "{prompt}",
                 "--model",
@@ -1557,6 +1558,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1606,6 +1608,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1663,6 +1666,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--reasoning-effort",
@@ -1694,6 +1698,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--cwd",
@@ -1801,6 +1806,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1996,6 +2002,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--sandbox",
                 "strict",
                 "--disable-web-search",
@@ -2425,6 +2432,7 @@ mod tests {
         assert_eq!(
             argv,
             [
+                OsString::from("--no-auto-update"),
                 OsString::from("--prompt-file"),
                 OsString::from("prompt.txt"),
                 OsString::from("--model"),
