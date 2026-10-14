@@ -2429,7 +2429,7 @@ fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        injected_named_assignment("child-c", "pending-after-fatal.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-join");
@@ -2560,7 +2560,7 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        injected_named_assignment("child-c", "pending-after-fatal.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-cancels-active");
@@ -2654,7 +2654,7 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-release-error"),
+        injected_named_assignment("child-c", "pending-after-release-error.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-release-error-abort");
@@ -2804,7 +2804,7 @@ fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment()
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-panic"),
+        injected_named_assignment("child-c", "pending-after-panic.md"),
     ];
     let mut plan = injected_multi_plan(assignments.clone(), 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
