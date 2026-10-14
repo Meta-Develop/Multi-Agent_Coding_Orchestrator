@@ -400,6 +400,316 @@ fn loaded_policy_unknown_model_none_effort_is_honest_and_exactly_authorized() ->
 }
 
 #[test]
+fn loaded_policy_score_semantics_v1_remains_deserializable() {
+    let v1 = serde_json::from_value::<RoutingScoreSemantics>(serde_json::json!(
+        "loaded_policy_evidence_penalty_v1"
+    ))
+    .expect("historical loaded-policy v1 token");
+    assert_eq!(v1, RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV1);
+    let v2 = serde_json::from_value::<RoutingScoreSemantics>(serde_json::json!(
+        "loaded_policy_evidence_penalty_v2"
+    ))
+    .expect("loaded-policy v2 token");
+    assert_eq!(v2, RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2);
+
+    let schema = schema::selection_event_schema_value();
+    let score = &schema["properties"]["provenance"]["properties"]["candidate_set"]["items"]
+        ["properties"]["score"];
+    let score_object = score["oneOf"]
+        .as_array()
+        .expect("nullable score schema")
+        .iter()
+        .find(|alt| alt.get("properties").is_some())
+        .expect("candidate_set item score object schema");
+    let tokens = score_object["properties"]["routing_score_semantics"]["enum"]
+        .as_array()
+        .expect("routing_score_semantics enum");
+    let tokens = tokens
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(tokens.contains(&"legacy_baseline_plus_cost_proxy_adjustments_v1"));
+    assert!(tokens.contains(&"loaded_policy_evidence_penalty_v1"));
+    assert!(tokens.contains(&"loaded_policy_evidence_penalty_v2"));
+}
+
+#[test]
+fn loaded_policy_unknown_evidence_skips_quality_normalization() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let candidate = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "account-advertised-unmeasured-model".to_string(),
+        effort: ReasoningEffort::None,
+    };
+    input.signals.previous_choice = Some(candidate.clone());
+    input.signals.retry_count = 3;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-unknown-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let evaluation = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == candidate)
+        .expect("unknown loaded-policy evaluation");
+    let evidence = evaluation
+        .loaded_policy_evidence
+        .as_ref()
+        .expect("unknown loaded-policy evidence");
+    assert_eq!(evidence.quality_basis_points, None);
+    assert_eq!(evidence.expected_accepted_cycle_cost_microunits, None);
+    assert!(evidence.uncertainty_penalty > 0);
+    let score = evaluation
+        .score
+        .as_ref()
+        .expect("unknown loaded-policy score");
+    assert_eq!(
+        score.routing_score_semantics,
+        RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+    );
+    assert_eq!(score.posterior_quality_basis_points, 0);
+    assert_eq!(score.retry_cost_microunits, 0);
+    assert_eq!(score.human_review_cost_proxy_microunits, 0);
+    assert_eq!(score.human_review_adjustment_microunits, 0);
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_observed_ledger_without_class_fit_applies_review_tradeoffs() -> anyhow::Result<()>
+{
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let candidate = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "account-advertised-unmeasured-model".to_string(),
+        effort: ReasoningEffort::None,
+    };
+    input.outcomes.push(OutcomeRecord {
+        attempt_id: "attempt-1".to_string(),
+        task: input.task.clone(),
+        candidate: candidate.clone(),
+        result: OutcomeResult::Accepted,
+        failure_class: None,
+        execution_cost_microunits: 10,
+        review_cost_microunits: 25,
+        rework_cost_microunits: 8,
+        rereview_cost_microunits: 0,
+        environment_cost_microunits: 0,
+        environment_failures: Vec::new(),
+        fixed_cause_relaunch: None,
+    });
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-observed-ledger-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let evaluation = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == candidate)
+        .expect("observed-ledger loaded-policy evaluation");
+    assert!(evaluation.prior_source_id.is_none());
+    assert!(evaluation.eligible);
+    let evidence = evaluation
+        .loaded_policy_evidence
+        .as_ref()
+        .expect("observed-ledger loaded-policy evidence");
+    assert!(evidence.quality_basis_points.is_some());
+    assert!(evidence.expected_accepted_cycle_cost_microunits.is_some());
+    assert_eq!(evidence.uncertainty_penalty, 0);
+    let score = evaluation
+        .score
+        .as_ref()
+        .expect("observed-ledger loaded-policy score");
+    assert_eq!(
+        score.routing_score_semantics,
+        RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+    );
+    assert_eq!(score.human_review_cost_proxy_microunits, 25);
+    assert_eq!(score.retry_rework_cost_proxy_microunits, 8);
+    assert_eq!(
+        score.human_review_adjustment_microunits,
+        score.human_review_cost_proxy_microunits * 75 / 25
+    );
+    assert_eq!(
+        score.total_score_microunits,
+        score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+    );
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_known_fit_uses_prior_review_and_previous_choice_retry() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-known-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let initial = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    for evaluation in initial.candidate_set.iter().filter(|entry| entry.eligible) {
+        let score = evaluation.score.as_ref().expect("known-fit loaded score");
+        assert_eq!(
+            score.routing_score_semantics,
+            RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+        );
+        assert_eq!(score.retry_cost_microunits, 0);
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 75 / 25
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
+        assert!(score.human_review_cost_proxy_microunits > 0);
+    }
+    let previous = initial
+        .choice
+        .as_ref()
+        .expect("known-fit loaded choice")
+        .candidate
+        .clone();
+    input.signals.previous_choice = Some(previous.clone());
+    input.signals.retry_count = 3;
+    let retried = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let previous_score = retried
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .and_then(|entry| entry.score.as_ref())
+        .expect("previous loaded-policy retry score");
+    assert!(previous_score.retry_cost_microunits > 0);
+    assert!(retried.candidate_set.iter().all(|entry| {
+        entry.candidate == previous
+            || entry
+                .score
+                .as_ref()
+                .is_none_or(|score| score.retry_cost_microunits == 0)
+    }));
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_nonzero_retry_rework_weight_adds_utility_preference_not_a_second_bill(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "retry-rework-utility-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 75;
+    profile.tradeoffs.quota_consumption_percent = 0;
+    profile.tradeoffs.latency_percent = 0;
+    profile.tradeoffs.retry_rework_percent = 25;
+    profile.tradeoffs.human_review_percent = 0;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let initial = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let previous = initial
+        .choice
+        .as_ref()
+        .expect("initial loaded-policy choice")
+        .candidate
+        .clone();
+    let before = initial
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .and_then(|entry| entry.score.as_ref())
+        .expect("initial previous-candidate score");
+    assert_eq!(before.retry_cost_microunits, 0);
+    assert_eq!(before.switch_cost_microunits, 0);
+    assert_eq!(before.switch_transition, ContextSwitchTransition::Continue);
+    let r = before.retry_rework_cost_proxy_microunits;
+    let before_cycle = before.expected_total_cost_per_accepted_task_microunits;
+    let before_baseline = before.legacy_baseline_score_microunits;
+    let before_total = before.total_score_microunits;
+    input.signals.previous_choice = Some(previous.clone());
+    input.signals.retry_count = 3;
+    let retried = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let after_eval = retried
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .expect("retried previous-candidate evaluation");
+    let after = after_eval
+        .score
+        .as_ref()
+        .expect("retried previous-candidate score");
+    let p = after.retry_cost_microunits;
+    assert!(p > 0);
+    assert!(retried.candidate_set.iter().all(|entry| {
+        entry.candidate == previous
+            || entry
+                .score
+                .as_ref()
+                .is_none_or(|score| score.retry_cost_microunits == 0)
+    }));
+    assert_eq!(
+        after.expected_total_cost_per_accepted_task_microunits,
+        before_cycle
+    );
+    assert_eq!(
+        after_eval
+            .loaded_policy_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.expected_accepted_cycle_cost_microunits),
+        Some(before_cycle)
+    );
+    assert_eq!(after.switch_cost_microunits, 0);
+    assert_eq!(after.switch_transition, ContextSwitchTransition::Continue);
+    assert_eq!(after.legacy_baseline_score_microunits, before_baseline + p);
+    assert_eq!(after.retry_rework_cost_proxy_microunits, r + p);
+    assert_eq!(after.human_review_adjustment_microunits, 0);
+    let expected_total_increment = p + ((r + p) * 25 / 75) - (r * 25 / 75);
+    assert_eq!(
+        after.total_score_microunits,
+        before_total + expected_total_increment
+    );
+    Ok(())
+}
+
+#[test]
 fn legacy_catalog_access_absence_preserves_wire_digest_and_replay() {
     let input = base_input();
     let legacy_bytes = serde_json::to_vec(&input).unwrap();

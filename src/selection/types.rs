@@ -692,6 +692,7 @@ pub struct ScoreBreakdown {
 pub enum RoutingScoreSemantics {
     LegacyBaselinePlusCostProxyAdjustmentsV1,
     LoadedPolicyEvidencePenaltyV1,
+    LoadedPolicyEvidencePenaltyV2,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

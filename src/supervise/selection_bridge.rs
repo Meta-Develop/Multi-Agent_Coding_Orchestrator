@@ -5809,7 +5809,7 @@ mod tests {
         assert_ne!(adjusted_choice.candidate, default_choice.candidate);
         assert_eq!(
             adjusted_choice.reason,
-            selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+            selection::ChoiceReason::LoadedRoutingPolicy
         );
         let score = adjusted_worker
             .provenance
@@ -5820,7 +5820,7 @@ mod tests {
             .context("adjusted worker selected score")?;
         assert_eq!(
             score.routing_score_semantics,
-            selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+            selection::RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
         );
         assert_eq!(score.routing_tradeoff_weights, frozen.profile.tradeoffs);
         assert_eq!(score.retry_rework_adjustment_microunits, 0);
@@ -8498,10 +8498,7 @@ mod tests {
             crate::optimizer::objective::DEFAULT_TERMINAL_MODEL
         );
         assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
-        assert_eq!(
-            choice.reason,
-            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
-        );
+        assert_eq!(choice.reason, selection::ChoiceReason::LoadedRoutingPolicy);
         let evaluation = worker
             .provenance
             .candidate_set
@@ -8594,10 +8591,7 @@ mod tests {
             .as_ref()
             .context("fallback worker choice")?;
         assert_eq!(choice.candidate.runtime, "codex");
-        assert_eq!(
-            choice.reason,
-            selection::ChoiceReason::LowestExpectedTotalCostPerAcceptedTask
-        );
+        assert_eq!(choice.reason, selection::ChoiceReason::LoadedRoutingPolicy);
         assert!(worker
             .provenance
             .normalized_input

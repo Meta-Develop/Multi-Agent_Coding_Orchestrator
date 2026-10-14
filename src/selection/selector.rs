@@ -1029,6 +1029,7 @@ fn evaluate_candidate(
     if let Some(receipt) = routing_policy {
         return evaluate_loaded_policy_candidate(
             input,
+            profile,
             model,
             candidate,
             prior,
@@ -1280,6 +1281,7 @@ fn evaluate_candidate(
 #[allow(clippy::too_many_arguments)]
 fn evaluate_loaded_policy_candidate(
     input: &SelectionInput,
+    profile: &SelectorCalibration,
     model: &CatalogModel,
     candidate: CandidateKey,
     prior: Option<&ModelPrior>,
@@ -1424,7 +1426,94 @@ fn evaluate_loaded_policy_candidate(
             policy.objective.rejected_attempt_weight,
         )?;
         let effort_penalty = weighted(distance, policy.objective.effort_distance_weight)?;
-        let total = checked_sum_costs(
+        let known_quality = quality.filter(|value| *value > 0);
+        let retry_cost_microunits = if input.signals.previous_choice.as_ref() == Some(&candidate) {
+            if let Some(known_quality) = known_quality {
+                normalize_cost_per_accepted(
+                    u128_to_u64(
+                        u128::from(input.signals.retry_count)
+                            * u128::from(profile.retry_penalty_microunits),
+                        "loaded-policy retry score",
+                    )?,
+                    known_quality,
+                    "loaded-policy retry cost per accepted task",
+                )?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let (expected_retry_rework_cost, expected_human_review_cost) =
+            match (fit, known_quality, ledger.accepted) {
+                (Some(fit), Some(_), _) => {
+                    let expected_retry_rework = expected_cost_component_per_accepted(
+                        fit.rework_cost_microunits,
+                        ledger.rework_cost_microunits,
+                        fit,
+                        &ledger,
+                        "expected retry/rework cost per accepted task",
+                    )?;
+                    let prior_human_review_cost = checked_sum_costs(
+                        [fit.review_cost_microunits, fit.rereview_cost_microunits],
+                        "prior human-review cost",
+                    )?;
+                    let observed_human_review_cost = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )?;
+                    let expected_human_review = expected_cost_component_per_accepted(
+                        prior_human_review_cost,
+                        observed_human_review_cost,
+                        fit,
+                        &ledger,
+                        "expected human-review cost per accepted task",
+                    )?;
+                    (expected_retry_rework, expected_human_review)
+                }
+                (None, Some(_), accepted) if accepted > 0 => {
+                    let accepted = u64::from(accepted);
+                    let observed_rework = ledger.rework_cost_microunits / accepted;
+                    let observed_human_review = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )? / accepted;
+                    (observed_rework, observed_human_review)
+                }
+                _ => (0, 0),
+            };
+        let routing_weights = &input.resolved_objective_profile.profile.tradeoffs;
+        let retry_rework_cost_proxy_microunits = checked_sum_costs(
+            [expected_retry_rework_cost, retry_cost_microunits],
+            "loaded-policy retry/rework cost proxy",
+        )?;
+        let human_review_cost_proxy_microunits = expected_human_review_cost;
+        let retry_rework_adjustment_microunits = proportional_cost_proxy_adjustment(
+            retry_rework_cost_proxy_microunits,
+            routing_weights.retry_rework_percent,
+            routing_weights.monetary_cost_percent,
+            "loaded-policy retry/rework cost-proxy adjustment",
+        )?;
+        let human_review_adjustment_microunits = proportional_cost_proxy_adjustment(
+            human_review_cost_proxy_microunits,
+            routing_weights.human_review_percent,
+            routing_weights.monetary_cost_percent,
+            "loaded-policy human-review cost-proxy adjustment",
+        )?;
+        let total_adjustment_microunits = checked_sum_costs(
+            [
+                retry_rework_adjustment_microunits,
+                human_review_adjustment_microunits,
+            ],
+            "loaded-policy total cost-proxy adjustment",
+        )?;
+        let legacy_baseline_score_microunits = checked_sum_costs(
             [
                 cycle_cost,
                 rejection_penalty,
@@ -1432,8 +1521,16 @@ fn evaluate_loaded_policy_candidate(
                 evidence_penalty,
                 pool.marginal_cost_microunits,
                 applied_switch_cost,
+                retry_cost_microunits,
             ],
             "loaded routing objective",
+        )?;
+        let total = checked_sum_costs(
+            [
+                legacy_baseline_score_microunits,
+                total_adjustment_microunits,
+            ],
+            "loaded routing objective plus cost-proxy adjustments",
         )?;
         Some(ScoreBreakdown {
             // Zero here is paired with explicit unknown provenance, never used as measured quality.
@@ -1445,7 +1542,7 @@ fn evaluate_loaded_policy_candidate(
             entitlement_scarcity_cost_microunits: 0,
             observed_consumption_cost_microunits: 0,
             marginal_cost_microunits: pool.marginal_cost_microunits,
-            retry_cost_microunits: rejection_penalty,
+            retry_cost_microunits,
             degrade_cost_microunits: effort_penalty,
             switch_transition: switch.estimate.class,
             switch_cost_origin: switch.origin,
@@ -1454,16 +1551,14 @@ fn evaluate_loaded_policy_candidate(
             configured_switch_cost_origin: switch.configured_profile_prior_origin,
             applied_switch_cost_microunits: applied_switch_cost,
             switch_cost_microunits: applied_switch_cost,
-            routing_score_semantics: RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV1,
-            routing_tradeoff_weights: input.resolved_objective_profile.profile.tradeoffs.clone(),
-            legacy_baseline_score_microunits: cycle_cost,
-            retry_rework_cost_proxy_microunits: ledger.rework_cost_microunits,
-            human_review_cost_proxy_microunits: ledger
-                .review_cost_microunits
-                .saturating_add(ledger.rereview_cost_microunits),
-            retry_rework_adjustment_microunits: rejection_penalty,
-            human_review_adjustment_microunits: 0,
-            total_adjustment_microunits: evidence_penalty,
+            routing_score_semantics: RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2,
+            routing_tradeoff_weights: routing_weights.clone(),
+            legacy_baseline_score_microunits,
+            retry_rework_cost_proxy_microunits,
+            human_review_cost_proxy_microunits,
+            retry_rework_adjustment_microunits,
+            human_review_adjustment_microunits,
+            total_adjustment_microunits,
             total_score_microunits: total,
         })
     } else {

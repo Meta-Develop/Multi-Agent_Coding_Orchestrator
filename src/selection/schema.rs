@@ -587,7 +587,11 @@ fn score_breakdown() -> Value {
         "configured_switch_cost_origin" => configured_switch_cost_origin(),
         "applied_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
-        "routing_score_semantics" => enum_schema(&["legacy_baseline_plus_cost_proxy_adjustments_v1", "loaded_policy_evidence_penalty_v1"]),
+        "routing_score_semantics" => enum_schema(&[
+            "legacy_baseline_plus_cost_proxy_adjustments_v1",
+            "loaded_policy_evidence_penalty_v1",
+            "loaded_policy_evidence_penalty_v2",
+        ]),
         "routing_tradeoff_weights" => routing_tradeoff_weights(),
         "legacy_baseline_score_microunits" => nonnegative_integer(),
         "retry_rework_cost_proxy_microunits" => nonnegative_integer(),
