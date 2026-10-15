@@ -3338,6 +3338,15 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let mut metadata = SupervisorPlanMetadata::default();
     let _policy = bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
         .expect("assess the actual verified entry task");
+    // The assessed binding copies policy and assessment only. An explicit
+    // schedule is required because the writer always emits assignment_schedule,
+    // and an empty list does not cover the flattened assignment.
+    metadata.assignment_schedule = vec![AssignmentScheduleEntry {
+        assignment_id: assignment.id.clone(),
+        parent_assignment_id: None,
+        depth: MIN_SUPERVISOR_DEPTH,
+        flattened_index: 0,
+    }];
     let document = supervisor_plan_value(
         &plan,
         &SupervisorConsultantPlan::default(),

@@ -122,7 +122,9 @@ fn run_messaging_ipc_fixture_helper_subprocess(
         .with_environment(EnvironmentMode::InheritAndSet(environment))
         .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_stdin(StdinMode::Null)
-        .with_timeout(Some(Duration::from_secs(180)))
+        // Four bounded IPC phases precede a journal-bound dispatch. Leave room
+        // for its full debug-image custody checks and post-launch collection.
+        .with_timeout(Some(Duration::from_secs(480)))
         .with_stdout(StreamCapture::bounded(HELPER_STDOUT_MAX_BYTES))
         .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
     )
@@ -436,7 +438,11 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         max_child_assignments: 2,
         max_child_retries: 0,
         max_gate_corrections: 0,
-        child_timeout_seconds: 30,
+        // The prepared dispatch binds the production journal appender, which
+        // repeatedly hashes this full unoptimized libtest image. A short
+        // provider-only budget can expire before containment preflight obtains
+        // the native quiescence evidence required for scratch cleanup.
+        child_timeout_seconds: 300,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
@@ -782,6 +788,7 @@ fn build_admitted_grok_worker_command(
         managed_child,
         true,
     )?;
+    command.verify_grok_run_account_binding(assignment.run_id.as_str())?;
     let admission = worktree_writable_admission_record(
         &assignment.assignment.id,
         &assignment.assignment.assigned_paths,
@@ -861,12 +868,17 @@ fn messaging_ipc_verified_external_runner(
     cancellation: &ProcessCancellation,
     review: Option<ExternalPreActionReviewRuntime<'_>>,
 ) -> ExternalAgentRun {
-    run_external_agent_for_ipc_kind(
+    let report = run_external_agent_for_ipc_kind(
         MessagingIpcLaunchKind::Verified,
         command,
         cancellation,
         review,
-    )
+    );
+    assert!(
+        report.scratch_quiescence_verified(),
+        "verified IPC dispatch must retain native process-tree and confinement evidence before collection: {report:#?}"
+    );
+    report
 }
 
 fn bail_assignment_execution_completed(
@@ -922,6 +934,30 @@ fn assignment_messaging_ipc_acceptance(
     commit_fixture_repository(&repo);
 
     let run_id = RunId::new(RUN_SLUG)?;
+    // Selection is normally admitted by scheduler initialization. This fixture
+    // builds assignment commands directly, so carry the same run-bound account
+    // through every phase, including prepare_child_attempt's admission check.
+    let binding = match launch_kind {
+        MessagingIpcLaunchKind::Verified => {
+            let evidence = expected_verified_cam_binding
+                .context("verified IPC fixture requires its selected CAM account")?;
+            crate::account_authority::FrozenGrokSelectedBinding {
+                authority_id: evidence.authority_id.clone(),
+                provider_id: evidence.provider_id.clone(),
+                account_id: evidence.account_id.clone(),
+                account_incarnation: evidence.account_incarnation.clone(),
+                selection_revision: evidence.selection_revision,
+            }
+        }
+        MessagingIpcLaunchKind::Simulated => crate::account_authority::FrozenGrokSelectedBinding {
+            authority_id: None,
+            provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.to_string(),
+            account_id: "simulated-messaging-account".to_string(),
+            account_incarnation: "simulated-messaging-incarnation".to_string(),
+            selection_revision: 1,
+        },
+    };
+    crate::account_authority::admit_grok_run_account_binding(run_id.as_str(), Some(binding));
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,

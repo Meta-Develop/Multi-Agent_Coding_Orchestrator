@@ -757,8 +757,14 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
-    let source_run_id =
-        RunId::new("licensed-cascade-enqueue-resume").expect("cascade resume run id");
+    // CAM launch bindings are process-wide and keyed by run id. The enqueue
+    // interruption and stale-lease tests can run concurrently with different
+    // account registries, so each fixture needs its own source execution id.
+    let source_run_id = RunId::new(format!(
+        "licensed-cascade-enqueue-resume-{}",
+        crate::artifacts::state_auth::random_identifier().expect("unique cascade fixture id")
+    ))
+    .expect("cascade resume run id");
     let plan_file = temp.path().join("licensed-cascade-enqueue-resume.json");
     fs::write(
         &plan_file,
@@ -813,8 +819,18 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     let mut runner = licensed_follow_up_enqueue_interruption_runner(&fixture);
 
     set_interrupt_after_follow_up_enqueue();
-    let error = run_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
-        .expect_err("interrupt after durable follow-up enqueue");
+    let error =
+        match run_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner) {
+            Err(error) => error,
+            Ok(outcome) => panic!(
+                "expected interruption after durable follow-up enqueue; source status: {:?}; \
+             generated tasks: {}; source findings: {:#?}; follow-up environment failures: {:#?}",
+                outcome.source_report.status,
+                outcome.source_report.generated_follow_up_tasks.len(),
+                outcome.source_report.findings,
+                outcome.follow_up_environment_failures,
+            ),
+        };
     assert!(format!("{error:#}")
         .contains("injected interruption after durable generated follow-up enqueue"));
     assert_eq!(
@@ -2557,7 +2573,19 @@ fn licensed_follow_up_stale_predecessor_lease_recovers_through_cascade_resume() 
         resume_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
             .expect("resume cascade after stale predecessor lease");
     clear_generated_follow_up_queue_observer();
-    assert!(outcome.follow_up_cascade_success, "{outcome:#?}");
+    assert!(
+        outcome.follow_up_cascade_success,
+        "stale-lease cascade failed; source status: {:?}; follow-up status/findings: {:#?}; \
+         gate denials: {:#?}; environment failures: {:#?}",
+        outcome.source_report.status,
+        outcome
+            .follow_up_reports
+            .iter()
+            .map(|report| (&report.status, &report.findings))
+            .collect::<Vec<_>>(),
+        outcome.follow_up_gate_denials,
+        outcome.follow_up_environment_failures,
+    );
     assert!(outcome.generated_follow_up_dispatch_performed());
     assert_eq!(
         fixture

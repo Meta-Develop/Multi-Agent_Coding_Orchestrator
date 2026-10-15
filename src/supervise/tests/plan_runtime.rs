@@ -4126,11 +4126,25 @@ fn invalid_objective_profile_file_fails_before_external_dispatch() {
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_authorized_lens_effort()
+{
     skip_without_containment!();
     let _capability =
         install_named_test_models(&["available-child-model", "available-auditor-model"]);
     let (temp, repo_path) = injected_repository();
+    let mut policy = crate::selection::routing_policy::load_routing_policy(&repo_path)
+        .expect("load fixture routing policy")
+        .policy;
+    let mut auditor_policy = policy.role(AgentRole::Auditor.as_str()).clone();
+    auditor_policy.minimum_effort = Some(crate::selection::ReasoningEffort::Low);
+    policy
+        .role_preferences
+        .insert(AgentRole::Auditor.as_str().to_string(), auditor_policy);
+    fs::write(
+        repo_path.join(crate::selection::routing_policy::ROUTING_POLICY_FILE),
+        serde_json::to_vec(&policy).expect("serialize fixture routing policy"),
+    )
+    .expect("write fixture Auditor effort minimum");
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
@@ -4158,6 +4172,10 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         panic!("default supervisor lens must be model-backed");
     };
     *model = "available-child-model".to_string();
+    // The selected fixture supplies evidence for this exact lens profile.
+    // This low-effort lens meets the fixture's explicit Auditor minimum.
+    // Below-minimum refusal is covered by selection_bridge::tests::
+    // authored_review_lens_refusals_and_scope_exit_preserve_outer_authority.
     *reasoning_effort = Some("low".to_string());
     let options = injected_options(&repo_path, temp.path(), "independent-auditor-preference");
     let catalog =
@@ -4175,9 +4193,20 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
             assert_eq!(command.model.as_deref(), Some("available-child-model"));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
+            assert_eq!(
+                AgentRole::Auditor.reasoning_effort_floor(),
+                Some(ReasoningEffort::Low)
+            );
+            crate::selection::routing_policy::validate_selected_launch(
+                AgentRole::Auditor.as_str(),
+                SupervisorRuntime::Codex.as_str(),
+                "available-child-model",
+                "low",
+            )
+            .expect("lens launch must match its exact selector authorization");
             assert!(fs::read_to_string(&command.prompt)
                 .expect("read resolved auditor prompt")
-                .contains("Reasoning effort: xhigh"));
+                .contains("Reasoning effort: low"));
             let argv = crate::external_agent::command_argv(command)
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
@@ -4187,7 +4216,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .any(|arguments| arguments == ["-m", "available-child-model"]));
             assert!(argv
                 .windows(2)
-                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
+                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"low\""] }));
             let child = injected_child_report(&assignment);
             write_injected_json(
                 &command.output_last_message,

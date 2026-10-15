@@ -958,7 +958,7 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
 #[test]
 fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
     let (temp, repo_path) = injected_repository();
-    let assignments = (0..7)
+    let mut assignments = (0..7)
         .map(|index| {
             injected_named_assignment(
                 &format!("degrade-child-{index}"),
@@ -966,6 +966,14 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
             )
         })
         .collect::<Vec<_>>();
+    // Budget-pressure reselection includes the Worker role. Declare a real,
+    // pending terminal scope so normal selection retains its replay evidence;
+    // the hard ceiling must halt before this scope can run.
+    let mut pending_worker =
+        injected_named_assignment("degrade-pending-worker", "degrade-worker.txt");
+    pending_worker.role = AgentRole::Worker;
+    pending_worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignments.push(pending_worker);
     let plan = injected_multi_plan(assignments.clone(), 0);
     let budget = injected_run_budget(Some(10), Some(60), None, None, 10, 1);
     let run_id = "budget-degrade-production-scheduler";
@@ -1060,7 +1068,7 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
     let child_bindings = child_bindings
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    assert_eq!(child_bindings.len(), 6);
+    assert_eq!(child_bindings.len(), 6, "{report:#?}");
     assert_eq!(
         child_bindings["degrade-child-0"],
         (FRONTIER_PROFILE_MODEL.to_string(), "xhigh".to_string())
@@ -1074,6 +1082,7 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
         (FRONTIER_PROFILE_MODEL.to_string(), "xhigh".to_string())
     );
     assert!(!child_bindings.contains_key("degrade-child-6"));
+    assert!(!child_bindings.contains_key("degrade-pending-worker"));
 
     let execution = report
         .role_economics_profile
@@ -3094,7 +3103,13 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
             },
         );
         let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
-        let options = injected_options(&repo_path, temp.path(), "model-attribution-pipeline");
+        // Each independent CAM registry needs its own immutable run binding.
+        let run_id = format!(
+            "model-attribution-pipeline-{}-{}",
+            observed.unwrap_or("unknown"),
+            if unknown_auditor { "auditor" } else { "child" }
+        );
+        let options = injected_options(&repo_path, temp.path(), &run_id);
         let mut invocations = 0;
         let mut runner = |command: &ExternalAgentCommand| {
             invocations += 1;
@@ -3150,7 +3165,10 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
         );
         assert!(!report.accepted);
         assert!(!report.publishable);
-        assert_eq!(invocations, expected_invocations);
+        assert_eq!(
+            invocations, expected_invocations,
+            "observed={observed:?}, unknown_auditor={unknown_auditor}: {report:#?}"
+        );
         let charged = report.run_budget.as_ref().unwrap();
         assert_eq!(charged.consumed.tokens, invocations * 10);
         assert_eq!(charged.active_reservations, 0);
@@ -3463,7 +3481,9 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
         let mut plan = injected_plan(assignment.clone(), 0);
         inject_priced_process_roles(&mut plan, "priced-model", 2.0);
         let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
-        let options = injected_options(&repo_path, temp.path(), "observed-auditor-effort");
+        // A new registry incarnation must not reuse the previous case's RunId.
+        let run_id = format!("observed-auditor-effort-{}", effort.unwrap_or("unknown"));
+        let options = injected_options(&repo_path, temp.path(), &run_id);
         let mut invocations = 0;
         let mut runner = |command: &ExternalAgentCommand| {
             invocations += 1;
@@ -3532,7 +3552,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
             &mut runner,
         )
         .unwrap();
-        assert_eq!(invocations, 2);
+        assert_eq!(invocations, 2, "{effort:?}: {report:#?}");
         assert_eq!(
             report.success,
             effort == Some("xhigh"),
