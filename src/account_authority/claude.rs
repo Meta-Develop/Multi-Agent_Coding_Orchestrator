@@ -182,7 +182,9 @@ pub(crate) fn acquire_claude_launch_authority(
     carried: Option<&FrozenClaudeSelectedBinding>,
     deadline_unix_millis: u64,
 ) -> Result<ClaudeLaunchAuthority> {
-    let socket_path = configured_cam_authority_socket();
+    let socket_path = super::cam_socket_for_frozen_selection(
+        carried.and_then(|frozen| frozen.authority_socket.as_deref()),
+    )?;
     let frozen = require_carried_claude_launch_binding(carried, socket_path.is_some())?;
     if let (Some(socket_path), Some(frozen)) = (socket_path.as_ref(), frozen) {
         let live =

@@ -36,6 +36,9 @@ pub(crate) const CODEX_CLI_PROVIDER_ID: &str = "codex-cli";
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub(crate) struct FrozenCodexSelectedBinding {
+    /// Socket observed at admission; absence means the local registry was used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub authority_socket: Option<std::path::PathBuf>,
     pub authority_id: String,
     pub provider_id: String,
     pub account_id: String,
@@ -43,11 +46,13 @@ pub(crate) struct FrozenCodexSelectedBinding {
     pub selection_revision: u64,
 }
 
-/// Absence of a run slot is legacy unmanaged execution. Missing selection in an
-/// initialized managed run is an explicit refusal, not permission to read ambient auth.
+/// The admitted auth source for a run, including explicit unmanaged admission.
+/// A missing selection from a configured socket is always a refusal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) enum CodexRunAccountBinding {
     Missing,
+    /// No socket or local selection was configured when this run was admitted.
+    LocalAuth,
     Selected(FrozenCodexSelectedBinding),
 }
 
@@ -68,12 +73,42 @@ impl FrozenCodexSelectedBinding {
 static CODEX_RUN_ACCOUNT_BINDINGS: Mutex<BTreeMap<String, CodexRunAccountBinding>> =
     Mutex::new(BTreeMap::new());
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn record_observed_codex_selection(
     run_id: Option<&str>,
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+) {
+    record_codex_selection(run_id, provider_id, authority_id, binding, None, false);
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn record_observed_codex_selection_from_source(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
+) {
+    record_codex_selection(
+        run_id,
+        provider_id,
+        authority_id,
+        binding,
+        authority_socket,
+        true,
+    );
+}
+
+#[cfg(target_os = "linux")]
+fn record_codex_selection(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
+    allow_local_auth: bool,
 ) {
     if provider_id != CODEX_CLI_PROVIDER_ID {
         return;
@@ -82,12 +117,16 @@ pub(crate) fn record_observed_codex_selection(
     let frozen = match (authority_id, binding) {
         (Some(authority_id), Some(binding)) if binding.provider_id == CODEX_CLI_PROVIDER_ID => {
             CodexRunAccountBinding::Selected(FrozenCodexSelectedBinding {
+                authority_socket: authority_socket.map(Into::into),
                 authority_id,
                 provider_id: binding.provider_id.clone(),
                 account_id: binding.account_id.clone(),
                 account_incarnation: binding.account_incarnation.clone(),
                 selection_revision: binding.selection_revision,
             })
+        }
+        (None, None) if allow_local_auth && authority_socket.is_none() => {
+            CodexRunAccountBinding::LocalAuth
         }
         _ => CodexRunAccountBinding::Missing,
     };
@@ -97,6 +136,50 @@ pub(crate) fn record_observed_codex_selection(
         .expect("Codex run account binding lock")
         .entry(run_id.to_string())
         .or_insert(frozen);
+}
+
+/// Revalidation must use the same source admitted at observation. A removed
+/// implicit installation must never turn a socket-bound run into local auth.
+#[cfg(target_os = "linux")]
+pub(crate) fn cam_socket_for_frozen_selection(
+    frozen_socket: Option<&std::path::Path>,
+) -> Result<Option<std::path::PathBuf>> {
+    let configured = configured_cam_authority_socket();
+    if frozen_socket.is_some() && configured.as_deref() != frozen_socket {
+        return Err(anyhow!(
+            "CAM authority socket configuration changed since selection observation; refusing local fallback"
+        ));
+    }
+    Ok(configured)
+}
+
+/// Use the source admitted by scheduler observation when rechecking a selected
+/// candidate before constructing its launch command.
+#[cfg(target_os = "linux")]
+pub(crate) fn cam_socket_for_run_selection(
+    run_id: &str,
+    provider_id: &str,
+) -> Result<Option<std::path::PathBuf>> {
+    let socket = match provider_id {
+        CODEX_CLI_PROVIDER_ID => match codex_run_account_binding(run_id) {
+            Some(CodexRunAccountBinding::Selected(frozen)) => frozen.authority_socket,
+            _ => None,
+        },
+        GROK_CLI_PROVIDER_ID => {
+            grok_run_account_binding(run_id).and_then(|frozen| frozen.authority_socket)
+        }
+        CLAUDE_CODE_PROVIDER_ID => {
+            claude_run_account_binding(run_id).and_then(|frozen| frozen.authority_socket)
+        }
+        GEMINI_CLI_PROVIDER_ID => {
+            gemini_run_account_binding(run_id).and_then(|frozen| frozen.authority_socket)
+        }
+        CURSOR_PROVIDER_ID => {
+            cursor_run_account_binding(run_id).and_then(|frozen| frozen.authority_socket)
+        }
+        _ => None,
+    };
+    cam_socket_for_frozen_selection(socket.as_deref())
 }
 
 pub(crate) fn codex_run_account_binding(run_id: &str) -> Option<CodexRunAccountBinding> {
@@ -136,6 +219,7 @@ pub(crate) struct ManagedGeminiAccountSelectionEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct FrozenGrokSelectedBinding {
+    pub authority_socket: Option<std::path::PathBuf>,
     pub authority_id: Option<String>,
     pub provider_id: String,
     pub account_id: String,
@@ -147,6 +231,7 @@ pub(crate) struct FrozenGrokSelectedBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct FrozenClaudeSelectedBinding {
+    pub authority_socket: Option<std::path::PathBuf>,
     pub authority_id: Option<String>,
     pub provider_id: String,
     pub account_id: String,
@@ -161,6 +246,7 @@ impl FrozenClaudeSelectedBinding {
         binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
     ) -> Self {
         Self {
+            authority_socket: None,
             authority_id,
             provider_id: binding.provider_id.clone(),
             account_id: binding.account_id.clone(),
@@ -207,6 +293,7 @@ pub(crate) struct ManagedCursorAccountSelectionEvidence {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct FrozenCursorSelectedBinding {
+    pub authority_socket: Option<std::path::PathBuf>,
     pub authority_id: Option<String>,
     pub provider_id: String,
     pub account_id: String,
@@ -221,6 +308,7 @@ impl FrozenCursorSelectedBinding {
         binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
     ) -> Self {
         Self {
+            authority_socket: None,
             authority_id,
             provider_id: binding.provider_id.clone(),
             account_id: binding.account_id.clone(),
@@ -261,6 +349,7 @@ impl FrozenGrokSelectedBinding {
         binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
     ) -> Self {
         Self {
+            authority_socket: None,
             authority_id,
             provider_id: binding.provider_id.clone(),
             account_id: binding.account_id.clone(),
@@ -309,6 +398,7 @@ impl FrozenGrokSelectedBinding {
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub(crate) struct FrozenGeminiSelectedBinding {
+    pub authority_socket: Option<std::path::PathBuf>,
     pub authority_id: Option<String>,
     pub provider_id: String,
     pub account_id: String,
@@ -323,6 +413,7 @@ impl FrozenGeminiSelectedBinding {
         binding: &coding_agent_manager_lib::account_authority::SelectedAccountBinding,
     ) -> Self {
         Self {
+            authority_socket: None,
             authority_id,
             provider_id: binding.provider_id.clone(),
             account_id: binding.account_id.clone(),
@@ -395,12 +486,16 @@ pub(crate) fn record_observed_grok_selection(
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
 ) -> Option<FrozenGrokSelectedBinding> {
     if provider_id != GROK_CLI_PROVIDER_ID {
         return None;
     }
-    let frozen = binding
-        .map(|binding| FrozenGrokSelectedBinding::from_selected_binding(authority_id, binding));
+    let frozen = binding.map(|binding| {
+        let mut frozen = FrozenGrokSelectedBinding::from_selected_binding(authority_id, binding);
+        frozen.authority_socket = authority_socket.map(Into::into);
+        frozen
+    });
     freeze_observed_grok_selection(frozen.clone());
     if let Some(run_id) = run_id {
         admit_grok_run_account_binding(run_id, frozen.clone());
@@ -415,12 +510,16 @@ pub(crate) fn record_observed_claude_selection(
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
 ) -> Option<FrozenClaudeSelectedBinding> {
     if provider_id != CLAUDE_CODE_PROVIDER_ID {
         return None;
     }
-    let frozen = binding
-        .map(|binding| FrozenClaudeSelectedBinding::from_selected_binding(authority_id, binding));
+    let frozen = binding.map(|binding| {
+        let mut frozen = FrozenClaudeSelectedBinding::from_selected_binding(authority_id, binding);
+        frozen.authority_socket = authority_socket.map(Into::into);
+        frozen
+    });
     if let Some(run_id) = run_id {
         admit_claude_run_account_binding(run_id, frozen.clone());
     }
@@ -474,12 +573,16 @@ pub(crate) fn record_observed_gemini_selection(
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
 ) -> Option<FrozenGeminiSelectedBinding> {
     if provider_id != GEMINI_CLI_PROVIDER_ID {
         return None;
     }
-    let frozen = binding
-        .map(|binding| FrozenGeminiSelectedBinding::from_selected_binding(authority_id, binding));
+    let frozen = binding.map(|binding| {
+        let mut frozen = FrozenGeminiSelectedBinding::from_selected_binding(authority_id, binding);
+        frozen.authority_socket = authority_socket.map(Into::into);
+        frozen
+    });
     if let Some(run_id) = run_id {
         admit_gemini_run_account_binding(run_id, frozen.clone());
     }
@@ -554,18 +657,32 @@ pub(crate) fn require_carried_gemini_launch_binding(
     })?))
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) fn record_observed_cursor_selection(
     run_id: Option<&str>,
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
 ) -> Option<FrozenCursorSelectedBinding> {
+    record_observed_cursor_selection_from_source(run_id, provider_id, authority_id, binding, None)
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn record_observed_cursor_selection_from_source(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&std::path::Path>,
+) -> Option<FrozenCursorSelectedBinding> {
     if provider_id != CURSOR_PROVIDER_ID {
         return None;
     }
-    let frozen = binding
-        .map(|binding| FrozenCursorSelectedBinding::from_selected_binding(authority_id, binding));
+    let frozen = binding.map(|binding| {
+        let mut frozen = FrozenCursorSelectedBinding::from_selected_binding(authority_id, binding);
+        frozen.authority_socket = authority_socket.map(Into::into);
+        frozen
+    });
     if let Some(run_id) = run_id {
         let mut slots = CURSOR_RUN_ACCOUNT_BINDINGS
             .lock()
@@ -674,8 +791,63 @@ mod run_binding_tests {
 
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn socket_observed_provider_bindings_refuse_absent_implicit_installation() {
+        use authority_socket_config::CamAuthoritySocketTestGuard;
+        use coding_agent_manager_lib::account_authority::SelectedAccountBinding;
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("maco/account-authority.sock");
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+        let binding = |provider: &str| SelectedAccountBinding {
+            provider_id: provider.into(),
+            account_id: "synthetic".into(),
+            account_incarnation: "synthetic-incarnation".into(),
+            selection_revision: 1,
+        };
+        let mut grok = FrozenGrokSelectedBinding::from_selected_binding(
+            Some("synthetic-authority".into()),
+            &binding(GROK_CLI_PROVIDER_ID),
+        );
+        grok.authority_socket = Some(socket.clone());
+        let mut gemini = FrozenGeminiSelectedBinding::from_selected_binding(
+            Some("synthetic-authority".into()),
+            &binding(GEMINI_CLI_PROVIDER_ID),
+        );
+        gemini.authority_socket = Some(socket.clone());
+        let mut claude = FrozenClaudeSelectedBinding::from_selected_binding(
+            Some("synthetic-authority".into()),
+            &binding(CLAUDE_CODE_PROVIDER_ID),
+        );
+        claude.authority_socket = Some(socket.clone());
+        let mut cursor = FrozenCursorSelectedBinding::from_selected_binding(
+            Some("synthetic-authority".into()),
+            &binding(CURSOR_PROVIDER_ID),
+        );
+        cursor.authority_socket = Some(socket);
+        let errors = [
+            grok::acquire_grok_launch_authority(Some(&grok))
+                .err()
+                .unwrap(),
+            gemini::acquire_gemini_launch_authority(Some(&gemini))
+                .err()
+                .unwrap(),
+            claude::acquire_claude_launch_authority(Some(&claude), u64::MAX)
+                .err()
+                .unwrap(),
+            cursor::acquire_cursor_launch_authority(Some(&cursor))
+                .err()
+                .unwrap(),
+        ];
+        for error in errors {
+            assert!(format!("{error:#}").contains("refusing local fallback"));
+        }
+    }
+
     fn synthetic_binding(account_id: &str, revision: u64) -> FrozenGrokSelectedBinding {
         FrozenGrokSelectedBinding {
+            authority_socket: None,
             authority_id: Some(format!("auth-{account_id}")),
             provider_id: GROK_CLI_PROVIDER_ID.to_string(),
             account_id: account_id.to_string(),
@@ -686,6 +858,7 @@ mod run_binding_tests {
 
     fn synthetic_gemini_binding(account_id: &str, revision: u64) -> FrozenGeminiSelectedBinding {
         FrozenGeminiSelectedBinding {
+            authority_socket: None,
             authority_id: Some(format!("gemini-auth-{account_id}")),
             provider_id: GEMINI_CLI_PROVIDER_ID.to_string(),
             account_id: account_id.to_string(),

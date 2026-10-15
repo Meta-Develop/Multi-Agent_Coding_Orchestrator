@@ -2144,6 +2144,7 @@ mod tests {
             "read-only",
         )
         .with_gemini_run_account_binding(Some(FrozenGeminiSelectedBinding {
+            authority_socket: None,
             authority_id: Some("synthetic-offline-authority".into()),
             provider_id: "gemini-cli".into(),
             account_id: "synthetic-account".into(),

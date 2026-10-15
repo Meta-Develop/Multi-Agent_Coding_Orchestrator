@@ -863,6 +863,7 @@ mod grok_worker_journal_binding_tests {
                 .trim_start_matches('.')
         );
         let account = FrozenGrokSelectedBinding {
+            authority_socket: None,
             authority_id: Some("fixture-authority".into()),
             provider_id: "grok-cli".into(),
             account_id: "fixture-account".into(),
@@ -5485,6 +5486,7 @@ mod grok_native_custody_tests {
         let workspace = Path::new("/managed/parent");
         let incoming = Path::new("/private/incoming");
         let binding = FrozenGrokSelectedBinding {
+            authority_socket: None,
             authority_id: Some("authority".into()),
             provider_id: "grok-cli".into(),
             account_id: "account".into(),
@@ -6013,6 +6015,7 @@ mod grok_native_custody_tests {
                 "lifecycle" => changed.agent_lifecycle.as_mut().unwrap().task_id = "sibling".into(),
                 "account" => {
                     changed.grok_run_account_binding = Some(FrozenGrokSelectedBinding {
+                        authority_socket: None,
                         authority_id: Some("authority".into()),
                         provider_id: "grok-cli".into(),
                         account_id: "account".into(),

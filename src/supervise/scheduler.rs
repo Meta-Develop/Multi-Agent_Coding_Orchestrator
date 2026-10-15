@@ -6013,20 +6013,18 @@ pub(crate) fn select_normal_intake(
         // Check the complete live tuple again before handing this binding to the
         // ordinary supervisor. Execution still performs its own account checks.
         let provider = &selected.account_binding().provider_id;
-        let live =
-            if let Some(socket) = crate::account_authority::configured_cam_authority_socket() {
-                crate::account_authority::selected_binding_via_authority_socket(&socket, provider)?
-                    .map(|(_, binding)| binding)
-            } else {
-                let data_dir =
-                    project_dirs().context("account metadata directory is unavailable")?;
-                StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()))
-                    .selected_binding(provider)
-                    .map_err(|error| {
-                        anyhow!("failed to revalidate normal intake selection: {error}")
-                    })?
-            }
-            .context("normal intake selected account disappeared")?;
+        let live = if let Some(socket) =
+            crate::account_authority::cam_socket_for_run_selection(run_id.as_str(), provider)?
+        {
+            crate::account_authority::selected_binding_via_authority_socket(&socket, provider)?
+                .map(|(_, binding)| binding)
+        } else {
+            let data_dir = project_dirs().context("account metadata directory is unavailable")?;
+            StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()))
+                .selected_binding(provider)
+                .map_err(|error| anyhow!("failed to revalidate normal intake selection: {error}"))?
+        }
+        .context("normal intake selected account disappeared")?;
         selected.validate_binding(&(&live).into())?;
         Ok((runtime, selected, decision))
     }
@@ -6174,6 +6172,12 @@ pub(super) fn account_observation_for_launch_runtime(
         let Some(provider_id) = cam_provider_id_for_supervisor_runtime(runtime) else {
             return Ok(None);
         };
+        let socket_path = match run_id {
+            Some(run_id) => {
+                crate::account_authority::cam_socket_for_run_selection(run_id, provider_id)?
+            }
+            None => crate::account_authority::configured_cam_authority_socket(),
+        };
         #[cfg(test)]
         {
             if let Some(result) = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
@@ -6198,7 +6202,7 @@ pub(super) fn account_observation_for_launch_runtime(
                 return result;
             }
         }
-        if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+        if let Some(socket_path) = socket_path {
             let observed = crate::account_authority::observe_selected_authority_via_socket(
                 &socket_path,
                 provider_id,
@@ -6210,18 +6214,25 @@ pub(super) fn account_observation_for_launch_runtime(
                         provider_id,
                         Some(observed.authority_id.clone()),
                         Some(&observed.observation.binding),
+                        Some(&socket_path),
                     );
                     Some(observed.observation)
                 }
                 None => {
-                    record_observed_managed_selection(run_id, provider_id, None, None);
+                    record_observed_managed_selection(
+                        run_id,
+                        provider_id,
+                        None,
+                        None,
+                        Some(&socket_path),
+                    );
                     None
                 }
             });
         }
         let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
             if provider_id == crate::account_authority::CODEX_CLI_PROVIDER_ID {
-                record_observed_managed_selection(run_id, provider_id, None, None);
+                record_observed_managed_selection(run_id, provider_id, None, None, None);
             }
             return Ok(None);
         };
@@ -6252,6 +6263,7 @@ fn freeze_observed_managed_selection_from_registry(
         provider_id,
         observation.map(|_| authority_id_for(registry.metadata_path())),
         observation.map(|observation| &observation.binding),
+        None,
     );
 }
 
@@ -6269,13 +6281,14 @@ fn freeze_selected_codex_launch_binding(run_id: Option<&str>) -> Result<()> {
         .with(|cell| {
             cell.borrow().as_ref().map(|harness| {
                 let binding = harness.registry.selected_binding(PROVIDER)?;
-                crate::account_authority::record_observed_codex_selection(
+                crate::account_authority::record_observed_codex_selection_from_source(
                     Some(run_id),
                     PROVIDER,
                     binding
                         .as_ref()
                         .map(|_| authority_id_for(harness.registry.metadata_path())),
                     binding.as_ref(),
+                    None,
                 );
                 Ok::<(), coding_agent_manager_lib::error::Error>(())
             })
@@ -6292,34 +6305,46 @@ fn freeze_selected_codex_launch_binding(run_id: Option<&str>) -> Result<()> {
         )?;
         match live {
             Some((authority, binding)) => {
-                crate::account_authority::record_observed_codex_selection(
+                crate::account_authority::record_observed_codex_selection_from_source(
                     Some(run_id),
                     PROVIDER,
                     Some(authority),
                     Some(&binding),
+                    Some(&socket_path),
                 )
             }
-            None => crate::account_authority::record_observed_codex_selection(
+            None => crate::account_authority::record_observed_codex_selection_from_source(
                 Some(run_id),
                 PROVIDER,
                 None,
                 None,
+                Some(&socket_path),
             ),
         }
         return Ok(());
     }
-    let data_dir = project_dirs().context("Coding Agent Manager data directory is unavailable")?;
+    let Some(data_dir) = project_dirs() else {
+        crate::account_authority::record_observed_codex_selection_from_source(
+            Some(run_id),
+            PROVIDER,
+            None,
+            None,
+            None,
+        );
+        return Ok(());
+    };
     let registry = StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()));
     let binding = registry
         .selected_binding(PROVIDER)
         .context("failed to read selected Coding Agent Manager Codex account")?;
-    crate::account_authority::record_observed_codex_selection(
+    crate::account_authority::record_observed_codex_selection_from_source(
         Some(run_id),
         PROVIDER,
         binding
             .as_ref()
             .map(|_| authority_id_for(registry.metadata_path())),
         binding.as_ref(),
+        None,
     );
     Ok(())
 }
@@ -6327,24 +6352,27 @@ fn freeze_selected_codex_launch_binding(run_id: Option<&str>) -> Result<()> {
 #[cfg(target_os = "linux")]
 fn freeze_selected_claude_launch_binding(run_id: Option<&str>) -> Result<()> {
     const PROVIDER: &str = crate::account_authority::CLAUDE_CODE_PROVIDER_ID;
-    if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+    let socket_path = match run_id {
+        Some(run_id) => crate::account_authority::cam_socket_for_run_selection(run_id, PROVIDER)?,
+        None => crate::account_authority::configured_cam_authority_socket(),
+    };
+    if let Some(socket_path) = socket_path {
         let selected = crate::account_authority::selected_binding_via_authority_socket(
             &socket_path,
             PROVIDER,
         )?;
         match selected {
             Some((authority_id, binding)) => {
-                crate::account_authority::record_observed_claude_selection(
+                record_observed_managed_selection(
                     run_id,
                     PROVIDER,
                     Some(authority_id),
                     Some(&binding),
+                    Some(&socket_path),
                 );
             }
             None => {
-                crate::account_authority::record_observed_claude_selection(
-                    run_id, PROVIDER, None, None,
-                );
+                record_observed_managed_selection(run_id, PROVIDER, None, None, Some(&socket_path));
             }
         }
         return Ok(());
@@ -6356,13 +6384,14 @@ fn freeze_selected_claude_launch_binding(run_id: Option<&str>) -> Result<()> {
     let binding = registry
         .selected_binding(PROVIDER)
         .context("failed to read selected Coding Agent Manager Claude account")?;
-    crate::account_authority::record_observed_claude_selection(
+    record_observed_managed_selection(
         run_id,
         PROVIDER,
         binding
             .as_ref()
             .map(|_| authority_id_for(registry.metadata_path())),
         binding.as_ref(),
+        None,
     );
     Ok(())
 }
@@ -6373,13 +6402,15 @@ fn record_observed_managed_selection(
     provider_id: &str,
     authority_id: Option<String>,
     binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&Path>,
 ) {
     if provider_id == crate::account_authority::CODEX_CLI_PROVIDER_ID {
-        crate::account_authority::record_observed_codex_selection(
+        crate::account_authority::record_observed_codex_selection_from_source(
             run_id,
             provider_id,
             authority_id,
             binding,
+            authority_socket,
         );
     } else if provider_id == crate::account_authority::GROK_CLI_PROVIDER_ID {
         crate::account_authority::record_observed_grok_selection(
@@ -6387,6 +6418,7 @@ fn record_observed_managed_selection(
             provider_id,
             authority_id,
             binding,
+            authority_socket,
         );
     } else if provider_id == crate::account_authority::CLAUDE_CODE_PROVIDER_ID {
         crate::account_authority::record_observed_claude_selection(
@@ -6394,6 +6426,7 @@ fn record_observed_managed_selection(
             provider_id,
             authority_id,
             binding,
+            authority_socket,
         );
     } else if provider_id == crate::account_authority::GEMINI_CLI_PROVIDER_ID {
         crate::account_authority::record_observed_gemini_selection(
@@ -6401,13 +6434,15 @@ fn record_observed_managed_selection(
             provider_id,
             authority_id,
             binding,
+            authority_socket,
         );
     } else if provider_id == crate::account_authority::CURSOR_PROVIDER_ID {
-        crate::account_authority::record_observed_cursor_selection(
+        crate::account_authority::record_observed_cursor_selection_from_source(
             run_id,
             provider_id,
             authority_id,
             binding,
+            authority_socket,
         );
     }
 }
@@ -6504,10 +6539,15 @@ fn freeze_selected_secondary_managed_launch_bindings(
                 coding_agent_manager_lib::account_authority::SelectedAccountBinding,
             )>,
         > = None;
+        let authority_socket = if test_binding.is_some() {
+            None
+        } else {
+            crate::account_authority::cam_socket_for_run_selection(run_id, provider)?
+        };
         let selected = if let Some(selected) = test_binding {
             selected
-        } else if let Some(socket) = crate::account_authority::configured_cam_authority_socket() {
-            crate::account_authority::selected_binding_via_authority_socket(&socket, provider)?
+        } else if let Some(socket) = authority_socket.as_ref() {
+            crate::account_authority::selected_binding_via_authority_socket(socket, provider)?
         } else {
             let dirs =
                 project_dirs().context("Coding Agent Manager data directory is unavailable")?;
@@ -6518,13 +6558,25 @@ fn freeze_selected_secondary_managed_launch_bindings(
                 .map(|binding| (authority_id_for(registry.metadata_path()), binding))
         };
         let Some((authority, binding)) = selected else {
-            record_observed_managed_selection(Some(run_id), provider, None, None);
+            record_observed_managed_selection(
+                Some(run_id),
+                provider,
+                None,
+                None,
+                authority_socket.as_deref(),
+            );
             bail!("no complete selected Coding Agent Manager account for secondary runtime '{provider}'");
         };
         if binding.provider_id != provider {
             bail!("selected secondary Coding Agent Manager binding has a different provider");
         }
-        record_observed_managed_selection(Some(run_id), provider, Some(authority), Some(&binding));
+        record_observed_managed_selection(
+            Some(run_id),
+            provider,
+            Some(authority),
+            Some(&binding),
+            authority_socket.as_deref(),
+        );
     }
     Ok(())
 }
@@ -10016,16 +10068,118 @@ mod selection_policy_tests {
         }
 
         #[test]
-        fn codex_scheduler_missing_secondary_selection_freezes_explicit_refusal() -> Result<()> {
+        fn codex_scheduler_missing_local_selection_freezes_local_auth() -> Result<()> {
             use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
             let _guard = activate_stub(false, SchedulerObserveStubMode::ObservedModels);
             let run = "synthetic-codex-secondary-missing";
             freeze_selected_codex_launch_binding(Some(run))?;
             assert_eq!(
                 codex_run_account_binding(run),
-                Some(CodexRunAccountBinding::Missing)
+                Some(CodexRunAccountBinding::LocalAuth)
             );
             assert!(codex_run_account_binding("synthetic-never-initialized-codex").is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn absent_implicit_cam_scheduler_observation_uses_local_registry() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let runtime = tempfile::tempdir()?;
+            let _socket = CamAuthoritySocketTestGuard::install_default(
+                runtime.path().join("maco/account-authority.sock"),
+            );
+            assert!(crate::account_authority::configured_cam_authority_socket().is_none());
+            let _selected = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let run = "r9-scheduler-local-selected";
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .context("local registry selection")?;
+            let Some(CodexRunAccountBinding::Selected(frozen)) = codex_run_account_binding(run)
+            else {
+                panic!("local selection was not frozen");
+            };
+            assert_eq!(frozen.to_selected_binding(), observation.binding);
+            assert!(frozen.authority_socket.is_none());
+            let _empty = activate_stub(false, SchedulerObserveStubMode::ObservedModels);
+            let run = "r9-scheduler-local-empty";
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .is_none()
+            );
+            freeze_selected_codex_launch_binding(Some(run))?;
+            assert_eq!(
+                codex_run_account_binding(run),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn configured_cam_scheduler_observation_refuses_missing_or_unsafe_endpoint() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let runtime = tempfile::tempdir()?;
+            let socket = runtime.path().join("maco/account-authority.sock");
+            {
+                let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+                assert!(
+                    account_observation_for_launch_runtime(SupervisorRuntime::Codex, None).is_err()
+                );
+                assert!(
+                    freeze_selected_codex_launch_binding(Some("r9-explicit-missing-freeze"))
+                        .is_err()
+                );
+            }
+            fs::create_dir(socket.parent().unwrap())?;
+            std::os::unix::fs::symlink("missing.sock", &socket)?;
+            let _default = CamAuthoritySocketTestGuard::install_default(socket);
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, None).is_err()
+            );
+            assert!(
+                freeze_selected_codex_launch_binding(Some("r9-implicit-unsafe-freeze")).is_err()
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn socket_source_cannot_be_overwritten_by_local_reobservation() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let root = tempfile::tempdir()?;
+            let socket = root.path().join("maco/account-authority.sock");
+            let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            for runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::GeminiCli,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::Cursor,
+            ] {
+                let provider = cam_provider_id_for_supervisor_runtime(runtime).unwrap();
+                let run = format!("r9-socket-reobserve-{provider}");
+                let binding = coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+                    provider_id: provider.into(),
+                    account_id: "synthetic".into(),
+                    account_incarnation: "synthetic-incarnation".into(),
+                    selection_revision: 1,
+                };
+                record_observed_managed_selection(
+                    Some(&run),
+                    provider,
+                    Some("synthetic-authority".into()),
+                    Some(&binding),
+                    Some(&socket),
+                );
+                let error =
+                    account_observation_for_launch_runtime(runtime, Some(&run)).unwrap_err();
+                assert!(format!("{error:#}").contains("refusing local fallback"));
+                assert!(
+                    crate::account_authority::cam_socket_for_run_selection(&run, provider).is_err()
+                );
+            }
             Ok(())
         }
 

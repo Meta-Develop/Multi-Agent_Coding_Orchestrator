@@ -8273,6 +8273,7 @@ fn selected_writable_claude_command(temp: &Path) -> Result<ExternalAgentCommand>
     .with_writable_runtime_selection("claude-worker", RuntimeId::ClaudeCode, true)
     .map(|command| {
         command.with_claude_run_account_binding(Some(FrozenClaudeSelectedBinding {
+            authority_socket: None,
             authority_id: Some("test-claude-authority".to_string()),
             provider_id: crate::account_authority::CLAUDE_CODE_PROVIDER_ID.to_string(),
             account_id: "test-claude-account".to_string(),

@@ -119,7 +119,9 @@ impl GrokLaunchAuthority {
 pub(crate) fn acquire_grok_launch_authority(
     carried: Option<&FrozenGrokSelectedBinding>,
 ) -> Result<GrokLaunchAuthority> {
-    let socket_path = configured_cam_authority_socket();
+    let socket_path = super::cam_socket_for_frozen_selection(
+        carried.and_then(|frozen| frozen.authority_socket.as_deref()),
+    )?;
     let frozen = require_carried_grok_launch_binding(carried, socket_path.is_some())?;
     if let Some(socket_path) = socket_path.as_ref() {
         let frozen = frozen.ok_or_else(|| {
@@ -138,9 +140,9 @@ pub(crate) fn acquire_grok_launch_authority(
 
 /// Acquire a selected CAM account for optional live catalog discovery.
 /// An absent selection is optional only to the caller; drift and registry errors fail closed.
-#[cfg(not(test))]
 pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLaunchAuthority>> {
-    if let Some(socket_path) = configured_cam_authority_socket() {
+    let socket_path = configured_cam_authority_socket();
+    if let Some(socket_path) = socket_path {
         let selected =
             super::selected_binding_via_authority_socket(&socket_path, GROK_CLI_PROVIDER_ID)
                 .context(
@@ -149,10 +151,21 @@ pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLau
         let Some((authority_id, binding)) = selected else {
             return Ok(None);
         };
-        let frozen = FrozenGrokSelectedBinding::from_selected_binding(Some(authority_id), &binding);
+        let mut frozen =
+            FrozenGrokSelectedBinding::from_selected_binding(Some(authority_id), &binding);
+        frozen.authority_socket = Some(socket_path);
         return acquire_grok_launch_authority(Some(&frozen)).map(Some);
     }
-    let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
+    let data_dir = project_dirs().map(|dirs| dirs.data_dir().to_path_buf());
+    #[cfg(test)]
+    let data_dir = CAM_GROK_TEST_OVERRIDE
+        .with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .map(|harness| harness.data_dir.clone())
+        })
+        .or(data_dir);
+    let Some(data_dir) = data_dir else {
         return Ok(None);
     };
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
@@ -346,7 +359,9 @@ fn map_binding_drift(
 fn map_cam_error(error: CamError) -> anyhow::Error {
     match error {
         CamError::NoSelectedAccount(provider) => {
-            anyhow!("no complete account is selected for Coding Agent Manager provider `{provider}`")
+            anyhow!(
+                "no complete account is selected for Coding Agent Manager provider `{provider}`"
+            )
         }
         CamError::StaleSelection { provider } => {
             anyhow!("Coding Agent Manager selection for `{provider}` is stale")
@@ -547,6 +562,210 @@ mod tests {
                 .join("grok-cli")
                 .join(account_id)
         }
+
+        fn activate(self) -> CamGrokTestGuard {
+            activate_cam_grok_test_harness(CamGrokTestHarness {
+                _root: self._root,
+                registry: self.registry,
+                adapter: self.adapter,
+                user_home: self.user_home,
+                data_dir: self.data_dir,
+            })
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn catalog_socket_fixture(parent_exists: bool) -> (tempfile::TempDir, PathBuf) {
+        let root = tempfile::tempdir().expect("socket runtime");
+        let socket = fs::canonicalize(root.path())
+            .expect("canonical runtime")
+            .join("maco/account-authority.sock");
+        if parent_exists {
+            fsx::create_dir_all_private(socket.parent().expect("maco parent"))
+                .expect("private maco parent");
+        }
+        (root, socket)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_absent_default_returns_none_without_local_selection() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let _registry = Fixture::new().activate();
+        {
+            let (_runtime, socket) = catalog_socket_fixture(false);
+            let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+            assert!(acquire_optional_grok_catalog_authority()?.is_none());
+        }
+        // The runtime-directory resolver accepts absolute paths with `..`.
+        let (runtime, _) = catalog_socket_fixture(false);
+        fsx::create_dir_all_private(&runtime.path().join("alias"))?;
+        let _socket = CamAuthoritySocketTestGuard::install_default(
+            runtime.path().join("alias/../maco/account-authority.sock"),
+        );
+        assert!(acquire_optional_grok_catalog_authority()?.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_absent_default_uses_selected_local_registry() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let (harness, managed_home, _) = build_cam_grok_test_harness("account-a")?;
+        let _registry = activate_cam_grok_test_harness(harness);
+        let (_runtime, socket) = catalog_socket_fixture(false);
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        let authority = acquire_optional_grok_catalog_authority()?.context("local selection")?;
+        assert_eq!(authority.binding().account_id, "account-a");
+        assert_eq!(authority.managed_grok_home(), managed_home);
+        assert!(!authority.socket_bound);
+        assert!(authority.selection_evidence().authority_id.is_some());
+        authority.verify_binding_unchanged()?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_existing_default_parent_requires_socket() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let _registry = Fixture::new().activate();
+        let (_runtime, socket) = catalog_socket_fixture(true);
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        assert!(acquire_optional_grok_catalog_authority().is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_explicit_absent_socket_fails_closed() -> Result<()> {
+        let _registry = Fixture::new().activate();
+        for parent_exists in [false, true] {
+            let (_runtime, socket) = catalog_socket_fixture(parent_exists);
+            let _socket = SocketEnvGuard::set(&socket);
+            let error = acquire_optional_grok_catalog_authority()
+                .err()
+                .context("explicit missing socket must fail closed")?;
+            assert!(format!("{error:#}").contains("catalog discovery"));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_default_symlink_fails_closed_even_with_missing_target() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use std::os::unix::fs::symlink;
+
+        let _registry = Fixture::new().activate();
+        for target_exists in [false, true] {
+            let (_runtime, socket) = catalog_socket_fixture(false);
+            let runtime = socket.parent().unwrap().parent().unwrap();
+            let target = runtime.join("target");
+            if target_exists {
+                fsx::create_dir_all_private(&target)?;
+            }
+            symlink(&target, socket.parent().unwrap())?;
+            let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+            let error = acquire_optional_grok_catalog_authority()
+                .err()
+                .context("symlinked default ancestor must fail closed")?;
+            assert!(format!("{error:#}").contains("symlink"));
+        }
+        let (_runtime, socket) = catalog_socket_fixture(true);
+        symlink("missing.sock", &socket)?;
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        let error = acquire_optional_grok_catalog_authority()
+            .err()
+            .context("dangling default socket symlink must fail closed")?;
+        assert!(format!("{error:#}").contains("symlink"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_default_unsafe_ancestor_fails_closed_with_missing_socket() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use std::os::unix::fs::PermissionsExt;
+
+        let _registry = Fixture::new().activate();
+        let (_runtime, socket) = catalog_socket_fixture(true);
+        fs::set_permissions(socket.parent().unwrap(), fs::Permissions::from_mode(0o770))?;
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        let error = acquire_optional_grok_catalog_authority()
+            .err()
+            .context("unsafe default ancestor must fail closed")?;
+        assert!(format!("{error:#}").contains("writable"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_existing_default_connection_error_fails_closed() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use std::os::unix::net::UnixListener;
+
+        let _registry = Fixture::new().activate();
+        let (_runtime, socket) = catalog_socket_fixture(true);
+        drop(UnixListener::bind(&socket)?);
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        let error = acquire_optional_grok_catalog_authority()
+            .err()
+            .context("existing default connection failure must fail closed")?;
+        assert!(format!("{error:#}").contains("failed to connect"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn optional_catalog_absent_default_does_not_hide_local_registry_error() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let fixture = Fixture::new();
+        fs::write(fixture.registry.metadata_path(), b"invalid registry")?;
+        let _registry = fixture.activate();
+        let (_runtime, socket) = catalog_socket_fixture(false);
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket);
+        let error = acquire_optional_grok_catalog_authority()
+            .err()
+            .context("local registry errors must fail closed")?;
+        assert!(
+            format!("{error:#}").contains("failed to inspect Coding Agent Manager Grok selection")
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_launch_absent_default_respects_frozen_source() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+        let mut frozen = frozen_from_registry(&harness.registry, true);
+        let _registry = activate_cam_grok_test_harness(harness);
+        for parent_exists in [false, true] {
+            let (_runtime, socket) = catalog_socket_fixture(parent_exists);
+            let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            frozen.authority_socket = None;
+            if !parent_exists {
+                let authority = acquire_grok_launch_authority(Some(&frozen))?;
+                assert!(!authority.socket_bound);
+                authority.verify_binding_unchanged()?;
+                drop(authority);
+                assert!(acquire_grok_launch_authority(None).is_ok());
+            }
+            frozen.authority_socket = Some(socket);
+            let error = acquire_grok_launch_authority(Some(&frozen))
+                .err()
+                .context("a socket-observed selection must still require the socket")?;
+            let error = format!("{error:#}");
+            assert!(
+                error.contains("failed to revalidate") || error.contains("refusing local fallback")
+            );
+        }
+        Ok(())
     }
 
     #[test]

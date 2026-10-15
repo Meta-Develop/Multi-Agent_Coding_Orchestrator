@@ -5992,10 +5992,12 @@ impl ValidatedCodexAuth {
                     Err(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable.into())
                 }
             }
-            None if crate::account_authority::configured_cam_authority_socket().is_some() => {
+            None | Some(CodexRunAccountBinding::LocalAuth)
+                if crate::account_authority::configured_cam_authority_socket().is_some() =>
+            {
                 Err(CodexAuthValidationFailureCause::ManagedSelectionNotCarried.into())
             }
-            None => Self::load(),
+            None | Some(CodexRunAccountBinding::LocalAuth) => Self::load(),
         }
     }
 
@@ -7378,6 +7380,45 @@ mod selected_codex_auth_tests {
             Duration::from_secs(1),
         )
         .with_agent_lifecycle("/workspace", "worker", run_id, "worker")
+    }
+
+    #[test]
+    fn absent_implicit_cam_allows_codex_legacy_auth_admission() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("maco/account-authority.sock");
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+        // A missing synthetic home proves the legacy loader is reached without
+        // inspecting the operator's home or any real credential file.
+        let previous = set_injected_codex_auth_home_for_test(Some(root.path().join("legacy")));
+        struct RestoreHome(Option<PathBuf>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                set_injected_codex_auth_home_for_test(self.0.take());
+            }
+        }
+        let _home = RestoreHome(previous);
+        assert!(ValidatedCodexAuth::load_for_command(&command("r9-legacy-unobserved"))?.is_none());
+        record_observed_codex_selection_from_source(
+            Some("r9-legacy-admitted"), CODEX_CLI_PROVIDER_ID, None, None, None,
+        );
+        let admitted = command("r9-legacy-admitted");
+        assert_eq!(admitted.codex_run_account_binding, Some(CodexRunAccountBinding::LocalAuth));
+        assert!(ValidatedCodexAuth::load_for_command(&admitted)?.is_none());
+        set_injected_codex_auth_home_for_test(Some(PathBuf::from("synthetic-relative-home")));
+        let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::HomeNotAbsolute));
+        {
+            let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+            let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+            assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+        }
+        fs::create_dir(socket.parent().unwrap())?;
+        fs::write(&socket, b"not a Unix socket")?;
+        let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+        Ok(())
     }
 
     #[test]

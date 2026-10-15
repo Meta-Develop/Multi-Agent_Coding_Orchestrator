@@ -117,7 +117,9 @@ impl CursorLaunchAuthority {
 pub(crate) fn acquire_cursor_launch_authority(
     carried: Option<&FrozenCursorSelectedBinding>,
 ) -> Result<CursorLaunchAuthority> {
-    let socket = configured_cam_authority_socket();
+    let socket = super::cam_socket_for_frozen_selection(
+        carried.and_then(|frozen| frozen.authority_socket.as_deref()),
+    )?;
     if socket.is_some() && carried.is_none() {
         return Err(anyhow!(
             "no frozen Cursor selection binding from Coding Agent Manager authority observation"

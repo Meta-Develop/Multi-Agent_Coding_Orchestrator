@@ -206,6 +206,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         crate::account_authority::admit_grok_run_account_binding(
             run_id.as_str(),
             Some(crate::account_authority::FrozenGrokSelectedBinding {
+                authority_socket: None,
                 authority_id: Some("nested-grok-authority".into()),
                 provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.into(),
                 account_id: "nested-grok-account".into(),

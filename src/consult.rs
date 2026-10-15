@@ -630,10 +630,10 @@ fn freeze_gemini_consult_selection() -> Result<crate::account_authority::FrozenG
         let (authority, binding) =
             selected_binding_via_authority_socket(&socket, GEMINI_CLI_PROVIDER_ID)?
                 .context("no complete Gemini account is selected via the configured authority")?;
-        return Ok(FrozenGeminiSelectedBinding::from_selected_binding(
-            Some(authority),
-            &binding,
-        ));
+        let mut frozen =
+            FrozenGeminiSelectedBinding::from_selected_binding(Some(authority), &binding);
+        frozen.authority_socket = Some(socket);
+        return Ok(frozen);
     }
     use coding_agent_manager_lib::{
         account_authority::{authority_id_for, StoredAccountRegistry},
@@ -1524,6 +1524,7 @@ mod tests {
                 bail!("fixture budget refused")
             };
             command = command.with_gemini_run_account_binding(Some(FrozenGeminiSelectedBinding {
+                authority_socket: None,
                 authority_id: Some("synthetic-offline-authority".into()),
                 provider_id: "gemini-cli".into(),
                 account_id: "synthetic-account".into(),

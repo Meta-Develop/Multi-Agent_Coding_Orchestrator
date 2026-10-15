@@ -942,6 +942,7 @@ fn assignment_messaging_ipc_acceptance(
             let evidence = expected_verified_cam_binding
                 .context("verified IPC fixture requires its selected CAM account")?;
             crate::account_authority::FrozenGrokSelectedBinding {
+                authority_socket: None,
                 authority_id: evidence.authority_id.clone(),
                 provider_id: evidence.provider_id.clone(),
                 account_id: evidence.account_id.clone(),
@@ -950,6 +951,7 @@ fn assignment_messaging_ipc_acceptance(
             }
         }
         MessagingIpcLaunchKind::Simulated => crate::account_authority::FrozenGrokSelectedBinding {
+            authority_socket: None,
             authority_id: None,
             provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.to_string(),
             account_id: "simulated-messaging-account".to_string(),

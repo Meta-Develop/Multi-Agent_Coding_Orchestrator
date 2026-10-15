@@ -38,19 +38,20 @@ That Linux host also needs:
 - an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
 - root-owned, non-writable, executable `systemd-run`, `systemctl`, `sh`, `env`, `sleep`, `stat`, and `findmnt` at `/usr/bin`, `/bin`, or `/run/current-system/sw/bin`
 - logical `codex` at `/usr/bin/codex`, `/bin/codex`, or `/run/current-system/sw/bin/codex` (root-owned, executable, not group- or world-writable, not a symlink). Catalog preflight runs `codex debug models` with a 30-second limit
-- `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset, as a non-symlink regular file
-- `MACO_CAM_AUTHORITY_SOCKET` left unset
+- `MACO_CAM_AUTHORITY_SOCKET` left unset for default CAM discovery
+
+Without a CAM authority service (both the implicit socket and its `maco` parent absent), MACO uses the local CAM registry selection if one exists; otherwise Codex uses `$CODEX_HOME/auth.json` or `~/.codex/auth.json` (a non-symlink regular file). An installed CAM authority service at `/run/user/<uid>/maco/account-authority.sock` is used and must be healthy; see [packaging](docs/PACKAGING.md).
 
 Reviewed `machine-global.json` (version 1). The root named by `--machine-global-runtime-root-id` is an existing canonical directory inside `/run/user/<uid>`. `state_root` is a different owner-private `0700` directory and does not overlap that root. The config file is current-user-owned, has one hard link, and is not group- or world-writable.
 
 ```json
 {
   "version": 1,
-  "state_root": "/run/user/1000/maco/state",
+  "state_root": "/run/user/1000/maco-task/state",
   "roots": [
     {
       "id": "runtime",
-      "path": "/run/user/1000/maco/runtime",
+      "path": "/run/user/1000/maco-task/runtime",
       "protected_paths": [],
       "quarantine_grace_seconds": 86400
     }

@@ -1179,6 +1179,7 @@ mod tests {
         };
         if case == "grok-proof" {
             let grok_binding = crate::account_authority::FrozenGrokSelectedBinding {
+                authority_socket: None,
                 authority_id: Some("authority".into()),
                 provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.into(),
                 account_id: "account".into(),

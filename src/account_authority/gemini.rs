@@ -113,7 +113,9 @@ impl GeminiLaunchAuthority {
 pub(crate) fn acquire_gemini_launch_authority(
     carried: Option<&FrozenGeminiSelectedBinding>,
 ) -> Result<GeminiLaunchAuthority> {
-    let socket_path = configured_cam_authority_socket();
+    let socket_path = super::cam_socket_for_frozen_selection(
+        carried.and_then(|frozen| frozen.authority_socket.as_deref()),
+    )?;
     let frozen = require_carried_gemini_launch_binding(carried, socket_path.is_some())?;
     if let Some(socket_path) = socket_path.as_ref() {
         let frozen = frozen.context(

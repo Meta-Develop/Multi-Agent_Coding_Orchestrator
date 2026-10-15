@@ -10,7 +10,12 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::{launch_spec_for, LaunchSpec};
 
-use super::{configured_cam_authority_socket, FrozenCodexSelectedBinding, CODEX_CLI_PROVIDER_ID};
+use super::{cam_socket_for_frozen_selection, FrozenCodexSelectedBinding, CODEX_CLI_PROVIDER_ID};
+
+#[cfg(test)]
+thread_local! {
+    static CODEX_TEST_REGISTRY: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
+}
 
 pub(crate) struct CodexLaunchAuthority {
     registry: StoredAccountRegistry,
@@ -38,7 +43,7 @@ impl CodexLaunchAuthority {
     }
 
     pub(crate) fn verify_binding_unchanged(&self) -> Result<()> {
-        if configured_cam_authority_socket() != self.socket_path {
+        if cam_socket_for_frozen_selection(self.socket_path.as_deref())? != self.socket_path {
             return Err(anyhow!(
                 "selected Codex authority socket configuration changed"
             ));
@@ -64,13 +69,23 @@ impl CodexLaunchAuthority {
 pub(crate) fn acquire_codex_launch_authority(
     frozen: &FrozenCodexSelectedBinding,
 ) -> Result<CodexLaunchAuthority> {
-    let data_dir = project_dirs().context("Coding Agent Manager data directory is unavailable")?;
-    let registry = StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()));
-    let socket_path = configured_cam_authority_socket();
+    let socket_path = cam_socket_for_frozen_selection(frozen.authority_socket.as_deref())?;
     if let Some(path) = &socket_path {
         revalidate_socket(path, frozen)?;
     }
+    let registry = execution_registry()?;
     finish_codex_launch_authority(&registry, frozen, socket_path)
+}
+
+fn execution_registry() -> Result<StoredAccountRegistry> {
+    #[cfg(test)]
+    if let Some(path) = CODEX_TEST_REGISTRY.with(|slot| slot.borrow().clone()) {
+        return Ok(StoredAccountRegistry::new(path));
+    }
+    let data_dir = project_dirs().context("Coding Agent Manager data directory is unavailable")?;
+    Ok(StoredAccountRegistry::new(stored_accounts_path(
+        data_dir.data_dir(),
+    )))
 }
 
 fn adapter_for_registry(registry: &StoredAccountRegistry) -> Result<CodexCliAdapter> {
@@ -190,6 +205,7 @@ mod tests {
             .select_complete_revision(CODEX_CLI_PROVIDER_ID, "work", None)
             .unwrap();
         let frozen = FrozenCodexSelectedBinding {
+            authority_socket: None,
             authority_id: authority_id_for(registry.metadata_path()),
             provider_id: binding.provider_id,
             account_id: binding.account_id,
@@ -267,5 +283,115 @@ mod tests {
             .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
             .unwrap();
         assert!(require_registry_binding(&registry, &frozen).is_err());
+    }
+
+    #[test]
+    fn absent_implicit_default_allows_local_codex_launch_authority() {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let (root, registry, frozen) = selected_fixture();
+        let _socket = CamAuthoritySocketTestGuard::install_default(
+            root.path().join("maco/account-authority.sock"),
+        );
+        struct RestoreRegistry(Option<PathBuf>);
+        impl Drop for RestoreRegistry {
+            fn drop(&mut self) {
+                CODEX_TEST_REGISTRY.with(|slot| slot.replace(self.0.take()));
+            }
+        }
+        let _registry = RestoreRegistry(
+            CODEX_TEST_REGISTRY
+                .with(|slot| slot.replace(Some(registry.metadata_path().to_path_buf()))),
+        );
+        let authority = acquire_codex_launch_authority(&frozen).unwrap();
+        authority.verify_binding_unchanged().unwrap();
+        assert_eq!(authority.selection_evidence(), frozen);
+    }
+
+    #[test]
+    fn frozen_socket_codex_selection_refuses_disappeared_installation() {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use std::os::unix::net::UnixListener;
+
+        let (root, _registry, mut frozen) = selected_fixture();
+        let socket = root.path().join("maco/account-authority.sock");
+        std::fs::create_dir(socket.parent().unwrap()).unwrap();
+        let _listener = UnixListener::bind(&socket).unwrap();
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+        frozen.authority_socket = Some(socket.clone());
+        cam_socket_for_frozen_selection(frozen.authority_socket.as_deref()).unwrap();
+        std::fs::remove_file(&socket).unwrap();
+        // A remaining maco directory still requires the socket and refuses.
+        assert!(acquire_codex_launch_authority(&frozen).is_err());
+        std::fs::remove_dir(socket.parent().unwrap()).unwrap();
+        assert!(super::super::configured_cam_authority_socket().is_none());
+        let error = acquire_codex_launch_authority(&frozen).unwrap_err();
+        assert!(format!("{error:#}").contains("refusing local fallback"));
+    }
+
+    #[test]
+    fn observed_socket_codex_binding_carries_source_and_refuses_disappearance() {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use super::super::{
+            codex_run_account_binding, record_observed_codex_selection_from_source,
+            CodexRunAccountBinding,
+        };
+        use coding_agent_manager_lib::account_authority::{
+            listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
+        };
+        use std::os::unix::fs::PermissionsExt;
+
+        let (root, registry, _) = selected_fixture();
+        let parent = root.path().join("maco");
+        std::fs::create_dir(&parent).unwrap();
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let socket = parent.join("account-authority.sock");
+        let safe = resolve_socket_path(&socket).unwrap();
+        let context = AuthorityContext::new(registry).without_registry_fallback();
+        let listener = listen(safe, AuthorityServerConfig::new(context).unwrap()).unwrap();
+        let server = std::thread::spawn(move || listener.accept_once().unwrap());
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+        let (authority, binding) =
+            super::super::selected_binding_via_authority_socket(&socket, CODEX_CLI_PROVIDER_ID)
+                .unwrap()
+                .unwrap();
+        server.join().unwrap();
+        record_observed_codex_selection_from_source(
+            Some("r9-codex-observed-socket"),
+            CODEX_CLI_PROVIDER_ID,
+            Some(authority),
+            Some(&binding),
+            Some(&socket),
+        );
+        let Some(CodexRunAccountBinding::Selected(frozen)) =
+            codex_run_account_binding("r9-codex-observed-socket")
+        else {
+            panic!("missing socket observation");
+        };
+        assert_eq!(frozen.authority_socket.as_deref(), Some(socket.as_path()));
+        // The listener cleans up its socket on drop. Remove the installation too.
+        if socket.symlink_metadata().is_ok() {
+            std::fs::remove_file(&socket).unwrap();
+        }
+        std::fs::remove_dir(parent).unwrap();
+        assert!(super::super::configured_cam_authority_socket().is_none());
+        let error = acquire_codex_launch_authority(&frozen).unwrap_err();
+        assert!(format!("{error:#}").contains("refusing local fallback"));
+    }
+
+    #[test]
+    fn local_codex_selection_refuses_explicit_missing_or_installed_unsafe_default() {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let (root, _registry, frozen) = selected_fixture();
+        let socket = root.path().join("maco/account-authority.sock");
+        {
+            let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+            assert!(acquire_codex_launch_authority(&frozen).is_err());
+        }
+        std::fs::create_dir(socket.parent().unwrap()).unwrap();
+        std::fs::write(&socket, b"not a Unix socket").unwrap();
+        let _default = CamAuthoritySocketTestGuard::install_default(socket);
+        assert!(acquire_codex_launch_authority(&frozen).is_err());
     }
 }
