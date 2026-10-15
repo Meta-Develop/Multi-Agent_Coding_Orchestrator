@@ -3,10 +3,16 @@ use crate::external_agent::EnvironmentFailureCategory;
 use crate::mutation_taxonomy::{CatalogPreflightOrigin, SupervisorCatalogCodexPreflightGrant};
 
 fn catalog_options(runtime: SupervisorRuntime, codex_bin: &str) -> SupervisorRunOptions {
+    // Parallel catalog tests share this helper, so each call takes its own run id.
+    let run_id = RunId::new(format!(
+        "catalog-preflight-admission-{}",
+        crate::artifacts::state_auth::random_identifier().expect("unique catalog preflight run id")
+    ))
+    .expect("valid run id");
     SupervisorRunOptions {
         repo: PathBuf::from("."),
         plan_file: PathBuf::from("plan.json"),
-        run_id: RunId::new("catalog-preflight-admission").expect("valid run id"),
+        run_id,
         parent_node: None,
         codex_bin: PathBuf::from(codex_bin),
         runtime,

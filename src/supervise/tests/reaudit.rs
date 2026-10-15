@@ -332,7 +332,15 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
     } else {
         injected_assignment(true)
     };
-    let source_id = RunId::new("reaudit-source-evidence").expect("valid source run id");
+    // Each variant binds its own process-wide run id. The two tests run together.
+    let variant = if generated_direct {
+        "generated-direct"
+    } else {
+        "injected"
+    };
+    let source_id =
+        RunId::new(format!("reaudit-source-evidence-{variant}")).expect("valid source run id");
+    let destination_run_id = format!("reaudit-accepts-preserved-{variant}");
     let (source, assignment, preserved_worktree) = run_evidence_rejected_source_with_assignment(
         &temp,
         &repo,
@@ -389,7 +397,7 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         .expect("evidence-only operation");
     assert_eq!(operation.preserved_candidate_binding, source_binding);
     assert_eq!(loaded.plan.assignments[0].role, assignment.role);
-    let options = injected_options(&repo, temp.path(), "reaudit-accepts-preserved");
+    let options = injected_options(&repo, temp.path(), &destination_run_id);
     let mut evidence_dispatches = 0usize;
     let mut auditor_dispatches = 0usize;
     let mut evidence_pre_action_review = false;
@@ -527,7 +535,7 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         "terminal-worker evidence must be preserved rather than regenerated"
     );
     let destination_id =
-        RunId::new("reaudit-accepts-preserved").expect("valid evidence-only destination run id");
+        RunId::new(&destination_run_id).expect("valid evidence-only destination run id");
     let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &destination_id)
         .expect("open authenticated re-audit artifacts");
     let plan_snapshot: Value = serde_json::from_slice(
