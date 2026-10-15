@@ -818,8 +818,6 @@ fn supervise_plan_from_goal_emits_scoped_coverage_gaps_and_run_refuses_unassesse
         path_str(&repo_path)?,
         "--run-id",
         "gap-goal-intake",
-        "--runtime",
-        "fake",
         "--json",
     ])?;
     assert!(

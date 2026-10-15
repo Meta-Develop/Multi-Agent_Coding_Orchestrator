@@ -51,6 +51,8 @@ const GROK_CATALOG_MAX_MODELS: usize = 512;
 const GROK_MODEL_SLUG_MAX_BYTES: usize = 256;
 const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
+pub(crate) const GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED: &str =
+    "Grok runtime model catalog requires owner authentication";
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
 const GROK_AUTH_FILE: &str = "auth.json";
@@ -1676,6 +1678,9 @@ fn parse_grok_model_line(line: &str) -> Result<(&str, bool)> {
 }
 
 fn validate_grok_login_line(line: &str) -> Result<()> {
+    if line == "You are not authenticated." {
+        bail!(GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
+    }
     let provider = line
         .strip_prefix("You are logged in with ")
         .and_then(|rest| rest.strip_suffix('.'))
@@ -2904,6 +2909,26 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{label}: {error}");
         }
+    }
+
+    #[test]
+    fn unauthenticated_public_models_catalog_fails_closed_before_advertising() {
+        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+        assert_eq!(
+            sha256_hex(UNAUTHENTICATED_PUBLIC_PAYLOAD),
+            "028d0f4e90faa109b2a8c061728829287302687df51a521b8d0226ef7856cf34"
+        );
+        let error = parse_grok_model_catalog(UNAUTHENTICATED_PUBLIC_PAYLOAD)
+            .expect_err("unauthenticated public models listing must fail closed")
+            .to_string();
+        assert_eq!(error, GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
+        assert!(
+            !error.contains("grok-4.7")
+                && !error.contains("grok-4.6")
+                && !error.contains("grok-4.5")
+                && !error.contains("grok-4.7-build-fast"),
+            "{error}"
+        );
     }
 
     #[test]

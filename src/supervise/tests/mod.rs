@@ -1868,6 +1868,20 @@ fn assert_parseable_partial_usage_is_conservative(
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, Some(1.0), 50, 50);
     let options = injected_options(&repo_path, temp.path(), run_id);
     let mut invocations = 0usize;
@@ -1895,12 +1909,14 @@ fn assert_parseable_partial_usage_is_conservative(
         }
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize partial-usage run");

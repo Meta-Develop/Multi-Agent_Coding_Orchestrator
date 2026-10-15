@@ -43,7 +43,7 @@ use crate::{
     messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN},
     process_runner::{
         run_process, ContainmentPolicy, EnvironmentMode, ProcessCancellation, ProcessSpec,
-        StdinMode, StreamCapture, WorkspaceAccess,
+        StdinMode, StreamCapture,
     },
     worktree::WorktreeRecord,
 };
@@ -562,12 +562,10 @@ struct MessagingGrokChildProbeFixture<'a> {
 /// Parent-owned secure-output targets must be unique per external-agent launch; re-reserving the
 /// same `incoming/report.json` fails simulation after the first phase. Writable Grok confinement
 /// proof snapshots those paths, so admission must be re-sealed on the final command each phase.
-fn rebind_grok_phase_launch_and_writable_admission(
+fn bind_grok_phase_artifact_paths(
     command: &mut ExternalAgentCommand,
     incoming: &Path,
     phase_slug: &str,
-    assignment: &OrchestratorAssignment,
-    binding: &MessagingGrokWritableAdmissionBinding,
 ) -> Result<()> {
     let phase_incoming = incoming.join(phase_slug);
     fs::create_dir_all(&phase_incoming)?;
@@ -578,7 +576,7 @@ fn rebind_grok_phase_launch_and_writable_admission(
     }
     command.json_log = phase_incoming.join("events.jsonl");
     command.output_last_message = phase_incoming.join("report.json");
-    bind_grok_fixture_writable_admission(command, assignment, binding)
+    Ok(())
 }
 
 fn grok_fixture_writable_admission(
@@ -814,13 +812,7 @@ fn run_grok_child_phase(
     probe: &MessagingGrokChildProbeFixture<'_>,
     command: &mut ExternalAgentCommand,
 ) -> Result<ExternalAgentRun> {
-    rebind_grok_phase_launch_and_writable_admission(
-        command,
-        incoming,
-        phase_slug,
-        context.assignment,
-        admission_binding,
-    )?;
+    bind_grok_phase_artifact_paths(command, incoming, phase_slug)?;
     write_messaging_fixture_manifest(
         probe.fixture_manifest,
         probe.child_probe_binary,
@@ -830,6 +822,7 @@ fn run_grok_child_phase(
         probe.disposable_peer_pid,
     )?;
     let server = bind_assignment_messaging_for_external_child_launch(context, WORKER_ID, command)?;
+    bind_grok_fixture_writable_admission(command, context.assignment, admission_binding)?;
     let report = run_external_agent_for_ipc_kind(launch_kind, command, &context.cancellation, None);
     drop(server);
     Ok(report)

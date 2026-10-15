@@ -600,6 +600,18 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
         let invocations = Arc::clone(&invocations);
         move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             invocations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -706,6 +718,18 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
         let options = injected_options(&repo_path, temp.path(), &run_id);
         let runner = move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             let assignment = assignments
                 .iter()
                 .find(|assignment| assignment.id == id)
@@ -905,6 +929,18 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
         let state = Arc::clone(&state);
         move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             let (lock, condvar) = &*state;
             let mut block = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if id == "child-c" {
@@ -3115,11 +3151,12 @@ fn supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run write-lease regression");
@@ -3155,11 +3192,12 @@ fn injected_runner_path_violation_blocks_retry_and_primary_mutations_fail_integr
         write_injected_json(&command.output_last_message, &child);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected path violation");
@@ -3202,11 +3240,12 @@ fn injected_runner_path_violation_blocks_retry_and_primary_mutations_fail_integr
             }
             injected_verified_run(command)
         };
-        let report = run_supervisor_plan_with_runner(
+        let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect("run injected primary mutation");

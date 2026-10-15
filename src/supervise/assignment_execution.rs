@@ -14122,12 +14122,21 @@ done
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
+        assert!(argv.iter().any(|argument| argument == "--no-auto-update"));
         assert!(argv
             .windows(2)
-            .any(|window| window == ["agent", "--no-leader"]));
+            .any(|window| window == ["--sandbox", "strict"]));
+        assert!(argv
+            .iter()
+            .any(|argument| argument == "--disable-web-search"));
+        assert!(argv
+            .windows(3)
+            .any(|window| { window == ["agent", "--always-approve", "--no-leader"] }));
         assert_eq!(argv.last().map(String::as_str), Some("stdio"));
         assert!(!argv.iter().any(|argument| argument == "streaming-json"));
         assert!(!argv.iter().any(|argument| argument == "--prompt-file"));
+        assert!(!argv.iter().any(|argument| argument == "--permission-mode"));
+        assert!(!argv.iter().any(|argument| argument == "dontAsk"));
         Ok(())
     }
 
@@ -15449,6 +15458,146 @@ done
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    struct OwnedCursorAdapterFixture<'a> {
+        _owner: &'a tempfile::TempDir,
+        registry: coding_agent_manager_lib::account_authority::StoredAccountRegistry,
+        options: &'a SupervisorRunOptions,
+    }
+
+    #[cfg(target_os = "linux")]
+    impl<'a> OwnedCursorAdapterFixture<'a> {
+        fn new(owner: &'a tempfile::TempDir, options: &'a SupervisorRunOptions) -> Result<Self> {
+            use coding_agent_manager_lib::{
+                account_authority::{authority_id_for, StoredAccountRegistry},
+                model::{AuthKind, StoredAccountMaterial},
+                paths::stored_accounts_path,
+            };
+
+            if !options
+                .repo
+                .canonicalize()?
+                .starts_with(owner.path().canonicalize()?)
+                || crate::account_authority::cursor_run_account_binding(options.run_id.as_str())
+                    .is_some()
+            {
+                bail!(
+                    "Cursor adapter fixture requires its owned repository and unused run identity"
+                );
+            }
+            let registry = StoredAccountRegistry::new(stored_accounts_path(
+                &owner.path().join("cursor-adapter-fixture-data"),
+            ));
+            // Nonlive metadata only: Core supplies incarnation and selection revision.
+            registry.begin_add(
+                "cursor-cli",
+                "owned-cursor-fixture",
+                "SYNTHETIC Cursor adapter account fixture",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add("cursor-cli", "owned-cursor-fixture")?;
+            registry.select_complete_revision("cursor-cli", "owned-cursor-fixture", None)?;
+            let binding = registry
+                .selected_binding("cursor-cli")?
+                .context("owned Cursor fixture selected account")?;
+            let fixture = Self {
+                _owner: owner,
+                registry,
+                options,
+            };
+            crate::account_authority::record_observed_cursor_selection(
+                Some(options.run_id.as_str()),
+                "cursor-cli",
+                Some(authority_id_for(fixture.registry.metadata_path())),
+                Some(&binding),
+            )
+            .context("freeze owned Cursor fixture selection")?;
+            Ok(fixture)
+        }
+
+        fn bind(
+            &self,
+            command: ExternalAgentCommand,
+            assignment: &OrchestratorAssignment,
+            budget_policy: &AssignmentBudgetPolicy,
+            plan: &SupervisorPlan,
+            catalog: &RuntimeModelCatalog,
+            mechanical_duty: Option<MechanicalTerminalDuty>,
+        ) -> Result<(SupervisorRuntime, ExternalAgentCommand)> {
+            use coding_agent_manager_lib::account_authority::authority_id_for;
+
+            let launch_runtime = assignment_launch_runtime(assignment, self.options, budget_policy);
+            if launch_runtime != SupervisorRuntime::Cursor
+                || assignment.role != AgentRole::Worker
+                || assignment.phase != AssignmentPhase::Execution
+                || assignment.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+                || !assignment.worker_assignments.is_empty()
+            {
+                bail!("owned Cursor adapter fixture requires a selected terminal Cursor Worker");
+            }
+            let binding = self
+                .registry
+                .selected_binding("cursor-cli")?
+                .context("owned Cursor fixture lost its selected account")?;
+            let current = crate::account_authority::record_observed_cursor_selection(
+                None,
+                "cursor-cli",
+                Some(authority_id_for(self.registry.metadata_path())),
+                Some(&binding),
+            )
+            .context("read owned Cursor fixture selection")?;
+            if crate::account_authority::cursor_run_account_binding(self.options.run_id.as_str())
+                .as_ref()
+                != Some(&current)
+            {
+                bail!("owned Cursor adapter fixture selection changed");
+            }
+            let managed_worktree = command.cwd.clone();
+            let launch_catalog =
+                runtime_model_catalog_for_launch(catalog, self.options.runtime, launch_runtime)?;
+            let bound_launch = bind_selected_runtime_launch(
+                command,
+                assignment,
+                plan,
+                self.options,
+                launch_runtime,
+                &launch_catalog,
+                mechanical_duty,
+                &ChildAttemptPurpose::Ordinary,
+            )?;
+            // Conversion has now set invocation=Cursor; attach its real run binding
+            // before the first writable workspace admission, without private fields.
+            let command = bound_launch.command.with_agent_lifecycle(
+                &self.options.repo,
+                assignment.role.as_str(),
+                self.options.run_id.as_str(),
+                &assignment.id,
+            );
+            let command = bind_selected_native_execution_workspace(
+                command,
+                assignment,
+                launch_runtime,
+                &managed_worktree,
+                true,
+            )?;
+            Ok((launch_runtime, command))
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    impl Drop for OwnedCursorAdapterFixture<'_> {
+        fn drop(&mut self) {
+            // Setup refused an occupied slot; restore only this fixture's run to None.
+            crate::account_authority::record_observed_cursor_selection(
+                Some(self.options.run_id.as_str()),
+                "cursor-cli",
+                None,
+                None,
+            );
+        }
+    }
+
     #[test]
     fn weak_mechanical_executor_cursor_adapter_accepts_typed_duty() -> Result<()> {
         let overlay = install_test_fixture_models(&[(
@@ -15486,6 +15635,31 @@ done
             "{missing:#}"
         );
 
+        #[cfg(target_os = "linux")]
+        let owner = tempfile::tempdir()?;
+        #[cfg(target_os = "linux")]
+        let mut options = launch_fixture_options(SupervisorRuntime::Codex);
+        #[cfg(target_os = "linux")]
+        {
+            options.repo = owner.path().to_path_buf();
+            options.run_id = RunId::new("weak-mechanical-cursor-owned-account")?;
+        }
+        #[cfg(target_os = "linux")]
+        let fixture = OwnedCursorAdapterFixture::new(&owner, &options)?;
+        #[cfg(target_os = "linux")]
+        let (runtime, command) = fixture.bind(
+            {
+                let mut command = launch_fixture_command();
+                command.cwd = owner.path().to_path_buf();
+                command
+            },
+            &assignment,
+            &policy,
+            &plan,
+            &catalog,
+            Some(MechanicalTerminalDuty::FormatPreselectedFiles),
+        )?;
+        #[cfg(not(target_os = "linux"))]
         let (runtime, command) = bind_selected_assignment_launch_with_duty_for_test(
             launch_fixture_command(),
             &assignment,
@@ -15558,7 +15732,23 @@ done
         );
         let plan = policy.apply(&worker_plan(MODEL));
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([MODEL])?);
+        #[cfg(target_os = "linux")]
+        let mut options = launch_fixture_options(SupervisorRuntime::Codex);
+        #[cfg(target_os = "linux")]
+        {
+            options.repo = repo.clone();
+            options.run_id = RunId::new("operator-cursor-owned-account")?;
+        }
+        #[cfg(target_os = "linux")]
+        let fixture = OwnedCursorAdapterFixture::new(&_temp, &options)?;
         let launch = || {
+            #[cfg(target_os = "linux")]
+            {
+                let mut command = launch_fixture_command();
+                command.cwd = repo.clone();
+                fixture.bind(command, &assignment, &policy, &plan, &catalog, None)
+            }
+            #[cfg(not(target_os = "linux"))]
             bind_selected_assignment_launch_for_test(
                 launch_fixture_command(),
                 &assignment,

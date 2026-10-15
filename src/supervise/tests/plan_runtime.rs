@@ -1821,14 +1821,34 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
         .as_array()
         .expect("assignments array");
     assert_eq!(assignments.len(), 1);
-    assert_eq!(assignments[0]["id"], "assignment-001");
-    assert_eq!(assignments[0]["phase"], "execution");
-    assert_eq!(assignments[0]["role"], "worker");
-    assert_eq!(
-        assignments[0]["role_category"],
-        "non_delegating_terminal_worker"
+    let assignment_id = assignments[0]["id"]
+        .as_str()
+        .expect("coordinated Execution parent id");
+    assert!(
+        assignment_id.starts_with("coordinated-execution-"),
+        "coordinated Execution identity uses coordinated-execution- prefix, got {assignment_id}"
     );
-    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    let hash_suffix = assignment_id
+        .strip_prefix("coordinated-execution-")
+        .expect("combined assignment prefix");
+    assert_eq!(hash_suffix.len(), 16);
+    assert!(
+        hash_suffix
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f')),
+        "combined identity suffix must be 16 lowercase hex, got {hash_suffix}"
+    );
+    let repeated = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("repeat plan policy/script task");
+    assert_eq!(
+        repeated["assignments"][0]["id"]
+            .as_str()
+            .expect("repeated coordinated Execution parent id"),
+        assignment_id
+    );
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "child_orchestrator");
+    assert_eq!(assignments[0]["role_category"], "delegating_coordinator");
     assert_eq!(
         assignments[0]["assigned_paths"],
         json!([
@@ -1836,13 +1856,62 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
             ".agents/skills/agent-orchestration/SKILL.md"
         ])
     );
-    let worker_task = assignments[0]["task"].as_str().expect("direct worker task");
-    assert!(worker_task.contains(".agents/skills/agent-orchestration/SKILL.md"));
-    assert!(worker_task.contains(".agents/scripts/o2-autopilot"));
-    assert!(worker_task.contains("Additional required workstream"));
+    let parent_task = assignments[0]["task"]
+        .as_str()
+        .expect("coordinated Execution parent task");
+    let original_task = fs::read_to_string(&task_file).expect("read original task");
+    assert_eq!(parent_task.trim(), original_task.trim());
+    assert!(parent_task.contains(".agents/skills/agent-orchestration/SKILL.md"));
+    assert!(parent_task.contains(".agents/scripts/o2-autopilot"));
     assert_eq!(
         assignments[0]["spec_fragment_ids"],
         json!(["fragment-001", "fragment-002"])
+    );
+    let workers = assignments[0]["worker_assignments"]
+        .as_array()
+        .expect("nested worker_assignments");
+    assert_eq!(workers.len(), 2);
+    assert_eq!(workers[0]["id"], "assignment-001");
+    assert_eq!(workers[1]["id"], "assignment-002");
+    for worker in workers {
+        assert_eq!(worker["role"], "worker");
+        assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+        assert!(worker.get("worker_assignments").is_none());
+        let worker_paths = worker["assigned_paths"].as_array().expect("worker paths");
+        assert_eq!(worker_paths.len(), 1);
+        let worker_task = worker["task"].as_str().expect("worker task");
+        let path = worker_paths[0].as_str().expect("worker path");
+        assert!(worker_task.contains(path));
+        let fragments = worker["spec_fragment_ids"]
+            .as_array()
+            .expect("worker spec_fragment_ids");
+        assert_eq!(fragments.len(), 1);
+    }
+    assert_eq!(
+        workers[0]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/SKILL.md"])
+    );
+    assert_eq!(
+        workers[1]["assigned_paths"],
+        json!([".agents/scripts/o2-autopilot"])
+    );
+    assert_eq!(workers[0]["spec_fragment_ids"], json!(["fragment-001"]));
+    assert_eq!(workers[1]["spec_fragment_ids"], json!(["fragment-002"]));
+    let worker_path_set: BTreeSet<String> = workers
+        .iter()
+        .map(|worker| {
+            worker["assigned_paths"][0]
+                .as_str()
+                .expect("worker path")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        worker_path_set,
+        BTreeSet::from([
+            ".agents/scripts/o2-autopilot".to_string(),
+            ".agents/skills/agent-orchestration/SKILL.md".to_string(),
+        ])
     );
     let scopes = assignments
         .iter()

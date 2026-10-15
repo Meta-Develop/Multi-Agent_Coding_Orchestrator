@@ -9079,7 +9079,19 @@ mod selection_policy_tests {
             prepared.requested_plan.review_lenses,
             requested_plan.review_lenses
         );
-        assert_eq!(prepared.plan.role_models.len(), 5);
+        let expected_roles = BTreeSet::from([
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+            AgentRole::ChildOrchestrator,
+        ]);
+        let actual_roles: BTreeSet<_> = prepared.plan.role_models.keys().copied().collect();
+        assert_eq!(actual_roles, expected_roles);
+        assert!(actual_roles.contains(&AgentRole::Supervisor));
+        assert!(actual_roles.contains(&AgentRole::GateClassifier));
+        assert!(actual_roles.contains(&AgentRole::Auditor));
+        assert!(actual_roles.contains(&AgentRole::ChildOrchestrator));
+        assert!(!actual_roles.contains(&AgentRole::Researcher));
         assert_ne!(prepared.plan, prepared.requested_plan);
         Ok(())
     }
@@ -9208,15 +9220,24 @@ mod selection_policy_tests {
             original_role_models[&AgentRole::Auditor].model
         );
         assert_eq!(
-            normalized_auditor.reasoning_effort.as_deref(),
-            Some("xhigh")
+            normalized_auditor.reasoning_effort,
+            original_role_models[&AgentRole::Auditor].reasoning_effort
         );
         let events = &profile
             .execution
             .as_ref()
             .context("selection failure execution metadata")?
             .selection_decisions;
-        assert_eq!(events.len(), provisional_default_role_models().len());
+        let required_roles = BTreeSet::from([
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+            AgentRole::ChildOrchestrator,
+        ]);
+        assert_eq!(events.len(), required_roles.len());
+        let event_roles: BTreeSet<_> = events.iter().map(|event| event.role).collect();
+        assert_eq!(event_roles, required_roles);
+        assert!(!event_roles.contains(&AgentRole::Researcher));
         let auditor_event = events
             .iter()
             .find(|event| event.role == AgentRole::Auditor)

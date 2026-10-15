@@ -1206,6 +1206,20 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-child-pre-runner-release";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -1215,12 +1229,14 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
         panic!("pre-runner child failure must not invoke an external runner")
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize child pre-runner failure");
@@ -1268,6 +1284,20 @@ fn budget_lifecycle_oversized_child_intent_reaches_runner_once() {
     child.task = Some("x".repeat(8 * 1024 + 1));
     let mut plan = injected_plan(child.clone(), 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let options = injected_options(&repo_path, temp.path(), "budget-oversized-child-intent");
     let mut invocations = 0usize;
@@ -1279,12 +1309,14 @@ fn budget_lifecycle_oversized_child_intent_reaches_runner_once() {
         injected_verified_nonzero_run(command, 17)
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize oversized child intent after runner execution");
@@ -1396,6 +1428,20 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, None, 50, 50);
     let run_id = "budget-child-runner-panic";
     let options = injected_options(&repo_path, temp.path(), run_id);
@@ -1405,12 +1451,14 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
         panic!("injected child runner panic")
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize child runner panic");
@@ -1530,6 +1578,20 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
     let options = injected_options(&repo_path, temp.path(), "budget-never-started-release");
     let mut invocations = 0usize;
@@ -1541,12 +1603,14 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
         run
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize never-started dispatch");

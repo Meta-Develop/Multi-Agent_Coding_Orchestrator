@@ -427,6 +427,7 @@ fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> b
         message == "Grok authentication source auth.json is missing"
             || message == "Grok authentication source auth.json is unavailable"
             || message == "Grok runtime model catalog has an invalid header"
+            || message == crate::runtime_adapter::grok::GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED
             || ((message.starts_with("Grok catalog executable '")
                 || message.starts_with("Grok executable '"))
                 && message.ends_with("' is missing"))
@@ -8429,6 +8430,46 @@ mod tests {
         );
         assert!(
             message.contains("Grok runtime model catalog has an invalid header"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_omits_implicit_owner_authentication_required() -> Result<()> {
+        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+        let runner = FakeGrokRunner::successful(UNAUTHENTICATED_PUBLIC_PAYLOAD);
+        assert_eq!(
+            observe_optional_live_grok_catalog(
+                &runner,
+                Path::new("/workspace"),
+                CAPTURED_CURSOR_AT_UNIX_MILLIS,
+                None,
+            )?,
+            None
+        );
+        assert_eq!(runner.observed_specs.borrow().len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn live_grok_catalog_bridge_fails_closed_for_explicit_owner_authentication_required() {
+        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+        let error = observe_optional_live_grok_catalog(
+            &FakeGrokRunner::successful(UNAUTHENTICATED_PUBLIC_PAYLOAD),
+            Path::new("/workspace"),
+            CAPTURED_CURSOR_AT_UNIX_MILLIS,
+            Some(std::ffi::OsStr::new("/configured/grok")),
+        )
+        .expect_err("an explicit unauthenticated Grok listing must fail closed");
+
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("live Grok catalog observation failed closed"),
+            "{message}"
+        );
+        assert!(
+            message
+                .contains(crate::runtime_adapter::grok::GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED),
             "{message}"
         );
     }
