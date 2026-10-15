@@ -9851,7 +9851,8 @@ mod selection_policy_tests {
             let expected = super::super::super::selection_bridge::frozen_review_account_binding(
                 SupervisorRuntime::Codex,
                 run.as_str(),
-            )?;
+            )?
+            .context("frozen selected review account")?;
             let expected_account = (&expected).into();
             let observed = account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
                 .context("original selected account observation")?;
@@ -9862,8 +9863,10 @@ mod selection_policy_tests {
                 SupervisorRuntime::Codex,
                 supplied_catalog,
                 &baseline.provenance,
-                &observed,
-                &expected_account,
+                super::super::super::selection_bridge::ReviewLensAccount::Selected {
+                    observation: &observed,
+                    expected_binding: &expected_account,
+                },
                 SupervisorQuotaSelectionInput::default(),
             )?;
             let captured =
@@ -9908,7 +9911,7 @@ mod selection_policy_tests {
                                 SupervisorRuntime::Codex,
                                 run.as_str(),
                             )?,
-                            expected
+                            Some(expected)
                         );
                         let error =
                             super::super::super::selection_bridge::select_authored_review_lens(
@@ -9917,8 +9920,9 @@ mod selection_policy_tests {
                                 SupervisorRuntime::Codex,
                                 supplied_catalog,
                                 &baseline.provenance,
-                                &observed,
-                                &expected_account,
+                                super::super::super::selection_bridge::ReviewLensAccount::Selected {
+                                    observation: &observed, expected_binding: &expected_account,
+                                },
                                 SupervisorQuotaSelectionInput::default(),
                             )
                             .err()

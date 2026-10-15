@@ -2126,6 +2126,19 @@ struct PreparedChildAttempt<'a> {
     pre_action_review_context: Option<ReviewContext>,
 }
 
+fn bind_codex_assignment_native_delegation(
+    command: ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+    role: AgentRole,
+    managed_parent: bool,
+) -> ExternalAgentCommand {
+    if runtime == SupervisorRuntime::Codex && (managed_parent || role == AgentRole::Worker) {
+        command.with_codex_native_delegation_disabled()
+    } else {
+        command
+    }
+}
+
 pub(super) fn bind_worker_journal_artifacts(
     mut command: ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
@@ -2916,8 +2929,15 @@ fn prepare_child_attempt_with_purpose<'a>(
         command = command.with_read_only_input_file(worktree.path.join(&input.path));
     }
     command.researcher_source_inputs = source_inputs;
+    // Direct terminal Workers use the same observed app-server route as nested
+    // Workers. Bind native-off intent before admission, independently of CAM.
+    command = bind_codex_assignment_native_delegation(
+        command,
+        launch_runtime,
+        assignment.role,
+        managed_parent,
+    );
     if managed_parent && launch_runtime == SupervisorRuntime::Codex {
-        command = command.with_codex_native_delegation_disabled();
         command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
             command.with_codex_managed_worker_requests()
         } else {
@@ -6432,9 +6452,25 @@ fn prepare_parent_auditor<'a>(
             )?;
             // Observe without rewriting the run's frozen identity. Selection below
             // rejects removal, incarnation/revision drift, stale models and access loss.
-            let observation =
-                super::scheduler::account_observation_for_launch_runtime(launch_runtime, None)?
-                    .context("parent review selected account observation disappeared")?;
+            let observation = expected_binding
+                .as_ref()
+                .map(|_| {
+                    super::scheduler::account_observation_for_launch_runtime(launch_runtime, None)?
+                        .context("parent review selected account observation disappeared")
+                })
+                .transpose()?;
+            let account_binding = expected_binding.as_ref().map(Into::into);
+            let account = match (observation.as_ref(), account_binding.as_ref()) {
+                (Some(observation), Some(expected_binding)) => {
+                    super::selection_bridge::ReviewLensAccount::Selected {
+                        observation,
+                        expected_binding,
+                    }
+                }
+                _ => super::selection_bridge::ReviewLensAccount::LocalAuth {
+                    run_id: options.run_id.as_str(),
+                },
+            };
             let quota_context = live_quota_context_for_run(repo)?;
             let selected = super::selection_bridge::select_authored_review_lens(
                 lens,
@@ -6442,8 +6478,7 @@ fn prepare_parent_auditor<'a>(
                 launch_runtime,
                 runtime_model_catalog,
                 &baseline.provenance,
-                &observation,
-                &(&expected_binding).into(),
+                account,
                 SupervisorQuotaSelectionInput {
                     context: quota_context.as_ref(),
                     ledger: quota_context.as_ref().map(|_| *budget_ledger),
@@ -11602,12 +11637,104 @@ mod decomposition_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn local_auth_worker_binding_satisfies_app_server_classification() -> Result<()> {
+        let _socket =
+            crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                None,
+            );
+        let run = "local-auth-worker-classification";
+        crate::account_authority::record_observed_codex_selection_from_source(
+            Some(run),
+            "codex-cli",
+            None,
+            None,
+            None,
+        );
+        let assignment: OrchestratorAssignment = serde_json::from_value(json!({
+            "id":"worker", "phase":"execution", "role":"worker",
+            "role_category":"non_delegating_terminal_worker", "assigned_paths":["README.md"]
+        }))?;
+        let grant = admit_assignment_child_process_intent(
+            run,
+            &assignment.id,
+            1,
+            Path::new("codex"),
+            Some("gpt-5.6-sol"),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )?;
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/private/prompt",
+            "/private/log",
+            "/private/report",
+            Duration::from_secs(3),
+        )
+        .with_agent_lifecycle("/registry", "worker", run, &assignment.id)
+        .with_model_selection(Some("gpt-5.6-sol".into()), Some("high".into()))
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+        let incoming = Path::new("/private");
+        let command = bind_worker_journal_artifacts(
+            command,
+            &assignment,
+            incoming,
+            vec![
+                incoming.join(worker_execution_journal_incoming_relative_for_id(
+                    &assignment.id,
+                )),
+            ],
+        )?;
+        assert_eq!(
+            command.assignment_process_launch_kind,
+            Some(AssignmentProcessLaunchKind::AssignmentChild)
+        );
+        assert_eq!(command.worker_journal_artifacts.len(), 1);
+        assert!(!command.codex_native_delegation_is_disabled());
+        assert!(command
+            .managed_worker_app_server_selected_for_test()
+            .is_err());
+        let command = bind_codex_assignment_native_delegation(
+            command,
+            SupervisorRuntime::Codex,
+            assignment.role,
+            false,
+        );
+        assert_eq!(
+            command.codex_run_account_binding_for_test(),
+            Some(&crate::account_authority::CodexRunAccountBinding::LocalAuth)
+        );
+        assert!(command.codex_native_delegation_is_disabled());
+        assert_eq!(
+            command.managed_worker_app_server_selected_for_test(),
+            Ok(true)
+        );
+        assert_eq!(command.agent_lifecycle.as_ref().unwrap().role, "worker");
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn prepare_child_and_parent_auditor_issuers_reach_production_sink() -> Result<()> {
+        exercise_child_and_parent_auditor_issuers(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_auth_direct_worker_prepares_app_server_authority() -> Result<()> {
+        exercise_child_and_parent_auditor_issuers(true)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn exercise_child_and_parent_auditor_issuers(local_auth: bool) -> Result<()> {
         use crate::mutation_taxonomy::{
             AssignmentProcessLaunchGrantError, AssignmentProcessLaunchKind,
             ASSIGNMENT_CHILD_PROCESS_DUTY, PARENT_AUDITOR_PROCESS_DUTY,
         };
 
+        let _socket =
+            crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+                None,
+            );
         let temp = tempfile::tempdir().expect("temporary issuer fixture");
         let repo = temp.path().join("repo");
         Repository::init(&repo).expect("initialize issuer fixture repository");
@@ -11618,20 +11745,24 @@ mod decomposition_tests {
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            role_category: None,
+            role: if local_auth {
+                AgentRole::Worker
+            } else {
+                AgentRole::ChildOrchestrator
+            },
+            role_category: local_auth.then_some(RoleCategory::NonDelegatingTerminalWorker),
             selection_source: None,
             assigned_paths: vec![PathBuf::from("README.md")],
             semantic_symbols: Vec::new(),
             semantic_modules: Vec::new(),
-            task: None,
+            task: local_auth.then(|| "Update README.md in the owned scope".to_string()),
             worker_assignments: Vec::new(),
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: None,
             decision_refs: Vec::new(),
         };
-        let plan = SupervisorPlan {
+        let mut plan = SupervisorPlan {
             version: SUPERVISOR_SCHEMA_VERSION,
             task: "issuer sink exercise".to_string(),
             task_file: None,
@@ -11654,10 +11785,19 @@ mod decomposition_tests {
         let options = SupervisorRunOptions {
             repo: repo.clone(),
             plan_file: temp.path().join("plan.json"),
-            run_id: RunId::new("issuer-sink-admission").expect("valid fixture run id"),
+            run_id: RunId::new(if local_auth {
+                "local-auth-worker-issuer"
+            } else {
+                "issuer-sink-admission"
+            })
+            .expect("valid fixture run id"),
             parent_node: None,
             codex_bin: PathBuf::from("unused-codex"),
-            runtime: SupervisorRuntime::Fake,
+            runtime: if local_auth {
+                SupervisorRuntime::Codex
+            } else {
+                SupervisorRuntime::Fake
+            },
             allow_dirty_primary: false,
             allow_live_run_collision: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
@@ -11677,9 +11817,23 @@ mod decomposition_tests {
             "issuer-sink-test",
         )
         .expect("reserve issuer artifacts");
+        if local_auth {
+            ensure_phase_child_review_schemas(&mut artifact_writer);
+        }
         let run_dir = artifact_writer.run_dir().to_path_buf();
         let dirs = RunDirs::for_writer(&artifact_writer);
         let manager = WorktreeManager::new(&repo);
+        if local_auth {
+            // This test exercises command preparation. Give it an explicit
+            // disposable worktree rather than the production default-root Git
+            // exclude probe, which needs a trusted system Git executable.
+            manager.create_for_test(WorktreeCreateOptions {
+                agent_id: assignment.id.clone(),
+                branch: None,
+                base: None,
+                worktree_root: Some(temp.path().join("worktrees")),
+            })?;
+        }
         let sync_store = SyncStore::open(&repo).expect("open fixture sync store");
         let semantic_store = SemanticIntentStore::open(&repo).expect("open fixture semantic store");
         let assignment_schedule = vec![AssignmentScheduleEntry {
@@ -11691,7 +11845,53 @@ mod decomposition_tests {
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
-        let runtime_model_catalog = RuntimeModelCatalog::LocalDeterministicFake;
+        let runtime_model_catalog = if local_auth {
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?)
+        } else {
+            RuntimeModelCatalog::LocalDeterministicFake
+        };
+        let mut budget_policy = AssignmentBudgetPolicy::default();
+        let mut plan_metadata = SupervisorPlanMetadata::default();
+        let _policy = if local_auth {
+            crate::account_authority::record_observed_codex_selection_from_source(
+                Some(options.run_id.as_str()),
+                "codex-cli",
+                None,
+                None,
+                None,
+            );
+            let guard =
+                super::super::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
+            let admission = SupervisorAdmissionPolicyInput::resolve(
+                &repo,
+                1,
+                plan_metadata.admission,
+                options.admission_overrides,
+            )?;
+            let objective = resolve_objective_profile(&repo, None)?;
+            let resolution =
+                super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                    &mut plan,
+                    SupervisorRuntime::Codex,
+                    &runtime_model_catalog,
+                    &admission,
+                    &super::super::selection_bridge::AdvertisedCatalogSet::empty(),
+                    Some(&objective),
+                    Default::default(),
+                    None,
+                    &[],
+                    plan_metadata.task_routing_assessment.as_ref(),
+                )?;
+            assert!(
+                resolution.selection_preflight_failure.is_none(),
+                "{:?}",
+                resolution.selection_preflight_failure
+            );
+            budget_policy.initial_selector_decisions = resolution.decisions;
+            Some(guard)
+        } else {
+            None
+        };
         let cancellation = ProcessCancellation::new();
         let mut journal = initialize_orchestration_event_journal(
             &repo,
@@ -11724,7 +11924,7 @@ mod decomposition_tests {
             execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
             worktree_creation: SupervisorWorktreeCreation::TestOnly,
             manager: &manager,
-            reused: false,
+            reused: local_auth,
             sync_store: &sync_store,
             semantic_store: &semantic_store,
             prepared_semantic_token: None,
@@ -11738,7 +11938,7 @@ mod decomposition_tests {
             semantic_block_gate: None,
             artifacts: &artifacts,
             budget_ledger: &budget_ledger,
-            budget_policy: AssignmentBudgetPolicy::default(),
+            budget_policy,
             admission_commit: None,
             runtime_model_catalog: &runtime_model_catalog,
             cancellation,
@@ -11748,19 +11948,50 @@ mod decomposition_tests {
             gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
             ..AssignmentExecutionOutcome::default()
         };
-        let preflight = match prepare_assignment_execution(&context, &mut outcome)
-            .expect("issuer preflight invocation")
-        {
-            AssignmentExecutionDisposition::Continue(preflight) => preflight,
-            AssignmentExecutionDisposition::Complete => panic!("preflight unexpectedly completed"),
+        let preflight = if local_auth {
+            let lease = manager.acquire_write_execution_lease(&assignment.id)?;
+            let worktree = lease.record().clone();
+            let claim = sync_store.claim_paths_for_run(
+                &options.run_id,
+                &assignment.id,
+                &assignment.assigned_paths,
+            )?;
+            AssignmentExecutionPreflight {
+                nested_turn_issued: AtomicBool::new(false),
+                journal_parent_id: options.run_id.as_str(),
+                environment_requirements: Vec::new(),
+                semantic_token: None,
+                child_base_head: current_head_oid(&worktree.path)?,
+                mandatory_worktree_controls: provision_mandatory_worktree_controls(&worktree.path)?,
+                worktree,
+                worktree_write_lease: Some(lease),
+                primary_scope_baseline: None,
+                managed_process_cancellation: sync_store
+                    .managed_process_cancellation_for_claim(claim.token, &context.cancellation)?,
+                claim,
+                assignment: assignment.clone(),
+                _semantic_block_turn: None,
+            }
+        } else {
+            match prepare_assignment_execution(&context, &mut outcome)
+                .expect("issuer preflight invocation")
+            {
+                AssignmentExecutionDisposition::Continue(preflight) => preflight,
+                AssignmentExecutionDisposition::Complete => panic!(
+                    "preflight unexpectedly completed: findings={:?}, health={:?}",
+                    outcome.findings, outcome.health_signals
+                ),
+            }
         };
 
         let schema_path = dirs.schemas.join("orchestrator-review-report.schema.json");
         let worker_schema_path = dirs.schemas.join("worker-report.schema.json");
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
         fs::create_dir_all(&dirs.schemas).expect("create issuer schema directory");
-        fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
-            .expect("materialize issuer auditor schema");
+        if !local_auth {
+            fs::write(&auditor_schema_path, "{\"type\":\"object\"}\n")
+                .expect("materialize issuer auditor schema");
+        }
         let prepared = match prepare_child_attempt(
             &context,
             &mut outcome,
@@ -11786,6 +12017,25 @@ mod decomposition_tests {
             prepared.command.assignment_process_launch_kind,
             Some(AssignmentProcessLaunchKind::AssignmentChild)
         );
+        if local_auth {
+            assert!(prepared.command.codex_native_delegation_is_disabled());
+            assert!(!prepared.command.codex_managed_worker_requests_enabled());
+            assert!(!prepared
+                .command
+                .codex_managed_readonly_continuation_enabled());
+            assert_eq!(
+                prepared.command.workspace_access,
+                WorkspaceAccess::ReadWrite
+            );
+            assert_eq!(prepared.command.worker_journal_artifacts.len(), 1);
+            let journal = &prepared.command.worker_journal_artifacts[0];
+            assert_eq!(journal.worker_id, assignment.id);
+            assert!(journal.path.is_file());
+            assert_eq!(
+                prepared.command.codex_run_account_binding_for_test(),
+                Some(&crate::account_authority::CodexRunAccountBinding::LocalAuth)
+            );
+        }
         let child_grant = prepared
             .command
             .assignment_process_launch_grant
@@ -11807,6 +12057,13 @@ mod decomposition_tests {
                 .map(|id| id.task_id.as_str()),
             Some(assignment.id.as_str())
         );
+
+        if local_auth {
+            // The legacy issuer test below exercises executable release and
+            // replay. Here the real prepared command is the regression boundary;
+            // no custom executable or provider is launched.
+            return Ok(());
+        }
 
         let mut missing = prepared.command.clone();
         let (_missing_temp, missing_marker) =

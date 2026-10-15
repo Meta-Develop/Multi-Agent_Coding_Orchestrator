@@ -1684,13 +1684,30 @@ fn validate_custom_review_lens_contracts(plan: &SupervisorPlan) -> Result<()> {
     Ok(())
 }
 
-/// Constructed only by evaluation of an authored lens against current account
-/// observations and the already assessed, frozen run input. It grants no budget,
+/// Constructed only by evaluation of an authored lens against the current
+/// catalog and already assessed, frozen run input. It grants no budget,
 /// filesystem, account-login or publication authority.
 #[cfg(target_os = "linux")]
 pub(super) struct SelectedReviewLens {
     decision: SelectionProvenance,
-    launch: crate::selection::routing_policy::SelectedLaunchRequest,
+    authority: ReviewLensAuthority,
+}
+
+#[cfg(target_os = "linux")]
+enum ReviewLensAuthority {
+    Selected(Box<crate::selection::routing_policy::SelectedLaunchRequest>),
+    LocalAuth { run_id: String },
+}
+
+#[cfg(target_os = "linux")]
+pub(super) enum ReviewLensAccount<'a> {
+    Selected {
+        observation: &'a AccountObserveResult,
+        expected_binding: &'a crate::selection::routing_policy::AccountBinding,
+    },
+    LocalAuth {
+        run_id: &'a str,
+    },
 }
 
 #[cfg(target_os = "linux")]
@@ -1725,8 +1742,14 @@ impl SelectedReviewLens {
             .as_ref()
             .context("selected lens choice")?
             .candidate;
-        if candidate != self.launch.candidate() {
-            bail!("review lens launch differs from its selector decision");
+        match &self.authority {
+            ReviewLensAuthority::Selected(launch) if candidate != launch.candidate() => {
+                bail!("review lens launch differs from its selector decision");
+            }
+            ReviewLensAuthority::LocalAuth { run_id } => {
+                require_local_auth_review(run_id)?;
+            }
+            ReviewLensAuthority::Selected(_) => {}
         }
         crate::selection::routing_policy::validate_selected_launch(
             AgentRole::Auditor.as_str(),
@@ -1742,13 +1765,17 @@ impl SelectedReviewLens {
 pub(super) fn frozen_review_account_binding(
     runtime: SupervisorRuntime,
     run: &str,
-) -> Result<coding_agent_manager_lib::account_authority::SelectedAccountBinding> {
+) -> Result<Option<coding_agent_manager_lib::account_authority::SelectedAccountBinding>> {
     use crate::account_authority as authority;
     let binding =
         match runtime {
             SupervisorRuntime::Codex => match authority::codex_run_account_binding(run) {
                 Some(authority::CodexRunAccountBinding::Selected(binding)) => {
                     Some(binding.to_selected_binding())
+                }
+                Some(authority::CodexRunAccountBinding::LocalAuth) => {
+                    require_local_auth_review(run)?;
+                    return Ok(None);
                 }
                 _ => None,
             },
@@ -1762,7 +1789,20 @@ pub(super) fn frozen_review_account_binding(
                 .map(|binding| binding.to_selected_binding()),
             SupervisorRuntime::Fake => None,
         };
-    binding.context("review lens requires the run's frozen selected account")
+    binding
+        .map(Some)
+        .context("review lens requires the run's frozen selected account or CAM-unconfigured LocalAuth Codex binding")
+}
+
+#[cfg(target_os = "linux")]
+fn require_local_auth_review(run_id: &str) -> Result<()> {
+    if crate::account_authority::configured_cam_authority_socket().is_some()
+        || crate::account_authority::codex_run_account_binding(run_id)
+            != Some(crate::account_authority::CodexRunAccountBinding::LocalAuth)
+    {
+        bail!("local-auth review requires CAM unconfigured and the run's frozen LocalAuth Codex binding");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1773,15 +1813,29 @@ pub(super) fn select_authored_review_lens(
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
     baseline: &SelectionProvenance,
-    observation: &AccountObserveResult,
-    expected_binding: &crate::selection::routing_policy::AccountBinding,
+    account: ReviewLensAccount<'_>,
     quota: SupervisorQuotaSelectionInput<'_>,
 ) -> Result<SelectedReviewLens> {
-    if &crate::selection::routing_policy::AccountBinding::from(&observation.binding)
-        != expected_binding
-    {
-        bail!("review lens selected account changed from the frozen run binding");
-    }
+    let observation = match &account {
+        ReviewLensAccount::Selected {
+            observation,
+            expected_binding,
+        } => {
+            if &crate::selection::routing_policy::AccountBinding::from(&observation.binding)
+                != *expected_binding
+            {
+                bail!("review lens selected account changed from the frozen run binding");
+            }
+            Some(*observation)
+        }
+        ReviewLensAccount::LocalAuth { run_id } => {
+            if runtime != SupervisorRuntime::Codex {
+                bail!("local-auth review is supported only for Codex");
+            }
+            require_local_auth_review(run_id)?;
+            None
+        }
+    };
     let ReviewLensBackendConfig::Model {
         model,
         reasoning_effort: Some(effort),
@@ -1811,8 +1865,27 @@ pub(super) fn select_authored_review_lens(
     // Reuse the real assessment projection, frozen objective, priors, history
     // and constraints. No task morphology or authority is invented for a lens.
     let mut input = baseline.normalized_input.clone();
-    input.catalogs =
-        catalogs_from_account_observation(observation, runtime, &input.task, &input.priors)?;
+    input.catalogs = if let Some(observation) = observation {
+        catalogs_from_account_observation(observation, runtime, &input.task, &input.priors)?
+    } else {
+        if input
+            .catalogs
+            .iter()
+            .any(|catalog| catalog.models.iter().any(|model| model.access.is_some()))
+            || input.pools.iter().any(|pool| {
+                pool.observation_revision
+                    .starts_with("account-observe-sha256:")
+            })
+        {
+            bail!("local-auth review cannot reuse CAM account observations");
+        }
+        vec![runtime_catalog_from_priors(
+            runtime.as_str(),
+            catalog,
+            &input.task,
+            &input.priors,
+        )?]
+    };
     input
         .constraints
         .allowed_runtimes
@@ -1844,11 +1917,13 @@ pub(super) fn select_authored_review_lens(
             .runtime
             .clone();
         apply_live_quota_selection_input(&mut input, context, quota.ledger, source.as_str())?;
-    } else if let Some(pool) = input
-        .pools
-        .iter_mut()
-        .find(|pool| pool.runtime == runtime.as_str())
-    {
+    } else if let (Some(observation), Some(pool)) = (
+        observation,
+        input
+            .pools
+            .iter_mut()
+            .find(|pool| pool.runtime == runtime.as_str()),
+    ) {
         if let Some(content) = observation
             .quota
             .as_ref()
@@ -1889,14 +1964,24 @@ pub(super) fn select_authored_review_lens(
                     .map(|entry| &entry.ineligibility_reasons),
             )
         })?;
-    let launch = crate::selection::routing_policy::SelectedLaunchRequest::from_observation(
-        choice.candidate.clone(),
-        observation,
-        &receipt.frozen,
-        receipt.features.clone(),
-        None,
-    )?;
-    Ok(SelectedReviewLens { decision, launch })
+    let authority = match account {
+        ReviewLensAccount::Selected { observation, .. } => ReviewLensAuthority::Selected(Box::new(
+            crate::selection::routing_policy::SelectedLaunchRequest::from_observation(
+                choice.candidate.clone(),
+                observation,
+                &receipt.frozen,
+                receipt.features.clone(),
+                None,
+            )?,
+        )),
+        ReviewLensAccount::LocalAuth { run_id } => ReviewLensAuthority::LocalAuth {
+            run_id: run_id.to_string(),
+        },
+    };
+    Ok(SelectedReviewLens {
+        decision,
+        authority,
+    })
 }
 
 fn authored_override_runtime(
@@ -6524,8 +6609,10 @@ mod tests {
                 SupervisorRuntime::Codex,
                 &catalog,
                 &baseline,
-                &observation,
-                &expected,
+                ReviewLensAccount::Selected {
+                    observation: &observation,
+                    expected_binding: &expected,
+                },
                 SupervisorQuotaSelectionInput::default(),
             )?;
             let exited =
@@ -6603,8 +6690,10 @@ mod tests {
                 SupervisorRuntime::Codex,
                 &catalog,
                 &baseline,
-                &changed,
-                &expected,
+                ReviewLensAccount::Selected {
+                    observation: &changed,
+                    expected_binding: &expected,
+                },
                 SupervisorQuotaSelectionInput::default(),
             );
             assert!(result.is_err(), "{refusal} must not grant lens authority");
@@ -6649,8 +6738,10 @@ mod tests {
             SupervisorRuntime::Codex,
             &catalog,
             &strict_baseline,
-            &supported,
-            &expected,
+            ReviewLensAccount::Selected {
+                observation: &supported,
+                expected_binding: &expected,
+            },
             SupervisorQuotaSelectionInput::default(),
         )
         .err()
@@ -9692,6 +9783,141 @@ mod tests {
                 "configured CAM account catalog set is missing the selected primary runtime binding"
             ));
         }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_auth_review_keeps_selector_gates_and_scoped_authority() -> Result<()> {
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+        use crate::selection::routing_policy::*;
+
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let _policy = bind_fixture_routing_policy()?;
+        let run_id = format!(
+            "local-review-{}",
+            crate::artifacts::state_auth::random_identifier()?
+        );
+        crate::account_authority::record_observed_codex_selection_from_source(
+            Some(&run_id),
+            "codex-cli",
+            None,
+            None,
+            None,
+        );
+        assert!(frozen_review_account_binding(SupervisorRuntime::Codex, &run_id)?.is_none());
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        let baseline = &resolution
+            .decisions
+            .iter()
+            .find(|event| event.role == AgentRole::Auditor)
+            .context("Auditor baseline")?
+            .provenance;
+        let before = captured_selected_authorizations();
+        let lens = &plan.review_lenses[0];
+        let select = |lens: &ReviewLensConfig, catalog: &RuntimeModelCatalog, run_id: &str| {
+            select_authored_review_lens(
+                lens,
+                lens.backend.reasoning_effort().unwrap(),
+                SupervisorRuntime::Codex,
+                catalog,
+                baseline,
+                ReviewLensAccount::LocalAuth { run_id },
+                SupervisorQuotaSelectionInput::default(),
+            )
+        };
+        let selected = select(lens, &catalog, &run_id)?;
+        {
+            let (_guard, decision) = selected.bind()?;
+            let candidate = &decision.choice.as_ref().context("lens choice")?.candidate;
+            validate_selected_launch(
+                "auditor",
+                "codex",
+                &candidate.model,
+                candidate.effort.as_str(),
+            )?;
+            assert_eq!(decision.normalized_task, baseline.normalized_task);
+            assert!(decision
+                .normalized_input
+                .catalogs
+                .iter()
+                .flat_map(|catalog| &catalog.models)
+                .all(|model| model.access.is_none()));
+            assert!(decision.normalized_input.quota_source.is_none());
+            assert!(decision
+                .normalized_input
+                .pools
+                .iter()
+                .all(|pool| pool.observation_source.is_none()));
+        }
+        assert_eq!(captured_selected_authorizations(), before);
+
+        let unavailable =
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["other-model"])?);
+        assert!(select(lens, &unavailable, &run_id).is_err());
+        assert!(select(lens, &catalog, "never-admitted-local-review").is_err());
+        let mut weak = lens.clone();
+        if let ReviewLensBackendConfig::Model { model, .. } = &mut weak.backend {
+            *model = ECONOMY_PROFILE_MODEL.to_string();
+        }
+        assert!(select(&weak, &catalog, &run_id).is_err());
+        let mut wrong_role = baseline.clone();
+        wrong_role.normalized_input.task.authority_role = AuthorityRole::TerminalLeaf;
+        assert!(select_authored_review_lens(
+            lens,
+            lens.backend.reasoning_effort().unwrap(),
+            SupervisorRuntime::Codex,
+            &catalog,
+            &wrong_role,
+            ReviewLensAccount::LocalAuth { run_id: &run_id },
+            SupervisorQuotaSelectionInput::default(),
+        )
+        .is_err());
+
+        // A CAM appearing after selection must also refuse before authority binds.
+        let selected = select(lens, &catalog, &run_id)?;
+        let _configured = CamAuthoritySocketTestGuard::install(Some(std::ffi::OsStr::new(
+            "/tmp/unavailable-review-cam.sock",
+        )));
+        assert!(frozen_review_account_binding(SupervisorRuntime::Codex, &run_id).is_err());
+        assert!(select(lens, &catalog, &run_id).is_err());
+        assert!(selected.bind().is_err());
+        assert_eq!(captured_selected_authorizations(), before);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn review_refuses_missing_binding_and_configured_cam_without_selection() -> Result<()> {
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        assert!(
+            frozen_review_account_binding(SupervisorRuntime::Codex, "unadmitted-review").is_err()
+        );
+        let run_id = format!(
+            "missing-review-{}",
+            crate::artifacts::state_auth::random_identifier()?
+        );
+        crate::account_authority::record_observed_codex_selection(
+            Some(&run_id),
+            "codex-cli",
+            None,
+            None,
+        );
+        assert!(frozen_review_account_binding(SupervisorRuntime::Codex, &run_id).is_err());
+        let _configured = CamAuthoritySocketTestGuard::install(Some(std::ffi::OsStr::new(
+            "/tmp/unavailable-review-cam.sock",
+        )));
+        assert!(frozen_review_account_binding(SupervisorRuntime::Codex, &run_id).is_err());
         Ok(())
     }
 

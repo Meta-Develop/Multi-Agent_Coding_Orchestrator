@@ -14377,11 +14377,13 @@ mod managed_worker_live_budget {
             None,
         );
         assert!(!run.stdout.target_launch_attempted);
-        assert!(run
-            .error
-            .as_deref()
-            .unwrap()
-            .contains("requires a verified TrustedSystemCodex executable"));
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("requires a verified TrustedSystemCodex executable"),
+            "{run:?}"
+        );
     }
 
     #[test]

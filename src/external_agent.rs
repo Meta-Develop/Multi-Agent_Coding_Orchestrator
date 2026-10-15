@@ -4080,6 +4080,16 @@ impl ExternalAgentCommand {
         self.codex_native_delegation_disabled
     }
 
+    #[cfg(test)]
+    pub(crate) fn codex_run_account_binding_for_test(&self) -> Option<&CodexRunAccountBinding> {
+        self.codex_run_account_binding.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn managed_worker_app_server_selected_for_test(&self) -> Result<bool, String> {
+        classify_managed_worker_app_server(self, ExternalExecutionRuntime::Verified)
+    }
+
     /// Pre-dispatch contract verification. Returned cgroup, cancellation, capture and usage
     /// evidence must still pass the controller's post-dispatch checks and settlement.
     pub(crate) fn managed_parent_control_transport(
