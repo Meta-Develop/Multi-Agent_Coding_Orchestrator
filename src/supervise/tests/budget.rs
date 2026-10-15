@@ -471,14 +471,30 @@ fn assert_unpriced_dispatch_refused(model: &str) {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("unpriced fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("unpriced fixture parent-lens effort")
+        .to_string();
     let selection = RoleModelSelection {
         model: Some(model.to_string()),
-        reasoning_effort: None,
+        reasoning_effort: Some(existing_effort),
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     };
     plan.role_models
         .insert(AgentRole::ChildOrchestrator, selection.clone());
     plan.role_models.insert(AgentRole::Auditor, selection);
+    for lens in &mut plan.review_lenses {
+        if let ReviewLensBackendConfig::Model {
+            model: lens_model, ..
+        } = &mut lens.backend
+        {
+            *lens_model = model.to_string();
+        }
+    }
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
     let options = injected_options(&repo_path, temp.path(), "budget-missing-pricing");
     let mut invocations = 0usize;
@@ -487,12 +503,14 @@ fn assert_unpriced_dispatch_refused(model: &str) {
         panic!("missing pricing must refuse before invoking the external runner")
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize missing pricing refusal");

@@ -1028,9 +1028,44 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
 
     assert_eq!(task.supervisor_plan.assignments.len(), 1);
     assert_eq!(task.supervisor_plan.max_child_assignments, 1);
+    let source_plan_file = scenario
+        ._temp
+        .path()
+        .join(format!("{}.json", scenario.run_id.as_str()));
+    let loaded_source =
+        load_supervisor_plan_file_with_consultant(&source_plan_file, Some(&scenario.repo))
+            .expect("load bound licensed source plan written by the selected scenario");
+    let mut expected_lenses = single_parent_acceptance_review_lenses();
+    match (
+        expected_lenses.as_mut_slice(),
+        loaded_source.plan.review_lenses.as_slice(),
+    ) {
+        (
+            [ReviewLensConfig {
+                backend:
+                    ReviewLensBackendConfig::Model {
+                        backend_id: expected_backend_id,
+                        ..
+                    },
+                ..
+            }],
+            [ReviewLensConfig {
+                backend:
+                    ReviewLensBackendConfig::Model {
+                        backend_id: source_backend_id,
+                        ..
+                    },
+                ..
+            }],
+        ) => {
+            *expected_backend_id = source_backend_id.clone();
+        }
+        _ => panic!("bound source plan must keep a single Model parent-acceptance lens"),
+    }
+    assert_eq!(loaded_source.plan.review_lenses, expected_lenses);
     assert_eq!(
         task.supervisor_plan.review_lenses,
-        single_parent_acceptance_review_lenses()
+        loaded_source.plan.review_lenses
     );
     assert_eq!(
         task.supervisor_plan.review_aggregation_policy,

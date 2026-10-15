@@ -336,8 +336,12 @@ fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
     let (_temp, repo_path) = injected_repository();
     let mut first = injected_named_assignment("grok-first", "README.md");
     first.role = AgentRole::Worker;
+    first.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    first.worker_assignments.clear();
     let mut second = injected_named_assignment("grok-second", "SECOND.md");
     second.role = AgentRole::Worker;
+    second.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    second.worker_assignments.clear();
     let mut plan = injected_multi_plan(vec![first, second], 0);
     let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
     let grok_source = include_bytes!(concat!(

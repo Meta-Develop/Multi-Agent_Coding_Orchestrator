@@ -5637,12 +5637,152 @@ pub(super) fn carry_selected_concurrent_fixture_metadata(
     Ok(())
 }
 
+// Evidence-only fixtures retain authenticated historical metadata separately
+// from the assessment of the current task. No candidate-tree check belongs here.
+#[cfg(all(test, target_os = "linux"))]
+struct SelectedEvidenceOnlyReauditFixture {
+    run: RunId,
+    repo: PathBuf,
+    plan: SupervisorPlan,
+    catalog: CodexRuntimeModelCatalog,
+    historical_metadata: SupervisorPlanMetadata,
+    current_assessment: TaskRoutingAssessment,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE: RefCell<Option<SelectedEvidenceOnlyReauditFixture>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedEvidenceOnlyReauditFixtureGuard<'scope, 'owner> {
+    previous: Option<SelectedEvidenceOnlyReauditFixture>,
+    _parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedEvidenceOnlyReauditFixtureGuard<'_, '_> {
+    fn drop(&mut self) {
+        SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn bind_selected_evidence_only_reaudit_fixture<'scope, 'owner>(
+    loaded: &LoadedSupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    current_assessment: TaskRoutingAssessment,
+    parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+) -> Result<SelectedEvidenceOnlyReauditFixtureGuard<'scope, 'owner>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment] = loaded.plan.assignments.as_slice() else {
+        bail!("selected evidence-only fixture requires exactly its historical subject");
+    };
+    let operation = loaded
+        .plan_metadata
+        .evidence_only_reaudit
+        .as_ref()
+        .context("selected evidence-only fixture operation")?;
+    let frozen = loaded
+        .plan_metadata
+        .resolved_routing_policy
+        .as_ref()
+        .context("selected evidence-only fixture historical policy")?;
+    let historical = loaded
+        .plan_metadata
+        .task_routing_assessment
+        .as_ref()
+        .context("selected evidence-only fixture historical assessment")?;
+    let RuntimeModelCatalog::Codex(catalog) = catalog else {
+        bail!("selected evidence-only fixture requires its actual Codex catalog");
+    };
+    if options.runtime != SupervisorRuntime::Codex
+        || !repo.starts_with(parent_acceptance._account._owner.path().canonicalize()?)
+        || options.run_id == operation.source_run_id
+        || assignment.id != operation.assignment_id
+        || loaded.plan_metadata.execution_target.is_some()
+        || loaded.plan_metadata.normal_intake_selection.is_some()
+        || loaded.plan_metadata.generated_follow_up.is_some()
+        || crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen)
+        || !CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some())
+        || SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow().is_some())
+        || SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| slot.borrow().is_some())
+        || super::test_runtime_model_catalog(&loaded.plan, options.runtime)?
+            != RuntimeModelCatalog::Codex(catalog.clone())
+    {
+        bail!("selected evidence-only fixture lost its owned run, catalog or held policy/account custody");
+    }
+    historical.validate(frozen)?;
+    current_assessment.validate_for_task(frozen, &loaded.plan.task)?;
+    // This checks authenticated history and lineage only. It never reads or
+    // validates the mutable preserved candidate tree, whose denial stays typed.
+    verify_evidence_only_reaudit_source(&repo, operation, assignment, Some(historical))?;
+    let fixture = SelectedEvidenceOnlyReauditFixture {
+        run: options.run_id.clone(),
+        repo,
+        plan: loaded.plan.clone(),
+        catalog: catalog.clone(),
+        historical_metadata: loaded.plan_metadata.clone(),
+        current_assessment,
+    };
+    let previous =
+        SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    Ok(SelectedEvidenceOnlyReauditFixtureGuard {
+        previous,
+        _parent_acceptance: parent_acceptance,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn selected_evidence_only_reaudit_fixture_matches(
+    fixture: &SelectedEvidenceOnlyReauditFixture,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+) -> Result<bool> {
+    // Preparation resolves a missing objective normally. Compare that resolved
+    // copy without modifying the historical metadata retained by the caller.
+    let mut expected_metadata = fixture.historical_metadata.clone();
+    resolve_preselection_objective_profile(&fixture.repo, &mut expected_metadata)?;
+    if request.current_run != Some(&fixture.run)
+        || request.execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+        || request.runtime != SupervisorRuntime::Codex
+        || request.repo.canonicalize()? != fixture.repo
+        || !matches!(request.runtime_model_catalog, Ok(RuntimeModelCatalog::Codex(actual)) if actual == &fixture.catalog)
+        || plan != &fixture.plan
+        || metadata != &expected_metadata
+        || crate::selection::routing_policy::current_routing_policy().as_ref()
+            != expected_metadata.resolved_routing_policy.as_ref()
+    {
+        bail!("selected evidence-only scheduler request differs from its exact fixture binding");
+    }
+    fixture.current_assessment.validate_for_task(
+        expected_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .context("selected evidence-only fixture policy disappeared")?,
+        &plan.task,
+    )?;
+    Ok(true)
+}
+
 #[cfg(all(test, target_os = "linux"))]
 fn selected_concurrent_fixture_matches(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
     request: &PreparedSupervisorSelectionRequest<'_>,
 ) -> Result<bool> {
+    if let Some(matches) = SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+        slot.borrow().as_ref().map(|fixture| {
+            selected_evidence_only_reaudit_fixture_matches(fixture, plan, metadata, request)
+        })
+    }) {
+        return matches;
+    }
     SELECTED_CONCURRENT_FIXTURE.with(|slot| {
         let slot = slot.borrow();
         let Some(fixture) = slot.as_ref().filter(|fixture| request.current_run == Some(&fixture.run)) else {
@@ -6426,6 +6566,11 @@ fn initialize_supervisor_selection_with_catalog_discovery(
             history.as_ref(),
             &account_observations,
         )?;
+        let current_reaudit_assessment = SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|fixture| fixture.current_assessment.clone())
+        });
         let resolution = super::selection_bridge::initialize_supervisor_selection_with_assessment(
             plan,
             runtime,
@@ -6436,7 +6581,9 @@ fn initialize_supervisor_selection_with_catalog_discovery(
             quota,
             history.as_ref(),
             &account_observations,
-            plan_metadata.task_routing_assessment.as_ref(),
+            current_reaudit_assessment
+                .as_ref()
+                .or(plan_metadata.task_routing_assessment.as_ref()),
         )?;
         if resolution.selection_preflight_failure.is_none() {
             bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
