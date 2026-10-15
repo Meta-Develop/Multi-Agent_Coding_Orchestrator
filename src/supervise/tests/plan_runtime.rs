@@ -298,6 +298,22 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
                 run.publishable = false;
                 run.program_trust = ExternalProgramTrust::ExplicitCustom;
                 run.codex_permissions = None;
+                run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalCursor,
+                ));
+                run.cursor_managed_parent_evidence =
+                    Some(crate::runtime_adapter::CursorManagedParentEvidence {
+                        peer_verified: true,
+                        admitted_attempts: 1,
+                        completed_attempts: 1,
+                        usage_attempts_covered: 1,
+                        usage_is_incomplete: Some(false),
+                        input_tokens: Some(2),
+                        output_tokens: Some(1),
+                        cache_read_tokens: Some(0),
+                        cache_write_tokens: Some(0),
+                        ..Default::default()
+                    });
             }
             run
         }
@@ -411,6 +427,68 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             output_usd_per_million_tokens: 1.0,
         },
     );
+    #[cfg(target_os = "linux")]
+    let _cursor_account = {
+        use crate::account_authority::CURSOR_PROVIDER_ID;
+        use coding_agent_manager_lib::{
+            account_authority::{authority_id_for, StoredAccountRegistry},
+            model::{AuthKind, StoredAccountMaterial},
+            paths::stored_accounts_path,
+        };
+
+        struct CursorAccountGuard<'a> {
+            run: &'a RunId,
+            _registry: StoredAccountRegistry,
+        }
+        impl Drop for CursorAccountGuard<'_> {
+            fn drop(&mut self) {
+                crate::account_authority::record_observed_cursor_selection(
+                    Some(self.run.as_str()),
+                    CURSOR_PROVIDER_ID,
+                    None,
+                    None,
+                );
+            }
+        }
+
+        assert!(repo_path.starts_with(temp.path()));
+        assert!(
+            crate::account_authority::cursor_run_account_binding(options.run_id.as_str()).is_none()
+        );
+        let registry = StoredAccountRegistry::new(stored_accounts_path(
+            &temp.path().join("quota-cursor-account"),
+        ));
+        registry
+            .begin_add(
+                CURSOR_PROVIDER_ID,
+                "quota-cursor-fixture",
+                "Synthetic quota-refresh Cursor account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin owned synthetic Cursor account");
+        registry
+            .complete_add(CURSOR_PROVIDER_ID, "quota-cursor-fixture")
+            .expect("complete owned synthetic Cursor account");
+        registry
+            .select_complete_revision(CURSOR_PROVIDER_ID, "quota-cursor-fixture", None)
+            .expect("select owned synthetic Cursor account");
+        let binding = registry
+            .selected_binding(CURSOR_PROVIDER_ID)
+            .expect("read owned Cursor account")
+            .expect("selected owned Cursor account");
+        crate::account_authority::record_observed_cursor_selection(
+            Some(options.run_id.as_str()),
+            CURSOR_PROVIDER_ID,
+            Some(authority_id_for(registry.metadata_path())),
+            Some(&binding),
+        )
+        .expect("freeze owned quota-refresh Cursor account");
+        CursorAccountGuard {
+            run: &options.run_id,
+            _registry: registry,
+        }
+    };
     let second_command = ExternalAgentCommand::codex(
         &options.codex_bin,
         &repo_path,
@@ -625,8 +703,11 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
     )
     .expect("write objective profile override");
 
-    let plan_document = serde_json::to_value(injected_plan(injected_assignment(false), 0))
-        .expect("serialize injected plan");
+    let mut assignment = injected_assignment(false);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let plan_document =
+        serde_json::to_value(injected_plan(assignment, 0)).expect("serialize injected plan");
     let mut authored_document = plan_document.clone();
     authored_document["objective_profile"] = json!(profile_id);
     let mut default_loaded =
@@ -727,7 +808,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
     assert_ne!(default_choice.candidate, adjusted_choice.candidate);
     assert_eq!(
         adjusted_choice.reason,
-        crate::selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+        crate::selection::ChoiceReason::LoadedRoutingPolicy
     );
 
     let resolved = &adjusted_worker.provenance.resolved_objective_profile;
@@ -750,7 +831,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         .expect("selected candidate score evidence");
     assert_eq!(
         selected_score.routing_score_semantics,
-        crate::selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+        crate::selection::RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
     );
     assert_eq!(
         selected_score.routing_tradeoff_weights,
@@ -3812,20 +3893,17 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
         .expect("runtime-default fallback");
     assert!(fallback.model.is_none());
     assert_eq!(fallback.reasoning_effort.as_deref(), Some("high"));
+    let mut fake_only = provisional_default_role_model_selection(AgentRole::GateClassifier);
+    fake_only.model = Some("classifier-model".to_string());
+    fake_only.unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
     let local_fake = RuntimeModelCatalog::LocalDeterministicFake
-        .resolve_role_model_selection(
-            &provisional_default_role_model_selection(AgentRole::GateClassifier),
-            SupervisorRuntime::Fake,
-        )
+        .resolve_role_model_selection(&fake_only, SupervisorRuntime::Fake)
         .expect("local fake fallback");
     assert_eq!(local_fake.selection, RoleModelSelection::default());
     assert_eq!(
         local_fake.observation,
         ModelResolutionObservation::LocalDeterministicFake
     );
-    let mut fake_only = provisional_default_role_model_selection(AgentRole::GateClassifier);
-    fake_only.model = Some("classifier-model".to_string());
-    fake_only.unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
     assert!(injected_codex_runtime_catalog(&["unrelated-model"])
         .resolve_role_model_selection(&fake_only, SupervisorRuntime::Codex,)
         .expect_err("local fake cannot replace a Codex model")

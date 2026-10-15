@@ -876,8 +876,14 @@ pub(super) fn bind_selected_assignment_launch_with_duty_for_test(
         mechanical_duty,
         &ChildAttemptPurpose::Ordinary,
     )?;
+    let command = bound_launch.command.with_agent_lifecycle(
+        &options.repo,
+        assignment.role.as_str(),
+        options.run_id.as_str(),
+        &assignment.id,
+    );
     let command = bind_selected_native_execution_workspace(
-        bound_launch.command,
+        command,
         assignment,
         launch_runtime,
         &managed_worktree,
