@@ -1132,9 +1132,10 @@ fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-08-26.1");
-    assert_eq!(priors.published_on, "2026-08-26");
+    assert_eq!(priors.revision, "2026-10-15.1");
+    assert_eq!(priors.published_on, "2026-10-15");
     assert_eq!(priors.schema_version, 2);
+    assert_eq!(priors.models.len(), 9);
     assert_eq!(priors.objective_profiles[0].version, 3);
     assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-26");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
@@ -1146,6 +1147,330 @@ fn built_in_data_is_dated_and_keeps_policy_in_data() {
         base_input().resolved_objective_profile.profile.switch_costs,
         ContextSwitchCosts::default()
     );
+}
+
+const ALL_AUTHORITY_ROLES: [AuthorityRole; 9] = [
+    AuthorityRole::TerminalLeaf,
+    AuthorityRole::Delegating,
+    AuthorityRole::AcceptanceGate,
+    AuthorityRole::ReviewAuditor,
+    AuthorityRole::Audit,
+    AuthorityRole::ConflictResolution,
+    AuthorityRole::FailureClassification,
+    AuthorityRole::GitPublication,
+    AuthorityRole::UnknownJudgment,
+];
+
+fn current_codex_input(authority: AuthorityRole) -> SelectionInput {
+    let mut input = base_input();
+    input.task.authority_role = authority;
+    if authority != AuthorityRole::TerminalLeaf {
+        input.task.task_class = "review_gate".into();
+        input.task.risk = RiskLevel::Critical;
+        input.task.boundedness = Boundedness::CrossCutting;
+        input.task.context = ContextSize::Long;
+        input.task.horizon = TaskHorizon::Long;
+    }
+    input.catalogs = vec![catalog(
+        "codex",
+        "codex-0.162.0",
+        &input.task.task_class,
+        authority,
+        &[
+            (
+                "gpt-6-astra",
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Xhigh,
+                    ReasoningEffort::Max,
+                    ReasoningEffort::Ultra,
+                ],
+                true,
+            ),
+            (
+                "gpt-6.1-sol",
+                &[ReasoningEffort::High, ReasoningEffort::Xhigh],
+                true,
+            ),
+        ],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    input
+}
+
+#[test]
+fn current_codex_priors_keep_owner_policy_distinct_from_measured_evidence() {
+    let priors = built_in_prior_dataset().expect("built-in priors");
+    validate_prior_dataset(&priors).expect("valid built-in priors");
+    let prior = |model| {
+        priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "codex" && prior.model == model)
+            .expect("Codex policy prior")
+    };
+    let sol = prior("gpt-6.1-sol");
+    let previous = prior("gpt-5.6-sol");
+    assert!(sol.source_id.starts_with("owner-policy-"));
+    assert!(sol.limitations.iter().any(|limitation| limitation
+        .contains("owner-policy baseline values")
+        && limitation.contains("not measured local evidence")));
+    assert_eq!(sol.class_fit, previous.class_fit);
+    assert!(sol.strength_rank > previous.strength_rank);
+    assert_eq!(
+        sol.strong_gate_fallback_efforts,
+        previous.strong_gate_fallback_efforts
+    );
+    assert!(sol.authority_evidence.is_empty());
+    let astra = prior("gpt-6-astra");
+    let terra = prior("gpt-5.6-terra");
+    assert!(astra.prohibited && terra.prohibited);
+    assert!(astra
+        .prohibition_reason
+        .as_ref()
+        .unwrap()
+        .contains("owner policy"));
+    assert_eq!(
+        astra.prohibited_authority_roles,
+        terra.prohibited_authority_roles
+    );
+    assert_eq!(
+        astra.prohibited_authority_roles,
+        ALL_AUTHORITY_ROLES.into_iter().collect()
+    );
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        assert_eq!(
+            priors.measured_authority_eligibility(model, AuthorityRole::TerminalLeaf),
+            MeasuredAuthorityEligibility::NoDatedEvidence
+        );
+    }
+}
+
+#[test]
+fn current_sol_passes_judgment_admission_while_astra_is_prohibited() -> anyhow::Result<()> {
+    use crate::supervise::{
+        admit_role_category, validate_known_judgment_role_model, AgentRole, RoleCategory,
+    };
+
+    for role in [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::Researcher,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ] {
+        validate_known_judgment_role_model(role, Some("gpt-6.1-sol"))?;
+        let denied = validate_known_judgment_role_model(role, Some("gpt-6-astra"))
+            .expect_err("standing owner prohibition must precede static capability fallback");
+        assert!(denied.to_string().contains("standing owner policy"));
+    }
+    for category in [
+        RoleCategory::DelegatingCoordinator,
+        RoleCategory::ReadOnlyReviewAuditor,
+    ] {
+        admit_role_category(category, Some("gpt-6.1-sol"))?;
+        assert!(admit_role_category(category, Some("gpt-6-astra")).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = current_codex_input(AuthorityRole::AcceptanceGate);
+    // Reproduce the pre-prohibition dataset with only the unmeasured candidate available.
+    input
+        .priors
+        .models
+        .retain(|prior| prior.model != "gpt-6-astra");
+    input.catalogs[0]
+        .models
+        .retain(|model| model.model == "gpt-6-astra");
+    assert_eq!(
+        input
+            .priors
+            .measured_authority_eligibility("gpt-6-astra", input.task.authority_role),
+        MeasuredAuthorityEligibility::NoDatedEvidence
+    );
+    let legacy = select(&input)?;
+    assert!(legacy.choice.is_none());
+    assert!(legacy.candidate_set.iter().all(|evaluation| evaluation
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::MissingDatedPrior)));
+    let loaded = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert_eq!(
+        loaded
+            .choice
+            .as_ref()
+            .expect("unmeasured policy choice")
+            .candidate
+            .model,
+        "gpt-6-astra"
+    );
+    Ok(())
+}
+
+#[test]
+fn current_codex_policy_excludes_astra_for_every_authority_and_catalog_fallback(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for authority in ALL_AUTHORITY_ROLES {
+        let input = current_codex_input(authority);
+        assert!(matches!(
+            input
+                .priors
+                .measured_authority_eligibility("gpt-6-astra", authority),
+            MeasuredAuthorityEligibility::Ineligible { .. }
+        ));
+        assert_eq!(
+            input
+                .priors
+                .measured_authority_eligibility("gpt-6.1-sol", authority),
+            MeasuredAuthorityEligibility::Eligible
+        );
+        for routing in [None, Some(&receipt)] {
+            let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
+            let astra = decision
+                .candidate_set
+                .iter()
+                .filter(|evaluation| evaluation.candidate.model == "gpt-6-astra")
+                .collect::<Vec<_>>();
+            assert_eq!(astra.len(), 8);
+            assert!(astra.iter().all(|evaluation| !evaluation.eligible
+                && evaluation.score.is_none()
+                && evaluation
+                    .ineligibility_reasons
+                    .iter()
+                    .any(|reason| reason.code == IneligibilityCode::PolicyProhibited)));
+            if authority == AuthorityRole::UnknownJudgment {
+                assert!(decision.choice.is_none());
+            } else {
+                let choice = decision.choice.expect("permitted Sol choice");
+                assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+                if routing.is_none() && authority != AuthorityRole::TerminalLeaf {
+                    assert_eq!(
+                        choice.reason,
+                        ChoiceReason::StrongestNoEvidenceJudgmentFallback
+                    );
+                    assert_eq!(choice.candidate.effort, ReasoningEffort::Xhigh);
+                }
+            }
+            let mut withdrawn = input.clone();
+            withdrawn.catalogs[0]
+                .models
+                .retain(|model| model.model != "gpt-6.1-sol");
+            assert!(select_with_loaded_routing_policy(&withdrawn, &[], routing)?
+                .choice
+                .is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn current_sol_is_the_strongest_approved_no_evidence_judgment_fallback() {
+    for authority in ALL_AUTHORITY_ROLES.into_iter().filter(|authority| {
+        !matches!(
+            authority,
+            AuthorityRole::TerminalLeaf | AuthorityRole::UnknownJudgment
+        )
+    }) {
+        let mut input = current_codex_input(authority);
+        let mut previous = input.catalogs[0].models[1].clone();
+        previous.model = "gpt-5.6-sol".into();
+        input.catalogs[0].models.push(previous);
+        let decision = select(&input).expect("owner-policy default gate fallback");
+        let choice = decision.choice.expect("strong Sol judgment choice");
+        assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+        assert_eq!(
+            choice.reason,
+            ChoiceReason::StrongestNoEvidenceJudgmentFallback
+        );
+    }
+}
+
+#[test]
+fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_override(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for authority in ALL_AUTHORITY_ROLES {
+        let mut input = current_codex_input(authority);
+        let source = CandidateKey {
+            runtime: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            effort: ReasoningEffort::Xhigh,
+        };
+        let target = CandidateKey {
+            model: "gpt-6-astra".into(),
+            ..source.clone()
+        };
+        input
+            .priors
+            .models
+            .iter_mut()
+            .find(|prior| prior.model == source.model)
+            .unwrap()
+            .one_shot_environment_fallbacks
+            .push(OneShotEnvironmentFallback {
+                rejection_code: "test_environment_rejection".into(),
+                target_runtime: target.runtime.clone(),
+                target_model: target.model.clone(),
+                target_effort: target.effort,
+            });
+        input.signals.previous_choice = Some(source.clone());
+        input
+            .signals
+            .environment_rejections
+            .push(EnvironmentRejectionState {
+                candidate: source,
+                rejection_code: "test_environment_rejection".into(),
+                evidence_id: "test-rejection-evidence".into(),
+                fallback_transition_used: false,
+            });
+        if authority != AuthorityRole::UnknownJudgment {
+            let mut no_prior = input.clone();
+            no_prior
+                .priors
+                .models
+                .retain(|prior| prior.model != target.model);
+            let control = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
+            assert_eq!(
+                control
+                    .choice
+                    .expect("unmeasured environment fallback")
+                    .reason,
+                ChoiceReason::OneShotEnvironmentFallback
+            );
+            assert_eq!(control.environment_fallback.unwrap().target, target);
+        }
+        for routing in [None, Some(&receipt)] {
+            let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
+            assert!(decision.environment_fallback.is_none());
+            assert!(decision
+                .choice
+                .is_none_or(|choice| choice.candidate.model == "gpt-6.1-sol"));
+            let mut overridden = input.clone();
+            overridden.constraints.allow_debug_override = true;
+            overridden.debug_override = Some(DebugOverride {
+                candidate: target.clone(),
+                requested_by: "test operator".into(),
+                reason: "prove the standing prohibition survives an explicit override".into(),
+            });
+            let decision = select_with_loaded_routing_policy(&overridden, &[], routing)?;
+            assert!(decision.choice.is_none());
+            assert_eq!(
+                decision.debug_override.unwrap().disposition,
+                DebugOverrideDisposition::Rejected
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "dataset_id": "maco-runtime-model-effort-priors",
-  "revision": "2026-08-26.1",
-  "published_on": "2026-08-26",
+  "revision": "2026-10-15.1",
+  "published_on": "2026-10-15",
   "objective_profiles": [
     {
       "name": "accepted-task-total-cost",
@@ -153,6 +153,44 @@
       "class_fit": [
         {"task_class":"localized_code_change","effort":"high","quality_basis_points":8600,"sample_size":3,"execution_cost_microunits":105000,"review_cost_microunits":30000,"rework_cost_microunits":15000,"rereview_cost_microunits":5000}
       ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "codex",
+      "model": "gpt-6.1-sol",
+      "observed_on": "2026-10-15",
+      "source_id": "owner-policy-gpt-6-1-sol-baseline-2026-10-15",
+      "prior_scope": "owner-policy default capable model baseline plus strongest approved no-evidence gate fallback",
+      "limitations": ["quality, sample-size weights, and costs are owner-policy baseline values inherited from gpt-5.6-sol, not measured local evidence for gpt-6.1-sol", "strength rank expresses owner-policy default preference, not a measured capability comparison", "not comparable local accepted-task gate evidence", "outcome ledger remains authoritative for local cost and acceptance"],
+      "prohibited": false,
+      "prohibition_reason": null,
+      "prohibited_authority_roles": [],
+      "long_context_eligible": true,
+      "strong_gate_fallback_efforts": ["xhigh"],
+      "strength_rank": 110,
+      "class_fit": [
+        {"task_class":"localized_code_change","effort":"high","quality_basis_points":9000,"sample_size":10,"execution_cost_microunits":90000,"review_cost_microunits":20000,"rework_cost_microunits":10000,"rereview_cost_microunits":5000},
+        {"task_class":"localized_code_change","effort":"xhigh","quality_basis_points":9600,"sample_size":10,"execution_cost_microunits":110000,"review_cost_microunits":15000,"rework_cost_microunits":5000,"rereview_cost_microunits":3000},
+        {"task_class":"review_gate","effort":"xhigh","quality_basis_points":9600,"sample_size":1,"execution_cost_microunits":120000,"review_cost_microunits":20000,"rework_cost_microunits":5000,"rereview_cost_microunits":3000}
+      ],
+      "authority_evidence": [],
+      "one_shot_environment_fallbacks": []
+    },
+    {
+      "runtime": "codex",
+      "model": "gpt-6-astra",
+      "observed_on": "2026-10-15",
+      "source_id": "owner-policy-gpt-6-astra-prohibition-2026-10-15",
+      "prior_scope": "standing owner-policy prohibition for every role, retained solely as prohibition evidence",
+      "limitations": ["not an eligibility path", "no automatic expiry; only explicit owner instruction can lift the prohibition"],
+      "prohibited": true,
+      "prohibition_reason": "standing owner policy prohibits GPT-6 Astra (gpt-6-astra and equivalent aliases) for every role, including delegation, review, acceptance, escalation, fallback, and terminal work; no automatic expiry",
+      "prohibited_authority_roles": ["terminal_leaf","delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
+      "long_context_eligible": false,
+      "strong_gate_fallback_efforts": [],
+      "strength_rank": 0,
+      "class_fit": [],
       "authority_evidence": [],
       "one_shot_environment_fallbacks": []
     }
