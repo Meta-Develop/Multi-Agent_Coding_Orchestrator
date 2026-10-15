@@ -405,13 +405,14 @@ mod tests {
             .context("bundled Sol prior")?
             .clone();
         prior.model = model.to_string();
+        prior.observed_on = base.published_on.clone();
         prior.source_id = "operator-declared-new-model".to_string();
         prior.prior_scope = "operator dated prior for focused admission test".to_string();
         Ok(OperatorPriorSnapshot {
             schema_version: PRIOR_INPUT_SCHEMA_VERSION,
             dataset_id: "operator-prior-test".to_string(),
-            revision: "2026-09-13.1".to_string(),
-            published_on: "2026-09-13".to_string(),
+            revision: format!("{}+operator-prior-test", base.revision),
+            published_on: base.published_on.clone(),
             models: vec![prior],
             capability_policy: ModelCapabilityPolicy {
                 id: "operator-capability-test".to_string(),
@@ -422,7 +423,7 @@ mod tests {
                     capability: ModelCapabilityClass::CriticalJudgment,
                     eligible: true,
                     evidence: "operator-declared capability fixture".to_string(),
-                    as_of: "2026-09-13".to_string(),
+                    as_of: base.published_on,
                 }],
             },
         })
@@ -436,6 +437,25 @@ mod tests {
             raw,
         )?;
         Ok(install(Some(binding)))
+    }
+
+    #[test]
+    fn predating_operator_dataset_is_refused() -> Result<()> {
+        let base = selection::built_in_prior_dataset()?;
+        let mut snapshot = new_model_snapshot("new-advertised-model")?;
+        let year = base.published_on[..4].parse::<u32>()?;
+        snapshot.published_on = format!("{:04}-01-01", year - 1);
+        assert!(snapshot.published_on < base.published_on);
+        let error = bind_fixture(&snapshot)
+            .err()
+            .context("predating operator dataset must refuse")?;
+        assert!(
+            error
+                .to_string()
+                .contains("operator prior data predates the bundled dataset it extends"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -565,7 +585,7 @@ mod tests {
         snapshot.models.pop();
         snapshot.models[0].observed_on = "2026-02-30".to_string();
         assert!(bind_fixture(&snapshot).is_err());
-        snapshot.models[0].observed_on = "2026-09-13".to_string();
+        snapshot.models[0].observed_on = snapshot.published_on.clone();
         snapshot.capability_policy.models[0].evidence.clear();
         assert!(bind_fixture(&snapshot).is_err());
         let mut value = serde_json::to_value(new_model_snapshot("new-advertised-model")?)?;

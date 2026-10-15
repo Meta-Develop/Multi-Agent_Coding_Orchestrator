@@ -15705,20 +15705,22 @@ done
 
         const MODEL: &str = "operator-cursor-fixture";
         let (_temp, repo) = super::super::tests::injected_repository();
-        let mut prior = base_selector_priors_with_terminal_worker_economics()?
+        let base = base_selector_priors_with_terminal_worker_economics()?;
+        let mut prior = base
             .models
             .into_iter()
             .find(|row| row.model == "gpt-5.6-sol")
             .context("bundled Sol prior")?;
         prior.runtime = "cursor".to_string();
         prior.model = MODEL.to_string();
+        prior.observed_on = base.published_on.clone();
         prior.source_id = "operator-cursor-fixture".to_string();
         prior.prior_scope = "operator dated adapter admission fixture".to_string();
         let mut snapshot = OperatorPriorSnapshot {
             schema_version: 1,
             dataset_id: "operator-cursor-test".to_string(),
-            revision: "2026-09-13.1".to_string(),
-            published_on: "2026-09-13".to_string(),
+            revision: format!("{}+operator-cursor-test", base.revision),
+            published_on: base.published_on.clone(),
             models: Vec::new(),
             capability_policy: ModelCapabilityPolicy {
                 id: "operator-cursor-capability-test".to_string(),
@@ -15801,7 +15803,7 @@ done
                 capability: ModelCapabilityClass::GeneralJudgment,
                 eligible: false,
                 evidence: "operator-declared ineligible adapter fixture".to_string(),
-                as_of: "2026-09-13".to_string(),
+                as_of: base.published_on,
             });
         write_snapshot(&snapshot)?;
         {
