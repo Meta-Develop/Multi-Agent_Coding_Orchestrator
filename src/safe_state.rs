@@ -3424,9 +3424,28 @@ fn same_file_generation(before: &fs::Metadata, after: &fs::Metadata) -> bool {
 
 #[cfg(unix)]
 fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Result<File> {
-    let mut directory = open_unix_directory(root)?;
+    let directory = open_unix_directory(root)?;
+    open_relative_regular_no_follow_allow_mounts(&directory, relative, false)
+}
+
+/// Walk from a held directory without following any path component. Mounts are
+/// allowed; callers must separately verify the expected file identity and policy.
+#[cfg(unix)]
+pub(crate) fn open_relative_regular_no_follow_allow_mounts(
+    root: &File,
+    relative: &Path,
+    append: bool,
+) -> Result<File> {
     let components = relative.components().collect::<Vec<_>>();
-    let mut walked = root.to_path_buf();
+    if components.is_empty()
+        || !components
+            .iter()
+            .all(|component| matches!(component, Component::Normal(_)))
+    {
+        bail!("expected a nonempty relative path without traversal");
+    }
+    let mut directory = root.try_clone()?;
+    let mut walked = PathBuf::new();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(segment) = component else {
             bail!("invalid relative component in {}", relative.display());
@@ -3459,7 +3478,13 @@ fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Resu
             libc::openat(
                 directory.as_raw_fd(),
                 name.as_ptr(),
-                libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                (if append {
+                    libc::O_WRONLY | libc::O_APPEND
+                } else {
+                    libc::O_RDONLY
+                }) | libc::O_NOFOLLOW
+                    | libc::O_CLOEXEC
+                    | libc::O_NONBLOCK,
             )
         };
         if fd < 0 {
@@ -3471,7 +3496,7 @@ fn open_relative_regular_unix_allow_mounts(root: &Path, relative: &Path) -> Resu
             });
         }
         let opened = unsafe { File::from_raw_fd(fd) };
-        identity_from_file(&opened, &root.join(relative))?;
+        identity_from_file(&opened, relative)?;
         return Ok(opened);
     }
     bail!(

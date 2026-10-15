@@ -660,7 +660,6 @@ fn verify_worker_journal_identity(
 fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
-    use std::os::unix::io::{AsRawFd, FromRawFd};
     use std::path::Component;
 
     if !path.is_absolute()
@@ -675,6 +674,51 @@ fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> 
     let relative = path.strip_prefix("/")?;
     let name = CString::new(relative.as_os_str().as_bytes())?;
     let root = fs::File::open("/")?;
+    let flags = (if append {
+        libc::O_WRONLY | libc::O_APPEND
+    } else {
+        libc::O_RDONLY
+    }) | libc::O_CLOEXEC
+        | libc::O_NOFOLLOW
+        | libc::O_NONBLOCK;
+    match open_worker_journal_at(&root, &name, flags) {
+        Ok(file) => Ok(file),
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            // Older kernels and sandbox seccomp filters can make openat2
+            // unavailable. Reuse the descriptor-relative component walk: every
+            // ancestor is O_DIRECTORY | O_NOFOLLOW, and the leaf never follows,
+            // creates or truncates. Mounts remain allowed, just as above. The
+            // caller verifies the held fd's identity, owner, mode and link count
+            // before writing and on both reopens.
+            crate::safe_state::open_relative_regular_no_follow_allow_mounts(&root, relative, append)
+                .context("cannot open the existing worker journal without following links")
+        }
+        Err(error) => {
+            Err(error).context("cannot open the existing worker journal without following links")
+        }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static WORKER_JOURNAL_OPENAT2_ERROR: std::cell::Cell<Option<i32>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+#[cfg(target_os = "linux")]
+fn open_worker_journal_at(
+    root: &fs::File,
+    name: &std::ffi::CStr,
+    flags: libc::c_int,
+) -> std::io::Result<fs::File> {
+    use std::os::unix::io::{AsRawFd, FromRawFd};
+
+    #[cfg(test)]
+    if let Some(error) = WORKER_JOURNAL_OPENAT2_ERROR.with(|slot| slot.get()) {
+        return Err(std::io::Error::from_raw_os_error(error));
+    }
+
     #[repr(C)]
     struct OpenHow {
         flags: u64,
@@ -682,15 +726,7 @@ fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> 
         resolve: u64,
     }
     let how = OpenHow {
-        flags: u64::try_from(
-            (if append {
-                libc::O_WRONLY | libc::O_APPEND
-            } else {
-                libc::O_RDONLY
-            }) | libc::O_CLOEXEC
-                | libc::O_NOFOLLOW
-                | libc::O_NONBLOCK,
-        )?,
+        flags: flags as u64,
         mode: 0,
         // BENEATH | NO_MAGICLINKS | NO_SYMLINKS. Bind mounts are admitted by
         // the existing exact-file containment contract; do not forbid those.
@@ -708,13 +744,15 @@ fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> 
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error())
-            .context("cannot open the existing worker journal without following links");
+        return Err(std::io::Error::last_os_error());
     }
-    let fd = i32::try_from(fd).context("worker journal descriptor overflow")?;
     // SAFETY: successful openat2 returned a new descriptor, transferred once.
-    Ok(unsafe { fs::File::from_raw_fd(fd) })
+    Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
 }
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "reporting_tests.rs"]
+mod tests;
 
 pub(super) fn worker_execution_journal_apply_patch_example() -> Result<String> {
     let entry = WorkerExecutionJournalEntry {
