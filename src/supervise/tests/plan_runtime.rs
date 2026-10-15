@@ -3578,6 +3578,22 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
             on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
         })
     );
+
+    // Unmodified all_frontier_role_models() is what selects ALL_FRONTIER_PROFILE_NAME.
+    let mut frontier_plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    frontier_plan.role_models = all_frontier_role_models();
+    let document = serde_json::to_string(&frontier_plan).expect("serialize frontier profile plan");
+    let loaded =
+        parse_supervisor_plan_with_consultant(&document).expect("reload frontier profile plan");
+    assert_eq!(loaded.plan.role_models, frontier_plan.role_models);
+    assert_eq!(
+        loaded.plan.effective_role_economics_profile().name,
+        ALL_FRONTIER_PROFILE_NAME
+    );
 }
 
 #[test]

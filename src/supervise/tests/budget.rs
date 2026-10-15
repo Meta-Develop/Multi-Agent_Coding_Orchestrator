@@ -1089,11 +1089,42 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
         .as_ref()
         .and_then(|profile| profile.execution.as_ref())
         .expect("execution telemetry");
-    assert_eq!(execution.budget_degradations.len(), 1);
-    assert!(matches!(
-        execution.budget_degradations[0].change,
-        BudgetDegradationChange::Halt { .. }
-    ));
+    // Halts are recorded per denied pending assignment.
+    assert_eq!(
+        execution.budget_degradations.len(),
+        2,
+        "expected exactly two budget halts: {:#?}",
+        execution.budget_degradations
+    );
+    assert!(
+        execution.budget_degradations.iter().all(|record| matches!(
+            record.change,
+            BudgetDegradationChange::Halt {
+                before_new_dispatch_allowed: true,
+                after_new_dispatch_allowed: false,
+            }
+        )),
+        "expected a budget halt: {:#?}",
+        execution.budget_degradations
+    );
+    assert!(
+        execution
+            .budget_degradations
+            .iter()
+            .all(|record| record.role_binding_transition.is_none()),
+        "expected no role-binding transition: {:#?}",
+        execution.budget_degradations
+    );
+    assert_eq!(
+        execution
+            .budget_degradations
+            .iter()
+            .map(|record| record.assignment_id.as_str())
+            .collect::<BTreeSet<_>>(),
+        BTreeSet::from(["degrade-child-6", "degrade-pending-worker"]),
+        "expected one halt per denied pending assignment: {:#?}",
+        execution.budget_degradations
+    );
     assert_ne!(
         execution.role_bindings[&AgentRole::ChildOrchestrator].observation,
         RoleBindingObservation::AssignmentSpecific,
@@ -1154,7 +1185,10 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
         persisted["role_economics_profile"]["execution"]["budget_degradations"]
             .as_array()
             .map(Vec::len),
-        Some(1)
+        Some(2),
+        "persisted budget degradations: {:#?}; execution budget degradations: {:#?}",
+        persisted["role_economics_profile"]["execution"]["budget_degradations"],
+        execution.budget_degradations
     );
 }
 
