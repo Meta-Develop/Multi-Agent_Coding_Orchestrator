@@ -1182,7 +1182,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         "--property=CapabilityBoundingSet=".to_string(),
         "--property=AmbientCapabilities=".to_string(),
         "--property=PrivateUsers=yes".to_string(),
-        "--property=RestrictNamespaces=yes".to_string(),
+        "--property=RestrictNamespaces=no".to_string(),
         "--property=PrivateNetwork=no".to_string(),
         "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string(),
         format!(
@@ -1208,7 +1208,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
     ] {
         assert!(arguments.contains(&expected), "missing {expected}");
     }
-    assert!(!arguments.contains("--property=RestrictNamespaces=no"));
+    assert!(!arguments.contains("--property=RestrictNamespaces=yes"));
     assert!(arguments
         .iter()
         .all(|argument| !argument.contains("AF_NETLINK")));
@@ -1216,7 +1216,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         .iter()
         .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
         .expect("ExternalGrok system call filter");
-    assert!(system_call_filter
+    assert!(!system_call_filter
         .split_whitespace()
         .any(|token| token.trim_start_matches('~') == "@mount"));
 
@@ -4593,7 +4593,7 @@ fn system_call_filter_accepts_retained_and_complete_expanded_deny_forms() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
+fn external_codex_and_grok_admit_inner_bubblewrap_namespaces_and_mounts() {
     let mut external = program_visibility_sandbox(Path::new("/worktree"));
     external.kind = SideEffectConfinementProfileKind::ExternalCodex;
     let mut command = Command::new("systemd-run");
@@ -4613,6 +4613,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         .iter()
         .any(|argument| argument == "--property=PrivateUsers=yes"));
     for expected in [
+        "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
         "--property=AmbientCapabilities=",
     ] {
@@ -4633,20 +4634,40 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         external_filter,
     )
     .expect("ExternalCodex bubblewrap-compatible deny list");
-    verify_effective_namespace_restriction(SideEffectConfinementProfileKind::ExternalCodex, "no")
-        .expect("ExternalCodex namespaces are available to bubblewrap");
-    assert!(verify_effective_namespace_restriction(
-        SideEffectConfinementProfileKind::ExternalCodex,
-        "yes",
+    external.kind = SideEffectConfinementProfileKind::ExternalGrok;
+    let mut grok_command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut grok_command,
+        &external,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    let grok_arguments = grok_command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let expected_grok_arguments = arguments
+        .iter()
+        .map(|argument| {
+            if argument == "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+            {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string()
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(grok_arguments, expected_grok_arguments);
+    verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalGrok,
+        external_filter,
     )
-    .is_err());
+    .expect("ExternalGrok has the same bubblewrap-compatible deny list as ExternalCodex");
 
     for kind in [
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
         SideEffectConfinementProfileKind::ExternalClaude,
-        SideEffectConfinementProfileKind::ExternalGrok,
         SideEffectConfinementProfileKind::GeminiOnlineBridge,
         SideEffectConfinementProfileKind::ExternalCursor,
         SideEffectConfinementProfileKind::TrustedCompatibility,
@@ -4694,16 +4715,16 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
             | SideEffectConfinementProfileKind::TrustedCompatibility => {
                 "--property=RestrictAddressFamilies=AF_INET AF_INET6"
             }
-            SideEffectConfinementProfileKind::ExternalGrok
-            | SideEffectConfinementProfileKind::GeminiOnlineBridge
+            SideEffectConfinementProfileKind::GeminiOnlineBridge
             | SideEffectConfinementProfileKind::ExternalCursor => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
             }
             SideEffectConfinementProfileKind::ExternalClaude => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET"
             }
-            SideEffectConfinementProfileKind::ExternalCodex => {
-                unreachable!("ExternalCodex is checked separately")
+            SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok => {
+                unreachable!("bubblewrap profiles are checked separately")
             }
         };
         assert!(
@@ -4733,11 +4754,32 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     }
 
     let ordinary_filter = retained_system_call_filter_fixture();
-    assert!(verify_effective_system_call_filter(
+    for kind in [
         SideEffectConfinementProfileKind::ExternalCodex,
-        &ordinary_filter,
-    )
-    .is_err());
+        SideEffectConfinementProfileKind::ExternalGrok,
+    ] {
+        verify_effective_namespace_restriction(kind, "no").expect("bubblewrap requires namespaces");
+        assert!(verify_effective_namespace_restriction(kind, "yes").is_err());
+        assert!(verify_effective_system_call_filter(kind, &ordinary_filter).is_err());
+        for (group, representatives) in required_denied_group_representatives() {
+            if group == "@mount" {
+                for denied_mount in std::iter::once(group).chain(representatives.iter().copied()) {
+                    assert!(verify_effective_system_call_filter(
+                        kind,
+                        &format!("{external_filter} {denied_mount}"),
+                    )
+                    .is_err());
+                }
+            } else {
+                let incomplete_filter = external_filter
+                    .split_whitespace()
+                    .filter(|token| token.trim_start_matches('~') != group)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(verify_effective_system_call_filter(kind, &incomplete_filter).is_err());
+            }
+        }
+    }
     assert!(verify_effective_system_call_filter(
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
         external_filter,

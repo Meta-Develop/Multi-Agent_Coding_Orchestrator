@@ -16,7 +16,12 @@ fn verify_effective_system_call_filter(
     // architecture-specific expansion. Require either the group token or every selected
     // architecture-common member from each requested group.
     for (group, representatives) in required_denied_group_representatives() {
-        if kind == SideEffectConfinementProfileKind::ExternalCodex && group == "@mount" {
+        if matches!(
+            kind,
+            SideEffectConfinementProfileKind::ExternalCodex
+                | SideEffectConfinementProfileKind::ExternalGrok
+        ) && group == "@mount"
+        {
             let denied_group = tokens
                 .iter()
                 .any(|token| token.trim_start_matches('~') == group);
@@ -29,7 +34,7 @@ fn verify_effective_system_call_filter(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
-                        "effective SystemCallFilter denied ExternalCodex inner bubblewrap mount operations: {}",
+                        "effective SystemCallFilter denied {kind:?} inner bubblewrap mount operations: {}",
                         denied_member.copied().unwrap_or(group)
                     ),
                 ));
@@ -124,7 +129,11 @@ fn verify_effective_namespace_restriction(
     kind: SideEffectConfinementProfileKind,
     value: &str,
 ) -> std::io::Result<()> {
-    let expected = if kind == SideEffectConfinementProfileKind::ExternalCodex {
+    let expected = if matches!(
+        kind,
+        SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok
+    ) {
         "no"
     } else {
         "yes"
