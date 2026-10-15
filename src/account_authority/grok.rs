@@ -24,7 +24,7 @@ pub(crate) struct GrokLaunchAuthority {
     registry: StoredAccountRegistry,
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
     // Held until this launch authority is dropped, including failed runs.
     _selected_use_lease: SelectedUseLease,
     managed_grok_home: PathBuf,
@@ -44,7 +44,7 @@ impl GrokLaunchAuthority {
             account_incarnation: self.binding.account_incarnation.clone(),
             selection_revision: self.binding.selection_revision,
             // Report captured identity even for no-socket local observe-then-launch.
-            // `socket_bound` is the revalidation/no-fallback flag, not a hide-identity flag.
+            // The socket path freezes the source without hiding the registry identity.
             authority_id: self.authority_id.clone(),
         }
     }
@@ -61,14 +61,15 @@ impl GrokLaunchAuthority {
 
     /// Re-read the chosen authority before releasing the target process.
     pub(crate) fn verify_binding_unchanged(&self) -> Result<()> {
-        if self.socket_bound {
-            let socket_path = configured_cam_authority_socket().ok_or_else(|| {
-                anyhow!(
-                    "Coding Agent Manager authority socket is no longer configured; refusing local fallback"
-                )
-            })?;
+        if super::cam_socket_for_frozen_selection(self.socket_path.as_deref())? != self.socket_path
+        {
+            return Err(anyhow!(
+                "selected Grok authority socket configuration changed"
+            ));
+        }
+        if let Some(socket_path) = &self.socket_path {
             let live =
-                super::selected_binding_via_authority_socket(&socket_path, GROK_CLI_PROVIDER_ID)
+                super::selected_binding_via_authority_socket(socket_path, GROK_CLI_PROVIDER_ID)
                     .context(
                     "failed to revalidate Coding Agent Manager Grok selection via authority socket",
                 )?;
@@ -130,12 +131,9 @@ pub(crate) fn acquire_grok_launch_authority(
             )
         })?;
         revalidate_frozen_selection_via_socket(socket_path, frozen)?;
-        return acquire_from_execution_registry(Some(frozen), true);
+        return acquire_from_execution_registry(Some(frozen), Some(socket_path.clone()));
     }
-    match frozen {
-        Some(frozen) => acquire_from_execution_registry(Some(frozen), false),
-        None => acquire_from_execution_registry(None, false),
-    }
+    acquire_from_execution_registry(frozen, socket_path)
 }
 
 /// Acquire a selected CAM account for optional live catalog discovery.
@@ -210,7 +208,7 @@ fn revalidate_frozen_selection_via_socket(
 
 fn acquire_from_execution_registry(
     frozen: Option<&FrozenGrokSelectedBinding>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
 ) -> Result<GrokLaunchAuthority> {
     #[cfg(test)]
     {
@@ -220,7 +218,7 @@ fn acquire_from_execution_registry(
                     &harness.registry,
                     &harness.adapter,
                     frozen,
-                    socket_bound,
+                    socket_path.clone(),
                 )
             })
         });
@@ -238,7 +236,7 @@ fn acquire_from_execution_registry(
         &registry,
         &GrokCliAdapter::default(),
         frozen,
-        socket_bound,
+        socket_path,
     )
 }
 
@@ -248,14 +246,14 @@ pub(crate) fn acquire_grok_launch_authority_from(
     registry: &StoredAccountRegistry,
     adapter: &GrokCliAdapter,
 ) -> Result<GrokLaunchAuthority> {
-    acquire_grok_launch_authority_from_bound(registry, adapter, None, false)
+    acquire_grok_launch_authority_from_bound(registry, adapter, None, None)
 }
 
 fn acquire_grok_launch_authority_from_bound(
     registry: &StoredAccountRegistry,
     adapter: &GrokCliAdapter,
     frozen: Option<&FrozenGrokSelectedBinding>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
 ) -> Result<GrokLaunchAuthority> {
     let current = registry
         .selected_binding(GROK_CLI_PROVIDER_ID)
@@ -271,7 +269,7 @@ fn acquire_grok_launch_authority_from_bound(
     } else {
         (current, None)
     };
-    finish_grok_launch_authority(registry, adapter, binding, authority_id, socket_bound)
+    finish_grok_launch_authority(registry, adapter, binding, authority_id, socket_path)
 }
 
 fn require_execution_matches_frozen(
@@ -298,7 +296,7 @@ fn finish_grok_launch_authority(
     adapter: &GrokCliAdapter,
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
 ) -> Result<GrokLaunchAuthority> {
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
@@ -314,7 +312,7 @@ fn finish_grok_launch_authority(
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
-        socket_bound,
+        socket_path,
         _selected_use_lease: selected_use_lease,
         managed_grok_home,
         launch_env_removals,
@@ -620,7 +618,7 @@ mod tests {
         let authority = acquire_optional_grok_catalog_authority()?.context("local selection")?;
         assert_eq!(authority.binding().account_id, "account-a");
         assert_eq!(authority.managed_grok_home(), managed_home);
-        assert!(!authority.socket_bound);
+        assert!(authority.socket_path.is_none());
         assert!(authority.selection_evidence().authority_id.is_some());
         authority.verify_binding_unchanged()?;
         Ok(())
@@ -751,7 +749,7 @@ mod tests {
             frozen.authority_socket = None;
             if !parent_exists {
                 let authority = acquire_grok_launch_authority(Some(&frozen))?;
-                assert!(!authority.socket_bound);
+                assert!(authority.socket_path.is_none());
                 authority.verify_binding_unchanged()?;
                 drop(authority);
                 assert!(acquire_grok_launch_authority(None).is_ok());
@@ -1118,6 +1116,22 @@ mod tests {
     }
 
     #[test]
+    fn grok_launch_endpoint_changes_after_acquire_are_refused() -> Result<()> {
+        let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+        super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
+            |socket_path| {
+                acquire_grok_launch_authority_from_bound(
+                    &harness.registry,
+                    &harness.adapter,
+                    None,
+                    socket_path,
+                )
+            },
+            |authority| authority.verify_binding_unchanged(),
+        )
+    }
+
+    #[test]
     fn matching_socket_and_local_authority_acquires_frozen_binding() -> Result<()> {
         let fixture = Fixture::new();
         add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
@@ -1147,6 +1161,17 @@ mod tests {
         let evidence = authority.selection_evidence();
         assert_eq!(evidence.account_id, expected_account);
         assert_eq!(evidence.authority_id, expected_authority);
+        authority.verify_binding_unchanged()?;
+        // Both endpoints serve exactly the same registry and binding. The path
+        // itself remains part of the launch contract.
+        let replacement_registry = StoredAccountRegistry::new(authority.registry.metadata_path());
+        let (_replacement_dir, replacement, _replacement_server) =
+            serve_registry_on_socket(replacement_registry);
+        {
+            let _changed = SocketEnvGuard::set(&replacement);
+            let error = authority.verify_binding_unchanged().unwrap_err();
+            assert!(format!("{error:#}").contains("socket configuration changed"));
+        }
         authority.verify_binding_unchanged()?;
         Ok(())
     }

@@ -6131,6 +6131,14 @@ impl ValidatedCodexAuth {
     }
 
     fn verify_source_unchanged(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.managed_authority.is_none()
+            && crate::account_authority::cam_socket_for_frozen_selection(None)
+                .context(CodexAuthValidationFailureCause::ManagedSelectionNotCarried)?
+                .is_some()
+        {
+            return Err(CodexAuthValidationFailureCause::ManagedSelectionNotCarried.into());
+        }
         let metadata = fs::symlink_metadata(&self.path)
             .context(CodexAuthValidationFailureCause::AuthFileRevalidationInspectionFailed)?;
         if metadata.file_type().is_symlink()
@@ -7423,6 +7431,98 @@ mod selected_codex_auth_tests {
             .with_codex_managed_worker_requests()
             .managed_parent_control_transport(SupervisorRuntime::Codex)
             .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_codex_auth_endpoint_appearing_before_release_is_refused() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+
+        // Keep the full legacy loader's ancestry checks; this fixture never
+        // reads the operator's auth home. Run on a normally owned filesystem.
+        let root = tempfile::Builder::new()
+            .prefix("maco-local-auth-endpoint-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let home = root.path().join("legacy");
+        write_synthetic_auth(&home, b"FAKE-legacy-codex-auth")?;
+        let previous = set_injected_codex_auth_home_for_test(Some(home));
+        struct RestoreHome(Option<PathBuf>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                set_injected_codex_auth_home_for_test(self.0.take());
+            }
+        }
+        let _home = RestoreHome(previous);
+        for observed in [false, true] {
+            let run_id = if observed {
+                "r14-local-observed"
+            } else {
+                "r14-local-unobserved"
+            };
+            let socket = root
+                .path()
+                .join(if observed { "obs" } else { "raw" })
+                .join("cam.sock");
+            let _endpoint = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            if observed {
+                record_observed_codex_selection_from_source(
+                    Some(run_id), CODEX_CLI_PROVIDER_ID, None, None, None,
+                );
+            }
+            let auth = ValidatedCodexAuth::load_for_command(&command(run_id))?
+                .context("synthetic legacy auth capture")?;
+            assert!(auth.managed_authority.is_none());
+            auth.verify_source_unchanged()?;
+            fs::create_dir(socket.parent().unwrap())?;
+            // A real endpoint appears after capture while auth.json is unchanged.
+            let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            let error = auth.verify_source_unchanged().unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<CodexAuthValidationFailureCause>(),
+                Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_codex_auth_revalidation_refuses_new_endpoint() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Exercise the pre-release check with a synthetic captured source. The
+        // full loader's ancestry checks are covered by the admission test above.
+        for entry in ["parent", "socket", "file"] {
+            let root = tempfile::tempdir()?;
+            let socket = root.path().join("maco/account-authority.sock");
+            let _endpoint = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            write_synthetic_auth(root.path(), b"FAKE-legacy-codex-auth")?;
+            let path = root.path().join("auth.json");
+            let metadata = fs::metadata(&path)?;
+            let auth = ValidatedCodexAuth {
+                managed_authority: None,
+                bytes: fs::read(&path)?,
+                path,
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            };
+            auth.verify_source_unchanged()?;
+            fs::create_dir(socket.parent().unwrap())?;
+            let _listener = match entry {
+                "socket" => Some(std::os::unix::net::UnixListener::bind(&socket)?),
+                "file" => {
+                    fs::write(&socket, b"not a socket")?;
+                    None
+                }
+                _ => None,
+            };
+            let error = auth.verify_source_unchanged().unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<CodexAuthValidationFailureCause>(),
+                Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+            );
+        }
         Ok(())
     }
 

@@ -978,3 +978,6 @@ mod run_binding_tests {
         admit_gemini_run_account_binding(RUN_A, None);
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod launch_endpoint_tests;

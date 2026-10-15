@@ -15,8 +15,7 @@ use coding_agent_manager_lib::providers::cursor::CursorAdapter;
 use coding_agent_manager_lib::providers::launch_spec_for;
 
 use super::{
-    configured_cam_authority_socket, FrozenCursorSelectedBinding,
-    ManagedCursorAccountSelectionEvidence, CURSOR_PROVIDER_ID,
+    FrozenCursorSelectedBinding, ManagedCursorAccountSelectionEvidence, CURSOR_PROVIDER_ID,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,7 +31,7 @@ pub(crate) struct CursorLaunchAuthority {
     registry: StoredAccountRegistry,
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
     managed_home: PathBuf,
     auth_path: PathBuf,
@@ -74,13 +73,14 @@ impl CursorLaunchAuthority {
     }
 
     pub(crate) fn verify_binding_unchanged(&self) -> Result<()> {
-        if self.socket_bound {
-            let socket = configured_cam_authority_socket().ok_or_else(|| {
-                anyhow!(
-                    "Coding Agent Manager authority socket disappeared; refusing local fallback"
-                )
-            })?;
-            let live = super::selected_binding_via_authority_socket(&socket, CURSOR_PROVIDER_ID)
+        if super::cam_socket_for_frozen_selection(self.socket_path.as_deref())? != self.socket_path
+        {
+            return Err(anyhow!(
+                "selected Cursor authority socket configuration changed"
+            ));
+        }
+        if let Some(socket) = &self.socket_path {
+            let live = super::selected_binding_via_authority_socket(socket, CURSOR_PROVIDER_ID)
                 .context("failed to revalidate Cursor selection via authority socket")?;
             let Some((authority_id, binding)) = live else {
                 return Err(anyhow!(
@@ -143,19 +143,14 @@ pub(crate) fn acquire_cursor_launch_authority(
         .map(|dirs| dirs.data_dir().to_path_buf())
         .context("Coding Agent Manager data directory is unavailable")?;
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
-    acquire_from_registry(
-        &registry,
-        &CursorAdapter::default(),
-        carried,
-        socket.is_some(),
-    )
+    acquire_from_registry(&registry, &CursorAdapter::default(), carried, socket)
 }
 
 fn acquire_from_registry(
     registry: &StoredAccountRegistry,
     adapter: &CursorAdapter,
     frozen: Option<&FrozenCursorSelectedBinding>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
 ) -> Result<CursorLaunchAuthority> {
     let current = registry
         .selected_binding(CURSOR_PROVIDER_ID)
@@ -191,7 +186,7 @@ fn acquire_from_registry(
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
-        socket_bound,
+        socket_path,
         _selected_use_lease: selected_use_lease,
         managed_home,
         auth_path,
@@ -288,4 +283,44 @@ fn verify_auth_identity(path: &Path, file: &File, expected: CursorAuthIdentity) 
 
 fn map_cam_error(error: CamError) -> anyhow::Error {
     anyhow!("Coding Agent Manager Cursor authority refused launch: {error}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn cursor_launch_endpoint_changes_after_acquire_are_refused() -> Result<()> {
+        let root = tempfile::tempdir()?;
+        let data = root.path().join("data");
+        fs::create_dir(&data)?;
+        let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+        registry.begin_add(
+            CURSOR_PROVIDER_ID,
+            "work",
+            "Work",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        registry.complete_add(CURSOR_PROVIDER_ID, "work")?;
+        registry.select_complete_revision(CURSOR_PROVIDER_ID, "work", None)?;
+        let home = data.join("accounts").join(CURSOR_PROVIDER_ID).join("work");
+        let config = home.join(".cursor");
+        fs::create_dir_all(&config)?;
+        for directory in [&home, &config] {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+        }
+        let auth = config.join("auth.json");
+        fs::write(&auth, b"synthetic-cursor-auth")?;
+        fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+        let adapter = CursorAdapter::with_home(root.path())
+            .with_data_dir(&data)
+            .with_working_directory(root.path());
+        super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
+            |socket_path| acquire_from_registry(&registry, &adapter, None, socket_path),
+            |authority| authority.verify_binding_unchanged(),
+        )
+    }
 }

@@ -20,8 +20,7 @@ use serde_json::{Map, Value};
 use crate::artifacts::state_auth::sha256_hex;
 
 use super::{
-    configured_cam_authority_socket, require_carried_claude_launch_binding,
-    FrozenClaudeSelectedBinding, CLAUDE_CODE_PROVIDER_ID,
+    require_carried_claude_launch_binding, FrozenClaudeSelectedBinding, CLAUDE_CODE_PROVIDER_ID,
 };
 
 const MAX_CLAUDE_CREDENTIAL_BYTES: usize = 1024 * 1024;
@@ -51,7 +50,7 @@ pub(crate) struct ClaudeLaunchAuthority {
     registry: StoredAccountRegistry,
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
     #[cfg(test)]
     managed_home: PathBuf,
@@ -135,14 +134,15 @@ impl ClaudeLaunchAuthority {
     }
 
     pub(crate) fn verify_binding_unchanged(&mut self) -> Result<()> {
-        if self.socket_bound {
-            let socket_path = configured_cam_authority_socket().ok_or_else(|| {
-                anyhow!(
-                    "Coding Agent Manager authority socket is no longer configured; refusing local fallback"
-                )
-            })?;
+        if super::cam_socket_for_frozen_selection(self.socket_path.as_deref())? != self.socket_path
+        {
+            return Err(anyhow!(
+                "selected Claude authority socket configuration changed"
+            ));
+        }
+        if let Some(socket_path) = &self.socket_path {
             let live =
-                super::selected_binding_via_authority_socket(&socket_path, CLAUDE_CODE_PROVIDER_ID)
+                super::selected_binding_via_authority_socket(socket_path, CLAUDE_CODE_PROVIDER_ID)
                     .context("failed to revalidate Coding Agent Manager Claude selection")?;
             let Some((authority_id, binding)) = live else {
                 bail!("no complete selected Coding Agent Manager Claude account");
@@ -208,7 +208,7 @@ pub(crate) fn acquire_claude_launch_authority(
         &registry,
         &data_dir,
         frozen,
-        socket_path.is_some(),
+        socket_path,
         deadline_unix_millis,
     )
 }
@@ -217,7 +217,7 @@ fn acquire_from_registry(
     registry: &StoredAccountRegistry,
     data_dir: &Path,
     frozen: Option<&FrozenClaudeSelectedBinding>,
-    socket_bound: bool,
+    socket_path: Option<PathBuf>,
     deadline_unix_millis: u64,
 ) -> Result<ClaudeLaunchAuthority> {
     let current = registry
@@ -264,7 +264,7 @@ fn acquire_from_registry(
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
-        socket_bound,
+        socket_path,
         _selected_use_lease: selected_use_lease,
         #[cfg(test)]
         managed_home,
@@ -329,7 +329,7 @@ pub(crate) fn acquire_claude_launch_authority_from(
     frozen: Option<&FrozenClaudeSelectedBinding>,
     deadline_unix_millis: u64,
 ) -> Result<ClaudeLaunchAuthority> {
-    acquire_from_registry(registry, data_dir, frozen, false, deadline_unix_millis)
+    acquire_from_registry(registry, data_dir, frozen, None, deadline_unix_millis)
 }
 
 fn safe_account_component(value: &str) -> bool {
@@ -689,7 +689,18 @@ mod tests {
     }
 
     #[test]
+    fn claude_launch_endpoint_changes_after_acquire_are_refused() -> Result<()> {
+        let (_root, registry, data, deadline) = selected_fixture()?;
+        super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
+            |socket_path| acquire_from_registry(&registry, &data, None, socket_path, deadline),
+            |authority| authority.verify_binding_unchanged(),
+        )
+    }
+
+    #[test]
     fn selected_managed_oauth_grant_is_bound_and_revalidated() -> Result<()> {
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
         let (_root, registry, data, deadline) = selected_fixture()?;
         let binding = registry
             .selected_binding(CLAUDE_CODE_PROVIDER_ID)?
