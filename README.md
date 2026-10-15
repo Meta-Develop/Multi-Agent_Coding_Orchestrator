@@ -29,6 +29,47 @@ reviewable and recoverable:
 
 ## Current Status
 
+### Quickstart: one supervised Codex task on Linux
+
+`maco init`, `maco repo`, `maco llm`, and `maco supervise plan` stay local, including on Windows. `maco supervise run` needs Linux. The process must already sit in a delegated systemd user manager (`user@<uid>.service` on the unified cgroup v2 hierarchy). Windows refuses writable-runtime admission before spawn.
+
+That Linux host also needs:
+
+- an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
+- root-owned, non-writable, executable `systemd-run`, `systemctl`, `sh`, `env`, `sleep`, `stat`, and `findmnt` at `/usr/bin`, `/bin`, or `/run/current-system/sw/bin`
+- logical `codex` at `/usr/bin/codex`, `/bin/codex`, or `/run/current-system/sw/bin/codex` (root-owned, executable, not group- or world-writable, not a symlink). Catalog preflight runs `codex debug models` with a 30-second limit
+- `$CODEX_HOME/auth.json`, or `~/.codex/auth.json` when `CODEX_HOME` is unset, as a non-symlink regular file
+- `MACO_CAM_AUTHORITY_SOCKET` left unset
+
+Reviewed `machine-global.json` (version 1). The root named by `--machine-global-runtime-root-id` is an existing canonical directory inside `/run/user/<uid>`. `state_root` is a different owner-private `0700` directory and does not overlap that root. The config file is current-user-owned, has one hard link, and is not group- or world-writable.
+
+```json
+{
+  "version": 1,
+  "state_root": "/run/user/1000/maco/state",
+  "roots": [
+    {
+      "id": "runtime",
+      "path": "/run/user/1000/maco/runtime",
+      "protected_paths": [],
+      "quarantine_grace_seconds": 86400
+    }
+  ]
+}
+```
+
+`1000` is the operator uid. Create both directories before launch. `goal.md` is the goal file read by `--from-goal`.
+
+```bash
+maco supervise run --runtime codex --repo . --run-id one-task \
+  --from-goal goal.md --codex-bin codex \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
+maco supervise collect one-task --repo . --json
+```
+
+The durable report is `.maco/o2/runs/one-task/reports/supervisor-final.json`. `supervise run` exits successfully only when its printed cascade has `follow_up_cascade_success` set to true; otherwise it exits with `supervise run failed`.
+
 The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
@@ -845,7 +886,7 @@ crosses away from its declared root's mount is refused.
   "roots": [
     {
       "id": "runtime-sessions",
-      "path": "/srv/agent-runtime/sessions",
+      "path": "/run/user/1000/maco/runtime-sessions",
       "protected_paths": [
         {
           "coordinate": {

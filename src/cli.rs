@@ -135,10 +135,11 @@ pub struct Cli {
 /// Explicit subcommand names and option-shaped first arguments retain Clap's
 /// normal behavior. `--` can be used as the first argument to force an
 /// instruction whose first word is an explicit subcommand name or looks like
-/// an option. Every routed argument is joined with one ASCII space and passed
-/// as one literal goal/spec, so option-shaped words after the first instruction
-/// word remain instruction text rather than becoming MACO options. The rewriter
-/// leaves runtime selection to account-bound normal intake before dispatch.
+/// an option. Routed words are joined with one ASCII space into one literal
+/// goal. A `--runtime <value>` or `--runtime=<value>` pair is removed from
+/// that goal and passed through as `--runtime`; every other option-shaped
+/// word stays literal goal text. When no runtime pair is present, the
+/// rewriter injects `--runtime codex`.
 pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = T>,
@@ -161,13 +162,7 @@ where
         1
     };
 
-    let mut instruction = OsString::new();
-    for (index, argument) in args[instruction_start..].iter().enumerate() {
-        if index != 0 {
-            instruction.push(" ");
-        }
-        instruction.push(argument);
-    }
+    let (instruction, runtime) = split_bare_runtime(&args[instruction_start..]);
 
     vec![
         args[0].clone(),
@@ -175,7 +170,55 @@ where
         OsString::from("run"),
         OsString::from("--literal-goal"),
         instruction,
+        OsString::from("--runtime"),
+        runtime,
     ]
+}
+
+/// Pulls `--runtime <value>` and `--runtime=<value>` out of a bare instruction.
+///
+/// The last well-formed pair wins and is omitted from the goal. A trailing
+/// `--runtime` with no value, a following option-shaped word, and every other
+/// option-shaped word stay in the goal. Goal words are joined with one ASCII
+/// space. An absent runtime defaults to `codex`.
+fn split_bare_runtime(words: &[OsString]) -> (OsString, OsString) {
+    let mut goal_words: Vec<&OsStr> = Vec::new();
+    let mut runtime = OsString::from("codex");
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if let Some(value) = bare_runtime_equals_value(word) {
+            runtime = value;
+            index += 1;
+            continue;
+        }
+        if word == OsStr::new("--runtime") {
+            if let Some(value) = words.get(index + 1) {
+                if !is_option_shaped(value) {
+                    runtime = value.clone();
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+        goal_words.push(word.as_os_str());
+        index += 1;
+    }
+
+    let mut goal = OsString::new();
+    for (word_index, word) in goal_words.iter().enumerate() {
+        if word_index != 0 {
+            goal.push(" ");
+        }
+        goal.push(word);
+    }
+    (goal, runtime)
+}
+
+fn bare_runtime_equals_value(word: &OsStr) -> Option<OsString> {
+    let text = word.to_str()?;
+    let value = text.strip_prefix("--runtime=")?;
+    Some(OsString::from(value))
 }
 
 fn is_option_shaped(argument: &OsStr) -> bool {
@@ -221,8 +264,13 @@ fn resolve_supervise_machine_global_binding(
             "explicit supervise run requires --machine-global-config and \
              --machine-global-runtime-root-id"
         ),
-        _ => bail!(
-            "--machine-global-config and --machine-global-runtime-root-id must be supplied together"
+        (None, Some(_)) => bail!(
+            "missing --machine-global-config; supply --machine-global-config and \
+             --machine-global-runtime-root-id together"
+        ),
+        (Some(_), None) => bail!(
+            "missing --machine-global-runtime-root-id; supply --machine-global-config and \
+             --machine-global-runtime-root-id together"
         ),
     }
 }

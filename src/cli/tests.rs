@@ -2557,7 +2557,7 @@ fn sniff_decision_ref_load_error_is_not_a_runtime_fallback() {
 }
 
 #[test]
-fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
+fn route_literal_instruction_args_injects_codex_runtime() {
     let routed = route_literal_instruction_args(["maco", "Update README.md"]);
     assert_eq!(
         routed,
@@ -2567,6 +2567,8 @@ fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
             OsString::from("run"),
             OsString::from("--literal-goal"),
             OsString::from("Update README.md"),
+            OsString::from("--runtime"),
+            OsString::from("codex"),
         ]
     );
 
@@ -2580,6 +2582,8 @@ fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
             OsString::from("run"),
             OsString::from("--literal-goal"),
             OsString::from("supervise is quoted instruction text"),
+            OsString::from("--runtime"),
+            OsString::from("codex"),
         ]
     );
 
@@ -2588,23 +2592,23 @@ fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
     let SuperviseSubcommand::Run(args) = supervise.command else {
         panic!("expected supervise run");
     };
-    assert_eq!(args.runtime, None);
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
     assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
 
     let quoted = Cli::try_parse_from(route_literal_instruction_args([
         "maco",
         "Update README.md",
-        "--runtime",
-        "grok",
+        "--runtime-bin",
+        "/opt/codex",
     ]))
-    .expect("option-shaped instruction words remain literal text");
+    .expect("option-shaped words other than --runtime remain literal text");
     let SuperviseSubcommand::Run(args) = expect_supervise_command(quoted.command).command else {
         panic!("expected supervise run");
     };
-    assert_eq!(args.runtime, None);
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
     assert_eq!(
         args.literal_goal.as_deref(),
-        Some("Update README.md --runtime grok")
+        Some("Update README.md --runtime-bin /opt/codex")
     );
 
     let explicit = Cli::try_parse_from(route_literal_instruction_args([
@@ -2631,5 +2635,72 @@ fn route_literal_instruction_args_defers_runtime_to_normal_intake() {
             OsString::from("status"),
             OsString::from("run-id"),
         ]
+    );
+}
+
+#[test]
+fn route_literal_instruction_args_honors_runtime_flag_equals_and_default() {
+    let separate = Cli::try_parse_from(route_literal_instruction_args([
+        "maco",
+        "Update",
+        "--runtime",
+        "grok",
+        "README.md",
+    ]))
+    .expect("separate --runtime is a runtime override");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(separate.command).command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Grok));
+    assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
+
+    let equals = Cli::try_parse_from(route_literal_instruction_args([
+        "maco",
+        "Update README.md",
+        "--runtime=codex",
+    ]))
+    .expect("equals --runtime is a runtime override");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(equals.command).command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
+    assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
+
+    let defaulted =
+        Cli::try_parse_from(route_literal_instruction_args(["maco", "Update README.md"]))
+            .expect("bare instruction defaults runtime");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(defaulted.command).command else {
+        panic!("expected supervise run");
+    };
+    assert_eq!(args.runtime, Some(supervise::SupervisorRuntime::Codex));
+    assert_eq!(args.literal_goal.as_deref(), Some("Update README.md"));
+}
+
+#[test]
+fn supervise_machine_global_binding_names_each_missing_flag() {
+    let both = resolve_supervise_machine_global_binding(false, None, None)
+        .expect_err("explicit run requires both flags");
+    let both = both.to_string();
+    assert!(both.contains("--machine-global-config"), "{both}");
+    assert!(both.contains("--machine-global-runtime-root-id"), "{both}");
+
+    let config = resolve_supervise_machine_global_binding(true, None, Some("runtime".to_string()))
+        .expect_err("runtime root alone is incomplete");
+    let config = config.to_string();
+    assert!(
+        config.contains("missing --machine-global-config"),
+        "{config}"
+    );
+
+    let root = resolve_supervise_machine_global_binding(
+        true,
+        Some(PathBuf::from("/tmp/machine-global.json")),
+        None,
+    )
+    .expect_err("config alone is incomplete");
+    let root = root.to_string();
+    assert!(
+        root.contains("missing --machine-global-runtime-root-id"),
+        "{root}"
     );
 }
