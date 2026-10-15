@@ -3409,9 +3409,13 @@ fn apply_systemd_sandbox_properties(
         "--property=OOMPolicy=kill",
     ]);
     command.arg(
-        if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
-            // Codex's native Linux sandbox establishes an inner bubblewrap namespace. The outer
-            // unit still verifies every other fixed confinement property and its exact path mounts.
+        if matches!(
+            sandbox.kind,
+            SideEffectConfinementProfileKind::ExternalCodex
+                | SideEffectConfinementProfileKind::ExternalGrok
+        ) {
+            // Codex's native Linux sandbox and Grok's denied-path protection use inner bubblewrap
+            // namespaces. The outer unit still verifies all other fixed properties and exact mounts.
             "--property=RestrictNamespaces=no"
         } else {
             "--property=RestrictNamespaces=yes"
@@ -3455,26 +3459,30 @@ fn apply_systemd_sandbox_properties(
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat {}",
             CURSOR_PROVIDERLESS_OFFLINE_UDS_DENIED_SOCKET_SYSCALLS.join(" ")
         ));
-    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
-        command.args([
-            "--property=PrivateNetwork=no",
+    } else if matches!(
+        sandbox.kind,
+        SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok
+    ) {
+        command.arg("--property=PrivateNetwork=no");
+        command.arg(if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
             // Codex initializes local Unix streams before its inner bubblewrap sandbox uses
             // AF_NETLINK to construct the network namespace and configure loopback. Known
             // same-user sockets remain masked by the exact path policy below.
-            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK",
-            // Bubblewrap must construct the inner mount tree. Keep the rest of the ordinary
-            // networked deny list intact and relax @mount and socketpair only for ExternalCodex.
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+        } else {
+            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
+        });
+        // Both runtimes need bubblewrap to construct the inner mount tree, including Grok's
+        // denied-path protection. Keep the rest of their networked deny lists intact.
+        command.arg(
             "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
-        ]);
-    } else if matches!(
-        sandbox.kind,
-        SideEffectConfinementProfileKind::ExternalGrok
-            | SideEffectConfinementProfileKind::ExternalCursor
-    ) {
+        );
+    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCursor {
         command.args([
             "--property=PrivateNetwork=no",
-            // Managed Grok and Cursor runtimes use local Unix streams during initialization.
-            // They do not need Codex's namespace or mount exceptions.
+            // Managed Cursor uses local Unix streams during initialization and retains the
+            // namespace and mount restrictions.
             "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
