@@ -1067,6 +1067,7 @@ mod grok_worker_journal_binding_tests {
             start_timestamp: "2026-09-30T00:00:00Z".into(),
             end_timestamp: "2026-09-30T00:00:01Z".into(),
             changed_paths: vec![PathBuf::from("src/a.py")],
+            observation: None,
         };
         crate::supervise::append_precreated_worker_execution_journal(
             &binding.append.journal.path,
@@ -1507,7 +1508,7 @@ fn bind_worker_journal_append_operation(
     }
     let prefix = serde_json::to_string(&binding.command_prefix()?)?;
     let appendix = format!(
-        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd, --start-timestamp, --end-timestamp, repeated --changed-path, then -- and the original command argv. Preserve the entire apply_patch payload as one argument. Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError; do not execute the action or repair the journal. The appender is record transport, not an action to recursively journal. Its arguments confer no launch, claim, or evidence authority.\n",
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd, --start-timestamp, --end-timestamp, then -- and original shell argv. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional and checked against observation.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --start-timestamp <start> --end-timestamp <end> --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again with fresh timestamps. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal. Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
         binding.helper_sha256,
     );
     if prompt

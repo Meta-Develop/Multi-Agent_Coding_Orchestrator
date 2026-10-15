@@ -338,12 +338,17 @@ fn worker_prompt_includes_execution_journal_contract() {
 
     assert!(prompt
         .contains("Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"));
-    assert!(prompt.contains("Append one JSON line directly"));
+    assert!(prompt.contains("The wrapper executes the command ONCE"));
+    assert!(prompt.contains("--changed-path is optional"));
+    assert!(prompt.contains("--observe-changes -- true"));
+    assert!(prompt.contains("IMMEDIATELY"));
     assert!(prompt.contains("exact precreated journal"));
     assert!(prompt.contains("parent is nonwritable"));
     assert!(prompt.contains("Never create, replace, rename, link, truncate, or swap"));
     assert!(prompt.contains("Never reconstruct at the end"));
     assert!(prompt.contains("WorkerExecutionJournalRecordError"));
+    assert!(prompt.contains("include the observed error in environment_failures"));
+    assert!(prompt.contains("sandbox_unavailable for sandbox/syscall failures"));
     assert!(prompt.contains("WorkerReport.commands_run may be a subset of real journal records"));
     assert!(prompt.contains(
         "each command array element and cwd must be copied byte-for-byte, failed commands included"
@@ -2695,14 +2700,15 @@ fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract(
         ));
         assert!(prompt.contains(&format!("Execution journal path: {}", expected.display())));
         for contract in [
-            "Append one JSON line directly",
+            "The wrapper executes the command ONCE",
+            "--observe-changes -- true",
             "exact precreated journal",
             "parent is nonwritable",
             "Never create, replace, rename, link, truncate, or swap",
             "Never reconstruct at the end",
             "WorkerExecutionJournalRecordError",
             "each command array element and cwd must be copied byte-for-byte",
-            "Preserve the full apply_patch record:",
+            "Preserve the full apply_patch record when recording native tool argv:",
         ] {
             assert!(prompt.contains(contract), "{contract}");
         }

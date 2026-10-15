@@ -669,6 +669,12 @@ fn collect_child_report_from_source(
     if let Some(source) = evidence_only_source {
         validate_evidence_only_report_preservation(source, report_path, &mut report);
     } else {
+        validate_worker_journal_worktree_binding(
+            worker_journals,
+            worktree_path,
+            child_base_head,
+            &mut report,
+        );
         validate_worker_execution_journal_evidence(
             assignment,
             report_path,
@@ -2752,6 +2758,55 @@ pub(super) fn validate_worker_report_evidence(
         "inspect worker reports and rerun the child scope with corrected evidence".to_string();
 }
 
+pub(super) fn validate_worker_journal_worktree_binding(
+    journals: &WorkerExecutionJournalEvidenceSet,
+    worktree: &Path,
+    base: &Oid,
+    report: &mut OrchestratorReviewReport,
+) {
+    for (worker_id, journal) in journals {
+        let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
+            continue;
+        };
+        let observations = entries
+            .iter()
+            .filter_map(|entry| entry.observation.as_ref())
+            .collect::<Vec<_>>();
+        if observations.is_empty() {
+            continue;
+        }
+        let binding = crate::safe_state::DirectoryBindingGuard::bind(worktree);
+        let valid = binding.as_ref().is_ok_and(|binding| {
+            observations.iter().all(|observation| {
+                observation.worktree == worktree
+                    && observation.worktree_identity == *binding.identity()
+                    && observation.head_oid.as_deref() == Some(base.to_string().as_str())
+            }) && binding.verify().is_ok()
+        });
+        if !valid {
+            let message = format!("worker '{worker_id}' journal observation is not bound to the supervisor's assigned worktree identity and base HEAD");
+            let paths = vec![journal.evidence_relative_path.clone()];
+            for worker in &mut report.worker_reports {
+                if worker.id == *worker_id {
+                    mark_worker_report_structural_inconsistency(
+                        worker,
+                        message.clone(),
+                        paths.clone(),
+                    );
+                }
+            }
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths,
+            });
+        }
+    }
+}
+
 pub(super) fn validate_worker_execution_journal_evidence(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
@@ -2831,6 +2886,20 @@ pub(super) fn validate_worker_execution_journal_evidence(
             }
         };
 
+        if let Err(error) = validate_worker_journal_observations(entries) {
+            let message = format!(
+                "worker '{}' execution journal observation is invalid: {error:#}",
+                worker_report.id
+            );
+            let paths = vec![journal.evidence_relative_path.clone()];
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                paths.clone(),
+            );
+            blocking_messages.push((message, paths));
+            continue;
+        }
         let mut journal_paths = BTreeSet::<PathBuf>::new();
         let mut journal_unauthorized_paths = BTreeSet::<PathBuf>::new();
         for entry in entries {

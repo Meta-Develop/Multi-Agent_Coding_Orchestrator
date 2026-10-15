@@ -1403,6 +1403,7 @@ fn injected_journal_entry(changed_paths: Vec<PathBuf>) -> WorkerExecutionJournal
         start_timestamp: "2026-01-01T00:00:00Z".to_string(),
         end_timestamp: "2026-01-01T00:00:01Z".to_string(),
         changed_paths,
+        observation: None,
     }
 }
 
@@ -1719,6 +1720,7 @@ fn injected_worker_journal_entries(worker: &WorkerReport) -> Vec<WorkerExecution
             start_timestamp: "2026-01-01T00:00:00Z".to_string(),
             end_timestamp: "2026-01-01T00:00:01Z".to_string(),
             changed_paths: worker.files_changed.clone(),
+            observation: None,
         })
         .collect()
 }

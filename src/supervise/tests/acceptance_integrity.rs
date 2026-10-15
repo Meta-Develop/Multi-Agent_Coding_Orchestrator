@@ -1384,6 +1384,134 @@ fn injected_worker_execution_journals_reject_material_mismatches() {
         .contains("commands_run entries are not supported by execution journal"));
 }
 
+#[cfg(target_os = "linux")]
+fn observed_parent_journal(
+    script: &str,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    Oid,
+    Vec<WorkerExecutionJournalEntry>,
+) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    let worktree = temp.path().canonicalize().unwrap().join("worktree");
+    let repo = Repository::init(&worktree).unwrap();
+    fs::write(worktree.join("README.md"), "original\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+    let base = repo
+        .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .unwrap();
+    let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&journal)
+        .unwrap();
+    let identity = crate::safe_state::FileIdentity {
+        device: file.metadata().unwrap().dev(),
+        file: file.metadata().unwrap().ino(),
+    };
+    let entry = WorkerExecutionJournalEntry {
+        command: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
+        cwd: worktree.clone(),
+        ..injected_journal_entry(Vec::new())
+    };
+    run_worker_execution_journal_command(&journal, &identity, &entry, false).unwrap();
+    let entries = parse_worker_execution_journal(&fs::read(&journal).unwrap(), &journal).unwrap();
+    (temp, worktree, base, entries)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_worker_journal_accepts_edit_without_declared_path_and_rejects_outside_scope() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let assignment = injected_assignment(true);
+    for (script, accepted) in [
+        ("printf edited >> README.md", true),
+        (
+            "printf edited >> README.md; printf outside > Cargo.toml",
+            false,
+        ),
+    ] {
+        let (_temp, worktree, base, entries) = observed_parent_journal(script);
+        let mut report = injected_child_report(&assignment);
+        report.files_changed = entries[1].changed_paths.clone();
+        report.worker_reports[0].files_changed = report.files_changed.clone();
+        let journals =
+            injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(entries));
+        validate_worker_journal_worktree_binding(&journals, &worktree, &base, &mut report);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("report.json"),
+            &journals,
+            &mut report,
+        );
+        assert_eq!(report.accepted, accepted, "{}", finding_messages(&report));
+        assert_eq!(
+            report.status,
+            if accepted {
+                ReviewStatus::Succeeded
+            } else {
+                ReviewStatus::Failed
+            }
+        );
+        if !accepted {
+            assert!(finding_messages(&report).contains("outside assigned_paths"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_worker_journal_parent_rejects_forged_delta_worktree_and_base() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let assignment = injected_assignment(true);
+    let (_temp, worktree, base, entries) = observed_parent_journal("printf edited >> README.md");
+    for spoof in ["delta", "worktree", "identity", "head"] {
+        let mut forged = entries.clone();
+        match spoof {
+            "delta" => forged[1].changed_paths.clear(),
+            "worktree" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().worktree = PathBuf::from("/unrelated");
+                }
+            }
+            "identity" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().worktree_identity.file += 1;
+                }
+            }
+            "head" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().head_oid = Some("0".repeat(40));
+                }
+            }
+            _ => unreachable!(),
+        }
+        let mut report = injected_child_report(&assignment);
+        report.files_changed = vec![PathBuf::from("README.md")];
+        report.worker_reports[0].files_changed = report.files_changed.clone();
+        let journals =
+            injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(forged));
+        validate_worker_journal_worktree_binding(&journals, &worktree, &base, &mut report);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("report.json"),
+            &journals,
+            &mut report,
+        );
+        assert!(!report.accepted, "spoof {spoof} accepted");
+        assert_eq!(report.status, ReviewStatus::Failed);
+    }
+}
+
 #[test]
 fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_identities() {
     let assignment = injected_assignment(true);
@@ -1417,6 +1545,7 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
             start_timestamp: "2026-08-25T02:16:22Z".to_string(),
             end_timestamp: "2026-08-25T02:16:22Z".to_string(),
             changed_paths: Vec::new(),
+            observation: None,
         },
         WorkerExecutionJournalEntry {
             command: failed_command,
@@ -1424,6 +1553,7 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
             start_timestamp: "2026-08-25T02:15:49Z".to_string(),
             end_timestamp: "2026-08-25T02:15:49Z".to_string(),
             changed_paths: Vec::new(),
+            observation: None,
         },
     ]));
 

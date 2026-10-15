@@ -1,5 +1,10 @@
 use super::*;
 
+#[path = "journal_observation.rs"]
+mod journal_observation;
+pub(crate) use journal_observation::run_worker_execution_journal_command;
+pub(super) use journal_observation::validate_worker_journal_observations;
+
 pub(super) const MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS: usize = 1024;
 pub(super) const ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER: &str = "…<truncated>";
 
@@ -483,6 +488,7 @@ pub(crate) fn parse_worker_execution_journal(
         })?;
         entries.push(entry);
     }
+    validate_worker_journal_observations(&entries)?;
     Ok(entries)
 }
 
@@ -578,6 +584,7 @@ pub(crate) fn append_worker_execution_journal_record(
 /// Append through the existing serializer to an already delegated journal file.
 /// The expected identity checks continuity; it does not grant filesystem authority
 /// or replace the parent's private held-descriptor capture and acceptance checks.
+#[cfg(test)]
 pub(crate) fn append_precreated_worker_execution_journal(
     path: &Path,
     expected: &crate::safe_state::FileIdentity,
@@ -585,7 +592,6 @@ pub(crate) fn append_precreated_worker_execution_journal(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::io::Write;
         use std::os::unix::io::AsRawFd;
 
         // Validate and encode before opening the append descriptor. Never expose a
@@ -601,37 +607,48 @@ pub(crate) fn append_precreated_worker_execution_journal(
             return Err(std::io::Error::last_os_error())
                 .context("worker journal is already being appended");
         }
-        let before = file.metadata()?;
-        verify_worker_journal_identity(&before, expected)?;
-        let final_len = before
-            .len()
-            .checked_add(u64::try_from(record.len())?)
-            .filter(|len| *len <= MAX_WORKER_EXECUTION_JOURNAL_BYTES as u64)
-            .context("worker journal append exceeds the existing capture byte limit")?;
-        let rebound = open_worker_journal_no_follow(path, false)?;
-        verify_worker_journal_identity(&rebound.metadata()?, expected)?;
-        if rebound.metadata()?.len() != before.len() {
-            bail!("worker journal length changed before append");
-        }
-        file.write_all(&record)
-            .context("worker journal append failed; stop without repairing the file")?;
-        file.sync_data()
-            .context("worker journal append flush failed")?;
-        let after = file.metadata()?;
-        verify_worker_journal_identity(&after, expected)?;
-        let rebound = open_worker_journal_no_follow(path, false)?;
-        let rebound_metadata = rebound.metadata()?;
-        verify_worker_journal_identity(&rebound_metadata, expected)?;
-        if after.len() != final_len || rebound_metadata.len() != final_len {
-            bail!("worker journal changed during append; stop without repairing the file");
-        }
-        Ok(())
+        append_locked_worker_journal(path, expected, &mut file, &record)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (path, expected, entry);
         bail!("precreated worker journal append requires the qualified Linux file contract")
     }
+}
+
+#[cfg(target_os = "linux")]
+fn append_locked_worker_journal(
+    path: &Path,
+    expected: &crate::safe_state::FileIdentity,
+    file: &mut fs::File,
+    record: &[u8],
+) -> Result<()> {
+    use std::io::Write;
+    let before = file.metadata()?;
+    verify_worker_journal_identity(&before, expected)?;
+    let final_len = before
+        .len()
+        .checked_add(u64::try_from(record.len())?)
+        .filter(|len| *len <= MAX_WORKER_EXECUTION_JOURNAL_BYTES as u64)
+        .context("worker journal append exceeds the existing capture byte limit")?;
+    let rebound = open_worker_journal_no_follow(path, false)?;
+    verify_worker_journal_identity(&rebound.metadata()?, expected)?;
+    if rebound.metadata()?.len() != before.len() {
+        bail!("worker journal length changed before append");
+    }
+    file.write_all(record)
+        .context("worker journal append failed; stop without repairing the file")?;
+    file.sync_data()
+        .context("worker journal append flush failed")?;
+    let after = file.metadata()?;
+    verify_worker_journal_identity(&after, expected)?;
+    let rebound = open_worker_journal_no_follow(path, false)?;
+    let rebound_metadata = rebound.metadata()?;
+    verify_worker_journal_identity(&rebound_metadata, expected)?;
+    if after.len() != final_len || rebound_metadata.len() != final_len {
+        bail!("worker journal changed during append; stop without repairing the file");
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -658,8 +675,7 @@ fn verify_worker_journal_identity(
 
 #[cfg(target_os = "linux")]
 fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> {
-    use std::ffi::CString;
-    use std::os::unix::ffi::OsStrExt;
+    use std::os::fd::AsRawFd;
     use std::path::Component;
 
     if !path.is_absolute()
@@ -672,82 +688,21 @@ fn open_worker_journal_no_follow(path: &Path, append: bool) -> Result<fs::File> 
         bail!("worker journal path must be an exact absolute path without traversal");
     }
     let relative = path.strip_prefix("/")?;
-    let name = CString::new(relative.as_os_str().as_bytes())?;
     let root = fs::File::open("/")?;
-    let flags = (if append {
+    let flags = if append {
         libc::O_WRONLY | libc::O_APPEND
     } else {
         libc::O_RDONLY
-    }) | libc::O_CLOEXEC
-        | libc::O_NOFOLLOW
-        | libc::O_NONBLOCK;
-    match open_worker_journal_at(&root, &name, flags) {
-        Ok(file) => Ok(file),
-        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
-            // Older kernels and sandbox seccomp filters can make openat2
-            // unavailable. Reuse the descriptor-relative component walk: every
-            // ancestor is O_DIRECTORY | O_NOFOLLOW, and the leaf never follows,
-            // creates or truncates. Mounts remain allowed, just as above. The
-            // caller verifies the held fd's identity, owner, mode and link count
-            // before writing and on both reopens.
-            crate::safe_state::open_relative_regular_no_follow_allow_mounts(&root, relative, append)
-                .context("cannot open the existing worker journal without following links")
-        }
-        Err(error) => {
-            Err(error).context("cannot open the existing worker journal without following links")
-        }
-    }
-}
-
-#[cfg(all(test, target_os = "linux"))]
-thread_local! {
-    static WORKER_JOURNAL_OPENAT2_ERROR: std::cell::Cell<Option<i32>> = const {
-        std::cell::Cell::new(None)
     };
-}
-
-#[cfg(target_os = "linux")]
-fn open_worker_journal_at(
-    root: &fs::File,
-    name: &std::ffi::CStr,
-    flags: libc::c_int,
-) -> std::io::Result<fs::File> {
-    use std::os::unix::io::{AsRawFd, FromRawFd};
-
-    #[cfg(test)]
-    if let Some(error) = WORKER_JOURNAL_OPENAT2_ERROR.with(|slot| slot.get()) {
-        return Err(std::io::Error::from_raw_os_error(error));
+    // Exact-file containment admits mounts. The shared ENOSYS-only fallback
+    // never follows, creates or truncates; callers verify identity and policy.
+    let file =
+        crate::safe_state::open_relative_no_follow_linux(root.as_raw_fd(), relative, flags, false)
+            .context("cannot open the existing worker journal without following links")?;
+    if !file.metadata()?.is_file() {
+        bail!("worker journal is not a regular file");
     }
-
-    #[repr(C)]
-    struct OpenHow {
-        flags: u64,
-        mode: u64,
-        resolve: u64,
-    }
-    let how = OpenHow {
-        flags: flags as u64,
-        mode: 0,
-        // BENEATH | NO_MAGICLINKS | NO_SYMLINKS. Bind mounts are admitted by
-        // the existing exact-file containment contract; do not forbid those.
-        resolve: 0x08 | 0x02 | 0x04,
-    };
-    // SAFETY: root is held, name is NUL-terminated, and how has the kernel ABI
-    // layout and lifetime required by openat2. No create/truncate flag is used.
-    let fd = unsafe {
-        libc::syscall(
-            libc::SYS_openat2,
-            root.as_raw_fd(),
-            name.as_ptr(),
-            &how as *const OpenHow,
-            std::mem::size_of::<OpenHow>(),
-        )
-    };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // SAFETY: successful openat2 returned a new descriptor, transferred once.
-    Ok(unsafe { fs::File::from_raw_fd(fd as libc::c_int) })
+    Ok(file)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -764,6 +719,7 @@ pub(super) fn worker_execution_journal_apply_patch_example() -> Result<String> {
         start_timestamp: "2026-08-25T00:00:00Z".to_string(),
         end_timestamp: "2026-08-25T00:00:01Z".to_string(),
         changed_paths: vec![PathBuf::from("p")],
+        observation: None,
     };
     let mut encoded = Vec::new();
     append_worker_execution_journal_record(&mut encoded, &entry)

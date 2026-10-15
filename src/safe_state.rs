@@ -1072,35 +1072,51 @@ impl DirectoryBindingGuard {
         relative: &Path,
         max_bytes: u64,
     ) -> Result<Option<Vec<u8>>> {
-        let relative = validated_relative_path(relative)?;
         #[cfg(target_os = "linux")]
         {
-            let file =
-                match open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative) {
-                    Ok(file) => file,
-                    Err(error)
-                        if error
-                            .root_cause()
-                            .downcast_ref::<std::io::Error>()
-                            .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
-                    {
-                        return Ok(None);
-                    }
-                    Err(error) => return Err(error),
-                };
-            let metadata = file.metadata()?;
-            if metadata.is_dir() {
-                return Ok(None);
-            }
-            ensure_regular_single_link_metadata(&self.path.join(&relative), &metadata)?;
-            let mut file = file;
-            read_bounded_file_with_reopen(&mut file, &self.path.join(&relative), max_bytes, || {
-                open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative)
-            })
-            .map(Some)
+            self.read_relative_optional_with_metadata(relative, max_bytes)
+                .map(|value| value.map(|(contents, _)| contents))
         }
         #[cfg(not(target_os = "linux"))]
         BoundedRegularReader::read_relative_optional(&self.path, relative, max_bytes)
+    }
+
+    /// Content and mode come from the same held, no-follow descriptor.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn read_relative_optional_with_metadata(
+        &self,
+        relative: &Path,
+        max_bytes: u64,
+    ) -> Result<Option<(Vec<u8>, fs::Metadata)>> {
+        let relative = validated_relative_path(relative)?;
+        let mut file =
+            match open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative) {
+                Ok(file) => file,
+                Err(error)
+                    if error
+                        .root_cause()
+                        .downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+                {
+                    return Ok(None);
+                }
+                Err(error) => return Err(error),
+            };
+        let metadata = file.metadata()?;
+        if metadata.is_dir() {
+            return Ok(None);
+        }
+        ensure_regular_single_link_metadata(&self.path.join(&relative), &metadata)?;
+        let contents = read_bounded_file_with_reopen(
+            &mut file,
+            &self.path.join(&relative),
+            max_bytes,
+            || open_repository_relative_linux_fd(self.directory.as_raw_fd(), &relative),
+        )?;
+        if !same_file_generation(&metadata, &file.metadata()?) {
+            bail!("observed file mode or generation changed during content capture");
+        }
+        Ok(Some((contents, metadata)))
     }
 
     pub fn verify(&self) -> Result<()> {
@@ -3436,6 +3452,25 @@ pub(crate) fn open_relative_regular_no_follow_allow_mounts(
     relative: &Path,
     append: bool,
 ) -> Result<File> {
+    let flags = if append {
+        libc::O_WRONLY | libc::O_APPEND
+    } else {
+        libc::O_RDONLY
+    };
+    let opened = open_relative_no_follow_components(root.as_raw_fd(), relative, flags, false)?;
+    identity_from_file(&opened, relative)?;
+    Ok(opened)
+}
+
+/// The ENOSYS fallback shares this walker with journal opens. Every lookup is
+/// one normal component relative to a held directory, never a following open.
+#[cfg(unix)]
+fn open_relative_no_follow_components(
+    root_fd: RawFd,
+    relative: &Path,
+    flags: libc::c_int,
+    same_mount: bool,
+) -> Result<File> {
     let components = relative.components().collect::<Vec<_>>();
     if components.is_empty()
         || !components
@@ -3444,7 +3479,12 @@ pub(crate) fn open_relative_regular_no_follow_allow_mounts(
     {
         bail!("expected a nonempty relative path without traversal");
     }
-    let mut directory = root.try_clone()?;
+    let root_device = fstat(root_fd)?.st_dev;
+    #[cfg(target_os = "linux")]
+    let root_mount = same_mount
+        .then(|| linux_mount_identity_for_fd(root_fd))
+        .transpose()?;
+    let mut directory = None::<File>;
     let mut walked = PathBuf::new();
     for (index, component) in components.iter().enumerate() {
         let Component::Normal(segment) = component else {
@@ -3453,38 +3493,18 @@ pub(crate) fn open_relative_regular_no_follow_allow_mounts(
         walked.push(segment);
         let name = c_string(segment)?;
         let is_final = index + 1 == components.len();
-        if !is_final {
-            let intent = DirectoryOpenIntent::Traverse;
-            let opened =
-                open_directory_component_at(&directory, &name, intent).with_context(|| {
-                    format!(
-                        "failed to open repository-relative component {} without following links",
-                        walked.display()
-                    )
-                })?;
-            let metadata = opened.metadata().with_context(|| {
-                format!("failed to inspect directory component {}", walked.display())
-            })?;
-            if !metadata.file_type().is_dir() {
-                bail!(
-                    "relative path component is not a directory: {}",
-                    walked.display()
-                );
-            }
-            directory = opened;
-            continue;
-        }
+        let parent_fd = directory.as_ref().map_or(root_fd, AsRawFd::as_raw_fd);
+        // SAFETY: parent_fd is held; name is one NUL-terminated normal component.
+        // Neither the leaf nor any ancestor can follow a symlink.
         let fd = unsafe {
             libc::openat(
-                directory.as_raw_fd(),
+                parent_fd,
                 name.as_ptr(),
-                (if append {
-                    libc::O_WRONLY | libc::O_APPEND
+                if is_final {
+                    flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK
                 } else {
-                    libc::O_RDONLY
-                }) | libc::O_NOFOLLOW
-                    | libc::O_CLOEXEC
-                    | libc::O_NONBLOCK,
+                    directory_component_open_flags(DirectoryOpenIntent::Traverse)
+                },
             )
         };
         if fd < 0 {
@@ -3495,9 +3515,27 @@ pub(crate) fn open_relative_regular_no_follow_allow_mounts(
                 )
             });
         }
+        // SAFETY: successful openat returned a new descriptor owned here.
         let opened = unsafe { File::from_raw_fd(fd) };
-        identity_from_file(&opened, relative)?;
-        return Ok(opened);
+        if same_mount && fstat(opened.as_raw_fd())?.st_dev != root_device {
+            return Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+                .context("refusing filesystem device crossing in component walk");
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(root_mount) = root_mount {
+            // st_dev also checked above. Mount IDs additionally refuse bind
+            // mounts of the same filesystem, as RESOLVE_NO_XDEV requires.
+            let observed = linux_mount_identity_for_fd(opened.as_raw_fd())?;
+            let observed = apply_linux_mount_test_observation("component walk", observed.mount_id);
+            if observed != root_mount.mount_id {
+                return Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+                    .context("refusing filesystem mount crossing in component walk");
+            }
+        }
+        if is_final {
+            return Ok(opened);
+        }
+        directory = Some(opened);
     }
     bail!(
         "relative path has no final component: {}",
@@ -3531,12 +3569,59 @@ struct LinuxMountIdentity {
 #[cfg(target_os = "linux")]
 fn linux_mount_identity_for_fd(fd: RawFd) -> Result<LinuxMountIdentity> {
     let expected = fstat(fd)?;
-    linux_mount_identity(
+    match linux_mount_identity(
         fd,
         c"",
         libc::AT_EMPTY_PATH | libc::AT_SYMLINK_NOFOLLOW,
         &expected,
-    )
+    ) {
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|error| error.raw_os_error() == Some(libc::ENOSYS)) =>
+        {
+            linux_mount_identity_from_fdinfo(fd)
+        }
+        result => result,
+    }
+}
+
+/// Older kernels/seccomp may also deny statx. The kernel's fdinfo exposes the
+/// same mount ID without traversing the target FD's procfs magic link.
+#[cfg(target_os = "linux")]
+fn linux_mount_identity_from_fdinfo(fd: RawFd) -> Result<LinuxMountIdentity> {
+    let proc_root = open_unix_directory(Path::new("/proc"))?;
+    // SAFETY: proc_root is live and filesystem is writable C-layout storage.
+    let mut filesystem: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::fstatfs(proc_root.as_raw_fd(), &mut filesystem) } != 0 {
+        return Err(std::io::Error::last_os_error()).context("failed to inspect procfs");
+    }
+    if filesystem.f_type != libc::PROC_SUPER_MAGIC {
+        bail!("mount identity fallback requires kernel procfs");
+    }
+    let relative = PathBuf::from(format!("{}/fdinfo/{fd}", std::process::id()));
+    let file = open_relative_regular_no_follow_allow_mounts(&proc_root, &relative, false)?;
+    if file.metadata()?.dev() != proc_root.metadata()?.dev() {
+        bail!("mount identity fdinfo left its kernel procfs");
+    }
+    let mut contents = String::new();
+    file.take(4097).read_to_string(&mut contents)?;
+    if contents.len() > 4096 {
+        bail!("mount identity fdinfo exceeded its byte limit");
+    }
+    let mut ids = contents
+        .lines()
+        .filter_map(|line| line.strip_prefix("mnt_id:"));
+    let mount_id = ids
+        .next()
+        .context("fdinfo omitted its mount identity")?
+        .trim()
+        .parse::<u64>()
+        .context("fdinfo mount identity was invalid")?;
+    if mount_id == 0 || ids.next().is_some() {
+        bail!("fdinfo mount identity was zero or duplicated");
+    }
+    Ok(LinuxMountIdentity { mount_id })
 }
 
 #[cfg(target_os = "linux")]
@@ -3560,9 +3645,16 @@ fn linux_mount_identity(
     flags: libc::c_int,
     expected: &libc::stat,
 ) -> Result<LinuxMountIdentity> {
+    #[cfg(test)]
+    if let Some(errno) = LINUX_STATX_ERROR.with(|slot| slot.get()) {
+        return Err(std::io::Error::from_raw_os_error(errno)).context("injected statx error");
+    }
     let mut observed = std::mem::MaybeUninit::<libc::statx>::zeroed();
+    // Use the syscall directly: a libc emulation can hide ENOSYS while omitting
+    // STATX_MNT_ID, preventing the descriptor-based compatibility path.
     let result = unsafe {
-        libc::statx(
+        libc::syscall(
+            libc::SYS_statx,
             directory_fd,
             name.as_ptr(),
             flags,
@@ -3659,13 +3751,95 @@ fn open_repository_relative_linux(root: &Path, relative: &Path) -> Result<File> 
 
 #[cfg(target_os = "linux")]
 fn open_repository_relative_linux_fd(root_fd: RawFd, relative: &Path) -> Result<File> {
-    let relative = c_string(relative.as_os_str())?;
+    open_relative_no_follow_linux(root_fd, relative, libc::O_RDONLY, true).with_context(|| {
+        format!(
+            "failed to open mount-confined repository-relative path {}",
+            relative.display()
+        )
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static LINUX_OPENAT2_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+    static LINUX_STATX_ERROR: std::cell::Cell<Option<i32>> = const { std::cell::Cell::new(None) };
+}
+
+/// Scoped across every openat2 reached by journal execute/observe, including
+/// append/reopen and snapshot/reopen. Thread-local so parallel tests are isolated.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct LinuxOpenat2Error {
+    previous: Option<i32>,
+    previous_statx: Option<i32>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl LinuxOpenat2Error {
+    pub(crate) fn force(errno: i32) -> Self {
+        Self {
+            previous: LINUX_OPENAT2_ERROR.with(|slot| slot.replace(Some(errno))),
+            previous_statx: LINUX_STATX_ERROR.with(|slot| slot.get()),
+        }
+    }
+
+    pub(crate) fn with_statx_enosys(self) -> Self {
+        LINUX_STATX_ERROR.with(|slot| slot.set(Some(libc::ENOSYS)));
+        self
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for LinuxOpenat2Error {
+    fn drop(&mut self) {
+        LINUX_OPENAT2_ERROR.with(|slot| slot.set(self.previous));
+        LINUX_STATX_ERROR.with(|slot| slot.set(self.previous_statx));
+    }
+}
+
+/// Existing-object lookup only. ENOSYS is the sole reason to use the walker;
+/// denied, invalid, raced, or crossing lookups must retain their original error.
+#[cfg(target_os = "linux")]
+pub(crate) fn open_relative_no_follow_linux(
+    root_fd: RawFd,
+    relative: &Path,
+    flags: libc::c_int,
+    same_mount: bool,
+) -> Result<File> {
+    let relative = validated_relative_path(relative)?;
+    if flags & (libc::O_CREAT | libc::O_TRUNC) != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE {
+        bail!("no-follow lookup refuses creation or truncation flags");
+    }
+    let result = open_relative_openat2(root_fd, &relative, flags, same_mount);
+    match result {
+        Err(error) if error.raw_os_error() == Some(libc::ENOSYS) => {
+            open_relative_no_follow_components(root_fd, &relative, flags, same_mount)
+        }
+        result => result.map_err(Into::into),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn open_relative_openat2(
+    root_fd: RawFd,
+    relative: &Path,
+    flags: libc::c_int,
+    same_mount: bool,
+) -> std::io::Result<File> {
+    #[cfg(test)]
+    if let Some(errno) = LINUX_OPENAT2_ERROR.with(|slot| slot.get()) {
+        return Err(std::io::Error::from_raw_os_error(errno));
+    }
+    let relative = std::ffi::CString::new(relative.as_os_str().as_bytes())?;
     let how = LinuxOpenHow {
-        flags: u64::try_from(libc::O_RDONLY | libc::O_CLOEXEC | libc::O_NONBLOCK)
-            .context("openat2 flags did not fit u64")?,
+        flags: (flags | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK) as u64,
         mode: 0,
-        resolve: RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS | RESOLVE_NO_SYMLINKS | RESOLVE_NO_XDEV,
+        resolve: RESOLVE_BENEATH
+            | RESOLVE_NO_MAGICLINKS
+            | RESOLVE_NO_SYMLINKS
+            | if same_mount { RESOLVE_NO_XDEV } else { 0 },
     };
+    // SAFETY: root_fd is held by the caller; relative and how remain live with
+    // the kernel ABI layout throughout this synchronous call.
     let fd = unsafe {
         libc::syscall(
             libc::SYS_openat2,
@@ -3676,15 +3850,10 @@ fn open_repository_relative_linux_fd(root_fd: RawFd, relative: &Path) -> Result<
         )
     };
     if fd < 0 {
-        return Err(std::io::Error::last_os_error()).with_context(|| {
-            format!(
-                "failed to open mount-confined repository-relative path {}",
-                Path::new(relative.to_string_lossy().as_ref()).display()
-            )
-        });
+        return Err(std::io::Error::last_os_error());
     }
-    let fd = i32::try_from(fd).context("openat2 returned an invalid file descriptor")?;
-    Ok(unsafe { File::from_raw_fd(fd) })
+    // SAFETY: successful openat2 returned one new owned descriptor.
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
 }
 
 #[cfg(target_os = "linux")]

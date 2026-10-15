@@ -1874,6 +1874,7 @@ fn worker_journal_append_writes_a_complete_apply_patch_record() {
         start_timestamp: "2026-08-25T00:00:00Z".to_string(),
         end_timestamp: "2026-08-25T00:00:01Z".to_string(),
         changed_paths: vec![PathBuf::from("src/supervise.rs")],
+        observation: None,
     };
     let mut journal = Vec::new();
 
@@ -1897,6 +1898,7 @@ fn worker_journal_append_rejects_blank_mandatory_fields_before_writing() {
         start_timestamp: "2026-08-25T00:00:00Z".to_string(),
         end_timestamp: "2026-08-25T00:00:01Z".to_string(),
         changed_paths: vec![PathBuf::from("src/supervise.rs")],
+        observation: None,
     };
     let existing = b"existing immutable record\n".to_vec();
 

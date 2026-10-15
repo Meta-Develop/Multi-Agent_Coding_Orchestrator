@@ -1074,7 +1074,7 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
         SuperviseSubcommand::JournalAppend(args) => {
-            supervise::append_precreated_worker_execution_journal(
+            supervise::run_worker_execution_journal_command(
                 &args.journal,
                 &crate::safe_state::FileIdentity {
                     device: args.device,
@@ -1086,7 +1086,9 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     start_timestamp: args.start_timestamp,
                     end_timestamp: args.end_timestamp,
                     changed_paths: args.changed_paths,
+                    observation: None,
                 },
+                args.observe_changes,
             )
         }
         SuperviseSubcommand::Plan(args) => {
@@ -1488,7 +1490,7 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
-    /// Serialize one record into an exact precreated Worker journal; never create or replace it.
+    /// Execute a command or observe a native edit and append to the exact precreated Worker journal.
     JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
@@ -1523,10 +1525,14 @@ struct WorkerJournalAppendArgs {
     start_timestamp: String,
     #[arg(long)]
     end_timestamp: String,
-    /// Canonical repository-relative changed path; repeat for multiple paths.
+    /// Optional assertion of observed paths; a mismatch is journaled and rejected.
     #[arg(long = "changed-path")]
     changed_paths: Vec<PathBuf>,
-    /// Original command argv, including the entire apply_patch payload as one argument.
+    /// Observe a native tool edit since the last snapshot without executing argv.
+    /// Use immediately after the edit; use `-- true` when no tool argv is recorded.
+    #[arg(long)]
+    observe_changes: bool,
+    /// Command argv to execute, or native tool argv when --observe-changes is set.
     #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
     command: Vec<String>,
 }
@@ -5106,13 +5112,20 @@ mod cli_integration_tests {
             "--inode".to_string(),
             identity.file.to_string(),
             "--cwd".to_string(),
-            "/worktree".to_string(),
+            journal
+                .parent()
+                .unwrap()
+                .join("worktree")
+                .to_str()
+                .unwrap()
+                .to_string(),
             "--start-timestamp".to_string(),
             "2026-09-30T00:00:00Z".to_string(),
             "--end-timestamp".to_string(),
             "2026-09-30T00:00:01Z".to_string(),
             "--changed-path".to_string(),
             changed_path.to_string(),
+            "--observe-changes".to_string(),
             "--".to_string(),
             "apply_patch".to_string(),
             patch.to_string(),
@@ -5130,6 +5143,7 @@ mod cli_integration_tests {
             .open(path)
             .unwrap();
         let metadata = file.metadata().unwrap();
+        git2::Repository::init(path.parent().unwrap().join("worktree")).unwrap();
         crate::safe_state::FileIdentity {
             device: metadata.dev(),
             file: metadata.ino(),
@@ -5145,7 +5159,10 @@ mod cli_integration_tests {
         let path = root.join("worker.jsonl");
         let identity = precreated_journal(&path);
         let patch = "*** Begin Patch\n*** Update File: src/duration.py\n@@\n-\"\"\"old\"\"\"\n+\"\"\"quoted \\\"text\\\" and \\path\"\"\"\n*** End Patch\n";
+        fs::create_dir(root.join("worktree/src")).unwrap();
+        fs::write(root.join("worktree/src/duration.py"), "first native edit").unwrap();
         invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
+        fs::write(root.join("worktree/src/duration.py"), "second native edit").unwrap();
         invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
         let bytes = fs::read(&path).unwrap();
         assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
@@ -5155,7 +5172,8 @@ mod cli_integration_tests {
                 serde_json::from_str(line).unwrap();
             assert_eq!(record.command, vec!["apply_patch", patch]);
             assert_eq!(record.changed_paths, vec![PathBuf::from("src/duration.py")]);
-            assert_eq!(record.cwd, PathBuf::from("/worktree"));
+            assert_eq!(record.cwd, root.join("worktree"));
+            assert!(record.observation.is_some());
             assert_eq!(record.start_timestamp, "2026-09-30T00:00:00Z");
             assert_eq!(record.end_timestamp, "2026-09-30T00:00:01Z");
         }
@@ -5166,6 +5184,155 @@ mod cli_integration_tests {
         );
         assert_eq!(metadata.mode() & 0o7777, 0o600);
         assert_eq!(metadata.nlink(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_executes_and_observes_without_changed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let device = identity.device.to_string();
+        let inode = identity.file.to_string();
+        let cwd = root.join("worktree");
+        Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "journal-append",
+            "--journal",
+            path.to_str().unwrap(),
+            "--device",
+            &device,
+            "--inode",
+            &inode,
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--start-timestamp",
+            "2026-10-16T00:00:00Z",
+            "--end-timestamp",
+            "2026-10-16T00:00:01Z",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'Hello from MACO\\n' > hello.txt",
+        ])
+        .unwrap()
+        .run()
+        .unwrap();
+        let entries =
+            supervise::parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].changed_paths, vec![PathBuf::from("hello.txt")]);
+        assert_eq!(
+            fs::read_to_string(cwd.join("hello.txt")).unwrap(),
+            "Hello from MACO\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_enosys_executes_and_observes_attributed_edits() {
+        use crate::safe_state::LinuxOpenat2Error;
+        for statx_enosys in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let path = root.join("worker.jsonl");
+            let identity = precreated_journal(&path);
+            let cwd = root.join("worktree");
+            let repo = git2::Repository::open(&cwd).unwrap();
+            fs::write(cwd.join("README.md"), "original\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+                .unwrap();
+            let mut error = LinuxOpenat2Error::force(libc::ENOSYS);
+            if statx_enosys {
+                error = error.with_statx_enosys();
+            }
+            let _error = error;
+            let invoke = |observe: bool, command: &[&str]| -> Result<()> {
+                let mut args = vec![
+                    "maco".to_string(),
+                    "supervise".into(),
+                    "journal-append".into(),
+                    "--journal".into(),
+                    path.to_str().unwrap().into(),
+                    "--device".into(),
+                    identity.device.to_string(),
+                    "--inode".into(),
+                    identity.file.to_string(),
+                    "--cwd".into(),
+                    cwd.to_str().unwrap().into(),
+                    "--start-timestamp".into(),
+                    "2026-10-16T00:00:00Z".into(),
+                    "--end-timestamp".into(),
+                    "2026-10-16T00:00:01Z".into(),
+                ];
+                if observe {
+                    args.push("--observe-changes".into());
+                }
+                args.push("--".into());
+                args.extend(command.iter().map(|arg| (*arg).to_string()));
+                Cli::try_parse_from(args)?.run()
+            };
+            let command = ["/bin/sh", "-c", "mkdir -p nested; printf 'Hello from MACO\\n' > nested/hello.txt; printf 'edited\\n' >> README.md; chmod +x nested/hello.txt"];
+            invoke(false, &command).unwrap();
+            fs::write(cwd.join("README.md"), "native edit\n").unwrap();
+            let native = [
+                "apply_patch",
+                "native patch payload with \"quotes\" and \\paths\n",
+            ];
+            invoke(true, &native).unwrap();
+            let entries =
+                supervise::parse_worker_execution_journal(&fs::read(&path).unwrap(), &path)
+                    .unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[1].command, command);
+            assert_eq!(
+                entries[1].changed_paths,
+                vec![
+                    PathBuf::from("README.md"),
+                    PathBuf::from("nested/hello.txt")
+                ]
+            );
+            assert_eq!(entries[2].command, native);
+            assert_eq!(entries[2].changed_paths, vec![PathBuf::from("README.md")]);
+            let completed = serde_json::to_value(&entries[1]).unwrap();
+            let observed = serde_json::to_value(&entries[2]).unwrap();
+            assert_eq!(
+                completed["observation"]["after"],
+                observed["observation"]["before"]
+            );
+            assert_ne!(
+                completed["observation"]["after"]["README.md"],
+                observed["observation"]["after"]["README.md"]
+            );
+            assert_eq!(
+                fs::read_to_string(cwd.join("nested/hello.txt")).unwrap(),
+                "Hello from MACO\n"
+            );
+
+            // Refuse traversal declarations, journal aliases and observed symlinks.
+            let bytes = fs::read(&path).unwrap();
+            assert!(invoke_worker_journal_append(&path, &identity, "patch", "../escape").is_err());
+            let alias = root.join("alias.jsonl");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(invoke_worker_journal_append(&alias, &identity, "patch", "README.md").is_err());
+            let outside = root.join("outside");
+            fs::write(&outside, "must not be read or changed").unwrap();
+            fs::remove_file(cwd.join("README.md")).unwrap();
+            std::os::unix::fs::symlink(&outside, cwd.join("README.md")).unwrap();
+            assert!(invoke(true, &native).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                fs::read_to_string(outside).unwrap(),
+                "must not be read or changed"
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]

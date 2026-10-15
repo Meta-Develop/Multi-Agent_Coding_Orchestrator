@@ -420,6 +420,7 @@ impl NativeToolJournal {
             } else {
                 Vec::new()
             },
+            observation: None,
         };
         let offset = self.bytes.len();
         self.append(&entry)?;
@@ -2609,6 +2610,7 @@ mod tests {
                 start_timestamp: "2026-09-30T00:00:00Z".into(),
                 end_timestamp: "2026-09-30T00:00:01Z".into(),
                 changed_paths: Vec::new(),
+                observation: None,
             },
         )?;
         let NativeJournalArtifact::Worker(artifact) = &journal.artifact else {

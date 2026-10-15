@@ -433,12 +433,14 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+#[cfg(all(test, target_os = "linux"))]
 pub(crate) use reporting::append_precreated_worker_execution_journal;
 #[cfg(target_os = "linux")]
 pub(crate) use reporting::append_worker_execution_journal_record;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use reporting::import_worker_execution_journals_at;
 pub(crate) use reporting::parse_worker_execution_journal;
+pub(crate) use reporting::run_worker_execution_journal_command;
 use reporting::*;
 
 #[cfg(test)]
@@ -4331,6 +4333,32 @@ pub(crate) struct WorkerExecutionJournalEntry {
     pub(crate) start_timestamp: String,
     pub(crate) end_timestamp: String,
     pub(crate) changed_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observation: Option<WorkerJournalObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerJournalObservation {
+    worktree: PathBuf,
+    worktree_identity: crate::safe_state::FileIdentity,
+    head_oid: Option<String>,
+    phase: WorkerJournalObservationPhase,
+    // Only differences from HEAD are stored. Absence means the HEAD state.
+    before: BTreeMap<PathBuf, String>,
+    after: BTreeMap<PathBuf, String>,
+    declared_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkerJournalObservationPhase {
+    Started,
+    Completed,
+    NativeEdit,
+    Failed,
 }
 
 #[derive(Debug, Clone)]

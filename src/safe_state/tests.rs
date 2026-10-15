@@ -1,6 +1,129 @@
 use super::*;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_enosys_preserves_no_follow_and_escape_refusals() {
+    use std::os::unix::fs::symlink;
+    let _error = LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), "observed").unwrap();
+    let outside = temp.path().join("outside");
+    fs::write(&outside, "outside").unwrap();
+    symlink(&outside, root.join("leaf")).unwrap();
+    symlink(temp.path(), root.join("ancestor")).unwrap();
+    fs::hard_link(&outside, root.join("hardlink")).unwrap();
+    let fifo = c_string(root.join("fifo").as_os_str()).unwrap();
+    // SAFETY: the NUL-terminated path is inside this test's private fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let binding = DirectoryBindingGuard::bind(&root).unwrap();
+    assert_eq!(
+        binding.read_relative(Path::new("nested/file"), 64).unwrap(),
+        b"observed"
+    );
+    assert!(binding
+        .read_relative_optional(Path::new("missing"), 64)
+        .unwrap()
+        .is_none());
+    assert!(binding
+        .read_relative_optional(Path::new("nested"), 64)
+        .unwrap()
+        .is_none());
+    for relative in [
+        Path::new("leaf"),
+        Path::new("ancestor/outside"),
+        Path::new("../outside"),
+        outside.as_path(),
+        Path::new("hardlink"),
+        Path::new("fifo"),
+    ] {
+        assert!(
+            binding.read_relative(relative, 64).is_err(),
+            "{}",
+            relative.display()
+        );
+        assert!(
+            binding.read_relative_optional(relative, 64).is_err(),
+            "{}",
+            relative.display()
+        );
+    }
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_enosys_refuses_device_and_same_device_mount_crossings() {
+    for statx_enosys in [false, true] {
+        let mut error = LinuxOpenat2Error::force(libc::ENOSYS);
+        if statx_enosys {
+            error = error.with_statx_enosys();
+        }
+        let _error = error;
+        let root = open_unix_directory(Path::new("/")).unwrap();
+        let error = open_repository_relative_linux_fd(root.as_raw_fd(), Path::new("proc/version"))
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        // The journal policy deliberately admits the same real mount crossing.
+        assert!(open_relative_no_follow_linux(
+            root.as_raw_fd(),
+            Path::new("proc/version"),
+            libc::O_RDONLY,
+            false
+        )
+        .is_ok());
+
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("file"), "content").unwrap();
+        let root = open_unix_directory(temp.path()).unwrap();
+        // The descriptor's actual st_dev matches; inject only a different mount
+        // ID, as with a same-filesystem bind mount. The real comparison refuses.
+        inject_next_linux_mount_mismatch("component walk");
+        let error =
+            open_repository_relative_linux_fd(root.as_raw_fd(), Path::new("file")).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_fallback_only_retries_enosys() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("file"), "content").unwrap();
+    let binding = DirectoryBindingGuard::bind(temp.path()).unwrap();
+    for errno in [
+        libc::EPERM,
+        libc::EACCES,
+        libc::EINVAL,
+        libc::ELOOP,
+        libc::EXDEV,
+    ] {
+        let _error = LinuxOpenat2Error::force(errno);
+        let error = binding.read_relative(Path::new("file"), 64).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(errno)
+        );
+    }
+}
+
 #[test]
 fn signed_and_unsigned_device_id_bits_are_preserved() {
     let negative_one = device_id_bits_to_u64(-1);
