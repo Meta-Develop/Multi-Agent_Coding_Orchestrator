@@ -416,17 +416,31 @@ impl PreclaimAssessmentProvider for DeterministicPreclaimProvider<'_> {
         } else {
             PreclaimConfidence::Low
         };
+        let mut reason = format!(
+            "deterministic viability dimensions: limited_scope={}, clear_verification_path={}, autonomously_completable={}",
+            finding_name(limited_scope),
+            finding_name(clear_verification_path),
+            finding_name(autonomously_completable),
+        );
+        if clear_verification_path == ViabilityFinding::Unknown
+            && assignment.role == AgentRole::Worker
+            && requested_verification_contract(assignment.notes.as_deref()).is_none()
+        {
+            if let [target] = assignment.assigned_paths.as_slice() {
+                if repo_map.is_some_and(|map| mapped_regular_file(map, target)) {
+                    reason.push_str(&format!(
+                        "; no typed existing-file verification contract was generated; for a literal append, regenerate the plan from this accepted goal phrasing: Update `{}`: append one final line that reads exactly `YOUR LINE`. Do not change any other file. The literal must be one nonempty quoted line and the goal must request only that edit",
+                        target.display(),
+                    ));
+                }
+            }
+        }
         PreclaimAssessment {
             dimensions,
             rejection_bucket,
             confidence,
             authority: PreclaimDecisionAuthority::DeterministicPolicy,
-            reason: format!(
-                "deterministic viability dimensions: limited_scope={}, clear_verification_path={}, autonomously_completable={}",
-                finding_name(limited_scope),
-                finding_name(clear_verification_path),
-                finding_name(autonomously_completable),
-            ),
+            reason,
         }
     }
 }
@@ -690,7 +704,9 @@ fn requested_explicit_new_file_contract(
         "Read-only planning gate for workstream '{}'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\n{}",
         execution.id, execution_task
     );
-    if repo_map.entries.iter().any(|entry| entry.path == target) {
+    if repo_map.entries.iter().any(|entry| entry.path == target)
+        || !crate::planning::safe_new_file_parent(&repo_map.root, &target)
+    {
         return false;
     }
     let mut parent = target.parent();
@@ -799,7 +815,7 @@ fn requested_existing_regular_file_edit_contract(
     {
         return false;
     }
-    let Some(target) = safe_requested_contract_path(assigned_path) else {
+    let Some(target) = safe_existing_requested_contract_path(assigned_path) else {
         return false;
     };
     let Some(execution_task) = execution.task.as_deref() else {
@@ -879,7 +895,12 @@ fn requested_direct_file_contract(
         ) => (assigned_path, execution_assignment),
         _ => return false,
     };
-    let Some(target) = safe_requested_contract_path(assigned_path) else {
+    let target = if existing {
+        safe_existing_requested_contract_path(assigned_path)
+    } else {
+        safe_requested_contract_path(assigned_path)
+    };
+    let Some(target) = target else {
         return false;
     };
     let Some(task) = assignment.task.as_deref() else {
@@ -911,6 +932,7 @@ fn requested_direct_file_contract(
     }
     if explicit_new_file_task_target(task).as_ref() != Some(&target)
         || repo_map.entries.iter().any(|entry| entry.path == target)
+        || !crate::planning::safe_new_file_parent(&repo_map.root, &target)
     {
         return false;
     }
@@ -1003,6 +1025,13 @@ fn requested_verification_contract(
 }
 
 fn safe_requested_contract_path(value: &str) -> Option<PathBuf> {
+    let path = safe_existing_requested_contract_path(value)?;
+    (!crate::planning::is_protected_new_file_path(&path)).then_some(path)
+}
+
+// Existing-file contracts are backed by the inventory and keep their original
+// path policy. The broader ignored-root policy applies only to new files.
+fn safe_existing_requested_contract_path(value: &str) -> Option<PathBuf> {
     if value.is_empty()
         || value.ends_with('/')
         || value.contains('\\')
@@ -1113,6 +1142,18 @@ fn parse_explicit_new_file_target(remainder: &str) -> Option<String> {
         return None;
     }
     let trailing = trailing.trim_start();
+    // Match the planner's root qualifier without admitting a nested target
+    // or bypassing the existing suffix checks.
+    let trailing = if let Some(remainder) =
+        strip_explicit_new_file_word_prefix(trailing, "at the repository root")
+    {
+        if Path::new(target).components().count() != 1 {
+            return None;
+        }
+        remainder.trim_start()
+    } else {
+        trailing
+    };
     if trailing.starts_with(',')
         || trailing.starts_with(';')
         || (!trailing.is_empty()
@@ -2190,6 +2231,17 @@ mod tests {
         contents: &str,
         tracked: bool,
     ) -> (tempfile::TempDir, RepoMap) {
+        let (temp, inventory) =
+            repository_map_with_test_inventory_for_file(relative, contents, tracked);
+        let map = crate::repo_map::scan_repository(&inventory.root).expect("scan repository map");
+        (temp, map)
+    }
+
+    fn repository_map_with_test_inventory_for_file(
+        relative: &str,
+        contents: &str,
+        tracked: bool,
+    ) -> (tempfile::TempDir, RepoMap) {
         let temp = tempfile::tempdir().expect("temporary preclaim repository");
         let repo_path = temp.path().join("repo");
         let repository = git2::Repository::init(&repo_path).expect("initialize repository");
@@ -2210,7 +2262,20 @@ mod tests {
                 .commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
                 .expect("commit repository file");
         }
-        let map = crate::repo_map::scan_repository(&repo_path).expect("scan repository map");
+        let map = RepoMap {
+            root: repo_path,
+            entries: vec![RepoMapEntry {
+                path: PathBuf::from(relative),
+                kind: RepoEntryKind::File,
+                size_bytes: Some(contents.len() as u64),
+                category: "fixture".to_string(),
+                git_status: if tracked {
+                    RepoGitStatus::Clean
+                } else {
+                    RepoGitStatus::Untracked
+                },
+            }],
+        };
         (temp, map)
     }
 
@@ -3261,6 +3326,388 @@ mod tests {
                 assignment.id,
                 decision.reason
             );
+        }
+    }
+
+    #[test]
+    fn safe_requested_contract_path_rejects_mixed_case_protected_components() {
+        for directory in [
+            ".GIT",
+            ".Git",
+            ".MACO",
+            ".Maco-Cache",
+            "TARGET",
+            ".Codex",
+            ".Worktrees",
+            ".Worktrees-Quarantine-test",
+            ".Agents/temp",
+            ".Agents/STORAGE",
+            ".Agents/LIVE",
+            ".Agent/TEMP",
+            ".Agent/Storage",
+        ] {
+            for prefix in ["", "docs/"] {
+                let path = format!("{prefix}{directory}/x");
+                assert_eq!(safe_requested_contract_path(&path), None, "{path}");
+                let task = format!("Add a new file `{path}` containing one line.");
+                assert_eq!(explicit_new_file_task_target(&task), None, "{task}");
+            }
+        }
+        for path in ["Docs/Hello.txt", "docs/Targeting/x", ".Agents/notes/x"] {
+            assert_eq!(
+                safe_requested_contract_path(path),
+                Some(PathBuf::from(path))
+            );
+        }
+        // Inventory-backed existing files keep their previous policy.
+        assert_eq!(
+            safe_existing_requested_contract_path("docs/TARGET/README.md"),
+            Some(PathBuf::from("docs/TARGET/README.md"))
+        );
+    }
+
+    // Unix symlink creation needs no elevated privileges, unlike some Windows setups.
+    #[cfg(unix)]
+    #[test]
+    fn new_file_contracts_recheck_resolved_parents_for_direct_and_paired_routes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let root = temp.path().join("repo");
+        std::fs::create_dir_all(root.join("docs")).expect("create safe parent");
+        let outside = temp.path().join("outside");
+        std::fs::create_dir(&outside).expect("create outside directory");
+        for directory in [".git", "Target", ".Codex"] {
+            std::fs::create_dir(root.join(directory)).expect("create protected directory");
+        }
+        let mut map = present_map();
+        map.root = root.clone();
+        let target = "docs/new.txt";
+        let assignments = explicit_new_file_assignments(
+            target,
+            "Add a new file `docs/new.txt` containing one line.",
+        );
+        let Some(RequestedPreclaimVerificationContract::ExplicitNewFileCreation {
+            execution_assignment,
+            ..
+        }) = requested_verification_contract(assignments[1].notes.as_deref())
+        else {
+            panic!("paired new-file contract");
+        };
+        let mut direct = assignments[1].clone();
+        direct.notes = Some(format!(
+            "{PRECLAIM_DIRECTIVE_PREFIX}{}",
+            serde_json::json!({
+                "verification_contract": RequestedPreclaimVerificationContract::DirectExplicitNewFileCreation {
+                    assigned_path: target.to_string(), execution_assignment,
+                }
+            })
+        ));
+        let risk = risk_for_path(target);
+        let routes = [assignments.as_slice(), std::slice::from_ref(&direct)];
+        for requested in routes {
+            for assignment in requested {
+                assert!(requested_explicit_new_file_contract(
+                    assignment, requested, &map, &risk
+                ));
+            }
+        }
+        std::fs::remove_dir(root.join("docs")).expect("remove original parent");
+        for destination in [
+            outside,
+            root.join(".git"),
+            root.join("Target"),
+            root.join(".Codex"),
+        ] {
+            symlink(&destination, root.join("docs")).expect("replace parent with symlink");
+            for requested in routes {
+                for assignment in requested {
+                    assert!(
+                        !requested_explicit_new_file_contract(assignment, requested, &map, &risk),
+                        "{} admitted {}",
+                        assignment.id,
+                        destination.display()
+                    );
+                }
+            }
+            std::fs::remove_file(root.join("docs")).expect("remove parent symlink");
+        }
+    }
+
+    #[test]
+    fn new_file_at_repository_root_contracts_pass_preclaim_for_direct_and_paired_routes() {
+        let task = "Add a new file `hello.txt` at the repository root containing exactly one line:\n`Hello from MACO`\nDo not change any other file.\n";
+        let lowered_task = "Add a new file `hello.txt` at the repository root containing exactly one line: `Hello from MACO` Do not change any other file.";
+        let (_temp, repo_map) =
+            repository_map_with_test_inventory_for_file("README.md", "# Scratch\n", true);
+        let session = crate::planning::task_planning_session_with_test_inventory(
+            &repo_map.root,
+            "",
+            task,
+            vec![PathBuf::from("README.md")],
+        )
+        .expect("decompose the exact E2E new-file goal");
+        let direct =
+            super::super::super::plan_api::supervisor_plan_from_task_planning_session_in_repo(
+                &repo_map.root,
+                task,
+                "",
+                &session,
+            )
+            .expect("lower direct Worker contract");
+        let paired = super::super::super::plan_api::supervisor_plan_from_task_planning_session(
+            task, "", &session,
+        )
+        .expect("lower paired contract");
+        assert_eq!(direct.assignments.len(), 1);
+        assert_eq!(paired.assignments.len(), 2);
+        let worker = &direct.assignments[0];
+        assert_eq!(worker.task.as_deref(), Some(lowered_task));
+        assert_eq!(worker.assigned_paths, vec![PathBuf::from("hello.txt")]);
+        assert!(matches!(
+            requested_verification_contract(worker.notes.as_deref()),
+            Some(RequestedPreclaimVerificationContract::DirectExplicitNewFileCreation { .. })
+        ));
+        let semantic_map = crate::repo_semantic::scan_repository(&repo_map.root)
+            .expect("scan semantic evidence before the new file exists");
+        let risk = risk_report_for_paths(&semantic_map, &worker.assigned_paths);
+        assert_eq!(risk.changed_paths, worker.assigned_paths);
+        assert!(risk.errors.is_empty());
+        let wrong_risk = risk_for_path("README.md");
+        let mut failed_risk = risk.clone();
+        failed_risk
+            .errors
+            .push(crate::repo_semantic::SemanticScanError {
+                file: PathBuf::from("hello.txt"),
+                kind: crate::repo_semantic::SemanticScanErrorKind::Read,
+                message: "risk scan failed".to_string(),
+                span: None,
+            });
+        let mut existing_target = repo_map.clone();
+        let mut entry = existing_target.entries[0].clone();
+        entry.path = PathBuf::from("hello.txt");
+        existing_target.entries.push(entry);
+        for requested in [direct.assignments.as_slice(), paired.assignments.as_slice()] {
+            for assignment in requested {
+                let decision = evaluate_preclaim_viability(
+                    assignment,
+                    requested,
+                    Some(&repo_map),
+                    Some(&risk),
+                    Some(SupervisorRuntime::Codex),
+                    SupervisorExecutionRuntime::Verified,
+                );
+                assert_eq!(
+                    decision.dimensions.clear_verification_path,
+                    ViabilityFinding::Yes,
+                    "{}: {}",
+                    assignment.id,
+                    decision.reason
+                );
+                assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+                for (map, evidence, runtime) in [
+                    (None, Some(&risk), Some(SupervisorRuntime::Codex)),
+                    (Some(&repo_map), None, Some(SupervisorRuntime::Codex)),
+                    (Some(&repo_map), Some(&risk), None),
+                    (
+                        Some(&repo_map),
+                        Some(&wrong_risk),
+                        Some(SupervisorRuntime::Codex),
+                    ),
+                    (
+                        Some(&existing_target),
+                        Some(&risk),
+                        Some(SupervisorRuntime::Codex),
+                    ),
+                ] {
+                    let decision = evaluate_preclaim_viability(
+                        assignment,
+                        requested,
+                        map,
+                        evidence,
+                        runtime,
+                        SupervisorExecutionRuntime::Verified,
+                    );
+                    assert_eq!(decision.disposition, PreclaimDisposition::Park);
+                }
+                let mut tampered = assignment.clone();
+                tampered.task = Some("Create a new file named OTHER.txt.".to_string());
+                let decision = evaluate_preclaim_viability(
+                    &tampered,
+                    requested,
+                    Some(&repo_map),
+                    Some(&risk),
+                    Some(SupervisorRuntime::Codex),
+                    SupervisorExecutionRuntime::Verified,
+                );
+                assert_eq!(decision.disposition, PreclaimDisposition::Park);
+            }
+        }
+        // The direct contract continues to require an error-free risk report.
+        let decision = evaluate_preclaim_viability(
+            worker,
+            &direct.assignments,
+            Some(&repo_map),
+            Some(&failed_risk),
+            Some(SupervisorRuntime::Codex),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Park);
+        assert_eq!(
+            explicit_new_file_task_target(task),
+            Some(PathBuf::from("hello.txt"))
+        );
+        assert!(!repo_map.root.join("hello.txt").exists());
+        assert_eq!(
+            std::fs::read_to_string(repo_map.root.join("README.md")).unwrap(),
+            "# Scratch\n"
+        );
+    }
+
+    #[test]
+    fn explicit_new_file_repository_root_qualifier_rejects_conflicting_or_ambiguous_paths() {
+        for task in [
+            "Add a new file `docs/hello.txt` at the repository root containing one line.",
+            "Add a new file `hello.txt` at the repository root and change README.md.",
+            "Add a new file `hello.txt` at the repository roots containing one line.",
+            "Add a new file `hello.txt` at the repository root, containing one line.",
+            "Add a new file `../hello.txt` at the repository root containing one line.",
+            "Add a new file `hello.txt` at the repository root containing one line. Create a file OTHER.txt.",
+        ] {
+            assert_eq!(explicit_new_file_task_target(task), None, "{task}");
+        }
+    }
+
+    #[test]
+    fn literal_existing_file_contracts_pass_preclaim_for_direct_and_paired_routes() {
+        for (path, task) in [
+            ("README.md", "Update README.md: append one final line that reads exactly\n`Hello from MACO`\nDo not change any other file."),
+            ("README.md", "Append one final line that reads exactly `Hello from MACO` to README.md. Do not change any other file."),
+            ("README.md", "In README.md, add one line: `Hello from MACO`."),
+            ("docs/x.md", "Update `docs/x.md` to append exactly one line: `Hello from MACO`."),
+            ("README.md", "Append `Hello from MACO` to README.md."),
+            ("README.md", "In README.md, add 'Hello from MACO'."),
+            ("docs/x.md", "Update `docs/x.md` to append \"Hello from MACO\"."),
+            ("README.md", "In README.md, add 'Hello  from MACO'."),
+        ] {
+            let (_temp, repo_map) = repository_map_with_test_inventory_for_file(path, "# MACO E2E scratch\n\nScratch repository for one supervised task.\n", true);
+            let session = crate::planning::task_planning_session_with_test_inventory(
+                &repo_map.root, "", task, vec![PathBuf::from(path)],
+            ).expect("decompose literal goal with fixture inventory");
+            let direct_plan = super::super::super::plan_api::supervisor_plan_from_task_planning_session_in_repo(
+                &repo_map.root, task, "", &session,
+            ).expect("lower actual direct Worker contract");
+            let paired_plan = super::super::super::plan_api::supervisor_plan_from_task_planning_session(
+                task, "", &session,
+            ).expect("lower actual paired contract");
+            assert_eq!(direct_plan.assignments.len(), 1);
+            assert_eq!(paired_plan.assignments.len(), 2);
+            let paired = paired_plan.assignments;
+            let mut direct = direct_plan.assignments[0].clone();
+            assert_eq!(direct.task.as_deref(), Some(task));
+            assert!(matches!(requested_verification_contract(direct.notes.as_deref()),
+                Some(RequestedPreclaimVerificationContract::DirectExistingGitVisibleRegularFileEdit { .. })));
+            let risk = risk_for_path(path);
+            for requested in [paired.as_slice(), std::slice::from_ref(&direct)] {
+                for assignment in requested {
+                    let decision = evaluate_preclaim_viability(
+                        assignment, requested, Some(&repo_map), Some(&risk),
+                        Some(SupervisorRuntime::Codex), SupervisorExecutionRuntime::Verified,
+                    );
+                    assert_eq!(decision.dimensions.clear_verification_path, ViabilityFinding::Yes, "{task}: {}", decision.reason);
+                    assert_eq!(decision.disposition, PreclaimDisposition::Claim, "{task}: {}", decision.reason);
+                }
+            }
+            // The direct route retains all authenticated-plan and acquired-evidence gates.
+            for (map, evidence) in [(None, Some(&risk)), (Some(&repo_map), None)] {
+                let decision = evaluate_preclaim_viability(
+                    &direct, std::slice::from_ref(&direct), map, evidence,
+                    Some(SupervisorRuntime::Codex), SupervisorExecutionRuntime::Verified,
+                );
+                assert_eq!(decision.disposition, PreclaimDisposition::Park);
+            }
+            let wrong_risk = risk_for_path("OTHER.md");
+            let mut failed_risk = risk.clone();
+            failed_risk.errors.push(crate::repo_semantic::SemanticScanError {
+                file: PathBuf::from(path),
+                kind: crate::repo_semantic::SemanticScanErrorKind::Read,
+                message: "risk scan failed".to_string(),
+                span: None,
+            });
+            for evidence in [&wrong_risk, &failed_risk] {
+                let decision = evaluate_preclaim_viability(
+                    &direct, std::slice::from_ref(&direct), Some(&repo_map), Some(evidence),
+                    Some(SupervisorRuntime::Codex), SupervisorExecutionRuntime::Verified,
+                );
+                assert_eq!(decision.disposition, PreclaimDisposition::Park);
+            }
+            let mut tampered = direct.clone();
+            tampered.task = Some("Update README.md.".to_string());
+            let decision = evaluate_preclaim_viability(
+                &tampered, std::slice::from_ref(&tampered), Some(&repo_map), Some(&risk),
+                Some(SupervisorRuntime::Codex), SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(decision.disposition, PreclaimDisposition::Park);
+
+            // This reproduces the persisted E2E plan's missing typed contract.
+            direct.notes = Some("Direct terminal Worker selected from validated task grain by frozen routing policy".to_string());
+            let decision = evaluate_preclaim_viability(
+                &direct, std::slice::from_ref(&direct), Some(&repo_map), Some(&risk),
+                Some(SupervisorRuntime::Codex), SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(decision.disposition, PreclaimDisposition::Park);
+            assert!(decision.reason.contains("no typed existing-file verification contract"));
+            assert!(decision.reason.contains(&format!("Update `{path}`: append one final line that reads exactly `YOUR LINE`")));
+        }
+    }
+
+    #[test]
+    fn existing_file_goals_without_a_raw_literal_contract_remain_parked_with_guidance() {
+        let (_temp, repo_map) =
+            repository_map_with_test_inventory_for_file("README.md", "# Scratch\n", true);
+        let risk = risk_for_path("README.md");
+        for task in [
+            "Update README.md.",
+            "Update README.md: append one line: Hello from MACO.",
+            "Update README.md: append one line: `Hello\nfrom MACO`.",
+            "Update README.md: append one line: `Hello\u{2028}from MACO`.",
+            "Update README.md: append one line: `Hello\u{2029}from MACO`.",
+            "Update README.md: append one line: `Hello\u{0085}from MACO`.",
+            "Update README.md: append one line: `Hello\u{000b}from MACO`.",
+            "Update README.md: append one line: `Hello\u{000c}from MACO`.",
+            "In README.md, add `Hello from MACO` unless it is already there.",
+        ] {
+            let session = crate::planning::task_planning_session_with_test_inventory(
+                &repo_map.root,
+                "",
+                task,
+                vec![PathBuf::from("README.md")],
+            )
+            .expect("ordinary file scope");
+            let plan =
+                super::super::super::plan_api::supervisor_plan_from_task_planning_session_in_repo(
+                    &repo_map.root,
+                    task,
+                    "",
+                    &session,
+                )
+                .expect("lower ordinary file scope");
+            assert_eq!(plan.assignments.len(), 1);
+            let assignment = &plan.assignments[0];
+            assert!(
+                requested_verification_contract(assignment.notes.as_deref()).is_none(),
+                "{task}"
+            );
+            let decision = evaluate_preclaim_viability(
+                assignment,
+                &plan.assignments,
+                Some(&repo_map),
+                Some(&risk),
+                Some(SupervisorRuntime::Codex),
+                SupervisorExecutionRuntime::Verified,
+            );
+            assert_eq!(decision.disposition, PreclaimDisposition::Park, "{task}");
+            assert!(decision.reason.contains("accepted goal phrasing: Update `README.md`: append one final line that reads exactly `YOUR LINE`"));
         }
     }
 

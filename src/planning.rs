@@ -18,6 +18,8 @@ use std::{
 };
 
 pub const DESIGN_DECISION_MARKER: &str = "design-decision:";
+pub(crate) const AUTHORITATIVE_LITERAL_FILE_EDIT_DIAGNOSTIC: &str =
+    "an explicit literal single-file append directive bounded the task before semantic inference";
 
 const REPOSITORY_INVENTORY_MAX_DEPTH: usize = 128;
 const REPOSITORY_INVENTORY_MAX_ENTRIES: usize = 100_000;
@@ -700,6 +702,36 @@ pub fn propose_task_decomposition(
     propose_task_decomposition_from_fragments(repo, fragments, title, body)
 }
 
+#[cfg(test)]
+pub(crate) fn task_planning_session_with_test_inventory(
+    repo: &Path,
+    title: &str,
+    body: &str,
+    files: Vec<PathBuf>,
+) -> Result<TaskPlanningSession> {
+    Ok(TaskPlanningSession {
+        proposal: propose_task_decomposition_from_inventory(
+            repo,
+            task_spec_fragments(title, body)?,
+            title,
+            body,
+            PlanningFileInventory {
+                files,
+                nested_repository_boundaries: Vec::new(),
+            },
+            TaskPathProposalDiagnostics::default(),
+        )?,
+        source: TaskPlanningSource::Heuristic,
+        provider_id: None,
+        model: None,
+        provider_usage: Usage::default(),
+        replans_used: 0,
+        completed_fragment_ids: BTreeSet::new(),
+        completed_assignments: Vec::new(),
+        provider_assignment_tree: Vec::new(),
+    })
+}
+
 fn propose_task_decomposition_from_fragments(
     repo: &Path,
     fragments: Vec<TaskSpecFragment>,
@@ -708,6 +740,17 @@ fn propose_task_decomposition_from_fragments(
 ) -> Result<TaskDecompositionProposal> {
     let mut diagnostics = TaskPathProposalDiagnostics::default();
     let inventory = collect_planning_files(repo, title, body, &mut diagnostics)?;
+    propose_task_decomposition_from_inventory(repo, fragments, title, body, inventory, diagnostics)
+}
+
+fn propose_task_decomposition_from_inventory(
+    repo: &Path,
+    fragments: Vec<TaskSpecFragment>,
+    title: &str,
+    body: &str,
+    inventory: PlanningFileInventory,
+    mut diagnostics: TaskPathProposalDiagnostics,
+) -> Result<TaskDecompositionProposal> {
     let files = inventory.files;
     let file_set = files.iter().cloned().collect::<BTreeSet<_>>();
     if let Some(assignment) =
@@ -717,6 +760,13 @@ fn propose_task_decomposition_from_fragments(
             "an explicit single-file-only directive bounded the task before semantic inference"
                 .to_string(),
         );
+        if explicit_existing_file_line_edit_target(&format!("{title}\n{body}")).as_ref()
+            == assignment.assigned_paths.first()
+        {
+            diagnostics
+                .notes
+                .push(AUTHORITATIVE_LITERAL_FILE_EDIT_DIAGNOSTIC.to_string());
+        }
         return Ok(TaskDecompositionProposal {
             fragments,
             assignments: vec![with_inferred_decision_dependencies(assignment)?],
@@ -874,21 +924,29 @@ fn authoritative_single_file_assignment(
         return None;
     }
     let only_path = named.resolved.iter().next()?.clone();
-    let directive_is_tied_to_path = full_text.lines().any(|line| {
-        let line_named = match_named_paths_in_text(repo, line, files, file_set);
-        line_named.resolved.contains(&only_path) && is_single_file_only_directive(line)
-    });
+    let literal_edit =
+        explicit_existing_file_line_edit_target(&full_text).as_ref() == Some(&only_path);
+    let directive_is_tied_to_path = literal_edit
+        || full_text.lines().any(|line| {
+            let line_named = match_named_paths_in_text(repo, line, files, file_set);
+            line_named.resolved.contains(&only_path) && is_single_file_only_directive(line)
+        });
     if !directive_is_tied_to_path {
         return None;
     }
 
     Some(TaskAssignmentProposal {
         id: "assignment-001".to_string(),
-        task: fragments
-            .iter()
-            .map(|fragment| fragment.text.as_str())
-            .collect::<Vec<_>>()
-            .join("\n"),
+        task: if literal_edit {
+            // Fragment normalization must not rewrite whitespace in an exact literal.
+            full_text.trim().to_string()
+        } else {
+            fragments
+                .iter()
+                .map(|fragment| fragment.text.as_str())
+                .collect::<Vec<_>>()
+                .join("\n")
+        },
         fragment_ids: fragments
             .iter()
             .map(|fragment| fragment.id.clone())
@@ -912,6 +970,112 @@ fn is_single_file_only_directive(line: &str) -> bool {
     ]
     .iter()
     .any(|phrase| contains_phrase(&normalized, phrase))
+}
+
+/// Recognize a complete literal append request, not arbitrary prose about a file.
+/// The quoted line supplies a deterministic verification target. Contract lowering
+/// and pre-claim validation share this parser; Git/readability/risk checks remain
+/// the scheduler's responsibility.
+pub(crate) fn explicit_existing_file_line_edit_target(text: &str) -> Option<PathBuf> {
+    let text = text.trim();
+    let (target, trailing) = if let Some(rest) = strip_ascii_word_prefix(text, "update") {
+        let (target, rest) = literal_line_edit_path(rest)?;
+        let rest = rest.trim_start();
+        let rest = rest
+            .strip_prefix(':')
+            .or_else(|| strip_ascii_word_prefix(rest, "to"))?
+            .trim_start();
+        let rest = strip_literal_append_verb(rest)?;
+        (target, literal_line_edit_payload(rest)?)
+    } else if let Some(rest) = strip_ascii_word_prefix(text, "in") {
+        let (target, rest) = literal_line_edit_path(rest)?;
+        let rest = rest.trim_start().strip_prefix(',')?.trim_start();
+        let rest = strip_literal_append_verb(rest)?;
+        (target, literal_line_edit_payload(rest)?)
+    } else {
+        let rest = strip_literal_append_verb(text)?;
+        let rest = literal_line_edit_payload(rest)?;
+        let rest = strip_ascii_word_prefix(rest.trim_start(), "to")?;
+        literal_line_edit_path(rest)?
+    };
+    let trailing = trailing.trim();
+    let trailing = trailing.strip_prefix('.').unwrap_or(trailing).trim();
+    let trailing = trailing.strip_suffix('.').unwrap_or(trailing).trim();
+    if !trailing.is_empty() && !trailing.eq_ignore_ascii_case("do not change any other file") {
+        return None;
+    }
+    Some(target)
+}
+
+fn strip_literal_append_verb(text: &str) -> Option<&str> {
+    ["append", "add"]
+        .iter()
+        .find_map(|verb| strip_ascii_word_prefix(text, verb))
+        .map(str::trim_start)
+}
+
+fn literal_line_edit_payload(text: &str) -> Option<&str> {
+    let rest = [
+        "one final line that reads exactly",
+        "one line that reads exactly",
+        "exactly one line:",
+        "one final line:",
+        "one line:",
+    ]
+    .iter()
+    .find_map(|prefix| strip_ascii_word_prefix(text, prefix))
+    .unwrap_or(text)
+    .trim_start();
+    let rest = rest.strip_prefix(':').unwrap_or(rest).trim_start();
+    let (payload, trailing) = quoted_literal_line_edit_token(rest)?;
+    if payload.trim().is_empty() {
+        return None;
+    }
+    Some(trailing)
+}
+
+fn quoted_literal_line_edit_token(text: &str) -> Option<(&str, &str)> {
+    let quote = text.chars().next()?;
+    if !matches!(quote, '`' | '\'' | '"') {
+        return None;
+    }
+    let rest = text.get(quote.len_utf8()..)?;
+    let end = rest.find(quote)?;
+    let token = rest.get(..end)?;
+    if token
+        .chars()
+        .any(|ch| ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}'))
+    {
+        return None;
+    }
+    Some((token, rest.get(end + quote.len_utf8()..)?))
+}
+
+fn literal_line_edit_path(text: &str) -> Option<(PathBuf, &str)> {
+    let text = text.trim_start();
+    let (raw, trailing) = if text.starts_with(['`', '\'', '"']) {
+        quoted_literal_line_edit_token(text)?
+    } else {
+        let end = text
+            .find(|ch: char| ch.is_whitespace() || matches!(ch, ':' | ','))
+            .unwrap_or(text.len());
+        let raw = text.get(..end)?;
+        (raw.strip_suffix('.').unwrap_or(raw), text.get(end..)?)
+    };
+    if raw.is_empty()
+        || raw.contains(['\\', ':', '`', '\'', '"'])
+        || raw.chars().any(|ch| ch.is_whitespace() || ch.is_control())
+        || raw
+            .split('/')
+            .any(|component| matches!(component, "" | "." | ".." | ".git"))
+    {
+        return None;
+    }
+    let target = normalize_repo_relative_path(raw).ok()?;
+    if is_excluded_planning_path(&target) || crate::repo_map::is_ignored_scan_path(&target) {
+        return None;
+    }
+    Some((target, trailing))
 }
 
 fn authoritative_new_file_creation_assignment(
@@ -1034,6 +1198,15 @@ fn parse_new_file_target(remainder: &str) -> Option<String> {
         return None;
     }
     let trailing = trailing.trim_start();
+    let trailing =
+        if let Some(remainder) = strip_ascii_word_prefix(trailing, "at the repository root") {
+            if Path::new(&target).components().count() != 1 {
+                return None;
+            }
+            remainder.trim_start()
+        } else {
+            trailing
+        };
     if trailing.starts_with(',')
         || trailing.starts_with(';')
         || (!trailing.is_empty()
@@ -1090,7 +1263,7 @@ fn safe_missing_new_file_target(
         || target.contains('\\')
         || target
             .split('/')
-            .any(|component| matches!(component, "." | ".." | ".git"))
+            .any(|component| matches!(component, "" | "." | ".."))
     {
         return None;
     }
@@ -1100,7 +1273,7 @@ fn safe_missing_new_file_target(
     }
     let normalized = normalize_repo_relative_path(target_path).ok()?;
     if normalized.as_os_str().is_empty()
-        || is_excluded_planning_path(&normalized)
+        || is_protected_new_file_path(&normalized)
         || file_set.contains(&normalized)
         || nested_repository_boundaries
             .iter()
@@ -1114,20 +1287,57 @@ fn safe_missing_new_file_target(
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(_) => return None,
     }
-    let mut parent = normalized.parent();
+    safe_new_file_parent(repo, &normalized).then_some(normalized)
+}
+
+/// Apply the existing protected/ignored roots to every ASCII-folded suffix.
+/// Keep this stricter policy confined to new files; inventory-backed edits use
+/// the existing path resolution rules.
+pub(crate) fn is_protected_new_file_path(path: &Path) -> bool {
+    let folded = PathBuf::from(path.as_os_str().to_ascii_lowercase());
+    let mut components = folded.components();
+    loop {
+        let suffix = components.as_path();
+        if is_excluded_planning_path(suffix) || crate::repo_map::is_ignored_scan_path(suffix) {
+            return true;
+        }
+        if components.next().is_none() {
+            return false;
+        }
+    }
+}
+
+/// Recheck disk parents at planning and preclaim time, including resolved paths
+/// on filesystems with aliases that lexical path checks cannot identify.
+pub(crate) fn safe_new_file_parent(repo: &Path, target: &Path) -> bool {
+    let Some(relative_parent) = target.parent() else {
+        return false;
+    };
+    let Ok(root) = repo.canonicalize() else {
+        return false;
+    };
+    let Ok(resolved_parent) = repo.join(relative_parent).canonicalize() else {
+        return false;
+    };
+    let Ok(resolved_relative) = resolved_parent.strip_prefix(&root) else {
+        return false;
+    };
+    if is_protected_new_file_path(resolved_relative) {
+        return false;
+    }
+
+    let mut parent = Some(relative_parent);
     while let Some(relative) = parent {
         if relative.as_os_str().is_empty() {
             break;
         }
         match fs::symlink_metadata(repo.join(relative)) {
             Ok(metadata) if metadata.is_dir() && !metadata.file_type().is_symlink() => {}
-            Ok(_) => return None,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return None,
+            _ => return false,
         }
         parent = relative.parent();
     }
-    Some(normalized)
+    true
 }
 
 pub fn propose_task_decomposition_with_optional_provider(
@@ -4319,6 +4529,120 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     }
 
     #[test]
+    fn literal_existing_file_edits_bind_before_semantic_inference() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "README.md", "# Scratch repository\n");
+        write_file(repo, "docs/x.md", "# Documentation\n");
+        write_file(repo, "src/lib.rs", "pub fn append() {}\npub fn add() {}\n");
+        for (task, target) in [
+            (
+                "Update README.md: append one final line that reads exactly\n`Hello from MACO`\nDo not change any other file.",
+                "README.md",
+            ),
+            (
+                "Append one final line that reads exactly `Hello from MACO` to README.md. Do not change any other file.",
+                "README.md",
+            ),
+            (
+                "In README.md, add one line: `Hello from MACO`. Do not change any other file.",
+                "README.md",
+            ),
+            (
+                "Update `docs/x.md` to append exactly one line: `Hello from MACO`.",
+                "docs/x.md",
+            ),
+            ("Append `Hello from MACO` to README.md.", "README.md"),
+            ("In README.md, add 'Hello from MACO'.", "README.md"),
+            ("Update `docs/x.md` to append \"Hello from MACO\".", "docs/x.md"),
+            ("In README.md, add 'Hello  from MACO'.", "README.md"),
+        ] {
+            let proposal = decompose_with_test_inventory(
+                repo,
+                "",
+                task,
+                ["README.md", "docs/x.md", "src/lib.rs"]
+                    .into_iter()
+                    .map(PathBuf::from)
+                    .collect(),
+            )
+            .expect("literal existing-file proposal");
+            assert_eq!(proposal.assignments.len(), 1, "{task}");
+            let assignment = &proposal.assignments[0];
+            assert_eq!(assignment.task, task, "exact literal whitespace must survive");
+            assert_eq!(assignment.assigned_paths, vec![PathBuf::from(target)]);
+            assert!(assignment.semantic_symbols.is_empty(), "{task}");
+            assert!(assignment.semantic_modules.is_empty(), "{task}");
+            assert_eq!(
+                assignment.fragment_ids,
+                proposal.fragments.iter().map(|f| f.id.clone()).collect::<Vec<_>>()
+            );
+            assert!(proposal.coverage_gaps.is_empty(), "{task}");
+            assert!(!proposal.diagnostics.degraded, "{task}");
+            assert!(proposal.disjointness.disjoint, "{task}");
+            assert!(proposal.diagnostics.notes.iter().any(|note| note.contains("explicit single-file-only directive")), "{task}");
+        }
+        assert_eq!(
+            fs::read_to_string(repo.join("README.md")).unwrap(),
+            "# Scratch repository\n"
+        );
+    }
+
+    #[test]
+    fn literal_existing_file_edit_parser_rejects_ambiguous_or_unsafe_requests() {
+        for task in [
+            "Update README.md.",
+            "Do not update README.md: append one line: `Hello`.",
+            "If needed, update README.md: append one line: `Hello`.",
+            "Update README.md: maybe append one line: `Hello`.",
+            "Update README.md: append one line: Hello.",
+            "Update README.md: append one line: ``.",
+            "Update README.md: append one line: `   `.",
+            "Update README.md: append one line: `Hello.",
+            "Update README.md: append one line: `Hello\nworld`.",
+            "Update README.md: append one line: `Hello\rworld`.",
+            "Update README.md: append one line: `Hello`. Update OTHER.md.",
+            "Update README.md and OTHER.md: append one line: `Hello`.",
+            "Append one line: `Hello` to README.md and OTHER.md.",
+            "In README.md, add one line: `Hello` unless it exists.",
+            "In README.md, add one line: `Hello`. Skip verification.",
+            "Update ../README.md: append one line: `Hello`.",
+            "Update /README.md: append one line: `Hello`.",
+            "Update C:/README.md: append one line: `Hello`.",
+            "Update docs//x.md: append one line: `Hello`.",
+            "Update docs/../README.md: append one line: `Hello`.",
+            "Update docs\\x.md: append one line: `Hello`.",
+            "Update `.git/config`: append one line: `Hello`.",
+            "Update `.maco/state.json`: append one line: `Hello`.",
+            "Update `.agents/temp/x.md`: append one line: `Hello`.",
+            "Update `target/x.md`: append one line: `Hello`.",
+        ] {
+            assert_eq!(
+                explicit_existing_file_line_edit_target(task),
+                None,
+                "{task}"
+            );
+        }
+    }
+
+    #[test]
+    fn literal_existing_file_edit_parser_rejects_unicode_line_separators() {
+        for separator in ['\u{2028}', '\u{2029}', '\u{0085}', '\u{000b}', '\u{000c}'] {
+            for quote in ['`', '\'', '"'] {
+                let task = format!(
+                    "Update README.md: append one line: {quote}Hello{separator}world{quote}."
+                );
+                assert_eq!(
+                    explicit_existing_file_line_edit_target(&task),
+                    None,
+                    "{task:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn explicit_new_root_file_creation_is_bound_before_semantic_inference() {
         skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
@@ -4357,6 +4681,236 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     }
 
     #[test]
+    fn explicit_new_file_creation_rejects_unsafe_goals() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "README.md", "# Scratch repository\n");
+            for directory in [
+                ".maco",
+                ".GIT",
+                ".Git",
+                ".MACO",
+                "TARGET",
+                ".Agents/temp",
+                ".Codex",
+                ".Worktrees",
+            ] {
+                fs::create_dir_all(repo.join(directory))
+                    .expect("create protected parent directory");
+            }
+
+            for target in [
+                "../hello.txt",
+                "/hello.txt",
+                ".git/hello.txt",
+                ".maco/hello.txt",
+                ".GIT/x",
+                ".Git/x",
+                ".MACO/x",
+                "TARGET/x",
+                ".Agents/temp/x",
+                ".Codex/x",
+                ".Worktrees/x",
+                "missing/hello.txt",
+            ] {
+                let task = format!("Add a new file `{target}` containing exactly one line: Hello.");
+                match
+                    decompose_with_test_inventory(repo, "", &task, vec![PathBuf::from("README.md")])
+                {
+                    Ok(proposal) => {
+                        assert!(proposal.assignments.iter().all(|assignment| !assignment
+                            .assigned_paths.iter().any(|path| path == Path::new(target))),
+                            "unexpectedly claimed {target}: {:?}", proposal.assignments);
+                        assert!(!proposal.coverage_gaps.is_empty(), "missing refusal for {target}");
+                    }
+                    Err(error) => assert_eq!(
+                        error.to_string(),
+                        format!("named repository path '{target}' is not a readable regular file in the repository; provide an existing Git-visible or on-disk repo-relative file (documentation, policy, script, or other), or a Rust module/symbol"),
+                        "unexpected refusal for {target}",
+                    ),
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn explicit_new_file_creation_at_repository_root_claims_only_the_new_file() {
+        run_contention_resilient_inventory_test(|| {
+            let temp = tempfile::tempdir().expect("tempdir");
+            let repo = temp.path();
+            let repository = git2::Repository::init(repo).expect("init repo");
+            write_file(repo, "README.md", "# Scratch repository\n");
+            commit_all_test_files(&repository, "Initial README");
+
+            let task =
+                "Add a new file `hello.txt` at the repository root containing exactly one line:\n\
+                `Hello from MACO`\n\
+                Do not change any other file.";
+            let proposal =
+                decompose_with_test_inventory(repo, "", task, vec![PathBuf::from("README.md")])
+                    .expect("new-file goal must decompose");
+
+            assert_eq!(proposal.assignments.len(), 1);
+            let assignment = &proposal.assignments[0];
+            assert_eq!(assignment.assigned_paths, vec![PathBuf::from("hello.txt")]);
+            assert_eq!(
+                assignment.fragment_ids,
+                proposal
+                    .fragments
+                    .iter()
+                    .map(|fragment| fragment.id.clone())
+                    .collect::<Vec<_>>()
+            );
+            assert!(assignment.semantic_symbols.is_empty());
+            assert!(assignment.semantic_modules.is_empty());
+            assert!(proposal.coverage_gaps.is_empty());
+            assert!(proposal.disjointness.disjoint);
+            assert!(!repo.join("hello.txt").exists());
+            assert_eq!(
+                fs::read_to_string(repo.join("README.md")).unwrap(),
+                "# Scratch repository\n"
+            );
+        });
+    }
+
+    #[test]
+    fn explicit_new_file_creation_requires_existing_parents_and_safe_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        for directory in [
+            "docs",
+            ".maco",
+            ".maco-cache",
+            "target",
+            ".codex",
+            ".worktrees",
+            ".worktrees-quarantine-test",
+            ".agents/temp",
+            ".agents/storage",
+            ".agents/live",
+            ".agent/temp",
+            ".agent/storage",
+        ] {
+            fs::create_dir_all(repo.join(directory)).expect("create parent directory");
+        }
+        let files = BTreeSet::new();
+        write_file(repo, "existing.txt", "already here\n");
+        assert_eq!(
+            safe_missing_new_file_target(repo, "docs/hello.txt", &files, &[]),
+            Some(PathBuf::from("docs/hello.txt"))
+        );
+        for target in [
+            "../hello.txt",
+            "docs/../../hello.txt",
+            "/hello.txt",
+            "C:/hello.txt",
+            "docs/../hello.txt",
+            "docs//hello.txt",
+            "./hello.txt",
+            "docs\\hello.txt",
+            ".git/config",
+            "docs/.git/config",
+            ".maco/hello.txt",
+            ".maco-cache/hello.txt",
+            "target/hello.txt",
+            ".codex/hello.txt",
+            ".worktrees/hello.txt",
+            ".worktrees-quarantine-test/hello.txt",
+            ".agents/temp/hello.txt",
+            ".agents/storage/hello.txt",
+            ".agents/live/hello.txt",
+            ".agent/temp/hello.txt",
+            ".agent/storage/hello.txt",
+            "missing/hello.txt",
+            "existing.txt/hello.txt",
+            "existing.txt",
+        ] {
+            assert_eq!(
+                safe_missing_new_file_target(repo, target, &files, &[]),
+                None,
+                "unexpectedly admitted {target}"
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_new_file_creation_rejects_mixed_case_protected_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        for directory in [
+            ".git",
+            ".maco",
+            ".maco-cache",
+            "target",
+            ".codex",
+            ".worktrees",
+            ".worktrees-quarantine-test",
+            ".agents/temp",
+            ".agents/storage",
+            ".agents/live",
+            ".agent/temp",
+            ".agent/storage",
+        ] {
+            for prefix in ["", "docs/"] {
+                let parent = format!("{prefix}{directory}").to_ascii_uppercase();
+                fs::create_dir_all(repo.join(&parent)).expect("create mixed-case parent directory");
+                let target = format!("{parent}/hello.txt");
+                assert_eq!(
+                    safe_missing_new_file_target(repo, &target, &BTreeSet::new(), &[]),
+                    None,
+                    "unexpectedly admitted {target}"
+                );
+            }
+        }
+        fs::create_dir_all(repo.join("Docs/Targeting")).expect("create ordinary directory");
+        assert_eq!(
+            safe_missing_new_file_target(repo, "Docs/Targeting/hello.txt", &BTreeSet::new(), &[]),
+            Some(PathBuf::from("Docs/Targeting/hello.txt"))
+        );
+    }
+
+    // Unix symlink creation needs no elevated privileges; Windows may require
+    // administrator rights or Developer Mode, so keep this fixture Unix-only.
+    #[cfg(unix)]
+    #[test]
+    fn explicit_new_file_creation_rejects_symlink_targets_and_ancestors() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path().join("repo");
+        git2::Repository::init(&repo).expect("init repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).expect("create outside directory");
+        fs::create_dir(outside.join("subdir")).expect("create outside subdirectory");
+        fs::create_dir(repo.join("docs")).expect("create inside directory");
+        fs::create_dir(repo.join(".codex")).expect("create protected directory");
+        symlink(&outside, repo.join("escape")).expect("outside symlink");
+        symlink(repo.join("docs"), repo.join("inside")).expect("inside symlink");
+        symlink(repo.join(".git"), repo.join("git-alias")).expect("Git directory symlink");
+        symlink(repo.join(".codex"), repo.join("control-alias"))
+            .expect("control directory symlink");
+        symlink(outside.join("missing.txt"), repo.join("dangling.txt")).expect("dangling symlink");
+
+        for target in [
+            "escape/hello.txt",
+            "escape/subdir/hello.txt",
+            "inside/hello.txt",
+            "git-alias/hello.txt",
+            "control-alias/hello.txt",
+            "dangling.txt",
+        ] {
+            assert_eq!(
+                safe_missing_new_file_target(&repo, target, &BTreeSet::new(), &[]),
+                None,
+                "unexpectedly admitted {target}"
+            );
+        }
+    }
+
+    #[test]
     fn explicit_new_file_creation_rejects_unsafe_or_ambiguous_targets() {
         let temp = tempfile::tempdir().expect("tempdir");
         let repo = temp.path();
@@ -4375,6 +4929,7 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             "Create a new file named . containing one line.",
             "Create a new file named .git/config.",
             "Create a new file named docs/.",
+            "Create a new file named docs/NEW.md at the repository root containing one line.",
             "Create a new file named vendor/nested/NEW.md.",
             "Create a new file named FIRST.md and SECOND.md.",
             "Create a new file named NOTICE and LICENSE.",
@@ -4403,17 +4958,17 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
 
     #[test]
     fn explicit_creation_of_an_existing_path_uses_normal_existing_path_planning() {
-        skip_without_containment!();
         run_contention_resilient_inventory_test(|| {
             let temp = tempfile::tempdir().expect("tempdir");
             let repo = temp.path();
             git2::Repository::init(repo).expect("init repo");
             write_file(repo, "EXISTING.md", "already here\n");
 
-            let proposal = propose_task_decomposition(
+            let proposal = decompose_with_test_inventory(
                 repo,
                 "Create a new file named EXISTING.md containing replacement text.",
                 "",
+                vec![PathBuf::from("EXISTING.md")],
             )
             .expect("existing path follows ordinary planning");
 
@@ -4427,6 +4982,10 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                 .notes
                 .iter()
                 .any(|note| { note.contains("explicit safe new-file creation directive") }));
+            assert_eq!(
+                fs::read_to_string(repo.join("EXISTING.md")).unwrap(),
+                "already here\n"
+            );
         });
     }
 
@@ -5822,6 +6381,16 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
                     && !assignment.task.contains("api.transport")
             }));
         });
+    }
+
+    fn decompose_with_test_inventory(
+        repo: &Path,
+        title: &str,
+        body: &str,
+        files: Vec<PathBuf>,
+    ) -> Result<TaskDecompositionProposal> {
+        task_planning_session_with_test_inventory(repo, title, body, files)
+            .map(TaskPlanningSession::into_proposal)
     }
 
     fn write_file(repo: &Path, relative: &str, contents: &str) {

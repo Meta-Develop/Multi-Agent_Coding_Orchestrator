@@ -1973,12 +1973,20 @@ fn authoritative_existing_file_edit_workstream_id(
         && assignment_fragment_ids == fragment_ids
         && assignment.semantic_symbols.is_empty()
         && assignment.semantic_modules.is_empty()
+        // Literal append contracts must originate from the complete raw goal.
+        // Fragment normalization alone can flatten an invalid multiline payload.
+        && (planning::explicit_existing_file_line_edit_target(&assignment.task).is_none()
+            || proposal.diagnostics.notes.iter().filter(|note|
+                note.as_str() == planning::AUTHORITATIVE_LITERAL_FILE_EDIT_DIAGNOSTIC
+            ).count() == 1)
         && explicit_existing_file_edit_verification_task(&assignment.task, assigned_path))
     .then(|| assignment.id.clone())
 }
 
 pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: &Path) -> bool {
-    if explicit_existing_file_rust_test_contract_task(task, target) {
+    if planning::explicit_existing_file_line_edit_target(task).as_deref() == Some(target)
+        || explicit_existing_file_rust_test_contract_task(task, target)
+    {
         return true;
     }
     let Some(target) = target.to_str() else {
