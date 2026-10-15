@@ -4848,7 +4848,9 @@ pub(super) fn bind_selected_licensed_source_fixture<'scope, 'owner>(
         || lens.id != "parent-acceptance"
         || lens.information_scope != ReviewInformationScope::FullChildTranscript
     {
-        bail!("licensed source fixture requires owned default-role Codex subjects and bounded workers");
+        bail!(
+            "licensed source fixture requires owned default-role Codex subjects and bounded workers"
+        );
     }
     let ReviewLensBackendConfig::Model {
         model,
@@ -4995,7 +4997,9 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
                 .as_ref()
                 .context("nested review fixture resolved Auditor model")?;
             if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
-                bail!("nested review fixture Auditor is absent from its supplied model/effort catalog");
+                bail!(
+                    "nested review fixture Auditor is absent from its supplied model/effort catalog"
+                );
             }
             models.insert((
                 model.clone(),
@@ -5749,7 +5753,9 @@ pub(super) fn bind_selected_evidence_only_reaudit_fixture<'scope, 'owner>(
         || super::test_runtime_model_catalog(&loaded.plan, options.runtime)?
             != RuntimeModelCatalog::Codex(catalog.clone())
     {
-        bail!("selected evidence-only fixture lost its owned run, catalog or held policy/account custody");
+        bail!(
+            "selected evidence-only fixture lost its owned run, catalog or held policy/account custody"
+        );
     }
     historical.validate(frozen)?;
     current_assessment.validate_for_task(frozen, &loaded.plan.task)?;
@@ -6565,7 +6571,9 @@ fn freeze_selected_secondary_managed_launch_bindings(
                 None,
                 authority_socket.as_deref(),
             );
-            bail!("no complete selected Coding Agent Manager account for secondary runtime '{provider}'");
+            bail!(
+                "no complete selected Coding Agent Manager account for secondary runtime '{provider}'"
+            );
         };
         if binding.provider_id != provider {
             bail!("selected secondary Coding Agent Manager binding has a different provider");
@@ -7591,7 +7599,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             false
         }
         Err(error) => {
-            return Err(error).context("failed to write normalized supervisor final report")
+            return Err(error).context("failed to write normalized supervisor final report");
         }
     };
     persist_supervisor_final_report(
@@ -10063,6 +10071,81 @@ mod selection_policy_tests {
             assert_eq!(
                 codex_run_account_binding(nested_run),
                 Some(CodexRunAccountBinding::Selected(frozen))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn local_auth_codex_scheduler_keeps_primary_with_only_grok_observed() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let _socket = CamAuthoritySocketTestGuard::install(None);
+            let (root, registry) = isolated_registry();
+            registry.begin_add(
+                "grok-cli",
+                "work",
+                "Synthetic Grok account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add("grok-cli", "work")?;
+            registry.select_complete_revision("grok-cli", "work", None)?;
+            let grok_prior = crate::selection::built_in_prior_dataset()?
+                .models
+                .into_iter()
+                .find(|prior| prior.runtime == "grok" && !prior.prohibited)
+                .context("synthetic Grok prior")?;
+            let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode: SchedulerObserveStubMode::ObservedModels,
+                }),
+                secondary_adapter: Some(Box::new(SchedulerObserveStub {
+                    id: "grok-cli",
+                    mode: SchedulerObserveStubMode::ObservedSynthetic(
+                        synthetic_prior_observed_model(&grok_prior),
+                    ),
+                })),
+                advertised: None,
+                resolved_auditor: None,
+                _root: root,
+            });
+            let run = RunId::new("r10-local-auth-codex-with-grok")?;
+            let observations =
+                account_observations_for_selection(SupervisorRuntime::Codex, Some(run.as_str()))?;
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].0, SupervisorRuntime::Grok);
+            assert_eq!(
+                codex_run_account_binding(run.as_str()),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+
+            let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("local-auth-worker")];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            let _policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+            let mut request = prepared_codex_request(&repo, &catalog, &admission);
+            request.current_run = Some(&run);
+            let resolution = initialize_supervisor_selection_with_catalog_discovery(
+                &mut plan,
+                &mut metadata,
+                request,
+                |_| Ok(AdvertisedCatalogSet::empty()),
+            )?;
+            assert!(resolution.selection_preflight_failure.is_none());
+            assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Codex));
+            assert!(resolution.decisions.iter().all(|event| {
+                event.provenance.normalized_input.catalogs.len() == 1
+                    && event.provenance.normalized_input.catalogs[0].runtime == "codex"
+                    && event.provenance.choice.as_ref().unwrap().candidate.runtime == "codex"
+            }));
+            assert_eq!(
+                codex_run_account_binding(run.as_str()),
+                Some(CodexRunAccountBinding::LocalAuth)
             );
             Ok(())
         }

@@ -4116,6 +4116,12 @@ impl ExternalAgentCommand {
                         if crate::account_authority::codex_run_account_binding(
                             &lifecycle.run_id,
                         ) == self.codex_run_account_binding => {}
+                    Some(CodexRunAccountBinding::LocalAuth)
+                        if crate::account_authority::codex_run_account_binding(
+                            &lifecycle.run_id,
+                        ) == self.codex_run_account_binding
+                            && crate::account_authority::configured_cam_authority_socket()
+                                .is_none() => {}
                     _ => bail!("managed parent Codex account selection is missing or changed"),
                 }
                 validate_managed_readonly_execute_binding(

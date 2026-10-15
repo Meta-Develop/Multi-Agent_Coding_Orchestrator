@@ -362,8 +362,8 @@ fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatal
             }
             None if grok_program.is_none() => None,
             None => bail!(
-            "live Grok catalog requires a complete Coding Agent Manager selected grok-cli account"
-        ),
+                "live Grok catalog requires a complete Coding Agent Manager selected grok-cli account"
+            ),
         }
     };
     #[cfg(not(target_os = "linux"))]
@@ -980,10 +980,6 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
     let frozen_policy = crate::selection::routing_policy::current_routing_policy();
     let routing_features =
         routing_features_with_assessment(plan, assessment, frozen_policy.as_ref())?;
-    let account_observation = account_observations
-        .iter()
-        .find(|(observed_runtime, _)| *observed_runtime == runtime)
-        .map(|(_, observation)| observation);
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
             mode: SupervisorSelectionMode::LegacyFake,
@@ -992,6 +988,11 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             selection_preflight_failure: None,
         });
     }
+    let account_observations = account_catalog_set_for_primary(runtime, account_observations)?;
+    let account_observation = account_observations
+        .iter()
+        .find(|(observed_runtime, _)| *observed_runtime == runtime)
+        .map(|(_, observation)| observation);
     let resolved_objective_profile = resolved_objective_profile
         .cloned()
         .context(
@@ -1665,7 +1666,10 @@ fn validate_custom_review_lens_contracts(plan: &SupervisorPlan) -> Result<()> {
                         .and_then(selector_effort_from_str)
                         .is_none()
                 {
-                    bail!("custom review lens '{}' requires an explicit model and supported effort", lens.id);
+                    bail!(
+                        "custom review lens '{}' requires an explicit model and supported effort",
+                        lens.id
+                    );
                 }
                 // The generic Auditor selects the executor runtime and supplies the
                 // assessed run inputs. Each authored lens is independently evaluated
@@ -2622,6 +2626,30 @@ fn selection_input_for_role_with_assessment(
     Ok(input)
 }
 
+/// Local-auth Codex has no CAM identity to put in an AccountObserveResult.
+/// Other providers' selected accounts must not displace its acquired catalog,
+/// including in the snapshot retained for retries. A configured authority with
+/// no primary selection remains a refusal rather than unmanaged admission.
+fn account_catalog_set_for_primary(
+    runtime: SupervisorRuntime,
+    accounts: &[(SupervisorRuntime, AccountObserveResult)],
+) -> Result<&[(SupervisorRuntime, AccountObserveResult)]> {
+    if accounts.iter().any(|(observed, _)| *observed == runtime) {
+        return Ok(accounts);
+    }
+    #[cfg(target_os = "linux")]
+    if runtime == SupervisorRuntime::Codex {
+        if crate::account_authority::configured_cam_authority_socket().is_none() {
+            return Ok(&[]);
+        }
+        bail!("configured CAM account catalog set is missing the selected primary runtime binding");
+    }
+    if accounts.is_empty() {
+        return Ok(accounts);
+    }
+    bail!("account catalog set is missing the selected primary runtime binding");
+}
+
 fn selection_input_for_role_with_assessment_and_accounts(
     args: SelectionInputForRoleArgs<'_>,
     accounts: &[(SupervisorRuntime, AccountObserveResult)],
@@ -2629,11 +2657,9 @@ fn selection_input_for_role_with_assessment_and_accounts(
     final_features: Option<&crate::selection::routing_policy::TaskRoutingFeatures>,
     frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
 ) -> Result<SelectionInput> {
+    let accounts = account_catalog_set_for_primary(args.runtime, accounts)?;
     if accounts.is_empty() {
         return selection_input_for_role_with_assessment(args, assessment, final_features, frozen);
-    }
-    if !accounts.iter().any(|(runtime, _)| *runtime == args.runtime) {
-        bail!("account catalog set is missing the selected primary runtime binding");
     }
     let mut runtimes = BTreeSet::new();
     let mut combined: Option<SelectionInput> = None;
@@ -9564,6 +9590,109 @@ mod tests {
             access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
         });
         observation
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn local_auth_codex_with_other_account_keeps_eligible_catalog_on_retry() -> Result<()> {
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let _policy = bind_fixture_routing_policy()?;
+        let accounts = vec![(
+            SupervisorRuntime::Grok,
+            qualified_account_fixture("grok-cli", "unrelated-account-model", "high"),
+        )];
+        let catalog = codex_catalog()?;
+        let mut plan = test_plan();
+        let resolution = initialize_supervisor_selection_with_accounts(
+            &mut plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &accounts,
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        for event in &resolution.decisions {
+            let input = &event.provenance.normalized_input;
+            assert_eq!(input.catalogs.len(), 1);
+            assert_eq!(input.catalogs[0].runtime, "codex");
+            assert!(input.catalogs[0].models.iter().any(|model| model.available));
+            assert_eq!(
+                event.provenance.choice.as_ref().unwrap().candidate.runtime,
+                "codex"
+            );
+            assert!(input.quota_source.is_none());
+            assert!(input
+                .operational_observations
+                .as_ref()
+                .unwrap()
+                .quota
+                .is_none());
+            assert!(input.pools[0].observation_source.is_none());
+            assert!(input.pools[0].admission_provenance.contains(
+                "external account quota and marginal-price observations were unavailable"
+            ));
+        }
+        let mut state = resolution.automatic_state.context("local-auth state")?;
+        assert!(state.account_observations.is_empty());
+        assert!(state.account_observation.is_none());
+        let replay = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(
+            replay.runtime_overrides[&AgentRole::Worker],
+            SupervisorRuntime::Codex
+        );
+        assert_eq!(
+            replay.decisions[0].1.normalized_input.catalogs[0].runtime,
+            "codex"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn configured_cam_codex_without_primary_account_refuses_catalog_fallback() -> Result<()> {
+        use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("missing-authority.sock");
+        let _socket = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+        let _policy = bind_fixture_routing_policy()?;
+        let accounts = [(
+            SupervisorRuntime::Grok,
+            qualified_account_fixture("grok-cli", "unrelated-account-model", "high"),
+        )];
+        let catalog = codex_catalog()?;
+        for observations in [&accounts[..], &[]] {
+            let error = initialize_supervisor_selection_with_accounts(
+                &mut test_plan(),
+                SupervisorRuntime::Codex,
+                &catalog,
+                &test_admission(),
+                &AdvertisedCatalogSet::empty(),
+                Some(&default_resolved_profile()),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                observations,
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains(
+                "configured CAM account catalog set is missing the selected primary runtime binding"
+            ));
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

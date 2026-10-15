@@ -7383,6 +7383,50 @@ mod selected_codex_auth_tests {
     }
 
     #[test]
+    fn local_auth_codex_managed_parent_preserves_launch_binding_and_cam_refusal() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+        use crate::supervise::SupervisorRuntime;
+
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let run = "r10-local-auth-managed-parent";
+        record_observed_codex_selection_from_source(
+            Some(run), CODEX_CLI_PROVIDER_ID, None, None, None,
+        );
+        let parent = ExternalAgentCommand::codex(
+            "codex", "/workspace", "/prompt", "/events", "/report", Duration::from_secs(1),
+        )
+        .with_agent_lifecycle("/workspace", "child_orchestrator", run, "parent")
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_model_selection(Some("synthetic-model".into()), Some("high".into()))
+        .with_codex_native_delegation_disabled()
+        .with_codex_managed_readonly_continuation();
+        parent.managed_parent_control_transport(SupervisorRuntime::Codex)?;
+
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("missing.sock");
+        {
+            let _configured = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+            assert!(parent.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        }
+        let mut changed = parent.clone();
+        changed.codex_run_account_binding = Some(CodexRunAccountBinding::Missing);
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        let mut changed = parent.clone();
+        changed.agent_lifecycle.as_mut().unwrap().run_id = "r10-unadmitted-parent".into();
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        let mut changed = parent.clone();
+        changed.codex_native_delegation_disabled = false;
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        // Initial parents still need their sealed inbox endpoint; local auth
+        // grants no transport, delegation, or worktree capability of its own.
+        assert!(parent
+            .with_codex_managed_worker_requests()
+            .managed_parent_control_transport(SupervisorRuntime::Codex)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
     fn absent_implicit_cam_allows_codex_legacy_auth_admission() -> Result<()> {
         use crate::account_authority::record_observed_codex_selection_from_source;
 
