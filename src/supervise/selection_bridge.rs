@@ -1730,8 +1730,13 @@ impl SelectedReviewLens {
         }
         // The existing guard saves the outer authorizations and restores them on
         // every exit, including preparation refusal and dispatch unwinding.
+        // Registry reads revalidate earlier launches, including the Worker. Keep
+        // those selector seals under the same frozen policy while replacing only
+        // the Auditor's triple for this lens.
+        let authorizations = crate::selection::routing_policy::captured_selected_authorizations();
         let guard =
             crate::selection::routing_policy::bind_routing_policy(Some(receipt.frozen.clone()))?;
+        crate::selection::routing_policy::install_selected_authorizations(authorizations);
         crate::selection::routing_policy::seal_selected_candidate(
             AgentRole::Auditor.as_str(),
             &self.decision,
@@ -6619,11 +6624,17 @@ mod tests {
                 std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<()> {
                     let (_scope, _) = selected.bind()?;
                     validate_selected_launch("auditor", "codex", FRONTIER_PROFILE_MODEL, "xhigh")?;
+                    validate_selected_launch(
+                        "child_orchestrator",
+                        "codex",
+                        FRONTIER_PROFILE_MODEL,
+                        "xhigh",
+                    )?;
                     assert!(validate_selected_launch(
                         "child_orchestrator",
                         "codex",
                         FRONTIER_PROFILE_MODEL,
-                        "xhigh"
+                        "low"
                     )
                     .is_err());
                     if panic_after_binding {
@@ -9824,6 +9835,29 @@ mod tests {
             .provenance;
         let before = captured_selected_authorizations();
         let lens = &plan.review_lenses[0];
+        // This is the same serde validation used when registration rereads the
+        // registry left by a completed Worker before adding the Auditor probe.
+        let worker = before.get("worker").context("Worker selector seal")?;
+        let worker_record = crate::agent_lifecycle::AgentProcessRecord {
+            pid: 1,
+            process_start_time: "fixture-worker-start".to_string(),
+            role: "worker".to_string(),
+            run_id: run_id.clone(),
+            task_id: "assignment-001".to_string(),
+            parent: Some(run_id.clone()),
+            repo: PathBuf::from("/workspace"),
+            argv: vec![
+                "codex".to_string(),
+                "app-server".to_string(),
+                "-c".to_string(),
+                format!("model={:?}", worker.model),
+                "-c".to_string(),
+                format!("model_reasoning_effort={:?}", worker.effort.as_str()),
+            ],
+            launch_timestamp_ms: 1,
+            mechanical_executor: None,
+        };
+        let registry_record = serde_json::to_vec(&worker_record)?;
         let select = |lens: &ReviewLensConfig, catalog: &RuntimeModelCatalog, run_id: &str| {
             select_authored_review_lens(
                 lens,
@@ -9845,6 +9879,20 @@ mod tests {
                 &candidate.model,
                 candidate.effort.as_str(),
             )?;
+            assert_eq!(
+                serde_json::from_slice::<crate::agent_lifecycle::AgentProcessRecord>(
+                    &registry_record
+                )?,
+                worker_record
+            );
+            assert!(validate_selected_model("worker", "unselected-worker-model").is_err());
+            assert!(validate_selected_model("auditor", "unselected-auditor-model").is_err());
+            let mut unauthorized = serde_json::to_value(&worker_record)?;
+            unauthorized["argv"][3] = serde_json::json!("model=\"unselected-worker-model\"");
+            assert!(
+                serde_json::from_value::<crate::agent_lifecycle::AgentProcessRecord>(unauthorized)
+                    .is_err()
+            );
             assert_eq!(decision.normalized_task, baseline.normalized_task);
             assert!(decision
                 .normalized_input

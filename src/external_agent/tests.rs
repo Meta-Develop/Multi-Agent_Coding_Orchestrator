@@ -10913,12 +10913,6 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
             stdout: PathBuf::from("injected-stdout"),
             stderr: PathBuf::from("injected-stderr"),
         },
-        ProcessRunError::Spawn {
-            label: "codex version preflight".to_string(),
-            command: "codex --version".to_string(),
-            current_dir: PathBuf::from("."),
-            source: std::io::Error::other("injected ambiguous spawn failure"),
-        },
         ProcessRunError::SetupTimeout {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -10976,6 +10970,12 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
     }
 
     let pre_spawn_errors = vec![
+        ProcessRunError::Spawn {
+            label: "codex version preflight".to_string(),
+            command: "codex --version".to_string(),
+            current_dir: PathBuf::from("."),
+            source: std::io::Error::other("injected spawn failure before child creation"),
+        },
         ProcessRunError::Cancelled {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),

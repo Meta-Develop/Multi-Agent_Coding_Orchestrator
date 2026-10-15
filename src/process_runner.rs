@@ -2811,6 +2811,14 @@ pub struct ProcessFailureEvidence {
     pub stdin_error: Option<String>,
 }
 
+/// Live rollback evidence from the runner, never reconstructed from error text.
+#[derive(Debug, Error)]
+#[error("{message}")]
+struct AgentRegistrationFailure {
+    message: String,
+    evidence: ProcessFailureEvidence,
+}
+
 impl fmt::Display for ProcessFailureEvidence {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         let stdout = self.stdout.summarize_chars(512);
@@ -2881,6 +2889,7 @@ pub enum ProcessRunError {
         stdout: PathBuf,
         stderr: PathBuf,
     },
+    /// The runner has not successfully spawned a child when this is returned.
     #[error("failed to spawn {label} ({command}) in {current_dir}: {source}")]
     Spawn {
         label: String,
@@ -2944,6 +2953,29 @@ pub enum ProcessRunError {
 }
 
 impl ProcessRunError {
+    pub(crate) fn agent_registration_failed(
+        label: String,
+        command: String,
+        message: String,
+        evidence: ProcessFailureEvidence,
+    ) -> Self {
+        Self::ProcessOwnership {
+            label,
+            command,
+            source: std::io::Error::other(AgentRegistrationFailure { message, evidence }),
+        }
+    }
+
+    pub(crate) fn registration_rollback_evidence(&self) -> Option<&ProcessFailureEvidence> {
+        let Self::ProcessOwnership { source, .. } = self else {
+            return None;
+        };
+        source
+            .get_ref()?
+            .downcast_ref::<AgentRegistrationFailure>()
+            .map(|failure| &failure.evidence)
+    }
+
     /// Typed pre-spawn failure when Required Linux containment cannot find a
     /// delegated systemd user manager.
     ///
@@ -3299,10 +3331,9 @@ fn run_process_cancellable_with_interaction(
     #[cfg(test)]
     if let Some(marker) = env::var_os("MACO_TEST_AFTER_CHILD_SPAWN_MARKER") {
         if let Err(source) = fs::write(marker, b"spawned") {
-            let error = ProcessRunError::Spawn {
+            let error = ProcessRunError::IoSetup {
                 label: spec.label.clone(),
                 command: command_display.clone(),
-                current_dir: spec.current_dir.clone(),
                 source,
             };
             let cleanup = terminate_unowned_child(&mut child, &spec.label);
@@ -3485,17 +3516,24 @@ fn run_process_cancellable_with_interaction(
                     "agent lifecycle registration rollback",
                 ),
             );
-            let source = append_error(
+            let message = append_error(
                 Some(format!("failed to register launched agent: {error:#}")),
-                cleanup_error,
+                cleanup_error.clone(),
             )
-            .map(std::io::Error::other)
-            .unwrap_or_else(|| std::io::Error::other("failed to register launched agent"));
-            return Err(ProcessRunError::ProcessOwnership {
-                label: spec.label.clone(),
-                command: command_display,
-                source,
-            });
+            .unwrap_or_else(|| "failed to register launched agent".to_string());
+            return Err(ProcessRunError::agent_registration_failed(
+                spec.label.clone(),
+                command_display,
+                message,
+                ProcessFailureEvidence {
+                    stdout: CapturedBytes::default(),
+                    stderr: CapturedBytes::default(),
+                    process_tree: cleanup.process_tree,
+                    side_effects: cleanup.side_effects,
+                    process_error: cleanup_error,
+                    stdin_error: None,
+                },
+            ));
         }
     }
     #[cfg(target_os = "linux")]

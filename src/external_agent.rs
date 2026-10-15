@@ -11593,6 +11593,22 @@ impl EnvironmentPreflightProcessEvidence {
     }
 
     fn record_error(&mut self, error: &ProcessRunError) {
+        if let Some(evidence) = error.registration_rollback_evidence() {
+            let verified = evidence.process_tree.is_verified_empty()
+                && evidence.side_effects.is_verified()
+                && evidence.process_error.is_none()
+                && evidence.stdin_error.is_none();
+            self.record(
+                if verified {
+                    evidence.process_tree
+                } else {
+                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                },
+                evidence.side_effects,
+                verified,
+            );
+            return;
+        }
         match error {
             ProcessRunError::Wait { evidence, .. }
             | ProcessRunError::Cancelled {
@@ -11605,7 +11621,6 @@ impl EnvironmentPreflightProcessEvidence {
             ),
             ProcessRunError::OpenTee { .. }
             | ProcessRunError::TeeConflict { .. }
-            | ProcessRunError::Spawn { .. }
             | ProcessRunError::SetupTimeout { .. }
             | ProcessRunError::ProcessOwnership { .. }
             | ProcessRunError::IoSetup { .. } => self.record(
@@ -11626,6 +11641,7 @@ impl EnvironmentPreflightProcessEvidence {
                 false,
             ),
             ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {
                 target_process_started: false,
@@ -11659,6 +11675,7 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
     matches!(
         error,
         ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {
                 target_process_started: false,
@@ -12362,6 +12379,126 @@ mod preflight_quiescence_regression {
             )),
             "explicit custom target refused after version preflight".to_string(),
         )
+    }
+
+    #[test]
+    fn preflight_spawn_failure_keeps_never_spawned_proof() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let error = run_process_cancellable(
+            ProcessSpec::direct(
+                "auditor version preflight",
+                temp.path().join("missing-codex"),
+                ["--version"],
+                temp.path(),
+                128,
+            ),
+            &ProcessCancellation::new(),
+        )
+        .expect_err("missing executable must fail before spawning");
+        assert!(matches!(error, ProcessRunError::Spawn { .. }));
+        assert!(process_run_error_definitely_before_process_start(&error));
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        evidence.record_error(&error);
+        assert!(!evidence.started);
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        );
+        let mut report = explicit_custom_policy_refusal(&command);
+        retain_environment_preflight_process_evidence(&mut report, &evidence);
+        assert!(report.scratch_quiescence_verified());
+        assert!(report.environment_preflight_quiescence_verified());
+
+        // A later failure before spawn cannot erase an earlier unverified probe.
+        evidence.record(
+            ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            false,
+        );
+        evidence.record_error(&error);
+        retain_environment_preflight_process_evidence(&mut report, &evidence);
+        assert!(!report.scratch_quiescence_verified());
+        Ok(())
+    }
+
+    #[test]
+    fn preflight_registration_failure_requires_verified_rollback() -> Result<()> {
+        let command = ExternalAgentCommand::codex(
+            "codex",
+            ".",
+            "prompt",
+            "log",
+            "output",
+            Duration::from_secs(1),
+        );
+        for (tree_verified, effects_verified, cleanup_failed) in [
+            (true, true, false),
+            (false, true, false),
+            (true, false, false),
+            (true, true, true),
+        ] {
+            let error = ProcessRunError::agent_registration_failed(
+                "auditor version preflight".to_string(),
+                "codex --version".to_string(),
+                "failed to register launched agent".to_string(),
+                crate::process_runner::ProcessFailureEvidence {
+                    stdout: CapturedBytes::default(),
+                    stderr: CapturedBytes::default(),
+                    process_tree: if tree_verified {
+                        ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                    } else {
+                        ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                    },
+                    side_effects: if effects_verified {
+                        SideEffectConfinementEvidence::Verified(
+                            SideEffectConfinementProfileKind::ExternalCodex,
+                        )
+                    } else {
+                        SideEffectConfinementEvidence::Unverified(
+                            SideEffectConfinementProfileKind::ExternalCodex,
+                        )
+                    },
+                    process_error: cleanup_failed.then(|| "rollback failed".to_string()),
+                    stdin_error: None,
+                },
+            );
+            assert!(!process_run_error_definitely_before_process_start(&error));
+            let mut evidence = EnvironmentPreflightProcessEvidence::default();
+            evidence.record_error(&error);
+            assert!(evidence.started, "the containment wrapper was spawned");
+            let mut report = explicit_custom_policy_refusal(&command);
+            retain_environment_preflight_process_evidence(&mut report, &evidence);
+            let expected = tree_verified && effects_verified && !cleanup_failed;
+            assert_eq!(report.scratch_quiescence_verified(), expected);
+            assert_eq!(report.environment_preflight_quiescence_verified(), expected);
+            assert!(!report.succeeded());
+            report.process_tree = None;
+            report.side_effects = None;
+            assert_eq!(report.scratch_quiescence_verified(), expected);
+            let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+            assert!(!restored.scratch_quiescence_verified());
+        }
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        evidence.record_error(&ProcessRunError::ProcessOwnership {
+            label: "auditor version preflight".to_string(),
+            command: "codex --version".to_string(),
+            source: std::io::Error::other(
+                "failed to register launched agent; cleanup verified empty",
+            ),
+        });
+        let mut report = explicit_custom_policy_refusal(&command);
+        retain_environment_preflight_process_evidence(&mut report, &evidence);
+        assert!(
+            !report.scratch_quiescence_verified(),
+            "text is not rollback proof"
+        );
+        Ok(())
     }
 
     #[test]
