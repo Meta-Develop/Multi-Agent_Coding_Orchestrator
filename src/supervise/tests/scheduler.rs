@@ -2808,7 +2808,6 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
 fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
     #[derive(Default)]
     struct ReleaseState {
-        child_a_returned: bool,
         child_b_started: bool,
         release_child_b: bool,
         child_c_started: bool,
@@ -2867,19 +2866,18 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
                 store
                     .release(claim.token)
                     .expect("inject scheduler release failure");
-                let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                release.child_a_returned = true;
-                condvar.notify_all();
             }
             run
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    let (release_error_sender, release_error_receiver) = mpsc::channel();
     #[cfg(target_os = "linux")]
     let selected_fixture_owner = Arc::new(temp);
     #[cfg(target_os = "linux")]
     let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
+        crate::supervise::scheduler::set_concurrent_release_error_observer(release_error_sender);
         let result = {
             #[cfg(target_os = "linux")]
             let _selected_fixture = selected_concurrent_injected_fixture(
@@ -2901,14 +2899,19 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
 
     let (lock, condvar) = &*state;
     let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    while !release.child_a_returned {
+    // Removing A's claim in its callback precedes assignment collection and
+    // scheduler cleanup. Hold B until the scheduler observes the release error
+    // and stops scheduling; otherwise B can finish first and admit C.
+    while release_error_receiver.try_recv().is_err() {
         match done_receiver.try_recv() {
             Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
                 release.release_child_b = true;
                 condvar.notify_all();
                 drop(release);
                 let _ = supervisor_thread.join();
-                panic!("claim release fixture supervisor completed before child-a callback");
+                panic!(
+                    "claim release fixture supervisor completed before scheduler observed child-a release error"
+                );
             }
             Err(mpsc::TryRecvError::Empty) => {}
         }

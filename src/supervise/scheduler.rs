@@ -220,6 +220,17 @@ pub(crate) fn set_live_grant_admission_observer(sender: std::sync::mpsc::Sender<
 }
 
 #[cfg(test)]
+thread_local! {
+    static CONCURRENT_RELEASE_ERROR_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_concurrent_release_error_observer(sender: std::sync::mpsc::Sender<()>) {
+    CONCURRENT_RELEASE_ERROR_OBSERVER.with(|observer| *observer.borrow_mut() = Some(sender));
+}
+
+#[cfg(test)]
 fn admission_commit_abort_injections(
 ) -> &'static std::sync::Mutex<std::collections::BTreeMap<String, usize>> {
     static INJECTIONS: std::sync::OnceLock<
@@ -2261,6 +2272,15 @@ fn run_concurrent_assignment_schedule(
             if outcome.requires_scheduler_abort() {
                 cancellation.cancel();
                 stop_scheduling = true;
+                #[cfg(test)]
+                if !outcome.release_errors.is_empty() || !outcome.semantic_release_errors.is_empty()
+                {
+                    CONCURRENT_RELEASE_ERROR_OBSERVER.with(|observer| {
+                        if let Some(sender) = observer.borrow_mut().take() {
+                            let _ = sender.send(());
+                        }
+                    });
+                }
             } else {
                 if progress.circuit_breaker_trip.is_none() {
                     if let Some(trip) =
