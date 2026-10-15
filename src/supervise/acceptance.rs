@@ -1299,6 +1299,7 @@ pub(super) fn review_lens_verdict_from_auditor(
     expected_request: &ReviewLensRequest,
     expected_auditor_id: &str,
     report: &AuditorReport,
+    parent_process_record: &CommandRunRecord,
     licensed_breakage_review: Option<&LicensedBreakageReview>,
     process_procedural_failure: bool,
 ) -> Result<ReviewLensVerdict> {
@@ -1345,8 +1346,7 @@ pub(super) fn review_lens_verdict_from_auditor(
     } else {
         vec![(
             ReviewLensEvidenceKind::ModelReview,
-            serde_json::to_string(report)
-                .context("failed to recompute parent-owned review-lens evidence")?,
+            review_lens_auditor_evidence(report, parent_process_record)?,
         )]
     };
     ReviewLensVerdict::for_lens(
@@ -1356,6 +1356,46 @@ pub(super) fn review_lens_verdict_from_auditor(
         coverage,
         evidence,
     )
+}
+
+#[derive(Serialize)]
+struct ReviewLensParentProcessReference {
+    serialized_bytes: usize,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct ReviewLensAuditorEvidence<'a> {
+    version: u32,
+    auditor_report: &'a AuditorReport,
+    parent_process_record: ReviewLensParentProcessReference,
+}
+
+fn review_lens_auditor_evidence(
+    report: &AuditorReport,
+    parent_process_record: &CommandRunRecord,
+) -> Result<String> {
+    // Collection appends this parent-owned record after the auditor's commands.
+    // Its stdout can already fill the evidence limit before JSON escaping, and
+    // includes runtime events rather than the auditor's review. Keep the full
+    // record in the collected report/logs and bind it here by content digest.
+    // Auditor-authored commands and findings remain subject to the size limit.
+    if report.commands_run.last() != Some(parent_process_record) {
+        bail!("review lens auditor report lacks its appended parent process record");
+    }
+    let mut auditor_report = report.clone();
+    auditor_report.commands_run.pop();
+    let process_bytes = serde_json::to_vec(parent_process_record)
+        .context("failed to serialize review-lens parent process record")?;
+    serde_json::to_string(&ReviewLensAuditorEvidence {
+        version: 1,
+        auditor_report: &auditor_report,
+        parent_process_record: ReviewLensParentProcessReference {
+            serialized_bytes: process_bytes.len(),
+            sha256: crate::artifacts::state_auth::sha256_hex(&process_bytes),
+        },
+    })
+    .context("failed to recompute parent-owned review-lens evidence")
 }
 
 fn auditor_accepted_licensed_breakage(
@@ -3068,3 +3108,7 @@ pub(super) fn mark_auditor_primary_integrity_violation(
     report.next_safe_action =
         "inspect and restore the primary worktree before rerunning supervise".to_string();
 }
+
+#[cfg(test)]
+#[path = "tests/review_lens_evidence.rs"]
+mod review_lens_evidence_tests;

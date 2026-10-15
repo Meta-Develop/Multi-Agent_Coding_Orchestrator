@@ -7132,7 +7132,9 @@ fn dispatch_and_collect_parent_auditor(
     let auditor_command_record =
         command_record_from_external_for_runtime(&auditor_run, &auditor_command, launch_runtime);
     outcome.command_records.push(auditor_command_record.clone());
-    child_report.commands_run.push(auditor_command_record);
+    child_report
+        .commands_run
+        .push(auditor_command_record.clone());
     let raw_auditor_validated = read_auditor_report(
         auditor_run.output_last_message(),
         &auditor_artifacts.raw_report_relative,
@@ -7192,6 +7194,7 @@ fn dispatch_and_collect_parent_auditor(
         &expected_request,
         &auditor_id,
         &auditor_report,
+        &auditor_command_record,
         child_report.licensed_breakage_review.as_ref(),
         !auditor_containment_verified
             || auditor_primary_integrity_failed
