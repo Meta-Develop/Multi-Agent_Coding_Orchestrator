@@ -4955,10 +4955,16 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
         else {
             bail!("nested review fixture requires unchanged executable review contracts");
         };
-        if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
-            bail!("nested review fixture lens is absent from its supplied model/effort catalog");
+        if ReasoningEffort::parse(effort).is_none() {
+            bail!("nested review fixture lens has an invalid authored effort");
         }
-        models.insert((model.clone(), effort.clone()));
+        // A missing authored lens is a negative selection control, never observed access.
+        if catalog.contains(model) {
+            models.insert((
+                model.clone(),
+                resolve_review_lens_reasoning_effort(lens, None).resolved,
+            ));
+        }
     }
     // Retain a separately selected generic Auditor profile as well as the child
     // and authored lenses. Equal-profile callers add the same existing set entry.
@@ -4971,7 +4977,11 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
             if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
                 bail!("nested review fixture Auditor is absent from its supplied model/effort catalog");
             }
-            models.insert((model.clone(), effort.to_string()));
+            models.insert((
+                model.clone(),
+                enforce_role_reasoning_effort_floor(AgentRole::Auditor, Some(effort.to_string()))
+                    .context("fixture Auditor effort floor")?,
+            ));
         }
     }
     let uniform = models.len() == 1 && plan.review_lenses.len() == 3;
@@ -5086,11 +5096,16 @@ fn install_selected_concurrent_fixture_with_custody<'a>(
                     && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
                     && !nested_workers
                     && runtime_ok;
-                !(ordinary_child || terminal_worker)
+                let researcher = assignment.role == AgentRole::Researcher
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.role_category == Some(RoleCategory::ReadOnlyResearcher)
+                    && !nested_workers
+                    && runtime_ok;
+                !(ordinary_child || terminal_worker || researcher)
             })
         {
             bail!(
-                "selected concurrent fixture requires owned ordinary Codex ChildOrchestrators without workers, or explicit Worker assignments with NonDelegatingTerminalWorker and no nested workers"
+                "selected concurrent fixture requires owned workerless Codex ChildOrchestrators, explicit terminal Workers, or explicit read-only Researchers"
             );
         }
         let frozen = metadata

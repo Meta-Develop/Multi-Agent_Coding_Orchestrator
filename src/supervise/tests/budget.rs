@@ -385,12 +385,14 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize typed auditor budget refusal");
@@ -1017,8 +1019,27 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
                     );
                 write_injected_assignment_report(command, assignment);
             }
-            write_injected_usage(command, 7, 3);
-            injected_verified_run(command)
+            // Charge only the child turns in this degradation fixture. Review
+            // still runs and must carry complete parent-owned usage evidence.
+            let auditor = name.contains("review-auditor");
+            write_injected_usage(
+                command,
+                if auditor { 0 } else { 7 },
+                if auditor { 0 } else { 3 },
+            );
+            let mut run = injected_verified_run(command);
+            retain_attribution_fixture(&mut run, command, command.model.as_deref(), true, false);
+            if auditor {
+                run.codex_parent_evidence.as_mut().unwrap().turn_usage =
+                    crate::external_agent::CodexParentTurnUsage::Known {
+                        input_tokens: 0,
+                        output_tokens: 0,
+                        cached_input_tokens: 0,
+                        reasoning_output_tokens: 0,
+                    };
+                run.retain_app_server_parent_evidence_for_test();
+            }
+            run
         }
     };
 
@@ -2388,12 +2409,14 @@ fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
             write_injected_usage(command, 1, 0);
             injected_verified_run(command)
         };
-        let report = run_supervisor_plan_with_budget_and_runner(
+        let report = run_supervisor_plan_with_selected_nested_review_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             budget,
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            None,
+            &temp,
             &mut runner,
         )
         .unwrap_or_else(|error| panic!("{name} dispatch composition failed: {error:#}"));
@@ -3110,12 +3133,14 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
             }
             run
         };
-        let report = run_supervisor_plan_with_budget_and_runner(
+        let report = run_supervisor_plan_with_selected_nested_review_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             budget,
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            None,
+            &temp,
             &mut runner,
         )
         .unwrap();
@@ -3406,7 +3431,9 @@ fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants
     )
     .expect("three-lens dispatch");
     assert!(report.success, "{report:#?}");
-    assert!(report.accepted);
+    assert!(!report.accepted);
+    assert!(!report.publishable);
+    assert!(report.orchestrator_reports[0].accepted);
     assert_eq!(commands.len(), 3);
     assert_ne!(commands[0].cwd, commands[1].cwd);
     assert_ne!(commands[1].cwd, commands[2].cwd);
@@ -3494,12 +3521,14 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
             }
             run
         };
-        let report = run_supervisor_plan_with_budget_and_runner(
+        let report = run_supervisor_plan_with_selected_nested_review_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             budget,
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            None,
+            &temp,
             &mut runner,
         )
         .unwrap();
@@ -3509,7 +3538,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
             effort == Some("xhigh"),
             "{effort:?}: {report:#?}"
         );
-        assert_eq!(report.accepted, effort == Some("xhigh"));
+        assert!(!report.accepted, "simulation cannot authorize publication");
         if effort != Some("xhigh") {
             assert!(!report.publishable);
         }

@@ -15468,6 +15468,7 @@ done
     #[cfg(target_os = "linux")]
     impl<'a> OwnedCursorAdapterFixture<'a> {
         fn new(owner: &'a tempfile::TempDir, options: &'a SupervisorRunOptions) -> Result<Self> {
+            use crate::account_authority::CURSOR_PROVIDER_ID;
             use coding_agent_manager_lib::{
                 account_authority::{authority_id_for, StoredAccountRegistry},
                 model::{AuthKind, StoredAccountMaterial},
@@ -15490,16 +15491,16 @@ done
             ));
             // Nonlive metadata only: Core supplies incarnation and selection revision.
             registry.begin_add(
-                "cursor-cli",
+                CURSOR_PROVIDER_ID,
                 "owned-cursor-fixture",
                 "SYNTHETIC Cursor adapter account fixture",
                 AuthKind::OAuth,
                 StoredAccountMaterial::VendorHome,
             )?;
-            registry.complete_add("cursor-cli", "owned-cursor-fixture")?;
-            registry.select_complete_revision("cursor-cli", "owned-cursor-fixture", None)?;
+            registry.complete_add(CURSOR_PROVIDER_ID, "owned-cursor-fixture")?;
+            registry.select_complete_revision(CURSOR_PROVIDER_ID, "owned-cursor-fixture", None)?;
             let binding = registry
-                .selected_binding("cursor-cli")?
+                .selected_binding(CURSOR_PROVIDER_ID)?
                 .context("owned Cursor fixture selected account")?;
             let fixture = Self {
                 _owner: owner,
@@ -15508,7 +15509,7 @@ done
             };
             crate::account_authority::record_observed_cursor_selection(
                 Some(options.run_id.as_str()),
-                "cursor-cli",
+                CURSOR_PROVIDER_ID,
                 Some(authority_id_for(fixture.registry.metadata_path())),
                 Some(&binding),
             )
@@ -15525,6 +15526,7 @@ done
             catalog: &RuntimeModelCatalog,
             mechanical_duty: Option<MechanicalTerminalDuty>,
         ) -> Result<(SupervisorRuntime, ExternalAgentCommand)> {
+            use crate::account_authority::CURSOR_PROVIDER_ID;
             use coding_agent_manager_lib::account_authority::authority_id_for;
 
             let launch_runtime = assignment_launch_runtime(assignment, self.options, budget_policy);
@@ -15538,11 +15540,11 @@ done
             }
             let binding = self
                 .registry
-                .selected_binding("cursor-cli")?
+                .selected_binding(CURSOR_PROVIDER_ID)?
                 .context("owned Cursor fixture lost its selected account")?;
             let current = crate::account_authority::record_observed_cursor_selection(
                 None,
-                "cursor-cli",
+                CURSOR_PROVIDER_ID,
                 Some(authority_id_for(self.registry.metadata_path())),
                 Some(&binding),
             )
@@ -15591,7 +15593,7 @@ done
             // Setup refused an occupied slot; restore only this fixture's run to None.
             crate::account_authority::record_observed_cursor_selection(
                 Some(self.options.run_id.as_str()),
-                "cursor-cli",
+                crate::account_authority::CURSOR_PROVIDER_ID,
                 None,
                 None,
             );

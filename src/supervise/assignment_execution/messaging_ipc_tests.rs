@@ -27,6 +27,8 @@ use super::super::{
     SUPERVISOR_SCHEMA_VERSION,
 };
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
 use crate::account_authority::ManagedGrokAccountSelectionEvidence;
 #[cfg(target_os = "linux")]
 use crate::account_authority::{activate_cam_grok_test_harness, build_cam_grok_test_harness};
@@ -1423,6 +1425,7 @@ fn assignment_messaging_grok_verified_process_peer_isolation_and_ipc() -> Result
             if crate::test_containment::skip_current()? {
                 bail!("verified assignment messaging fixture requires containment");
             }
+            let _socket = CamAuthoritySocketTestGuard::install(None);
             let (cam_harness, _managed_grok_home, expected_cam_binding) =
                 build_cam_grok_test_harness("account-a")?;
             let _cam_guard = activate_cam_grok_test_harness(cam_harness);

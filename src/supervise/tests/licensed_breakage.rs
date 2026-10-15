@@ -30,6 +30,47 @@ fn persist_assessed_injected_source_plan(
 }
 
 #[cfg(target_os = "linux")]
+fn persist_selected_licensed_source_plan<'a>(
+    plan: &SupervisorPlan,
+    repo: &Path,
+    plan_file: &Path,
+    owner: &'a tempfile::TempDir,
+) -> crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a> {
+    let mut metadata = SupervisorPlanMetadata::default();
+    let mut document = serde_json::to_value(plan).expect("serialize licensed source");
+    {
+        let _assessment = bind_assessed_injected_plan(plan, repo, &mut metadata)
+            .expect("assess licensed source task and scope");
+        document["resolved_routing_policy"] = json!(metadata.resolved_routing_policy);
+        document["task_routing_assessment"] = json!(metadata.task_routing_assessment);
+    }
+    let selected = crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+        repo,
+        &mut document,
+        owner,
+    )
+    .expect("select owned licensed source and parent-acceptance profile");
+    fs::write(plan_file, serde_json::to_vec_pretty(&document).unwrap())
+        .expect("persist selected assessed source plan");
+    selected
+}
+
+#[cfg(target_os = "linux")]
+fn reassess_generated_fixture(plan: &mut GeneratedFollowUpSupervisorPlan) {
+    let frozen = plan
+        .resolved_routing_policy
+        .as_ref()
+        .expect("generated fixture policy");
+    plan.task_routing_assessment = Some(
+        GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+            &plan.ordinary_plan(),
+            frozen,
+        )
+        .expect("assess the deliberately distinct generated fixture"),
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispatch() {
     skip_without_containment!();
@@ -642,8 +683,9 @@ fn assert_leased_post_effect_heartbeat(queue: &GeneratedFollowUpQueue, item_id: 
 }
 
 #[cfg(target_os = "linux")]
-struct LicensedFollowUpEnqueueInterruptionFixture {
-    _temp: tempfile::TempDir,
+struct LicensedFollowUpEnqueueInterruptionFixture<'a> {
+    _parent_acceptance: crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a>,
+    _temp: &'a tempfile::TempDir,
     repo: PathBuf,
     options: SupervisorRunOptions,
     source_run_id: RunId,
@@ -655,9 +697,9 @@ struct LicensedFollowUpEnqueueInterruptionFixture {
 }
 
 #[cfg(target_os = "linux")]
-fn licensed_follow_up_enqueue_interruption_runner(
-    fixture: &LicensedFollowUpEnqueueInterruptionFixture,
-) -> impl FnMut(&ExternalAgentCommand) -> ExternalAgentRun + '_ {
+fn licensed_follow_up_enqueue_interruption_runner<'a>(
+    fixture: &'a LicensedFollowUpEnqueueInterruptionFixture<'_>,
+) -> impl FnMut(&ExternalAgentCommand) -> ExternalAgentRun + 'a {
     let source_assignment = &fixture.source_assignment;
     let follow_up_assignment = &fixture.follow_up_assignment;
     let declaration_sha256 = fixture.declaration_sha256.as_str();
@@ -709,8 +751,9 @@ fn licensed_follow_up_enqueue_interruption_runner(
 
 #[cfg(target_os = "linux")]
 fn run_licensed_follow_up_enqueue_interruption_fixture(
-) -> LicensedFollowUpEnqueueInterruptionFixture {
-    let (temp, repo) = injected_repository();
+    temp: &tempfile::TempDir,
+    repo: PathBuf,
+) -> LicensedFollowUpEnqueueInterruptionFixture<'_> {
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
@@ -754,7 +797,9 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     });
     let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let follow_up_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let selected = persist_selected_licensed_source_plan(&plan, &repo, &options.plan_file, temp);
     let fixture = LicensedFollowUpEnqueueInterruptionFixture {
+        _parent_acceptance: selected,
         _temp: temp,
         repo,
         options,
@@ -1720,11 +1765,12 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
         injected_verified_run(command)
     };
     install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
-    let error = run_supervisor_plan_with_runner(
+    let error = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect_err("licensed final-report checkpoint interruption");
@@ -1958,6 +2004,15 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
             serde_json::from_slice(&bytes).expect("decode generated follow-up plan");
         value["assignments"][0]["assigned_paths"] =
             serde_json::json!(["src/client.rs", "src/expanded.rs"]);
+        // Keep the altered document internally valid: the immutable queued-plan
+        // comparison, rather than the assessment parser, must refuse this expansion.
+        let ordinary: SupervisorPlan = serde_json::from_value(value.clone()).unwrap();
+        let frozen = serde_json::from_value(value["resolved_routing_policy"].clone()).unwrap();
+        value["task_routing_assessment"] = serde_json::to_value(
+            GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(&ordinary, &frozen)
+                .unwrap(),
+        )
+        .unwrap();
         fs::write(
             path,
             serde_json::to_vec_pretty(&value).expect("encode drifted generated follow-up plan"),
@@ -2452,7 +2507,8 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
 #[test]
 fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
     skip_without_containment!();
-    let fixture = run_licensed_follow_up_enqueue_interruption_fixture();
+    let (temp, repo) = injected_repository();
+    let fixture = run_licensed_follow_up_enqueue_interruption_fixture(&temp, repo);
     let mut runner = licensed_follow_up_enqueue_interruption_runner(&fixture);
     let outcome =
         resume_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
@@ -2484,7 +2540,8 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
 #[test]
 fn licensed_follow_up_stale_predecessor_lease_recovers_through_cascade_resume() {
     skip_without_containment!();
-    let fixture = run_licensed_follow_up_enqueue_interruption_fixture();
+    let (temp, repo) = injected_repository();
+    let fixture = run_licensed_follow_up_enqueue_interruption_fixture(&temp, repo);
     let predecessor = {
         let mut queue =
             reopen_authenticated_source_follow_up_queue(&fixture.repo, &fixture.source_run_id)
@@ -2574,6 +2631,8 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
         budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage
@@ -2646,6 +2705,7 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
     different_plan
         .task
         .push_str(" with pre-existing unauthorized plan drift");
+    reassess_generated_fixture(&mut different_plan);
     let subordinate_run_id = RunId::new(format!("follow-up-{}", enqueued.item_ids[0]))
         .expect("deterministic immediate mismatch subordinate run id");
     let subordinate_plan_file = temp.path().join("immediate-mismatch-subordinate.json");
@@ -2810,6 +2870,8 @@ fn run_held_finalized_subordinate_scenario(
         budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage
@@ -2892,6 +2954,7 @@ fn run_held_finalized_subordinate_scenario(
         finalized_plan
             .task
             .push_str(" with unauthorized plan drift");
+        reassess_generated_fixture(&mut finalized_plan);
     }
     let subordinate_plan_file = temp.path().join(format!("{run_name}-subordinate.json"));
     fs::write(
@@ -2967,6 +3030,7 @@ fn run_held_finalized_subordinate_scenario(
     clear_generated_follow_up_queue_observer();
     let primary_after =
         verified_whole_primary_snapshot_sha256(&repo).expect("capture held primary after");
+    drop(_selected_source);
 
     HeldFinalizedSubordinateScenario {
         _temp: temp,
@@ -3476,6 +3540,8 @@ fn licensed_follow_up_heartbeat_interruption_recovers_through_authenticated_fina
             "licensed-cascade-heartbeat-interrupt",
         )),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage

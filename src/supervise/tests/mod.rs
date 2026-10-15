@@ -604,17 +604,10 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     };
     if let Some(authored) = plan.role_models.get(&AgentRole::Auditor) {
-        // The single-lens budget cases supply both process preferences explicitly.
-        // Retain them only when they match this fixture's exact selected profile.
-        if plan.review_lenses.len() != 1
-            || authored.model != auditor.model
-            || authored.reasoning_effort != auditor.reasoning_effort
-            || !matches!(
-                authored.unavailable_model_fallback,
-                UnavailableModelFallback::FailClosed
-            )
-        {
-            bail!("nested review fixture must not replace an authored Auditor preference");
+        // Keep an explicit independent Auditor preference. Its model and effective
+        // effort receive synthetic observations below and still pass normal selection.
+        if authored.model.is_none() {
+            bail!("nested review fixture requires an explicit authored Auditor model");
         }
     } else {
         plan.role_models.insert(AgentRole::Auditor, auditor);
@@ -646,12 +639,16 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
         profiles
             .entry(lens.backend.model().to_string())
             .or_default()
-            .insert(
-                lens.backend
-                    .reasoning_effort()
-                    .context("fixture explicit lens effort")?
-                    .to_string(),
-            );
+            .insert(resolve_review_lens_reasoning_effort(lens, None).resolved);
+    }
+    if let Some(auditor) = plan.role_models.get(&AgentRole::Auditor) {
+        profiles
+            .entry(auditor.model.clone().context("fixture Auditor model")?)
+            .or_default()
+            .extend(enforce_role_reasoning_effort_floor(
+                AgentRole::Auditor,
+                auditor.reasoning_effort.clone(),
+            ));
     }
     let mut priors = Vec::new();
     let mut capabilities = Vec::new();

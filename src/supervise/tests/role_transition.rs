@@ -6,7 +6,17 @@ fn fake_supervise_run_emits_granted_role_transition_ledger_record() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
-    let plan = injected_plan(assignment.clone(), 0);
+    let mut plan = injected_plan(assignment.clone(), 0);
+    // Fake execution has no observed provider model. Bind only its synthetic
+    // subject capability so this fixture actually exercises a granted transition.
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::LocalDeterministicFake,
+            ..RoleModelSelection::default()
+        },
+    );
     let run_id = RunId::new("fake-role-transition-ledger").expect("valid run id");
     let mut options = injected_options(&repo_path, temp.path(), run_id.as_str());
     options.runtime = SupervisorRuntime::Fake;

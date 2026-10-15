@@ -615,10 +615,6 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
 #[test]
 fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     reset_live_switch_cost_session();
-    bind_live_router_config(SupervisorRouterConfig {
-        hysteresis_margin_bp: 2_500,
-        oscillation_alarm_threshold: 1,
-    });
 
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-live-four-arm").expect("valid run id");
@@ -715,6 +711,12 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     let _routing_policy =
         crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
             .expect("assess the actual selection-evidence task");
+    // Parsing the assessed plan binds its default router configuration. Apply
+    // the explicit comparison configuration after that parse.
+    bind_live_router_config(SupervisorRouterConfig {
+        hysteresis_margin_bp: 2_500,
+        oscillation_alarm_threshold: 1,
+    });
     let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
@@ -1605,11 +1607,12 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run direct Worker Codex schema dispatch");
@@ -3332,9 +3335,19 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
         correction_correlation_id: options.run_id.as_str().to_string(),
     });
     let run_id = options.run_id.clone();
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _policy = bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+        .expect("assess the actual verified entry task");
+    let document = supervisor_plan_value(
+        &plan,
+        &SupervisorConsultantPlan::default(),
+        &AssignmentMetadata::new(),
+        &metadata,
+    )
+    .expect("serialize assessed entry plan");
     fs::write(
         &options.plan_file,
-        serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
+        serde_json::to_vec(&document).expect("serialize verified supervisor plan"),
     )
     .expect("write verified supervisor plan");
 
@@ -4310,22 +4323,7 @@ fn journal_append_failure_does_not_block_fake_run_finalization() {
 
 #[test]
 fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
-    let temp = tempfile::tempdir().expect("temporary repository");
-    let repo = Repository::init(temp.path()).expect("initialize repository");
-    fs::write(temp.path().join("README.md"), "baseline\n").expect("write baseline");
-    let mut index = repo.index().expect("open index");
-    index
-        .add_path(Path::new("README.md"))
-        .expect("stage baseline");
-    index.write().expect("write index");
-    let tree_id = index.write_tree().expect("write tree");
-    let tree = repo.find_tree(tree_id).expect("find tree");
-    let signature =
-        Signature::now("maco test", "maco-test@example.invalid").expect("create signature");
-    repo.commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
-        .expect("commit baseline");
-    drop(tree);
-    drop(repo);
+    let (temp, repo_path) = injected_repository();
 
     let assignment_id = "child-unverified";
     let worker_id = "worker-unverified";
@@ -4341,7 +4339,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
-        review_lenses: default_supervisor_review_lenses(),
+        review_lenses: single_parent_acceptance_review_lenses(),
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
@@ -4374,7 +4372,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         }],
     };
     let options = SupervisorRunOptions {
-        repo: temp.path().to_path_buf(),
+        repo: repo_path.clone(),
         plan_file: temp.path().join("plan.json"),
         run_id: RunId::new("unverified-containment-stops-followups").expect("valid run id"),
         parent_node: None,
@@ -4522,11 +4520,12 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
             injected_target_attempted(run)
         };
 
-        run_supervisor_plan_with_runner(
+        run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect_err("unverified process quiescence must leave the run unfinalized")
@@ -4550,9 +4549,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         "unverified attempt launched a parent auditor"
     );
     assert!(error.to_string().contains("outstanding scratch"));
-    let run_root = temp
-        .path()
-        .join(".maco/o2/runs/unverified-containment-stops-followups");
+    let run_root = repo_path.join(".maco/o2/runs/unverified-containment-stops-followups");
     assert!(run_root.join("incoming").exists());
     assert!(run_root.join("capture").exists());
     assert!(!run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());

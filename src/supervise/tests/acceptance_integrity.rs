@@ -3245,11 +3245,12 @@ fn researcher_foreign_id_collision_after_retry_keeps_final_evidence_on_authored_
         write_injected_json(&command.output_last_message, &wire);
         injected_verified_run(command)
     };
-    let final_report = run_supervisor_plan_with_runner(
+    let final_report = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("finalize exhausted researcher attempts");

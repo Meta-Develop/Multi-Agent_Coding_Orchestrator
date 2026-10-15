@@ -166,8 +166,10 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
 
     let mut first = injected_named_assignment("quota-first", "README.md");
     first.role = AgentRole::Worker;
+    first.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut second = injected_named_assignment("quota-second", "SECOND.md");
     second.role = AgentRole::Worker;
+    second.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut plan = injected_multi_plan(vec![first.clone(), second.clone()], 0);
     let options = injected_options(&repo_path, temp.path(), "quota-live-sequential");
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
@@ -631,6 +633,16 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         parse_supervisor_plan_with_consultant(&plan_document.to_string()).expect("default plan");
     let mut authored_loaded = parse_supervisor_plan_with_consultant(&authored_document.to_string())
         .expect("authored objective-profile plan");
+    let _routing_policy = bind_assessed_injected_plan(
+        &default_loaded.plan,
+        &repo_path,
+        &mut default_loaded.plan_metadata,
+    )
+    .expect("assess the actual objective-profile fixture task");
+    authored_loaded.plan_metadata.resolved_routing_policy =
+        default_loaded.plan_metadata.resolved_routing_policy.clone();
+    authored_loaded.plan_metadata.task_routing_assessment =
+        default_loaded.plan_metadata.task_routing_assessment.clone();
     assert_eq!(
         authored_loaded.plan_metadata.objective_profile.as_deref(),
         Some(profile_id)
@@ -3424,19 +3436,44 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
     .expect("base plan")
     .plan;
     plan.role_models = provisional_default_role_models();
+    // Defaults are deliberately unresolved. Author the chain this test round-trips.
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                    on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+                },
+            ),
+        },
+    );
     let document = serde_json::to_string(&plan).expect("serialize tiered plan");
     assert!(document.contains("ordered_catalog_chain"));
     let loaded = parse_supervisor_plan_with_consultant(&document).expect("reload tiered plan");
     assert_eq!(loaded.plan.role_models, plan.role_models);
 
     plan.role_models = all_frontier_role_models();
+    for selection in plan.role_models.values_mut() {
+        selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+        selection.reasoning_effort = Some("xhigh".to_string());
+        selection.unavailable_model_fallback =
+            UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+                models: Vec::new(),
+                budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            });
+    }
     let document = serde_json::to_string(&plan).expect("serialize all-frontier plan");
     let loaded =
         parse_supervisor_plan_with_consultant(&document).expect("reload all-frontier plan");
     assert_eq!(loaded.plan.role_models, plan.role_models);
     assert_eq!(
         loaded.plan.effective_role_economics_profile().name,
-        ALL_FRONTIER_PROFILE_NAME
+        PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME
     );
     assert!(loaded
         .plan
@@ -3455,7 +3492,7 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
         UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
             models: Vec::new(),
             // gpt-5.6-terra is recorded as ineligible in the shipped capability
-            // policy, so the default degrade ladder may only name luna.
+            // policy, so this authored fixture ladder only names luna.
             budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
             on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
         })
@@ -3766,7 +3803,7 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
     );
     assert_eq!(
         profile.role_models[&AgentRole::Auditor].model.as_deref(),
-        Some(FRONTIER_PROFILE_MODEL)
+        None
     );
     assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
 
@@ -3786,11 +3823,11 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
         local_fake.observation,
         ModelResolutionObservation::LocalDeterministicFake
     );
+    let mut fake_only = provisional_default_role_model_selection(AgentRole::GateClassifier);
+    fake_only.model = Some("classifier-model".to_string());
+    fake_only.unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
     assert!(injected_codex_runtime_catalog(&["unrelated-model"])
-        .resolve_role_model_selection(
-            &provisional_default_role_model_selection(AgentRole::GateClassifier),
-            SupervisorRuntime::Codex,
-        )
+        .resolve_role_model_selection(&fake_only, SupervisorRuntime::Codex,)
         .expect_err("local fake cannot replace a Codex model")
         .to_string()
         .contains("valid only for the fake runtime"));
@@ -4014,7 +4051,7 @@ fn invalid_objective_profile_file_fails_before_external_dispatch() {
 fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
     skip_without_containment!();
     let _capability =
-        install_named_test_models(&["available-child-model", "unavailable-auditor-model"]);
+        install_named_test_models(&["available-child-model", "available-auditor-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
@@ -4029,7 +4066,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
     plan.role_models.insert(
         AgentRole::Auditor,
         RoleModelSelection {
-            model: Some("unavailable-auditor-model".to_string()),
+            model: Some("available-auditor-model".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -4044,12 +4081,9 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
     };
     *model = "available-child-model".to_string();
     *reasoning_effort = Some("low".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-auditor-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-child-model"]);
+    let options = injected_options(&repo_path, temp.path(), "independent-auditor-preference");
+    let catalog =
+        injected_codex_runtime_catalog(&["available-child-model", "available-auditor-model"]);
     let mut child_seen = false;
     let mut auditor_seen = false;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -4096,15 +4130,17 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
-    .expect("run production command path with unavailable auditor model");
+    .expect("run selected child and independent configured lens");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert!(child_seen);
@@ -4114,7 +4150,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             .role_economics_profile
             .as_ref()
             .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+        Some(RoleModelAvailability::Available)
     );
 }
 
@@ -5157,12 +5193,14 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
         write_injected_usage(command, 50, 10);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
     .expect("finalize unavailable-lens procedural report");
