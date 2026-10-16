@@ -1815,7 +1815,8 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
     assert!(!shape_problems.is_empty());
     assert_eq!(invalid.role, AgentRole::Worker);
     assert!(invalid.worker_reports.is_empty());
-    assert_eq!(invalid.status, ReviewStatus::Missing);
+    // The journal gate marks an envelope without its bound worker report as failed.
+    assert_eq!(invalid.status, ReviewStatus::Failed);
     assert!(invalid.rejected);
     let report_relative = Path::new("reports/direct-worker.json");
     let report_path = writer.run_dir().join(report_relative);
@@ -1829,6 +1830,12 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
         &invalid,
     )
     .expect("persist invalid direct worker finalization");
+    assert_eq!(
+        fs::read_dir(writer.run_dir().join("reports"))
+            .expect("read persisted direct worker reports")
+            .count(),
+        1
+    );
     write_final_report(&mut writer, &artifact_test_final_report(&run_id))
         .expect("write final report");
     writer
@@ -1849,7 +1856,7 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
     assert_eq!(persisted.id, assignment.id);
     assert!(!persisted.accepted);
     assert!(persisted.rejected);
-    assert_eq!(persisted.status, ReviewStatus::Missing);
+    assert_eq!(persisted.status, ReviewStatus::Failed);
     assert_eq!(persisted.no_further_delegation, None);
     assert!(persisted.findings.iter().any(|finding| finding
         .message

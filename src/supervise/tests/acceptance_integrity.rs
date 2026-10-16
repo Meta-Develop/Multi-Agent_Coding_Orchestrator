@@ -2220,9 +2220,59 @@ fn worker_journal_direct_envelope_requires_matching_rewritten_evidence() {
                 "report command references contain journal wrappers unsupported by execution journal evidence"
             );
         } else {
-            assert!(finding_messages(&report).contains("direct worker envelope"));
+            let expected = match mismatch {
+                "metadata" | "validation" => "direct worker envelope and its single nested report disagree after journal command canonicalization".to_string(),
+                "missing-worker" | "extra-worker" => format!(
+                    "direct worker envelope must contain exactly one report bound to assignment '{}' (found {} WorkerReport entries)",
+                    assignment.id, report.worker_reports.len()
+                ),
+                _ => unreachable!("handled mismatch: {mismatch}"),
+            };
+            assert!(
+                finding_messages(&report).contains(&expected),
+                "{mismatch}: {}",
+                finding_messages(&report)
+            );
         }
     }
+}
+
+#[test]
+fn worker_journal_real_missing_report_is_not_an_envelope_disagreement() {
+    let mut assignment = injected_assignment(true);
+    let worker = injected_child_report(&assignment).worker_reports.remove(0);
+    assignment.id = worker.id.clone();
+    assignment.role = AgentRole::Worker;
+    assignment.worker_assignments.clear();
+    let mut report = direct_worker_report_envelope(worker);
+    // Minimal supervisor fallback from both R27 real runs. The sole command is
+    // the failed host process, not a command emitted by a nested WorkerReport.
+    let mut host = injected_command_record();
+    host.command = vec!["codex".into(), "app-server".into(), "--stdio".into()];
+    host.status = ReviewStatus::Failed;
+    host.exit_code = Some(255);
+    host.error = Some(
+        "unexpected app-server message during turn: unsupported method turn/moderationMetadata"
+            .into(),
+    );
+    report.commands_run = vec![host.clone()];
+    report.worker_reports.clear();
+    report.validation_results.clear();
+    report.status = ReviewStatus::Missing;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.clear();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("evidence/incoming/assignment-001.json"),
+        &WorkerExecutionJournalEvidenceSet::default(),
+        &mut report,
+    );
+    assert!(report.rejected);
+    assert!(!report.accepted);
+    assert_eq!(report.commands_run, vec![host]);
+    assert!(finding_messages(&report).contains("exactly one report bound to assignment"));
+    assert!(!finding_messages(&report).contains("disagree after journal command canonicalization"));
 }
 
 #[cfg(target_os = "linux")]

@@ -3086,18 +3086,21 @@ pub(super) fn validate_worker_execution_journal_evidence(
 
     // Finalization takes command evidence from the single nested worker. An
     // envelope may omit that duplicate list, but must not contradict it.
-    if assignment.role == AgentRole::Worker
-        && !matches!(report.worker_reports.as_slice(), [worker]
-            if worker.id == assignment.id
-                && report.id == worker.id
-                && (report.commands_run.is_empty() || report.commands_run == worker.commands_run)
-                && report.validation_results == worker.validation_results)
-    {
-        blocking_messages.push((
-            "direct worker envelope and its single nested report disagree after journal command canonicalization"
-                .to_string(),
-            vec![report_path.to_path_buf()],
-        ));
+    if assignment.role == AgentRole::Worker {
+        let problem = match report.worker_reports.as_slice() {
+            [worker] if worker.id == assignment.id && report.id == worker.id => {
+                (!(report.commands_run.is_empty() || report.commands_run == worker.commands_run)
+                    || report.validation_results != worker.validation_results)
+                    .then(|| "direct worker envelope and its single nested report disagree after journal command canonicalization".to_string())
+            }
+            _ => Some(format!(
+                "direct worker envelope must contain exactly one report bound to assignment '{}' (found {} WorkerReport entries)",
+                assignment.id, report.worker_reports.len()
+            )),
+        };
+        if let Some(message) = problem {
+            blocking_messages.push((message, vec![report_path.to_path_buf()]));
+        }
     }
 
     if blocking_messages.is_empty() {

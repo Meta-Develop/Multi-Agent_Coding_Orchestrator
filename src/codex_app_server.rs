@@ -29,6 +29,7 @@ const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
+const MODERATION_METADATA_MAX_MESSAGES: usize = 64;
 const WORKER_REQUEST_TOOL: &str = "maco_worker_request";
 const WORKER_REQUEST_ID_MAX_BYTES: usize = 128;
 const WORKER_REQUEST_RESULT_MAX_BYTES: usize = 64 * 1024;
@@ -250,6 +251,31 @@ fn valid_account_rate_limits_updated(line: &[u8]) -> bool {
         && matches!(
             serde_json::from_slice::<AccountRateLimitsUpdated>(line),
             Ok(AccountRateLimitsUpdated { method, .. }) if method == "account/rateLimits/updated"
+        )
+}
+
+// Validate the envelope from original bytes so duplicate correlation keys cannot
+// be hidden by Value. Provider-specific metadata fields remain open.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnModerationMetadata {
+    method: String,
+    params: TurnModerationMetadataParams,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnModerationMetadataParams {
+    thread_id: String,
+    turn_id: String,
+    metadata: serde_json::Map<String, Value>,
+}
+
+fn valid_turn_moderation_metadata(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<TurnModerationMetadata>(line),
+            Ok(TurnModerationMetadata { method, .. }) if method == "turn/moderationMetadata"
         )
 }
 
@@ -1281,6 +1307,16 @@ impl ProtocolState {
                 });
             }
             if phase == "turn"
+                && message.get("method").and_then(Value::as_str) == Some("turn/moderationMetadata")
+                && !valid_turn_moderation_metadata(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "moderation metadata notification is malformed or oversized"
+                        .to_string(),
+                });
+            }
+            if phase == "turn"
                 && message.get("method").and_then(Value::as_str)
                     == Some("thread/tokenUsage/updated")
                 && !valid_token_usage_notification(&line)
@@ -2002,6 +2038,7 @@ where
     let mut refused_ceiling_expansions = 0usize;
     let mut turn_started_seen = false;
     let mut account_rate_limit_notices = 0usize;
+    let mut moderation_metadata_notices = 0usize;
     let mut token_usage = None;
     let mut cache_write_tokens = 0;
     let mut reroute_message = None;
@@ -2930,6 +2967,36 @@ where
                     }
                 }
             }
+            "turn/moderationMetadata" => {
+                // Provider telemetry from 0.144.4. Retain it in the bounded raw
+                // capture without granting any execution or completion authority.
+                if !turn_started_seen || object.contains_key("id") {
+                    return Err(AppServerError::Unexpected {
+                        phase: "turn/moderationMetadata",
+                        message: "moderation metadata must be an in-turn notification".to_string(),
+                    });
+                }
+                require_exact_text(
+                    &message,
+                    &["params", "threadId"],
+                    thread_id,
+                    "turn/moderationMetadata",
+                )?;
+                require_exact_text(
+                    &message,
+                    &["params", "turnId"],
+                    turn_id,
+                    "turn/moderationMetadata",
+                )?;
+                moderation_metadata_notices += 1;
+                if moderation_metadata_notices > MODERATION_METADATA_MAX_MESSAGES {
+                    return Err(AppServerError::Malformed {
+                        phase: "turn/moderationMetadata",
+                        message: "moderation metadata notifications exceeded their bound"
+                            .to_string(),
+                    });
+                }
+            }
             method if is_bounded_progress_notification(method) => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn progress")?;
                 if let Some(item_id) = params.get("itemId").and_then(Value::as_str) {
@@ -3672,6 +3739,162 @@ mod tests {
             "credits":{"hasCredits":true,"unlimited":false,"balance":null},
             "individualLimit":null,"planType":"pro","rateLimitReachedType":null
         }}})
+    }
+
+    fn captured_moderation_notice() -> Value {
+        // R27 real 0.144.4 worker capture, with IDs replaced and category flags
+        // reduced. This is provider telemetry, never command or report evidence.
+        json!({"method":"turn/moderationMetadata","params":{
+            "threadId":"thread-1","turnId":"turn-1","metadata":{
+                "prompt":{"omnimod":{"protection_type":"omnimod","outputs":[{
+                    "results":[{"category_flags":{"A1":false}}],"is_blocked":false
+                }]}},"generation":{},"tool_call":{},"tool_response":{}
+            }
+        }})
+    }
+
+    #[test]
+    fn captured_moderation_metadata_preserves_worker_report_and_command_evidence() {
+        let mut messages = command_observation_messages();
+        let terminal = messages.pop().unwrap();
+        // The real runs were cancelled at the metadata notice, before a final
+        // report. Supply a terminal continuation to prove it can still arrive.
+        let mut pending = json!({
+            "accepted":false,"assigned_paths":["README.md"],"assignment_kind":"ordinary",
+            "bloated_file_flags":[],"claim_token":1,"commands_run":[],
+            "decomposition_completion":null,"environment_failures":[],"field_guide_entries":[],
+            "files_changed":[],"findings":[],"id":"assignment-001",
+            "next_safe_action":"Establish the required journal baseline, append the requested README line, observe and validate the bounded change, then return the WorkerReport.",
+            "no_further_delegation":true,"rejected":false,"remaining_risk":"","role":"worker",
+            "semantic_intent_token":null,"semantic_modules":[],"semantic_symbols":[],
+            "status":"pending","target_path":null,"validation_results":[]
+        });
+        // Preserve the captured commentary WorkerReport shape as well as the
+        // notice that followed it. The successful final below is synthetic.
+        messages.splice(4..4, [
+            json!({"method":"item/started","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":"pending-worker-report","type":"agentMessage"}
+            }}),
+            json!({"method":"item/completed","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":"pending-worker-report","type":"agentMessage","text":pending.to_string(),"phase":"commentary"}
+            }}),
+        ]);
+        pending["status"] = json!("succeeded");
+        pending["accepted"] = json!(true);
+        let report = pending.to_string();
+        serde_json::from_str::<crate::supervise::WorkerReport>(&report).unwrap();
+        messages.extend([
+            json!({"method":"item/started","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":"worker-report","type":"agentMessage"}
+            }}),
+            json!({"method":"item/completed","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":"worker-report","type":"agentMessage","text":report,"phase":"final_answer"}
+            }}),
+            terminal,
+        ]);
+        let baseline = run_command_observation_messages(messages.clone()).unwrap();
+        messages.insert(6, captured_moderation_notice());
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.final_message.as_deref(), Some(report.as_str()));
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+        assert_eq!(outcome.token_usage, baseline.token_usage);
+    }
+
+    #[test]
+    fn captured_moderation_metadata_rejects_foreign_or_malformed_notices() {
+        for (field, value) in [
+            ("threadId", json!("foreign-thread")),
+            ("turnId", json!("foreign-turn")),
+            ("threadId", Value::Null),
+            ("turnId", Value::Null),
+            ("metadata", Value::Null),
+            ("metadata", json!([])),
+        ] {
+            let mut notice = captured_moderation_notice();
+            notice["params"][field] = value;
+            let mut messages = command_observation_messages();
+            messages.insert(4, notice);
+            assert!(
+                run_command_observation_messages(messages).is_err(),
+                "{field}"
+            );
+        }
+        let mut request = captured_moderation_notice();
+        request["id"] = json!(77);
+        let mut messages = command_observation_messages();
+        messages.insert(4, request);
+        assert!(run_command_observation_messages(messages).is_err());
+        let mut messages = command_observation_messages();
+        messages.insert(3, captured_moderation_notice());
+        assert!(run_command_observation_messages(messages).is_err());
+    }
+
+    #[test]
+    fn moderation_metadata_rejects_invalid_envelopes_and_excessive_notices() {
+        for turn_id in [None, Some(json!(7)), Some(Value::Null)] {
+            let mut notice = captured_moderation_notice();
+            let params = notice["params"].as_object_mut().unwrap();
+            params.remove("turnId");
+            if let Some(value) = turn_id {
+                params.insert("turnId".into(), value);
+            }
+            // A matching nested ID must never substitute for the required turnId.
+            params.insert("turn".into(), json!({"id":"turn-1"}));
+            let mut messages = command_observation_messages();
+            messages.insert(4, notice.clone());
+            assert!(run_command_observation_messages(messages).is_err());
+            notice["params"].as_object_mut().unwrap().remove("turn");
+            let mut messages = command_observation_messages();
+            messages.insert(4, notice);
+            assert!(run_command_observation_messages(messages).is_err());
+        }
+        let mut notice = captured_moderation_notice();
+        notice["params"]["grantRoot"] = json!("/");
+        let mut messages = command_observation_messages();
+        messages.insert(4, notice);
+        assert!(run_command_observation_messages(messages).is_err());
+
+        let duplicate = br#"{"method":"turn/moderationMetadata","params":{"threadId":"foreign","threadId":"thread-1","turnId":"turn-1","metadata":{}}}"#;
+        assert!(!valid_turn_moderation_metadata(duplicate));
+        let mut transport = FakeTransport::from_values(command_observation_messages());
+        transport
+            .incoming
+            .insert(1, ReaderEvent::Line(duplicate.to_vec()));
+        assert!(matches!(
+            run_app_server_turn(
+                &mut transport,
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+                || false,
+            ),
+            Err(AppServerError::Malformed { phase: "turn", .. })
+        ));
+
+        let mut notice = captured_moderation_notice();
+        notice["params"]["metadata"]["futureProviderField"] = json!({"unknown": [1, true]});
+        let mut messages = command_observation_messages();
+        for _ in 0..MODERATION_METADATA_MAX_MESSAGES {
+            messages.insert(4, notice.clone());
+        }
+        assert!(run_command_observation_messages(messages.clone()).is_ok());
+        messages.insert(4, notice);
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Malformed {
+                phase: "turn/moderationMetadata",
+                ..
+            })
+        ));
     }
 
     #[test]
