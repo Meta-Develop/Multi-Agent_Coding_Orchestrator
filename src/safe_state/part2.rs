@@ -2092,8 +2092,22 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn set_scavenge_deadline_hook(hook: impl FnMut(&str) -> bool + 'static) {
+pub(crate) fn set_scavenge_deadline_hook(
+    hook: impl FnMut(&str) -> bool + 'static,
+) -> ScavengeDeadlineHookGuard {
     SCAVENGE_DEADLINE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    ScavengeDeadlineHookGuard
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) struct ScavengeDeadlineHookGuard;
+
+#[cfg(test)]
+impl Drop for ScavengeDeadlineHookGuard {
+    fn drop(&mut self) {
+        SCAVENGE_DEADLINE_HOOK.with(|slot| slot.borrow_mut().take());
+    }
 }
 
 #[cfg(target_os = "linux")]

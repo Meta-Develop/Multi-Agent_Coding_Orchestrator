@@ -5530,7 +5530,7 @@ pub(crate) fn bounded_repository_status_paths_bound(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedStatusPathRecords> {
-    let (paths, _) = bounded_repository_status_paths_bound_with_process_wait(
+    let (paths, _, _) = bounded_repository_status_paths_bound_with_process_wait(
         binding,
         max_entries,
         max_output_bytes,
@@ -5544,7 +5544,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(BoundedStatusPathRecords, Duration)> {
+) -> Result<(BoundedStatusPathRecords, Duration, Duration)> {
     binding.verify()?;
     let records =
         bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
@@ -5552,6 +5552,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     Ok((
         parse_porcelain_v1_z(&records.status, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5560,7 +5561,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(BoundedStatusPathRecords, Duration)> {
+) -> Result<(BoundedStatusPathRecords, Duration, Duration)> {
     binding.verify()?;
     let records = bounded_worktree_records_trusted(
         binding.worktree(),
@@ -5572,6 +5573,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
     Ok((
         parse_porcelain_v1_z(&records.status, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5580,7 +5582,7 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(Vec<PathBuf>, Duration)> {
+) -> Result<(Vec<PathBuf>, Duration, Duration)> {
     binding.verify()?;
     let records = bounded_worktree_records_trusted(
         binding.worktree(),
@@ -5592,6 +5594,7 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     Ok((
         parse_nul_paths(&records.visible, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5600,4 +5603,5 @@ struct BoundedWorktreeRecords {
     status: Vec<u8>,
     ignored: Vec<u8>,
     process_queue_wait: Duration,
+    cleanup_elapsed: Duration,
 }

@@ -3492,21 +3492,25 @@ fn collect_git_inventory_snapshot(
     binding: &crate::worktree::RepositoryBindingGuard,
     deadline: &mut Instant,
 ) -> Result<GitInventorySnapshot> {
-    let (visible, process_queue_wait) =
+    let (visible, process_queue_wait, cleanup_elapsed) =
         crate::worktree::bounded_repository_visible_paths_bound_with_process_wait(
             binding,
             REPOSITORY_INVENTORY_MAX_ENTRIES,
             REPOSITORY_INVENTORY_MAX_TOTAL_PATH_BYTES,
             remaining_inventory_time(*deadline, "before bounded Git inventory")?,
         )?;
-    // The bounded-status layer serializes callers in-process before it starts
-    // its own execution deadline. Exclude only that queue wait from the
-    // repository inventory deadline so concurrent tests or callers do not
-    // consume one another's real inventory budget.
+    // Queue wait and final cleanup run outside the status execution budget.
+    // Exclude their measured durations once per snapshot from the inventory
+    // deadline too, preserving time for subsequent snapshots and descriptor work.
     extend_inventory_deadline(
         deadline,
         process_queue_wait,
         "bounded Git inventory queue wait",
+    )?;
+    extend_inventory_deadline(
+        deadline,
+        cleanup_elapsed,
+        "bounded Git inventory final cleanup",
     )?;
     let visible_paths = visible.into_iter().collect::<BTreeSet<_>>();
     let inventory = collect_descriptor_inventory(binding.worktree_binding(), *deadline)?;

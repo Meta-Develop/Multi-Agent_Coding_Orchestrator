@@ -1216,6 +1216,17 @@ fn forged_or_legacy_deletion_quarantine_is_never_removed() {
         .contains("version is unsupported"));
 }
 
+#[test]
+fn scavenge_deadline_hook_is_cleared_when_guard_unwinds() {
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = set_scavenge_deadline_hook(|_| true);
+        panic!("injected panic before hook triggers");
+    });
+    assert!(panic.is_err());
+    ensure_before_deadline(None, "after hook guard unwinds")
+        .expect("untriggered hook must not leak into later scavenging");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
@@ -1238,7 +1249,7 @@ fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
         max_duration: Duration::from_secs(5),
     };
     let mut child_quarantines = 0usize;
-    set_scavenge_deadline_hook(move |phase| {
+    let _hook_guard = set_scavenge_deadline_hook(move |phase| {
         if phase == "before child quarantine" {
             child_quarantines = child_quarantines.saturating_add(1);
         }
