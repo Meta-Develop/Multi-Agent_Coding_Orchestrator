@@ -1391,6 +1391,7 @@ fn injected_worker_journal_evidence(
             evidence_relative_path: worker_execution_journal_evidence_relative(
                 "child-a", "worker-a",
             ),
+            command_binding: None,
             status,
         },
     )])
@@ -1474,6 +1475,7 @@ pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalA
         .map(|artifact| WorkerJournalArtifactCapture {
             worker_id: artifact.worker_id.clone(),
             path: artifact.path.clone(),
+            command_binding: None,
             status: match fs::read(&artifact.path) {
                 Ok(bytes) => WorkerJournalArtifactCaptureStatus::Loaded(bytes),
                 Err(error) => WorkerJournalArtifactCaptureStatus::Invalid(format!(

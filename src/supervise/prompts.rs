@@ -210,13 +210,13 @@ Required behavior:
 - For execution worker_assignments, collect required advisory child-side review-auditor evidence using the generated REVIEW_AUDITOR template verbatim; preserve its trusted shared prefix then its six-line REVIEW_AUDITOR role metadata block. Acceptance-gate auditors are parent-launched MACO/Codex CLI subprocess roles; child-launched auditors are advisory unless MACO/O2 collects them through the parent-enforced gate.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
 - If an execution assignment declares worker_assignments but no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
-- Workers must return WorkerReport JSON matching the worker report contract and include "no_further_delegation": true.
-- WorkerReport, AuditorReport, and OrchestratorReviewReport must include environment_failures. Use [] when no typed failure occurred. A nonempty environment_failures list requires accepted=false, rejected=true, and status=failed; never include credential or secret values.
-- Workers may propose bounded field_guide_entries containing finding and context only. They must never add date, source_run, or other provenance; the trusted parent stamps provenance only after acceptance and audit.
-- Each worker must use its exact bound journal-append wrapper for shell execution and immediately observe native tool edits with --observe-changes. The wrapper appends JSONL to the exact precreated journal path and derives changed_paths from observed content, without requiring --changed-path. That file is its only non-source write capability; its parent directory is nonwritable. Never create, replace, rename, link, or swap it. Each command record contains command, cwd, start_timestamp, end_timestamp, changed_paths, and observation. The parent imports incoming/worker-journals/ and rejects missing, aliased, replaced, invalid, out-of-scope, or unsupported evidence.
+- Workers return schema-valid WorkerReport JSON with "no_further_delegation": true.
+- WorkerReport, AuditorReport and OrchestratorReviewReport require environment_failures=[] without typed failures; otherwise accepted=false, rejected=true, status=failed. Never include secrets.
+- Worker field_guide_entries: bounded finding/context only; no date/source_run/provenance. Only the trusted parent stamps accepted audited entries.
+- Workers execute shell argv once through their exact bound journal-append prefix; immediately --observe-changes after native edits. The precreated JSONL journal derives changed_paths; --changed-path is optional. It is the only non-source write; its parent directory is nonwritable. Never create, replace, rename, link, or swap it. The parent imports incoming/worker-journals/ and rejects missing/aliased/replaced/invalid/out-of-scope/unsupported evidence.
 - Review auditors must return AuditorReport JSON matching the auditor report contract and include "no_further_delegation": true and "read_only": true to attest they did not mutate files or repository state.
 - For an execution assignment with worker_assignments, embed each accepted terminal WorkerReport in OrchestratorReviewReport.worker_reports without losing or changing any reported evidence, using [] for genuinely empty arrays; represent absent optional evidence as null. Reject the child report if worker evidence is missing or rejected.
-- OrchestratorReviewReport may also propose bounded field_guide_entries containing finding and context only. Do not copy unreviewed or rejected worker suggestions into this field.
+- OrchestratorReviewReport field_guide_entries: bounded finding/context only; exclude unreviewed or rejected worker suggestions.
 - Preserve each worker assignment_kind and target_path in WorkerReport. A successful megafile_decomposition worker must report the exact canonical target_path in files_changed and include decomposition_completion with that target plus at least one concrete canonical replacement_path also present in files_changed. OrchestratorReviewReport must aggregate the exact accepted worker evidence in decomposition_completions; this evidence does not bypass claims, journals, validation, audit, or later merge gates.
 - For an execution assignment with worker_assignments, include at least one accepted read-only AuditorReport in audit_reports whose reviewed_worker_ids covers every embedded worker id; MACO rejects child reports with worker assignments that omit terminal audit evidence.
 - A licensed_breakage declaration in the assignment is immutable plan authority, not permission you may create or widen. For each dependent validation failure, use the exact declared dependent_id as ValidationResult.name, preserve the exact bounded compiler/build signature in message (including the declared interface name), and add an Error finding with the identical message and exact affected dependent paths. Unmatched failures remain ordinary assignment failures.
@@ -235,15 +235,16 @@ Safety requirements:
 fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
     Ok(format!(
-        r#"- Use the exact parent-bound MACO journal-append executable/prefix and precreated device/inode. For shell commands, append --cwd with the exact assigned worktree root, nonempty --start-timestamp and --end-timestamp, then -- and the original argv. The wrapper executes the command ONCE, appends a start record before execution, then observes and journals changed paths/content digests. Do not run the shell command separately. Never reconstruct at the end.
-- --changed-path is optional: the wrapper derives changed_paths from observation. If supplied, repeat it for every changed path; declarations must exactly match observation or the journal is flagged and the parent rejects it. Every observed path, including paths outside assigned_paths, is retained and checked by the parent.
-- Native apply_patch/Edit tools cannot be executed as shell argv. Before the first native edit, establish a baseline using the bound prefix plus --cwd /worktree --start-timestamp 2026-08-25T00:00:00Z --end-timestamp 2026-08-25T00:00:01Z --observe-changes -- true. Invoke the native edit tool, then IMMEDIATELY repeat that observation command with current timestamps, before any other action. Replace /worktree with the exact assigned worktree root. This records the observed edit since the previous snapshot without executing true. Do not pre-journal apply_patch as if it were a shell executable. To preserve native tool argv, replace true after -- with apply_patch and its full actual patch payload as ONE argument; --observe-changes still never executes it.
-- No hand JSON/new identity/PATH/repair; don't recursively journal the helper. Any observation or append failure: stop and report it; do not retry edits or repair evidence.
-- If the wrapper fails with an environment error (for example ENOSYS / Function not implemented, unavailable sandbox facilities, permission denial, or a missing executable), include the observed error in environment_failures using the matching existing category (sandbox_unavailable for sandbox/syscall failures, missing_executable for a missing command). Set status=failed, accepted=false, rejected=true; preserve real command evidence and do not claim success or rerun the edit outside the wrapper.
-- The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Append error, empty command, blank apply_patch command[1]/cwd/timestamps, or invalid paths: WorkerExecutionJournalRecordError; stop. No prose/Markdown.
+        r#"- Bound journal-append prefix/device/inode + --cwd <exact worktree> + nonempty --start-timestamp/--end-timestamp + -- <argv>. The wrapper executes the command ONCE, journaling start/completion/digests. Never execute separately. Never reconstruct at the end.
+- --changed-path is optional; repeat per path, matching observation. Parent checks all paths, including out-of-scope paths.
+- Native apply_patch/Edit: baseline before editing with bound prefix + cwd/timestamps + --observe-changes -- true; edit, then IMMEDIATELY observe with fresh timestamps before any other action. Observation never executes argv: record ["true"] or apply_patch + full patch as ONE argument.
+- Do not pre-journal apply_patch as shell argv.
+- Append/observation error: stop; no repair/retry, hand JSON, identity discovery, PATH change or recursive journaling. For environment errors include the observed error in environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true. Never rerun outside the wrapper.
+- The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Empty command/payload/cwd/timestamps or invalid paths: WorkerExecutionJournalRecordError; stop.
 - WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
-- After --observe-changes -- true, the journal command identity is ["true"]. Omit the native tool from commands_run unless you recorded its full actual argv/payload in observation mode; observing a native edit does not invent a shell command identity for it.
-- Helper record format (plus wrapper-owned observation fields); never write this JSON yourself. Preserve the full apply_patch record when recording native tool argv:
+- Report the inner argv after --: direct prefix ... -- bash -lc 'true' or /bin/bash -lc 'prefix ...' reports ["bash","-lc","true"]; the inner bash -lc array stays intact, with a matching finished journal record.
+- Replace /worktree with your assigned worktree.
+- Never write this JSON yourself. Preserve the full apply_patch record when recording native tool argv:
 {apply_patch_journal_example}"#
     ))
 }
@@ -251,10 +252,8 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
 pub(super) fn worker_cacheable_prefix() -> Result<String> {
     let journal_contract = worker_execution_journal_prompt_contract()?;
     Ok(format!(
-        r#"You are a terminal worker/researcher in an opt-in local Codex CLI supervised run.
-Current supervise run contract: user-directed root O2 or autonomous O2 supervisor -> O1 child orchestrator -> terminal worker/researcher/review-auditor.
-You are not the supervisor. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
-Your authority is execution-only. Do not plan, make judgments, review, act as an acceptance gate, merge, or publish on behalf of another role.
+        r#"You are a terminal worker/researcher under O2 -> O1 -> terminal roles. Do not launch further workers, delegate to another worker, or spawn/impersonate O1 or O2 roles.
+Execution-only authority: Do not plan, make judgments, review, act as an acceptance gate, merge, or publish on behalf of another role.
 
 {tool_call_batching_guidance}
 
@@ -266,15 +265,14 @@ Rules:
 - Do not stage, commit, push, merge, or otherwise publish changes.
 {journal_contract}
 - Validate, or record why not.
-- Return exactly one WorkerReport JSON object with assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, and next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
-- Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
-- field_guide_entries is optional: each item has exactly finding and context, no date, source_run, role text, policy, or provenance. Only the trusted supervisor may append accepted audited suggestions.
-- bloated_file_flags: at most {max_bloated_file_flags} unique {{"path":"repo/relative/file"}} objects. Paths must be canonical repo-relative and inside assigned paths; this schema infers no threshold.
-- For a successful megafile_decomposition, include the exact target and every concrete replacement in files_changed, then set decomposition_completion to {{"target_path":"the exact canonical target path","replacement_paths":["one or more canonical newly created files"]}}. Otherwise set it to null. Renames, unrelated edits, and no-op target reports are not decomposition completion evidence. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
-- Include "no_further_delegation": true in WorkerReport JSON to attest this terminal worker did not delegate further.
-- If you discover a large cross-cutting problem that needs a peer O2 supervisor, report it as an escalation candidate in findings and remaining_risk instead of taking it over. O2-to-O2 follow-up belongs to the user-root O2 or autonomous O2 durable queue, not this terminal role.
-- Only write a report file when an explicit report_path is assigned.
-- If the explicit report path is <none>, do not write any report file; only return WorkerReport JSON in your final response.
+- Return exactly one WorkerReport JSON object: assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
+- Use environment_failures=[] without typed failures; otherwise status=failed, accepted=false, rejected=true. Never include secrets.
+- Optional field_guide_entries: finding/context only, no date/source_run/role/policy/provenance; trusted supervisor appends accepted audited suggestions.
+- bloated_file_flags: at most {max_bloated_file_flags} unique {{"path":"repo/relative/file"}} objects within assigned paths; canonical repo-relative paths, no inferred threshold.
+- Successful megafile_decomposition: files_changed includes exact target and replacements; decomposition_completion={{"target_path":"exact canonical target","replacement_paths":["canonical newly created replacement"]}}; otherwise null. Renames, unrelated edits and no-op targets are insufficient. This typed evidence does not bypass the isolated worktree, hard claim, execution journal, validation, terminal audit, or later merge gates.
+- Attest no delegation with "no_further_delegation": true.
+- Cross-cutting escalation: findings + remaining_risk; peer O2 follow-up: user-root O2/autonomous durable queue.
+- Write a report file only at an explicit report_path; if <none>, return WorkerReport JSON only in the final response.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
         max_bloated_file_flags = MAX_BLOATED_FILE_FLAGS_PER_WORKER,
@@ -1515,7 +1513,7 @@ Declared role selection:
 - Worker runtime: {worker_launch_runtime}
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
-- The O1 must launch this supplied terminal worker template through runtime-native SubAgent on its enclosing bridge and preserve the runtime, model, and effort above. MACO's parent scheduler does not launch the worker automatically; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
+- The O1 must launch this supplied terminal worker template through runtime-native SubAgent on its bridge; preserve runtime/model/effort. No automatic parent launch; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
 
 - Use the worker report schema path: {schema_path}
 

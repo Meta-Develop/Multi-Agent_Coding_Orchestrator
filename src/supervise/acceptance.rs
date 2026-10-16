@@ -2813,8 +2813,8 @@ pub(super) fn validate_worker_execution_journal_evidence(
     journals: &WorkerExecutionJournalEvidenceSet,
     report: &mut OrchestratorReviewReport,
 ) {
-    if (assignment.role != AgentRole::Worker && assignment.worker_assignments.is_empty())
-        || report.worker_reports.is_empty()
+    if assignment.role != AgentRole::Worker
+        && (assignment.worker_assignments.is_empty() || report.worker_reports.is_empty())
     {
         return;
     }
@@ -2957,8 +2957,29 @@ pub(super) fn validate_worker_execution_journal_evidence(
             blocking_messages.push((message, finding_paths));
         }
 
+        canonicalize_journal_command_references(
+            &mut worker_report.commands_run,
+            &mut worker_report.validation_results,
+            journal,
+            entries,
+        );
+        canonicalize_journal_command_references(
+            &mut report.commands_run,
+            &mut report.validation_results,
+            journal,
+            entries,
+        );
         let journal_commands = entries
             .iter()
+            .filter(|entry| {
+                entry.observation.as_ref().is_none_or(|observation| {
+                    matches!(
+                        observation.phase,
+                        WorkerJournalObservationPhase::Completed
+                            | WorkerJournalObservationPhase::NativeEdit
+                    )
+                })
+            })
             .map(|entry| (entry.command.clone(), entry.cwd.clone()))
             .collect::<BTreeSet<_>>();
         let reported_commands_without_journal = worker_report
@@ -3035,6 +3056,50 @@ pub(super) fn validate_worker_execution_journal_evidence(
         }
     }
 
+    if report
+        .commands_run
+        .iter()
+        .chain(
+            report
+                .worker_reports
+                .iter()
+                .flat_map(|worker| &worker.commands_run),
+        )
+        .any(|record| journal_command::is_wrapper(&record.command))
+        || report
+            .validation_results
+            .iter()
+            .chain(
+                report
+                    .worker_reports
+                    .iter()
+                    .flat_map(|worker| &worker.validation_results),
+            )
+            .any(|validation| journal_command::is_wrapper(&validation.command))
+    {
+        blocking_messages.push((
+            "report command references contain journal wrappers unsupported by execution journal evidence"
+                .to_string(),
+            vec![report_path.to_path_buf()],
+        ));
+    }
+
+    // Finalization takes command evidence from the single nested worker. An
+    // envelope may omit that duplicate list, but must not contradict it.
+    if assignment.role == AgentRole::Worker
+        && !matches!(report.worker_reports.as_slice(), [worker]
+            if worker.id == assignment.id
+                && report.id == worker.id
+                && (report.commands_run.is_empty() || report.commands_run == worker.commands_run)
+                && report.validation_results == worker.validation_results)
+    {
+        blocking_messages.push((
+            "direct worker envelope and its single nested report disagree after journal command canonicalization"
+                .to_string(),
+            vec![report_path.to_path_buf()],
+        ));
+    }
+
     if blocking_messages.is_empty() {
         return;
     }
@@ -3054,6 +3119,32 @@ pub(super) fn validate_worker_execution_journal_evidence(
     report.next_safe_action =
         "inspect worker execution journals and rerun the child scope with corrected process evidence"
             .to_string();
+}
+
+fn canonicalize_journal_command_references(
+    commands: &mut [CommandRunRecord],
+    validations: &mut [ValidationResult],
+    journal: &WorkerExecutionJournalEvidence,
+    entries: &[WorkerExecutionJournalEntry],
+) {
+    for record in commands {
+        if let Some(command) = journal_command::canonicalize_wrapper(record, journal, entries) {
+            record.command = command;
+        }
+    }
+    // ValidationResult has no cwd; use the launcher's bound assignment cwd.
+    if let Some(binding) = &journal.command_binding {
+        for validation in validations {
+            if let Some(command) = journal_command::canonicalize_command(
+                &validation.command,
+                &binding.cwd,
+                journal,
+                entries,
+            ) {
+                validation.command = command;
+            }
+        }
+    }
 }
 
 fn mark_worker_report_structural_inconsistency(

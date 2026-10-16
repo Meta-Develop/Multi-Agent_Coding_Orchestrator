@@ -3417,6 +3417,7 @@ fn capture_worker_journal_artifacts(
             WorkerJournalArtifactCapture {
                 worker_id: artifact.worker_id.clone(),
                 path: artifact.path.clone(),
+                command_binding: None,
                 status,
             }
         })

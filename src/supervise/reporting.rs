@@ -432,6 +432,8 @@ pub(crate) fn import_worker_execution_journals_at(
             WorkerExecutionJournalEvidence {
                 incoming_relative_path,
                 evidence_relative_path,
+                command_binding: matching_capture
+                    .and_then(|capture| capture.command_binding.clone()),
                 status,
             },
         );
@@ -1948,6 +1950,7 @@ fn write_deterministic_fake_worker_journals(
         captures.push(WorkerJournalArtifactCapture {
             worker_id: worker_id.to_string(),
             path: journal_path,
+            command_binding: None,
             status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
         });
     }

@@ -1445,7 +1445,7 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
         incoming.path(),
         journal_paths[0].clone(),
     );
-    let fake = deterministic_fake_child_run(
+    let mut fake = deterministic_fake_child_run(
         &command,
         &assignment,
         &AssignmentMetadata::new(),
@@ -1473,12 +1473,23 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
     .expect("decode normalized worker report");
     assert_eq!(normalized, parsed.report);
 
+    let binding = WorkerJournalCommandBinding {
+        executable: PathBuf::from("/parent/provided/maco"),
+        journal: journal_paths[0].clone(),
+        device: 123,
+        inode: 456,
+        cwd: repo_path.clone(),
+    };
+    let mut captures = fake.worker_journal_artifacts().to_vec();
+    captures[0].command_binding = Some(binding.clone());
+    fake.replace_worker_journal_artifacts(captures);
     let journals = import_worker_execution_journals(&mut writer, &assignment, &incoming, &fake)
         .expect("import direct worker journal");
     assert!(matches!(
         journals.get("direct-worker").map(|evidence| &evidence.status),
         Some(WorkerExecutionJournalStatus::Loaded(entries)) if entries.is_empty()
     ));
+    assert_eq!(journals["direct-worker"].command_binding, Some(binding));
     discard_invocation_scratches(&mut writer, &incoming, &capture)
         .expect("discard direct worker scratch fixture");
 

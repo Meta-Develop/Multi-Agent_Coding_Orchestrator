@@ -711,6 +711,7 @@ mod tests {
             journals.insert(worker.to_string(), WorkerExecutionJournalEvidence {
                 incoming_relative_path: PathBuf::from(format!("worker-journals/{worker}.jsonl")),
                 evidence_relative_path: PathBuf::from(format!("logs/workers/{worker}.jsonl")),
+                command_binding: None,
                 status,
             });
         }

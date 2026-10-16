@@ -646,6 +646,20 @@ struct BoundWorkerJournalAppend {
 
 #[cfg(target_os = "linux")]
 impl BoundWorkerJournalAppend {
+    fn attach_command_binding(&self, captures: &mut [WorkerJournalArtifactCapture], cwd: &Path) {
+        for capture in captures {
+            if capture.worker_id == self.journal.worker_id && capture.path == self.journal.path {
+                capture.command_binding = Some(WorkerJournalCommandBinding {
+                    executable: self.helper_path.clone(),
+                    journal: self.journal.path.clone(),
+                    device: self.journal.identity.device,
+                    inode: self.journal.identity.inode,
+                    cwd: cwd.to_path_buf(),
+                });
+            }
+        }
+    }
+
     fn revalidate(&self) -> Result<()> {
         use std::os::unix::fs::MetadataExt;
         let metadata = self.helper_file.metadata()?;
@@ -1903,6 +1917,19 @@ mod worker_journal_append_binding_tests {
             sha256_hex(&fs::read(&binding.helper_path).unwrap())
         );
         let prefix = binding.command_prefix().unwrap();
+        let mut captures = capture_worker_journal_artifacts(&controls, true);
+        assert!(captures[0].command_binding.is_none());
+        binding.attach_command_binding(&mut captures, &spec.cwd);
+        assert_eq!(
+            captures[0].command_binding,
+            Some(WorkerJournalCommandBinding {
+                executable: binding.helper_path.clone(),
+                journal: binding.journal.path.clone(),
+                device: binding.journal.identity.device,
+                inode: binding.journal.identity.inode,
+                cwd: spec.cwd.clone(),
+            })
+        );
         assert_eq!(
             prefix,
             vec![
@@ -6109,7 +6136,18 @@ mod grok_native_custody_tests {
 pub(crate) struct WorkerJournalArtifactCapture {
     pub(crate) worker_id: String,
     pub(crate) path: PathBuf,
+    pub(crate) command_binding: Option<WorkerJournalCommandBinding>,
     pub(crate) status: WorkerJournalArtifactCaptureStatus,
+}
+
+/// Launcher-owned reporting context, never deserialized from worker evidence.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct WorkerJournalCommandBinding {
+    pub(crate) executable: PathBuf,
+    pub(crate) journal: PathBuf,
+    pub(crate) device: u64,
+    pub(crate) inode: u64,
+    pub(crate) cwd: PathBuf,
 }
 
 impl std::fmt::Debug for WorkerJournalArtifactCapture {
@@ -9293,6 +9331,15 @@ fn run_external_agent_runtime(
     }
     let worker_journal_artifacts =
         capture_worker_journal_artifacts(&protected_controls, report.scratch_quiescence_verified());
+    #[cfg(target_os = "linux")]
+    let mut worker_journal_artifacts = worker_journal_artifacts;
+    #[cfg(target_os = "linux")]
+    if let Some(binding) = worker_journal_append
+        .as_ref()
+        .or_else(|| grok_worker_journal.as_ref().map(|binding| &binding.append))
+    {
+        binding.attach_command_binding(&mut worker_journal_artifacts, &target_spec.cwd);
+    }
     report.replace_worker_journal_artifacts(worker_journal_artifacts);
     match output_staging.cleanup() {
         Ok(ExternalOutputCleanup::Quarantined(operation)) => {

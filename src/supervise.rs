@@ -29,7 +29,7 @@ use crate::{
         ManagedChildGitImport, PreActionJournalPhase, PreActionJournalRationale,
         PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
         WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
-        TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM,
+        WorkerJournalCommandBinding, TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -422,6 +422,7 @@ mod gate_health;
 pub use gate_health::*;
 
 mod journal;
+mod journal_command;
 use journal::*;
 
 mod checkpoint;
@@ -4312,6 +4313,7 @@ struct ExternalAttemptEvidenceContext<'a> {
 pub(crate) struct WorkerExecutionJournalEvidence {
     incoming_relative_path: PathBuf,
     evidence_relative_path: PathBuf,
+    command_binding: Option<WorkerJournalCommandBinding>,
     pub(crate) status: WorkerExecutionJournalStatus,
 }
 

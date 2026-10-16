@@ -350,6 +350,13 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("include the observed error in environment_failures"));
     assert!(prompt.contains("sandbox_unavailable for sandbox/syscall failures"));
     assert!(prompt.contains("WorkerReport.commands_run may be a subset of real journal records"));
+    assert!(prompt.contains("Report the inner argv after --"));
+    assert!(prompt.contains("the inner bash -lc array stays intact"));
+    assert!(prompt.contains("Replace /worktree with your assigned worktree."));
+    assert!(prompt.contains("Do not pre-journal apply_patch as shell argv."));
+    assert!(prompt.contains("direct prefix ... -- bash -lc"));
+    assert!(prompt.contains("/bin/bash -lc 'prefix"));
+    assert!(prompt.contains("matching finished journal record"));
     assert!(prompt.contains(
         "each command array element and cwd must be copied byte-for-byte, failed commands included"
     ));
@@ -2230,7 +2237,7 @@ fn active_gate_is_escalated_when_corrective_child_operation_panics() {
         .expect("finalize supervisor report after corrective operation panic");
 
     assert!(!report.success);
-    assert_eq!(invocations, 2);
+    assert_eq!(invocations, 2, "{report:#?}");
     assert!(report.findings.iter().any(|finding| finding
         .message
         .contains("supervisor assignment 'child-a' panicked")));
