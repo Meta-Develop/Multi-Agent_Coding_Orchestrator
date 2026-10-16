@@ -33,6 +33,8 @@ reviewable and recoverable:
 
 `maco init`, `maco repo`, `maco llm`, and `maco supervise plan` stay local, including on Windows. `maco supervise run` needs Linux. The process must already sit in a delegated systemd user manager (`user@<uid>.service` on the unified cgroup v2 hierarchy). Windows refuses writable-runtime admission before spawn.
 
+Operator command sequence for that host, including Codex and Grok: [operator quickstart](docs/OPERATOR_QUICKSTART.md).
+
 That Linux host also needs:
 
 - an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
