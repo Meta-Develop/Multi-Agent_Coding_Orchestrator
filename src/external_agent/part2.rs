@@ -7475,7 +7475,9 @@ mod selected_codex_auth_tests {
             auth.verify_source_unchanged()?;
             fs::create_dir(socket.parent().unwrap())?;
             // A real endpoint appears after capture while auth.json is unchanged.
-            let _listener = std::os::unix::net::UnixListener::bind(&socket)?;
+            // The helper binds through a short directory alias when this path
+            // exceeds sun_path, and the socket inode stays at `socket`.
+            let _listener = crate::test_support::bind_test_unix_socket(&socket)?;
             let error = auth.verify_source_unchanged().unwrap_err();
             assert_eq!(
                 error.downcast_ref::<CodexAuthValidationFailureCause>(),
