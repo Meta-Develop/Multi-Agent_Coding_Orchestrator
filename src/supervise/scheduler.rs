@@ -18,8 +18,10 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::observe_selected_account;
 
 mod preclaim;
+#[cfg(test)]
+use preclaim::evaluate_preclaim_viability;
 use preclaim::{
-    evaluate_preclaim_viability, parked_preclaim_outcome, persist_preclaim_decision,
+    evaluate_preclaim_with_metadata, parked_preclaim_outcome, persist_preclaim_decision,
     preclaim_assignment, PreclaimDecision, PreclaimRunEvidence,
 };
 
@@ -215,6 +217,17 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn set_live_grant_admission_observer(sender: std::sync::mpsc::Sender<usize>) {
     LIVE_GRANT_ADMISSION_OBSERVER.with(|observer| *observer.borrow_mut() = Some(sender));
+}
+
+#[cfg(test)]
+thread_local! {
+    static CONCURRENT_RELEASE_ERROR_OBSERVER: std::cell::RefCell<Option<std::sync::mpsc::Sender<()>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(crate) fn set_concurrent_release_error_observer(sender: std::sync::mpsc::Sender<()>) {
+    CONCURRENT_RELEASE_ERROR_OBSERVER.with(|observer| *observer.borrow_mut() = Some(sender));
 }
 
 #[cfg(test)]
@@ -587,20 +600,8 @@ impl AssignmentBudgetPolicy {
                 }
             }
         }
-        for lens in &mut effective.review_lenses {
-            if let ReviewLensBackendConfig::Model {
-                reasoning_effort, ..
-            } = &mut lens.backend
-            {
-                let resolved = resolve_reasoning_effort(
-                    AgentRole::Auditor,
-                    self.assignment_reasoning_effort,
-                    reasoning_effort.as_deref(),
-                    0,
-                );
-                *reasoning_effort = Some(resolved.resolved);
-            }
-        }
+        // Review triples have already been selector-authorized. Assignment effort
+        // overrides and role floors cannot rewrite a lens after that decision.
         effective
     }
 
@@ -1322,17 +1323,17 @@ impl BudgetDegradationController {
             ),
         );
         for (lens_index, lens) in effective_plan.review_lenses.iter().enumerate() {
-            let requested = requested_reasoning_effort.or_else(|| {
+            let requested = {
                 lens.backend
                     .reasoning_effort()
                     .and_then(ReasoningEffort::parse)
-            });
+            };
             push(
                 review_lens_auditor_id(assignment, lens_index),
                 AgentRole::Auditor,
                 requested,
                 lens.backend.reasoning_effort(),
-                None,
+                lens.backend.reasoning_effort(),
                 0,
                 ProcessObservation::NotRetained,
                 Some(
@@ -1706,22 +1707,25 @@ fn scheduler_preclaim_evidence(
             context.worktree_creation,
         ),
     )
+    .with_assignment_metadata(context.assignment_metadata)
 }
 
 pub(super) fn recheck_narrowed_assignment_preclaim(
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     assignment: &OrchestratorAssignment,
     requested_assignments: &[OrchestratorAssignment],
-    repo: &Path,
+    repo_and_metadata: (&Path, &AssignmentMetadata),
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
     worktree_creation: SupervisorWorktreeCreation<'_>,
 ) -> Result<Option<AssignmentExecutionOutcome>> {
+    let (repo, assignment_metadata) = repo_and_metadata;
     let evidence = PreclaimRunEvidence::acquire(
         repo,
         runtime,
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation),
-    );
+    )
+    .with_assignment_metadata(assignment_metadata);
     let decision = preclaim_assignment(artifacts, assignment, requested_assignments, &evidence)?;
     if decision.allows_path_claim() {
         Ok(None)
@@ -2078,7 +2082,16 @@ fn run_concurrent_assignment_schedule(
                     let concurrency = progress.concurrency.clone();
                     let (admission_commit, admission_receiver) = AdmissionCommitSignal::new();
                     let prior_binding = super::prior_input::captured_binding();
+                    let routing_policy = crate::selection::routing_policy::current_routing_policy();
+                    let selected_authorizations =
+                        crate::selection::routing_policy::captured_selected_authorizations();
+                    let runtime_binding = super::runtime_executables::captured_binding();
+                    #[cfg(all(test, target_os = "linux"))]
+                    let cam_observe_fixture = captured_cam_observe_test_harness();
                     let spawn_result = thread::Builder::new().spawn_scoped(scope, move || {
+                        #[cfg(all(test, target_os = "linux"))]
+                        let _cam_observe_guard =
+                            install_captured_cam_observe_test_harness(cam_observe_fixture);
                         #[cfg(test)]
                         let _test_completion = BudgetAdmissionTestCompletion {
                             run_id: context.options.run_id.as_str(),
@@ -2087,6 +2100,14 @@ fn run_concurrent_assignment_schedule(
                         };
                         let _prior_binding_guard =
                             super::prior_input::install_captured(prior_binding);
+                        let _routing_policy_guard =
+                            crate::selection::routing_policy::bind_routing_policy(routing_policy)
+                                .expect("already validated frozen routing policy");
+                        crate::selection::routing_policy::install_selected_authorizations(
+                            selected_authorizations,
+                        );
+                        let _runtime_binding_guard =
+                            super::runtime_executables::install_captured(runtime_binding);
                         let _completion = CompletionSignal {
                             index,
                             sender: completion_sender,
@@ -2251,6 +2272,15 @@ fn run_concurrent_assignment_schedule(
             if outcome.requires_scheduler_abort() {
                 cancellation.cancel();
                 stop_scheduling = true;
+                #[cfg(test)]
+                if !outcome.release_errors.is_empty() || !outcome.semantic_release_errors.is_empty()
+                {
+                    CONCURRENT_RELEASE_ERROR_OBSERVER.with(|observer| {
+                        if let Some(sender) = observer.borrow_mut().take() {
+                            let _ = sender.send(());
+                        }
+                    });
+                }
             } else {
                 if progress.circuit_breaker_trip.is_none() {
                     if let Some(trip) =
@@ -2752,7 +2782,7 @@ fn this_run_attempt_cost_records(
             .or_insert(row.attempt);
     }
     rows.iter()
-        .filter_map(|row| {
+        .map(|row| {
             attempt_cost_record(
                 row.costs.clone(),
                 resolve_this_run_terminal_result(
@@ -3046,15 +3076,15 @@ fn build_supervisor_final_report(
         semantic_release_errors,
         remaining_risk: if success && generated_follow_up_task_count > 0 && !publishable {
             format!(
-                "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence; {generated_follow_up_task_count} generated dependent update task(s) remain deferred and must be regenerated by an accepted publishable run"
+                "{}; {generated_follow_up_task_count} generated dependent update task(s) remain deferred and must be regenerated by an accepted publishable run",
+                nonpublishable_success_guidance(runtime).0
             )
         } else if success && generated_follow_up_task_count > 0 {
             format!(
                 "the breaking assignments completed under accepted narrow licenses; {generated_follow_up_task_count} complete generated dependent update plan(s) are eligible for the authenticated command-level queue, whose separate cascade outcome determines whether dispatch occurred"
             )
         } else if success && !publishable {
-            "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence"
-                .to_string()
+            nonpublishable_success_guidance(runtime).0.to_string()
         } else if success && !coverage_gaps.is_empty() {
             format!(
                 "all child reports passed, but {} spec-to-diff traceability coverage gap(s) remain; worker changes remain isolated in child worktrees",
@@ -3084,14 +3114,12 @@ fn build_supervisor_final_report(
             "one or more child or worker reports failed, were rejected, or were missing".to_string()
         },
         next_safe_action: if success && generated_follow_up_task_count > 0 && !publishable {
-            "rerun with the trusted system Codex runtime before treating the generated follow-up records as dispatchable evidence"
-                .to_string()
+            nonpublishable_success_guidance(runtime).1.to_string()
         } else if success && generated_follow_up_task_count > 0 {
             "inspect the authenticated follow-up queue and cascade outcome; any admitted generated plan still passes ordinary claims, budget admission, checkpoints, child gates, and review lenses"
                 .to_string()
         } else if success && !publishable {
-            "rerun with the trusted system Codex runtime before any real acceptance, merge, or publication"
-                .to_string()
+            nonpublishable_success_guidance(runtime).1.to_string()
         } else if success && !coverage_gaps.is_empty() {
             "inspect traceability coverage_gaps and child worktree diffs before any separate merge preview or apply step"
                 .to_string()
@@ -3527,6 +3555,7 @@ fn evaluate_supervisor_preclaims(
     plan: &SupervisorPlan,
     requested_plan: &SupervisorPlan,
     repo: &Path,
+    assignment_metadata: &AssignmentMetadata,
     runtime: SupervisorRuntime,
     execution_runtime: SupervisorExecutionRuntime,
 ) -> Vec<PreclaimDecision> {
@@ -3535,13 +3564,14 @@ fn evaluate_supervisor_preclaims(
         .iter()
         .map(|assignment| {
             let risk = evidence.risk_for(&assignment.assigned_paths);
-            evaluate_preclaim_viability(
+            evaluate_preclaim_with_metadata(
                 assignment,
                 &requested_plan.assignments,
                 evidence.repo_map.as_ref(),
                 risk.as_ref(),
                 evidence.runtime,
                 execution_runtime,
+                assignment_metadata,
             )
         })
         .collect()
@@ -3780,6 +3810,7 @@ fn prepare_supervisor_run(
     }
     let repo = discover_repo_root(&options.repo)?;
     super::prior_input::require_binding_repo(&repo)?;
+    super::runtime_executables::require_binding_repo_run(&repo, &options.run_id)?;
     let requested_plan = plan.clone();
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
@@ -3833,8 +3864,14 @@ fn prepare_supervisor_run(
     // later preparation failure still leaves durable gate evidence.
     let preclaim_runtime =
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
-    let preclaim_decisions =
-        evaluate_supervisor_preclaims(&plan, &requested_plan, &repo, runtime, preclaim_runtime);
+    let preclaim_decisions = evaluate_supervisor_preclaims(
+        &plan,
+        &requested_plan,
+        &repo,
+        &assignment_metadata,
+        runtime,
+        preclaim_runtime,
+    );
     persist_prepared_preclaim_decisions(
         &repo,
         &options.run_id,
@@ -3844,6 +3881,7 @@ fn prepare_supervisor_run(
         &preclaim_decisions,
     )?;
     super::prior_input::archive_current(&mut artifact_writer, &repo)?;
+    super::runtime_executables::archive_current(&mut artifact_writer, &repo, &options.run_id)?;
     let mut budget_ledger = RunBudgetLedger::new_composed(
         plan_metadata.run_budget.limits,
         options.budget_overrides,
@@ -3932,7 +3970,12 @@ fn prepare_supervisor_run(
                 .assignments
                 .first()
                 .context("evidence-only re-audit plan has no assignment")?;
-            verify_evidence_only_reaudit_source(&repo, operation, assignment)
+            verify_evidence_only_reaudit_source(
+                &repo,
+                operation,
+                assignment,
+                plan_metadata.task_routing_assessment.as_ref(),
+            )
         })
         .transpose()?;
     let assignment_schedule = validated_scheduler_assignment_schedule(&plan, &plan_metadata)?;
@@ -4010,27 +4053,48 @@ fn cam_provider_id_for_supervisor_runtime(runtime: SupervisorRuntime) -> Option<
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct CamObserveTestHarness {
+pub(super) struct CamObserveTestHarness {
     registry: StoredAccountRegistry,
     adapter: Box<dyn coding_agent_manager_lib::providers::ProviderAdapter>,
+    secondary_adapter: Option<Box<dyn coding_agent_manager_lib::providers::ProviderAdapter>>,
+    advertised: Option<AdvertisedCatalogSet>,
+    resolved_auditor: Option<SupervisorSelectionEvent>,
     _root: tempfile::TempDir,
 }
 
 #[cfg(all(test, target_os = "linux"))]
-struct CamObserveTestGuard {
-    previous: Option<CamObserveTestHarness>,
+pub(super) struct CamObserveTestGuard {
+    previous: Option<Arc<CamObserveTestHarness>>,
+    _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(all(test, target_os = "linux"))]
 thread_local! {
-    static CAM_OBSERVE_TEST_OVERRIDE: RefCell<Option<CamObserveTestHarness>> =
+    static CAM_OBSERVE_TEST_OVERRIDE: RefCell<Option<Arc<CamObserveTestHarness>>> =
         const { RefCell::new(None) };
 }
 
 #[cfg(all(test, target_os = "linux"))]
 fn activate_cam_observe_test_harness(harness: CamObserveTestHarness) -> CamObserveTestGuard {
-    let previous = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow_mut().replace(harness));
-    CamObserveTestGuard { previous }
+    install_captured_cam_observe_test_harness(Some(Arc::new(harness)))
+}
+
+// Share fixture custody, not an observation snapshot: Core re-reads the same
+// selected registry and invokes the same provider adapter on every observation.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn captured_cam_observe_test_harness() -> Option<Arc<CamObserveTestHarness>> {
+    CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_captured_cam_observe_test_harness(
+    harness: Option<Arc<CamObserveTestHarness>>,
+) -> CamObserveTestGuard {
+    let previous = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.replace(harness));
+    CamObserveTestGuard {
+        previous,
+        _thread_affinity: std::marker::PhantomData,
+    }
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -4040,6 +4104,1760 @@ impl Drop for CamObserveTestGuard {
             *cell.borrow_mut() = self.previous.take();
         });
     }
+}
+
+// Explicit nonlive account input for the positive injected Verified fixtures.
+// Unknown access stays unknown; the ordinary policy and selector remain authoritative.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct PositiveInjectedCamFixtureGuard<'a> {
+    _cam: CamObserveTestGuard,
+    _owner: &'a tempfile::TempDir,
+    _same_thread: std::marker::PhantomData<std::rc::Rc<()>>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_positive_injected_cam_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    supplied: &RuntimeModelCatalog,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    use coding_agent_manager_lib::account_authority::{
+        validate_observed_models, ModelAccessOutcome, ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("positive injected CAM fixture must not replace an existing observation control");
+    }
+    let RuntimeModelCatalog::Codex(catalog) = supplied else {
+        bail!("positive injected CAM fixture requires its supplied Codex catalog");
+    };
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let mut models = Vec::new();
+    for prior in priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex" && catalog.contains(&prior.model))
+    {
+        // The caller explicitly opts into this synthetic menu. Reuse its existing
+        // fixture priors (including held overlays), never invent a vendor default.
+        let supported = match catalog.effort_metadata(&prior.model) {
+            Some(metadata) => metadata
+                .supported
+                .clone()
+                .context("fixture catalog has unknown supported efforts")?,
+            None => prior
+                .class_fit
+                .iter()
+                .map(|fit| fit.effort.as_str().to_string())
+                .chain(
+                    prior
+                        .authority_evidence
+                        .iter()
+                        .map(|evidence| evidence.effort.as_str().to_string()),
+                )
+                .chain(
+                    prior
+                        .strong_gate_fallback_efforts
+                        .iter()
+                        .map(|effort| effort.as_str().to_string()),
+                )
+                .collect::<BTreeSet<_>>(),
+        };
+        if supported.is_empty() {
+            continue;
+        }
+        models.push(ObservedModel {
+            model_id: prior.model.clone(),
+            supported_efforts: Some(supported.into_iter().collect()),
+            default_effort: catalog
+                .effort_metadata(&prior.model)
+                .and_then(|metadata| metadata.default.clone()),
+            access: ModelAccessOutcome::UnknownAccess,
+        });
+    }
+    let models = ModelsObservation {
+        models,
+        provenance: None,
+    };
+    validate_observed_models(&models).map_err(anyhow::Error::msg)?;
+
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "codex-cli",
+        "synthetic-positive-injected",
+        "Synthetic fixture only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("codex-cli", "synthetic-positive-injected")?;
+    registry.select_complete_revision("codex-cli", "synthetic-positive-injected", None)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        secondary_adapter: None,
+        adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
+}
+
+// A repository-root loan for this one real libtest child. This is fixture custody,
+// never an account, process-launch, selection or publication grant.
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_HOLDER_TEST: &str = "supervise::tests::scheduler::external_termination_named_conflict_release_and_reacquisition_form_one_recovery_sequence";
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_CUSTODY_WITNESS: &str = "concurrent-holder-custody.json";
+#[cfg(all(test, target_os = "linux"))]
+const CONCURRENT_CUSTODY_LOCK: &str = "concurrent-holder-custody.lock";
+#[cfg(all(test, target_os = "linux"))]
+const MAX_CONCURRENT_CUSTODY_BYTES: u64 = 64 * 1024;
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConcurrentCustodyWitness {
+    version: u8,
+    test: String,
+    parent_pid: u32,
+    parent_incarnation: String,
+    root: PathBuf,
+    root_identity: crate::safe_state::FileIdentity,
+    repo: PathBuf,
+    repo_identity: crate::safe_state::FileIdentity,
+    // Readiness does not exist yet: bind its existing parent and future path only.
+    ready: PathBuf,
+    run: String,
+    inputs: [String; 3],
+    witness_identity: crate::safe_state::FileIdentity,
+    lock_identity: crate::safe_state::FileIdentity,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn concurrent_custody_inputs(
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    assessment: &TaskRoutingAssessment,
+) -> Result<[String; 3]> {
+    assessment.validate_for_task(frozen, &plan.task)?;
+    Ok([
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(plan)?),
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(frozen)?),
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(assessment)?),
+    ])
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn verify_concurrent_custody_root(root: &crate::safe_state::SafeRoot) -> Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    root.verify()?;
+    let metadata = std::fs::symlink_metadata(root.path())?;
+    // SAFETY: geteuid reads only the calling process's effective UID.
+    if !metadata.is_dir()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o077 != 0
+        || *root.identity()
+            != (crate::safe_state::FileIdentity {
+                device: metadata.dev(),
+                file: metadata.ino(),
+            })
+    {
+        bail!("inherited concurrent fixture root is not the pinned private directory");
+    }
+    root.verify()
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn concurrent_custody_ready(root: &crate::safe_state::SafeRoot, ready: &Path) -> Result<PathBuf> {
+    if ready.parent() != Some(root.path())
+        || ready.file_name() != Some(std::ffi::OsStr::new("issue-51-supervise-holder-ready"))
+    {
+        bail!("inherited concurrent fixture readiness path differs");
+    }
+    root.direct_child("issue-51-supervise-holder-ready")
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct ParentConcurrentFixtureCustody<'a> {
+    witness: PathBuf,
+    _root: crate::safe_state::SafeRoot,
+    _repo: crate::safe_state::SafeRoot,
+    _lock: crate::safe_state::KernelStateLock,
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _owner: &'a tempfile::TempDir,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl<'a> ParentConcurrentFixtureCustody<'a> {
+    pub(super) fn create(
+        plan: &SupervisorPlan,
+        options: &SupervisorRunOptions,
+        metadata: &SupervisorPlanMetadata,
+        owner: &'a tempfile::TempDir,
+        ready: &Path,
+        policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    ) -> Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let root = crate::safe_state::SafeRoot::open_existing(owner.path())?;
+        verify_concurrent_custody_root(&root)?;
+        let repo = crate::safe_state::SafeRoot::open_existing(&options.repo)?;
+        if !repo.path().starts_with(root.path()) || options.runtime != SupervisorRuntime::Codex {
+            bail!("parent concurrent fixture requires its original owned Codex repository");
+        }
+        let ready = concurrent_custody_ready(&root, ready)?;
+        match std::fs::symlink_metadata(&ready) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            _ => bail!("parent concurrent fixture readiness must still be absent"),
+        }
+        let frozen = metadata
+            .resolved_routing_policy
+            .as_ref()
+            .context("fixture frozen policy")?;
+        let assessment = metadata
+            .task_routing_assessment
+            .as_ref()
+            .context("fixture assessment")?;
+        if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen) {
+            bail!("parent concurrent fixture requires its held frozen policy");
+        }
+        let parent_pid = std::process::id();
+        let parent_incarnation = crate::agent_lifecycle::process_start_time(parent_pid)?;
+        let lock =
+            crate::safe_state::KernelStateLock::acquire_direct(&root, CONCURRENT_CUSTODY_LOCK)?;
+        let witness = root.direct_child(CONCURRENT_CUSTODY_WITNESS)?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&witness)?;
+        let file_metadata = file.metadata()?;
+        let data = ConcurrentCustodyWitness {
+            version: 1,
+            test: CONCURRENT_HOLDER_TEST.to_string(),
+            parent_pid,
+            parent_incarnation,
+            root: root.path().to_path_buf(),
+            root_identity: root.identity().clone(),
+            repo: repo.path().to_path_buf(),
+            repo_identity: repo.identity().clone(),
+            ready,
+            run: options.run_id.as_str().to_owned(),
+            inputs: concurrent_custody_inputs(plan, frozen, assessment)?,
+            witness_identity: crate::safe_state::FileIdentity {
+                device: file_metadata.dev(),
+                file: file_metadata.ino(),
+            },
+            lock_identity: lock.identity().clone(),
+        };
+        let bytes = serde_json::to_vec(&data)?;
+        if bytes.len() as u64 > MAX_CONCURRENT_CUSTODY_BYTES {
+            bail!("parent concurrent fixture custody witness exceeds its bound");
+        }
+        file.write_all(&bytes)?;
+        file.sync_all()?;
+        lock.verify_direct_binding(&root)?;
+        repo.verify()?;
+        verify_concurrent_custody_root(&root)?;
+        Ok(Self {
+            witness,
+            _root: root,
+            _repo: repo,
+            _lock: lock,
+            _policy: policy,
+            _owner: owner,
+        })
+    }
+
+    pub(super) fn witness_path(&self) -> &Path {
+        &self.witness
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+pub(super) struct InheritedConcurrentFixtureRoot {
+    root: crate::safe_state::SafeRoot,
+    repo: crate::safe_state::SafeRoot,
+    witness_path: PathBuf,
+    witness: ConcurrentCustodyWitness,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl InheritedConcurrentFixtureRoot {
+    fn read_witness(path: &Path) -> Result<ConcurrentCustodyWitness> {
+        use std::os::unix::fs::MetadataExt;
+        let mut identity = None;
+        let bytes = crate::safe_state::BoundedRegularReader::read_tree_no_follow_validated(
+            path,
+            MAX_CONCURRENT_CUSTODY_BYTES,
+            |metadata| {
+                // SAFETY: geteuid reads only the calling process's effective UID.
+                if metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o077 != 0
+                    || metadata.nlink() != 1
+                {
+                    bail!("inherited concurrent fixture witness is not private single-link data");
+                }
+                let observed = crate::safe_state::FileIdentity {
+                    device: metadata.dev(),
+                    file: metadata.ino(),
+                };
+                if identity.as_ref().is_some_and(|prior| prior != &observed) {
+                    bail!("inherited concurrent fixture witness identity changed");
+                }
+                identity = Some(observed);
+                Ok(())
+            },
+        )?;
+        let witness: ConcurrentCustodyWitness = serde_json::from_slice(&bytes)?;
+        if identity.as_ref() != Some(&witness.witness_identity) {
+            bail!("inherited concurrent fixture witness identity differs");
+        }
+        Ok(witness)
+    }
+
+    pub(super) fn open(
+        plan: &SupervisorPlan,
+        options: &SupervisorRunOptions,
+        metadata: &SupervisorPlanMetadata,
+        root: &Path,
+        ready: &Path,
+        witness_path: &Path,
+    ) -> Result<Self> {
+        let root = crate::safe_state::SafeRoot::open_existing(root)?;
+        let repo = crate::safe_state::SafeRoot::open_existing(&options.repo)?;
+        if witness_path != root.direct_child(CONCURRENT_CUSTODY_WITNESS)?
+            || !repo.path().starts_with(root.path())
+        {
+            bail!("inherited concurrent fixture paths are outside parent custody");
+        }
+        let witness = Self::read_witness(witness_path)?;
+        if witness.ready != concurrent_custody_ready(&root, ready)? {
+            bail!("inherited concurrent fixture readiness binding differs");
+        }
+        let inherited = Self {
+            root,
+            repo,
+            witness_path: witness_path.to_path_buf(),
+            witness,
+        };
+        inherited.verify(
+            plan,
+            &options.run_id,
+            &options.repo,
+            metadata
+                .resolved_routing_policy
+                .as_ref()
+                .context("fixture frozen policy")?,
+            metadata
+                .task_routing_assessment
+                .as_ref()
+                .context("fixture assessment")?,
+        )?;
+        Ok(inherited)
+    }
+
+    fn verify(
+        &self,
+        plan: &SupervisorPlan,
+        run: &RunId,
+        repo: &Path,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+        assessment: &TaskRoutingAssessment,
+    ) -> Result<()> {
+        use crate::safe_state::{BoundedRegularReader, ExistingExclusiveLock, KernelStateLock};
+        verify_concurrent_custody_root(&self.root)?;
+        self.repo.verify()?;
+        let witness = Self::read_witness(&self.witness_path)?;
+        if witness != self.witness
+            || witness.version != 1
+            || witness.test != CONCURRENT_HOLDER_TEST
+            || witness.root != self.root.path()
+            || witness.root_identity != *self.root.identity()
+            || witness.repo != self.repo.path()
+            || witness.repo_identity != *self.repo.identity()
+            || witness.repo != repo
+            || witness.run != run.as_str()
+            || witness.inputs != concurrent_custody_inputs(plan, frozen, assessment)?
+        {
+            bail!("inherited concurrent fixture input binding differs");
+        }
+        let lock_path = self.root.direct_child(CONCURRENT_CUSTODY_LOCK)?;
+        if BoundedRegularReader::identity(&lock_path)? != witness.lock_identity {
+            bail!("inherited concurrent fixture custody lock identity differs");
+        }
+        match KernelStateLock::try_acquire_existing_exclusive_direct(
+            &self.root,
+            CONCURRENT_CUSTODY_LOCK,
+        )? {
+            ExistingExclusiveLock::Busy => {}
+            ExistingExclusiveLock::Missing | ExistingExclusiveLock::Acquired(_) => {
+                bail!("inherited concurrent fixture custody is not held");
+            }
+        }
+        if BoundedRegularReader::identity(&lock_path)? != witness.lock_identity {
+            bail!("inherited concurrent fixture custody lock identity changed");
+        }
+        // Busy is contention, not a PID proof. Check actual parentage/incarnation too.
+        // The parent-side borrowed owner and KillOnDrop/reap order hold the fixture loan.
+        // SAFETY: getppid reads only the calling process's actual parent PID.
+        let parent_pid = unsafe { libc::getppid() };
+        if parent_pid <= 0
+            || parent_pid as u32 != witness.parent_pid
+            || !crate::agent_lifecycle::supported_process_start_time(
+                witness.parent_pid,
+                &witness.parent_incarnation,
+            )
+            || crate::agent_lifecycle::process_start_time(witness.parent_pid)?
+                != witness.parent_incarnation
+        {
+            bail!("inherited concurrent fixture parent incarnation differs");
+        }
+        Ok(())
+    }
+}
+
+// Explicit, nonlive selection evidence for an opted-in injected concurrency fixture.
+// This does not grant process, account-login, worktree or publication authority.
+#[cfg(all(test, target_os = "linux"))]
+struct SelectedConcurrentFixture {
+    run: RunId,
+    repo: PathBuf,
+    plan: SupervisorPlan,
+    catalog: CodexRuntimeModelCatalog,
+    assessment: TaskRoutingAssessment,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+    inherited: Option<InheritedConcurrentFixtureRoot>,
+    budget_bootstrap: Option<ConcurrentBudgetBootstrap>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[derive(Clone)]
+struct ConcurrentBudgetBootstrap {
+    model: String,
+    effort: ReasoningEffort,
+    concurrency: usize,
+    prior: crate::selection::OperatorPriorDataProvenance,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static SELECTED_CONCURRENT_FIXTURE: RefCell<Option<SelectedConcurrentFixture>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedConcurrentFixtureGuard<'a> {
+    #[cfg(target_os = "linux")]
+    previous: Option<SelectedConcurrentFixture>,
+    #[cfg(target_os = "linux")]
+    _cam: CamObserveTestGuard,
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _owner: &'a tempfile::TempDir,
+    _inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedConcurrentFixtureGuard<'_> {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct ConcurrentFixtureCodexObservation {
+    models: coding_agent_manager_lib::account_authority::ModelsObservation,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl coding_agent_manager_lib::providers::ProviderAdapter for ConcurrentFixtureCodexObservation {
+    fn id(&self) -> &'static str {
+        "codex-cli"
+    }
+
+    fn descriptor(&self) -> coding_agent_manager_lib::model::ProviderDescriptor {
+        use coding_agent_manager_lib::model::{
+            AuthKind, InstallState, Maturity, ProviderDescriptor,
+        };
+        ProviderDescriptor {
+            id: self.id().to_string(),
+            display_name: "Synthetic concurrent fixture (not a live provider)".to_string(),
+            vendor: "test".to_string(),
+            auth_kinds: vec![AuthKind::OAuth],
+            maturity: Maturity::Experimental,
+            install_state: InstallState::Unknown,
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn detect(&self) -> coding_agent_manager_lib::model::InstallState {
+        coding_agent_manager_lib::model::InstallState::Unknown
+    }
+
+    fn list_accounts(
+        &self,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::Account>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn activate_account(&self, _account: &str) -> coding_agent_manager_lib::error::Result<()> {
+        Err(coding_agent_manager_lib::error::Error::NotImplemented(
+            "synthetic concurrent fixture activation",
+        ))
+    }
+
+    fn quota_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::QuotaSnapshot>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn observe_models_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<
+        coding_agent_manager_lib::account_authority::CategoryObservation<
+            coding_agent_manager_lib::account_authority::ModelsObservation,
+        >,
+    > {
+        Ok(
+            coding_agent_manager_lib::account_authority::CategoryObservation::observed(
+                self.models.clone(),
+            ),
+        )
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+struct GrokReviewFixtureObservation {
+    models: coding_agent_manager_lib::account_authority::ModelsObservation,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl coding_agent_manager_lib::providers::ProviderAdapter for GrokReviewFixtureObservation {
+    fn id(&self) -> &'static str {
+        "grok-cli"
+    }
+
+    fn descriptor(&self) -> coding_agent_manager_lib::model::ProviderDescriptor {
+        use coding_agent_manager_lib::model::{
+            AuthKind, InstallState, Maturity, ProviderDescriptor,
+        };
+        ProviderDescriptor {
+            id: self.id().to_string(),
+            display_name: "Synthetic Grok review-cost fixture (not a live provider)".to_string(),
+            vendor: "test".to_string(),
+            auth_kinds: vec![AuthKind::OAuth],
+            maturity: Maturity::Experimental,
+            install_state: InstallState::Unknown,
+            capabilities: Vec::new(),
+        }
+    }
+
+    fn config_paths(&self) -> Vec<PathBuf> {
+        Vec::new()
+    }
+
+    fn detect(&self) -> coding_agent_manager_lib::model::InstallState {
+        coding_agent_manager_lib::model::InstallState::Unknown
+    }
+
+    fn list_accounts(
+        &self,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::Account>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn activate_account(&self, _account: &str) -> coding_agent_manager_lib::error::Result<()> {
+        Err(coding_agent_manager_lib::error::Error::NotImplemented(
+            "synthetic Grok review-cost fixture activation",
+        ))
+    }
+
+    fn quota_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<Vec<coding_agent_manager_lib::model::QuotaSnapshot>>
+    {
+        Ok(Vec::new())
+    }
+
+    fn observe_models_for_account(
+        &self,
+        _account: &coding_agent_manager_lib::model::StoredAccountMetadata,
+    ) -> coding_agent_manager_lib::error::Result<
+        coding_agent_manager_lib::account_authority::CategoryObservation<
+            coding_agent_manager_lib::account_authority::ModelsObservation,
+        >,
+    > {
+        Ok(
+            coding_agent_manager_lib::account_authority::CategoryObservation::observed(
+                self.models.clone(),
+            ),
+        )
+    }
+}
+
+// A known-access observation for a synthetic selected account, never a live
+// Grok entitlement or billing claim. Normal observe/freeze and selector gates apply.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_grok_review_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    fixture_model: &str,
+    supported_efforts: &[ReasoningEffort],
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    use coding_agent_manager_lib::account_authority::{
+        ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("Grok review fixture must not replace an existing CAM observation control");
+    }
+    let menu: BTreeSet<String> = supported_efforts
+        .iter()
+        .map(|effort| effort.as_str().to_string())
+        .collect();
+    if menu.is_empty() {
+        bail!("synthetic Grok review fixture requires a nonempty supported-effort menu");
+    }
+    let default_effort = if menu.len() == 1 {
+        menu.iter().next().cloned()
+    } else {
+        None
+    };
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "grok-cli",
+        "synthetic-review-cost",
+        "Synthetic review-cost account only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("grok-cli", "synthetic-review-cost")?;
+    registry.select_complete_revision("grok-cli", "synthetic-review-cost", None)?;
+    let binding = registry
+        .selected_binding("grok-cli")?
+        .context("synthetic Grok review fixture selected account")?;
+    let models = ModelsObservation {
+        models: vec![ObservedModel {
+            model_id: fixture_model.to_string(),
+            default_effort,
+            supported_efforts: Some(menu.into_iter().collect()),
+            access: ModelAccessOutcome::Available,
+        }],
+        provenance: Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some("2026-09-19T00:00:00Z".to_string()),
+            stale: false,
+            principal_binding: Some(binding),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        }),
+    };
+    coding_agent_manager_lib::account_authority::validate_observed_models(&models)
+        .map_err(anyhow::Error::msg)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        secondary_adapter: None,
+        adapter: Box::new(GrokReviewFixtureObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
+}
+
+// Associate the licensed scenario's already-held genuine account with the exact
+// NonpublishableSimulation source run. No second CAM observer is installed.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedLicensedSourceFixtureGuard<'scope, 'owner> {
+    previous: Option<SelectedConcurrentFixture>,
+    _parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedLicensedSourceFixtureGuard<'_, '_> {
+    fn drop(&mut self) {
+        SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn bind_selected_licensed_source_fixture<'scope, 'owner>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+) -> Result<SelectedLicensedSourceFixtureGuard<'scope, 'owner>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment] = plan.assignments.as_slice() else {
+        bail!("licensed source fixture requires exactly one original child");
+    };
+    let [lens] = plan.review_lenses.as_slice() else {
+        bail!("licensed source fixture requires its single parent-acceptance contract");
+    };
+    let RuntimeModelCatalog::Codex(catalog) = catalog else {
+        bail!("licensed source fixture requires its actual Codex catalog");
+    };
+    if options.runtime != SupervisorRuntime::Codex
+        || !repo.starts_with(parent_acceptance._account._owner.path().canonicalize()?)
+        || !plan.role_models.is_empty()
+        || assignment.role != AgentRole::ChildOrchestrator
+        || assignment.phase != AssignmentPhase::Execution
+        || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+        || assignment.assigned_paths.is_empty()
+        || assignment
+            .runtime
+            .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        || assignment.worker_assignments.iter().any(|worker| {
+            worker.role != AgentRole::Worker
+                || worker.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+                || worker.assigned_paths.is_empty()
+                || worker
+                    .assigned_paths
+                    .iter()
+                    .any(|path| !assignment.assigned_paths.contains(path))
+        })
+        || lens.id != "parent-acceptance"
+        || lens.information_scope != ReviewInformationScope::FullChildTranscript
+    {
+        bail!(
+            "licensed source fixture requires owned default-role Codex subjects and bounded workers"
+        );
+    }
+    let ReviewLensBackendConfig::Model {
+        model,
+        reasoning_effort: Some(effort),
+        ..
+    } = &lens.backend
+    else {
+        bail!("licensed source fixture requires its normally selected executable lens");
+    };
+    if !catalog.contains(model)
+        || ReasoningEffort::parse(effort).is_none()
+        || super::test_runtime_model_catalog(plan, options.runtime)?
+            != RuntimeModelCatalog::Codex(catalog.clone())
+    {
+        bail!("licensed source fixture must retain its complete actual catalog and lens effort");
+    }
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("licensed source frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("licensed source parsed assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen)
+        || !CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some())
+    {
+        bail!("licensed source fixture requires its held policy and selected-account observer");
+    }
+    let fixture = SelectedConcurrentFixture {
+        run: options.run_id.clone(),
+        repo,
+        plan: plan.clone(),
+        catalog: catalog.clone(),
+        assessment,
+        frozen,
+        inherited: None,
+        budget_bootstrap: None,
+    };
+    let previous = SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    Ok(SelectedLicensedSourceFixtureGuard {
+        previous,
+        _parent_acceptance: parent_acceptance,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_nested_review_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    effort: ReasoningEffort,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment, pending @ ..] = plan.assignments.as_slice() else {
+        bail!("nested review fixture requires an authored nested child");
+    };
+    // Single-lens budget lifecycle cases also retain one pending ordinary child.
+    // The existing two/three-lens fixtures still require exactly one nested child.
+    if !pending.is_empty()
+        && (plan.review_lenses.len() != 1
+            || pending.len() != 1
+            || pending.iter().any(|child| {
+                child.role != AgentRole::ChildOrchestrator
+                    || child.phase != AssignmentPhase::Execution
+                    || child.effective_role_category() != RoleCategory::DelegatingCoordinator
+                    || child.assigned_paths.is_empty()
+                    || !child.worker_assignments.is_empty()
+                    || child
+                        .runtime
+                        .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+            }))
+    {
+        bail!("single-lens nested review fixture permits only one pending ordinary Codex child");
+    }
+    if !repo.starts_with(owner.path().canonicalize()?)
+        || options.runtime != SupervisorRuntime::Codex
+        || assignment.role != AgentRole::ChildOrchestrator
+        || assignment.phase != AssignmentPhase::Execution
+        || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+        || (assignment.worker_assignments.is_empty() && plan.review_lenses.len() != 1)
+        || assignment
+            .runtime
+            .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        || assignment.worker_assignments.iter().any(|worker| {
+            worker.role != AgentRole::Worker
+                || worker.effective_role_category() != RoleCategory::NonDelegatingTerminalWorker
+                || worker.assigned_paths.is_empty()
+                || worker
+                    .assigned_paths
+                    .iter()
+                    .any(|path| !assignment.assigned_paths.contains(path))
+        })
+    {
+        bail!("nested review fixture requires an owned Codex child with bounded terminal workers");
+    }
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("nested review fixture frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("nested review fixture parsed assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen) {
+        bail!("nested review fixture requires its held matching policy guard");
+    }
+    let model = plan
+        .role_models
+        .get(&AgentRole::ChildOrchestrator)
+        .and_then(|selection| selection.model.as_ref())
+        .context("nested review fixture authored child model")?;
+    let mut models = BTreeSet::from([(model.clone(), effort.as_str().to_string())]);
+    if !catalog.contains(model) || !matches!(plan.review_lenses.len(), 1..=3) {
+        bail!("nested review fixture requires its actual child catalog and one to three lenses");
+    }
+    for lens in &plan.review_lenses {
+        let ReviewLensBackendConfig::Model {
+            model,
+            reasoning_effort: Some(effort),
+            ..
+        } = &lens.backend
+        else {
+            bail!("nested review fixture requires unchanged executable review contracts");
+        };
+        if ReasoningEffort::parse(effort).is_none() {
+            bail!("nested review fixture lens has an invalid authored effort");
+        }
+        // A missing authored lens is a negative selection control, never observed access.
+        if catalog.contains(model) {
+            models.insert((
+                model.clone(),
+                resolve_review_lens_reasoning_effort(lens, None).resolved,
+            ));
+        }
+    }
+    // Retain a separately selected generic Auditor profile as well as the child
+    // and authored lenses. Equal-profile callers add the same existing set entry.
+    if let Some(auditor) = plan.role_models.get(&AgentRole::Auditor) {
+        if let Some(effort) = auditor.reasoning_effort.as_deref() {
+            let model = auditor
+                .model
+                .as_ref()
+                .context("nested review fixture resolved Auditor model")?;
+            if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
+                bail!(
+                    "nested review fixture Auditor is absent from its supplied model/effort catalog"
+                );
+            }
+            models.insert((
+                model.clone(),
+                enforce_role_reasoning_effort_floor(AgentRole::Auditor, Some(effort.to_string()))
+                    .context("fixture Auditor effort floor")?,
+            ));
+        }
+    }
+    let uniform = models.len() == 1 && plan.review_lenses.len() == 3;
+    super::prior_input::require_binding_repo(&repo)?;
+    let prior = super::prior_input::current_provenance()
+        .context("nested review fixture requires its bound synthetic prior")?;
+    let cam = install_concurrent_fixture_observations(owner, models)?;
+    Ok(bind_selected_concurrent_fixture_inputs(
+        SelectedConcurrentFixture {
+            run: options.run_id.clone(),
+            repo,
+            plan: plan.clone(),
+            catalog: catalog.clone(),
+            assessment,
+            frozen,
+            inherited: None,
+            budget_bootstrap: uniform.then(|| ConcurrentBudgetBootstrap {
+                model: model.clone(),
+                effort,
+                concurrency: 1,
+                prior,
+            }),
+        },
+        cam,
+        policy,
+        owner,
+        None,
+    ))
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_concurrent_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    install_selected_concurrent_fixture_with_custody(
+        plan, options, catalog, metadata, owner, policy, None,
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_inherited_concurrent_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    registry_owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    inherited: &'a InheritedConcurrentFixtureRoot,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    install_selected_concurrent_fixture_with_custody(
+        plan,
+        options,
+        catalog,
+        metadata,
+        registry_owner,
+        policy,
+        Some(inherited),
+    )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_selected_concurrent_fixture_with_custody<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &CodexRuntimeModelCatalog,
+    metadata: SupervisorPlanMetadata,
+    owner: &'a tempfile::TempDir,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    {
+        let repo = options.repo.canonicalize()?;
+        let repo_owned = match inherited {
+            Some(custody) => {
+                custody.verify(
+                    plan,
+                    &options.run_id,
+                    &options.repo,
+                    metadata
+                        .resolved_routing_policy
+                        .as_ref()
+                        .context("fixture frozen policy")?,
+                    metadata
+                        .task_routing_assessment
+                        .as_ref()
+                        .context("fixture assessment")?,
+                )?;
+                repo == custody.repo.path()
+            }
+            None => repo.starts_with(owner.path().canonicalize()?),
+        };
+        if !repo_owned
+            || options.runtime != SupervisorRuntime::Codex
+            || plan.assignments.is_empty()
+            || plan.assignments.iter().any(|assignment| {
+                let nested_workers = !assignment.worker_assignments.is_empty();
+                let runtime_ok = !assignment
+                    .runtime
+                    .is_some_and(|runtime| runtime != SupervisorRuntime::Codex);
+                let ordinary_child = assignment.role == AgentRole::ChildOrchestrator
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+                    && !nested_workers
+                    && runtime_ok;
+                let terminal_worker = assignment.role == AgentRole::Worker
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+                    && !nested_workers
+                    && runtime_ok;
+                let researcher = assignment.role == AgentRole::Researcher
+                    && assignment.phase == AssignmentPhase::Execution
+                    && assignment.role_category == Some(RoleCategory::ReadOnlyResearcher)
+                    && !nested_workers
+                    && runtime_ok;
+                !(ordinary_child || terminal_worker || researcher)
+            })
+        {
+            bail!(
+                "selected concurrent fixture requires owned workerless Codex ChildOrchestrators, explicit terminal Workers, or explicit read-only Researchers"
+            );
+        }
+        let frozen = metadata
+            .resolved_routing_policy
+            .context("fixture frozen policy")?;
+        let assessment = metadata
+            .task_routing_assessment
+            .context("fixture parsed assessment")?;
+        assessment.validate_for_task(&frozen, &plan.task)?;
+        if crate::selection::routing_policy::current_routing_policy().as_ref() != Some(&frozen) {
+            bail!("selected concurrent fixture requires its held matching policy guard");
+        }
+        if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+            bail!("selected concurrent fixture must not replace an existing CAM control fixture");
+        }
+        // Use the caller's unchanged authored review contract, not a new model/effort default.
+        let mut lens_models = BTreeSet::new();
+        for lens in &plan.review_lenses {
+            let ReviewLensBackendConfig::Model {
+                model,
+                reasoning_effort,
+                ..
+            } = &lens.backend
+            else {
+                bail!("selected concurrent fixture requires an executable authored review lens");
+            };
+            let effort = reasoning_effort.as_ref().context("fixture review effort")?;
+            if !catalog.contains(model) {
+                bail!("fixture review model is absent from the actual supplied Codex catalog");
+            }
+            lens_models.insert((model.clone(), effort.clone()));
+        }
+        if lens_models.len() != 1 {
+            bail!(
+                "selected concurrent fixture requires one unchanged review model/effort contract"
+            );
+        }
+        let cam = install_concurrent_fixture_observations(owner, lens_models)?;
+        Ok(bind_selected_concurrent_fixture_inputs(
+            SelectedConcurrentFixture {
+                run: options.run_id.clone(),
+                repo,
+                plan: plan.clone(),
+                catalog: catalog.clone(),
+                assessment,
+                frozen,
+                inherited: inherited.cloned(),
+                budget_bootstrap: None,
+            },
+            cam,
+            policy,
+            owner,
+            inherited,
+        ))
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_concurrent_fixture_observations(
+    owner: &tempfile::TempDir,
+    lens_models: BTreeSet<(String, String)>,
+) -> Result<CamObserveTestGuard> {
+    use coding_agent_manager_lib::account_authority::{
+        ModelAccessBasis, ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind,
+        ModelsObservation, ObservedModel,
+    };
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    if CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some()) {
+        bail!("selected concurrent fixture must not replace an existing CAM control fixture");
+    }
+    let root = tempfile::tempdir_in(owner.path())?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&root.path().join("data")));
+    registry.begin_add(
+        "codex-cli",
+        "synthetic-concurrent",
+        "Synthetic only",
+        AuthKind::OAuth,
+        StoredAccountMaterial::VendorHome,
+    )?;
+    registry.complete_add("codex-cli", "synthetic-concurrent")?;
+    registry.select_complete_revision("codex-cli", "synthetic-concurrent", None)?;
+    let binding = registry
+        .selected_binding("codex-cli")?
+        .context("fixture selected account")?;
+    // These are deliberately synthetic, principal-bound fixture observations.
+    // The unchanged selector still validates access, priors, prohibitions and authority roles.
+    let models = ModelsObservation {
+        models: lens_models
+            .into_iter()
+            .fold(
+                BTreeMap::<String, BTreeSet<String>>::new(),
+                |mut models, (model, effort)| {
+                    models.entry(model).or_default().insert(effort);
+                    models
+                },
+            )
+            .into_iter()
+            .map(|(model_id, efforts)| ObservedModel {
+                model_id,
+                default_effort: (efforts.len() == 1).then(|| efforts.first().unwrap().clone()),
+                supported_efforts: Some(efforts.into_iter().collect()),
+                access: ModelAccessOutcome::Available,
+            })
+            .collect(),
+        provenance: Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::AuthenticatedCatalog,
+            fetched_at: Some("2026-09-19T00:00:00Z".to_string()),
+            stale: false,
+            principal_binding: Some(binding),
+            access_basis: Some(ModelAccessBasis::ConfirmedModelEntitlement),
+        }),
+    };
+    coding_agent_manager_lib::account_authority::validate_observed_models(&models)
+        .map_err(anyhow::Error::msg)?;
+    let cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+        registry,
+        secondary_adapter: None,
+        adapter: Box::new(ConcurrentFixtureCodexObservation { models }),
+        advertised: None,
+        resolved_auditor: None,
+        _root: root,
+    });
+    Ok(cam)
+}
+
+// A nonlive selected account held across the licensed source and generated runs.
+// This supplies observations only; each real RunId must pass normal selection/freeze.
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_licensed_autopilot_account_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    supplied: &RuntimeModelCatalog,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    let RuntimeModelCatalog::Codex(catalog) = supplied else {
+        bail!("licensed Autopilot fixture requires its actual Codex catalog");
+    };
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let mut models = BTreeSet::new();
+    for prior in priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "codex" && catalog.contains(&prior.model))
+    {
+        let supported = match catalog.effort_metadata(&prior.model) {
+            Some(metadata) => metadata
+                .supported
+                .clone()
+                .context("licensed fixture catalog has unknown supported efforts")?,
+            None => prior
+                .class_fit
+                .iter()
+                .map(|fit| fit.effort.as_str().to_string())
+                .chain(
+                    prior
+                        .authority_evidence
+                        .iter()
+                        .map(|evidence| evidence.effort.as_str().to_string()),
+                )
+                .chain(
+                    prior
+                        .strong_gate_fallback_efforts
+                        .iter()
+                        .map(|effort| effort.as_str().to_string()),
+                )
+                .collect(),
+        };
+        models.extend(
+            supported
+                .into_iter()
+                .map(|effort| (prior.model.clone(), effort)),
+        );
+    }
+    let cam = install_concurrent_fixture_observations(owner, models)?;
+    Ok(PositiveInjectedCamFixtureGuard {
+        _cam: cam,
+        _owner: owner,
+        _same_thread: std::marker::PhantomData,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn bind_selected_concurrent_fixture_inputs<'a>(
+    fixture: SelectedConcurrentFixture,
+    cam: CamObserveTestGuard,
+    policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    owner: &'a tempfile::TempDir,
+    inherited: Option<&'a InheritedConcurrentFixtureRoot>,
+) -> SelectedConcurrentFixtureGuard<'a> {
+    let previous = SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    SelectedConcurrentFixtureGuard {
+        previous,
+        _cam: cam,
+        _policy: policy,
+        _owner: owner,
+        _inherited: inherited,
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_child_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    if plan.assignments.iter().any(|assignment| {
+        assignment.role != AgentRole::ChildOrchestrator
+            || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
+    }) {
+        bail!(
+            "budget Child fixture requires only ChildOrchestrator/DelegatingCoordinator subjects"
+        );
+    }
+    install_selected_budget_fixture(plan, options, owner, profile, concurrency)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_selected_researcher_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    if plan.assignments.iter().any(|assignment| {
+        assignment.role != AgentRole::Researcher
+            || assignment.effective_role_category() != RoleCategory::ReadOnlyResearcher
+    }) {
+        bail!("budget Researcher fixture requires only Researcher/ReadOnlyResearcher subjects");
+    }
+    install_selected_budget_fixture(plan, options, owner, profile, concurrency)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn install_selected_budget_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    profile: (&str, ReasoningEffort),
+    concurrency: usize,
+) -> Result<SelectedConcurrentFixtureGuard<'a>> {
+    let repo = options.repo.canonicalize()?;
+    if !repo.starts_with(owner.path().canonicalize()?)
+        || options.runtime != SupervisorRuntime::Codex
+        || plan.assignments.is_empty()
+        || plan.assignments.iter().any(|assignment| {
+            assignment.phase != AssignmentPhase::Execution
+                || !assignment.worker_assignments.is_empty()
+                || assignment
+                    .runtime
+                    .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
+        })
+    {
+        bail!("budget fixture requires owned workerless Execution Codex subjects");
+    }
+    let RuntimeModelCatalog::Codex(catalog) =
+        super::test_runtime_model_catalog(plan, options.runtime)?
+    else {
+        bail!("budget fixture requires its actual supplied Codex catalog");
+    };
+    if !catalog.contains(profile.0) {
+        bail!("budget profile is absent from the actual supplied Codex catalog");
+    }
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = super::bind_assessed_injected_plan(plan, &repo, &mut metadata)?;
+    let frozen = metadata
+        .resolved_routing_policy
+        .context("budget fixture frozen policy")?;
+    let assessment = metadata
+        .task_routing_assessment
+        .context("budget fixture assessment")?;
+    assessment.validate_for_task(&frozen, &plan.task)?;
+    super::prior_input::require_binding_repo(&repo)?;
+    let prior = super::prior_input::current_provenance()
+        .context("budget fixture requires its bound synthetic prior")?;
+    let cam = install_concurrent_fixture_observations(
+        owner,
+        [(profile.0.to_string(), profile.1.as_str().to_string())]
+            .into_iter()
+            .collect(),
+    )?;
+    Ok(bind_selected_concurrent_fixture_inputs(
+        SelectedConcurrentFixture {
+            run: options.run_id.clone(),
+            repo,
+            plan: plan.clone(),
+            catalog,
+            assessment,
+            frozen,
+            inherited: None,
+            budget_bootstrap: Some(ConcurrentBudgetBootstrap {
+                model: profile.0.to_string(),
+                effort: profile.1,
+                concurrency,
+                prior,
+            }),
+        },
+        cam,
+        policy,
+        owner,
+        None,
+    ))
+}
+
+// Complete only the opted-in budget fixture at the normal preparation boundary.
+// Both bootstrap and final evaluation borrow the same resolved run inputs.
+#[cfg(all(test, target_os = "linux"))]
+fn complete_selected_budget_fixture(
+    plan: &mut SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+    history: Option<&super::outcome_history::FrozenOutcomeHistory>,
+    observations: &[(SupervisorRuntime, AccountObserveResult)],
+) -> Result<()> {
+    let pending = SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+        slot.borrow().as_ref().and_then(|fixture| {
+            fixture.budget_bootstrap.as_ref().map(|bootstrap| {
+                (
+                    fixture.run.clone(),
+                    fixture.plan.clone(),
+                    fixture.assessment.clone(),
+                    fixture.frozen.clone(),
+                    bootstrap.clone(),
+                )
+            })
+        })
+    });
+    let Some((run, mut completed, assessment, frozen, bootstrap)) = pending else {
+        return Ok(());
+    };
+    if request.current_run != Some(&run)
+        || serde_json::to_vec(plan)? != serde_json::to_vec(&completed)?
+        || request.admission_policy_input.entrypoint_bound != bootstrap.concurrency
+        || request.quota.context.is_some()
+        || request.quota.ledger.is_some()
+        || history.is_some_and(|history| {
+            history.provenance.projected_attempt_count != 0
+                || !history.provenance.source_digests.is_empty()
+                || !history.provenance.exclusions.is_empty()
+        })
+        || super::prior_input::current_provenance().as_ref() != Some(&bootstrap.prior)
+        || observations.len() != 1
+        || observations[0].0 != SupervisorRuntime::Codex
+    {
+        bail!("budget bootstrap requires its unchanged no-history/no-quota run inputs");
+    }
+    super::prior_input::require_binding_repo(request.repo)?;
+    let objective = metadata
+        .resolved_objective_profile
+        .as_ref()
+        .context("budget fixture resolved run objective")?;
+    let features = super::selection_bridge::routing_features_with_assessment(
+        &completed,
+        Some(&assessment),
+        Some(&frozen),
+    )?;
+    let priors = super::selection_bridge::selector_priors_with_terminal_worker_economics()?;
+    let observation = &observations[0].1;
+    let observation_digest =
+        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(observation)?);
+    let subject_role = completed.assignments[0].role;
+    let (subject_effort, auditor_effort) = {
+        // Temporary review authorization is restored before the completed fixture
+        // is stored; normal initialization must independently seal every role.
+        let _bootstrap_policy =
+            crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+        let (subject, subject_decision) =
+            super::selection_bridge::select_normal_account_intake_with_assessment(
+                &completed,
+                &frozen,
+                observations,
+                request.admission_policy_input,
+                objective,
+                history,
+                Some(&assessment),
+            )?;
+        let subject = subject.context("budget fixture subject selection refused")?;
+        let (auditor, auditor_decision) =
+            super::selection_bridge::select_account_review_auditor_with_assessment(
+                &completed,
+                &frozen,
+                observations,
+                request.admission_policy_input,
+                objective,
+                Some(&assessment),
+            )?;
+        let auditor = auditor.context("budget fixture auditor selection refused")?;
+        for (role, selected, decision) in [
+            (subject_role, &subject, &subject_decision),
+            (AgentRole::Auditor, &auditor, &auditor_decision),
+        ] {
+            let receipt = decision
+                .routing_policy
+                .as_ref()
+                .context("budget bootstrap policy receipt")?;
+            let choice = decision
+                .choice
+                .as_ref()
+                .context("budget bootstrap choice")?;
+            let task = super::selection_bridge::task_profile_with_assessment(
+                role,
+                Some(&assessment),
+                Some(&features),
+                Some(&frozen),
+            )?;
+            selected.validate_binding(&crate::selection::routing_policy::AccountBinding::from(
+                &observation.binding,
+            ))?;
+            if decision.status != crate::selection::DecisionStatus::Selected
+                || selected.candidate() != &choice.candidate
+                || selected.candidate().runtime != SupervisorRuntime::Codex.as_str()
+                || selected.candidate().model != bootstrap.model
+                || selected.candidate().effort.as_str() != bootstrap.effort.as_str()
+                || receipt.frozen != frozen
+                || receipt.role != role.as_str()
+                || receipt.features != features
+                || selected.policy_digest != frozen.sha256
+                || selected.task_features != features
+                || selected.catalog_digest != observation_digest
+                || selected.catalog_revision
+                    != format!("account-observe-sha256:{observation_digest}")
+                || decision.normalized_input.task != task
+                || decision.normalized_task != task
+                || decision.normalized_input.resolved_objective_profile != *objective
+                || decision.resolved_objective_profile != *objective
+                || decision.normalized_input.priors.dataset_id != priors.dataset_id
+                || decision.normalized_input.priors.revision != priors.revision
+                || decision.normalized_input.priors.published_on != priors.published_on
+                || decision.operator_prior_data.as_ref() != Some(&bootstrap.prior)
+                || decision.normalized_input.debug_override.is_some()
+                || decision.debug_override.is_some()
+                || !decision.normalized_input.outcomes.is_empty()
+                || !decision.candidate_set.iter().any(|evaluation| {
+                    evaluation.candidate == choice.candidate
+                        && evaluation.eligible
+                        && evaluation.ineligibility_reasons.is_empty()
+                })
+            {
+                bail!("budget bootstrap differs from its genuine role/account/policy decision");
+            }
+        }
+        (subject.candidate().effort, auditor.candidate().effort)
+    };
+    for (role, effort) in [
+        (subject_role, subject_effort),
+        (AgentRole::Auditor, auditor_effort),
+    ] {
+        let configured = completed
+            .role_models
+            .get_mut(&role)
+            .context("budget fixture requires its authored role preference")?;
+        if configured.model.as_deref() != Some(bootstrap.model.as_str())
+            || configured
+                .reasoning_effort
+                .as_deref()
+                .is_some_and(|existing| existing != effort.as_str())
+        {
+            bail!("budget fixture selection conflicts with its authored role preference");
+        }
+        if configured.reasoning_effort.is_none() {
+            configured.reasoning_effort = Some(effort.as_str().to_string());
+        }
+    }
+    for lens in &mut completed.review_lenses {
+        let ReviewLensBackendConfig::Model {
+            model,
+            reasoning_effort,
+            ..
+        } = &mut lens.backend
+        else {
+            bail!("budget fixture requires its authored executable review lenses");
+        };
+        if model.as_str() != bootstrap.model.as_str()
+            || reasoning_effort
+                .as_deref()
+                .is_some_and(|existing| existing != auditor_effort.as_str())
+        {
+            bail!("budget fixture selection conflicts with its authored review lens");
+        }
+        if reasoning_effort.is_none() {
+            *reasoning_effort = Some(auditor_effort.as_str().to_string());
+        }
+    }
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| -> Result<()> {
+        let mut slot = slot.borrow_mut();
+        let fixture = slot
+            .as_mut()
+            .context("budget fixture binding disappeared")?;
+        if fixture.run != run || fixture.budget_bootstrap.is_none() {
+            bail!("budget fixture binding changed during completion");
+        }
+        fixture.plan = completed.clone();
+        fixture.budget_bootstrap = None;
+        Ok(())
+    })?;
+    *plan = completed;
+    if !selected_concurrent_fixture_matches(plan, metadata, request)? {
+        bail!("completed budget fixture lost its exact binding");
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+pub(super) fn carry_selected_concurrent_fixture_metadata(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    metadata: &mut SupervisorPlanMetadata,
+) -> Result<()> {
+    #[cfg(not(target_os = "linux"))]
+    let _ = (plan, options, catalog, metadata);
+    #[cfg(target_os = "linux")]
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| -> Result<()> {
+        let slot = slot.borrow();
+        let Some(fixture) = slot
+            .as_ref()
+            .filter(|fixture| fixture.run == options.run_id)
+        else {
+            return Ok(());
+        };
+        if let Some(custody) = &fixture.inherited {
+            custody.verify(
+                &fixture.plan,
+                &fixture.run,
+                &fixture.repo,
+                &fixture.frozen,
+                &fixture.assessment,
+            )?;
+        }
+        if options.repo.canonicalize()? != fixture.repo
+            || options.runtime != SupervisorRuntime::Codex
+            || serde_json::to_vec(plan)? != serde_json::to_vec(&fixture.plan)?
+            || !matches!(catalog, RuntimeModelCatalog::Codex(actual) if actual == &fixture.catalog)
+            || metadata.task_routing_assessment.is_some()
+            || metadata.resolved_routing_policy.is_some()
+        {
+            bail!("selected concurrent fixture input differs from its explicit binding");
+        }
+        metadata.task_routing_assessment = Some(fixture.assessment.clone());
+        metadata.resolved_routing_policy = Some(fixture.frozen.clone());
+        Ok(())
+    })?;
+    Ok(())
+}
+
+// Evidence-only fixtures retain authenticated historical metadata separately
+// from the assessment of the current task. No candidate-tree check belongs here.
+#[cfg(all(test, target_os = "linux"))]
+struct SelectedEvidenceOnlyReauditFixture {
+    run: RunId,
+    repo: PathBuf,
+    plan: SupervisorPlan,
+    catalog: CodexRuntimeModelCatalog,
+    historical_metadata: SupervisorPlanMetadata,
+    current_assessment: TaskRoutingAssessment,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE: RefCell<Option<SelectedEvidenceOnlyReauditFixture>> =
+        const { RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) struct SelectedEvidenceOnlyReauditFixtureGuard<'scope, 'owner> {
+    previous: Option<SelectedEvidenceOnlyReauditFixture>,
+    _parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+impl Drop for SelectedEvidenceOnlyReauditFixtureGuard<'_, '_> {
+    fn drop(&mut self) {
+        SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+            *slot.borrow_mut() = self.previous.take();
+        });
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn bind_selected_evidence_only_reaudit_fixture<'scope, 'owner>(
+    loaded: &LoadedSupervisorPlan,
+    options: &SupervisorRunOptions,
+    catalog: &RuntimeModelCatalog,
+    current_assessment: TaskRoutingAssessment,
+    parent_acceptance: &'scope super::InjectedSupervisorParentAcceptanceGuard<'owner>,
+) -> Result<SelectedEvidenceOnlyReauditFixtureGuard<'scope, 'owner>> {
+    let repo = options.repo.canonicalize()?;
+    let [assignment] = loaded.plan.assignments.as_slice() else {
+        bail!("selected evidence-only fixture requires exactly its historical subject");
+    };
+    let operation = loaded
+        .plan_metadata
+        .evidence_only_reaudit
+        .as_ref()
+        .context("selected evidence-only fixture operation")?;
+    let frozen = loaded
+        .plan_metadata
+        .resolved_routing_policy
+        .as_ref()
+        .context("selected evidence-only fixture historical policy")?;
+    let historical = loaded
+        .plan_metadata
+        .task_routing_assessment
+        .as_ref()
+        .context("selected evidence-only fixture historical assessment")?;
+    let RuntimeModelCatalog::Codex(catalog) = catalog else {
+        bail!("selected evidence-only fixture requires its actual Codex catalog");
+    };
+    if options.runtime != SupervisorRuntime::Codex
+        || !repo.starts_with(parent_acceptance._account._owner.path().canonicalize()?)
+        || options.run_id == operation.source_run_id
+        || assignment.id != operation.assignment_id
+        || loaded.plan_metadata.execution_target.is_some()
+        || loaded.plan_metadata.normal_intake_selection.is_some()
+        || loaded.plan_metadata.generated_follow_up.is_some()
+        || crate::selection::routing_policy::current_routing_policy().as_ref() != Some(frozen)
+        || !CAM_OBSERVE_TEST_OVERRIDE.with(|slot| slot.borrow().is_some())
+        || SELECTED_CONCURRENT_FIXTURE.with(|slot| slot.borrow().is_some())
+        || SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| slot.borrow().is_some())
+        || super::test_runtime_model_catalog(&loaded.plan, options.runtime)?
+            != RuntimeModelCatalog::Codex(catalog.clone())
+    {
+        bail!(
+            "selected evidence-only fixture lost its owned run, catalog or held policy/account custody"
+        );
+    }
+    historical.validate(frozen)?;
+    current_assessment.validate_for_task(frozen, &loaded.plan.task)?;
+    // This checks authenticated history and lineage only. It never reads or
+    // validates the mutable preserved candidate tree, whose denial stays typed.
+    verify_evidence_only_reaudit_source(&repo, operation, assignment, Some(historical))?;
+    let fixture = SelectedEvidenceOnlyReauditFixture {
+        run: options.run_id.clone(),
+        repo,
+        plan: loaded.plan.clone(),
+        catalog: catalog.clone(),
+        historical_metadata: loaded.plan_metadata.clone(),
+        current_assessment,
+    };
+    let previous =
+        SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| slot.borrow_mut().replace(fixture));
+    Ok(SelectedEvidenceOnlyReauditFixtureGuard {
+        previous,
+        _parent_acceptance: parent_acceptance,
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn selected_evidence_only_reaudit_fixture_matches(
+    fixture: &SelectedEvidenceOnlyReauditFixture,
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+) -> Result<bool> {
+    // Preparation resolves a missing objective normally. Compare that resolved
+    // copy without modifying the historical metadata retained by the caller.
+    let mut expected_metadata = fixture.historical_metadata.clone();
+    resolve_preselection_objective_profile(&fixture.repo, &mut expected_metadata)?;
+    if request.current_run != Some(&fixture.run)
+        || request.execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+        || request.runtime != SupervisorRuntime::Codex
+        || request.repo.canonicalize()? != fixture.repo
+        || !matches!(request.runtime_model_catalog, Ok(RuntimeModelCatalog::Codex(actual)) if actual == &fixture.catalog)
+        || plan != &fixture.plan
+        || metadata != &expected_metadata
+        || crate::selection::routing_policy::current_routing_policy().as_ref()
+            != expected_metadata.resolved_routing_policy.as_ref()
+    {
+        bail!("selected evidence-only scheduler request differs from its exact fixture binding");
+    }
+    fixture.current_assessment.validate_for_task(
+        expected_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .context("selected evidence-only fixture policy disappeared")?,
+        &plan.task,
+    )?;
+    Ok(true)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn selected_concurrent_fixture_matches(
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+    request: &PreparedSupervisorSelectionRequest<'_>,
+) -> Result<bool> {
+    if let Some(matches) = SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+        slot.borrow().as_ref().map(|fixture| {
+            selected_evidence_only_reaudit_fixture_matches(fixture, plan, metadata, request)
+        })
+    }) {
+        return matches;
+    }
+    SELECTED_CONCURRENT_FIXTURE.with(|slot| {
+        let slot = slot.borrow();
+        let Some(fixture) = slot.as_ref().filter(|fixture| request.current_run == Some(&fixture.run)) else {
+            return Ok(false);
+        };
+        if let Some(custody) = &fixture.inherited {
+            custody.verify(&fixture.plan, &fixture.run, &fixture.repo, &fixture.frozen, &fixture.assessment)?;
+        }
+        let mut expected_plan = fixture.plan.clone();
+        expected_plan.assignments = plan.assignments.clone();
+        if request.execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+            || request.runtime != SupervisorRuntime::Codex
+            || request.repo.canonicalize()? != fixture.repo
+            || !matches!(request.runtime_model_catalog, Ok(RuntimeModelCatalog::Codex(actual)) if actual == &fixture.catalog)
+            || metadata.resolved_routing_policy.as_ref() != Some(&fixture.frozen)
+            || serde_json::to_vec(&metadata.task_routing_assessment)? != serde_json::to_vec(&Some(&fixture.assessment))?
+            || metadata.evidence_only_reaudit.is_some()
+            || metadata.execution_target.is_some()
+            || metadata.normal_intake_selection.is_some()
+            || serde_json::to_vec(plan)? != serde_json::to_vec(&expected_plan)?
+        {
+            bail!("selected concurrent scheduler request differs from its fixture binding");
+        }
+        // Preclaim may remove blocked assignments. It must not add or alter any subject.
+        for assignment in &plan.assignments {
+            let expected = fixture.plan.assignments.iter().find(|item| item.id == assignment.id)
+                .context("selected concurrent preclaim subject is outside its fixture")?;
+            if serde_json::to_vec(assignment)? != serde_json::to_vec(expected)? {
+                bail!("selected concurrent preclaim subject differs from its fixture");
+            }
+        }
+        fixture.assessment.validate_for_task(&fixture.frozen, &plan.task)?;
+        Ok(true)
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -4074,7 +5892,279 @@ fn observe_selected_cam_binding(
     })
 }
 
-fn account_observation_for_launch_runtime(
+pub(super) fn acquire_normal_intake_catalog(
+    options: &SupervisorRunOptions,
+    selected: &crate::selection::routing_policy::SelectedLaunchRequest,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> RuntimeModelCatalogAcquisition {
+    let acquired = (|| -> Result<RuntimeModelCatalog> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (options, selected, frozen);
+            bail!("normal account catalog requires managed Linux");
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use coding_agent_manager_lib::account_authority::ObservationOutcome;
+            if options.runtime.as_str() != selected.candidate().runtime {
+                bail!("normal intake runtime differs from the frozen selected account route");
+            }
+            let observation = account_observation_for_launch_runtime(
+                options.runtime,
+                Some(options.run_id.as_str()),
+            )?
+            .context("normal intake selected account is no longer available")?;
+            selected.validate_binding(&(&observation.binding).into())?;
+            crate::selection::routing_policy::SelectedLaunchRequest::from_observation(
+                selected.candidate().clone(),
+                &observation,
+                frozen,
+                selected.task_features.clone(),
+                selected.control_transport,
+            )?;
+            let models = observation
+                .models
+                .as_ref()
+                .filter(|category| category.outcome == ObservationOutcome::Observed)
+                .and_then(|category| category.content.as_ref())
+                .context("normal intake account model metadata is unknown")?;
+            if options.runtime == SupervisorRuntime::Codex {
+                Ok(RuntimeModelCatalog::Codex(
+                    CodexRuntimeModelCatalog::from_observed_models(models)?,
+                ))
+            } else {
+                Ok(RuntimeModelCatalog::OperatorDeclared)
+            }
+        }
+    })();
+    acquired.map_err(|error| {
+        Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+            "account-bound normal catalog refused: {error:#}"
+        )))
+    })
+}
+
+pub(crate) struct NormalIntakeConfig<'a> {
+    pub(crate) admission_overrides: SupervisorAdmissionConfig,
+    pub(crate) max_concurrent_children: usize,
+    pub(crate) objective_profile: Option<&'a str>,
+}
+
+pub(crate) fn select_normal_intake(
+    repo: &Path,
+    run_id: &RunId,
+    plan: &SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    assessment: Option<&TaskRoutingAssessment>,
+    config: NormalIntakeConfig<'_>,
+) -> Result<(
+    SupervisorRuntime,
+    crate::selection::routing_policy::SelectedLaunchRequest,
+    crate::selection::SelectionProvenance,
+)> {
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (repo, run_id, plan, frozen, assessment, config);
+        bail!("automatic account-bound normal intake requires the managed Linux runtime");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+        let assessment = assessment.context(
+            "automatic task assessment is unassessed: adopt task_estimation in the loaded routing policy before normal intake",
+        )?;
+        assessment.validate_for_task(frozen, &plan.task)?;
+        let admission = SupervisorAdmissionPolicyInput::resolve_with_quota(
+            repo,
+            config.max_concurrent_children,
+            SupervisorAdmissionConfig::default(),
+            config.admission_overrides,
+            None,
+        )?;
+        let objective = resolve_objective_profile(repo, config.objective_profile)?;
+        let mut observations = Vec::new();
+        for adapter in coding_agent_manager_lib::providers::registry() {
+            let runtime = match adapter.id() {
+                "codex-cli" => SupervisorRuntime::Codex,
+                "grok-cli" => SupervisorRuntime::Grok,
+                "cursor" => SupervisorRuntime::Cursor,
+                "claude-code" => SupervisorRuntime::ClaudeCode,
+                "gemini-cli" => SupervisorRuntime::GeminiCli,
+                _ => continue,
+            };
+            if let Some(observation) =
+                account_observation_for_launch_runtime(runtime, Some(run_id.as_str()))?
+            {
+                observations.push((runtime, observation));
+            }
+        }
+        let history = load_frozen_outcome_history(repo, run_id)?;
+        let (selected, decision) =
+            super::selection_bridge::select_normal_account_intake_with_assessment(
+                plan,
+                frozen,
+                &observations,
+                &admission,
+                &objective,
+                Some(&history),
+                Some(assessment),
+            )?;
+        let selected = selected.with_context(|| {
+            format!(
+                "normal account-bound intake refused before dispatch: {}",
+                decision.decision_reason
+            )
+        })?;
+        let runtime = super::selection_bridge::runtime_from_name(&selected.candidate().runtime)?;
+        // Check the complete live tuple again before handing this binding to the
+        // ordinary supervisor. Execution still performs its own account checks.
+        let provider = &selected.account_binding().provider_id;
+        let live = if let Some(socket) =
+            crate::account_authority::cam_socket_for_run_selection(run_id.as_str(), provider)?
+        {
+            crate::account_authority::selected_binding_via_authority_socket(&socket, provider)?
+                .map(|(_, binding)| binding)
+        } else {
+            let data_dir = project_dirs().context("account metadata directory is unavailable")?;
+            StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()))
+                .selected_binding(provider)
+                .map_err(|error| anyhow!("failed to revalidate normal intake selection: {error}"))?
+        }
+        .context("normal intake selected account disappeared")?;
+        selected.validate_binding(&(&live).into())?;
+        Ok((runtime, selected, decision))
+    }
+}
+
+fn nonpublishable_success_guidance(runtime: SupervisorRuntime) -> (&'static str, &'static str) {
+    if runtime == SupervisorRuntime::Fake {
+        (
+            "fake supervisor simulation succeeded but is not publishable or acceptable as real model evidence",
+            "rerun with a verified runtime and complete candidate and configured review proof before acceptance, merge, publication, or follow-up dispatch",
+        )
+    } else {
+        (
+            "supervisor completed without a reported failure, but verified execution, exact assignment candidate evidence, or complete configured parent review proof is missing; the run is not publishable",
+            "inspect the missing execution, assignment candidate, and configured parent review proof, then rerun the affected scopes before acceptance, merge, publication, or follow-up dispatch",
+        )
+    }
+}
+
+fn terminal_publishable(
+    success: bool,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    plan: &SupervisorPlan,
+    reports: &[OrchestratorReviewReport],
+    inspections: &BTreeMap<String, SupervisorCandidateInspection>,
+) -> bool {
+    if !success
+        || runtime == SupervisorRuntime::Fake
+        || execution_runtime != SupervisorExecutionRuntime::Verified
+        || plan.assignments.is_empty()
+        || validate_review_lens_set(&plan.review_lenses, plan.review_lens_correlation).is_err()
+        || reports.len() != plan.assignments.len()
+        || inspections.len() != plan.assignments.len()
+    {
+        return false;
+    }
+    let assignment_ids = plan
+        .assignments
+        .iter()
+        .map(|assignment| assignment.id.as_str())
+        .collect::<BTreeSet<_>>();
+    let report_ids = reports
+        .iter()
+        .map(|report| report.id.as_str())
+        .collect::<BTreeSet<_>>();
+    if assignment_ids.len() != plan.assignments.len()
+        || report_ids != assignment_ids
+        || inspections
+            .keys()
+            .map(String::as_str)
+            .collect::<BTreeSet<_>>()
+            != assignment_ids
+    {
+        return false;
+    }
+    plan.assignments.iter().all(|assignment| {
+        let report = reports
+            .iter()
+            .find(|report| report.id == assignment.id)
+            .expect("exact report ids checked above");
+        let inspection = &inspections[&assignment.id];
+        let Some(aggregate) = report.review_lens_aggregate.as_ref() else {
+            return false;
+        };
+        if report_failed(report)
+            || report.role != assignment.role
+            || report.assigned_paths != assignment.assigned_paths
+            || inspection.binding.agent_id != assignment.id
+            || inspection.binding.clone().canonicalized().is_err()
+            || normalize_paths(report.files_changed.clone()).ok().as_ref()
+                != Some(&inspection.changed_paths)
+            || aggregate.authority() != ReviewLensAggregateAuthority::ParentComputed
+            || aggregate.decision != ReviewAggregationDecision::Accept
+            || aggregate.policy != plan.review_aggregation_policy
+            || aggregate.required_coverage
+                != supervisor_review_coverage_requirement(assignment, report)
+            || aggregate.lens_verdicts.len() != plan.review_lenses.len()
+        {
+            return false;
+        }
+        plan.review_lenses.iter().all(|lens| {
+            let matching = aggregate
+                .lens_verdicts
+                .iter()
+                .filter(|verdict| verdict.lens.id == lens.id)
+                .collect::<Vec<_>>();
+            matching.len() == 1
+                && matching[0].reported
+                && matching[0].validation_errors.is_empty()
+                && matching[0].lens.information_scope == lens.information_scope
+                && aggregate
+                    .required_coverage
+                    .worker_ids
+                    .iter()
+                    .all(|id| matching[0].coverage.worker_ids.contains(id))
+                && aggregate
+                    .required_coverage
+                    .paths
+                    .iter()
+                    .all(|path| matching[0].coverage.paths.contains(path))
+        })
+    })
+}
+
+pub(crate) fn account_observations_for_selection(
+    primary_runtime: SupervisorRuntime,
+    run_id: Option<&str>,
+) -> Result<Vec<(SupervisorRuntime, AccountObserveResult)>> {
+    if primary_runtime == SupervisorRuntime::Fake {
+        return Ok(Vec::new());
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (primary_runtime, run_id);
+        Ok(Vec::new())
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mut observations = Vec::new();
+        for adapter in coding_agent_manager_lib::providers::registry() {
+            let Some(runtime) = super::selection_bridge::runtime_for_account_provider(adapter.id())
+            else {
+                continue;
+            };
+            if let Some(observation) = account_observation_for_launch_runtime(runtime, run_id)? {
+                observations.push((runtime, observation));
+            }
+        }
+        Ok(observations)
+    }
+}
+
+pub(super) fn account_observation_for_launch_runtime(
     runtime: SupervisorRuntime,
     run_id: Option<&str>,
 ) -> Result<Option<AccountObserveResult>> {
@@ -4088,55 +6178,68 @@ fn account_observation_for_launch_runtime(
         let Some(provider_id) = cam_provider_id_for_supervisor_runtime(runtime) else {
             return Ok(None);
         };
+        let socket_path = match run_id {
+            Some(run_id) => {
+                crate::account_authority::cam_socket_for_run_selection(run_id, provider_id)?
+            }
+            None => crate::account_authority::configured_cam_authority_socket(),
+        };
         #[cfg(test)]
         {
             if let Some(result) = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
                 cell.borrow().as_ref().map(|harness| {
-                    observe_selected_cam_binding(
-                        &harness.registry,
-                        harness.adapter.as_ref(),
-                        provider_id,
+                    let adapter = harness
+                        .secondary_adapter
+                        .as_deref()
+                        .filter(|adapter| adapter.id() == provider_id)
+                        .unwrap_or(harness.adapter.as_ref());
+                    observe_selected_cam_binding(&harness.registry, adapter, provider_id).inspect(
+                        |observation| {
+                            freeze_observed_managed_selection_from_registry(
+                                run_id,
+                                provider_id,
+                                &harness.registry,
+                                observation.as_ref(),
+                            );
+                        },
                     )
-                    .inspect(|observation| {
-                        freeze_observed_grok_from_registry(
-                            run_id,
-                            provider_id,
-                            &harness.registry,
-                            observation.as_ref(),
-                        );
-                    })
                 })
             }) {
                 return result;
             }
         }
-        if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+        if let Some(socket_path) = socket_path {
             let observed = crate::account_authority::observe_selected_authority_via_socket(
                 &socket_path,
                 provider_id,
             )?;
             return Ok(match observed {
                 Some(observed) => {
-                    crate::account_authority::record_observed_grok_selection(
+                    record_observed_managed_selection(
                         run_id,
                         provider_id,
-                        Some(observed.authority_id),
+                        Some(observed.authority_id.clone()),
                         Some(&observed.observation.binding),
+                        Some(&socket_path),
                     );
                     Some(observed.observation)
                 }
                 None => {
-                    crate::account_authority::record_observed_grok_selection(
+                    record_observed_managed_selection(
                         run_id,
                         provider_id,
                         None,
                         None,
+                        Some(&socket_path),
                     );
                     None
                 }
             });
         }
         let Some(data_dir) = project_dirs().map(|dirs| dirs.data_dir().to_path_buf()) else {
+            if provider_id == crate::account_authority::CODEX_CLI_PROVIDER_ID {
+                record_observed_managed_selection(run_id, provider_id, None, None, None);
+            }
             return Ok(None);
         };
         let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
@@ -4144,24 +6247,346 @@ fn account_observation_for_launch_runtime(
             anyhow!("Coding Agent Manager provider `{provider_id}` is not registered")
         })?;
         let observation = observe_selected_cam_binding(&registry, adapter.as_ref(), provider_id)?;
-        freeze_observed_grok_from_registry(run_id, provider_id, &registry, observation.as_ref());
+        freeze_observed_managed_selection_from_registry(
+            run_id,
+            provider_id,
+            &registry,
+            observation.as_ref(),
+        );
         Ok(observation)
     }
 }
 
 #[cfg(target_os = "linux")]
-fn freeze_observed_grok_from_registry(
+fn freeze_observed_managed_selection_from_registry(
     run_id: Option<&str>,
     provider_id: &str,
     registry: &StoredAccountRegistry,
     observation: Option<&AccountObserveResult>,
 ) {
-    crate::account_authority::record_observed_grok_selection(
+    record_observed_managed_selection(
         run_id,
         provider_id,
         observation.map(|_| authority_id_for(registry.metadata_path())),
         observation.map(|observation| &observation.binding),
+        None,
     );
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_selected_codex_launch_binding(run_id: Option<&str>) -> Result<()> {
+    let Some(run_id) = run_id else { return Ok(()) };
+    if crate::account_authority::codex_run_account_binding(run_id).is_some() {
+        return Ok(());
+    }
+    // Parent, terminal roles and a nested Codex Worker share this initialized run.
+    // Read selection metadata only; never acquire a model catalog or auth here.
+    const PROVIDER: &str = crate::account_authority::CODEX_CLI_PROVIDER_ID;
+    #[cfg(test)]
+    if CAM_OBSERVE_TEST_OVERRIDE
+        .with(|cell| {
+            cell.borrow().as_ref().map(|harness| {
+                let binding = harness.registry.selected_binding(PROVIDER)?;
+                crate::account_authority::record_observed_codex_selection_from_source(
+                    Some(run_id),
+                    PROVIDER,
+                    binding
+                        .as_ref()
+                        .map(|_| authority_id_for(harness.registry.metadata_path())),
+                    binding.as_ref(),
+                    None,
+                );
+                Ok::<(), coding_agent_manager_lib::error::Error>(())
+            })
+        })
+        .transpose()?
+        .is_some()
+    {
+        return Ok(());
+    }
+    if let Some(socket_path) = crate::account_authority::configured_cam_authority_socket() {
+        let live = crate::account_authority::selected_binding_via_authority_socket(
+            &socket_path,
+            PROVIDER,
+        )?;
+        match live {
+            Some((authority, binding)) => {
+                crate::account_authority::record_observed_codex_selection_from_source(
+                    Some(run_id),
+                    PROVIDER,
+                    Some(authority),
+                    Some(&binding),
+                    Some(&socket_path),
+                )
+            }
+            None => crate::account_authority::record_observed_codex_selection_from_source(
+                Some(run_id),
+                PROVIDER,
+                None,
+                None,
+                Some(&socket_path),
+            ),
+        }
+        return Ok(());
+    }
+    let Some(data_dir) = project_dirs() else {
+        crate::account_authority::record_observed_codex_selection_from_source(
+            Some(run_id),
+            PROVIDER,
+            None,
+            None,
+            None,
+        );
+        return Ok(());
+    };
+    let registry = StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()));
+    let binding = registry
+        .selected_binding(PROVIDER)
+        .context("failed to read selected Coding Agent Manager Codex account")?;
+    crate::account_authority::record_observed_codex_selection_from_source(
+        Some(run_id),
+        PROVIDER,
+        binding
+            .as_ref()
+            .map(|_| authority_id_for(registry.metadata_path())),
+        binding.as_ref(),
+        None,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_selected_claude_launch_binding(run_id: Option<&str>) -> Result<()> {
+    const PROVIDER: &str = crate::account_authority::CLAUDE_CODE_PROVIDER_ID;
+    let socket_path = match run_id {
+        Some(run_id) => crate::account_authority::cam_socket_for_run_selection(run_id, PROVIDER)?,
+        None => crate::account_authority::configured_cam_authority_socket(),
+    };
+    if let Some(socket_path) = socket_path {
+        let selected = crate::account_authority::selected_binding_via_authority_socket(
+            &socket_path,
+            PROVIDER,
+        )?;
+        match selected {
+            Some((authority_id, binding)) => {
+                record_observed_managed_selection(
+                    run_id,
+                    PROVIDER,
+                    Some(authority_id),
+                    Some(&binding),
+                    Some(&socket_path),
+                );
+            }
+            None => {
+                record_observed_managed_selection(run_id, PROVIDER, None, None, Some(&socket_path));
+            }
+        }
+        return Ok(());
+    }
+    let data_dir = project_dirs()
+        .map(|dirs| dirs.data_dir().to_path_buf())
+        .context("Coding Agent Manager data directory is unavailable")?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
+    let binding = registry
+        .selected_binding(PROVIDER)
+        .context("failed to read selected Coding Agent Manager Claude account")?;
+    record_observed_managed_selection(
+        run_id,
+        PROVIDER,
+        binding
+            .as_ref()
+            .map(|_| authority_id_for(registry.metadata_path())),
+        binding.as_ref(),
+        None,
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn record_observed_managed_selection(
+    run_id: Option<&str>,
+    provider_id: &str,
+    authority_id: Option<String>,
+    binding: Option<&coding_agent_manager_lib::account_authority::SelectedAccountBinding>,
+    authority_socket: Option<&Path>,
+) {
+    if provider_id == crate::account_authority::CODEX_CLI_PROVIDER_ID {
+        crate::account_authority::record_observed_codex_selection_from_source(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+            authority_socket,
+        );
+    } else if provider_id == crate::account_authority::GROK_CLI_PROVIDER_ID {
+        crate::account_authority::record_observed_grok_selection(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+            authority_socket,
+        );
+    } else if provider_id == crate::account_authority::CLAUDE_CODE_PROVIDER_ID {
+        crate::account_authority::record_observed_claude_selection(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+            authority_socket,
+        );
+    } else if provider_id == crate::account_authority::GEMINI_CLI_PROVIDER_ID {
+        crate::account_authority::record_observed_gemini_selection(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+            authority_socket,
+        );
+    } else if provider_id == crate::account_authority::CURSOR_PROVIDER_ID {
+        crate::account_authority::record_observed_cursor_selection_from_source(
+            run_id,
+            provider_id,
+            authority_id,
+            binding,
+            authority_socket,
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn freeze_selected_secondary_managed_launch_bindings(
+    plan: &SupervisorPlan,
+    decisions: &[SupervisorSelectionEvent],
+    primary_runtime: SupervisorRuntime,
+    run_id: Option<&str>,
+) -> Result<()> {
+    let Some(run_id) = run_id else { return Ok(()) };
+    let has_nested_workers = plan.assignments.iter().any(|assignment| {
+        assignment.role == AgentRole::ChildOrchestrator && !assignment.worker_assignments.is_empty()
+    });
+    let resolved_runtime = |role| {
+        decisions
+            .iter()
+            .rev()
+            .find(|decision| decision.role == role)
+            .and_then(|decision| decision.provenance.choice.as_ref())
+            .map(|choice| runtime_from_name(&choice.candidate.runtime))
+            .transpose()
+    };
+    let nested_runtime = if has_nested_workers {
+        resolved_runtime(AgentRole::Worker)?
+            .filter(|runtime| matches!(runtime, SupervisorRuntime::Codex | SupervisorRuntime::Grok))
+    } else {
+        None
+    };
+    // Parent review is not a top-level assignment: its model-backed lenses use
+    // the resolved Auditor runtime. Any launched assignment can produce a
+    // report requiring parent review; no empty plan or unused selector role
+    // authorizes an additional account lookup.
+    let auditor_runtime = if !plan.assignments.is_empty()
+        && plan
+            .review_lenses
+            .iter()
+            .any(|lens| matches!(&lens.backend, ReviewLensBackendConfig::Model { .. }))
+    {
+        resolved_runtime(AgentRole::Auditor)?
+    } else {
+        None
+    };
+    for runtime in [
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::GeminiCli,
+        SupervisorRuntime::Cursor,
+    ] {
+        if runtime == primary_runtime
+            || (!plan
+                .assignments
+                .iter()
+                .any(|assignment| assignment.runtime == Some(runtime))
+                && nested_runtime != Some(runtime)
+                && auditor_runtime != Some(runtime))
+        {
+            continue;
+        }
+        let already_frozen = match runtime {
+            SupervisorRuntime::Grok => {
+                crate::account_authority::grok_run_account_binding(run_id).is_some()
+            }
+            SupervisorRuntime::GeminiCli => {
+                crate::account_authority::gemini_run_account_binding(run_id).is_some()
+            }
+            SupervisorRuntime::Cursor => {
+                crate::account_authority::cursor_run_account_binding(run_id).is_some()
+            }
+            _ => unreachable!(),
+        };
+        if already_frozen {
+            continue;
+        }
+        let provider = cam_provider_id_for_supervisor_runtime(runtime)
+            .context("selected secondary runtime has no Coding Agent Manager provider")?;
+        // Selection metadata only: no secondary adapter/catalog/auth/provider observation.
+        #[cfg(test)]
+        let test_binding = CAM_OBSERVE_TEST_OVERRIDE
+            .with(|cell| {
+                cell.borrow().as_ref().map(|harness| {
+                    harness.registry.selected_binding(provider).map(|binding| {
+                        binding.map(|binding| {
+                            (authority_id_for(harness.registry.metadata_path()), binding)
+                        })
+                    })
+                })
+            })
+            .transpose()?;
+        #[cfg(not(test))]
+        let test_binding: Option<
+            Option<(
+                String,
+                coding_agent_manager_lib::account_authority::SelectedAccountBinding,
+            )>,
+        > = None;
+        let authority_socket = if test_binding.is_some() {
+            None
+        } else {
+            crate::account_authority::cam_socket_for_run_selection(run_id, provider)?
+        };
+        let selected = if let Some(selected) = test_binding {
+            selected
+        } else if let Some(socket) = authority_socket.as_ref() {
+            crate::account_authority::selected_binding_via_authority_socket(socket, provider)?
+        } else {
+            let dirs =
+                project_dirs().context("Coding Agent Manager data directory is unavailable")?;
+            let registry = StoredAccountRegistry::new(stored_accounts_path(dirs.data_dir()));
+            registry
+                .selected_binding(provider)
+                .context("failed to read selected secondary Coding Agent Manager account")?
+                .map(|binding| (authority_id_for(registry.metadata_path()), binding))
+        };
+        let Some((authority, binding)) = selected else {
+            record_observed_managed_selection(
+                Some(run_id),
+                provider,
+                None,
+                None,
+                authority_socket.as_deref(),
+            );
+            bail!(
+                "no complete selected Coding Agent Manager account for secondary runtime '{provider}'"
+            );
+        };
+        if binding.provider_id != provider {
+            bail!("selected secondary Coding Agent Manager binding has a different provider");
+        }
+        record_observed_managed_selection(
+            Some(run_id),
+            provider,
+            Some(authority),
+            Some(&binding),
+            authority_socket.as_deref(),
+        );
+    }
+    Ok(())
 }
 
 pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
@@ -4169,6 +6594,23 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
     plan_metadata: &mut SupervisorPlanMetadata,
     request: PreparedSupervisorSelectionRequest<'_>,
 ) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_catalog_discovery(
+        plan,
+        plan_metadata,
+        request,
+        advertised_catalogs_for_launch,
+    )
+}
+
+fn initialize_supervisor_selection_with_catalog_discovery(
+    plan: &mut SupervisorPlan,
+    plan_metadata: &mut SupervisorPlanMetadata,
+    request: PreparedSupervisorSelectionRequest<'_>,
+    discover_catalogs: impl FnOnce(&Path) -> Result<AdvertisedCatalogSet>,
+) -> Result<SupervisorSelectionResolution> {
+    #[cfg(all(test, target_os = "linux"))]
+    let selected_concurrent_fixture =
+        selected_concurrent_fixture_matches(plan, plan_metadata, &request)?;
     let PreparedSupervisorSelectionRequest {
         repo,
         current_run,
@@ -4178,12 +6620,77 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
         admission_policy_input,
         quota,
     } = request;
+    if plan_metadata.resolved_routing_policy.is_none() {
+        plan_metadata.resolved_routing_policy =
+            Some(crate::selection::routing_policy::load_routing_policy(repo)?);
+    }
+    let _routing_policy_guard = crate::selection::routing_policy::bind_routing_policy(
+        plan_metadata.resolved_routing_policy.clone(),
+    )?;
     if plan_metadata.resolved_objective_profile.is_none() {
         let requested_objective_profile = plan_metadata.objective_profile.clone();
         plan_metadata.resolved_objective_profile = Some(
             resolve_objective_profile(repo, requested_objective_profile.as_deref())
                 .context("failed to resolve the supervisor objective profile")?,
         );
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    if selected_concurrent_fixture {
+        // Explicit fixture evidence only; no ambient provider discovery or live-proof claim.
+        let account_observations =
+            account_observations_for_selection(runtime, current_run.map(RunId::as_str))?;
+        let history = current_run
+            .map(|run| load_frozen_outcome_history(repo, run))
+            .transpose()?;
+        let catalog = runtime_model_catalog
+            .as_ref()
+            .map_err(|_| anyhow!("selected fixture catalog failed"))?;
+        complete_selected_budget_fixture(
+            plan,
+            plan_metadata,
+            &PreparedSupervisorSelectionRequest {
+                repo,
+                current_run,
+                runtime,
+                execution_runtime,
+                runtime_model_catalog,
+                admission_policy_input,
+                quota,
+            },
+            history.as_ref(),
+            &account_observations,
+        )?;
+        let current_reaudit_assessment = SELECTED_EVIDENCE_ONLY_REAUDIT_FIXTURE.with(|slot| {
+            slot.borrow()
+                .as_ref()
+                .map(|fixture| fixture.current_assessment.clone())
+        });
+        let resolution = super::selection_bridge::initialize_supervisor_selection_with_assessment(
+            plan,
+            runtime,
+            catalog,
+            admission_policy_input,
+            &AdvertisedCatalogSet::empty(),
+            plan_metadata.resolved_objective_profile.as_ref(),
+            quota,
+            history.as_ref(),
+            &account_observations,
+            current_reaudit_assessment
+                .as_ref()
+                .or(plan_metadata.task_routing_assessment.as_ref()),
+        )?;
+        if resolution.selection_preflight_failure.is_none() {
+            bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
+            freeze_selected_codex_launch_binding(current_run.map(RunId::as_str))?;
+            freeze_selected_secondary_managed_launch_bindings(
+                plan,
+                &resolution.decisions,
+                runtime,
+                current_run.map(RunId::as_str),
+            )?;
+        }
+        return Ok(resolution);
     }
     let legacy_nonpublishable_explicit_selection =
         uses_legacy_nonpublishable_explicit_selection(execution_runtime, plan);
@@ -4195,25 +6702,166 @@ pub(super) fn initialize_supervisor_selection_from_prepared_metadata(
             selection_preflight_failure: None,
         }),
         Ok(catalog) => {
-            let advertised = advertised_catalogs_for_launch(repo)?;
+            // Model labels do not select an executor. Only an acquired local
+            // Fake catalog with no authored real executor can avoid discovery.
+            let local_deterministic_fake = runtime == SupervisorRuntime::Fake
+                && matches!(catalog, RuntimeModelCatalog::LocalDeterministicFake)
+                && plan.assignments.iter().all(|assignment| {
+                    assignment.runtime.is_none()
+                        || assignment.runtime == Some(SupervisorRuntime::Fake)
+                });
+            let advertised = if local_deterministic_fake {
+                AdvertisedCatalogSet::empty()
+            } else {
+                discover_catalogs(repo)?
+            };
+            #[cfg(all(test, target_os = "linux"))]
+            let advertised = CAM_OBSERVE_TEST_OVERRIDE
+                .with(|cell| {
+                    cell.borrow()
+                        .as_ref()
+                        .and_then(|harness| harness.advertised.clone())
+                })
+                .unwrap_or(advertised);
             let frozen_history = current_run
                 .map(|run| load_frozen_outcome_history(repo, run))
                 .transpose()?;
-            let account_observation =
-                account_observation_for_launch_runtime(runtime, current_run.map(RunId::as_str))?;
-            let resolution = initialize_supervisor_selection_with_history(
-                plan,
-                runtime,
-                catalog,
-                admission_policy_input,
-                &advertised,
-                plan_metadata.resolved_objective_profile.as_ref(),
-                quota,
-                frozen_history.as_ref(),
-                account_observation.as_ref(),
-            )?;
+            let account_observations =
+                account_observations_for_selection(runtime, current_run.map(RunId::as_str))?;
+            #[cfg(target_os = "linux")]
+            let account_observation = account_observations
+                .iter()
+                .find(|(observed_runtime, _)| *observed_runtime == runtime)
+                .map(|(_, observation)| observation);
+            #[cfg(target_os = "linux")]
+            if let Some(selected) = &plan_metadata.normal_intake_selection {
+                let observed = account_observation
+                    .context("normal intake account observation disappeared before selection")?;
+                selected.validate_binding(&(&observed.binding).into())?;
+                let revalidated =
+                    crate::selection::routing_policy::SelectedLaunchRequest::from_observation(
+                        selected.candidate().clone(),
+                        observed,
+                        plan_metadata
+                            .resolved_routing_policy
+                            .as_ref()
+                            .context("normal intake policy disappeared")?,
+                        selected.task_features.clone(),
+                        selected.control_transport,
+                    )?;
+                // Persist current catalog qualification and uncertainty rather
+                // than carrying an earlier advertisement as live access proof.
+                plan_metadata.normal_intake_selection = Some(revalidated);
+            }
+            let resolution =
+                super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                    plan,
+                    runtime,
+                    catalog,
+                    admission_policy_input,
+                    &advertised,
+                    plan_metadata.resolved_objective_profile.as_ref(),
+                    quota,
+                    frozen_history.as_ref(),
+                    &account_observations,
+                    if plan_metadata.evidence_only_reaudit.is_some() {
+                        None
+                    } else {
+                        plan_metadata.task_routing_assessment.as_ref()
+                    },
+                )?;
+            #[cfg(all(test, target_os = "linux"))]
+            let resolution = {
+                let mut resolution = resolution;
+                // A synthetic resolved role exercises the real initialization
+                // and launch-binding boundary without account-slot seeding or
+                // claiming a provider/model catalog observation.
+                if resolution.selection_preflight_failure.is_none() {
+                    let auditor = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| {
+                        cell.borrow()
+                            .as_ref()
+                            .and_then(|harness| harness.resolved_auditor.clone())
+                    });
+                    if let Some(mut auditor) = auditor {
+                        let choice = auditor
+                            .provenance
+                            .choice
+                            .as_ref()
+                            .context("synthetic resolved Auditor choice")?;
+                        let old_model = plan
+                            .role_models
+                            .get(&AgentRole::Auditor)
+                            .and_then(|selection| selection.model.clone());
+                        for lens in &mut plan.review_lenses {
+                            if let ReviewLensBackendConfig::Model {
+                                model,
+                                reasoning_effort,
+                                ..
+                            } = &mut lens.backend
+                            {
+                                if Some(model.as_str()) == old_model.as_deref() {
+                                    *model = choice.candidate.model.clone();
+                                    *reasoning_effort = Some(
+                                        selector_effort_as_str(choice.candidate.effort).to_string(),
+                                    );
+                                }
+                            }
+                        }
+                        plan.role_models.insert(
+                            AgentRole::Auditor,
+                            RoleModelSelection {
+                                model: Some(choice.candidate.model.clone()),
+                                reasoning_effort: Some(
+                                    selector_effort_as_str(choice.candidate.effort).to_string(),
+                                ),
+                                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+                            },
+                        );
+                        auditor.assignment_id = Some("synthetic-resolved-auditor".to_string());
+                        auditor.provenance.normalized_input.signals.previous_choice = resolution
+                            .decisions
+                            .iter()
+                            .find(|decision| decision.role == AgentRole::Auditor)
+                            .and_then(|decision| decision.provenance.choice.as_ref())
+                            .map(|choice| choice.candidate.clone());
+                        if let Some(state) = resolution.automatic_state.as_mut() {
+                            state.commit_completed_selection_events(
+                                runtime,
+                                std::slice::from_ref(&auditor),
+                            )?;
+                        }
+                        resolution
+                            .decisions
+                            .retain(|decision| decision.role != AgentRole::Auditor);
+                        resolution.decisions.push(auditor);
+                    }
+                }
+                resolution
+            };
             if resolution.selection_preflight_failure.is_none() {
                 bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
+                #[cfg(target_os = "linux")]
+                // Automatic state supplies budget-selected Worker/Auditor
+                // runtimes. Any such state or decision retains account binding.
+                if !local_deterministic_fake
+                    || resolution.automatic_state.is_some()
+                    || !resolution.decisions.is_empty()
+                {
+                    freeze_selected_codex_launch_binding(current_run.map(RunId::as_str))?;
+                    if plan
+                        .assignments
+                        .iter()
+                        .any(|assignment| assignment.runtime == Some(SupervisorRuntime::ClaudeCode))
+                    {
+                        freeze_selected_claude_launch_binding(current_run.map(RunId::as_str))?;
+                    }
+                    freeze_selected_secondary_managed_launch_bindings(
+                        plan,
+                        &resolution.decisions,
+                        runtime,
+                        current_run.map(RunId::as_str),
+                    )?;
+                }
             }
             Ok(resolution)
         }
@@ -4401,6 +7049,17 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         worktree_creation,
         runtime_model_catalog,
     )?;
+    let _routing_policy_guard = crate::selection::routing_policy::bind_routing_policy(
+        plan_metadata.resolved_routing_policy.clone(),
+    )?;
+    for decision in &selection_decisions {
+        if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+            crate::selection::routing_policy::seal_selected_candidate(
+                decision.role.as_str(),
+                &decision.provenance,
+            )?;
+        }
+    }
     let preclaim_parked_assignment_ids = preclaim_decisions
         .iter()
         .filter(|decision| !decision.allows_path_claim())
@@ -4815,7 +7474,14 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         || !environment_failures.is_empty()
         || collected.orchestrator_reports.iter().any(report_failed);
     let success = !failed;
-    let publishable = success && runtime == SupervisorRuntime::Codex;
+    let publishable = terminal_publishable(
+        success,
+        runtime,
+        execution_runtime,
+        &plan,
+        &collected.orchestrator_reports,
+        &collected.candidate_inspections,
+    );
     let (report_plan_file, report_run_dir) =
         supervisor_report_paths(&repo, &options.plan_file, &run_dir, &options.run_id);
     let usage_complete = !collected.usage_incomplete;
@@ -4933,7 +7599,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             false
         }
         Err(error) => {
-            return Err(error).context("failed to write normalized supervisor final report")
+            return Err(error).context("failed to write normalized supervisor final report");
         }
     };
     persist_supervisor_final_report(
@@ -4998,6 +7664,344 @@ mod selection_policy_tests {
         }
     }
 
+    fn publication_proof_fixture() -> Result<(
+        SupervisorPlan,
+        Vec<OrchestratorReviewReport>,
+        BTreeMap<String, SupervisorCandidateInspection>,
+    )> {
+        let mut plan = test_plan();
+        plan.assignments = vec![
+            terminal_worker_assignment("worker-a"),
+            terminal_worker_assignment("worker-b"),
+        ];
+        plan.assignments[1].assigned_paths = vec![PathBuf::from("tests/selector-two.rs")];
+        let mut reports = Vec::new();
+        let mut inspections = BTreeMap::new();
+        for assignment in &plan.assignments {
+            let mut report = accepted_review_report(&assignment.id);
+            report.assigned_paths = assignment.assigned_paths.clone();
+            report.files_changed = assignment.assigned_paths.clone();
+            let required = supervisor_review_coverage_requirement(assignment, &report);
+            let coverage = ReviewLensCoverage {
+                worker_ids: required.worker_ids.clone(),
+                paths: required.paths.clone(),
+            };
+            let child_transcript = format!(
+                "Synthetic publication fixture transcript for {}.",
+                assignment.id
+            );
+            let diff = format!("Synthetic candidate paths: {:?}", report.files_changed);
+            let output_report = serde_json::to_string(&report)?;
+            let verdicts = plan
+                .review_lenses
+                .iter()
+                .map(|lens| {
+                    let request = crate::review::build_review_lens_request(
+                        lens,
+                        crate::review::ReviewLensRequestSources {
+                            child_transcript: &child_transcript,
+                            diff: &diff,
+                            output_report: &output_report,
+                        },
+                    )?;
+                    let evidence_content = serde_json::to_string(&serde_json::json!({
+                        "fixture": "publication-proof",
+                        "request": &request,
+                        "coverage": &coverage,
+                        "verdict": "accept",
+                    }))?;
+                    ReviewLensVerdict::for_lens(
+                        lens,
+                        request.request_binding,
+                        ReviewLensVerdictStatus::Accept,
+                        coverage.clone(),
+                        vec![(
+                            crate::review::ReviewLensDescriptor::from(lens).expected_evidence_kind,
+                            evidence_content,
+                        )],
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            report.review_lens_aggregate = Some(crate::review::aggregate_review_lenses(
+                &plan.review_lenses,
+                plan.review_aggregation_policy,
+                required,
+                verdicts,
+            )?);
+            inspections.insert(
+                assignment.id.clone(),
+                SupervisorCandidateInspection {
+                    binding: CandidateValidationBinding {
+                        version: VALIDATION_BINDING_VERSION,
+                        agent_id: assignment.id.clone(),
+                        primary_head: Some("1".repeat(40)),
+                        agent_head: Some("2".repeat(40)),
+                        merge_base: Some("1".repeat(40)),
+                        diff_oid: "3".repeat(40),
+                    },
+                    changed_paths: report.files_changed.clone(),
+                },
+            );
+            reports.push(report);
+        }
+        Ok((plan, reports, inspections))
+    }
+
+    #[test]
+    fn publication_proof_fixture_uses_content_bound_review_requests() -> Result<()> {
+        let (plan, reports, _) = publication_proof_fixture()?;
+        for report in &reports {
+            let aggregate = report
+                .review_lens_aggregate
+                .as_ref()
+                .context("fixture review aggregate")?;
+            let mut source_report = report.clone();
+            source_report.review_lens_aggregate = None;
+            let child_transcript = format!(
+                "Synthetic publication fixture transcript for {}.",
+                report.id
+            );
+            let diff = format!("Synthetic candidate paths: {:?}", report.files_changed);
+            let output_report = serde_json::to_string(&source_report)?;
+            let changed_transcript = format!("{child_transcript}\nChanged fixture transcript.");
+            let changed_diff = format!("{diff}\nChanged fixture diff.");
+            let changed_output = format!("{output_report}\nChanged fixture output.");
+            assert_eq!(aggregate.lens_verdicts.len(), plan.review_lenses.len());
+            for (lens, verdict) in plan.review_lenses.iter().zip(&aggregate.lens_verdicts) {
+                let request = crate::review::build_review_lens_request(
+                    lens,
+                    crate::review::ReviewLensRequestSources {
+                        child_transcript: &child_transcript,
+                        diff: &diff,
+                        output_report: &output_report,
+                    },
+                )?;
+                assert_eq!(
+                    verdict.request_binding.as_deref(),
+                    Some(request.request_binding.as_str())
+                );
+                assert_eq!(request.request_binding.len(), 64);
+                assert!(request
+                    .request_binding
+                    .bytes()
+                    .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')));
+                let changed = crate::review::build_review_lens_request(
+                    lens,
+                    crate::review::ReviewLensRequestSources {
+                        child_transcript: &changed_transcript,
+                        diff: &changed_diff,
+                        output_report: &changed_output,
+                    },
+                )?;
+                assert_ne!(request.request_binding, changed.request_binding);
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_publication_is_provider_neutral_and_keeps_unknown_economics_separate() -> Result<()>
+    {
+        let (plan, reports, inspections) = publication_proof_fixture()?;
+        assert!(plan.model_pricing.is_empty());
+        for runtime in [
+            SupervisorRuntime::Codex,
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+        ] {
+            assert!(terminal_publishable(
+                true,
+                runtime,
+                SupervisorExecutionRuntime::Verified,
+                &plan,
+                &reports,
+                &inspections,
+            ));
+            assert!(!terminal_publishable(
+                false,
+                runtime,
+                SupervisorExecutionRuntime::Verified,
+                &plan,
+                &reports,
+                &inspections,
+            ));
+            assert!(!terminal_publishable(
+                true,
+                runtime,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                &plan,
+                &reports,
+                &inspections,
+            ));
+        }
+        assert!(!terminal_publishable(
+            true,
+            SupervisorRuntime::Fake,
+            SupervisorExecutionRuntime::Verified,
+            &plan,
+            &reports,
+            &inspections,
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_publication_requires_exact_accepted_assignment_candidates() -> Result<()> {
+        for defect in [
+            "missing-report",
+            "duplicate-report",
+            "foreign-report",
+            "missing-inspection",
+            "foreign-inspection",
+            "foreign-candidate",
+            "invalid-candidate",
+            "changed-paths",
+            "role",
+            "scope",
+            "failed-report",
+            "empty-plan",
+        ] {
+            let (mut plan, mut reports, mut inspections) = publication_proof_fixture()?;
+            match defect {
+                "missing-report" => {
+                    reports.pop();
+                }
+                "duplicate-report" => reports[1] = reports[0].clone(),
+                "foreign-report" => reports[0].id = "foreign".to_string(),
+                "missing-inspection" => {
+                    inspections.remove("worker-a");
+                }
+                "foreign-inspection" => {
+                    let inspection = inspections.remove("worker-a").unwrap();
+                    inspections.insert("foreign".to_string(), inspection);
+                }
+                "foreign-candidate" => {
+                    inspections.get_mut("worker-a").unwrap().binding.agent_id =
+                        "foreign".to_string();
+                }
+                "invalid-candidate" => {
+                    inspections.get_mut("worker-a").unwrap().binding.diff_oid = String::new();
+                }
+                "changed-paths" => inspections
+                    .get_mut("worker-a")
+                    .unwrap()
+                    .changed_paths
+                    .clear(),
+                "role" => reports[0].role = AgentRole::ChildOrchestrator,
+                "scope" => reports[0].assigned_paths.clear(),
+                "failed-report" => reports[0].accepted = false,
+                "empty-plan" => {
+                    plan.assignments.clear();
+                    reports.clear();
+                    inspections.clear();
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                !terminal_publishable(
+                    true,
+                    SupervisorRuntime::Grok,
+                    SupervisorExecutionRuntime::Verified,
+                    &plan,
+                    &reports,
+                    &inspections,
+                ),
+                "publication accepted {defect}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn terminal_publication_requires_parent_review_authority_and_configured_lens_coverage(
+    ) -> Result<()> {
+        for defect in [
+            "missing-aggregate",
+            "deserialized-authority",
+            "policy",
+            "missing-lens",
+            "foreign-lens",
+            "duplicate-lens",
+            "scope",
+            "required-coverage",
+            "worker-coverage",
+            "path-coverage",
+            "unreported-lens",
+            "validation-error",
+            "rejected-review",
+            "unconfigured-reviews",
+            "duplicate-configured-lens",
+        ] {
+            let (mut plan, mut reports, inspections) = publication_proof_fixture()?;
+            if defect == "missing-aggregate" {
+                reports[0].review_lens_aggregate = None;
+            } else if defect == "deserialized-authority" {
+                let bytes = serde_json::to_vec(reports[0].review_lens_aggregate.as_ref().unwrap())?;
+                reports[0].review_lens_aggregate = Some(serde_json::from_slice(&bytes)?);
+            } else {
+                let aggregate = reports[0].review_lens_aggregate.as_mut().unwrap();
+                match defect {
+                    "policy" => {
+                        aggregate.policy =
+                            ReviewAggregationPolicy::ValidatedQuorum { minimum_accepts: 1 };
+                    }
+                    "missing-lens" => {
+                        aggregate.lens_verdicts.pop();
+                    }
+                    "foreign-lens" => aggregate.lens_verdicts[0].lens.id = "foreign".to_string(),
+                    "duplicate-lens" => {
+                        aggregate.lens_verdicts[1] = aggregate.lens_verdicts[0].clone();
+                    }
+                    "scope" => {
+                        aggregate.lens_verdicts[0].lens.information_scope =
+                            ReviewInformationScope::OutputReportOnly;
+                    }
+                    "required-coverage" => aggregate.required_coverage.worker_ids.clear(),
+                    "worker-coverage" => aggregate.lens_verdicts[0].coverage.worker_ids.clear(),
+                    "path-coverage" => aggregate.lens_verdicts[0].coverage.paths.clear(),
+                    "unreported-lens" => aggregate.lens_verdicts[0].reported = false,
+                    "validation-error" => {
+                        aggregate.lens_verdicts[0]
+                            .validation_errors
+                            .push("invalid".to_string());
+                    }
+                    "rejected-review" => aggregate.decision = ReviewAggregationDecision::Reject,
+                    "unconfigured-reviews" => plan.review_lenses.clear(),
+                    "duplicate-configured-lens" => {
+                        plan.review_lenses[1] = plan.review_lenses[0].clone();
+                    }
+                    _ => unreachable!(),
+                }
+            }
+            assert!(
+                !terminal_publishable(
+                    true,
+                    SupervisorRuntime::Grok,
+                    SupervisorExecutionRuntime::Verified,
+                    &plan,
+                    &reports,
+                    &inspections,
+                ),
+                "publication accepted {defect}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nonpublishable_real_success_reports_missing_proof_without_codex_only_guidance() {
+        let (simulation_risk, _) = nonpublishable_success_guidance(SupervisorRuntime::Fake);
+        assert!(simulation_risk.contains("fake supervisor simulation"));
+        for runtime in [SupervisorRuntime::Codex, SupervisorRuntime::Grok] {
+            let (risk, action) = nonpublishable_success_guidance(runtime);
+            assert!(risk.contains("proof is missing"));
+            assert!(!risk.contains("fake"));
+            assert!(!action.contains("Codex"));
+        }
+    }
+
     fn complete_attempt_costs() -> AttemptAttributableCosts {
         AttemptAttributableCosts {
             execution_cost_microunits: Some(10),
@@ -5043,11 +8047,50 @@ mod selection_policy_tests {
         })
     }
 
+    fn assessed_selection_fixture() -> Result<(
+        SupervisorPlan,
+        TaskRoutingAssessment,
+        crate::selection::routing_policy::FrozenRoutingPolicy,
+    )> {
+        use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+
+        let policy: LoadedRoutingPolicy =
+            serde_json::from_str(include_str!("../selection/data/routing-policy.json"))?;
+        policy.validate()?;
+        let frozen = FrozenRoutingPolicy {
+            sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+            policy,
+            source: "public-scheduler-selection-fixture".to_string(),
+        };
+        let mut plan = test_plan();
+        plan.task = format!("Create {SELECTOR_TEST_TARGET} with one line: ready");
+        plan.assignments = vec![serde_json::from_value(serde_json::json!({
+            "id":"selector-parent", "phase":"execution", "role":"child_orchestrator",
+            "task": &plan.task, "assigned_paths":["tests"], "worker_assignments":[
+                {"id":"selector-worker", "role":"worker", "task": &plan.task,
+                    "assigned_paths":[SELECTOR_TEST_TARGET]}
+            ]
+        }))?];
+        let proposal: crate::planning::TaskDecompositionProposal =
+            serde_json::from_value(serde_json::json!({
+                "fragments":[{"id":"selector", "text": &plan.task}],
+                "assignments":[{"id":"selector-worker", "task": &plan.task,
+                    "fragment_ids":["selector"], "assigned_paths":[SELECTOR_TEST_TARGET],
+                    "semantic_symbols":[], "semantic_modules":[]}],
+                "diagnostics":{"degraded":false, "notes":[]},
+                "disjointness":{"disjoint":true, "conflicts":[]}
+            }))?;
+        let assessment =
+            super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+        Ok((plan, assessment, frozen))
+    }
+
     fn automatic_selection_fixture() -> Result<(
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         Vec<SupervisorSelectionEvent>,
         SupervisorPlan,
+        crate::selection::routing_policy::FrozenRoutingPolicy,
     )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -5085,16 +8128,22 @@ mod selection_policy_tests {
             },
             resolved_bound: 1,
         };
-        let mut plan = test_plan();
+        let (mut plan, assessment, frozen) = assessed_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let resolution = initialize_supervisor_selection(
-            &mut plan,
-            SupervisorRuntime::Codex,
-            &catalog,
-            &admission,
-            &AdvertisedCatalogSet::empty(),
-            Some(&resolved_objective_profile),
-        )?;
+        let resolution =
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                &mut plan,
+                SupervisorRuntime::Codex,
+                &catalog,
+                &admission,
+                &AdvertisedCatalogSet::empty(),
+                Some(&resolved_objective_profile),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                &[],
+                Some(&assessment),
+            )?;
         Ok((
             catalog,
             resolution
@@ -5102,6 +8151,7 @@ mod selection_policy_tests {
                 .context("automatic selector same-run state")?,
             resolution.decisions,
             plan,
+            frozen,
         ))
     }
 
@@ -5159,7 +8209,7 @@ mod selection_policy_tests {
 
     #[test]
     fn worker_role_binding_uses_unanimous_cross_runtime_assignment_evidence() -> Result<()> {
-        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        let (catalog, _, initial_events, mut plan, _) = automatic_selection_fixture()?;
         plan.assignments = vec![
             terminal_worker_assignment("worker-a"),
             terminal_worker_assignment("worker-b"),
@@ -5246,7 +8296,7 @@ mod selection_policy_tests {
 
     #[test]
     fn worker_role_binding_keeps_heterogeneous_assignments_explicit() -> Result<()> {
-        let (catalog, _, initial_events, mut plan) = automatic_selection_fixture()?;
+        let (catalog, _, initial_events, mut plan, _) = automatic_selection_fixture()?;
         plan.assignments = vec![
             terminal_worker_assignment("worker-a"),
             terminal_worker_assignment("worker-b"),
@@ -5411,6 +8461,7 @@ mod selection_policy_tests {
     #[test]
     fn selector_override_is_applied_after_legacy_budget_mutations() {
         let mut plan = test_plan();
+        plan.review_lenses = single_parent_acceptance_review_lenses();
         plan.role_models.insert(
             AgentRole::ChildOrchestrator,
             role_selection("plan-child", "xhigh"),
@@ -5571,10 +8622,46 @@ mod selection_policy_tests {
             Some("ultra")
         );
         assert_eq!(active_plan.review_lenses.len(), 2);
-        assert!(active_plan
-            .review_lenses
-            .iter()
-            .all(|lens| { lens.backend.reasoning_effort() == Some("xhigh") }));
+        assert_eq!(active_plan.review_lenses[0].id, "parent-acceptance");
+        assert_eq!(
+            active_plan.review_lenses[0].information_scope,
+            ReviewInformationScope::FullChildTranscript
+        );
+        match &active_plan.review_lenses[0].backend {
+            ReviewLensBackendConfig::Model {
+                backend_id,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(backend_id, "openai");
+                assert_eq!(model, "active-auditor");
+                assert_eq!(reasoning_effort.as_deref(), Some("ultra"));
+            }
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("selector-bound lens changed backend")
+            }
+        }
+        assert_eq!(active_plan.review_lenses[1].id, "active-effort-custom-lens");
+        assert_eq!(
+            active_plan.review_lenses[1].information_scope,
+            ReviewInformationScope::OutputReportOnly
+        );
+        match &active_plan.review_lenses[1].backend {
+            ReviewLensBackendConfig::Model {
+                backend_id,
+                model,
+                reasoning_effort,
+                ..
+            } => {
+                assert_eq!(backend_id, "custom-provider");
+                assert_eq!(model, "custom-auditor");
+                assert_eq!(reasoning_effort.as_deref(), Some("ultra"));
+            }
+            ReviewLensBackendConfig::Precomputed { .. } => {
+                panic!("independent custom lens changed backend")
+            }
+        }
 
         let mut controller = BudgetDegradationController::new(1);
         controller.record_assignment_effort_bindings(
@@ -5610,13 +8697,13 @@ mod selection_policy_tests {
             );
             assert_eq!(
                 auditor.requested_reasoning_effort,
-                Some(ReasoningEffort::Low)
+                Some(ReasoningEffort::Ultra)
             );
-            assert_eq!(auditor.fallback_reasoning_effort, "xhigh");
-            assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+            assert_eq!(auditor.fallback_reasoning_effort, "ultra");
+            assert_eq!(auditor.resolved_reasoning_effort, "ultra");
             assert_eq!(
                 auditor.resolution_observation,
-                EffortResolutionObservation::HardFloorClamped
+                EffortResolutionObservation::AssignmentOverride
             );
             assert!(auditor
                 .unavailable_reason
@@ -5627,7 +8714,8 @@ mod selection_policy_tests {
 
     #[test]
     fn completed_retry_promotes_matching_execution_override_and_reroute_state() -> Result<()> {
-        let (catalog, state, _, plan) = automatic_selection_fixture()?;
+        let (catalog, state, _, plan, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let mut controller = BudgetDegradationController::new_with_selection_state(
             2,
             Some(state),
@@ -5734,10 +8822,12 @@ mod selection_policy_tests {
             parent_result: None,
             costs: complete_attempt_costs(),
         }];
+        let unresolved = this_run_accepted_task_cost(&rows, &[]).expect("unresolved row retained");
+        assert_eq!(unresolved.complete_attempt_count, 1);
+        assert_eq!(unresolved.unknown_terminal_result_count, 1);
+        assert_eq!(unresolved.complete_total_cycle_cost_microunits, 12);
         assert_eq!(
-            observed_cost_per_accepted_task_microunits(
-                this_run_accepted_task_cost(&rows, &[]).as_ref()
-            ),
+            observed_cost_per_accepted_task_microunits(Some(&unresolved)),
             None
         );
         let rollup = this_run_accepted_task_cost(&rows, &[accepted_review_report("assignment-1")])
@@ -5749,8 +8839,74 @@ mod selection_policy_tests {
     }
 
     #[test]
+    fn this_run_cpo_retains_unresolved_earlier_attempts_after_latest_acceptance() {
+        let rows = [
+            ThisRunAttemptCostRow {
+                assignment_id: "assignment-1".to_string(),
+                attempt: 1,
+                parent_result: None,
+                costs: complete_attempt_costs(),
+            },
+            ThisRunAttemptCostRow {
+                assignment_id: "assignment-1".to_string(),
+                attempt: 2,
+                parent_result: None,
+                costs: complete_attempt_costs(),
+            },
+        ];
+        let reports = [accepted_review_report("assignment-1")];
+        let records = this_run_attempt_cost_records(&rows, &reports);
+        assert_eq!(records.len(), rows.len());
+        assert_eq!(records[0].result, None);
+        assert_eq!(records[1].result, Some(OutcomeResult::Accepted));
+        assert_eq!(records[0].costs, rows[0].costs);
+        let rollup = this_run_accepted_task_cost(&rows, &reports).expect("retained cost rollup");
+        assert_eq!(rollup.complete_attempt_count, 2);
+        assert_eq!(rollup.unknown_terminal_result_count, 1);
+        assert_eq!(rollup.complete_total_cycle_cost_microunits, 24);
+        assert_eq!(rollup.cost_per_accepted_task_microunits, None);
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(Some(&rollup)),
+            None
+        );
+    }
+
+    #[test]
+    fn this_run_cpo_refuses_mixed_missing_cost_but_retains_known_subtotal() {
+        let mut incomplete_costs = complete_attempt_costs();
+        incomplete_costs.environment_cost_microunits = None;
+        let rows = [
+            ThisRunAttemptCostRow {
+                assignment_id: "accepted".to_string(),
+                attempt: 1,
+                parent_result: Some(OutcomeResult::Accepted),
+                costs: complete_attempt_costs(),
+            },
+            ThisRunAttemptCostRow {
+                assignment_id: "blocked".to_string(),
+                attempt: 1,
+                parent_result: Some(OutcomeResult::Blocked),
+                costs: incomplete_costs,
+            },
+        ];
+        let records = this_run_attempt_cost_records(&rows, &[]);
+        assert_eq!(records.len(), rows.len());
+        assert_eq!(records[1].costs.environment_cost_microunits, None);
+        let rollup = this_run_accepted_task_cost(&rows, &[]).expect("partial cost rollup");
+        assert_eq!(rollup.incomplete_attempt_count, 1);
+        assert_eq!(rollup.unknown_terminal_result_count, 0);
+        assert_eq!(rollup.complete_total_cycle_cost_microunits, 12);
+        assert_eq!(rollup.cost_per_accepted_task_microunits, None);
+        assert_eq!(
+            observed_cost_per_accepted_task_microunits(Some(&rollup)),
+            None
+        );
+    }
+
+    #[test]
     fn commit_prefix_feeds_complete_cpo_into_shared_policy_reselect() -> Result<()> {
-        let (catalog, state, _, _) = automatic_selection_fixture()?;
+        let (catalog, state, _, _, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let mut controller = BudgetDegradationController::new_with_selection_state(
             2,
             Some(state),
@@ -5817,7 +8973,8 @@ mod selection_policy_tests {
 
     #[test]
     fn concurrent_retries_share_predispatch_state_and_commit_in_schedule_order() -> Result<()> {
-        let (catalog, state, initial_events, plan) = automatic_selection_fixture()?;
+        let (catalog, state, initial_events, plan, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
         let initial_worker = initial_events
             .iter()
             .find(|event| event.role == AgentRole::Worker)
@@ -5837,9 +8994,12 @@ mod selection_policy_tests {
             for (index, mut policy) in policies.into_iter().enumerate() {
                 let barrier = barrier.clone();
                 let catalog = &catalog;
+                let frozen = frozen.clone();
                 handles.push(scope.spawn(
                     move || -> Result<(usize, SupervisorSelectionEvent, RoleModelSelection)> {
                         barrier.wait();
+                        let _policy =
+                            crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
                         let events = policy.reselect(
                             SupervisorRuntime::Codex,
                             catalog,
@@ -6066,7 +9226,8 @@ mod selection_policy_tests {
     #[test]
     fn empty_role_model_test_catalog_supports_verified_automatic_selection() -> Result<()> {
         let (temporary, repo) = initialized_repository();
-        let mut plan = test_plan();
+        let (mut plan, assessment, frozen) = assessed_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
         let priors = crate::selection::built_in_prior_dataset()?;
         let RuntimeModelCatalog::Codex(codex_catalog) = &catalog else {
@@ -6087,14 +9248,19 @@ mod selection_policy_tests {
         )?;
 
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let resolution = initialize_supervisor_selection(
-            &mut plan,
-            SupervisorRuntime::Codex,
-            &catalog,
-            &admission,
-            &AdvertisedCatalogSet::empty(),
-            Some(&resolved_objective_profile),
-        )?;
+        let resolution =
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                &mut plan,
+                SupervisorRuntime::Codex,
+                &catalog,
+                &admission,
+                &AdvertisedCatalogSet::empty(),
+                Some(&resolved_objective_profile),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                &[],
+                Some(&assessment),
+            )?;
 
         assert_eq!(resolution.mode, SupervisorSelectionMode::Automatic);
         assert_eq!(resolution.decisions.len(), 5);
@@ -6127,6 +9293,11 @@ mod selection_policy_tests {
         }];
         let requested_plan = plan.clone();
         let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)?;
+        #[cfg(target_os = "linux")]
+        let _cam = install_positive_injected_cam_fixture(&temporary, &catalog)?;
+        let mut plan_metadata = SupervisorPlanMetadata::default();
+        let _routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
         let options =
             predispatch_options(&repo, temporary.path(), "automatic-requested-plan-identity");
 
@@ -6135,7 +9306,7 @@ mod selection_policy_tests {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),
                 assignment_metadata: AssignmentMetadata::new(),
-                plan_metadata: SupervisorPlanMetadata::default(),
+                plan_metadata,
             },
             &options,
             1,
@@ -6150,7 +9321,19 @@ mod selection_policy_tests {
             prepared.requested_plan.review_lenses,
             requested_plan.review_lenses
         );
-        assert_eq!(prepared.plan.role_models.len(), 5);
+        let expected_roles = BTreeSet::from([
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+            AgentRole::ChildOrchestrator,
+        ]);
+        let actual_roles: BTreeSet<_> = prepared.plan.role_models.keys().copied().collect();
+        assert_eq!(actual_roles, expected_roles);
+        assert!(actual_roles.contains(&AgentRole::Supervisor));
+        assert!(actual_roles.contains(&AgentRole::GateClassifier));
+        assert!(actual_roles.contains(&AgentRole::Auditor));
+        assert!(actual_roles.contains(&AgentRole::ChildOrchestrator));
+        assert!(!actual_roles.contains(&AgentRole::Researcher));
         assert_ne!(prepared.plan, prepared.requested_plan);
         Ok(())
     }
@@ -6199,21 +9382,30 @@ mod selection_policy_tests {
                 .filter(|prior| prior.runtime == "codex")
                 .map(|prior| prior.model.clone()),
         )?);
+        #[cfg(target_os = "linux")]
+        let _cam = install_positive_injected_cam_fixture(&temporary, &catalog)?;
         let admission = SupervisorAdmissionPolicyInput::resolve(
             &repo,
             1,
             SupervisorAdmissionConfig::default(),
             SupervisorAdmissionConfig::default(),
         )?;
+        let mut plan_metadata = SupervisorPlanMetadata::default();
+        let _routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
         let mut bridge_plan = plan.clone();
         let resolved_objective_profile = default_resolved_objective_profile()?;
-        let bridge_resolution = initialize_supervisor_selection(
+        let bridge_resolution = initialize_supervisor_selection_with_assessment(
             &mut bridge_plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
             Some(&resolved_objective_profile),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            plan_metadata.task_routing_assessment.as_ref(),
         )?;
         assert_eq!(bridge_plan.role_models, original_role_models);
         assert!(bridge_resolution.selection_preflight_failure.is_some());
@@ -6237,7 +9429,7 @@ mod selection_policy_tests {
                 plan,
                 consultant: SupervisorConsultantPlan::default(),
                 assignment_metadata: AssignmentMetadata::new(),
-                plan_metadata: SupervisorPlanMetadata::default(),
+                plan_metadata,
             },
             options,
             1,
@@ -6270,15 +9462,24 @@ mod selection_policy_tests {
             original_role_models[&AgentRole::Auditor].model
         );
         assert_eq!(
-            normalized_auditor.reasoning_effort.as_deref(),
-            Some("xhigh")
+            normalized_auditor.reasoning_effort,
+            original_role_models[&AgentRole::Auditor].reasoning_effort
         );
         let events = &profile
             .execution
             .as_ref()
             .context("selection failure execution metadata")?
             .selection_decisions;
-        assert_eq!(events.len(), provisional_default_role_models().len());
+        let required_roles = BTreeSet::from([
+            AgentRole::Supervisor,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+            AgentRole::ChildOrchestrator,
+        ]);
+        assert_eq!(events.len(), required_roles.len());
+        let event_roles: BTreeSet<_> = events.iter().map(|event| event.role).collect();
+        assert_eq!(event_roles, required_roles);
+        assert!(!event_roles.contains(&AgentRole::Researcher));
         let auditor_event = events
             .iter()
             .find(|event| event.role == AgentRole::Auditor)
@@ -6339,6 +9540,7 @@ mod selection_policy_tests {
 
         enum SchedulerObserveStubMode {
             ObservedModels,
+            ObservedSynthetic(ObservedModel),
             ObserveError,
         }
 
@@ -6395,10 +9597,12 @@ mod selection_policy_tests {
                 _account: &StoredAccountMetadata,
             ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
             {
-                match self.mode {
+                match &self.mode {
                     SchedulerObserveStubMode::ObservedModels => {
                         Ok(CategoryObservation::observed(ModelsObservation {
+                            provenance: None,
                             models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                                 model_id: FRONTIER_PROFILE_MODEL.to_string(),
                                 supported_efforts: Some(vec![
                                     "high".to_string(),
@@ -6408,11 +9612,41 @@ mod selection_policy_tests {
                             }],
                         }))
                     }
+                    SchedulerObserveStubMode::ObservedSynthetic(model) => {
+                        Ok(CategoryObservation::observed(ModelsObservation {
+                            provenance: None,
+                            models: vec![model.clone()],
+                        }))
+                    }
                     SchedulerObserveStubMode::ObserveError => Err(CamError::ConfigRead {
                         provider: self.id.to_string(),
                         reason: "scheduler observe stub refused models".to_string(),
                     }),
                 }
+            }
+        }
+
+        fn synthetic_prior_observed_model(prior: &crate::selection::ModelPrior) -> ObservedModel {
+            let mut efforts = std::collections::BTreeSet::new();
+            for fit in &prior.class_fit {
+                efforts.insert(fit.effort.as_str().to_string());
+            }
+            for evidence in &prior.authority_evidence {
+                efforts.insert(evidence.effort.as_str().to_string());
+            }
+            for effort in &prior.strong_gate_fallback_efforts {
+                efforts.insert(effort.as_str().to_string());
+            }
+            ObservedModel {
+                access:
+                    coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
+                model_id: prior.model.clone(),
+                supported_efforts: if efforts.is_empty() {
+                    None
+                } else {
+                    Some(efforts.into_iter().collect())
+                },
+                default_effort: None,
             }
         }
 
@@ -6450,10 +9684,13 @@ mod selection_policy_tests {
             }
             activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
+                secondary_adapter: None,
                 adapter: Box::new(SchedulerObserveStub {
                     id: "codex-cli",
                     mode,
                 }),
+                advertised: None,
+                resolved_auditor: None,
                 _root: root,
             })
         }
@@ -6501,6 +9738,1128 @@ mod selection_policy_tests {
         }
 
         #[test]
+        fn captured_cam_fixture_keeps_child_custody_and_restores_destination() -> Result<()> {
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let parent_guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let captured = captured_cam_observe_test_harness().context("parent CAM fixture")?;
+            let root = captured._root.path().to_path_buf();
+            let registry_path = captured.registry.metadata_path().to_path_buf();
+            let expected = captured
+                .registry
+                .selected_binding("codex-cli")?
+                .context("parent selected Codex account")?;
+            let authority = authority_id_for(&registry_path);
+            let child_root = root.clone();
+            thread::scope(|scope| -> Result<()> {
+                scope
+                    .spawn(|| assert!(captured_cam_observe_test_harness().is_none()))
+                    .join()
+                    .map_err(|_| anyhow!("unrelated sibling panicked"))?;
+                // The capture, then the destination guard, must own the real
+                // registry and TempDir after the coordinator's guard is gone.
+                drop(parent_guard);
+                assert!(root.exists());
+                scope
+                    .spawn(move || -> Result<()> {
+                        assert!(captured_cam_observe_test_harness().is_none());
+                        let destination_guard =
+                            activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+                        let destination =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("destination selected account")?;
+                        let result = (|| -> Result<()> {
+                            let _inherited =
+                                install_captured_cam_observe_test_harness(Some(captured));
+                            let run = "captured-cam-child-owned-registry";
+                            let observed = account_observation_for_launch_runtime(
+                                SupervisorRuntime::Codex,
+                                Some(run),
+                            )?
+                            .context("inherited selected account")?;
+                            assert_eq!(observed.binding, expected);
+                            let Some(CodexRunAccountBinding::Selected(frozen)) =
+                                codex_run_account_binding(run)
+                            else {
+                                bail!("child observation did not freeze its genuine selection");
+                            };
+                            assert_eq!(frozen.to_selected_binding(), expected);
+                            assert_eq!(frozen.authority_id, authority);
+                            assert!(child_root.exists());
+                            assert!(registry_path.exists());
+                            bail!("injected child scope exit after genuine observation")
+                        })();
+                        assert_eq!(
+                            result.unwrap_err().to_string(),
+                            "injected child scope exit after genuine observation"
+                        );
+                        assert!(!child_root.exists());
+                        let restored =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("restored destination account")?;
+                        assert_eq!(restored.binding, destination.binding);
+                        drop(destination_guard);
+                        assert!(captured_cam_observe_test_harness().is_none());
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| anyhow!("inherited child panicked"))??;
+                Ok(())
+            })?;
+            assert!(!root.exists());
+            Ok(())
+        }
+
+        #[test]
+        fn captured_cam_fixture_reobserves_drift_before_frozen_review() -> Result<()> {
+            let _cam = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            let mut worker = super::terminal_worker_assignment("captured-review-worker");
+            worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            plan.assignments = vec![worker];
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+            let run = RunId::new("captured-cam-live-review-drift")?;
+            let mut request = prepared_codex_request(&repo, &catalog, &admission);
+            request.current_run = Some(&run);
+            let initial = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut metadata,
+                request,
+            )?;
+            assert!(initial.selection_preflight_failure.is_none());
+            let baseline = initial
+                .decisions
+                .iter()
+                .find(|decision| decision.role == AgentRole::Auditor)
+                .context("genuine assessed Auditor decision")?
+                .clone();
+            let lens = plan
+                .review_lenses
+                .first()
+                .context("resolved review lens")?
+                .clone();
+            let effort = lens
+                .backend
+                .reasoning_effort()
+                .context("resolved fixture lens effort")?
+                .to_string();
+            let supplied_catalog = catalog
+                .as_ref()
+                .map_err(|_| anyhow!("fixture catalog is unavailable"))?;
+            let expected = super::super::super::selection_bridge::frozen_review_account_binding(
+                SupervisorRuntime::Codex,
+                run.as_str(),
+            )?
+            .context("frozen selected review account")?;
+            let expected_account = (&expected).into();
+            let observed = account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                .context("original selected account observation")?;
+            // Establish the ordinary review contract before introducing drift.
+            super::super::super::selection_bridge::select_authored_review_lens(
+                &lens,
+                &effort,
+                SupervisorRuntime::Codex,
+                supplied_catalog,
+                &baseline.provenance,
+                super::super::super::selection_bridge::ReviewLensAccount::Selected {
+                    observation: &observed,
+                    expected_binding: &expected_account,
+                },
+                SupervisorQuotaSelectionInput::default(),
+            )?;
+            let captured =
+                captured_cam_observe_test_harness().context("captured review fixture")?;
+            captured.registry.begin_add(
+                "codex-cli",
+                "changed",
+                "Synthetic changed account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            captured.registry.complete_add("codex-cli", "changed")?;
+            captured
+                .registry
+                .select_complete_revision("codex-cli", "changed", None)?;
+            let frozen = metadata
+                .resolved_routing_policy
+                .context("held frozen policy")?;
+            let prior = crate::supervise::prior_input::captured_binding();
+            thread::scope(|scope| -> Result<()> {
+                scope
+                    .spawn(move || -> Result<()> {
+                        let _cam = install_captured_cam_observe_test_harness(Some(captured));
+                        let _prior = crate::supervise::prior_input::install_captured(prior);
+                        let _policy =
+                            crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
+                        let observed =
+                            account_observation_for_launch_runtime(SupervisorRuntime::Codex, None)?
+                                .context("current selected account after capture")?;
+                        assert_eq!(observed.binding.provider_id, expected.provider_id);
+                        assert_eq!(observed.binding.account_id, "changed");
+                        assert_ne!(
+                            observed.binding.account_incarnation,
+                            expected.account_incarnation
+                        );
+                        assert_ne!(
+                            observed.binding.selection_revision,
+                            expected.selection_revision
+                        );
+                        assert_eq!(
+                            super::super::super::selection_bridge::frozen_review_account_binding(
+                                SupervisorRuntime::Codex,
+                                run.as_str(),
+                            )?,
+                            Some(expected)
+                        );
+                        let error =
+                            super::super::super::selection_bridge::select_authored_review_lens(
+                                &lens,
+                                &effort,
+                                SupervisorRuntime::Codex,
+                                supplied_catalog,
+                                &baseline.provenance,
+                                super::super::super::selection_bridge::ReviewLensAccount::Selected {
+                                    observation: &observed, expected_binding: &expected_account,
+                                },
+                                SupervisorQuotaSelectionInput::default(),
+                            )
+                            .err()
+                            .context("registry drift must refuse the frozen review contract")?;
+                        assert_eq!(
+                            error.to_string(),
+                            "review lens selected account changed from the frozen run binding"
+                        );
+                        Ok(())
+                    })
+                    .join()
+                    .map_err(|_| anyhow!("drift observation child panicked"))??;
+                Ok(())
+            })
+        }
+
+        #[test]
+        fn prepared_local_fake_selection_avoids_discovery_and_account_freezing() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let (_temporary, repo, _, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            let absent_socket = repo.join("absent-authority.sock");
+            assert!(!absent_socket.exists());
+            let _socket = CamAuthoritySocketTestGuard::install(Some(absent_socket.as_os_str()));
+            let run = RunId::new("prepared-local-fake-no-authority")?;
+            let catalog = Ok(RuntimeModelCatalog::LocalDeterministicFake);
+            plan.assignments = vec![super::terminal_worker_assignment("fake-worker")];
+            let original_lenses = plan.review_lenses.clone();
+            for authored_runtime in [None, Some(SupervisorRuntime::Fake)] {
+                plan.assignments[0].runtime = authored_runtime;
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = SupervisorRuntime::Fake;
+                request.current_run = Some(&run);
+                // Verified is the production experiment entrypoint, not the
+                // legacy nonpublishable-simulation shortcut used by unit helpers.
+                let resolution = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("local Fake must not discover real catalogs"),
+                )?;
+                assert_eq!(resolution.mode, SupervisorSelectionMode::LegacyFake);
+                assert!(resolution.selection_preflight_failure.is_none());
+                assert!(resolution.decisions.is_empty());
+                assert!(resolution.automatic_state.is_none());
+                assert_eq!(plan.assignments[0].runtime, authored_runtime);
+                assert_eq!(plan.review_lenses, original_lenses);
+                assert!(metadata.resolved_routing_policy.is_some());
+                assert!(metadata.resolved_objective_profile.is_some());
+                let controller = BudgetDegradationController::new_with_selection_state(
+                    1,
+                    resolution.automatic_state,
+                    SupervisorRuntime::Fake,
+                )?;
+                for role in [AgentRole::Worker, AgentRole::Auditor] {
+                    assert!(controller.policy.selected_runtime_for(role).is_none());
+                }
+                assert!(
+                    crate::account_authority::codex_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(
+                    crate::account_authority::claude_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(crate::account_authority::grok_run_account_binding(run.as_str()).is_none());
+                assert!(
+                    crate::account_authority::gemini_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(
+                    crate::account_authority::cursor_run_account_binding(run.as_str()).is_none()
+                );
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn prepared_fake_real_runtime_overrides_retain_catalog_discovery_errors() -> Result<()> {
+            let (_temporary, repo, _, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("mixed-worker")];
+            let catalog = Ok(RuntimeModelCatalog::LocalDeterministicFake);
+            for authored_runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::Cursor,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::GeminiCli,
+            ] {
+                plan.assignments[0].runtime = Some(authored_runtime);
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = SupervisorRuntime::Fake;
+                let error = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("real catalog discovery refused"),
+                )
+                .expect_err("an authored real executor must retain discovery failure");
+                assert_eq!(error.to_string(), "real catalog discovery refused");
+                assert_eq!(plan.assignments[0].runtime, Some(authored_runtime));
+            }
+            // Neither a real primary executor nor a non-local acquired catalog
+            // qualifies, even when assignment runtimes are unspecified.
+            plan.assignments[0].runtime = None;
+            for (runtime, catalog) in [
+                (
+                    SupervisorRuntime::Codex,
+                    RuntimeModelCatalog::LocalDeterministicFake,
+                ),
+                (
+                    SupervisorRuntime::Fake,
+                    RuntimeModelCatalog::OperatorDeclared,
+                ),
+            ] {
+                let catalog = Ok(catalog);
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.runtime = runtime;
+                let error = initialize_supervisor_selection_with_catalog_discovery(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                    |_| bail!("real catalog discovery refused"),
+                )
+                .expect_err("Fake runtime and acquired local catalog are both required");
+                assert_eq!(error.to_string(), "real catalog discovery refused");
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn codex_scheduler_observation_and_secondary_selection_are_frozen_per_run() -> Result<()> {
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+            let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let run = "synthetic-codex-primary-observed";
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .context("selected synthetic account")?;
+            let Some(CodexRunAccountBinding::Selected(frozen)) = codex_run_account_binding(run)
+            else {
+                panic!("Codex primary observation did not freeze its selected account");
+            };
+            assert_eq!(frozen.to_selected_binding(), observation.binding);
+            freeze_selected_codex_launch_binding(Some(run))?;
+            assert_eq!(
+                codex_run_account_binding(run),
+                Some(CodexRunAccountBinding::Selected(frozen.clone()))
+            );
+            let nested_run = "synthetic-codex-secondary-selected";
+            freeze_selected_codex_launch_binding(Some(nested_run))?;
+            assert_eq!(
+                codex_run_account_binding(nested_run),
+                Some(CodexRunAccountBinding::Selected(frozen))
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn local_auth_codex_scheduler_keeps_primary_with_only_grok_observed() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let _socket = CamAuthoritySocketTestGuard::install(None);
+            let (root, registry) = isolated_registry();
+            registry.begin_add(
+                "grok-cli",
+                "work",
+                "Synthetic Grok account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add("grok-cli", "work")?;
+            registry.select_complete_revision("grok-cli", "work", None)?;
+            let grok_prior = crate::selection::built_in_prior_dataset()?
+                .models
+                .into_iter()
+                .find(|prior| prior.runtime == "grok" && !prior.prohibited)
+                .context("synthetic Grok prior")?;
+            let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode: SchedulerObserveStubMode::ObservedModels,
+                }),
+                secondary_adapter: Some(Box::new(SchedulerObserveStub {
+                    id: "grok-cli",
+                    mode: SchedulerObserveStubMode::ObservedSynthetic(
+                        synthetic_prior_observed_model(&grok_prior),
+                    ),
+                })),
+                advertised: None,
+                resolved_auditor: None,
+                _root: root,
+            });
+            let run = RunId::new("r10-local-auth-codex-with-grok")?;
+            let observations =
+                account_observations_for_selection(SupervisorRuntime::Codex, Some(run.as_str()))?;
+            assert_eq!(observations.len(), 1);
+            assert_eq!(observations[0].0, SupervisorRuntime::Grok);
+            assert_eq!(
+                codex_run_account_binding(run.as_str()),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+
+            let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("local-auth-worker")];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            let _policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+            let mut request = prepared_codex_request(&repo, &catalog, &admission);
+            request.current_run = Some(&run);
+            let resolution = initialize_supervisor_selection_with_catalog_discovery(
+                &mut plan,
+                &mut metadata,
+                request,
+                |_| Ok(AdvertisedCatalogSet::empty()),
+            )?;
+            assert!(resolution.selection_preflight_failure.is_none());
+            assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Codex));
+            assert!(resolution.decisions.iter().all(|event| {
+                event.provenance.normalized_input.catalogs.len() == 1
+                    && event.provenance.normalized_input.catalogs[0].runtime == "codex"
+                    && event.provenance.choice.as_ref().unwrap().candidate.runtime == "codex"
+            }));
+            assert_eq!(
+                codex_run_account_binding(run.as_str()),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn codex_scheduler_missing_local_selection_freezes_local_auth() -> Result<()> {
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+            let _guard = activate_stub(false, SchedulerObserveStubMode::ObservedModels);
+            let run = "synthetic-codex-secondary-missing";
+            freeze_selected_codex_launch_binding(Some(run))?;
+            assert_eq!(
+                codex_run_account_binding(run),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+            assert!(codex_run_account_binding("synthetic-never-initialized-codex").is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn absent_implicit_cam_scheduler_observation_uses_local_registry() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+
+            let runtime = tempfile::tempdir()?;
+            let _socket = CamAuthoritySocketTestGuard::install_default(
+                runtime.path().join("maco/account-authority.sock"),
+            );
+            assert!(crate::account_authority::configured_cam_authority_socket().is_none());
+            let _selected = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+            let run = "r9-scheduler-local-selected";
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .context("local registry selection")?;
+            let Some(CodexRunAccountBinding::Selected(frozen)) = codex_run_account_binding(run)
+            else {
+                panic!("local selection was not frozen");
+            };
+            assert_eq!(frozen.to_selected_binding(), observation.binding);
+            assert!(frozen.authority_socket.is_none());
+            let _empty = activate_stub(false, SchedulerObserveStubMode::ObservedModels);
+            let run = "r9-scheduler-local-empty";
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .is_none()
+            );
+            freeze_selected_codex_launch_binding(Some(run))?;
+            assert_eq!(
+                codex_run_account_binding(run),
+                Some(CodexRunAccountBinding::LocalAuth)
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn configured_cam_scheduler_observation_refuses_missing_or_unsafe_endpoint() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let runtime = tempfile::tempdir()?;
+            let socket = runtime.path().join("maco/account-authority.sock");
+            {
+                let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+                assert!(
+                    account_observation_for_launch_runtime(SupervisorRuntime::Codex, None).is_err()
+                );
+                assert!(
+                    freeze_selected_codex_launch_binding(Some("r9-explicit-missing-freeze"))
+                        .is_err()
+                );
+            }
+            fs::create_dir(socket.parent().unwrap())?;
+            std::os::unix::fs::symlink("missing.sock", &socket)?;
+            let _default = CamAuthoritySocketTestGuard::install_default(socket);
+            assert!(
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, None).is_err()
+            );
+            assert!(
+                freeze_selected_codex_launch_binding(Some("r9-implicit-unsafe-freeze")).is_err()
+            );
+            Ok(())
+        }
+
+        #[test]
+        fn socket_source_cannot_be_overwritten_by_local_reobservation() -> Result<()> {
+            use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+            let root = tempfile::tempdir()?;
+            let socket = root.path().join("maco/account-authority.sock");
+            let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            for runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::GeminiCli,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::Cursor,
+            ] {
+                let provider = cam_provider_id_for_supervisor_runtime(runtime).unwrap();
+                let run = format!("r9-socket-reobserve-{provider}");
+                let binding = coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+                    provider_id: provider.into(),
+                    account_id: "synthetic".into(),
+                    account_incarnation: "synthetic-incarnation".into(),
+                    selection_revision: 1,
+                };
+                record_observed_managed_selection(
+                    Some(&run),
+                    provider,
+                    Some("synthetic-authority".into()),
+                    Some(&binding),
+                    Some(&socket),
+                );
+                let error =
+                    account_observation_for_launch_runtime(runtime, Some(&run)).unwrap_err();
+                assert!(format!("{error:#}").contains("refusing local fallback"));
+                assert!(
+                    crate::account_authority::cam_socket_for_run_selection(&run, provider).is_err()
+                );
+            }
+            Ok(())
+        }
+
+        fn secondary_command(
+            runtime: SupervisorRuntime,
+            run: &str,
+            task: &str,
+        ) -> ExternalAgentCommand {
+            secondary_role_command(runtime, AgentRole::Worker, run, task)
+        }
+
+        fn secondary_role_command(
+            runtime: SupervisorRuntime,
+            role: AgentRole,
+            run: &str,
+            task: &str,
+        ) -> ExternalAgentCommand {
+            let adapter = match runtime {
+                SupervisorRuntime::Grok => crate::runtime_adapter::RuntimeId::Grok,
+                SupervisorRuntime::GeminiCli => crate::runtime_adapter::RuntimeId::GeminiCli,
+                SupervisorRuntime::Cursor => crate::runtime_adapter::RuntimeId::Cursor,
+                _ => panic!("secondary fixture requires a managed adapter"),
+            };
+            // This is the same adapter/lifecycle construction used by ordinary and
+            // nested assignment callers; no account is supplied to the command.
+            ExternalAgentCommand::codex(
+                "unused-provider",
+                "/workspace",
+                "prompt",
+                "log",
+                "report",
+                Duration::from_secs(1),
+            )
+            .with_runtime_adapter(
+                adapter,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(adapter),
+            )
+            .with_agent_lifecycle("/workspace", role.as_str(), run, task)
+        }
+
+        #[test]
+        fn scheduler_initialization_carries_secondary_grok_to_ordinary_and_nested_commands(
+        ) -> Result<()> {
+            use crate::runtime_adapter::grok::{
+                inject_grok_advertised_catalog, GrokModelCatalog, GrokModelCatalogEntry,
+            };
+            let (root, registry) = isolated_registry();
+            seed_complete_account(&registry, true);
+            registry.begin_add(
+                "grok-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add("grok-cli", "work")?;
+            registry.select_complete_revision("grok-cli", "work", None)?;
+            let expected = registry
+                .selected_binding("grok-cli")?
+                .context("selected Grok fixture")?;
+            let authority = authority_id_for(registry.metadata_path());
+            let grok_prior = crate::selection::built_in_prior_dataset()?
+                .models
+                .into_iter()
+                .find(|prior| prior.runtime == "grok" && !prior.prohibited)
+                .context("synthetic advertised Grok prior")?;
+            let advertised = inject_grok_advertised_catalog(
+                GrokModelCatalog::from_injected_entries([GrokModelCatalogEntry::new(
+                    grok_prior.model.clone(),
+                    "Synthetic Worker",
+                )?])?,
+                Some(1_787_240_463_000),
+                b"synthetic-secondary-grok-catalog",
+            )?;
+            let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                // Both isolated selected accounts use their exact provider's
+                // nonlive menu through normal Core observation and validation.
+                adapter: Box::new(SchedulerObserveStub {
+                    id: "codex-cli",
+                    mode: SchedulerObserveStubMode::ObservedModels,
+                }),
+                secondary_adapter: Some(Box::new(SchedulerObserveStub {
+                    id: "grok-cli",
+                    mode: SchedulerObserveStubMode::ObservedSynthetic(
+                        synthetic_prior_observed_model(&grok_prior),
+                    ),
+                })),
+                advertised: Some(AdvertisedCatalogSet::with_grok(advertised)),
+                resolved_auditor: None,
+                _root: root,
+            });
+            let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                prepared_selection_fixture()?;
+            let mut worker = super::terminal_worker_assignment("ordinary-secondary");
+            worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            worker.assigned_paths = vec![PathBuf::from("tests/ordinary-secondary.txt")];
+            let mut parent = super::terminal_worker_assignment("parent-secondary");
+            parent.role = AgentRole::ChildOrchestrator;
+            parent.worker_assignments = vec![serde_json::from_value(serde_json::json!({
+                "id": "nested-secondary", "assigned_paths": [SELECTOR_TEST_TARGET]
+            }))?];
+            plan.assignments = vec![worker, parent];
+            plan.max_child_assignments = plan.assignments.len();
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+            let available = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut metadata,
+                prepared_codex_request(&repo, &catalog, &admission),
+            )?;
+            assert!(available.selection_preflight_failure.is_none());
+            let candidate = available
+                .decisions
+                .iter()
+                .find(|event| event.role == AgentRole::Worker)
+                .and_then(|event| {
+                    event.provenance.candidate_set.iter().find(|candidate| {
+                        candidate.eligible && candidate.candidate.runtime == "grok"
+                    })
+                })
+                .context("eligible synthetic Grok Worker candidate")?
+                .candidate
+                .clone();
+            plan.assignments[0].runtime = Some(SupervisorRuntime::Grok);
+            plan.role_models.clear();
+            plan.role_models.insert(
+                AgentRole::Worker,
+                super::role_selection(&candidate.model, selector_effort_as_str(candidate.effort)),
+            );
+            let run = RunId::new("synthetic-secondary-grok-initialized")?;
+            let before =
+                secondary_command(SupervisorRuntime::Grok, run.as_str(), "ordinary-secondary");
+            assert!(before
+                .verify_grok_run_account_binding(run.as_str())
+                .is_err());
+            let mut request = prepared_codex_request(&repo, &catalog, &admission);
+            request.current_run = Some(&run);
+            let resolution = initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut metadata,
+                request,
+            )?;
+            assert!(
+                resolution.selection_preflight_failure.is_none(),
+                "{:?}",
+                resolution.selection_preflight_failure
+            );
+            assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Grok));
+            let frozen = crate::account_authority::grok_run_account_binding(run.as_str())
+                .context("initialized secondary Grok")?;
+            assert_eq!(frozen.to_selected_binding(), expected);
+            assert_eq!(frozen.authority_id.as_deref(), Some(authority.as_str()));
+            for task in ["ordinary-secondary", "nested-secondary"] {
+                let command = secondary_command(SupervisorRuntime::Grok, run.as_str(), task);
+                command.verify_grok_run_account_binding(run.as_str())?;
+                assert_eq!(
+                    command
+                        .clone()
+                        .with_grok_run_account_binding(Some(frozen.clone())),
+                    command
+                );
+                assert!(command
+                    .verify_grok_run_account_binding("synthetic-other-run")
+                    .is_err());
+            }
+            // The same resolved Worker choice must also initialize a nested-only
+            // run: there is no top-level Grok assignment in this projection.
+            plan.assignments.remove(0);
+            let nested_run = "synthetic-secondary-grok-nested-only";
+            freeze_selected_secondary_managed_launch_bindings(
+                &plan,
+                &resolution.decisions,
+                SupervisorRuntime::Codex,
+                Some(nested_run),
+            )?;
+            secondary_command(SupervisorRuntime::Grok, nested_run, "nested-secondary")
+                .verify_grok_run_account_binding(nested_run)?;
+            assert_eq!(
+                crate::account_authority::grok_run_account_binding(nested_run),
+                Some(frozen)
+            );
+            assert!(crate::account_authority::gemini_run_account_binding(run.as_str()).is_none());
+            assert!(crate::account_authority::cursor_run_account_binding(run.as_str()).is_none());
+            Ok(())
+        }
+
+        #[test]
+        fn scheduler_secondary_metadata_preserves_identity_and_refuses_missing_selection(
+        ) -> Result<()> {
+            {
+                let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);
+                let (_temporary, repo, catalog, admission, mut plan, mut metadata) =
+                    prepared_selection_fixture()?;
+                let mut worker = super::terminal_worker_assignment("codex-reviewed-worker");
+                worker.runtime = Some(SupervisorRuntime::Codex);
+                worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+                plan.assignments = vec![worker];
+                let _routing_policy =
+                    crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut metadata)?;
+                let initial = initialize_supervisor_selection_from_prepared_metadata(
+                    &mut plan,
+                    &mut metadata,
+                    prepared_codex_request(&repo, &catalog, &admission),
+                )?;
+                assert!(initial.selection_preflight_failure.is_none());
+                let mut auditor = initial
+                    .decisions
+                    .iter()
+                    .find(|decision| decision.role == AgentRole::Auditor)
+                    .context("resolved Auditor fixture")?
+                    .clone();
+                // Only the resolved routing result is synthetic. This exercises
+                // initialization and the parent's real automatic budget-policy
+                // consumer, not Gemini catalog/provider acceptance.
+                auditor
+                    .provenance
+                    .choice
+                    .as_mut()
+                    .context("Auditor choice")?
+                    .candidate
+                    .runtime = "gemini-cli".to_string();
+                // Nonlive transport menu only: retain the assessed choice's model
+                // and effort without asserting Gemini capability or entitlement.
+                let candidate = &auditor
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .context("Auditor choice for synthetic transport menu")?
+                    .candidate;
+                let synthetic_transport_menu = ObservedModel {
+                    model_id: candidate.model.clone(),
+                    supported_efforts: Some(vec![candidate.effort.as_str().to_string()]),
+                    default_effort: Some(candidate.effort.as_str().to_string()),
+                    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
+                };
+                let expected = CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<_> {
+                    let mut cell = cell.borrow_mut();
+                    let harness = Arc::get_mut(cell.as_mut().unwrap())
+                        .context("CAM fixture setup requires exclusive observer custody")?;
+                    harness.registry.begin_add(
+                        "gemini-cli",
+                        "review",
+                        "Review",
+                        AuthKind::OAuth,
+                        StoredAccountMaterial::VendorHome,
+                    )?;
+                    harness.registry.complete_add("gemini-cli", "review")?;
+                    harness
+                        .registry
+                        .select_complete_revision("gemini-cli", "review", None)?;
+                    harness.secondary_adapter = Some(Box::new(SchedulerObserveStub {
+                        id: "gemini-cli",
+                        mode: SchedulerObserveStubMode::ObservedSynthetic(
+                            synthetic_transport_menu.clone(),
+                        ),
+                    }));
+                    harness.resolved_auditor = Some(auditor);
+                    Ok((
+                        authority_id_for(harness.registry.metadata_path()),
+                        harness
+                            .registry
+                            .selected_binding("gemini-cli")?
+                            .context("selected Gemini Auditor")?,
+                    ))
+                })?;
+                let run = RunId::new("synthetic-codex-worker-gemini-parent-auditor")?;
+                assert!(
+                    crate::account_authority::gemini_run_account_binding(run.as_str()).is_none()
+                );
+                assert!(
+                    crate::account_authority::require_carried_gemini_launch_binding(None, true)
+                        .is_err()
+                );
+                plan.role_models.clear();
+                plan.review_lenses = default_supervisor_review_lenses();
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.current_run = Some(&run);
+                let resolution = initialize_supervisor_selection_from_prepared_metadata(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                )?;
+                assert!(resolution.selection_preflight_failure.is_none());
+                assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Codex));
+                let controller = BudgetDegradationController::new_with_selection_state(
+                    1,
+                    resolution.automatic_state,
+                    SupervisorRuntime::Codex,
+                )?;
+                let launch_runtime = controller
+                    .policy
+                    .selected_runtime_for(AgentRole::Auditor)
+                    .unwrap_or(SupervisorRuntime::Codex);
+                assert_eq!(launch_runtime, SupervisorRuntime::GeminiCli);
+                let frozen = crate::account_authority::gemini_run_account_binding(run.as_str())
+                    .context("initialized parent Auditor binding")?;
+                assert_eq!(frozen.to_selected_binding(), expected.1);
+                assert_eq!(frozen.authority_id.as_deref(), Some(expected.0.as_str()));
+                let active_plan = controller.policy.apply(&plan);
+                assert_eq!(
+                    active_plan.review_lenses.len(),
+                    default_supervisor_review_lenses().len()
+                );
+                for (index, lens) in active_plan.review_lenses.iter().enumerate() {
+                    let command = secondary_role_command(
+                        launch_runtime,
+                        AgentRole::Auditor,
+                        run.as_str(),
+                        &format!("parent-lens-{index}"),
+                    )
+                    .with_model_selection(
+                        Some(lens.backend.model().to_string()),
+                        lens.backend.reasoning_effort().map(str::to_string),
+                    )
+                    .with_agent_parent("codex-reviewed-worker");
+                    assert_eq!(
+                        command
+                            .clone()
+                            .with_gemini_run_account_binding(Some(frozen.clone())),
+                        command
+                    );
+                    assert_eq!(
+                        crate::account_authority::require_carried_gemini_launch_binding(
+                            Some(&frozen),
+                            true
+                        )?,
+                        Some(&frozen)
+                    );
+                }
+                assert!(crate::account_authority::grok_run_account_binding(run.as_str()).is_none());
+                assert!(
+                    crate::account_authority::cursor_run_account_binding(run.as_str()).is_none()
+                );
+                let empty_run = "synthetic-gemini-auditor-without-assignment";
+                freeze_selected_secondary_managed_launch_bindings(
+                    &super::test_plan(),
+                    &resolution.decisions,
+                    SupervisorRuntime::Codex,
+                    Some(empty_run),
+                )?;
+                assert!(crate::account_authority::gemini_run_account_binding(empty_run).is_none());
+                let mut no_lenses = plan.clone();
+                no_lenses.review_lenses.clear();
+                let unused_run = "synthetic-gemini-auditor-without-lenses";
+                freeze_selected_secondary_managed_launch_bindings(
+                    &no_lenses,
+                    &resolution.decisions,
+                    SupervisorRuntime::Codex,
+                    Some(unused_run),
+                )?;
+                assert!(crate::account_authority::gemini_run_account_binding(unused_run).is_none());
+                let mut unlaunched_roles = resolution.decisions.clone();
+                unlaunched_roles.retain(|decision| decision.role != AgentRole::Auditor);
+                for decision in &mut unlaunched_roles {
+                    if matches!(
+                        decision.role,
+                        AgentRole::Supervisor | AgentRole::GateClassifier
+                    ) {
+                        decision
+                            .provenance
+                            .choice
+                            .as_mut()
+                            .context("unused role choice")?
+                            .candidate
+                            .runtime = "gemini-cli".to_string();
+                    }
+                }
+                let unchosen_run = "synthetic-secondary-unused-selector-roles";
+                freeze_selected_secondary_managed_launch_bindings(
+                    &plan,
+                    &unlaunched_roles,
+                    SupervisorRuntime::Codex,
+                    Some(unchosen_run),
+                )?;
+                assert!(
+                    crate::account_authority::gemini_run_account_binding(unchosen_run).is_none()
+                );
+                let _missing = activate_stub(false, SchedulerObserveStubMode::ObserveError);
+                CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<()> {
+                    let mut cell = cell.borrow_mut();
+                    let harness = Arc::get_mut(cell.as_mut().unwrap())
+                        .context("CAM fixture setup requires exclusive observer custody")?;
+                    harness.resolved_auditor = resolution
+                        .decisions
+                        .iter()
+                        .find(|decision| decision.role == AgentRole::Auditor)
+                        .cloned();
+                    Ok(())
+                })?;
+                let missing_run = RunId::new("synthetic-gemini-parent-auditor-missing-account")?;
+                plan.role_models.clear();
+                plan.review_lenses = default_supervisor_review_lenses();
+                let mut request = prepared_codex_request(&repo, &catalog, &admission);
+                request.current_run = Some(&missing_run);
+                let error = initialize_supervisor_selection_from_prepared_metadata(
+                    &mut plan,
+                    &mut metadata,
+                    request,
+                )
+                .expect_err("missing parent Auditor account must refuse at initialization");
+                assert!(error
+                    .to_string()
+                    .contains("no complete selected Coding Agent Manager account"));
+                assert!(
+                    crate::account_authority::gemini_run_account_binding(missing_run.as_str())
+                        .is_none()
+                );
+            }
+            for runtime in [
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::GeminiCli,
+                SupervisorRuntime::Cursor,
+            ] {
+                let provider = cam_provider_id_for_supervisor_runtime(runtime).unwrap();
+                let (root, registry) = isolated_registry();
+                registry.begin_add(
+                    provider,
+                    "work",
+                    "Work",
+                    AuthKind::OAuth,
+                    StoredAccountMaterial::VendorHome,
+                )?;
+                registry.complete_add(provider, "work")?;
+                registry.select_complete_revision(provider, "work", None)?;
+                let expected = registry
+                    .selected_binding(provider)?
+                    .context("selected fixture")?;
+                let authority = authority_id_for(registry.metadata_path());
+                let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
+                    registry,
+                    secondary_adapter: None,
+                    adapter: Box::new(SchedulerObserveStub {
+                        id: "codex-cli",
+                        mode: SchedulerObserveStubMode::ObserveError,
+                    }),
+                    advertised: None,
+                    resolved_auditor: None,
+                    _root: root,
+                });
+                let run = format!("synthetic-secondary-{}", runtime_name(runtime));
+                let mut plan = super::test_plan();
+                let mut assignment = super::terminal_worker_assignment("secondary-worker");
+                assignment.runtime = Some(runtime);
+                plan.assignments.push(assignment);
+                let before = secondary_command(runtime, &run, "secondary-worker");
+                freeze_selected_secondary_managed_launch_bindings(
+                    &plan,
+                    &[],
+                    SupervisorRuntime::Codex,
+                    Some(&run),
+                )?;
+                let carried = secondary_command(runtime, &run, "secondary-worker");
+                assert_ne!(before, carried);
+                let selected = match runtime {
+                    SupervisorRuntime::Grok => {
+                        carried.verify_grok_run_account_binding(&run)?;
+                        let frozen =
+                            crate::account_authority::grok_run_account_binding(&run).unwrap();
+                        assert_eq!(frozen.authority_id.as_deref(), Some(authority.as_str()));
+                        frozen.to_selected_binding()
+                    }
+                    SupervisorRuntime::GeminiCli => {
+                        let frozen =
+                            crate::account_authority::gemini_run_account_binding(&run).unwrap();
+                        assert_eq!(frozen.authority_id.as_deref(), Some(authority.as_str()));
+                        crate::account_authority::require_carried_gemini_launch_binding(
+                            Some(&frozen),
+                            false,
+                        )?;
+                        assert_eq!(
+                            carried
+                                .clone()
+                                .with_gemini_run_account_binding(Some(frozen.clone())),
+                            carried
+                        );
+                        frozen.to_selected_binding()
+                    }
+                    SupervisorRuntime::Cursor => {
+                        let frozen =
+                            crate::account_authority::cursor_run_account_binding(&run).unwrap();
+                        assert_eq!(frozen.authority_id.as_deref(), Some(authority.as_str()));
+                        frozen.to_selected_binding()
+                    }
+                    _ => unreachable!(),
+                };
+                assert_eq!(selected, expected);
+                CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<()> {
+                    let cell = cell.borrow();
+                    let registry = &cell.as_ref().unwrap().registry;
+                    registry.begin_add(
+                        provider,
+                        "other",
+                        "Other",
+                        AuthKind::OAuth,
+                        StoredAccountMaterial::VendorHome,
+                    )?;
+                    registry.complete_add(provider, "other")?;
+                    registry.select_complete_revision(provider, "other", None)?;
+                    assert_ne!(
+                        registry.selected_binding(provider)?.as_ref(),
+                        Some(&expected)
+                    );
+                    Ok(())
+                })?;
+                freeze_selected_secondary_managed_launch_bindings(
+                    &plan,
+                    &[],
+                    SupervisorRuntime::Codex,
+                    Some(&run),
+                )?;
+                assert_eq!(
+                    secondary_command(runtime, &run, "secondary-worker"),
+                    carried
+                );
+                drop(_guard);
+
+                let (root, registry) = isolated_registry();
+                // Incomplete metadata is not a selected account and cannot authorize launch.
+                registry.begin_add(
+                    provider,
+                    "pending",
+                    "Pending",
+                    AuthKind::OAuth,
+                    StoredAccountMaterial::VendorHome,
+                )?;
+                let _missing = activate_cam_observe_test_harness(CamObserveTestHarness {
+                    registry,
+                    secondary_adapter: None,
+                    adapter: Box::new(SchedulerObserveStub {
+                        id: "codex-cli",
+                        mode: SchedulerObserveStubMode::ObserveError,
+                    }),
+                    advertised: None,
+                    resolved_auditor: None,
+                    _root: root,
+                });
+                let missing_run = format!("synthetic-secondary-missing-{}", runtime_name(runtime));
+                let error = freeze_selected_secondary_managed_launch_bindings(
+                    &plan,
+                    &[],
+                    SupervisorRuntime::Codex,
+                    Some(&missing_run),
+                )
+                .expect_err("missing selected secondary must refuse before command construction");
+                assert!(error
+                    .to_string()
+                    .contains("no complete selected Coding Agent Manager account"));
+                assert_eq!(
+                    secondary_command(runtime, &missing_run, "secondary-worker"),
+                    before.with_agent_lifecycle(
+                        "/workspace",
+                        "worker",
+                        &missing_run,
+                        "secondary-worker"
+                    )
+                );
+                // A selected-but-unchosen runtime never creates a slot for this run.
+                CAM_OBSERVE_TEST_OVERRIDE.with(|cell| -> Result<()> {
+                    let cell = cell.borrow();
+                    let registry = &cell.as_ref().unwrap().registry;
+                    registry.complete_add(provider, "pending")?;
+                    registry.select_complete_revision(provider, "pending", None)?;
+                    assert!(registry.selected_binding(provider)?.is_some());
+                    Ok(())
+                })?;
+                let unchosen_run =
+                    format!("synthetic-secondary-unchosen-{}", runtime_name(runtime));
+                freeze_selected_secondary_managed_launch_bindings(
+                    &super::test_plan(),
+                    &[],
+                    SupervisorRuntime::Codex,
+                    Some(&unchosen_run),
+                )?;
+                match runtime {
+                    SupervisorRuntime::Grok => assert!(
+                        crate::account_authority::grok_run_account_binding(&unchosen_run).is_none()
+                    ),
+                    SupervisorRuntime::GeminiCli => assert!(
+                        crate::account_authority::gemini_run_account_binding(&unchosen_run)
+                            .is_none()
+                    ),
+                    SupervisorRuntime::Cursor => assert!(
+                        crate::account_authority::cursor_run_account_binding(&unchosen_run)
+                            .is_none()
+                    ),
+                    _ => unreachable!(),
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
         fn cam_provider_id_maps_supervisor_runtime_and_fake_stays_none() {
             assert_eq!(
                 cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Grok),
@@ -6545,6 +10904,10 @@ mod selection_policy_tests {
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment("observed-model-worker")];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,
@@ -6593,10 +10956,13 @@ mod selection_policy_tests {
             seed_complete_account(&registry, false);
             let _guard = activate_cam_observe_test_harness(CamObserveTestHarness {
                 registry,
+                secondary_adapter: None,
                 adapter: Box::new(SchedulerObserveStub {
                     id: "codex-cli",
                     mode: SchedulerObserveStubMode::ObservedModels,
                 }),
+                advertised: None,
+                resolved_auditor: None,
                 _root: root,
             });
             assert!(
@@ -6608,6 +10974,12 @@ mod selection_policy_tests {
 
             let (temporary, repo, catalog, admission, mut plan, mut plan_metadata) =
                 prepared_selection_fixture()?;
+            plan.assignments = vec![super::terminal_worker_assignment(
+                "unselected-account-worker",
+            )];
+            plan.assignments[0].role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+            let _routing_policy =
+                crate::supervise::bind_assessed_injected_plan(&plan, &repo, &mut plan_metadata)?;
             let resolution = initialize_supervisor_selection_from_prepared_metadata(
                 &mut plan,
                 &mut plan_metadata,
@@ -6731,7 +11103,9 @@ mod selection_policy_tests {
                 ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
                 {
                     Ok(CategoryObservation::observed(ModelsObservation {
+                        provenance: None,
                         models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                             model_id: "socket-routed-model".to_string(),
                             supported_efforts: None,
                             default_effort: None,
@@ -6776,6 +11150,7 @@ mod selection_policy_tests {
                     .as_ref()
                     .and_then(|content| content.models.first()),
                 Some(&ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                     model_id: "socket-routed-model".to_string(),
                     supported_efforts: None,
                     default_effort: None,
@@ -6856,7 +11231,9 @@ mod selection_policy_tests {
                 ) -> coding_agent_manager_lib::error::Result<CategoryObservation<ModelsObservation>>
                 {
                     Ok(CategoryObservation::observed(ModelsObservation {
+                        provenance: None,
                         models: vec![ObservedModel {
+    access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::UnknownAccess,
                             model_id: "socket-grok-model".to_string(),
                             supported_efforts: None,
                             default_effort: None,

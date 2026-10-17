@@ -1,4 +1,4 @@
-//! Cursor read-only acceptance tests.
+//! Cursor account inspection and legacy-method acceptance tests.
 //!
 //! Every adapter instance is rooted at a `TempDir`. In particular, an injected
 //! home with no fixture CLI must not fall back to the host `PATH` and execute a
@@ -9,7 +9,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use coding_agent_manager_lib::error::Error;
-use coding_agent_manager_lib::model::{AuthKind, InstallState, Maturity};
+use coding_agent_manager_lib::model::{AuthKind, InstallState, Maturity, ProviderCapability};
 use coding_agent_manager_lib::providers::cursor::CursorAdapter;
 use coding_agent_manager_lib::providers::ProviderAdapter;
 
@@ -49,7 +49,7 @@ fn empty_injected_home_does_not_detect_or_run_the_host_installation() {
 }
 
 #[test]
-fn descriptor_and_methods_advertise_read_only_reality() {
+fn managed_descriptor_and_legacy_methods_preserve_ambient_state() {
     let home = staged_home();
     let adapter = CursorAdapter::with_home(home.path());
     let descriptor = adapter.descriptor();
@@ -58,9 +58,17 @@ fn descriptor_and_methods_advertise_read_only_reality() {
     assert_eq!(descriptor.maturity, Maturity::Experimental);
     assert_eq!(
         descriptor.auth_kinds,
-        vec![AuthKind::Unknown, AuthKind::ApiKey]
+        vec![AuthKind::OAuth, AuthKind::ApiKey]
     );
-    assert!(descriptor.capabilities.is_empty());
+    assert_eq!(
+        descriptor.capabilities,
+        vec![
+            ProviderCapability::AddAccount,
+            ProviderCapability::SwitchAccount,
+            ProviderCapability::DeleteAccount,
+            ProviderCapability::LaunchTool,
+        ]
+    );
     assert!(matches!(
         adapter.add_account("work"),
         Err(Error::NotImplemented(_))

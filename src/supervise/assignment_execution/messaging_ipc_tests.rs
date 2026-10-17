@@ -27,6 +27,8 @@ use super::super::{
     SUPERVISOR_SCHEMA_VERSION,
 };
 use super::*;
+#[cfg(target_os = "linux")]
+use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
 use crate::account_authority::ManagedGrokAccountSelectionEvidence;
 #[cfg(target_os = "linux")]
 use crate::account_authority::{activate_cam_grok_test_harness, build_cam_grok_test_harness};
@@ -43,7 +45,7 @@ use crate::{
     messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN},
     process_runner::{
         run_process, ContainmentPolicy, EnvironmentMode, ProcessCancellation, ProcessSpec,
-        StdinMode, StreamCapture, WorkspaceAccess,
+        StdinMode, StreamCapture,
     },
     worktree::WorktreeRecord,
 };
@@ -120,7 +122,9 @@ fn run_messaging_ipc_fixture_helper_subprocess(
         .with_environment(EnvironmentMode::InheritAndSet(environment))
         .with_containment(ContainmentPolicy::TrustedBestEffort)
         .with_stdin(StdinMode::Null)
-        .with_timeout(Some(Duration::from_secs(180)))
+        // Four bounded IPC phases precede a journal-bound dispatch. Leave room
+        // for its full debug-image custody checks and post-launch collection.
+        .with_timeout(Some(Duration::from_secs(480)))
         .with_stdout(StreamCapture::bounded(HELPER_STDOUT_MAX_BYTES))
         .with_stderr(StreamCapture::bounded(HELPER_STDERR_MAX_BYTES)),
     )
@@ -434,7 +438,11 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         max_child_assignments: 2,
         max_child_retries: 0,
         max_gate_corrections: 0,
-        child_timeout_seconds: 30,
+        // The prepared dispatch binds the production journal appender, which
+        // repeatedly hashes this full unoptimized libtest image. A short
+        // provider-only budget can expire before containment preflight obtains
+        // the native quiescence evidence required for scratch cleanup.
+        child_timeout_seconds: 300,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
@@ -562,12 +570,10 @@ struct MessagingGrokChildProbeFixture<'a> {
 /// Parent-owned secure-output targets must be unique per external-agent launch; re-reserving the
 /// same `incoming/report.json` fails simulation after the first phase. Writable Grok confinement
 /// proof snapshots those paths, so admission must be re-sealed on the final command each phase.
-fn rebind_grok_phase_launch_and_writable_admission(
+fn bind_grok_phase_artifact_paths(
     command: &mut ExternalAgentCommand,
     incoming: &Path,
     phase_slug: &str,
-    assignment: &OrchestratorAssignment,
-    binding: &MessagingGrokWritableAdmissionBinding,
 ) -> Result<()> {
     let phase_incoming = incoming.join(phase_slug);
     fs::create_dir_all(&phase_incoming)?;
@@ -578,15 +584,15 @@ fn rebind_grok_phase_launch_and_writable_admission(
     }
     command.json_log = phase_incoming.join("events.jsonl");
     command.output_last_message = phase_incoming.join("report.json");
-    bind_grok_fixture_writable_admission(command, assignment, binding)
+    Ok(())
 }
 
-fn bind_grok_fixture_writable_admission(
-    command: &mut ExternalAgentCommand,
+fn grok_fixture_writable_admission(
+    command: &ExternalAgentCommand,
     assignment: &OrchestratorAssignment,
     binding: &MessagingGrokWritableAdmissionBinding,
-) -> Result<()> {
-    let admission = super::worktree_writable_admission_record(
+) -> Result<crate::external_agent::WorktreeWritableAdmission> {
+    super::worktree_writable_admission_record(
         &assignment.id,
         &assignment.assigned_paths,
         1,
@@ -597,7 +603,15 @@ fn bind_grok_fixture_writable_admission(
         binding.runtime,
         assignment.phase,
     )?
-    .context("rebind writable Grok admission for messaging IPC phase")?;
+    .context("rebind writable Grok admission for messaging IPC phase")
+}
+
+fn bind_grok_fixture_writable_admission(
+    command: &mut ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    binding: &MessagingGrokWritableAdmissionBinding,
+) -> Result<()> {
+    let admission = grok_fixture_writable_admission(command, assignment, binding)?;
     *command = command
         .clone()
         .with_worktree_writable_confinement(admission);
@@ -757,7 +771,7 @@ fn build_admitted_grok_worker_command(
         assignment.run_id.as_str(),
         WORKER_ID,
     );
-    let (runtime, mut command) = bind_selected_assignment_launch_for_test(
+    let (runtime, command) = bind_selected_assignment_launch_for_test(
         initial_command,
         assignment.assignment,
         assignment.policy,
@@ -765,17 +779,16 @@ fn build_admitted_grok_worker_command(
         assignment.options,
         assignment.catalog,
     )?;
-    command.cwd = paths.primary.to_path_buf();
-    command.workspace_access = WorkspaceAccess::ReadOnly;
     let command =
         bind_runtime_output_schema(command, SupervisorRuntime::Grok, paths.worker_schema_path)?;
-    let command = bind_selected_grok_execution_workspace(
+    let command = bind_selected_native_execution_workspace(
         command,
         assignment.assignment,
         runtime,
         managed_child,
         true,
     )?;
+    command.verify_grok_run_account_binding(assignment.run_id.as_str())?;
     let admission = worktree_writable_admission_record(
         &assignment.assignment.id,
         &assignment.assignment.assigned_paths,
@@ -808,13 +821,7 @@ fn run_grok_child_phase(
     probe: &MessagingGrokChildProbeFixture<'_>,
     command: &mut ExternalAgentCommand,
 ) -> Result<ExternalAgentRun> {
-    rebind_grok_phase_launch_and_writable_admission(
-        command,
-        incoming,
-        phase_slug,
-        context.assignment,
-        admission_binding,
-    )?;
+    bind_grok_phase_artifact_paths(command, incoming, phase_slug)?;
     write_messaging_fixture_manifest(
         probe.fixture_manifest,
         probe.child_probe_binary,
@@ -824,6 +831,7 @@ fn run_grok_child_phase(
         probe.disposable_peer_pid,
     )?;
     let server = bind_assignment_messaging_for_external_child_launch(context, WORKER_ID, command)?;
+    bind_grok_fixture_writable_admission(command, context.assignment, admission_binding)?;
     let report = run_external_agent_for_ipc_kind(launch_kind, command, &context.cancellation, None);
     drop(server);
     Ok(report)
@@ -860,12 +868,17 @@ fn messaging_ipc_verified_external_runner(
     cancellation: &ProcessCancellation,
     review: Option<ExternalPreActionReviewRuntime<'_>>,
 ) -> ExternalAgentRun {
-    run_external_agent_for_ipc_kind(
+    let report = run_external_agent_for_ipc_kind(
         MessagingIpcLaunchKind::Verified,
         command,
         cancellation,
         review,
-    )
+    );
+    assert!(
+        report.scratch_quiescence_verified(),
+        "verified IPC dispatch must retain native process-tree and confinement evidence before collection: {report:#?}"
+    );
+    report
 }
 
 fn bail_assignment_execution_completed(
@@ -921,6 +934,32 @@ fn assignment_messaging_ipc_acceptance(
     commit_fixture_repository(&repo);
 
     let run_id = RunId::new(RUN_SLUG)?;
+    // Selection is normally admitted by scheduler initialization. This fixture
+    // builds assignment commands directly, so carry the same run-bound account
+    // through every phase, including prepare_child_attempt's admission check.
+    let binding = match launch_kind {
+        MessagingIpcLaunchKind::Verified => {
+            let evidence = expected_verified_cam_binding
+                .context("verified IPC fixture requires its selected CAM account")?;
+            crate::account_authority::FrozenGrokSelectedBinding {
+                authority_socket: None,
+                authority_id: evidence.authority_id.clone(),
+                provider_id: evidence.provider_id.clone(),
+                account_id: evidence.account_id.clone(),
+                account_incarnation: evidence.account_incarnation.clone(),
+                selection_revision: evidence.selection_revision,
+            }
+        }
+        MessagingIpcLaunchKind::Simulated => crate::account_authority::FrozenGrokSelectedBinding {
+            authority_socket: None,
+            authority_id: None,
+            provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.to_string(),
+            account_id: "simulated-messaging-account".to_string(),
+            account_incarnation: "simulated-messaging-incarnation".to_string(),
+            selection_revision: 1,
+        },
+    };
+    crate::account_authority::admit_grok_run_account_binding(run_id.as_str(), Some(binding));
     let mut artifact_writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Supervise,
@@ -1315,11 +1354,11 @@ fn assignment_messaging_ipc_acceptance(
     if launch_kind == MessagingIpcLaunchKind::Simulated {
         // Simulation does not persist production writable admission. Use the same
         // authenticated claim without changing production-created artifact paths.
-        bind_grok_fixture_writable_admission(
-            &mut prepared.command,
+        prepared.worktree_writable_admission = Some(grok_fixture_writable_admission(
+            &prepared.command,
             assignment,
             &grok_admission_binding,
-        )?;
+        )?);
     }
     // This command has not launched yet. Keep the production-created report root,
     // journal paths and writable admission together for the actual dispatch.
@@ -1424,6 +1463,7 @@ fn assignment_messaging_grok_verified_process_peer_isolation_and_ipc() -> Result
             if crate::test_containment::skip_current()? {
                 bail!("verified assignment messaging fixture requires containment");
             }
+            let _socket = CamAuthoritySocketTestGuard::install(None);
             let (cam_harness, _managed_grok_home, expected_cam_binding) =
                 build_cam_grok_test_harness("account-a")?;
             let _cam_guard = activate_cam_grok_test_harness(cam_harness);

@@ -29,7 +29,7 @@ use crate::{
         ManagedChildGitImport, PreActionJournalPhase, PreActionJournalRationale,
         PreActionJournalRecord, PreActionJournalSink, SandboxDenialEvidence,
         WorkerJournalArtifactCapture, WorkerJournalArtifactCaptureStatus,
-        TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM,
+        WorkerJournalCommandBinding, TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM,
     },
     field_guide::{
         decode_canonical_prompt_entry_line, DecodedFieldGuidePromptEntry, FieldGuideDraft,
@@ -254,7 +254,8 @@ pub(crate) fn live_quota_concurrency_bound(
 mod plan_api;
 pub use plan_api::*;
 pub(crate) use plan_api::{
-    load_supervisor_plan_file_in_repo, validate_generated_follow_up_plan_document_in_repo,
+    load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,
+    validate_generated_follow_up_plan_document_in_repo,
 };
 mod model_policy;
 pub use model_policy::*;
@@ -293,14 +294,29 @@ pub use scheduler::*;
 
 mod selection_bridge;
 use selection_bridge::*;
+#[cfg(target_os = "linux")]
+pub(crate) use selection_bridge::{
+    select_account_review_auditor, select_account_review_auditor_with_assessment,
+};
+
+mod parent_broker;
+mod task_routing;
+#[cfg(target_os = "linux")]
+pub(crate) use task_routing::assess_task_routing;
+pub use task_routing::TaskRoutingAssessment;
 
 mod accepted_task_cost;
 pub use accepted_task_cost::AcceptedTaskCostRollup;
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
+mod runtime_executables;
 use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
+pub(crate) use runtime_executables::{
+    bind_new as bind_explicit_runtime_executables,
+    bind_resume as bind_frozen_runtime_executables_for_run,
+};
 
 mod messaging_bridge;
 
@@ -312,6 +328,90 @@ pub(crate) mod held_out;
 pub(crate) use assignment_execution::configure_assignment_phase_command_for_test;
 use assignment_execution::*;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) struct InjectedSupervisorParentAcceptanceGuard<'a> {
+    // Restore outer policy/role authority while the selected observer is still held.
+    _policy: crate::selection::routing_policy::RoutingPolicyGuard,
+    _account: scheduler::PositiveInjectedCamFixtureGuard<'a>,
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test<'a>(
+    repo: &Path,
+    document: &mut Value,
+    owner: &'a tempfile::TempDir,
+) -> Result<InjectedSupervisorParentAcceptanceGuard<'a>> {
+    if !repo
+        .canonicalize()?
+        .starts_with(owner.path().canonicalize()?)
+    {
+        bail!("licensed Autopilot selected fixture requires its owned repository");
+    }
+    let mut loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
+        &serde_json::to_string(document)?,
+        Some(repo),
+    )?;
+    let frozen = loaded
+        .plan_metadata
+        .resolved_routing_policy
+        .clone()
+        .context("assessed injected fixture requires its frozen routing policy")?;
+    let policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
+    // Exclude only the unresolved lens placeholder from catalog acquisition.
+    // The complete default stack still goes through normal selection below.
+    let mut catalog_plan = loaded.plan.clone();
+    catalog_plan.review_lenses.clear();
+    let catalog = test_runtime_model_catalog(&catalog_plan, SupervisorRuntime::Codex)?;
+    let account = scheduler::install_licensed_autopilot_account_fixture(owner, &catalog)?;
+    loaded.plan.review_lenses = default_supervisor_review_lenses();
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        repo,
+        1,
+        loaded.plan_metadata.admission,
+        SupervisorAdmissionConfig::default(),
+    )?;
+    let objective =
+        resolve_objective_profile(repo, loaded.plan_metadata.objective_profile.as_deref())?;
+    let advertised = advertised_catalogs_for_launch(repo)?;
+    let accounts = account_observations_for_selection(SupervisorRuntime::Codex, None)?;
+    let resolution = initialize_supervisor_selection_with_assessment(
+        &mut loaded.plan,
+        SupervisorRuntime::Codex,
+        &catalog,
+        &admission,
+        &advertised,
+        Some(&objective),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &accounts,
+        loaded.plan_metadata.task_routing_assessment.as_ref(),
+    )?;
+    if let Some(failure) = resolution.selection_preflight_failure {
+        bail!(
+            "injected fixture auditor bootstrap refused: {}",
+            failure.message
+        );
+    }
+    let parent_acceptance = loaded
+        .plan
+        .review_lenses
+        .into_iter()
+        .find(|lens| {
+            lens.id == "parent-acceptance"
+                && lens.information_scope == ReviewInformationScope::FullChildTranscript
+        })
+        .context("bound default review stack omitted parent-acceptance")?;
+    document["review_lenses"] = serde_json::to_value(vec![parent_acceptance])?;
+    let source_plan: SupervisorPlan = serde_json::from_value(document.clone())?;
+    if test_runtime_model_catalog(&source_plan, SupervisorRuntime::Codex)? != catalog {
+        bail!("licensed source fixture must retain the exact bootstrap catalog");
+    }
+    Ok(InjectedSupervisorParentAcceptanceGuard {
+        _policy: policy,
+        _account: account,
+    })
+}
+
 mod plan_validation;
 use plan_validation::*;
 
@@ -322,6 +422,7 @@ mod gate_health;
 pub use gate_health::*;
 
 mod journal;
+mod journal_command;
 use journal::*;
 
 mod checkpoint;
@@ -333,6 +434,14 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use reporting::append_precreated_worker_execution_journal;
+#[cfg(target_os = "linux")]
+pub(crate) use reporting::append_worker_execution_journal_record;
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use reporting::import_worker_execution_journals_at;
+pub(crate) use reporting::parse_worker_execution_journal;
+pub(crate) use reporting::run_worker_execution_journal_command;
 use reporting::*;
 
 #[cfg(test)]
@@ -430,9 +539,13 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
      contained, authenticated runtime-advertised model catalog and applies each role's declared \
      unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
      membership is runtime-advertised availability rather than a fresh entitlement guarantee";
+#[cfg(test)]
 const FRONTIER_PROFILE_MODEL: &str = "gpt-5.6-sol";
+#[cfg(test)]
 const BALANCED_PROFILE_MODEL: &str = "gpt-5.6-terra";
+#[cfg(test)]
 const ECONOMY_PROFILE_MODEL: &str = "gpt-5.6-luna";
+#[cfg(test)]
 const DEFAULT_PROFILE_MODEL: &str = FRONTIER_PROFILE_MODEL;
 const CODEX_MODEL_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const LENIENT_JSON_EXTRACTION_WARNING: &str = "report required lenient JSON extraction";
@@ -745,25 +858,25 @@ pub(crate) fn default_supervisor_review_lenses() -> Vec<ReviewLensConfig> {
 }
 
 pub(crate) fn default_stacked_uncorrelated_review_lenses() -> Vec<ReviewLensConfig> {
-    let model_backend = |reasoning_effort: &str| ReviewLensBackendConfig::Model {
-        backend_id: "openai".to_string(),
-        model: DEFAULT_PROFILE_MODEL.to_string(),
-        reasoning_effort: Some(reasoning_effort.to_string()),
+    let model_backend = || ReviewLensBackendConfig::Model {
+        backend_id: "automatic".to_string(),
+        model: "automatic".to_string(),
+        reasoning_effort: None,
     };
     vec![
         ReviewLensConfig {
             id: "parent-acceptance".to_string(),
-            backend: model_backend("xhigh"),
+            backend: model_backend(),
             information_scope: ReviewInformationScope::FullChildTranscript,
         },
         ReviewLensConfig {
             id: "output-only".to_string(),
-            backend: model_backend("high"),
+            backend: model_backend(),
             information_scope: ReviewInformationScope::OutputReportOnly,
         },
         ReviewLensConfig {
             id: "diff-only".to_string(),
-            backend: model_backend("high"),
+            backend: model_backend(),
             information_scope: ReviewInformationScope::DiffOnly,
         },
     ]
@@ -926,8 +1039,7 @@ impl SupervisorAdmissionConfig {
 }
 
 impl SupervisorAdmissionPolicyInput {
-    #[cfg(test)]
-    fn resolve(
+    pub(crate) fn resolve(
         repo: &Path,
         entrypoint_bound: usize,
         plan: SupervisorAdmissionConfig,
@@ -1873,6 +1985,8 @@ struct AssignmentMetadata {
     parent_validation: Option<held_out::ParentValidationAuthority>,
     workers: BTreeMap<(String, String), WorkerAssignmentMetadata>,
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
+    source_inputs:
+        BTreeMap<String, Vec<crate::external_agent::researcher_inputs::ResearcherSourceInput>>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -1921,6 +2035,7 @@ impl AssignmentMetadata {
 
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
+        self.source_inputs.retain(|owner, _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.direct_mechanical_duties
@@ -1934,6 +2049,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             workers,
             parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
+            source_inputs: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }
@@ -1941,6 +2057,10 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
+    resolved_routing_policy: Option<crate::selection::routing_policy::FrozenRoutingPolicy>,
+    task_routing_assessment: Option<TaskRoutingAssessment>,
+    normal_intake_selection: Option<crate::selection::routing_policy::SelectedLaunchRequest>,
+    normal_intake_decision: Option<crate::selection::SelectionProvenance>,
     objective_profile: Option<String>,
     resolved_objective_profile: Option<ResolvedObjectiveProfile>,
     spec_fragment_ids: Vec<String>,
@@ -2150,6 +2270,10 @@ pub struct GeneratedFollowUpSupervisorPlan {
     pub task: String,
     #[serde(serialize_with = "serialize_optional_path")]
     pub task_file: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resolved_routing_policy: Option<crate::selection::routing_policy::FrozenRoutingPolicy>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_routing_assessment: Option<TaskRoutingAssessment>,
     pub max_depth: u8,
     pub max_child_assignments: usize,
     pub max_child_retries: u8,
@@ -2171,6 +2295,42 @@ pub struct GeneratedFollowUpSupervisorPlan {
 }
 
 impl GeneratedFollowUpSupervisorPlan {
+    /// Assess this dependent's declaration, never the source task's assessment.
+    /// The ordinary loader replays this exact scope to reject substituted metadata.
+    pub(crate) fn assess_task_routing_for_plan(
+        plan: &SupervisorPlan,
+        frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+    ) -> Result<TaskRoutingAssessment> {
+        let assignment = plan
+            .assignments
+            .first()
+            .filter(|_| plan.assignments.len() == 1)
+            .context("generated task assessment requires exactly one assignment")?;
+        if !assignment.worker_assignments.is_empty() {
+            bail!("generated task assessment requires the exact terminal dependent scope");
+        }
+        let fragment_id = "licensed-dependent-update".to_string();
+        let proposal = planning::TaskDecompositionProposal {
+            fragments: vec![planning::TaskSpecFragment {
+                id: fragment_id.clone(),
+                text: plan.task.clone(),
+            }],
+            assignments: vec![planning::TaskAssignmentProposal {
+                id: assignment.id.clone(),
+                task: assignment.task.clone().unwrap_or_else(|| plan.task.clone()),
+                fragment_ids: vec![fragment_id],
+                assigned_paths: assignment.assigned_paths.clone(),
+                semantic_symbols: assignment.semantic_symbols.clone(),
+                semantic_modules: assignment.semantic_modules.clone(),
+                decision_dependencies: Vec::new(),
+            }],
+            coverage_gaps: Vec::new(),
+            diagnostics: planning::TaskPathProposalDiagnostics::default(),
+            disjointness: planning::TaskDisjointnessReport::default(),
+        };
+        task_routing::assess_task_routing(&plan.task, &proposal, frozen)
+    }
+
     fn bind_assignment_role_categories(&mut self) {
         for assignment in &mut self.assignments {
             assignment.bind_role_category();
@@ -2356,6 +2516,7 @@ pub enum AgentRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
     Minimal,
     Low,
     Medium,
@@ -2368,6 +2529,7 @@ pub enum ReasoningEffort {
 impl ReasoningEffort {
     const fn as_str(self) -> &'static str {
         match self {
+            Self::None => "none",
             Self::Minimal => "minimal",
             Self::Low => "low",
             Self::Medium => "medium",
@@ -2380,6 +2542,7 @@ impl ReasoningEffort {
 
     fn parse(value: &str) -> Option<Self> {
         match value {
+            "none" => Some(Self::None),
             "minimal" => Some(Self::Minimal),
             "low" => Some(Self::Low),
             "medium" => Some(Self::Medium),
@@ -2398,7 +2561,8 @@ impl ReasoningEffort {
             Self::Xhigh => Self::High,
             Self::High => Self::Medium,
             Self::Medium => Self::Low,
-            Self::Low | Self::Minimal => Self::Minimal,
+            Self::Low => Self::Minimal,
+            Self::Minimal | Self::None => Self::None,
         }
     }
 }
@@ -2417,13 +2581,41 @@ fn resolve_reasoning_effort(
     fallback: Option<&str>,
     budget_degradation_steps: usize,
 ) -> ResolvedReasoningEffort {
+    resolve_reasoning_effort_with_floor(
+        role.reasoning_effort_floor(),
+        requested,
+        fallback,
+        budget_degradation_steps,
+    )
+}
+
+fn resolve_review_lens_reasoning_effort(
+    lens: &ReviewLensConfig,
+    requested: Option<ReasoningEffort>,
+) -> ResolvedReasoningEffort {
+    // The selector-authorized lens effort is exact. Assignment overrides cannot change it.
+    let _ = requested;
+    resolve_reasoning_effort_with_floor(None, None, lens.backend.reasoning_effort(), 0)
+}
+
+fn resolve_reasoning_effort_with_floor(
+    floor: Option<ReasoningEffort>,
+    requested: Option<ReasoningEffort>,
+    fallback: Option<&str>,
+    budget_degradation_steps: usize,
+) -> ResolvedReasoningEffort {
     let fallback = fallback.unwrap_or("runtime_default").to_string();
-    let mut effort = requested
+    let Some(mut effort) = requested
         .or_else(|| ReasoningEffort::parse(&fallback))
-        .unwrap_or_else(|| {
-            role.reasoning_effort_floor()
-                .unwrap_or(ReasoningEffort::Low)
-        });
+        .or(floor)
+    else {
+        return ResolvedReasoningEffort {
+            requested,
+            resolved: fallback.clone(),
+            fallback,
+            observation: EffortResolutionObservation::RoleFallback,
+        };
+    };
     let mut observation = if requested.is_some() {
         EffortResolutionObservation::AssignmentOverride
     } else {
@@ -2433,7 +2625,7 @@ fn resolve_reasoning_effort(
         effort = effort.lowered();
         observation = EffortResolutionObservation::BudgetDegraded;
     }
-    if let Some(floor) = role.reasoning_effort_floor() {
+    if let Some(floor) = floor {
         if effort < floor {
             effort = floor;
             observation = EffortResolutionObservation::HardFloorClamped;
@@ -2444,6 +2636,26 @@ fn resolve_reasoning_effort(
         fallback,
         resolved: effort.as_str().to_string(),
         observation,
+    }
+}
+
+#[cfg(test)]
+mod review_lens_effort_tests {
+    use super::*;
+
+    #[test]
+    fn lens_keeps_exact_selected_effort_without_assignment_clamp() {
+        let mut lens = default_supervisor_review_lenses().remove(0);
+        if let ReviewLensBackendConfig::Model {
+            reasoning_effort, ..
+        } = &mut lens.backend
+        {
+            *reasoning_effort = Some("minimal".into());
+        }
+        assert_eq!(
+            resolve_review_lens_reasoning_effort(&lens, Some(ReasoningEffort::Ultra)).resolved,
+            "minimal"
+        );
     }
 }
 
@@ -2486,12 +2698,10 @@ impl AgentRole {
         }
     }
 
-    const fn reasoning_effort_floor(self) -> Option<ReasoningEffort> {
-        match self {
-            Self::GateClassifier => Some(ReasoningEffort::High),
-            Self::Auditor => Some(ReasoningEffort::Xhigh),
-            Self::Supervisor | Self::ChildOrchestrator | Self::Worker | Self::Researcher => None,
-        }
+    fn reasoning_effort_floor(self) -> Option<ReasoningEffort> {
+        crate::selection::routing_policy::current_routing_policy()
+            .and_then(|frozen| frozen.policy.role(self.as_str()).minimum_effort)
+            .and_then(|effort| ReasoningEffort::parse(effort.as_str()))
     }
 
     const fn minimum_model_capability(self) -> ModelCapabilityClass {
@@ -4100,16 +4310,18 @@ struct ExternalAttemptEvidenceContext<'a> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct WorkerExecutionJournalEvidence {
+pub(crate) struct WorkerExecutionJournalEvidence {
     incoming_relative_path: PathBuf,
     evidence_relative_path: PathBuf,
-    status: WorkerExecutionJournalStatus,
+    command_binding: Option<WorkerJournalCommandBinding>,
+    pub(crate) status: WorkerExecutionJournalStatus,
 }
 
-type WorkerExecutionJournalEvidenceSet = BTreeMap<String, WorkerExecutionJournalEvidence>;
+pub(crate) type WorkerExecutionJournalEvidenceSet =
+    BTreeMap<String, WorkerExecutionJournalEvidence>;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum WorkerExecutionJournalStatus {
+pub(crate) enum WorkerExecutionJournalStatus {
     Loaded(Vec<WorkerExecutionJournalEntry>),
     Missing,
     Invalid(String),
@@ -4117,12 +4329,38 @@ enum WorkerExecutionJournalStatus {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct WorkerExecutionJournalEntry {
-    command: Vec<String>,
-    cwd: PathBuf,
-    start_timestamp: String,
-    end_timestamp: String,
-    changed_paths: Vec<PathBuf>,
+pub(crate) struct WorkerExecutionJournalEntry {
+    pub(crate) command: Vec<String>,
+    pub(crate) cwd: PathBuf,
+    pub(crate) start_timestamp: String,
+    pub(crate) end_timestamp: String,
+    pub(crate) changed_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) observation: Option<WorkerJournalObservation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkerJournalObservation {
+    worktree: PathBuf,
+    worktree_identity: crate::safe_state::FileIdentity,
+    head_oid: Option<String>,
+    phase: WorkerJournalObservationPhase,
+    // Only differences from HEAD are stored. Absence means the HEAD state.
+    before: BTreeMap<PathBuf, String>,
+    after: BTreeMap<PathBuf, String>,
+    declared_paths: Vec<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    failure: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkerJournalObservationPhase {
+    Started,
+    Completed,
+    NativeEdit,
+    Failed,
 }
 
 #[derive(Debug, Clone)]

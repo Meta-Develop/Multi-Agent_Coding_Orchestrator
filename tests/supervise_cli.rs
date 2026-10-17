@@ -25,7 +25,7 @@ use git2::{Oid, Repository, Signature};
 use multi_agent_coding_orchestrator::supervise::FieldGuideEntrySuggestion;
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -603,88 +603,53 @@ fn supervise_plan_literal_new_file_emits_parent_gated_direct_worker_contract() -
         path_str(&repo_path)?,
         "--json",
     ])?;
+
+    // One bounded file needs a direct terminal Worker, not a synthetic Planning pair.
     let assignments = plan["assignments"].as_array().context("assignments")?;
-    assert_eq!(assignments.len(), 2);
-    assert_eq!(assignments[0]["id"], "assignment-001-planning");
-    assert_eq!(assignments[0]["phase"], "planning");
-    assert_eq!(assignments[0]["role"], "child_orchestrator");
-    assert_eq!(assignments[0]["role_category"], "delegating_coordinator");
-    assert_eq!(assignments[1]["id"], "assignment-001");
-    assert_eq!(assignments[1]["phase"], "execution");
-    assert_eq!(assignments[1]["role"], "worker");
+    assert_eq!(assignments.len(), 1);
+    let worker = &assignments[0];
+    assert_eq!(worker["id"], "assignment-001");
+    assert_eq!(worker["phase"], "execution");
+    assert_eq!(worker["task"], "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.");
+    assert_eq!(worker["role"], "worker");
+    assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
     assert_eq!(
-        assignments[1]["role_category"],
-        "non_delegating_terminal_worker"
+        worker["assigned_paths"],
+        serde_json::json!(["LITERAL_E2E.md"])
     );
-    assert!(assignments
-        .iter()
-        .all(|assignment| assignment["assigned_paths"] == serde_json::json!(["LITERAL_E2E.md"])));
-    for assignment in assignments {
-        assert_eq!(assignment["semantic_symbols"], serde_json::json!([]));
-        assert_eq!(assignment["semantic_modules"], serde_json::json!([]));
-        assert_eq!(assignment["worker_assignments"], serde_json::json!([]));
-        assert_eq!(
-            assignment["environment_requirements"],
-            serde_json::json!([])
-        );
-        assert!(assignment.get("licensed_breakage").is_none());
-    }
+    assert_eq!(worker["semantic_symbols"], serde_json::json!([]));
+    assert_eq!(worker["semantic_modules"], serde_json::json!([]));
+    assert_eq!(worker["worker_assignments"], serde_json::json!([]));
+    assert!(worker.get("runtime").is_none());
+    assert!(worker.get("selection_source").is_none());
+    assert_eq!(worker["environment_requirements"], serde_json::json!([]));
+    assert!(worker.get("licensed_breakage").is_none());
+    assert_eq!(plan["max_depth"], 2);
+    assert_eq!(plan["max_child_assignments"], 1);
     assert_eq!(
         plan["assignment_schedule"],
-        serde_json::json!([
-            {
-                "assignment_id": "assignment-001-planning",
-                "depth": 2,
-                "flattened_index": 0
-            },
-            {
-                "assignment_id": "assignment-001",
-                "parent_assignment_id": "assignment-001-planning",
-                "depth": 3,
-                "flattened_index": 1
-            }
-        ])
+        serde_json::json!([{
+            "assignment_id": "assignment-001", "depth": 2, "flattened_index": 0
+        }])
     );
-
-    let contracts = assignments
-        .iter()
-        .map(|assignment| {
-            let notes = assignment["notes"]
-                .as_str()
-                .context("literal assignment notes")?;
-            let payload = notes
-                .strip_prefix("maco-preclaim-v1:")
-                .context("typed preclaim directive prefix")?;
-            serde_json::from_str::<Value>(payload).context("typed preclaim directive JSON")
-        })
-        .collect::<Result<Vec<_>>>()?;
-    assert_eq!(contracts[0], contracts[1]);
-    let contract = &contracts[0]["verification_contract"];
-    assert_eq!(contract["kind"], "explicit_new_file_creation");
+    let notes = worker["notes"]
+        .as_str()
+        .context("literal assignment notes")?;
+    let payload = notes
+        .strip_prefix("maco-preclaim-v1:")
+        .context("typed preclaim directive prefix")?;
+    let directive: Value =
+        serde_json::from_str(payload).context("typed preclaim directive JSON")?;
+    let contract = &directive["verification_contract"];
+    assert_eq!(contract["kind"], "direct_explicit_new_file_creation");
     assert_eq!(contract["assigned_path"], "LITERAL_E2E.md");
-    assert_eq!(
-        contract["planning_assignment"]["id"],
-        "assignment-001-planning"
-    );
-    assert_eq!(contract["planning_assignment"]["phase"], "planning");
-    assert_eq!(
-        contract["planning_assignment"]["role"],
-        "child_orchestrator"
-    );
-    assert_eq!(
-        contract["planning_assignment"]["role_category"],
-        "delegating_coordinator"
-    );
+    assert!(contract.get("planning_assignment").is_none());
     assert_eq!(contract["execution_assignment"]["id"], "assignment-001");
     assert_eq!(contract["execution_assignment"]["phase"], "execution");
     assert_eq!(contract["execution_assignment"]["role"], "worker");
     assert_eq!(
         contract["execution_assignment"]["role_category"],
         "non_delegating_terminal_worker"
-    );
-    assert_eq!(
-        contract["planning_assignment"]["task_sha256"],
-        "dd5eb07b5e6698eb47b432b7d53053f7b097a77a5e9a71db09531040f58a4b72"
     );
     assert_eq!(
         contract["execution_assignment"]["task_sha256"],
@@ -704,11 +669,9 @@ fn supervise_plan_from_goal_emits_parent_gated_traceable_disjoint_workers() -> R
     let goal_path = temp.path().join("goal.md");
     fs::write(
         &goal_path,
-        "Coordinate independent child orchestrators.\n\
-         - Update README.\n\
+        "- Update README.\n\
          - Clarify documentation in README.\n\
-         - Update the ok function in src/lib.rs.\n\
-         - Explain the unmatched frobnicator.\n",
+         - Update the ok function in src/lib.rs.\n",
     )?;
 
     let plan = run_success_json(&[
@@ -723,221 +686,149 @@ fn supervise_plan_from_goal_emits_parent_gated_traceable_disjoint_workers() -> R
 
     assert_eq!(plan["version"], 1);
     assert!(plan.get("task_file").is_none());
-    assert_eq!(
-        plan["spec_fragment_ids"],
-        serde_json::json!([
-            "fragment-001",
-            "fragment-002",
-            "fragment-003",
-            "fragment-004",
-            "fragment-005"
-        ])
-    );
-
-    let string_array = |value: &Value, field: &str| -> Result<Vec<String>> {
-        value[field]
-            .as_array()
-            .with_context(|| format!("{field} must be an array"))?
-            .iter()
-            .map(|entry| {
-                entry
-                    .as_str()
-                    .map(str::to_string)
-                    .with_context(|| format!("{field} entry must be a string"))
-            })
-            .collect()
-    };
-    let assignments = plan["assignments"].as_array().context("assignments")?;
-    let assignments_by_id = assignments
-        .iter()
-        .map(|assignment| {
-            let id = assignment["id"]
-                .as_str()
-                .context("assignment id must be a string")?;
-            Ok((id.to_string(), assignment))
-        })
-        .collect::<Result<BTreeMap<_, _>>>()?;
-    assert_eq!(
-        assignments_by_id.len(),
-        assignments.len(),
-        "planner assignment ids must be unique"
-    );
-
-    let max_depth = plan["max_depth"]
-        .as_u64()
-        .context("max_depth must be an integer")?;
-    let max_child_assignments = plan["max_child_assignments"]
-        .as_u64()
-        .context("max_child_assignments must be an integer")?;
-    let schedule = plan["assignment_schedule"]
+    assert_coordinated_two_worker_plan(
+        &plan,
+        ["README.md", "src/lib.rs"],
+        [&["fragment-001", "fragment-002"], &["fragment-003"]],
+    )?;
+    let workers = plan["assignments"][0]["worker_assignments"]
         .as_array()
-        .context("assignment schedule")?;
+        .context("nested Workers")?;
+    let readme = workers
+        .iter()
+        .find(|worker| worker["assigned_paths"] == serde_json::json!(["README.md"]))
+        .context("README Worker")?;
+    let rust = workers
+        .iter()
+        .find(|worker| worker["assigned_paths"] == serde_json::json!(["src/lib.rs"]))
+        .context("Rust Worker")?;
     assert_eq!(
-        schedule.len(),
-        assignments.len(),
-        "the schedule must cover every MACO-visible assignment"
+        readme["task"],
+        "Update README.\nClarify documentation in README."
     );
+    assert_eq!(readme["semantic_symbols"], serde_json::json!([]));
+    assert_eq!(readme["semantic_modules"], serde_json::json!([]));
+    assert_eq!(rust["task"], "Update the ok function in src/lib.rs.");
+    assert_eq!(rust["semantic_symbols"], serde_json::json!(["crate::ok"]));
+    assert_eq!(rust["semantic_modules"], serde_json::json!([]));
+    assert!(!repo_path.join(".maco/o2").exists());
+    Ok(())
+}
+
+#[test]
+fn supervise_plan_from_goal_emits_scoped_coverage_gaps_and_run_refuses_unassessed_intake(
+) -> Result<()> {
+    support::require_containment!(
+        "supervise_plan_from_goal_emits_scoped_coverage_gaps_and_run_refuses_unassessed_intake"
+    );
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let goal_path = temp.path().join("incomplete-goal.md");
+    fs::write(
+        &goal_path,
+        "Coordinate independent child orchestrators.\n\
+         - Update README.\n\
+         - Clarify documentation in README.\n\
+         - Update the ok function in src/lib.rs.\n\
+         - Explain the unmatched frobnicator.\n",
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target();
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
+
+    let plan = run_success_json(&[
+        "supervise",
+        "plan",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--json",
+    ])?;
+    let assignments = plan["assignments"]
+        .as_array()
+        .context("generated assignments")?;
     assert!(
-        max_child_assignments >= schedule.len() as u64,
-        "the generated fan-out bound must admit the whole flattened schedule"
+        !assignments.is_empty(),
+        "scoped README/lib work must remain in the planning document: {plan}"
     );
-
-    let mut scheduled_depths = BTreeMap::<String, u64>::new();
-    let mut root_ids = Vec::new();
-    let mut nested_entry_count = 0usize;
-    for (expected_index, entry) in schedule.iter().enumerate() {
-        let assignment_id = entry["assignment_id"]
-            .as_str()
-            .context("scheduled assignment id must be a string")?;
-        let depth = entry["depth"]
-            .as_u64()
-            .context("scheduled assignment depth must be an integer")?;
-        assert_eq!(
-            entry["flattened_index"].as_u64(),
-            Some(expected_index as u64),
-            "schedule order and flattened indexes must agree"
-        );
-        assert!(
-            assignments_by_id.contains_key(assignment_id),
-            "scheduled assignment {assignment_id} must be executable"
-        );
-        assert!(
-            (2..=max_depth).contains(&depth),
-            "scheduled depth must stay inside the declared plan bound"
-        );
-
-        if let Some(parent_id) = entry.get("parent_assignment_id").and_then(Value::as_str) {
-            let parent_depth = scheduled_depths.get(parent_id).copied().with_context(|| {
-                format!("nested assignment {assignment_id} must follow its parent {parent_id}")
-            })?;
-            assert_eq!(
-                depth,
-                parent_depth + 1,
-                "nested assignment depth must be exactly one below its parent"
+    let mut assigned_paths = BTreeSet::new();
+    for assignment in assignments {
+        for path in assignment["assigned_paths"]
+            .as_array()
+            .context("assignment assigned_paths")?
+        {
+            assigned_paths.insert(
+                path.as_str()
+                    .context("assigned path must be a string")?
+                    .to_string(),
             );
-            assert!(depth > 2, "nested assignments must be deeper than O1 roots");
-            let worker = assignments_by_id[assignment_id];
-            let parent = assignments_by_id[parent_id];
-            assert_eq!(worker["phase"], "execution");
-            assert_eq!(worker["role"], "worker");
-            assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
-            assert_eq!(parent["phase"], "planning");
-            assert_eq!(parent["role"], "child_orchestrator");
-            assert_eq!(parent["role_category"], "delegating_coordinator");
-            for field in ["assigned_paths", "semantic_symbols", "semantic_modules"] {
-                assert_eq!(
-                    worker[field], parent[field],
-                    "parent/worker {field} must agree"
-                );
-            }
-            nested_entry_count += 1;
-        } else {
-            assert_eq!(
-                depth, 2,
-                "independent workstream roots must stay at depth 2"
-            );
-            let parent = assignments_by_id[assignment_id];
-            assert_eq!(parent["phase"], "planning");
-            assert_eq!(parent["role"], "child_orchestrator");
-            assert_eq!(parent["role_category"], "delegating_coordinator");
-            root_ids.push(assignment_id.to_string());
         }
-
-        assert!(
-            scheduled_depths
-                .insert(assignment_id.to_string(), depth)
-                .is_none(),
-            "each assignment must appear in the schedule exactly once"
-        );
+        if let Some(workers) = assignment["worker_assignments"].as_array() {
+            for worker in workers {
+                for path in worker["assigned_paths"]
+                    .as_array()
+                    .context("worker assigned_paths")?
+                {
+                    assigned_paths.insert(
+                        path.as_str()
+                            .context("worker assigned path must be a string")?
+                            .to_string(),
+                    );
+                }
+            }
+        }
     }
     assert!(
-        nested_entry_count > 0,
-        "goal planning must emit at least one genuine parented assignment"
+        assigned_paths.contains("README.md"),
+        "known README work must remain assigned: {assigned_paths:?}"
     );
-    assert_eq!(
-        nested_entry_count,
-        root_ids.len(),
-        "each planning workstream must have a parent-gated terminal Worker"
+    assert!(
+        assigned_paths.contains("src/lib.rs"),
+        "known lib work must remain assigned: {assigned_paths:?}"
     );
-
-    let mut root_paths = root_ids
+    let gap_ids = plan["coverage_gaps"]
+        .as_array()
+        .context("coverage gaps")?
         .iter()
-        .map(|root_id| {
-            let assignment = assignments_by_id
-                .get(root_id)
-                .with_context(|| format!("root assignment {root_id} must exist"))?;
-            string_array(assignment, "assigned_paths")
+        .map(|gap| {
+            gap["spec_fragment_id"]
+                .as_str()
+                .map(str::to_string)
+                .context("coverage gap spec_fragment_id")
         })
         .collect::<Result<Vec<_>>>()?;
-    root_paths.sort();
     assert_eq!(
-        root_paths,
-        vec![
-            vec!["README.md".to_string()],
-            vec!["src/lib.rs".to_string()]
-        ],
-        "independent README and Rust workstreams must remain disjoint roots"
+        gap_ids,
+        vec!["fragment-001".to_string(), "fragment-005".to_string()],
+        "intro prose is fragment-001 and unmatched frobnicator is fragment-005 with three scoped lines"
     );
+    assert!(plan.get("task_routing_assessment").is_none());
+    assert!(plan.get("resolved_routing_policy").is_some());
+    assert!(!repo_path.join(".maco/o2").exists());
 
-    let mut readme_fragments = BTreeSet::new();
-    let mut rust_fragments = BTreeSet::new();
-    let mut rust_semantics = BTreeSet::new();
-    let mut readme_worker_preserves_path = false;
-    let mut rust_worker_preserves_path_and_semantics = false;
-    for assignment in assignments {
-        let is_execution = assignment["phase"] == "execution";
-        let assigned_paths = string_array(assignment, "assigned_paths")?;
-        let fragments = assignment
-            .get("spec_fragment_ids")
-            .map(|_| string_array(assignment, "spec_fragment_ids"))
-            .transpose()?
-            .unwrap_or_default();
-        let workers = assignment["worker_assignments"]
-            .as_array()
-            .context("worker assignments must be an array")?;
-        assert!(
-            workers.is_empty(),
-            "generated planning coordinators and terminal Workers must not delegate native nested workers"
-        );
-
-        match assigned_paths.as_slice() {
-            [path] if path == "README.md" => {
-                readme_fragments.extend(fragments);
-                readme_worker_preserves_path |= is_execution;
-            }
-            [path] if path == "src/lib.rs" => {
-                rust_fragments.extend(fragments);
-                rust_semantics.extend(string_array(assignment, "semantic_symbols")?);
-                rust_worker_preserves_path_and_semantics |=
-                    is_execution && string_array(assignment, "semantic_symbols")? == ["crate::ok"];
-            }
-            other => panic!("unexpected generated assignment scope: {other:?}"),
-        }
-    }
-    assert_eq!(
-        readme_fragments,
-        BTreeSet::from(["fragment-002".to_string(), "fragment-003".to_string()])
-    );
-    assert_eq!(rust_fragments, BTreeSet::from(["fragment-004".to_string()]));
-    assert_eq!(rust_semantics, BTreeSet::from(["crate::ok".to_string()]));
+    let error = run_failure_stderr(&[
+        "supervise",
+        "run",
+        "--from-goal",
+        path_str(&goal_path)?,
+        "--repo",
+        path_str(&repo_path)?,
+        "--run-id",
+        "gap-goal-intake",
+        "--json",
+    ])?;
     assert!(
-        readme_worker_preserves_path,
-        "README execution must retain its worker path claim"
+        error.contains("automatic task assessment is unassessed"),
+        "normal from-goal intake must fail closed on unassessed gap documents: {error}"
     );
-    assert!(
-        rust_worker_preserves_path_and_semantics,
-        "Rust execution must retain its worker path and semantic traceability"
-    );
-
-    assert_eq!(
-        plan["coverage_gaps"]
-            .as_array()
-            .context("coverage gaps")?
-            .iter()
-            .map(|gap| gap["spec_fragment_id"].as_str().context("gap fragment"))
-            .collect::<Result<Vec<_>>>()?,
-        vec!["fragment-001", "fragment-005"]
-    );
+    assert!(!repo_path.join(".maco/o2").exists());
+    assert_eq!(Repository::open(&repo_path)?.head()?.target(), head_before);
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
     Ok(())
 }
 
@@ -951,8 +842,7 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
     let goal_path = temp.path().join("run-goal.md");
     fs::write(
         &goal_path,
-        "Coordinate the requested repository work.\n\
-         - Update README.md.\n\
+        "- Update README.md.\n\
          - Update the ok function in src/lib.rs.\n",
     )?;
     let expected_plan = run_success_json(&[
@@ -989,12 +879,11 @@ fn supervise_run_from_goal_executes_the_same_validated_plan_and_preserves_primar
     assert_eq!(report["success"], true);
     assert_eq!(report["publishable"], false);
     assert_eq!(report["plan_file"], "<external-plan>");
-    assert_eq!(expected_plan["max_depth"], 3);
-    assert!(expected_plan["assignment_schedule"]
-        .as_array()
-        .context("goal-derived assignment schedule")?
-        .iter()
-        .any(|entry| entry.get("parent_assignment_id").is_some()));
+    assert_coordinated_two_worker_plan(
+        &expected_plan,
+        ["README.md", "src/lib.rs"],
+        [&["fragment-001"], &["fragment-002"]],
+    )?;
     assert_eq!(
         report["orchestrator_reports"].as_array().map(Vec::len),
         expected_plan["assignments"].as_array().map(Vec::len)
@@ -1020,8 +909,7 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
     let goal_path = temp.path().join("budget-goal.md");
     fs::write(
         &goal_path,
-        "Coordinate the requested repository work.\n\
-         - Update README.md.\n\
+        "- Update README.md.\n\
          - Update the ok function in src/lib.rs.\n",
     )?;
     let plan = run_success_json(&[
@@ -1033,6 +921,16 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         path_str(&repo_path)?,
         "--json",
     ])?;
+    assert_coordinated_two_worker_plan(
+        &plan,
+        ["README.md", "src/lib.rs"],
+        [&["fragment-001"], &["fragment-002"]],
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    let head_before = repo.head()?.target();
+    let index_before = fs::read(repo.path().join("index"))?;
+    let readme_before = fs::read(repo_path.join("README.md"))?;
+    let lib_before = fs::read(repo_path.join("src/lib.rs"))?;
     assert_eq!(
         plan["run_budget"]["role_token_reservations"]["child_orchestrator"],
         1024
@@ -1046,7 +944,27 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         1024
     );
     let plan_path = temp.path().join("generated-plan.json");
-    fs::write(&plan_path, serde_json::to_vec_pretty(&plan)?).context("write generated plan")?;
+    let input_plan_bytes = serde_json::to_vec_pretty(&plan)?;
+    fs::write(&plan_path, &input_plan_bytes).context("write generated plan")?;
+
+    // The run receipt includes parsed Worker defaults and the effective CLI ceiling.
+    let mut expected_executed_plan = plan.clone();
+    for worker in expected_executed_plan["assignments"][0]["worker_assignments"]
+        .as_array_mut()
+        .context("generated Worker assignments")?
+    {
+        // Canonical plan JSON now emits default AssignmentKind::Ordinary as "ordinary".
+        assert_eq!(worker["kind"], "ordinary");
+        worker["kind"] = Value::String("ordinary".to_string());
+    }
+    assert!(expected_executed_plan["run_budget"]
+        .get("hard_tokens")
+        .is_none());
+    assert!(expected_executed_plan["run_budget"]
+        .get("soft_tokens")
+        .is_none());
+    expected_executed_plan["run_budget"]["hard_tokens"] = Value::from(100000);
+    expected_executed_plan["run_budget"]["soft_tokens"] = Value::from(100000);
 
     let output = command_with_test_machine_global_binding(
         BIN,
@@ -1075,8 +993,14 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         !stdout.contains("no token reservation") && !stderr.contains("no token reservation"),
         "generated role reservations must admit dispatch under --max-tokens: stdout={stdout} stderr={stderr}"
     );
+    assert!(
+        output.status.success(),
+        "fake-backed budget run failed: stdout={stdout} stderr={stderr}"
+    );
+    assert_eq!(fs::read(&plan_path)?, input_plan_bytes);
     let report: Value = serde_json::from_slice(&output.stdout)
         .with_context(|| format!("parse max-tokens run JSON: stdout={stdout} stderr={stderr}"))?;
+    assert_eq!(report["success"], true);
     assert_eq!(report["publishable"], false);
     assert!(
         report["role_economics_profile"]["execution"]["started_assignment_count"]
@@ -1092,6 +1016,11 @@ fn supervise_plan_then_run_with_cli_token_ceiling_completes_without_plan_edit() 
         executed_plan["run_budget"]["role_token_reservations"],
         plan["run_budget"]["role_token_reservations"]
     );
+    assert_eq!(executed_plan, expected_executed_plan);
+    assert_eq!(Repository::open(&repo_path)?.head()?.target(), head_before);
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(fs::read(repo_path.join("README.md"))?, readme_before);
+    assert_eq!(fs::read(repo_path.join("src/lib.rs"))?, lib_before);
     Ok(())
 }
 
@@ -1154,33 +1083,14 @@ fn supervise_plan_plain_text_policy_and_script_paths_emit_workstreams() -> Resul
         path_str(&repo_path)?,
         "--json",
     ])?;
-    let assignments = plan["assignments"].as_array().context("assignments")?;
-    assert_eq!(assignments.len(), 4);
-    let scopes = assignments
-        .iter()
-        .map(|assignment| {
-            assignment["assigned_paths"]
-                .as_array()
-                .context("assigned_paths")
-                .and_then(|paths| {
-                    paths
-                        .iter()
-                        .map(|path| {
-                            path.as_str()
-                                .map(str::to_string)
-                                .context("assigned path must be a string")
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
-    assert_eq!(
-        scopes,
-        BTreeSet::from([
-            vec![".agents/scripts/o2-autopilot".to_string()],
-            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
-        ])
-    );
+    assert_coordinated_two_worker_plan(
+        &plan,
+        [
+            ".agents/skills/agent-orchestration/SKILL.md",
+            ".agents/scripts/o2-autopilot",
+        ],
+        [&["fragment-001"], &["fragment-002"]],
+    )?;
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
@@ -1200,6 +1110,11 @@ fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result
     )?;
     let repo = Repository::open(&repo_path)?;
     commit_all(&repo, "ignore policy tree")?;
+    assert!(repo.status_should_ignore(Path::new(".agents/skills/agent-orchestration/SKILL.md"))?);
+    assert!(repo
+        .index()?
+        .get_path(Path::new(".agents/skills/agent-orchestration/SKILL.md"), 0)
+        .is_none());
     let task_path = temp.path().join("gitignored-policy-plan-task.md");
     fs::write(
         &task_path,
@@ -1215,31 +1130,36 @@ fn supervise_plan_plain_text_gitignored_policy_path_emits_workstream() -> Result
         "--json",
     ])?;
     let assignments = plan["assignments"].as_array().context("assignments")?;
-    assert_eq!(assignments.len(), 2);
-    let scopes = assignments
-        .iter()
-        .map(|assignment| {
-            assignment["assigned_paths"]
-                .as_array()
-                .context("assigned_paths")
-                .and_then(|paths| {
-                    paths
-                        .iter()
-                        .map(|path| {
-                            path.as_str()
-                                .map(str::to_string)
-                                .context("assigned path must be a string")
-                        })
-                        .collect::<Result<Vec<_>>>()
-                })
-        })
-        .collect::<Result<BTreeSet<_>>>()?;
+    assert_eq!(assignments.len(), 1);
+    let worker = &assignments[0];
+    assert_eq!(worker["phase"], "execution");
+    assert_eq!(worker["role"], "worker");
+    assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
     assert_eq!(
-        scopes,
-        BTreeSet::from([vec![
-            ".agents/skills/agent-orchestration/SKILL.md".to_string()
-        ]])
+        worker["assigned_paths"],
+        serde_json::json!([".agents/skills/agent-orchestration/SKILL.md"])
     );
+    assert_eq!(worker["worker_assignments"], serde_json::json!([]));
+    assert!(worker.get("runtime").is_none());
+    assert!(worker.get("selection_source").is_none());
+    assert_eq!(worker["environment_requirements"], serde_json::json!([]));
+    assert_eq!(
+        worker["spec_fragment_ids"],
+        serde_json::json!(["fragment-001"])
+    );
+    assert_eq!(
+        plan["spec_fragment_ids"],
+        serde_json::json!(["fragment-001"])
+    );
+    assert_eq!(plan["max_depth"], 2);
+    assert_eq!(plan["max_child_assignments"], 1);
+    assert_eq!(
+        plan["assignment_schedule"],
+        serde_json::json!([{
+            "assignment_id": worker["id"], "depth": 2, "flattened_index": 0
+        }])
+    );
+    assert!(plan.get("coverage_gaps").is_none());
     assert!(!repo_path.join(".maco/o2").exists());
     Ok(())
 }
@@ -1730,6 +1650,17 @@ fn supervise_run_help_documents_auto_concurrency_default() -> Result<()> {
 fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
     let repo_path = create_committed_repo(temp.path())?;
+    // A missing ANCESTOR is refused before connecting; a missing socket leaf alone is allowed.
+    let absent_parent = temp.path().join("absent-cam-authority");
+    let absent_socket = absent_parent.join("account-authority.sock");
+    assert_eq!(
+        fs::symlink_metadata(&absent_parent).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let authority_refusal = format!(
+        "CAM authority socket path `{}` failed ancestry checks",
+        absent_socket.display()
+    );
 
     let literal = run_failure_stderr(&[
         "supervise",
@@ -1740,12 +1671,15 @@ fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
         path_str(&repo_path)?,
         "--run-id",
         "literal-no-runtime",
+        "--cam-authority-socket",
+        path_str(&absent_socket)?,
         "--json",
     ])?;
     assert!(
-        literal.contains("--runtime"),
-        "literal-goal sniff must name --runtime: {literal}"
+        literal.contains(&authority_refusal),
+        "normal literal-goal intake must retain account-authority refusal: {literal}"
     );
+    assert!(!literal.contains("supervise run has no loadable plan at sniff time"));
     assert!(!repo_path.join(".maco/o2/runs/literal-no-runtime").exists());
 
     let goal_path = temp.path().join("run-goal.md");
@@ -1759,16 +1693,19 @@ fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
         path_str(&repo_path)?,
         "--run-id",
         "from-goal-no-runtime",
+        "--cam-authority-socket",
+        path_str(&absent_socket)?,
         "--json",
     ])?;
     assert!(
-        from_goal.contains("--runtime"),
-        "from-goal sniff must name --runtime: {from_goal}"
+        from_goal.contains(&authority_refusal),
+        "normal from-goal intake must retain account-authority refusal: {from_goal}"
     );
     assert!(!repo_path
         .join(".maco/o2/runs/from-goal-no-runtime")
         .exists());
 
+    assert!(!from_goal.contains("supervise run has no loadable plan at sniff time"));
     let missing = run_failure_stderr(&[
         "supervise",
         "run",
@@ -1777,6 +1714,8 @@ fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
         path_str(&repo_path)?,
         "--run-id",
         "missing-plan-no-runtime",
+        "--cam-authority-socket",
+        path_str(&absent_socket)?,
         "--json",
     ])?;
     assert!(
@@ -1794,11 +1733,25 @@ fn supervise_run_without_loadable_plan_requires_runtime() -> Result<()> {
         path_str(&repo_path)?,
         "--run-id",
         "unparsable-plan-no-runtime",
+        "--cam-authority-socket",
+        path_str(&absent_socket)?,
         "--json",
     ])?;
     assert!(
         unparsable_error.contains("--runtime"),
         "unparsable plan sniff must name --runtime: {unparsable_error}"
+    );
+    assert!(!missing.contains("CAM authority socket path"));
+    assert!(!unparsable_error.contains("CAM authority socket path"));
+    assert!(!repo_path
+        .join(".maco/o2/runs/missing-plan-no-runtime")
+        .exists());
+    assert!(!repo_path
+        .join(".maco/o2/runs/unparsable-plan-no-runtime")
+        .exists());
+    assert_eq!(
+        fs::symlink_metadata(&absent_parent).unwrap_err().kind(),
+        std::io::ErrorKind::NotFound
     );
     Ok(())
 }
@@ -2425,6 +2378,157 @@ fn security_document_describes_deterministic_fake_and_verified_codex_boundary() 
     assert!(security.contains("legacy formats and are refused for resume"));
     assert!(security.contains("fixed known-hosts set is a later integration boundary")
         || security.contains("Destination allowlisting against a fixed known-hosts set is a later integration boundary"));
+    Ok(())
+}
+
+// Expected scopes/fragments come from each authored fixture, not from planner output.
+fn assert_coordinated_two_worker_plan(
+    plan: &Value,
+    expected_paths: [&str; 2],
+    expected_fragments: [&[&str]; 2],
+) -> Result<()> {
+    let strings = |value: &Value, field: &str| -> Result<Vec<String>> {
+        value[field]
+            .as_array()
+            .with_context(|| format!("{field} must be an array"))?
+            .iter()
+            .map(|entry| {
+                entry
+                    .as_str()
+                    .map(str::to_string)
+                    .with_context(|| format!("{field} entry must be a string"))
+            })
+            .collect()
+    };
+    let assignments = plan["assignments"].as_array().context("assignments")?;
+    assert_eq!(
+        assignments.len(),
+        1,
+        "only the Execution parent is a top-level assignment"
+    );
+    let parent = &assignments[0];
+    let parent_id = parent["id"].as_str().context("parent id")?;
+    assert!(!parent_id.is_empty());
+    assert_eq!(parent["phase"], "execution");
+    assert_eq!(parent["role"], "child_orchestrator");
+    assert_eq!(parent["role_category"], "delegating_coordinator");
+    assert!(parent.get("runtime").is_none());
+    assert!(parent.get("selection_source").is_none());
+    assert_eq!(parent["environment_requirements"], serde_json::json!([]));
+    assert!(parent.get("licensed_breakage").is_none());
+    assert_eq!(
+        plan["max_depth"], 3,
+        "nested terminal Workers fit below the depth-2 parent"
+    );
+    assert_eq!(
+        plan["max_child_assignments"], 3,
+        "capacity includes the parent and both nested Workers"
+    );
+    assert_eq!(
+        plan["assignment_schedule"],
+        serde_json::json!([{
+            "assignment_id": parent_id, "depth": 2, "flattened_index": 0
+        }]),
+        "nested Workers must not also be flattened/scheduled as independent roots"
+    );
+    let workers = parent["worker_assignments"]
+        .as_array()
+        .context("nested Workers")?;
+    assert_eq!(workers.len(), 2);
+    let mut ids = BTreeSet::from([parent_id]);
+    let mut paths = BTreeSet::new();
+    let mut fragments = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut modules = BTreeSet::new();
+    let mut expected_union = expected_paths
+        .iter()
+        .map(|path| path.to_string())
+        .collect::<Vec<_>>();
+    expected_union.sort_unstable();
+    assert_eq!(strings(parent, "assigned_paths")?, expected_union);
+    for (path, expected_fragment_ids) in expected_paths.into_iter().zip(expected_fragments) {
+        let matching = workers
+            .iter()
+            .filter(|worker| worker["assigned_paths"] == serde_json::json!([path]))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            matching.len(),
+            1,
+            "exactly one nested Worker must own {path}"
+        );
+        let worker = matching[0];
+        let id = worker["id"].as_str().context("Worker id")?;
+        assert!(!id.is_empty());
+        assert!(ids.insert(id), "parent and Worker ids must be unique");
+        assert_eq!(worker["role"], "worker");
+        assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+        assert!(worker.get("selection_source").is_none());
+        assert!(
+            worker.get("worker_assignments").is_none(),
+            "terminal Worker schema has no delegation slot"
+        );
+        assert_eq!(worker["environment_requirements"], serde_json::json!([]));
+        assert!(worker["task"]
+            .as_str()
+            .is_some_and(|task| !task.trim().is_empty()));
+        assert_eq!(
+            strings(worker, "spec_fragment_ids")?,
+            expected_fragment_ids
+                .iter()
+                .map(|id| id.to_string())
+                .collect::<Vec<_>>()
+        );
+        for path in strings(worker, "assigned_paths")? {
+            assert!(
+                paths.insert(path),
+                "nested Worker path ownership must be disjoint"
+            );
+        }
+        for fragment in strings(worker, "spec_fragment_ids")? {
+            assert!(
+                fragments.insert(fragment),
+                "each fragment must have exactly one Worker owner"
+            );
+        }
+        for symbol in strings(worker, "semantic_symbols")? {
+            assert!(
+                symbols.insert(symbol),
+                "nested Worker semantic ownership must be disjoint"
+            );
+        }
+        for module in strings(worker, "semantic_modules")? {
+            assert!(
+                modules.insert(module),
+                "nested Worker module ownership must be disjoint"
+            );
+        }
+    }
+    assert_eq!(
+        strings(parent, "assigned_paths")?
+            .into_iter()
+            .collect::<BTreeSet<_>>(),
+        paths
+    );
+    assert_eq!(
+        strings(parent, "semantic_symbols")?,
+        symbols.into_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(
+        strings(parent, "semantic_modules")?,
+        modules.into_iter().collect::<Vec<_>>()
+    );
+    let expected_all = expected_fragments
+        .into_iter()
+        .flatten()
+        .map(|id| id.to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(strings(plan, "spec_fragment_ids")?, expected_all);
+    assert_eq!(strings(parent, "spec_fragment_ids")?, expected_all);
+    assert_eq!(fragments, expected_all.into_iter().collect::<BTreeSet<_>>());
+    assert!(
+        plan.get("coverage_gaps").is_none(),
+        "a positive complete plan cannot hide uncovered fragments"
+    );
     Ok(())
 }
 

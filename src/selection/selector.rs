@@ -133,6 +133,30 @@ pub fn select_with_switch_cost_estimates(
     input: &SelectionInput,
     switch_cost_evidence: &[CandidateSwitchCostEvidence],
 ) -> Result<SelectionProvenance, SelectionError> {
+    select_with_loaded_routing_policy(input, switch_cost_evidence, None)
+}
+
+pub fn select_with_loaded_routing_policy(
+    input: &SelectionInput,
+    switch_cost_evidence: &[CandidateSwitchCostEvidence],
+    routing_policy: Option<&super::routing_policy::RoutingPolicyReceipt>,
+) -> Result<SelectionProvenance, SelectionError> {
+    if let Some(receipt) = routing_policy {
+        receipt
+            .frozen
+            .policy
+            .validate()
+            .map_err(|error| SelectionError::InvalidInput(error.to_string()))?;
+        let policy_digest = crate::artifacts::state_auth::sha256_hex(
+            &serde_json::to_vec(&receipt.frozen.policy)
+                .map_err(|error| SelectionError::Serialization(error.to_string()))?,
+        );
+        if policy_digest != receipt.frozen.sha256 {
+            return invalid("routing policy digest changed");
+        }
+        super::routing_policy::evaluate_task_grain(&receipt.features, &receipt.frozen.policy.tree)
+            .map_err(|error| SelectionError::InvalidInput(error.to_string()))?;
+    }
     let mut normalized = input.clone();
     normalize_input(&mut normalized);
     validate_input(&normalized)?;
@@ -187,6 +211,7 @@ pub fn select_with_switch_cost_estimates(
                     model,
                     candidate,
                     &normalized_switch_cost_evidence,
+                    routing_policy,
                 )?);
             }
         }
@@ -268,13 +293,24 @@ pub fn select_with_switch_cost_estimates(
         decision_reason =
             "one-shot data-declared environment fallback selected after an evidenced native rejection"
                 .to_string();
-    } else if let Some(mut selected) = automatic_choice(&normalized, &candidate_set)? {
+    } else if let Some(mut selected) = if routing_policy.is_some() {
+        candidate_set
+            .iter()
+            .filter(|candidate| candidate.eligible)
+            .min_by(candidate_score_order)
+            .map(|candidate| selected_choice(candidate, ChoiceReason::LoadedRoutingPolicy))
+            .transpose()?
+    } else {
+        automatic_choice(&normalized, &candidate_set)?
+    } {
         if quota_source.is_some_and(|pool| {
             pool.exhausted && pool.exhaustion_behavior == Some(ExhaustionBehavior::Degrade)
         }) {
             selected.reason = ChoiceReason::AuthorizedQuotaDegrade;
         }
         decision_reason = match selected.reason {
+            ChoiceReason::LoadedRoutingPolicy =>
+                "selected supported account-catalog candidate by frozen routing policy; absent quality/cost evidence remains explicitly unknown".to_string(),
             ChoiceReason::StrongestNoEvidenceJudgmentFallback =>
                 "no comparable exact judgment evidence was eligible; selected the strongest data-declared xhigh gate fallback"
                     .to_string(),
@@ -321,6 +357,7 @@ pub fn select_with_switch_cost_estimates(
     let quota = quota_decision_provenance(&normalized, &candidate_set, choice.as_ref())?;
 
     Ok(SelectionProvenance {
+        routing_policy: routing_policy.cloned(),
         schema_version: SELECTION_SCHEMA_VERSION,
         status,
         normalized_input: normalized.clone(),
@@ -886,6 +923,7 @@ fn evaluate_candidate(
     model: &CatalogModel,
     candidate: CandidateKey,
     switch_cost_evidence: &[CandidateSwitchCostEvidence],
+    routing_policy: Option<&super::routing_policy::RoutingPolicyReceipt>,
 ) -> Result<CandidateEvaluation, SelectionError> {
     let prior = input
         .priors
@@ -900,7 +938,7 @@ fn evaluate_candidate(
     let ledger = ledger_summary(input, &candidate)?;
     let mut reasons = Vec::new();
 
-    if !model.available {
+    if !model.available || model.access == Some(ModelAccessOutcome::Unavailable) {
         reject(
             &mut reasons,
             IneligibilityCode::CatalogUnavailable,
@@ -972,6 +1010,36 @@ fn evaluate_candidate(
         | QuotaCandidateDisposition::SourceAvailable
         | QuotaCandidateDisposition::SourceExhausted
         | QuotaCandidateDisposition::AuthorizedAlternative => {}
+    }
+    if let Some(prior) = prior {
+        if prior.prohibited
+            || prior
+                .prohibited_authority_roles
+                .contains(&input.task.authority_role)
+        {
+            reject(
+                &mut reasons,
+                IneligibilityCode::PolicyProhibited,
+                prior.prohibition_reason.as_deref().unwrap_or(
+                    "dated policy data prohibits this candidate for the requested authority",
+                ),
+            );
+        }
+    }
+    if let Some(receipt) = routing_policy {
+        return evaluate_loaded_policy_candidate(
+            input,
+            profile,
+            model,
+            candidate,
+            prior,
+            pool,
+            quota,
+            ledger,
+            reasons,
+            receipt,
+            switch_cost_evidence,
+        );
     }
     if !model
         .capabilities
@@ -1051,19 +1119,6 @@ fn evaluate_candidate(
         ),
         Some(prior) => {
             strength_rank = prior.strength_rank;
-            if prior.prohibited
-                || prior
-                    .prohibited_authority_roles
-                    .contains(&input.task.authority_role)
-            {
-                reject(
-                    &mut reasons,
-                    IneligibilityCode::PolicyProhibited,
-                    prior.prohibition_reason.as_deref().unwrap_or(
-                        "dated policy data prohibits this candidate for the requested authority",
-                    ),
-                );
-            }
             if input.task.context == ContextSize::Long && !prior.long_context_eligible {
                 reject(
                     &mut reasons,
@@ -1207,6 +1262,7 @@ fn evaluate_candidate(
     let _ = strength_rank;
     Ok(CandidateEvaluation {
         candidate,
+        loaded_policy_evidence: None,
         prior_source_id: prior.map(|prior| prior.source_id.clone()),
         prior_observed_on: prior.map(|prior| prior.observed_on.clone()),
         prior_scope: prior.map(|prior| prior.prior_scope.clone()),
@@ -1214,6 +1270,317 @@ fn evaluate_candidate(
             .map(|prior| prior.limitations.clone())
             .unwrap_or_default(),
         strong_gate_fallback,
+        eligible: reasons.is_empty() && score.is_some(),
+        ineligibility_reasons: reasons,
+        quota,
+        ledger,
+        score,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_loaded_policy_candidate(
+    input: &SelectionInput,
+    profile: &SelectorCalibration,
+    model: &CatalogModel,
+    candidate: CandidateKey,
+    prior: Option<&ModelPrior>,
+    pool: Option<&RuntimePoolState>,
+    quota: QuotaCandidateProvenance,
+    ledger: LedgerSummary,
+    mut reasons: Vec<IneligibilityReason>,
+    receipt: &super::routing_policy::RoutingPolicyReceipt,
+    switch_evidence: &[CandidateSwitchCostEvidence],
+) -> Result<CandidateEvaluation, SelectionError> {
+    let policy = &receipt.frozen.policy;
+    let role = policy.role(&receipt.role);
+    if input.task.authority_role == AuthorityRole::UnknownJudgment {
+        reject(
+            &mut reasons,
+            IneligibilityCode::UnknownJudgmentAuthority,
+            "task authority must be known; model choice cannot grant authority",
+        );
+    }
+    if role
+        .minimum_effort
+        .is_some_and(|minimum| candidate.effort < minimum)
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::OperatorConstraint,
+            "effort is below the loaded policy preference",
+        );
+    }
+    if input
+        .signals
+        .environment_rejections
+        .iter()
+        .any(|rejection| rejection.candidate == candidate)
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::EnvironmentRejected,
+            "candidate has an evidenced environment rejection",
+        );
+    }
+    let fit = prior.and_then(|prior| {
+        prior
+            .class_fit
+            .iter()
+            .find(|fit| fit.task_class == input.task.task_class && fit.effort == candidate.effort)
+    });
+    let quality = fit
+        .map(|fit| posterior_quality_basis_points(fit, &ledger))
+        .transpose()?;
+    let samples = fit
+        .map_or(0, |fit| fit.sample_size)
+        .saturating_add(ledger.quality_attempts);
+    let observed_quality = (ledger.quality_attempts > 0).then(|| {
+        ((u64::from(ledger.accepted) * 10_000) / u64::from(ledger.quality_attempts)).min(10_000)
+            as u16
+    });
+    let quality = quality.or(observed_quality);
+    if quality.is_some_and(|value| value < role.minimum_quality_basis_points) {
+        reject(
+            &mut reasons,
+            IneligibilityCode::QualityBarNotMet,
+            "measured quality is below the loaded policy quality threshold",
+        );
+    }
+    let authority_evidence = prior.and_then(|prior| {
+        prior.authority_evidence.iter().find(|evidence| {
+            evidence.task_class == input.task.task_class
+                && evidence.role == input.task.authority_role
+                && evidence.effort == candidate.effort
+        })
+    });
+    if role.require_measured_quality
+        && (quality.is_none_or(|value| value < role.minimum_quality_basis_points)
+            || samples < role.minimum_samples)
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::ClassFitEvidenceInsufficient,
+            "loaded policy requires measured class-fit quality and sufficient samples",
+        );
+    }
+    let evidence_unknown = quality.is_none();
+    let mut limitations = prior
+        .map(|prior| prior.limitations.clone())
+        .unwrap_or_default();
+    if evidence_unknown {
+        limitations.push("Model quality and accepted-cycle cost are unknown; routing uses a loaded-policy inference penalty, not fabricated benchmark evidence".to_string());
+    }
+    let expected_cost = if ledger.accepted > 0 {
+        Some(ledger.total_cycle_cost_microunits / u64::from(ledger.accepted))
+    } else if let Some(fit) = fit {
+        Some(expected_cost_per_accepted(fit, &ledger)?)
+    } else {
+        None
+    };
+    let score = if reasons.is_empty() {
+        let switch = resolve_switch_cost(input, &candidate, switch_evidence)?;
+        let configured_switch_cost = switch.configured_profile_prior_microunits;
+        let applied_switch_cost = u64::try_from(switch.estimate.total_cost_micros)
+            .map_err(|_| SelectionError::InvalidInput("negative routing switch cost".into()))?
+            .max(configured_switch_cost);
+        let pool = pool.ok_or_else(|| {
+            SelectionError::InvalidInput("selected policy candidate lost pool".into())
+        })?;
+        let intensity = receipt
+            .features
+            .complexity
+            .max(receipt.features.risk)
+            .max(receipt.features.horizon)
+            .max(
+                u16::try_from(
+                    (u128::from(receipt.features.context_tokens) * 10_000)
+                        / u128::from(policy.tree.coordinated_context_tokens_min.max(1)),
+                )
+                .unwrap_or(10_000)
+                .min(10_000),
+            );
+        let desired = role.preferred_effort.unwrap_or_else(|| {
+            let mut supported = model.supported_efforts.clone();
+            supported.sort();
+            let index = usize::from(intensity) * supported.len().saturating_sub(1) / 10_000;
+            supported[index]
+        });
+        let distance = candidate.effort.rank().abs_diff(desired.rank());
+        let weighted = |value: u64, weight: u64| {
+            value.checked_mul(weight).ok_or_else(|| {
+                SelectionError::InvalidInput("loaded routing objective overflow".into())
+            })
+        };
+        let evidence_penalty = if evidence_unknown || expected_cost.is_none() {
+            policy.objective.unknown_evidence_penalty
+        } else {
+            0
+        };
+        let cycle_cost = weighted(
+            expected_cost.unwrap_or(0),
+            policy.objective.accepted_cycle_cost_weight,
+        )?;
+        let rejection_penalty = weighted(
+            u64::from(ledger.rejected),
+            policy.objective.rejected_attempt_weight,
+        )?;
+        let effort_penalty = weighted(distance, policy.objective.effort_distance_weight)?;
+        let known_quality = quality.filter(|value| *value > 0);
+        let retry_cost_microunits = if input.signals.previous_choice.as_ref() == Some(&candidate) {
+            if let Some(known_quality) = known_quality {
+                normalize_cost_per_accepted(
+                    u128_to_u64(
+                        u128::from(input.signals.retry_count)
+                            * u128::from(profile.retry_penalty_microunits),
+                        "loaded-policy retry score",
+                    )?,
+                    known_quality,
+                    "loaded-policy retry cost per accepted task",
+                )?
+            } else {
+                0
+            }
+        } else {
+            0
+        };
+        let (expected_retry_rework_cost, expected_human_review_cost) =
+            match (fit, known_quality, ledger.accepted) {
+                (Some(fit), Some(_), _) => {
+                    let expected_retry_rework = expected_cost_component_per_accepted(
+                        fit.rework_cost_microunits,
+                        ledger.rework_cost_microunits,
+                        fit,
+                        &ledger,
+                        "expected retry/rework cost per accepted task",
+                    )?;
+                    let prior_human_review_cost = checked_sum_costs(
+                        [fit.review_cost_microunits, fit.rereview_cost_microunits],
+                        "prior human-review cost",
+                    )?;
+                    let observed_human_review_cost = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )?;
+                    let expected_human_review = expected_cost_component_per_accepted(
+                        prior_human_review_cost,
+                        observed_human_review_cost,
+                        fit,
+                        &ledger,
+                        "expected human-review cost per accepted task",
+                    )?;
+                    (expected_retry_rework, expected_human_review)
+                }
+                (None, Some(_), accepted) if accepted > 0 => {
+                    let accepted = u64::from(accepted);
+                    let observed_rework = ledger.rework_cost_microunits / accepted;
+                    let observed_human_review = checked_sum_costs(
+                        [
+                            ledger.review_cost_microunits,
+                            ledger.rereview_cost_microunits,
+                        ],
+                        "observed human-review cost",
+                    )? / accepted;
+                    (observed_rework, observed_human_review)
+                }
+                _ => (0, 0),
+            };
+        let routing_weights = &input.resolved_objective_profile.profile.tradeoffs;
+        let retry_rework_cost_proxy_microunits = checked_sum_costs(
+            [expected_retry_rework_cost, retry_cost_microunits],
+            "loaded-policy retry/rework cost proxy",
+        )?;
+        let human_review_cost_proxy_microunits = expected_human_review_cost;
+        let retry_rework_adjustment_microunits = proportional_cost_proxy_adjustment(
+            retry_rework_cost_proxy_microunits,
+            routing_weights.retry_rework_percent,
+            routing_weights.monetary_cost_percent,
+            "loaded-policy retry/rework cost-proxy adjustment",
+        )?;
+        let human_review_adjustment_microunits = proportional_cost_proxy_adjustment(
+            human_review_cost_proxy_microunits,
+            routing_weights.human_review_percent,
+            routing_weights.monetary_cost_percent,
+            "loaded-policy human-review cost-proxy adjustment",
+        )?;
+        let total_adjustment_microunits = checked_sum_costs(
+            [
+                retry_rework_adjustment_microunits,
+                human_review_adjustment_microunits,
+            ],
+            "loaded-policy total cost-proxy adjustment",
+        )?;
+        let legacy_baseline_score_microunits = checked_sum_costs(
+            [
+                cycle_cost,
+                rejection_penalty,
+                effort_penalty,
+                evidence_penalty,
+                pool.marginal_cost_microunits,
+                applied_switch_cost,
+                retry_cost_microunits,
+            ],
+            "loaded routing objective",
+        )?;
+        let total = checked_sum_costs(
+            [
+                legacy_baseline_score_microunits,
+                total_adjustment_microunits,
+            ],
+            "loaded routing objective plus cost-proxy adjustments",
+        )?;
+        Some(ScoreBreakdown {
+            // Zero here is paired with explicit unknown provenance, never used as measured quality.
+            posterior_quality_basis_points: quality.unwrap_or(0),
+            authority_quality_basis_points: authority_evidence
+                .map(|evidence| evidence.quality_basis_points),
+            expected_total_cost_per_accepted_task_microunits: expected_cost.unwrap_or(0),
+            pool_pressure_cost_microunits: 0,
+            entitlement_scarcity_cost_microunits: 0,
+            observed_consumption_cost_microunits: 0,
+            marginal_cost_microunits: pool.marginal_cost_microunits,
+            retry_cost_microunits,
+            degrade_cost_microunits: effort_penalty,
+            switch_transition: switch.estimate.class,
+            switch_cost_origin: switch.origin,
+            switch_cost_estimate: switch.estimate,
+            configured_switch_cost_microunits: configured_switch_cost,
+            configured_switch_cost_origin: switch.configured_profile_prior_origin,
+            applied_switch_cost_microunits: applied_switch_cost,
+            switch_cost_microunits: applied_switch_cost,
+            routing_score_semantics: RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2,
+            routing_tradeoff_weights: routing_weights.clone(),
+            legacy_baseline_score_microunits,
+            retry_rework_cost_proxy_microunits,
+            human_review_cost_proxy_microunits,
+            retry_rework_adjustment_microunits,
+            human_review_adjustment_microunits,
+            total_adjustment_microunits,
+            total_score_microunits: total,
+        })
+    } else {
+        None
+    };
+    Ok(CandidateEvaluation {
+        candidate,
+        prior_source_id: prior.map(|prior| prior.source_id.clone()),
+        loaded_policy_evidence: Some(LoadedCandidateEvidence {
+            quality_basis_points: quality,
+            expected_accepted_cycle_cost_microunits: expected_cost,
+            samples,
+            uncertainty_penalty: if evidence_unknown || expected_cost.is_none() {
+                policy.objective.unknown_evidence_penalty
+            } else {
+                0
+            },
+        }),
+        prior_observed_on: prior.map(|prior| prior.observed_on.clone()),
+        prior_scope: prior.map(|prior| prior.prior_scope.clone()),
+        prior_limitations: limitations,
+        strong_gate_fallback: false,
         eligible: reasons.is_empty() && score.is_some(),
         ineligibility_reasons: reasons,
         quota,

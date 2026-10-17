@@ -135,11 +135,11 @@ pub struct Cli {
 /// Explicit subcommand names and option-shaped first arguments retain Clap's
 /// normal behavior. `--` can be used as the first argument to force an
 /// instruction whose first word is an explicit subcommand name or looks like
-/// an option. Every routed argument is joined with one ASCII space and passed
-/// as one literal goal/spec, so option-shaped words after the first instruction
-/// word remain instruction text rather than becoming MACO options. The rewriter
-/// injects `--runtime codex` after `--literal-goal` so a bare
-/// `maco <instruction>` is an explicit live Codex launch.
+/// an option. Routed words are joined with one ASCII space into one literal
+/// goal. A `--runtime <value>` or `--runtime=<value>` pair is removed from
+/// that goal and passed through as `--runtime`; every other option-shaped
+/// word stays literal goal text. When no runtime pair is present, the
+/// rewriter injects `--runtime codex`.
 pub fn route_literal_instruction_args<I, T>(args: I) -> Vec<OsString>
 where
     I: IntoIterator<Item = T>,
@@ -162,13 +162,7 @@ where
         1
     };
 
-    let mut instruction = OsString::new();
-    for (index, argument) in args[instruction_start..].iter().enumerate() {
-        if index != 0 {
-            instruction.push(" ");
-        }
-        instruction.push(argument);
-    }
+    let (instruction, runtime) = split_bare_runtime(&args[instruction_start..]);
 
     vec![
         args[0].clone(),
@@ -177,8 +171,54 @@ where
         OsString::from("--literal-goal"),
         instruction,
         OsString::from("--runtime"),
-        OsString::from("codex"),
+        runtime,
     ]
+}
+
+/// Pulls `--runtime <value>` and `--runtime=<value>` out of a bare instruction.
+///
+/// The last well-formed pair wins and is omitted from the goal. A trailing
+/// `--runtime` with no value, a following option-shaped word, and every other
+/// option-shaped word stay in the goal. Goal words are joined with one ASCII
+/// space. An absent runtime defaults to `codex`.
+fn split_bare_runtime(words: &[OsString]) -> (OsString, OsString) {
+    let mut goal_words: Vec<&OsStr> = Vec::new();
+    let mut runtime = OsString::from("codex");
+    let mut index = 0;
+    while index < words.len() {
+        let word = &words[index];
+        if let Some(value) = bare_runtime_equals_value(word) {
+            runtime = value;
+            index += 1;
+            continue;
+        }
+        if word == OsStr::new("--runtime") {
+            if let Some(value) = words.get(index + 1) {
+                if !is_option_shaped(value) {
+                    runtime = value.clone();
+                    index += 2;
+                    continue;
+                }
+            }
+        }
+        goal_words.push(word.as_os_str());
+        index += 1;
+    }
+
+    let mut goal = OsString::new();
+    for (word_index, word) in goal_words.iter().enumerate() {
+        if word_index != 0 {
+            goal.push(" ");
+        }
+        goal.push(word);
+    }
+    (goal, runtime)
+}
+
+fn bare_runtime_equals_value(word: &OsStr) -> Option<OsString> {
+    let text = word.to_str()?;
+    let value = text.strip_prefix("--runtime=")?;
+    Some(OsString::from(value))
 }
 
 fn is_option_shaped(argument: &OsStr) -> bool {
@@ -224,8 +264,13 @@ fn resolve_supervise_machine_global_binding(
             "explicit supervise run requires --machine-global-config and \
              --machine-global-runtime-root-id"
         ),
-        _ => bail!(
-            "--machine-global-config and --machine-global-runtime-root-id must be supplied together"
+        (None, Some(_)) => bail!(
+            "missing --machine-global-config; supply --machine-global-config and \
+             --machine-global-runtime-root-id together"
+        ),
+        (Some(_), None) => bail!(
+            "missing --machine-global-runtime-root-id; supply --machine-global-config and \
+             --machine-global-runtime-root-id together"
         ),
     }
 }
@@ -1028,6 +1073,24 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
+        SuperviseSubcommand::JournalAppend(args) => {
+            supervise::run_worker_execution_journal_command(
+                &args.journal,
+                &crate::safe_state::FileIdentity {
+                    device: args.device,
+                    file: args.inode,
+                },
+                &supervise::WorkerExecutionJournalEntry {
+                    command: args.command,
+                    cwd: args.cwd,
+                    start_timestamp: args.start_timestamp,
+                    end_timestamp: args.end_timestamp,
+                    changed_paths: args.changed_paths,
+                    observation: None,
+                },
+                args.observe_changes,
+            )
+        }
         SuperviseSubcommand::Plan(args) => {
             let PlanSuperviseArgs {
                 task_file,
@@ -1133,13 +1196,71 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 host_disk_per_child_mib: args.host_disk_per_child_mib,
                 host_fallback_children: args.host_fallback_children,
             };
+            let mut normal_document = None;
             let runtime = match args.runtime {
                 Some(runtime) => runtime,
+                None if goal_spec.is_some() && !resume_existing => {
+                    let (plan, mut document) =
+                        supervise::supervisor_plan_and_document_from_goal_spec(
+                            &resolved_repo,
+                            "",
+                            goal_spec
+                                .as_deref()
+                                .context("normal intake goal disappeared")?,
+                        )?;
+                    let frozen: crate::selection::routing_policy::FrozenRoutingPolicy =
+                        serde_json::from_value(
+                            document
+                                .get("resolved_routing_policy")
+                                .cloned()
+                                .context("normal intake has no frozen routing policy")?,
+                        )
+                        .context("normal intake routing policy receipt is invalid")?;
+                    let task_routing_assessment =
+                        supervise::task_routing_assessment_from_plan_document(&plan, &document)?;
+                    let (runtime, selected, decision) = supervise::select_normal_intake(
+                        &resolved_repo,
+                        &resolved_run_id,
+                        &plan,
+                        &frozen,
+                        task_routing_assessment.as_ref(),
+                        supervise::NormalIntakeConfig {
+                            admission_overrides,
+                            max_concurrent_children: args
+                                .max_concurrent_children
+                                .resolve(crate::process_runner::HostProcessCapacity::measured()),
+                            objective_profile: args.objective_profile.as_deref(),
+                        },
+                    )?;
+                    let decision_sha256 =
+                        crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&decision)?);
+                    let object = document
+                        .as_object_mut()
+                        .context("normal intake plan is not an object")?;
+                    object.insert(
+                        "normal_intake_selection".to_string(),
+                        serde_json::to_value(selected)?,
+                    );
+                    object.insert(
+                        "normal_intake_decision".to_string(),
+                        serde_json::to_value(decision)?,
+                    );
+                    object.insert(
+                        "normal_intake_decision_sha256".to_string(),
+                        serde_json::Value::String(decision_sha256),
+                    );
+                    normal_document = Some(document);
+                    runtime
+                }
                 None => sniff_supervise_runtime_from_plan(&plan_file, &resolved_repo)?,
             };
             let json = args.json;
             let objective_profile_override = args.objective_profile.clone();
             let role_category_override = args.role_category_override.role_category;
+            if let (Some(document), Some(category)) = (&mut normal_document, role_category_override)
+            {
+                stamp_operator_role_category_override(document, category)?;
+            }
             if resume_existing && objective_profile_override.is_some() {
                 bail!(
                     "--objective-profile cannot change an existing supervise run; resume uses its frozen objective profile"
@@ -1150,13 +1271,17 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "--role-category cannot change an existing supervise run; resume uses its frozen role categories"
                 );
             }
-            let (plan_file, goal_spec) = materialize_launch_plan_for_operator_role_category(
-                plan_file,
-                goal_spec,
-                &resolved_repo,
-                resolved_run_id.as_str(),
-                role_category_override,
-            )?;
+            let (plan_file, goal_spec) = if normal_document.is_some() {
+                (plan_file, goal_spec)
+            } else {
+                materialize_launch_plan_for_operator_role_category(
+                    plan_file,
+                    goal_spec,
+                    &resolved_repo,
+                    resolved_run_id.as_str(),
+                    role_category_override,
+                )?
+            };
             let reap_repo = resolved_repo.clone();
             let _rolling_guard = rolling_quota
                 .map(|quota| {
@@ -1183,7 +1308,8 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .map(|path| supervise::bind_operator_prior_data(&resolved_repo, path))
                     .transpose()?
             };
-            let options = SupervisorRunOptions {
+            let supplied_runtime_bin = args.runtime_bin.clone();
+            let mut options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
                 run_id: resolved_run_id.clone(),
@@ -1208,8 +1334,48 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     correction_correlation_id: resolved_run_id.as_str().to_string(),
                 }),
             };
+            let additional_runtime_bins = args
+                .additional_runtime_bin
+                .iter()
+                .map(|binding| (binding.runtime, binding.executable.clone()))
+                .collect::<Vec<_>>();
+            let _runtime_executable_guard = if resume_existing {
+                supervise::bind_frozen_runtime_executables_for_run(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    supplied_runtime_bin.as_deref(),
+                    &additional_runtime_bins,
+                )?
+                .map(|(guard, primary)| {
+                    options.codex_bin = primary;
+                    guard
+                })
+            } else if additional_runtime_bins.is_empty() {
+                None
+            } else {
+                let primary = supplied_runtime_bin
+                    .as_deref()
+                    .context("--additional-runtime-bin requires an explicit --runtime-bin")?;
+                Some(supervise::bind_explicit_runtime_executables(
+                    &options.repo,
+                    &options.run_id,
+                    options.runtime,
+                    primary,
+                    &additional_runtime_bins,
+                )?)
+            };
             let outcome = (|| {
-                let report = match (goal_spec, resume_existing) {
+                let report = if let Some(document) = normal_document {
+                    supervise::run_supervisor_normal_document_cascade(
+                        options,
+                        document,
+                        args.max_concurrent_children,
+                        args.allow_primary_worktree,
+                        objective_profile_override,
+                    )?
+                } else {
+                    match (goal_spec, resume_existing) {
                     (Some(goal_spec), true) => {
                         supervise::resume_supervisor_goal_spec_cascade_with_concurrency_policy(
                             options,
@@ -1242,6 +1408,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                             objective_profile_override,
                         )?
                     }
+                }
                 };
                 print_query_report(&report, json)?;
                 if !report.follow_up_cascade_success {
@@ -1323,6 +1490,8 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
+    /// Execute a command or observe a native edit and append to the exact precreated Worker journal.
+    JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
     /// Run a supervisor plan with child orchestrators for a selected runtime.
@@ -1338,6 +1507,34 @@ enum SuperviseSubcommand {
     Collect(CollectSuperviseArgs),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
+}
+
+#[derive(Debug, Args)]
+struct WorkerJournalAppendArgs {
+    /// Exact delegated journal path.
+    #[arg(long)]
+    journal: PathBuf,
+    /// Device and inode of the parent's precreated journal, not a new path lookup.
+    #[arg(long)]
+    device: u64,
+    #[arg(long)]
+    inode: u64,
+    #[arg(long)]
+    cwd: PathBuf,
+    #[arg(long)]
+    start_timestamp: String,
+    #[arg(long)]
+    end_timestamp: String,
+    /// Optional assertion of observed paths; a mismatch is journaled and rejected.
+    #[arg(long = "changed-path")]
+    changed_paths: Vec<PathBuf>,
+    /// Observe a native tool edit since the last snapshot without executing argv.
+    /// Use immediately after the edit; use `-- true` when no tool argv is recorded.
+    #[arg(long)]
+    observe_changes: bool,
+    /// Command argv to execute, or native tool argv when --observe-changes is set.
+    #[arg(last = true, required = true, num_args = 1.., allow_hyphen_values = true)]
+    command: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -1654,6 +1851,14 @@ struct RunSuperviseArgs {
     /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
+    /// Additional exact executable for a distinct runtime in this supervise run.
+    /// Requires an absolute primary --runtime-bin as well.
+    #[arg(
+        long = "additional-runtime-bin",
+        value_name = "RUNTIME=ABSOLUTE_EXECUTABLE",
+        value_parser = parse_additional_runtime_bin
+    )]
+    additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
@@ -1822,7 +2027,8 @@ impl ConsultCommand {
                     args.run_id.as_deref(),
                     args.json,
                 )?;
-                let report = consult::ask_consultant(ConsultAskOptions {
+                let gemini = args.gemini_inputs()?;
+                let options = ConsultAskOptions {
                     repo: resolved.repo,
                     run_id: resolved.run_id,
                     runtime: args.runtime,
@@ -1830,7 +2036,11 @@ impl ConsultCommand {
                     question,
                     context_paths: args.context_path,
                     timeout_seconds: args.timeout_seconds,
-                })?;
+                };
+                let report = match gemini {
+                    Some(inputs) => consult::ask_gemini_consultant(options, inputs)?,
+                    None => consult::ask_consultant(options)?,
+                };
                 print_query_report(&report, args.json)?;
                 if !report.success {
                     bail!("consult ask failed");
@@ -1861,9 +2071,15 @@ struct AskConsultArgs {
     /// Consultant runtime to use. Real runtimes require --consultant-bin.
     #[arg(long, default_value = "fake")]
     runtime: ConsultantRuntime,
-    /// Codex- or Claude-compatible executable for real consultant runtimes.
+    /// Runtime executable for real consultant runtimes.
     #[arg(long)]
     consultant_bin: Option<PathBuf>,
+    /// Explicit requested model for Gemini; never an observed model identity.
+    #[arg(long)]
+    model: Option<String>,
+    /// Positive finite token ceiling required for Gemini consultation.
+    #[arg(long)]
+    token_budget: Option<usize>,
     /// Repo-relative existing path to mention as context. Contents are not inlined.
     #[arg(long = "context-path")]
     context_path: Vec<PathBuf>,
@@ -1879,6 +2095,83 @@ struct AskConsultArgs {
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,
+}
+
+impl AskConsultArgs {
+    fn gemini_inputs(&self) -> Result<Option<consult::GeminiConsultOptions>> {
+        if self.runtime == ConsultantRuntime::Gemini {
+            let inputs = consult::GeminiConsultOptions {
+                model: self.model.clone().context("Gemini requires --model")?,
+                token_budget: self
+                    .token_budget
+                    .context("Gemini requires --token-budget")?,
+            };
+            inputs.validate()?;
+            Ok(Some(inputs))
+        } else {
+            if self.model.is_some() || self.token_budget.is_some() {
+                bail!("--model and --token-budget on consult ask require --runtime gemini");
+            }
+            Ok(None)
+        }
+    }
+}
+
+#[cfg(test)]
+mod gemini_consult_input_tests {
+    use super::*;
+
+    fn ask(flags: &[&str]) -> Result<AskConsultArgs> {
+        let argv = [
+            vec!["maco", "consult", "ask", "--question", "inspect"],
+            flags.to_vec(),
+        ]
+        .concat();
+        let parsed = Cli::try_parse_from(argv)?;
+        let Command::Consult(ConsultCommand {
+            command: ConsultSubcommand::Ask(args),
+        }) = parsed.command
+        else {
+            bail!("expected consult ask");
+        };
+        Ok(args)
+    }
+
+    #[test]
+    fn gemini_consult_cli_requires_explicit_model_and_budget_without_other_runtime_defaults(
+    ) -> Result<()> {
+        assert!(ask(&[])?.gemini_inputs()?.is_none());
+        for flags in [
+            vec!["--runtime", "gemini"],
+            vec!["--runtime", "gemini", "--model", "gemini-2.5-pro"],
+            vec!["--runtime", "gemini", "--token-budget", "10"],
+            vec![
+                "--runtime",
+                "gemini",
+                "--model",
+                "gemini-2.5-pro",
+                "--token-budget",
+                "0",
+            ],
+            vec!["--runtime", "codex", "--token-budget", "10"],
+            vec!["--runtime", "claude", "--model", "gemini-2.5-pro"],
+        ] {
+            assert!(ask(&flags)?.gemini_inputs().is_err(), "accepted {flags:?}");
+        }
+        let inputs = ask(&[
+            "--runtime",
+            "gemini",
+            "--model",
+            "gemini-2.5-pro",
+            "--token-budget",
+            "10",
+        ])?
+        .gemini_inputs()?
+        .context("missing Gemini inputs")?;
+        assert_eq!(inputs.model, "gemini-2.5-pro");
+        assert_eq!(inputs.token_budget, 10);
+        Ok(())
+    }
 }
 
 fn consult_question(args: &AskConsultArgs) -> Result<String> {
@@ -3105,8 +3398,7 @@ impl WorktreeCommand {
                 // repository is observed clean through the bounded status boundary.
                 let cleanliness = manager.acquire_repository_cleanliness().context(
                     "managed worktree creation requires a capability-bound repository \
-                     cleanliness input; commit, stash, or remove pending changes in the \
-                     primary repository, then rerun `maco worktree create`",
+                     cleanliness input",
                 )?;
                 let record = manager.create_with_repository_cleanliness_and_retention(
                     WorktreeCreateOptions {
@@ -4799,6 +5091,323 @@ fn expect_supervise_command(command: Command) -> SuperviseCommand {
 #[cfg(test)]
 mod cli_integration_tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::fs;
+
+    #[cfg(target_os = "linux")]
+    fn invoke_worker_journal_append(
+        journal: &Path,
+        identity: &crate::safe_state::FileIdentity,
+        patch: &str,
+        changed_path: &str,
+    ) -> Result<()> {
+        let args = vec![
+            "maco".to_string(),
+            "supervise".to_string(),
+            "journal-append".to_string(),
+            "--journal".to_string(),
+            journal.to_str().unwrap().to_string(),
+            "--device".to_string(),
+            identity.device.to_string(),
+            "--inode".to_string(),
+            identity.file.to_string(),
+            "--cwd".to_string(),
+            journal
+                .parent()
+                .unwrap()
+                .join("worktree")
+                .to_str()
+                .unwrap()
+                .to_string(),
+            "--start-timestamp".to_string(),
+            "2026-09-30T00:00:00Z".to_string(),
+            "--end-timestamp".to_string(),
+            "2026-09-30T00:00:01Z".to_string(),
+            "--changed-path".to_string(),
+            changed_path.to_string(),
+            "--observe-changes".to_string(),
+            "--".to_string(),
+            "apply_patch".to_string(),
+            patch.to_string(),
+        ];
+        Cli::try_parse_from(args)?.run()
+    }
+
+    #[cfg(target_os = "linux")]
+    fn precreated_journal(path: &Path) -> crate::safe_state::FileIdentity {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        let file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+            .unwrap();
+        let metadata = file.metadata().unwrap();
+        git2::Repository::init(path.parent().unwrap().join("worktree")).unwrap();
+        crate::safe_state::FileIdentity {
+            device: metadata.dev(),
+            file: metadata.ino(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_preserves_quotes_backslashes_and_patch_newlines() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let patch = "*** Begin Patch\n*** Update File: src/duration.py\n@@\n-\"\"\"old\"\"\"\n+\"\"\"quoted \\\"text\\\" and \\path\"\"\"\n*** End Patch\n";
+        fs::create_dir(root.join("worktree/src")).unwrap();
+        fs::write(root.join("worktree/src/duration.py"), "first native edit").unwrap();
+        invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
+        fs::write(root.join("worktree/src/duration.py"), "second native edit").unwrap();
+        invoke_worker_journal_append(&path, &identity, patch, "src/duration.py").unwrap();
+        let bytes = fs::read(&path).unwrap();
+        assert_eq!(bytes.iter().filter(|byte| **byte == b'\n').count(), 2);
+        assert_eq!(bytes.last(), Some(&b'\n'));
+        for line in std::str::from_utf8(&bytes).unwrap().lines() {
+            let record: supervise::WorkerExecutionJournalEntry =
+                serde_json::from_str(line).unwrap();
+            assert_eq!(record.command, vec!["apply_patch", patch]);
+            assert_eq!(record.changed_paths, vec![PathBuf::from("src/duration.py")]);
+            assert_eq!(record.cwd, root.join("worktree"));
+            assert!(record.observation.is_some());
+            assert_eq!(record.start_timestamp, "2026-09-30T00:00:00Z");
+            assert_eq!(record.end_timestamp, "2026-09-30T00:00:01Z");
+        }
+        let metadata = fs::metadata(&path).unwrap();
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (identity.device, identity.file)
+        );
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_executes_and_observes_without_changed_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let device = identity.device.to_string();
+        let inode = identity.file.to_string();
+        let cwd = root.join("worktree");
+        Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "journal-append",
+            "--journal",
+            path.to_str().unwrap(),
+            "--device",
+            &device,
+            "--inode",
+            &inode,
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--start-timestamp",
+            "2026-10-16T00:00:00Z",
+            "--end-timestamp",
+            "2026-10-16T00:00:01Z",
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'Hello from MACO\\n' > hello.txt",
+        ])
+        .unwrap()
+        .run()
+        .unwrap();
+        let entries =
+            supervise::parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].changed_paths, vec![PathBuf::from("hello.txt")]);
+        assert_eq!(
+            fs::read_to_string(cwd.join("hello.txt")).unwrap(),
+            "Hello from MACO\n"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_enosys_executes_and_observes_attributed_edits() {
+        use crate::safe_state::LinuxOpenat2Error;
+        for statx_enosys in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path().canonicalize().unwrap();
+            let path = root.join("worker.jsonl");
+            let identity = precreated_journal(&path);
+            let cwd = root.join("worktree");
+            let repo = git2::Repository::open(&cwd).unwrap();
+            fs::write(cwd.join("README.md"), "original\n").unwrap();
+            let mut index = repo.index().unwrap();
+            index.add_path(Path::new("README.md")).unwrap();
+            index.write().unwrap();
+            let tree = repo.find_tree(index.write_tree().unwrap()).unwrap();
+            let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+            repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+                .unwrap();
+            let mut error = LinuxOpenat2Error::force(libc::ENOSYS);
+            if statx_enosys {
+                error = error.with_statx_enosys();
+            }
+            let _error = error;
+            let invoke = |observe: bool, command: &[&str]| -> Result<()> {
+                let mut args = vec![
+                    "maco".to_string(),
+                    "supervise".into(),
+                    "journal-append".into(),
+                    "--journal".into(),
+                    path.to_str().unwrap().into(),
+                    "--device".into(),
+                    identity.device.to_string(),
+                    "--inode".into(),
+                    identity.file.to_string(),
+                    "--cwd".into(),
+                    cwd.to_str().unwrap().into(),
+                    "--start-timestamp".into(),
+                    "2026-10-16T00:00:00Z".into(),
+                    "--end-timestamp".into(),
+                    "2026-10-16T00:00:01Z".into(),
+                ];
+                if observe {
+                    args.push("--observe-changes".into());
+                }
+                args.push("--".into());
+                args.extend(command.iter().map(|arg| (*arg).to_string()));
+                Cli::try_parse_from(args)?.run()
+            };
+            let command = ["/bin/sh", "-c", "mkdir -p nested; printf 'Hello from MACO\\n' > nested/hello.txt; printf 'edited\\n' >> README.md; chmod +x nested/hello.txt"];
+            invoke(false, &command).unwrap();
+            fs::write(cwd.join("README.md"), "native edit\n").unwrap();
+            let native = [
+                "apply_patch",
+                "native patch payload with \"quotes\" and \\paths\n",
+            ];
+            invoke(true, &native).unwrap();
+            let entries =
+                supervise::parse_worker_execution_journal(&fs::read(&path).unwrap(), &path)
+                    .unwrap();
+            assert_eq!(entries.len(), 3);
+            assert_eq!(entries[1].command, command);
+            assert_eq!(
+                entries[1].changed_paths,
+                vec![
+                    PathBuf::from("README.md"),
+                    PathBuf::from("nested/hello.txt")
+                ]
+            );
+            assert_eq!(entries[2].command, native);
+            assert_eq!(entries[2].changed_paths, vec![PathBuf::from("README.md")]);
+            let completed = serde_json::to_value(&entries[1]).unwrap();
+            let observed = serde_json::to_value(&entries[2]).unwrap();
+            assert_eq!(
+                completed["observation"]["after"],
+                observed["observation"]["before"]
+            );
+            assert_ne!(
+                completed["observation"]["after"]["README.md"],
+                observed["observation"]["after"]["README.md"]
+            );
+            assert_eq!(
+                fs::read_to_string(cwd.join("nested/hello.txt")).unwrap(),
+                "Hello from MACO\n"
+            );
+
+            // Refuse traversal declarations, journal aliases and observed symlinks.
+            let bytes = fs::read(&path).unwrap();
+            assert!(invoke_worker_journal_append(&path, &identity, "patch", "../escape").is_err());
+            let alias = root.join("alias.jsonl");
+            std::os::unix::fs::symlink(&path, &alias).unwrap();
+            assert!(invoke_worker_journal_append(&alias, &identity, "patch", "README.md").is_err());
+            let outside = root.join("outside");
+            fs::write(&outside, "must not be read or changed").unwrap();
+            fs::remove_file(cwd.join("README.md")).unwrap();
+            std::os::unix::fs::symlink(&outside, cwd.join("README.md")).unwrap();
+            assert!(invoke(true, &native).is_err());
+            assert_eq!(fs::read(&path).unwrap(), bytes);
+            assert_eq!(
+                fs::read_to_string(outside).unwrap(),
+                "must not be read or changed"
+            );
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_refuses_wrong_missing_and_symlink_identity() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let other = root.join("other.jsonl");
+        precreated_journal(&other);
+        let patch = "*** Begin Patch\n*** Update File: p\n+x\n*** End Patch";
+        assert!(invoke_worker_journal_append(&other, &identity, patch, "p").is_err());
+        let missing = root.join("missing.jsonl");
+        assert!(invoke_worker_journal_append(&missing, &identity, patch, "p").is_err());
+        assert!(!missing.exists());
+        let alias = root.join("alias.jsonl");
+        symlink(&path, &alias).unwrap();
+        assert!(invoke_worker_journal_append(&alias, &identity, patch, "p").is_err());
+        let ancestor = root.join("alias-dir");
+        symlink(&root, &ancestor).unwrap();
+        assert!(invoke_worker_journal_append(
+            &ancestor.join("worker.jsonl"),
+            &identity,
+            patch,
+            "p"
+        )
+        .is_err());
+        fs::hard_link(&path, root.join("hardlink.jsonl")).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, patch, "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        assert!(fs::read(&other).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_preserves_validation_before_any_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let error = invoke_worker_journal_append(&path, &identity, " \n ", "p").unwrap_err();
+        assert!(error.to_string().contains("omitted the patch payload"));
+        let error =
+            invoke_worker_journal_append(&path, &identity, "patch", "../escape").unwrap_err();
+        assert!(error.to_string().contains("invalid changed_paths"));
+        assert!(fs::read(&path).unwrap().is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_append_cli_refuses_unsafe_mode_locked_file_and_capture_overflow() {
+        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::io::AsRawFd;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().canonicalize().unwrap().join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let locked = fs::File::open(&path).unwrap();
+        // SAFETY: the test owns a live descriptor and uses no pointer arguments.
+        assert_eq!(
+            unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert!(fs::read(&path).unwrap().is_empty());
+        drop(locked);
+        let original = vec![b' '; 1024 * 1024];
+        fs::write(&path, &original).unwrap();
+        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        assert_eq!(fs::read(&path).unwrap(), original);
+    }
 
     #[test]
     fn held_out_provider_routing_preserves_legacy_fake_opt_in() {
@@ -5184,6 +5793,48 @@ mod cli_integration_tests {
         ]);
         assert_eq!(from_goal.runtime, Some(supervise::SupervisorRuntime::Grok));
         assert_eq!(from_goal.from_goal, Some(PathBuf::from("goal.md")));
+    }
+
+    #[test]
+    fn supervise_run_parses_bounded_additional_runtime_bindings() {
+        let args = supervise_run_args(&[
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--runtime",
+            "codex",
+            "--runtime-bin",
+            "/opt/codex",
+            "--additional-runtime-bin",
+            "grok=/opt/grok",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ]);
+        assert_eq!(args.additional_runtime_bin.len(), 1);
+        assert_eq!(
+            args.additional_runtime_bin[0].runtime,
+            supervise::SupervisorRuntime::Grok
+        );
+        assert_eq!(
+            args.additional_runtime_bin[0].executable,
+            PathBuf::from("/opt/grok")
+        );
+        assert!(Cli::try_parse_from([
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--additional-runtime-bin",
+            "unknown=/opt/agent",
+            LAUNCH_RETENTION[0],
+            LAUNCH_RETENTION[1],
+            LAUNCH_RETENTION[2],
+            LAUNCH_RETENTION[3],
+        ])
+        .is_err());
     }
 
     #[test]

@@ -154,7 +154,10 @@ fn fixed_version_probe_streams(
     environment: &BTreeMap<String, String>,
     codex_auth: Option<&ValidatedCodexAuth>,
     credential_redactor: Option<&CredentialRedactor>,
-) -> (EnvironmentFixedVersionProbeStream, EnvironmentFixedVersionProbeStream) {
+) -> (
+    EnvironmentFixedVersionProbeStream,
+    EnvironmentFixedVersionProbeStream,
+) {
     let redact = |redactor: &CredentialRedactor| {
         (
             bounded_redacted_probe_stream(
@@ -172,7 +175,7 @@ fn fixed_version_probe_streams(
     if let Some(redactor) = credential_redactor {
         return redact(redactor);
     }
-    match CredentialRedactor::from_runtime(environment, codex_auth) {
+    match CredentialRedactor::from_runtime(environment, codex_auth, None) {
         Ok(redactor) => redact(&redactor),
         Err(_) => (
             withheld_fixed_version_probe_stream(),
@@ -189,22 +192,17 @@ fn record_fixed_version_probe_output(
     credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) {
-    let (stdout, stderr) = fixed_version_probe_streams(
-        output,
-        environment,
-        codex_auth,
-        credential_redactor,
-    );
-    process_evidence.fixed_version_probe_evidence =
-        Some(EnvironmentFixedVersionProbeEvidence {
-            executable,
-            exit_code: output.status.and_then(|status| status.code()),
-            timed_out: output.timed_out,
-            stdout,
-            stderr,
-            process_tree: output.process_tree,
-            side_effects: output.side_effects,
-        });
+    let (stdout, stderr) =
+        fixed_version_probe_streams(output, environment, codex_auth, credential_redactor);
+    process_evidence.fixed_version_probe_evidence = Some(EnvironmentFixedVersionProbeEvidence {
+        executable,
+        exit_code: output.status.and_then(|status| status.code()),
+        timed_out: output.timed_out,
+        stdout,
+        stderr,
+        process_tree: output.process_tree,
+        side_effects: output.side_effects,
+    });
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -369,6 +367,7 @@ fn with_external_runtime_context(
         .with_private_runtime_home(true)
         .with_private_runtime_codex_home(codex_invocation && staged_codex_home.is_none())
         .with_private_runtime_grok_home(invocation == ExternalAgentInvocation::Grok)
+        .with_private_runtime_cursor_home(invocation == ExternalAgentInvocation::Cursor)
         .with_side_effect_confinement(side_effect_profile);
     let prepared = match staged_codex_home {
         Some(home) => prepared.with_staged_codex_home(home),
@@ -402,6 +401,8 @@ fn credential_present(
     environment: &BTreeMap<String, String>,
 ) -> bool {
     match credential {
+        EnvironmentCredential::AnthropicApiKey => environment.contains_key("ANTHROPIC_API_KEY"),
+        EnvironmentCredential::ClaudeManagedOAuth => false,
         EnvironmentCredential::OpenAiApiKey => environment.contains_key("OPENAI_API_KEY"),
         EnvironmentCredential::CodexApiKey => environment.contains_key("CODEX_API_KEY"),
         EnvironmentCredential::CodexAccessToken => environment.contains_key("CODEX_ACCESS_TOKEN"),
@@ -424,6 +425,8 @@ fn configuration_present(
 
 const fn credential_name(credential: EnvironmentCredential) -> &'static str {
     match credential {
+        EnvironmentCredential::AnthropicApiKey => "ANTHROPIC_API_KEY",
+        EnvironmentCredential::ClaudeManagedOAuth => "selected CAM Claude OAuth account",
         EnvironmentCredential::OpenAiApiKey => "OPENAI_API_KEY",
         EnvironmentCredential::CodexApiKey => "CODEX_API_KEY",
         EnvironmentCredential::CodexAccessToken => "CODEX_ACCESS_TOKEN",
@@ -442,11 +445,11 @@ const fn external_sandbox_requirement(
 ) -> EnvironmentRequirement {
     let capability = match invocation {
         ExternalAgentInvocation::Grok => EnvironmentSandboxCapability::VerifiedExternalGrok,
+        ExternalAgentInvocation::ClaudeCode => EnvironmentSandboxCapability::VerifiedExternalClaude,
+        ExternalAgentInvocation::Cursor => EnvironmentSandboxCapability::VerifiedExternalCursor,
         ExternalAgentInvocation::CodexSupervisor
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::ClaudeConsultant
-        | ExternalAgentInvocation::Cursor
-        | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => EnvironmentSandboxCapability::VerifiedExternalCodex,
     };
     EnvironmentRequirement::sandbox(capability)
@@ -511,7 +514,24 @@ fn insert_admitted_grok_home_environment(
 }
 
 fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, key: &str) -> bool {
-    invocation != ExternalAgentInvocation::Grok || !matches!(key, "HOME" | "GROK_HOME")
+    match invocation {
+        ExternalAgentInvocation::Grok => !matches!(key, "HOME" | "GROK_HOME"),
+        ExternalAgentInvocation::ClaudeCode => !matches!(
+            key,
+            "HOME"
+                | "CLAUDE_CONFIG_DIR"
+                | "CLAUDE_SECURESTORAGE_CONFIG_DIR"
+                | "CLAUDE_CODE_OAUTH_TOKEN"
+                | "ANTHROPIC_API_KEY"
+                | "ANTHROPIC_AUTH_TOKEN"
+                | "ANTHROPIC_BASE_URL"
+        ),
+        ExternalAgentInvocation::Cursor => !matches!(
+            key,
+            "HOME" | "CURSOR_CONFIG_DIR" | "AGENT_CLI_CREDENTIAL_STORE" | "CURSOR_API_KEY"
+        ),
+        _ => true,
+    }
 }
 
 pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
@@ -519,6 +539,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     external_environment: &mut BTreeMap<String, String>,
 ) -> Result<()> {
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(());
     };
     let identity = spec
@@ -528,6 +551,9 @@ pub(crate) fn extend_common_runtime_environment_with_assignment_messaging(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(());
+    }
     for (key, value) in pairs {
         external_environment.insert(key, value);
     }
@@ -543,6 +569,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
 
     let Some(launch) = spec.assignment_messaging_launch.as_ref() else {
+        if spec.codex_managed_worker_requests_enabled() {
+            bail!("managed initial Codex parent is missing its sealed inbox endpoint");
+        }
         return Ok(BTreeMap::new());
     };
     let identity = spec
@@ -552,6 +581,9 @@ pub(crate) fn assignment_messaging_launch_environment_overlay(
     let pairs = launch
         .environment_for(&identity.run_id, &identity.task_id)
         .context("assignment messaging launch binding refused for lifecycle identity")?;
+    if spec.codex_managed_readonly_route_active() {
+        return Ok(BTreeMap::new());
+    }
     let mut overlay = BTreeMap::new();
     for (key, value) in pairs {
         if key == ENV_MESSAGE_ENDPOINT || key == ENV_MESSAGE_TOKEN {
@@ -798,6 +830,26 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
     static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
         const { std::cell::Cell::new(0) };
+    static INJECTED_ADMITTED_CLAUDE_IDENTITY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+pub(crate) struct InjectedAdmittedClaudeIdentityGuard;
+
+#[cfg(test)]
+impl Drop for InjectedAdmittedClaudeIdentityGuard {
+    fn drop(&mut self) {
+        INJECTED_ADMITTED_CLAUDE_IDENTITY.with(|injected| injected.set(false));
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn inject_admitted_claude_identity_for_test() -> InjectedAdmittedClaudeIdentityGuard {
+    INJECTED_ADMITTED_CLAUDE_IDENTITY.with(|injected| {
+        assert!(!injected.replace(true), "nested Claude identity injection");
+    });
+    InjectedAdmittedClaudeIdentityGuard
 }
 
 #[cfg(test)]
@@ -830,7 +882,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     if program != Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM) {
         return Ok(None);
     }
-    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone()) else {
+    let Some(path) = INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.borrow().clone())
+    else {
         return Ok(None);
     };
     let canonical = fs::canonicalize(&path)
@@ -839,7 +892,8 @@ fn injected_trusted_codex_resolution(program: &Path) -> Result<Option<PathBuf>> 
     Ok(Some(canonical))
 }
 
-pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure> {
+pub(crate) fn supervisor_explicit_codex_catalog_binding_mismatch_failure() -> Box<EnvironmentFailure>
+{
     Box::new(EnvironmentFailure::runtime_model_catalog(format!(
         "Codex runtime model catalog acquisition failed: cause={}",
         CodexRuntimeModelCatalogFailureCause::UntrustedCustomExecutable
@@ -917,7 +971,9 @@ fn prepare_codex_runtime_model_catalog_process(
                     (sealed_program.to_path_buf(), Some(grant))
                 } else {
                     let resolved_program = resolve_external_program(program, resolver_search_base)
-                        .context(CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed)?;
+                        .context(
+                            CodexRuntimeModelCatalogFailureCause::ExecutableResolutionFailed,
+                        )?;
                     let grant = grant
                         .seal_independently_verified_canonical_binding(&resolved_program)
                         .map_err(|error| {
@@ -970,6 +1026,7 @@ fn prepare_codex_runtime_model_catalog_process(
         .with_environment(EnvironmentMode::ClearAndSet(allowed_env(
             ExternalAgentInvocation::CodexSupervisor,
             ExternalProgramTrust::TrustedSystemCodex,
+            false,
         )))
         .with_stdin(StdinMode::Null)
         .with_timeout(Some(timeout))
@@ -1002,9 +1059,7 @@ fn bind_catalog_preflight_grant(
     };
     let sealed_expected_parent = grant
         .consume_for_process_binding(program, &process_spec.current_dir, args, expected_origin)
-        .map_err(|error| {
-            anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error))
-        })?;
+        .map_err(|error| anyhow::Error::from(CodexRuntimeModelCatalogFailureCause::from(error)))?;
     let expected_confinement = SideEffectConfinementProfile::ExternalCodex(
         ExternalCodexProfile::read_only(&sealed_expected_parent),
     );
@@ -1038,8 +1093,8 @@ fn execute_prepared_codex_runtime_model_catalog(
         return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
     }
     auth_result?;
-    let output =
-        process_result.map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
+    let output = process_result
+        .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
     if !output.safety_sensitive_succeeded() {
         return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
     }
@@ -1239,7 +1294,76 @@ fn parse_codex_runtime_model_catalog(bytes: &[u8]) -> Result<CodexRuntimeModelCa
             })?;
         slugs.push(slug.to_string());
     }
-    CodexRuntimeModelCatalog::from_slugs(slugs)
+    let mut catalog = CodexRuntimeModelCatalog::from_slugs(slugs)?;
+    for model in models {
+        let slug = model["slug"]
+            .as_str()
+            .context("validated model slug disappeared")?;
+        let supported = match model.get("supported_reasoning_levels") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let levels = value
+                    .as_array()
+                    .context("supported reasoning levels must be an array")?;
+                if levels.is_empty() {
+                    bail!("supported reasoning levels must be omitted when unknown");
+                }
+                let mut efforts = BTreeSet::new();
+                for level in levels {
+                    let effort = level
+                        .as_str()
+                        .or_else(|| level.get("effort").and_then(serde_json::Value::as_str))
+                        .context("reasoning level must have a string effort")?;
+                    if !matches!(
+                        effort,
+                        "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max" | "ultra"
+                    ) || !efforts.insert(effort.to_string())
+                    {
+                        bail!("unsupported or duplicate advertised reasoning effort");
+                    }
+                }
+                Some(efforts)
+            }
+        };
+        let default = match model.get("default_reasoning_level") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(
+                value
+                    .as_str()
+                    .context("default reasoning level must be a string")?
+                    .to_string(),
+            ),
+        };
+        if default.as_ref().is_some_and(|effort| {
+            !supported
+                .as_ref()
+                .is_some_and(|supported| supported.contains(effort))
+        }) {
+            bail!("default reasoning effort must be present in advertised support");
+        }
+        catalog.effort_metadata.insert(
+            slug.to_string(),
+            CodexModelEffortMetadata { supported, default },
+        );
+    }
+    Ok(catalog)
+}
+
+#[cfg(test)]
+mod catalog_effort_tests {
+    use super::*;
+
+    #[test]
+    fn parser_retains_exact_efforts_and_refuses_invalid_defaults() -> Result<()> {
+        let catalog = parse_codex_runtime_model_catalog(br#"{"models":[{"slug":"catalog-model","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"}],"default_reasoning_level":"high"}]}"#)?;
+        assert!(catalog.supports_effort("catalog-model", "minimal"));
+        assert!(!catalog.supports_effort("catalog-model", "xhigh"));
+        let unknown =
+            parse_codex_runtime_model_catalog(br#"{"models":[{"slug":"catalog-model"}]}"#)?;
+        assert!(!unknown.supports_effort("catalog-model", "high"));
+        assert!(parse_codex_runtime_model_catalog(br#"{"models":[{"slug":"catalog-model","supported_reasoning_levels":["high"],"default_reasoning_level":"xhigh"}]}"#).is_err());
+        Ok(())
+    }
 }
 
 fn validate_codex_model_slug(slug: &str) -> Result<()> {
@@ -1287,7 +1411,8 @@ fn external_program_trust_for_resolved_executable(
     if matches!(
         spec.invocation,
         ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
-    ) && spec.program.is_absolute() {
+    ) && spec.program.is_absolute()
+    {
         match resolve_trusted_system_codex_executable_for_catalog(&spec.cwd) {
             Ok(trusted) if trusted == resolved_program => {
                 return ExternalProgramTrust::TrustedSystemCodex;
@@ -1489,6 +1614,7 @@ fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> 
 struct ExternalProgramIdentity {
     length: u64,
     modified: Option<std::time::SystemTime>,
+    sha256: String,
     #[cfg(unix)]
     device: u64,
     #[cfg(unix)]
@@ -1505,14 +1631,164 @@ impl ExternalProgramIdentity {
         #[cfg(unix)]
         {
             format!(
-                "dev={};ino={};len={};mtime_ns={modified}",
-                self.device, self.inode, self.length
+                "dev={};ino={};len={};mtime_ns={modified};sha256={}",
+                self.device, self.inode, self.length, self.sha256
             )
         }
         #[cfg(not(unix))]
         {
-            format!("len={};mtime_ns={modified}", self.length)
+            format!(
+                "len={};mtime_ns={modified};sha256={}",
+                self.length, self.sha256
+            )
         }
+    }
+}
+
+/// Holds the source prompt whose bytes were augmented for the native Grok
+/// pathname transport. It is neither an extra readable root nor a wire proof.
+#[cfg(target_os = "linux")]
+struct HeldWorkerPrompt {
+    file: fs::File,
+    identity: ExternalProgramIdentity,
+    mode: u32,
+    owner: u32,
+}
+
+#[cfg(target_os = "linux")]
+impl HeldWorkerPrompt {
+    fn open(path: &Path, expected_sha256: &str) -> Result<Self> {
+        use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+        ensure_safe_read_target(path)?;
+        let file = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+            .open(path)?;
+        let metadata = file.metadata()?;
+        let held = Self {
+            file,
+            identity: external_program_identity(path)?,
+            mode: metadata.mode(),
+            owner: metadata.uid(),
+        };
+        held.revalidate(path, expected_sha256)?;
+        Ok(held)
+    }
+
+    fn revalidate(&self, path: &Path, expected_sha256: &str) -> Result<()> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        ensure_safe_read_target(path)?;
+        let held = self.file.metadata()?;
+        let visible = fs::symlink_metadata(path)?;
+        if !held.is_file()
+            || !visible.is_file()
+            || held.dev() != visible.dev()
+            || held.ino() != visible.ino()
+            || held.len() != visible.len()
+            || held.mode() != visible.mode()
+            || held.uid() != visible.uid()
+            || held.mode() != self.mode
+            || held.uid() != self.owner
+            || held.nlink() != 1
+            || held.len() > MAX_PROMPT_BYTES as u64
+            || external_program_identity(path)? != self.identity
+        {
+            bail!("Grok journal source prompt held identity changed");
+        }
+        let mut bytes = vec![0_u8; usize::try_from(held.len())?];
+        self.file.read_exact_at(&mut bytes, 0)?;
+        let after = self.file.metadata()?;
+        if sha256_hex(&bytes) != expected_sha256
+            || after.len() != held.len()
+            || after.modified()? != held.modified()?
+            || after.mode() != self.mode
+            || after.uid() != self.owner
+            || after.nlink() != 1
+            || external_program_identity(path)? != self.identity
+        {
+            bail!("Grok journal source prompt bytes changed");
+        }
+        Ok(())
+    }
+}
+
+fn external_program_sha256(path: &Path) -> Result<String> {
+    let mut file = OpenOptions::new()
+        .read(true)
+        .open(path)
+        .with_context(|| format!("failed to open executable bytes {}", path.display()))?;
+    let mut bytes = Vec::new();
+    file.read_to_end(&mut bytes)
+        .with_context(|| format!("failed to read executable bytes {}", path.display()))?;
+    Ok(sha256_hex(&bytes))
+}
+
+fn resolve_claude_native_program_identity(program: &Path, cwd: &Path) -> Result<(PathBuf, String)> {
+    #[cfg(test)]
+    if program == Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+        && INJECTED_ADMITTED_CLAUDE_IDENTITY.with(std::cell::Cell::get)
+    {
+        return Ok((
+            PathBuf::from(claude::CLAUDE_NATIVE_EXECUTABLE),
+            claude::CLAUDE_NATIVE_SHA256.to_string(),
+        ));
+    }
+    let resolved = resolve_external_program(program, cwd)
+        .context("failed to resolve Claude executable for immutable byte binding")?;
+    let digest = external_program_sha256(&resolved)?;
+    Ok((resolved, digest))
+}
+
+fn validate_read_only_target_executable_pin_mode(spec: &ExternalAgentCommand) -> Result<()> {
+    if !cfg!(target_os = "linux")
+        || spec.invocation != ExternalAgentInvocation::Grok
+        || spec.workspace_access != WorkspaceAccess::ReadOnly
+        || grok_acp_stdio_protocol_selected(spec)
+    {
+        bail!("target executable pin requires Linux headless Grok read-only delivery");
+    }
+    if spec
+        .read_only_target_executable_pin
+        .as_ref()
+        .is_some_and(|program| program != &spec.program)
+    {
+        bail!("read-only target executable pin program context changed");
+    }
+    Ok(())
+}
+
+fn capture_read_only_target_executable_pin(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+    resolved_program: &Path,
+) -> Result<Option<crate::pinned_exec::PinnedDirectExecutable>> {
+    if spec.read_only_target_executable_pin.is_none() {
+        return Ok(None);
+    }
+    validate_read_only_target_executable_pin_mode(spec)?;
+    if runtime != ExternalExecutionRuntime::Verified {
+        bail!("read-only target executable pin requires verified delivery");
+    }
+    #[cfg(target_os = "linux")]
+    {
+        if fs::canonicalize(&spec.program)? != resolved_program {
+            bail!("read-only target executable pin resolved program context changed");
+        }
+        let pin = crate::pinned_exec::PinnedDirectExecutable::capture(resolved_program)?;
+        // Reject shebang delivery: its interpreter pin does not cover the import/dispatch graph.
+        // Use the existing authenticated plan validation without retaining another command copy.
+        let (descriptor, digest) = pin.encode_descriptor(&[], &[])?.into_parts();
+        let request = crate::pinned_exec::decode_verified_descriptor(
+            &descriptor,
+            std::ffi::OsStr::new(&digest),
+        )?;
+        request.prepare_exec_plan(-1)?;
+        Ok(Some(pin))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = resolved_program;
+        bail!("read-only target executable pin is unsupported on this platform");
     }
 }
 
@@ -1522,12 +1798,14 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
     if metadata.file_type().is_symlink() || !metadata.is_file() {
         bail!("external executable identity is not a regular file");
     }
+    let sha256 = external_program_sha256(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
         Ok(ExternalProgramIdentity {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            sha256,
             device: metadata.dev(),
             inode: metadata.ino(),
         })
@@ -1537,6 +1815,7 @@ fn external_program_identity(path: &Path) -> Result<ExternalProgramIdentity> {
         Ok(ExternalProgramIdentity {
             length: metadata.len(),
             modified: metadata.modified().ok(),
+            sha256,
         })
     }
 }
@@ -1795,7 +2074,10 @@ pub(crate) fn materialize_managed_child_git_commit(
 
     run_managed_child_git_command(
         &boundary,
-        vec![OsString::from("read-tree"), OsString::from(captured_base.to_string())],
+        vec![
+            OsString::from("read-tree"),
+            OsString::from(captured_base.to_string()),
+        ],
         StdinMode::Null,
         "initialize managed child materialization index",
     )?;
@@ -2037,9 +2319,7 @@ fn managed_child_tree_edge_paths(
     Ok(paths)
 }
 
-fn require_managed_child_clean_unstaged_worktree(
-    boundary: &ManagedChildGitBoundary,
-) -> Result<()> {
+fn require_managed_child_clean_unstaged_worktree(boundary: &ManagedChildGitBoundary) -> Result<()> {
     let unstaged = run_managed_child_git_command_allow_status(
         boundary,
         vec![
@@ -3137,6 +3417,7 @@ fn capture_worker_journal_artifacts(
             WorkerJournalArtifactCapture {
                 worker_id: artifact.worker_id.clone(),
                 path: artifact.path.clone(),
+                command_binding: None,
                 status,
             }
         })
@@ -4870,64 +5151,148 @@ fn materialize_control_exception_file(
         .open(workspace.join(relative))
 }
 
+pub(crate) const CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS: [&str; 5] = [
+    "/etc/claude-code",
+    "/mnt/c/Program Files/ClaudeCode",
+    "/mnt/c/ProgramData/ClaudeCode",
+    "/mnt/c/Users",
+    "/mnt/d",
+];
+
 enum ExternalProviderProfile {
     Codex(ExternalCodexProfile),
+    Claude(ExternalClaudeProfile),
     Grok(ExternalGrokProfile),
+    Cursor(ExternalCursorProfile),
+}
+
+#[derive(Clone, Copy, Default)]
+struct ClaudeProfileBinding<'a> {
+    child_config_home: Option<&'a Path>,
+    managed_data_root: Option<&'a Path>,
+    parent_socket: Option<&'a Path>,
+    deadline_unix_millis: Option<u64>,
+    helper_registration_nonce: Option<&'a str>,
+    containment_owner: Option<&'a ClaudeContainmentOwnerBinding>,
 }
 
 impl ExternalProviderProfile {
-    fn for_command(spec: &ExternalAgentCommand) -> Result<Self> {
-        Ok(match (
-            spec.invocation,
-            spec.workspace_access,
-            spec.writable_runtime_selection.as_ref(),
-        ) {
-            (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
-                ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
-            ),
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
-                Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
-            }
-            // Direct profile unit tests exercise lower-level Grok inputs. Production writable
-            // Grok reaches this point only after the external boundary has required supervisor
-            // selection and confinement evidence.
-            (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
-                Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadOnly, _) => {
-                Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
-            }
-            (_, WorkspaceAccess::ReadWrite, _) => {
-                Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
-            }
-        })
+    fn for_command(spec: &ExternalAgentCommand, claude: ClaudeProfileBinding<'_>) -> Result<Self> {
+        Ok(
+            match (
+                spec.invocation,
+                spec.workspace_access,
+                spec.writable_runtime_selection.as_ref(),
+            ) {
+                (ExternalAgentInvocation::Grok, _, Some(_)) => Self::Grok(
+                    ExternalGrokProfile::read_write(spec.selected_grok_writable_workspace()?),
+                ),
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadOnly, None) => {
+                    Self::Grok(ExternalGrokProfile::read_only(&spec.cwd))
+                }
+                // Direct profile unit tests exercise lower-level Grok inputs. Production writable
+                // Grok reaches this point only after the external boundary has required supervisor
+                // selection and confinement evidence.
+                (ExternalAgentInvocation::Grok, WorkspaceAccess::ReadWrite, None) => {
+                    Self::Grok(ExternalGrokProfile::read_write(&spec.cwd))
+                }
+                (ExternalAgentInvocation::ClaudeCode, WorkspaceAccess::ReadOnly, _)
+                    if spec.uses_live_claude_managed_worker_budget() =>
+                {
+                    Self::Claude(ExternalClaudeProfile::read_only(
+                        &spec.cwd,
+                        claude
+                            .parent_socket
+                            .context("managed Claude launch has no parent relay socket binding")?,
+                        claude
+                            .deadline_unix_millis
+                            .context("managed Claude launch has no relay deadline binding")?,
+                        claude
+                            .helper_registration_nonce
+                            .context("managed Claude launch has no helper registration binding")?,
+                        claude
+                            .containment_owner
+                            .context("managed Claude launch has no containment owner binding")?
+                            .clone(),
+                    ))
+                }
+                (ExternalAgentInvocation::ClaudeCode, WorkspaceAccess::ReadWrite, _)
+                    if spec.uses_live_claude_managed_worker_budget() =>
+                {
+                    Self::Claude(ExternalClaudeProfile::read_write(
+                        &spec.cwd,
+                        claude
+                            .parent_socket
+                            .context("managed Claude launch has no parent relay socket binding")?,
+                        claude
+                            .deadline_unix_millis
+                            .context("managed Claude launch has no relay deadline binding")?,
+                        claude
+                            .helper_registration_nonce
+                            .context("managed Claude launch has no helper registration binding")?,
+                        claude
+                            .containment_owner
+                            .context("managed Claude launch has no containment owner binding")?
+                            .clone(),
+                    ))
+                }
+                (ExternalAgentInvocation::Cursor, WorkspaceAccess::ReadOnly, _) => {
+                    Self::Cursor(ExternalCursorProfile::read_only(&spec.cwd))
+                }
+                (ExternalAgentInvocation::Cursor, WorkspaceAccess::ReadWrite, _) => {
+                    Self::Cursor(ExternalCursorProfile::read_write(&spec.cwd))
+                }
+                (_, WorkspaceAccess::ReadOnly, _) => {
+                    Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
+                }
+                (_, WorkspaceAccess::ReadWrite, _) => {
+                    Self::Codex(ExternalCodexProfile::read_write(&spec.cwd))
+                }
+            },
+        )
     }
 
     fn with_visible_read_only_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_only_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_root(root.into())),
+            Self::Cursor(profile) => Self::Cursor(profile.with_visible_read_only_root(root.into())),
         }
     }
 
     fn with_visible_read_only_file(self, file: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_only_file(file.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_file(file.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_file(file.into())),
+            Self::Cursor(profile) => Self::Cursor(profile.with_visible_read_only_file(file.into())),
         }
     }
 
     fn with_visible_read_write_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_root(root.into())),
+            Self::Claude(profile) => {
+                Self::Claude(profile.with_visible_read_write_root(root.into()))
+            }
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_write_root(root.into())),
+            Self::Cursor(profile) => {
+                Self::Cursor(profile.with_visible_read_write_root(root.into()))
+            }
         }
     }
 
     fn with_visible_read_write_file(self, file: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_file(file.into())),
+            Self::Claude(profile) => {
+                Self::Claude(profile.with_visible_read_write_file(file.into()))
+            }
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_write_file(file.into())),
+            Self::Cursor(profile) => {
+                Self::Cursor(profile.with_visible_read_write_file(file.into()))
+            }
         }
     }
 
@@ -4941,39 +5306,68 @@ impl ExternalProviderProfile {
             Self::Codex(profile) => profile
                 .with_visible_read_write_file_capability(file.into(), held_file)
                 .map(Self::Codex),
+            Self::Claude(profile) => profile
+                .with_visible_read_write_file_capability(file.into(), held_file)
+                .map(Self::Claude),
             Self::Grok(profile) => profile
                 .with_visible_read_write_file_capability(file.into(), held_file)
                 .map(Self::Grok),
+            Self::Cursor(profile) => profile
+                .with_visible_read_write_file_capability(file.into(), held_file)
+                .map(Self::Cursor),
         }
     }
 
     fn with_writable_artifact_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_writable_artifact_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_writable_artifact_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile),
+            Self::Cursor(profile) => Self::Cursor(profile),
         }
     }
 
     fn with_hidden_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_hidden_root(root.into())),
+            Self::Claude(profile) => Self::Claude(profile.with_hidden_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_hidden_root(root.into())),
+            Self::Cursor(profile) => Self::Cursor(profile.with_hidden_root(root.into())),
         }
     }
 
     fn finish(self) -> SideEffectConfinementProfile {
         match self {
             Self::Codex(profile) => SideEffectConfinementProfile::ExternalCodex(profile),
+            Self::Claude(profile) => SideEffectConfinementProfile::ExternalClaude(profile),
             Self::Grok(profile) => SideEffectConfinementProfile::ExternalGrok(profile),
+            Self::Cursor(profile) => SideEffectConfinementProfile::ExternalCursor(profile),
         }
     }
 }
 
+#[cfg(test)]
 fn external_side_effect_profile(
     spec: &ExternalAgentCommand,
     program: &Path,
     program_trust: ExternalProgramTrust,
     protected_controls: &ProtectedWorktreeControls,
+) -> Result<SideEffectConfinementProfile> {
+    external_side_effect_profile_with_claude_relay(
+        spec,
+        program,
+        program_trust,
+        protected_controls,
+        ClaudeProfileBinding::default(),
+    )
+}
+
+fn external_side_effect_profile_with_claude_relay(
+    spec: &ExternalAgentCommand,
+    program: &Path,
+    program_trust: ExternalProgramTrust,
+    protected_controls: &ProtectedWorktreeControls,
+    claude: ClaudeProfileBinding<'_>,
 ) -> Result<SideEffectConfinementProfile> {
     if program_trust != ExternalProgramTrust::TrustedSystemCodex
         && !spec.invocation.is_adapter_subprocess()
@@ -4997,7 +5391,7 @@ fn external_side_effect_profile(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli => {
-            let mut profile = ExternalProviderProfile::for_command(spec)?;
+            let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
             }
@@ -5119,8 +5513,34 @@ fn external_side_effect_profile(
             // Grok's bounded streaming-json response is captured and published by the MACO
             // parent. The child needs only its exact precreated journal file capabilities; it
             // must never receive the incoming publication directory as a writable root.
-            if spec.invocation != ExternalAgentInvocation::Grok {
+            if !matches!(
+                spec.invocation,
+                ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+            ) {
                 profile = profile.with_writable_artifact_root(artifact_root);
+            }
+            if spec.invocation == ExternalAgentInvocation::ClaudeCode {
+                // Pinned bare mode still loads managed policy. Mask both native Linux policy and
+                // the Windows policy roots consulted by the pinned WSL path before target start.
+                for root in CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS {
+                    profile = profile.with_hidden_root(root);
+                }
+                if spec.uses_live_claude_managed_worker_budget() {
+                    let child_config_home = claude
+                        .child_config_home
+                        .context("managed Claude OAuth launch has no isolated child config home")?;
+                    let managed_data_root = claude
+                        .managed_data_root
+                        .context("managed Claude OAuth launch has no selected CAM data root")?;
+                    let relay_parent = claude
+                        .parent_socket
+                        .and_then(Path::parent)
+                        .context("managed Claude launch has no private relay directory")?;
+                    profile = profile
+                        .with_visible_read_write_root(child_config_home)
+                        .with_visible_read_only_root(relay_parent)
+                        .with_hidden_root(managed_data_root);
+                }
             }
             for root in &spec.hidden_roots {
                 profile = profile.with_hidden_root(root);
@@ -5171,6 +5591,52 @@ pub(crate) fn selected_grok_profile_projection_for_test(
         workspace_access,
         systemd_properties,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn selected_claude_systemd_properties_for_test(
+    spec: &ExternalAgentCommand,
+    child_config_home: &Path,
+    managed_data_root: &Path,
+    parent_relay_socket: &Path,
+    deadline_unix_millis: u64,
+) -> Result<Vec<String>> {
+    let output_parent = required_parent(&spec.output_last_message)?;
+    let controls = ProtectedWorktreeControls {
+        writable_artifact_root: Some(fs::canonicalize(output_parent)?),
+        ..ProtectedWorktreeControls::default()
+    };
+    let containment_owner = crate::process_runner::ClaudeContainmentOwnerBinding::new();
+    let profile = external_side_effect_profile_with_claude_relay(
+        spec,
+        &spec.program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+        ClaudeProfileBinding {
+            child_config_home: Some(child_config_home),
+            managed_data_root: Some(managed_data_root),
+            parent_socket: Some(parent_relay_socket),
+            deadline_unix_millis: Some(deadline_unix_millis),
+            helper_registration_nonce: Some(
+                "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+            ),
+            containment_owner: Some(&containment_owner),
+        },
+    )?;
+    let SideEffectConfinementProfile::ExternalClaude(profile) = profile else {
+        bail!("selected managed Claude command did not produce an ExternalClaude profile");
+    };
+    crate::process_runner::external_claude_systemd_properties_for_test(
+        profile,
+        &spec.program,
+        &spec.cwd,
+    )
+    .map_err(Into::into)
+}
+
+#[cfg(test)]
+fn claude_bare_api_key_present(environment: &BTreeMap<String, String>) -> bool {
+    credential_present(EnvironmentCredential::AnthropicApiKey, environment)
 }
 
 fn sandbox_denials_from_codex_jsonl(
@@ -5292,6 +5758,12 @@ fn required_parent(path: &Path) -> Result<&Path> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 enum CodexAuthValidationFailureCause {
+    #[error("managed_codex_selection_missing")]
+    ManagedSelectionMissing,
+    #[error("managed_codex_selection_not_carried")]
+    ManagedSelectionNotCarried,
+    #[error("managed_codex_authority_unavailable")]
+    ManagedAuthorityUnavailable,
     #[error("auth_home_not_absolute")]
     HomeNotAbsolute,
     #[error("auth_home_canonicalization_failed")]
@@ -5481,6 +5953,8 @@ fn ensure_trusted_codex_auth_file_metadata(
 
 #[derive(Debug)]
 struct ValidatedCodexAuth {
+    #[cfg(target_os = "linux")]
+    managed_authority: Option<crate::account_authority::codex::CodexLaunchAuthority>,
     path: PathBuf,
     bytes: Vec<u8>,
     length: u64,
@@ -5492,6 +5966,59 @@ struct ValidatedCodexAuth {
 }
 
 impl ValidatedCodexAuth {
+    fn load_for_command(spec: &ExternalAgentCommand) -> Result<Option<Self>> {
+        let observed = spec.agent_lifecycle.as_ref().and_then(|identity| {
+            crate::account_authority::codex_run_account_binding(&identity.run_id)
+        });
+        if observed != spec.codex_run_account_binding {
+            return Err(CodexAuthValidationFailureCause::ManagedSelectionNotCarried.into());
+        }
+        match spec.codex_run_account_binding.as_ref() {
+            Some(CodexRunAccountBinding::Missing) => {
+                Err(CodexAuthValidationFailureCause::ManagedSelectionMissing.into())
+            }
+            Some(CodexRunAccountBinding::Selected(frozen)) => {
+                #[cfg(target_os = "linux")]
+                {
+                    let authority =
+                        crate::account_authority::codex::acquire_codex_launch_authority(frozen)
+                            .context(
+                                CodexAuthValidationFailureCause::ManagedAuthorityUnavailable,
+                            )?;
+                    Self::load_for_managed_authority(authority).map(Some)
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = frozen;
+                    Err(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable.into())
+                }
+            }
+            None | Some(CodexRunAccountBinding::LocalAuth)
+                if crate::account_authority::configured_cam_authority_socket().is_some() =>
+            {
+                Err(CodexAuthValidationFailureCause::ManagedSelectionNotCarried.into())
+            }
+            None | Some(CodexRunAccountBinding::LocalAuth) => Self::load(),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn load_for_managed_authority(
+        authority: crate::account_authority::codex::CodexLaunchAuthority,
+    ) -> Result<Self> {
+        authority
+            .verify_binding_unchanged()
+            .context(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable)?;
+        // Unlike legacy canonical-home behavior, a selected managed declaration
+        // must retain its exact no-symlink ancestry before reading any credential.
+        ensure_trusted_codex_auth_home(authority.managed_codex_home())?;
+        let mut auth = Self::load_from_home(authority.managed_codex_home())?
+            .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
+        auth.managed_authority = Some(authority);
+        auth.verify_source_unchanged()?;
+        Ok(auth)
+    }
+
     fn load() -> Result<Option<Self>> {
         #[cfg(test)]
         if let Some(home) = INJECTED_CODEX_AUTH_HOME.with(|injected| injected.borrow().clone()) {
@@ -5588,6 +6115,8 @@ impl ValidatedCodexAuth {
                 );
             }
             Ok(Some(Self {
+                #[cfg(target_os = "linux")]
+                managed_authority: None,
                 path,
                 bytes,
                 length: metadata.len(),
@@ -5603,6 +6132,14 @@ impl ValidatedCodexAuth {
     }
 
     fn verify_source_unchanged(&self) -> Result<()> {
+        #[cfg(target_os = "linux")]
+        if self.managed_authority.is_none()
+            && crate::account_authority::cam_socket_for_frozen_selection(None)
+                .context(CodexAuthValidationFailureCause::ManagedSelectionNotCarried)?
+                .is_some()
+        {
+            return Err(CodexAuthValidationFailureCause::ManagedSelectionNotCarried.into());
+        }
         let metadata = fs::symlink_metadata(&self.path)
             .context(CodexAuthValidationFailureCause::AuthFileRevalidationInspectionFailed)?;
         if metadata.file_type().is_symlink()
@@ -5626,11 +6163,29 @@ impl ValidatedCodexAuth {
                 );
             }
         }
+        #[cfg(target_os = "linux")]
+        if let Some(authority) = &self.managed_authority {
+            authority
+                .verify_binding_unchanged()
+                .context(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable)?;
+            ensure_trusted_codex_auth_home(authority.managed_codex_home())?;
+            let current = Self::load_from_home(authority.managed_codex_home())?
+                .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
+            if current.path != self.path
+                || current.bytes != self.bytes
+                || current.device != self.device
+                || current.inode != self.inode
+            {
+                return Err(
+                    CodexAuthValidationFailureCause::AuthFileRevalidationIdentityChanged.into(),
+                );
+            }
+        }
         Ok(())
     }
 }
 
-#[derive(Clone, Default)]
+#[derive(Default)]
 struct CredentialRedactor {
     patterns: Vec<Vec<u8>>,
 }
@@ -5644,13 +6199,27 @@ impl std::fmt::Debug for CredentialRedactor {
     }
 }
 
+impl Drop for CredentialRedactor {
+    fn drop(&mut self) {
+        for pattern in &mut self.patterns {
+            pattern.fill(0);
+        }
+    }
+}
+
 impl CredentialRedactor {
     fn from_runtime(
         environment: &BTreeMap<String, String>,
         codex_auth: Option<&ValidatedCodexAuth>,
+        claude_oauth: Option<&[u8]>,
     ) -> Result<Self> {
         let mut patterns = Vec::new();
-        for key in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "OPENAI_API_KEY",
+            "CODEX_API_KEY",
+            "CODEX_ACCESS_TOKEN",
+        ] {
             if let Some(value) = environment.get(key) {
                 add_credential_pattern(&mut patterns, value.as_bytes())?;
                 if let Ok(quoted) = serde_json::to_string(value) {
@@ -5698,6 +6267,9 @@ impl CredentialRedactor {
                     "oversized Codex auth material did not expose any bounded redaction patterns"
                 );
             }
+        }
+        if let Some(oauth) = claude_oauth {
+            add_credential_pattern(&mut patterns, oauth)?;
         }
         patterns.sort_by(|left, right| right.len().cmp(&left.len()).then_with(|| left.cmp(right)));
         Ok(Self { patterns })
@@ -5916,12 +6488,10 @@ fn command_argv_with_controls_and_service_tier_input(
 
 pub(crate) fn grok_acp_stdio_protocol_selected(spec: &ExternalAgentCommand) -> bool {
     spec.invocation == ExternalAgentInvocation::Grok
-        && spec
-            .runtime_adapter
-            .as_ref()
-            .is_some_and(|config| {
-                config.grok_interaction_protocol() == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
-            })
+        && spec.runtime_adapter.as_ref().is_some_and(|config| {
+            config.grok_interaction_protocol()
+                == crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+        })
 }
 
 fn external_agent_stdin_mode(
@@ -5929,7 +6499,10 @@ fn external_agent_stdin_mode(
     app_server_required: bool,
     prompt: Vec<u8>,
 ) -> StdinMode {
-    if app_server_required || grok_acp_stdio_protocol_selected(spec) {
+    if app_server_required
+        || grok_acp_stdio_protocol_selected(spec)
+        || spec.invocation == ExternalAgentInvocation::Cursor
+    {
         StdinMode::Interactive
     } else if spec
         .runtime_adapter
@@ -5960,10 +6533,75 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
         output: &spec.output_last_message,
     };
     if spec.invocation == ExternalAgentInvocation::Grok {
-        config.render_grok_os_argv(&context, spec.output_schema.as_deref())
+        let mut argv = config.render_grok_os_argv(&context, spec.output_schema.as_deref())?;
+        if spec.workspace_access == WorkspaceAccess::ReadOnly
+            && !grok_acp_stdio_protocol_selected(spec)
+        {
+            argv.extend([OsString::from("--deny"), OsString::from("MCPTool")]);
+        }
+        Ok(argv)
     } else {
-        config.render_os_argv(&context)
+        let mut argv = config.render_os_argv(&context)?;
+        if spec.invocation == ExternalAgentInvocation::ClaudeCode
+            && spec
+                .claude_reservation_binding
+                .as_ref()
+                .is_some_and(|bound| {
+                    bound.claude_managed_launch.auth_mode == ClaudeAuthMode::ManagedOAuth
+                })
+        {
+            let bare = argv
+                .iter()
+                .position(|argument| argument == OsStr::new("--bare"))
+                .context("managed Claude OAuth argv omitted the pinned --bare transition point")?;
+            argv.remove(bare);
+        }
+        Ok(argv)
     }
+}
+
+#[cfg(target_os = "linux")]
+fn cursor_managed_argv(
+    spec: &ExternalAgentCommand,
+    install: &crate::runtime_adapter::cursor_managed_parent::CursorManagedInstall,
+) -> Result<Vec<OsString>> {
+    let config = spec
+        .runtime_adapter
+        .as_ref()
+        .context("managed Cursor launch omitted its adapter configuration")?;
+    if config.binary_path() != spec.program.as_path() {
+        bail!("managed Cursor selected executable changed before source binding");
+    }
+    let context = LaunchContext {
+        prompt: &spec.prompt,
+        model: spec.model.as_deref(),
+        effort: spec.reasoning_effort.as_deref(),
+        cwd: &spec.cwd,
+        output: &spec.output_last_message,
+    };
+    let vendor = config.render_managed_cursor_argv(&context)?;
+    cursor_managed_bootstrap_argv(&install.eval_source()?, vendor)
+}
+
+#[cfg(target_os = "linux")]
+const CURSOR_BOOTSTRAP_TRAMPOLINE: &str = "const source=JSON.parse(process.argv[1])+JSON.parse(process.argv[2]);process.argv.splice(1,2);eval(source);";
+
+#[cfg(target_os = "linux")]
+fn cursor_managed_bootstrap_argv(source: &str, vendor: Vec<String>) -> Result<Vec<OsString>> {
+    let mut split = source.len() / 2;
+    while !source.is_char_boundary(split) {
+        split -= 1;
+    }
+    let (first, second) = source.split_at(split);
+    let mut argv = vec![
+        OsString::from("-e"),
+        OsString::from(CURSOR_BOOTSTRAP_TRAMPOLINE),
+        OsString::from("--"),
+        OsString::from(serde_json::to_string(first)?),
+        OsString::from(serde_json::to_string(second)?),
+    ];
+    argv.extend(vendor.into_iter().map(OsString::from));
+    Ok(argv)
 }
 
 fn codex_supervisor_argv(
@@ -5971,12 +6609,13 @@ fn codex_supervisor_argv(
     controls: &ProtectedWorktreeControls,
     service_tier: Option<CodexServiceTierOverride>,
 ) -> Vec<OsString> {
-    let terminal_role = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
-        matches!(
-            identity.role.as_str(),
-            "worker" | "researcher" | "auditor" | "gate_classifier"
-        )
-    });
+    let terminal_role = spec.codex_native_delegation_disabled
+        || spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+            matches!(
+                identity.role.as_str(),
+                "worker" | "researcher" | "auditor" | "gate_classifier"
+            )
+        });
     let mut argv = codex_hardened_argv_with_service_tier(
         spec,
         controls,
@@ -5988,7 +6627,11 @@ fn codex_supervisor_argv(
         service_tier,
     );
     argv.extend([
-        OsString::from(if terminal_role { "--disable" } else { "--enable" }),
+        OsString::from(if terminal_role {
+            "--disable"
+        } else {
+            "--enable"
+        }),
         OsString::from("goals"),
         OsString::from("--json"),
         OsString::from("--output-last-message"),
@@ -6019,12 +6662,7 @@ fn codex_hardened_argv(
     spec: &ExternalAgentCommand,
     controls: &ProtectedWorktreeControls,
 ) -> Vec<OsString> {
-    codex_hardened_argv_with_service_tier(
-        spec,
-        controls,
-        CodexMultiAgentMode::Disabled,
-        None,
-    )
+    codex_hardened_argv_with_service_tier(spec, controls, CodexMultiAgentMode::Disabled, None)
 }
 
 fn codex_hardened_argv_with_service_tier(
@@ -6155,6 +6793,7 @@ fn codex_app_server_argv(
         "computer_use",
         "image_generation",
         "multi_agent",
+        "goals",
     ] {
         argv.push(OsString::from("--disable"));
         argv.push(OsString::from(feature));
@@ -6256,6 +6895,14 @@ fn codex_filesystem_permissions(
         }
     }
     for path in &controls.exact_read_only_input_files {
+        // The outer launch installs the declared source's immutable private
+        // snapshot and unlinks its backing name before releasing Codex. Rebinding
+        // that individual mount in the inner sandbox can fail with ENOENT. The
+        // identical read-only workspace grant already covers this descendant;
+        // retain the exact outer mount and every outside-workspace file rule.
+        if immutable_source_input_covered_by_read_only_workspace(spec, path) {
+            continue;
+        }
         if let Some(path) = path.to_str() {
             path_permissions.insert(path.to_string(), "read");
         }
@@ -6305,6 +6952,37 @@ fn codex_filesystem_permissions(
         "permissions.maco_external_codex.filesystem={{{}}}",
         entries.join(",")
     )
+}
+
+fn immutable_source_input_covered_by_read_only_workspace(
+    spec: &ExternalAgentCommand,
+    path: &Path,
+) -> bool {
+    if spec.workspace_access != WorkspaceAccess::ReadOnly
+        || spec.invocation != ExternalAgentInvocation::CodexSupervisor
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|identity| identity.role != "researcher")
+        || researcher_inputs::validate_command(spec).is_err()
+    {
+        return false;
+    }
+    let Ok(workspace) = fs::canonicalize(&spec.cwd) else {
+        return false;
+    };
+    // This only normalizes a redundant inner rule after the declaration, hash,
+    // no-follow identity and exact outer permission have all validated. The held
+    // snapshot preflight and its final launch revalidation remain mandatory.
+    path.starts_with(&workspace)
+        && spec
+            .read_only_input_files
+            .iter()
+            .any(|declared| declared == path)
+        && spec
+            .researcher_source_inputs
+            .iter()
+            .any(|input| workspace.join(&input.path) == path)
 }
 
 fn toml_basic_string(value: &str) -> String {
@@ -6369,7 +7047,22 @@ pub(crate) fn codex_usage_from_jsonl(bytes: &[u8]) -> Result<Option<Usage>> {
                 .context("Codex output token count does not fit this platform")?,
             total_tokens: 0,
         };
-        aggregate = aggregate.saturating_add(usage);
+        let input_tokens = aggregate
+            .input_tokens
+            .checked_add(usage.input_tokens)
+            .context("Codex aggregate input token count overflowed")?;
+        let output_tokens = aggregate
+            .output_tokens
+            .checked_add(usage.output_tokens)
+            .context("Codex aggregate output token count overflowed")?;
+        let total_tokens = input_tokens
+            .checked_add(output_tokens)
+            .context("Codex aggregate total token count overflowed")?;
+        aggregate = Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        };
         observed = true;
     }
     Ok(observed.then_some(aggregate))
@@ -6383,16 +7076,70 @@ fn claude_consultant_argv() -> Vec<OsString> {
     ]
 }
 
+fn external_environment_for_command(
+    spec: &ExternalAgentCommand,
+    target_adapter: Option<&RuntimeAdapterConfig>,
+    program_trust: ExternalProgramTrust,
+) -> BTreeMap<String, String> {
+    let selected_codex = matches!(
+        spec.invocation,
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+    ) && matches!(
+        spec.codex_run_account_binding.as_ref(),
+        Some(CodexRunAccountBinding::Selected(_))
+    );
+    let allow_claude_bare_api_key = !spec.uses_live_claude_managed_worker_budget();
+    let mut environment = if selected_codex {
+        allowed_env_with_selected_codex(
+            spec.invocation,
+            program_trust,
+            allow_claude_bare_api_key,
+            true,
+        )
+    } else {
+        allowed_env(spec.invocation, program_trust, allow_claude_bare_api_key)
+    };
+    if let Some(config) = target_adapter {
+        for key in &config.env_passthrough {
+            if !runtime_environment_passthrough_allowed(spec.invocation, key)
+                || (selected_codex
+                    && matches!(
+                        key.as_str(),
+                        "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN"
+                    ))
+            {
+                continue;
+            }
+            if let Ok(value) = env::var(key) {
+                environment.insert(key.clone(), value);
+            }
+        }
+    }
+    environment
+}
+
 fn allowed_env(
     invocation: ExternalAgentInvocation,
     program_trust: ExternalProgramTrust,
+    allow_claude_bare_api_key: bool,
+) -> BTreeMap<String, String> {
+    // Existing explicitly unmanaged/catalog callers retain their original policy.
+    allowed_env_with_selected_codex(invocation, program_trust, allow_claude_bare_api_key, false)
+}
+
+fn allowed_env_with_selected_codex(
+    invocation: ExternalAgentInvocation,
+    program_trust: ExternalProgramTrust,
+    allow_claude_bare_api_key: bool,
+    selected_codex: bool,
 ) -> BTreeMap<String, String> {
     let mut environment = BTreeMap::from([
         ("LANG".to_string(), "C.UTF-8".to_string()),
         ("LC_ALL".to_string(), "C.UTF-8".to_string()),
         ("TERM".to_string(), "dumb".to_string()),
     ]);
-    if program_trust == ExternalProgramTrust::TrustedSystemCodex
+    if !selected_codex
+        && program_trust == ExternalProgramTrust::TrustedSystemCodex
         && matches!(
             invocation,
             ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
@@ -6407,6 +7154,18 @@ fn allowed_env(
                 }
             }
         }
+    }
+    if invocation == ExternalAgentInvocation::ClaudeCode {
+        if allow_claude_bare_api_key {
+            if let Ok(value) = env::var("ANTHROPIC_API_KEY") {
+                if (MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+                    && !value.contains(['\n', '\r', '\0'])
+                {
+                    environment.insert("ANTHROPIC_API_KEY".to_string(), value);
+                }
+            }
+        }
+        environment.insert("DISABLE_COMPACT".to_string(), "1".to_string());
     }
     environment.insert("PATH".to_string(), TRUSTED_PATH.to_string());
     let trusted_ca = Path::new("/etc/ssl/certs/ca-bundle.crt");
@@ -6520,7 +7279,7 @@ fn summarize_redacted_output(
         bytes,
         raw_truncated: Some(output.is_truncated()),
         target_launch_attempted: false,
-        run_metadata: ExternalAgentRunMetadata::default(),
+        run_metadata: Box::default(),
     }
 }
 
@@ -6531,6 +7290,61 @@ fn write_redacted_json_log(
 ) -> Result<()> {
     let redacted = credential_redactor.redact_bytes(bytes);
     reservation.write_bytes_atomic(&redacted, OUTPUT_TEE_LIMIT_BYTES)
+}
+
+fn grok_filesystem_original_command_matches(
+    report: &ExternalAgentRun,
+    command: &ExternalAgentCommand,
+) -> bool {
+    report
+        .stdout
+        .run_metadata
+        .grok_native_usage
+        .as_ref()
+        .is_none_or(|capture| capture.command == *command)
+}
+
+// The batch receiver already matched its complete submitted ProcessSpec. Associate the
+// opaque result with this original invocation, reusing any existing native command snapshot.
+fn retain_grok_read_only_filesystem(
+    report: &mut ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+    evidence: Option<ReadOnlyFilesystemEvidence>,
+) {
+    let associated = grok_filesystem_original_command_matches(report, command);
+    report.stdout.run_metadata.grok_read_only_filesystem = if runtime
+        == ExternalExecutionRuntime::Verified
+        && command.invocation == ExternalAgentInvocation::Grok
+        && command.workspace_access == WorkspaceAccess::ReadOnly
+        && !grok_acp_stdio_protocol_selected(command)
+        && associated
+    {
+        evidence
+    } else {
+        None
+    };
+}
+
+fn qualify_grok_read_only_capture(
+    command: &ExternalAgentCommand,
+    report: &ExternalAgentRun,
+    captured: RuntimeAdapterCapturedOutput,
+) -> Result<RuntimeAdapterCapturedOutput> {
+    if matches!(&captured, RuntimeAdapterCapturedOutput::Captured(_))
+        && command.invocation == ExternalAgentInvocation::Grok
+        && command.workspace_access == WorkspaceAccess::ReadOnly
+        && !grok_acp_stdio_protocol_selected(command)
+        && (report
+            .stdout
+            .run_metadata
+            .grok_read_only_filesystem
+            .is_none()
+            || !grok_filesystem_original_command_matches(report, command))
+    {
+        bail!("Grok read-only captured output lacks matching settled filesystem evidence");
+    }
+    Ok(captured)
 }
 
 fn replace_report_stdout(report: &mut ExternalAgentRun, mut stdout: CapturedOutput) {
@@ -6544,6 +7358,464 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod selected_codex_auth_tests {
+    use super::*;
+    use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+    use crate::account_authority::{record_observed_codex_selection, CODEX_CLI_PROVIDER_ID};
+    use coding_agent_manager_lib::account_authority::{authority_id_for, StoredAccountRegistry};
+    use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+    use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn write_synthetic_auth(home: &Path, bytes: &[u8]) -> Result<()> {
+        fs::create_dir_all(home)?;
+        fs::set_permissions(home, fs::Permissions::from_mode(0o700))?;
+        fs::write(home.join("auth.json"), bytes)?;
+        fs::set_permissions(home.join("auth.json"), fs::Permissions::from_mode(0o600))?;
+        Ok(())
+    }
+
+    fn command(run_id: &str) -> ExternalAgentCommand {
+        ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/run/prompt",
+            "/run/events",
+            "/run/report",
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle("/workspace", "worker", run_id, "worker")
+    }
+
+    #[test]
+    fn local_auth_codex_managed_parent_preserves_launch_binding_and_cam_refusal() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+        use crate::supervise::SupervisorRuntime;
+
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let run = "r10-local-auth-managed-parent";
+        record_observed_codex_selection_from_source(
+            Some(run), CODEX_CLI_PROVIDER_ID, None, None, None,
+        );
+        let parent = ExternalAgentCommand::codex(
+            "codex", "/workspace", "/prompt", "/events", "/report", Duration::from_secs(1),
+        )
+        .with_agent_lifecycle("/workspace", "child_orchestrator", run, "parent")
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_model_selection(Some("synthetic-model".into()), Some("high".into()))
+        .with_codex_native_delegation_disabled()
+        .with_codex_managed_readonly_continuation();
+        parent.managed_parent_control_transport(SupervisorRuntime::Codex)?;
+
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("missing.sock");
+        {
+            let _configured = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+            assert!(parent.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        }
+        let mut changed = parent.clone();
+        changed.codex_run_account_binding = Some(CodexRunAccountBinding::Missing);
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        let mut changed = parent.clone();
+        changed.agent_lifecycle.as_mut().unwrap().run_id = "r10-unadmitted-parent".into();
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        let mut changed = parent.clone();
+        changed.codex_native_delegation_disabled = false;
+        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        // Initial parents still need their sealed inbox endpoint; local auth
+        // grants no transport, delegation, or worktree capability of its own.
+        assert!(parent
+            .with_codex_managed_worker_requests()
+            .managed_parent_control_transport(SupervisorRuntime::Codex)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn local_codex_auth_endpoint_appearing_before_release_is_refused() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+
+        // Keep the full legacy loader's ancestry checks; this fixture never
+        // reads the operator's auth home. Run on a normally owned filesystem.
+        let root = tempfile::Builder::new()
+            .prefix("maco-local-auth-endpoint-")
+            .tempdir_in(env!("CARGO_MANIFEST_DIR"))?;
+        let home = root.path().join("legacy");
+        write_synthetic_auth(&home, b"FAKE-legacy-codex-auth")?;
+        let previous = set_injected_codex_auth_home_for_test(Some(home));
+        struct RestoreHome(Option<PathBuf>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                set_injected_codex_auth_home_for_test(self.0.take());
+            }
+        }
+        let _home = RestoreHome(previous);
+        for observed in [false, true] {
+            let run_id = if observed {
+                "r14-local-observed"
+            } else {
+                "r14-local-unobserved"
+            };
+            let socket = root
+                .path()
+                .join(if observed { "obs" } else { "raw" })
+                .join("cam.sock");
+            let _endpoint = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            if observed {
+                record_observed_codex_selection_from_source(
+                    Some(run_id), CODEX_CLI_PROVIDER_ID, None, None, None,
+                );
+            }
+            let auth = ValidatedCodexAuth::load_for_command(&command(run_id))?
+                .context("synthetic legacy auth capture")?;
+            assert!(auth.managed_authority.is_none());
+            auth.verify_source_unchanged()?;
+            fs::create_dir(socket.parent().unwrap())?;
+            // A real endpoint appears after capture while auth.json is unchanged.
+            // The helper binds through a short directory alias when this path
+            // exceeds sun_path, and the socket inode stays at `socket`.
+            let _listener = crate::test_support::bind_test_unix_socket(&socket)?;
+            let error = auth.verify_source_unchanged().unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<CodexAuthValidationFailureCause>(),
+                Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn local_codex_auth_revalidation_refuses_new_endpoint() -> Result<()> {
+        use std::os::unix::fs::MetadataExt;
+
+        // Exercise the pre-release check with a synthetic captured source. The
+        // full loader's ancestry checks are covered by the admission test above.
+        for entry in ["parent", "socket", "file"] {
+            let root = tempfile::tempdir()?;
+            let socket = root.path().join("maco/account-authority.sock");
+            let _endpoint = CamAuthoritySocketTestGuard::install_default(socket.clone());
+            write_synthetic_auth(root.path(), b"FAKE-legacy-codex-auth")?;
+            let path = root.path().join("auth.json");
+            let metadata = fs::metadata(&path)?;
+            let auth = ValidatedCodexAuth {
+                managed_authority: None,
+                bytes: fs::read(&path)?,
+                path,
+                length: metadata.len(),
+                modified: metadata.modified().ok(),
+                device: metadata.dev(),
+                inode: metadata.ino(),
+            };
+            auth.verify_source_unchanged()?;
+            fs::create_dir(socket.parent().unwrap())?;
+            let _listener = match entry {
+                "socket" => Some(std::os::unix::net::UnixListener::bind(&socket)?),
+                "file" => {
+                    fs::write(&socket, b"not a socket")?;
+                    None
+                }
+                _ => None,
+            };
+            let error = auth.verify_source_unchanged().unwrap_err();
+            assert_eq!(
+                error.downcast_ref::<CodexAuthValidationFailureCause>(),
+                Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn absent_implicit_cam_allows_codex_legacy_auth_admission() -> Result<()> {
+        use crate::account_authority::record_observed_codex_selection_from_source;
+
+        let root = tempfile::tempdir()?;
+        let socket = root.path().join("maco/account-authority.sock");
+        let _socket = CamAuthoritySocketTestGuard::install_default(socket.clone());
+        // A missing synthetic home proves the legacy loader is reached without
+        // inspecting the operator's home or any real credential file.
+        let previous = set_injected_codex_auth_home_for_test(Some(root.path().join("legacy")));
+        struct RestoreHome(Option<PathBuf>);
+        impl Drop for RestoreHome {
+            fn drop(&mut self) {
+                set_injected_codex_auth_home_for_test(self.0.take());
+            }
+        }
+        let _home = RestoreHome(previous);
+        assert!(ValidatedCodexAuth::load_for_command(&command("r9-legacy-unobserved"))?.is_none());
+        record_observed_codex_selection_from_source(
+            Some("r9-legacy-admitted"), CODEX_CLI_PROVIDER_ID, None, None, None,
+        );
+        let admitted = command("r9-legacy-admitted");
+        assert_eq!(admitted.codex_run_account_binding, Some(CodexRunAccountBinding::LocalAuth));
+        assert!(ValidatedCodexAuth::load_for_command(&admitted)?.is_none());
+        set_injected_codex_auth_home_for_test(Some(PathBuf::from("synthetic-relative-home")));
+        let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::HomeNotAbsolute));
+        {
+            let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
+            let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+            assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+        }
+        fs::create_dir(socket.parent().unwrap())?;
+        fs::write(&socket, b"not a Unix socket")?;
+        let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
+        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+        Ok(())
+    }
+
+    #[test]
+    fn selected_codex_auth_uses_managed_home_and_never_falls_back_to_ambient() -> Result<()> {
+        const CHILD_MARKER: &str = "MACO_SYNTHETIC_CODEX_AUTH_CHILD";
+        const SELECTED: &[u8] = b"FAKE-selected-managed-auth";
+        const AMBIENT: &[u8] = b"FAKE-conflicting-codex-auth";
+        const HOME_AUTH: &[u8] = b"FAKE-conflicting-home-auth";
+        if env::var_os(CHILD_MARKER).is_none() {
+            // This subprocess changes only its own environment. Its trusted data
+            // stays under the runner's private HOME rather than writable /tmp.
+            let trusted_home = env::var_os("HOME").context("test runner HOME is required")?;
+            let root = tempfile::Builder::new()
+                .prefix("maco-selected-codex-")
+                .tempdir_in(trusted_home)?;
+            ensure_trusted_codex_auth_home(root.path())?;
+            let ambient_home = root.path().join("ambient-home");
+            let ambient_codex = root.path().join("ambient-codex");
+            write_synthetic_auth(&ambient_home.join(".codex"), HOME_AUTH)?;
+            write_synthetic_auth(&ambient_codex, AMBIENT)?;
+            let output = std::process::Command::new(env::current_exe()?)
+                .args(["--exact", "external_agent::selected_codex_auth_tests::selected_codex_auth_uses_managed_home_and_never_falls_back_to_ambient", "--nocapture"])
+                .env(CHILD_MARKER, root.path())
+                .env("HOME", &ambient_home)
+                .env("CODEX_HOME", &ambient_codex)
+                .env("OPENAI_API_KEY", "FAKE-conflicting-openai-key")
+                .env("CODEX_API_KEY", "FAKE-conflicting-codex-key")
+                .env("CODEX_ACCESS_TOKEN", "FAKE-conflicting-access-token")
+                .env("XDG_DATA_HOME", root.path().join("cam-data"))
+                .env_remove(crate::account_authority::authority_socket_config::CAM_AUTHORITY_SOCKET_ENV)
+                .output()?;
+            assert!(
+                output.status.success(),
+                "synthetic auth subprocess failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            assert!(
+                stdout.contains("test result: ok. 1 passed; 0 failed; 0 ignored;"),
+                "synthetic auth subprocess did not execute exactly one test"
+            );
+            assert_eq!(fs::read(ambient_codex.join("auth.json"))?, AMBIENT);
+            assert_eq!(fs::read(ambient_home.join(".codex/auth.json"))?, HOME_AUTH);
+            return Ok(());
+        }
+
+        let root = PathBuf::from(env::var_os(CHILD_MARKER).context("synthetic test root")?);
+        ensure_trusted_codex_auth_home(&root)?;
+        assert_eq!(
+            env::var_os("HOME"),
+            Some(root.join("ambient-home").into_os_string())
+        );
+        assert_eq!(
+            env::var_os("CODEX_HOME"),
+            Some(root.join("ambient-codex").into_os_string())
+        );
+        assert_eq!(
+            env::var_os("XDG_DATA_HOME"),
+            Some(root.join("cam-data").into_os_string())
+        );
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let dirs = project_dirs().context("synthetic CAM data path")?;
+        assert!(dirs.data_dir().starts_with(root.join("cam-data")));
+        let registry = StoredAccountRegistry::new(stored_accounts_path(dirs.data_dir()));
+        for account in ["work", "personal"] {
+            registry.begin_add(
+                CODEX_CLI_PROVIDER_ID,
+                account,
+                account,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add(CODEX_CLI_PROVIDER_ID, account)?;
+        }
+        let binding = registry.select_complete_revision(CODEX_CLI_PROVIDER_ID, "work", None)?;
+        record_observed_codex_selection(
+            Some("synthetic-managed-auth"),
+            CODEX_CLI_PROVIDER_ID,
+            Some(authority_id_for(registry.metadata_path())),
+            Some(&binding),
+        );
+        let spec = command("synthetic-managed-auth");
+        let unmanaged = command("synthetic-unmanaged-environment");
+        let mut adapter_config = RuntimeAdapterConfig::defaults(RuntimeId::Codex);
+        adapter_config.env_passthrough = vec![
+            "OPENAI_API_KEY".to_string(),
+            "CODEX_API_KEY".to_string(),
+            "CODEX_ACCESS_TOKEN".to_string(),
+        ];
+        for adapter in [None, Some(&adapter_config)] {
+            let selected_env = external_environment_for_command(
+                &spec,
+                adapter,
+                ExternalProgramTrust::TrustedSystemCodex,
+            );
+            let unmanaged_env = external_environment_for_command(
+                &unmanaged,
+                adapter,
+                ExternalProgramTrust::TrustedSystemCodex,
+            );
+            for (key, synthetic) in [
+                ("OPENAI_API_KEY", "FAKE-conflicting-openai-key"),
+                ("CODEX_API_KEY", "FAKE-conflicting-codex-key"),
+                ("CODEX_ACCESS_TOKEN", "FAKE-conflicting-access-token"),
+            ] {
+                assert!(
+                    !selected_env.contains_key(key),
+                    "selected environment forwarded {key}"
+                );
+                assert_eq!(
+                    unmanaged_env.get(key).map(String::as_str),
+                    Some(synthetic),
+                    "explicit unmanaged behavior changed for {key}"
+                );
+            }
+        }
+        let account = registry.complete(CODEX_CLI_PROVIDER_ID, "work")?;
+        let adapter = coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter::default()
+            .with_data_dir(dirs.data_dir());
+        let declaration = coding_agent_manager_lib::providers::launch_spec_for(&adapter, &account)?;
+        let managed_home = PathBuf::from(&declaration.plain_environment()[0].1);
+        write_synthetic_auth(&managed_home, SELECTED)?;
+        let auth = ValidatedCodexAuth::load_for_command(&spec)?.context("managed auth capture")?;
+        assert_eq!(auth.path, managed_home.join("auth.json"));
+        assert_eq!(auth.bytes, SELECTED);
+        assert_eq!(ValidatedCodexAuth::load()?.unwrap().bytes, AMBIENT);
+        auth.verify_source_unchanged()?; // same check used by paused pre-release
+        assert!(registry
+            .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
+            .is_err());
+        assert!(registry
+            .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
+            .is_err());
+
+        // An out-of-band file replacement cannot become completion evidence.
+        let replacement = managed_home.join("replacement");
+        fs::write(&replacement, SELECTED)?;
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600))?;
+        fs::rename(&replacement, &auth.path)?;
+        assert!(auth.verify_source_unchanged().is_err());
+        drop(auth);
+        fs::remove_file(managed_home.join("auth.json"))?;
+        assert_eq!(ValidatedCodexAuth::load()?.unwrap().bytes, AMBIENT);
+        assert!(ValidatedCodexAuth::load_for_command(&spec).is_err());
+        let ambient = PathBuf::from(env::var_os("CODEX_HOME").unwrap()).join("auth.json");
+        std::os::unix::fs::symlink(&ambient, managed_home.join("auth.json"))?;
+        assert!(ValidatedCodexAuth::load_for_command(&spec).is_err());
+        fs::remove_file(managed_home.join("auth.json"))?;
+
+        // A new revision or materialization cannot reuse this run's frozen slot.
+        registry.select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)?;
+        write_synthetic_auth(&managed_home, SELECTED)?;
+        assert!(ValidatedCodexAuth::load_for_command(&spec).is_err());
+        registry.begin_delete(CODEX_CLI_PROVIDER_ID, "work")?;
+        registry.finish_delete(CODEX_CLI_PROVIDER_ID, "work")?;
+        registry.begin_add(
+            CODEX_CLI_PROVIDER_ID,
+            "work",
+            "work",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        registry.complete_add(CODEX_CLI_PROVIDER_ID, "work")?;
+        registry.select_complete_revision(CODEX_CLI_PROVIDER_ID, "work", None)?;
+        assert!(ValidatedCodexAuth::load_for_command(&spec).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn initialized_codex_missing_selection_and_dropped_carry_refuse_before_ambient_auth() {
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        record_observed_codex_selection(
+            Some("synthetic-missing-codex"),
+            CODEX_CLI_PROVIDER_ID,
+            None,
+            None,
+        );
+        let mut spec = command("synthetic-missing-codex");
+        let error = ValidatedCodexAuth::load_for_command(&spec).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CodexAuthValidationFailureCause>(),
+            Some(&CodexAuthValidationFailureCause::ManagedSelectionMissing)
+        );
+        spec.codex_run_account_binding = None;
+        let error = ValidatedCodexAuth::load_for_command(&spec).unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CodexAuthValidationFailureCause>(),
+            Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+        );
+    }
+
+    #[test]
+    fn codex_run_binding_carries_parent_nested_and_readonly_roles_and_binds_snapshot() {
+        use coding_agent_manager_lib::account_authority::SelectedAccountBinding;
+        let binding = SelectedAccountBinding {
+            provider_id: CODEX_CLI_PROVIDER_ID.to_string(),
+            account_id: "work".to_string(),
+            account_incarnation: "synthetic-incarnation".to_string(),
+            selection_revision: 7,
+        };
+        let run = "synthetic-codex-carry";
+        record_observed_codex_selection(
+            Some(run),
+            CODEX_CLI_PROVIDER_ID,
+            Some("synthetic-authority".to_string()),
+            Some(&binding),
+        );
+        let expected = crate::account_authority::codex_run_account_binding(run).unwrap();
+        for role in [
+            "orchestrator",
+            "worker",
+            "researcher",
+            "auditor",
+            "consultant",
+        ] {
+            let spec = if role == "consultant" {
+                ExternalAgentCommand::codex_read_only_consultant(
+                    "codex",
+                    "/workspace",
+                    "/run/prompt",
+                    "/run/events",
+                    "/run/report",
+                    Duration::from_secs(1),
+                )
+                .with_agent_lifecycle("/workspace", role, run, "task")
+            } else {
+                command(run).with_agent_lifecycle("/workspace", role, run, "task")
+            };
+            assert_eq!(
+                spec.codex_run_account_binding.as_ref(),
+                Some(&expected),
+                "{role}"
+            );
+            let snapshot = WorktreeConfinementSnapshot::from_command(&spec, true);
+            let mut changed = spec.clone();
+            changed.codex_run_account_binding = Some(CodexRunAccountBinding::Missing);
+            assert!(!snapshot.matches_command(&changed, true), "{role}");
+        }
+        let mut later = binding.clone();
+        later.selection_revision += 1;
+        record_observed_codex_selection(
+            Some(run),
+            CODEX_CLI_PROVIDER_ID,
+            Some("synthetic-authority".to_string()),
+            Some(&later),
+        );
+        assert_eq!(command(run).codex_run_account_binding, Some(expected));
+        assert!(command("synthetic-unmanaged-other-run")
+            .codex_run_account_binding
+            .is_none());
     }
 }
 
@@ -6696,6 +7968,8 @@ mod fixed_version_probe_redaction_tests {
             .collect::<Vec<_>>();
         let oversized_bytes = serde_json::to_vec(&oversized_values).expect("serialize auth");
         let oversized_auth = ValidatedCodexAuth {
+            #[cfg(target_os = "linux")]
+            managed_authority: None,
             path: PathBuf::from("/private/oversized-auth.json"),
             length: oversized_bytes.len() as u64,
             modified: None,
@@ -6705,7 +7979,10 @@ mod fixed_version_probe_redaction_tests {
             inode: 3,
             bytes: oversized_bytes,
         };
-        assert!(CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth)).is_err());
+        assert!(
+            CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth), None)
+                .is_err()
+        );
 
         #[cfg(unix)]
         let status = {
@@ -6719,7 +7996,9 @@ mod fixed_version_probe_redaction_tests {
             status,
             duration: Duration::from_millis(1),
             timed_out: false,
-            process_tree: ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ),
             side_effects: SideEffectConfinementEvidence::Verified(
                 SideEffectConfinementProfileKind::ExternalCodex,
             ),

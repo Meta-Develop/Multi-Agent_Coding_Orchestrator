@@ -4,6 +4,9 @@
 //! observation. Policy code may classify the returned slugs, but this adapter
 //! does not embed a live model list or infer authority from a model name.
 
+#[path = "cursor/managed_bridge.rs"]
+pub mod managed_bridge;
+
 use super::AdapterId;
 use crate::{
     artifacts::state_auth::sha256_hex,

@@ -2840,6 +2840,7 @@ fn held_out_native_runtime_parent_capture_requires_successful_verified_output() 
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     };
     assert!(

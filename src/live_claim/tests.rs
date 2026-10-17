@@ -2,6 +2,168 @@ use super::*;
 use std::sync::Arc;
 
 #[cfg(target_os = "linux")]
+#[test]
+fn captured_claim_identity_is_live_on_parent_and_two_scoped_threads() {
+    let identity = current_claim_process_identity();
+    assert!(identity.process_start_time.is_some());
+    let expected = ClaimProcessLivenessObservation {
+        liveness: ClaimProcessLiveness::Live,
+        reason: ClaimProcessLivenessReason::Matched,
+    };
+    assert_eq!(claim_process_liveness_observation(&identity), expected);
+    std::thread::scope(|scope| {
+        let first = scope.spawn(|| claim_process_liveness_observation(&identity));
+        let second = scope.spawn(|| claim_process_liveness_observation(&identity));
+        assert_eq!(first.join().unwrap(), expected);
+        assert_eq!(second.join().unwrap(), expected);
+    });
+}
+
+#[test]
+fn claim_liveness_observation_preserves_classification_and_single_probe() {
+    let identity = ClaimProcessIdentity {
+        pid: 17,
+        process_start_time: Some("linux-v2:17:11111111-2222-3333-4444-555555555555:456".into()),
+    };
+    let cases = [
+        (
+            Ok("linux-v2:17:11111111-2222-3333-4444-555555555555:456".to_string()),
+            ClaimProcessLiveness::Live,
+            ClaimProcessLivenessReason::Matched,
+        ),
+        (
+            Ok("linux-v2:17:11111111-2222-3333-4444-555555555555:457".to_string()),
+            ClaimProcessLiveness::Interrupted,
+            ClaimProcessLivenessReason::DifferentStartToken {
+                pid: 17,
+                expected: "linux-v2:17:11111111-2222-3333-4444-555555555555:456".into(),
+                observed: "linux-v2:17:11111111-2222-3333-4444-555555555555:457".into(),
+            },
+        ),
+        (
+            Err(anyhow::Error::new(std::io::Error::from(
+                std::io::ErrorKind::NotFound,
+            ))),
+            ClaimProcessLiveness::Interrupted,
+            ClaimProcessLivenessReason::ReadFailure {
+                error_kind: Some(std::io::ErrorKind::NotFound),
+            },
+        ),
+        (
+            Err(
+                anyhow::Error::new(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+                    .context("private reader context must not escape"),
+            ),
+            ClaimProcessLiveness::Unknown,
+            ClaimProcessLivenessReason::ReadFailure {
+                error_kind: Some(std::io::ErrorKind::PermissionDenied),
+            },
+        ),
+        (
+            Err(anyhow::anyhow!("private malformed process token")),
+            ClaimProcessLiveness::Unknown,
+            ClaimProcessLivenessReason::ReadFailure { error_kind: None },
+        ),
+    ];
+    for (result, liveness, reason) in cases {
+        let calls = std::cell::Cell::new(0);
+        let observed = claim_process_liveness_observation_with_probe(&identity, |pid| {
+            assert_eq!(pid, identity.pid);
+            calls.set(calls.get() + 1);
+            result
+        });
+        assert_eq!(calls.get(), 1);
+        assert_eq!(
+            observed,
+            ClaimProcessLivenessObservation { liveness, reason }
+        );
+        assert!(!format!("{:?}", observed.reason).contains("private"));
+    }
+    let missing = ClaimProcessIdentity {
+        process_start_time: None,
+        ..identity
+    };
+    let observed = claim_process_liveness_observation_with_probe(&missing, |_| {
+        panic!("missing recorded token must not probe")
+    });
+    assert_eq!(observed.liveness, ClaimProcessLiveness::Unknown);
+    assert_eq!(
+        observed.reason,
+        ClaimProcessLivenessReason::MissingRecordedToken
+    );
+}
+
+#[test]
+fn claim_liveness_rejects_oversized_tokens_without_diagnostic_values() {
+    let token = "界".repeat(512);
+    let identity = ClaimProcessIdentity {
+        pid: 17,
+        process_start_time: Some(token.clone()),
+    };
+    let observed = claim_process_liveness_observation_with_probe(&identity, |_| {
+        panic!("unsupported recorded token must not probe")
+    });
+    assert_eq!(observed.liveness, ClaimProcessLiveness::Unknown);
+    assert_eq!(
+        observed.reason,
+        ClaimProcessLivenessReason::UnsupportedRecordedToken
+    );
+    assert!(!format!("{:?}", observed.reason).contains(&token));
+}
+
+#[test]
+fn legacy_and_malformed_claim_incarnations_remain_unknown_without_probing() {
+    for token in [
+        "123:456",
+        "malformed",
+        "linux-v2:18:11111111-2222-3333-4444-555555555555:456",
+    ] {
+        let identity = ClaimProcessIdentity {
+            pid: 17,
+            process_start_time: Some(token.into()),
+        };
+        let observation = claim_process_liveness_observation_with_probe(&identity, |_| {
+            panic!("unsupported record must not probe")
+        });
+        assert_eq!(observation.liveness, ClaimProcessLiveness::Unknown);
+        assert_eq!(
+            observation.reason,
+            ClaimProcessLivenessReason::UnsupportedRecordedToken
+        );
+    }
+}
+
+#[test]
+fn supported_claim_incarnations_refuse_changed_boot_ticks_and_mixed_schemes() {
+    let identity = ClaimProcessIdentity {
+        pid: 17,
+        process_start_time: Some("linux-v2:17:11111111-2222-3333-4444-555555555555:456".into()),
+    };
+    for token in [
+        "linux-v2:17:aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee:456",
+        "linux-v2:17:11111111-2222-3333-4444-555555555555:457",
+    ] {
+        let observation =
+            claim_process_liveness_observation_with_probe(&identity, |_| Ok(token.into()));
+        assert_eq!(observation.liveness, ClaimProcessLiveness::Interrupted);
+        assert_eq!(observation.reason.diagnostic_label(), "DifferentStartToken");
+    }
+    for token in [
+        "123:456",
+        "malformed",
+        "linux-v2:18:11111111-2222-3333-4444-555555555555:456",
+    ] {
+        let observation =
+            claim_process_liveness_observation_with_probe(&identity, |_| Ok(token.into()));
+        assert_eq!(observation.liveness, ClaimProcessLiveness::Unknown);
+        assert_eq!(
+            observation.reason,
+            ClaimProcessLivenessReason::UnsupportedObservedToken
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
 struct ClaimAtomicTestFaultGuard {
     previous_errno: Option<i32>,
     previous_crash: Option<ClaimFallbackCrashPoint>,

@@ -66,59 +66,175 @@ impl<'a> AssignmentAttemptAuthority<'a> {
     /// `subject_id` is selected by the supervisor from its authored plan, never a child
     /// command description. Resolve the complete worker here rather than accepting a
     /// caller-supplied WorkerAssignment with a matching ID and widened scope.
+    /// Always admits a writable assignment. A read-only managed parent uses
+    /// [`Self::admit_managed_parent_read_only`] and is rejected here.
     pub(super) fn admit(
         &self,
         subject_id: &str,
         command: &ExternalAgentCommand,
         runtime: SupervisorRuntime,
     ) -> Result<AssignmentCommandAdmission> {
-        let semantic_intent = self.verify_resources()?;
-        let (role, parent_id, paths) = if subject_id == self.parent.id {
-            (
-                self.parent.role,
-                self.journal_parent_id,
-                &self.parent.assigned_paths,
-            )
-        } else {
-            if self.parent.role != AgentRole::ChildOrchestrator {
-                bail!("nested worker admission requires a ChildOrchestrator resource owner");
-            }
-            let mut authored = self
-                .parent
-                .worker_assignments
-                .iter()
-                .filter(|worker| worker.id == subject_id);
-            let worker = authored
-                .next()
-                .context("nested worker ID is not authored under this parent")?;
-            if authored.next().is_some() || worker.role != AgentRole::Worker {
-                bail!("nested worker admission requires one exact authored Worker");
-            }
-            if normalize_paths(worker.assigned_paths.clone())? != worker.assigned_paths
-                || worker.assigned_paths.is_empty()
-                || worker.assigned_paths.iter().any(|path| {
-                    !self
-                        .parent
-                        .assigned_paths
-                        .iter()
-                        .any(|parent| path_is_covered_by_claim(path, parent))
-                })
-                || worker
-                    .semantic_symbols
-                    .iter()
-                    .any(|symbol| !self.parent.semantic_symbols.contains(symbol))
-                || worker
-                    .semantic_modules
-                    .iter()
-                    .any(|module| !self.parent.semantic_modules.contains(module))
-            {
-                bail!("nested worker paths and semantic scope must be a canonical parent subset");
-            }
-            (
-                AgentRole::Worker,
-                self.parent.id.as_str(),
+        self.admit_with_mode(
+            subject_id,
+            command,
+            runtime,
+            AssignmentAdmissionMode::WritableAssignment,
+        )
+    }
+
+    /// Explicit admission for the resource-owning managed parent when its command is
+    /// read-only, Codex-only, and has native delegation disabled. Does not grant Worker
+    /// writable authority and does not accept a writable command.
+    pub(super) fn admit_managed_parent_read_only(
+        &self,
+        subject_id: &str,
+        command: &ExternalAgentCommand,
+        runtime: SupervisorRuntime,
+    ) -> Result<AssignmentCommandAdmission> {
+        self.admit_with_mode(
+            subject_id,
+            command,
+            runtime,
+            AssignmentAdmissionMode::ManagedReadOnlyParent,
+        )
+    }
+
+    /// Seal the exact finalized nested Grok command after the unique serial permit and
+    /// parent-owned resources have both been revalidated. The Worker remains the launch
+    /// subject while the enclosing ChildOrchestrator remains the worktree/claim owner.
+    pub(super) fn seal_nested_grok_worktree_confinement(
+        &self,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        permit: &mut NestedTurnExecutionPermit<'_, '_>,
+        subject_id: &str,
+        command: ExternalAgentCommand,
+    ) -> Result<ExternalAgentCommand> {
+        permit.revalidate(preflight, self.attempt)?;
+        self.admit(subject_id, &command, SupervisorRuntime::Grok)?;
+        let worker = self
+            .parent
+            .worker_assignments
+            .iter()
+            .find(|worker| worker.id == subject_id)
+            .context("nested Grok authority lost its authored Worker")?;
+        let capabilities =
+            command.selected_writable_capabilities(SupervisorRuntime::Grok, Some(subject_id))?;
+        if capabilities
+            .writable_launch_refusal(command.writable_launch_target)
+            .is_some()
+            || capabilities.side_effect_confinement
+                != crate::runtime_adapter::SideEffectConfinement::Verified
+        {
+            bail!("nested Grok authority requires verified native confinement");
+        }
+        let nested =
+            crate::external_agent::NestedWorktreeWritableAdmission::from_live_assignment_authority(
+                subject_id,
+                &self.parent.id,
+                self.run_id.as_str(),
+                self.attempt,
+                self.attempt,
+                &self.worktree.name,
+                &self.worktree.path,
+                &self.worktree.branch,
+                &self.claim.agent_id,
+                self.claim.token.get(),
+                &self.claim.paths,
                 &worker.assigned_paths,
-            )
+                self.held_semantic_token,
+                crate::external_agent::NativeSandboxAdmission {
+                    runtime: SupervisorRuntime::Grok,
+                    workspace_access: command.workspace_access,
+                    side_effect_confinement: capabilities.side_effect_confinement,
+                },
+                &command.worker_journal_artifacts,
+            )?;
+        let command = command.with_nested_worktree_writable_confinement(nested)?;
+        self.admit(subject_id, &command, SupervisorRuntime::Grok)?;
+        permit.revalidate(preflight, self.attempt)?;
+        Ok(command)
+    }
+
+    fn admit_with_mode(
+        &self,
+        subject_id: &str,
+        command: &ExternalAgentCommand,
+        runtime: SupervisorRuntime,
+        mode: AssignmentAdmissionMode,
+    ) -> Result<AssignmentCommandAdmission> {
+        let semantic_intent = self.verify_resources()?;
+        let (role, parent_id, writable_paths) = match mode {
+            AssignmentAdmissionMode::WritableAssignment => {
+                if subject_id == self.parent.id {
+                    (
+                        self.parent.role,
+                        self.journal_parent_id,
+                        Some(&self.parent.assigned_paths),
+                    )
+                } else {
+                    if self.parent.role != AgentRole::ChildOrchestrator {
+                        bail!(
+                            "nested worker admission requires a ChildOrchestrator resource owner"
+                        );
+                    }
+                    let mut authored = self
+                        .parent
+                        .worker_assignments
+                        .iter()
+                        .filter(|worker| worker.id == subject_id);
+                    let worker = authored
+                        .next()
+                        .context("nested worker ID is not authored under this parent")?;
+                    if authored.next().is_some() || worker.role != AgentRole::Worker {
+                        bail!("nested worker admission requires one exact authored Worker");
+                    }
+                    if normalize_paths(worker.assigned_paths.clone())? != worker.assigned_paths
+                        || worker.assigned_paths.is_empty()
+                        || worker.assigned_paths.iter().any(|path| {
+                            !self
+                                .parent
+                                .assigned_paths
+                                .iter()
+                                .any(|parent| path_is_covered_by_claim(path, parent))
+                        })
+                        || worker
+                            .semantic_symbols
+                            .iter()
+                            .any(|symbol| !self.parent.semantic_symbols.contains(symbol))
+                        || worker
+                            .semantic_modules
+                            .iter()
+                            .any(|module| !self.parent.semantic_modules.contains(module))
+                    {
+                        bail!(
+                            "nested worker paths and semantic scope must be a canonical parent subset"
+                        );
+                    }
+                    (
+                        AgentRole::Worker,
+                        self.parent.id.as_str(),
+                        Some(&worker.assigned_paths),
+                    )
+                }
+            }
+            AssignmentAdmissionMode::ManagedReadOnlyParent => {
+                if subject_id != self.parent.id {
+                    bail!(
+                        "managed read-only parent admission accepts only the resource-owning parent"
+                    );
+                }
+                if self.parent.role != AgentRole::ChildOrchestrator
+                    || self.parent.effective_role_category() != RoleCategory::DelegatingCoordinator
+                {
+                    bail!(
+                        "managed read-only parent admission requires a delegating ChildOrchestrator"
+                    );
+                }
+                if self.parent.worker_assignments.is_empty() {
+                    bail!("managed read-only parent admission requires authored workers");
+                }
+                (self.parent.role, self.journal_parent_id, None)
+            }
         };
         let identity = command
             .agent_lifecycle
@@ -135,14 +251,35 @@ impl<'a> AssignmentAttemptAuthority<'a> {
             bail!("assignment admission command does not bind the current run, parent, subject and attempt");
         }
         command.verify_assignment_child_admission_identity()?;
-        if command.workspace_access != WorkspaceAccess::ReadWrite
-            || command.writable_launch_target
-                != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
-        {
-            bail!("assignment admission requires a writable managed worktree command");
-        }
-        if assignment_worktree_control_exceptions(paths)? != command.worktree_control_exceptions {
-            bail!("assignment admission command widens its authored control path scope");
+        match mode {
+            AssignmentAdmissionMode::WritableAssignment => {
+                if command.workspace_access != WorkspaceAccess::ReadWrite
+                    || command.writable_launch_target
+                        != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+                {
+                    bail!("assignment admission requires a writable managed worktree command");
+                }
+                let paths = writable_paths
+                    .context("writable assignment admission lost its authored path scope")?;
+                if assignment_worktree_control_exceptions(paths)?
+                    != command.worktree_control_exceptions
+                {
+                    bail!("assignment admission command widens its authored control path scope");
+                }
+            }
+            AssignmentAdmissionMode::ManagedReadOnlyParent => {
+                if command.workspace_access != WorkspaceAccess::ReadOnly
+                    || command.writable_launch_target
+                        != crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree
+                {
+                    bail!(
+                        "managed read-only parent admission requires a read-only managed child worktree command"
+                    );
+                }
+                if !command.worktree_control_exceptions.is_empty() {
+                    bail!("managed read-only parent admission refuses worktree control exceptions");
+                }
+            }
         }
         let expected_invocation = match runtime {
             SupervisorRuntime::Codex => {
@@ -161,14 +298,27 @@ impl<'a> AssignmentAttemptAuthority<'a> {
         if command.invocation != expected_invocation {
             bail!("assignment admission runtime differs from the selected command");
         }
-        let capabilities = command.selected_writable_capabilities(runtime, Some(subject_id))?;
-        if capabilities
-            .writable_launch_refusal(command.writable_launch_target)
-            .is_some()
-            || capabilities.side_effect_confinement
-                != crate::runtime_adapter::SideEffectConfinement::Verified
-        {
-            bail!("assignment admission requires verified native confinement");
+        match mode {
+            AssignmentAdmissionMode::WritableAssignment => {
+                let capabilities =
+                    command.selected_writable_capabilities(runtime, Some(subject_id))?;
+                if runtime == SupervisorRuntime::Grok {
+                    command.verify_grok_run_account_binding(self.run_id.as_str())?;
+                }
+                if capabilities
+                    .writable_launch_refusal(command.writable_launch_target)
+                    .is_some()
+                    || capabilities.side_effect_confinement
+                        != crate::runtime_adapter::SideEffectConfinement::Verified
+                {
+                    bail!("assignment admission requires verified native confinement");
+                }
+            }
+            AssignmentAdmissionMode::ManagedReadOnlyParent => {
+                // The command owns the effective selected descriptor, account and
+                // native-off configuration. A bare vendor descriptor is insufficient.
+                command.managed_parent_control_transport(runtime)?;
+            }
         }
         Ok(AssignmentCommandAdmission {
             repo: self.repo.to_path_buf(),
@@ -182,6 +332,7 @@ impl<'a> AssignmentAttemptAuthority<'a> {
             subject_id: subject_id.to_owned(),
             runtime,
             command: command.clone(),
+            admission_mode: mode,
             semantic_intent,
             cancellation: self.cancellation.clone(),
             run_cancellation: self.run_cancellation.clone(),
@@ -225,6 +376,14 @@ impl<'a> AssignmentAttemptAuthority<'a> {
     }
 }
 
+/// Which admission entry produced this binding. Replay must use the same mode and the
+/// original command; a read-only parent admission is never rewritten into a writable one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssignmentAdmissionMode {
+    WritableAssignment,
+    ManagedReadOnlyParent,
+}
+
 /// In-memory, non-serializable binding to an exact selected command. This is an
 /// admission primitive, not a process-launch grant: a future nested dispatcher must
 /// revalidate against its current attempt immediately before the existing launch gates.
@@ -242,6 +401,7 @@ pub(super) struct AssignmentCommandAdmission {
     subject_id: String,
     runtime: SupervisorRuntime,
     command: ExternalAgentCommand,
+    admission_mode: AssignmentAdmissionMode,
     semantic_intent: Option<SemanticIntent>,
     cancellation: ProcessCancellation,
     run_cancellation: ProcessCancellation,
@@ -270,7 +430,14 @@ impl AssignmentCommandAdmission {
         if self.cancellation.is_cancelled() || self.run_cancellation.is_cancelled() {
             bail!("assignment admission original authority has been revoked");
         }
-        let refreshed = current.admit(subject_id, command, self.runtime)?;
+        let refreshed = match self.admission_mode {
+            AssignmentAdmissionMode::WritableAssignment => {
+                current.admit(subject_id, command, self.runtime)?
+            }
+            AssignmentAdmissionMode::ManagedReadOnlyParent => {
+                current.admit_managed_parent_read_only(subject_id, command, self.runtime)?
+            }
+        };
         if refreshed.semantic_intent != self.semantic_intent {
             bail!("assignment admission semantic authority changed");
         }
@@ -818,6 +985,160 @@ mod tests {
         fixture.semantic_store.release(report.intent.token)?;
         assert!(admission
             .revalidate(&authority, "worker", &command)
+            .is_err());
+        Ok(())
+    }
+
+    fn read_only_parent_command(fixture: &Fixture) -> Result<ExternalAgentCommand> {
+        #[cfg(target_os = "linux")]
+        crate::account_authority::record_observed_codex_selection(
+            Some(fixture.run_id.as_str()),
+            "codex-cli",
+            Some("test-authority".into()),
+            Some(
+                &coding_agent_manager_lib::account_authority::SelectedAccountBinding {
+                    provider_id: "codex-cli".into(),
+                    account_id: "test-account".into(),
+                    account_incarnation: "test-incarnation".into(),
+                    selection_revision: 1,
+                },
+            ),
+        );
+        let command = fixture
+            .command("parent")?
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_model_selection(Some("fixture-model".into()), Some("fixture-effort".into()))
+            .with_codex_native_delegation_disabled()
+            .with_codex_managed_readonly_continuation();
+        let grant = admit_assignment_child_process_intent(
+            fixture.run_id.as_str(),
+            "parent",
+            1,
+            Path::new("codex"),
+            command.model.as_deref(),
+            ASSIGNMENT_CHILD_PROCESS_DUTY,
+        )?;
+        Ok(command
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant))
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn writable_admit_still_rejects_read_only_parent_command() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let command = read_only_parent_command(&fixture)?;
+        assert!(command.codex_native_delegation_is_disabled());
+        assert!(fixture
+            .authority()
+            .admit("parent", &command, SupervisorRuntime::Codex)
+            .is_err());
+        assert!(fixture
+            .authority()
+            .admit("worker", &command, SupervisorRuntime::Codex)
+            .is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn managed_read_only_parent_admit_accepts_exact_parent_and_rejects_widening() -> Result<()> {
+        let fixture = Fixture::new()?;
+        let authority = fixture.authority();
+        let command = read_only_parent_command(&fixture)?;
+        let admission = authority.admit_managed_parent_read_only(
+            "parent",
+            &command,
+            SupervisorRuntime::Codex,
+        )?;
+        assert_eq!(admission.subject_id, "parent");
+        assert_eq!(admission.command, command);
+        assert_eq!(
+            admission.command.workspace_access,
+            WorkspaceAccess::ReadOnly
+        );
+        assert!(admission.command.codex_native_delegation_is_disabled());
+        assert!(admission.command.worktree_control_exceptions.is_empty());
+        admission.revalidate(&authority, "parent", &command)?;
+
+        assert!(authority
+            .admit_managed_parent_read_only(
+                "worker",
+                &fixture.command("worker")?,
+                SupervisorRuntime::Codex
+            )
+            .is_err());
+        let worker_read_only = fixture
+            .command("worker")?
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_codex_native_delegation_disabled();
+        assert!(authority
+            .admit_managed_parent_read_only("worker", &worker_read_only, SupervisorRuntime::Codex)
+            .is_err());
+
+        let mut worker_parent = fixture.parent.clone();
+        worker_parent.role = AgentRole::Worker;
+        worker_parent.worker_assignments.clear();
+        let worker_role_authority = AssignmentAttemptAuthority {
+            parent: &worker_parent,
+            ..fixture.authority()
+        };
+        let mut worker_role_command = read_only_parent_command(&fixture)?;
+        worker_role_command.agent_lifecycle.as_mut().unwrap().role =
+            AgentRole::Worker.as_str().into();
+        assert!(worker_role_authority
+            .admit_managed_parent_read_only(
+                "parent",
+                &worker_role_command,
+                SupervisorRuntime::Codex
+            )
+            .is_err());
+
+        let mut overridden = fixture.parent.clone();
+        overridden.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        let overridden_authority = AssignmentAttemptAuthority {
+            parent: &overridden,
+            ..fixture.authority()
+        };
+        assert!(overridden_authority
+            .admit_managed_parent_read_only("parent", &command, SupervisorRuntime::Codex)
+            .is_err());
+
+        assert!(authority
+            .admit_managed_parent_read_only("parent", &command, SupervisorRuntime::Grok)
+            .is_err());
+        let native_enabled = fixture
+            .command("parent")?
+            .with_workspace_access(WorkspaceAccess::ReadOnly);
+        assert!(!native_enabled.codex_native_delegation_is_disabled());
+        assert!(authority
+            .admit_managed_parent_read_only("parent", &native_enabled, SupervisorRuntime::Codex)
+            .is_err());
+        let writable = fixture.command("parent")?;
+        assert!(authority
+            .admit_managed_parent_read_only("parent", &writable, SupervisorRuntime::Codex)
+            .is_err());
+        let mut exceptions = command.clone();
+        exceptions
+            .worktree_control_exceptions
+            .push("AGENTS.md".into());
+        assert!(authority
+            .admit_managed_parent_read_only("parent", &exceptions, SupervisorRuntime::Codex)
+            .is_err());
+
+        let mut substituted = command.clone();
+        substituted.prompt = "other-prompt".into();
+        assert!(admission
+            .revalidate(&authority, "parent", &substituted)
+            .is_err());
+        fixture.sync_store.release(fixture.claim.token)?;
+        assert!(admission
+            .revalidate(&authority, "parent", &command)
             .is_err());
         Ok(())
     }

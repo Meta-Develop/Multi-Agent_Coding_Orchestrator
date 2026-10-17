@@ -1,6 +1,8 @@
 //! Thin Tauri IPC for core [`observe_selected_account`] (exact binding only).
 
-use crate::account_authority::{AccountObserveRequest, AccountObserveResult};
+use crate::account_authority::{
+    AccountObserveRequest, AccountObserveResult, SelectedAccountBinding,
+};
 use crate::error::Result;
 use crate::model::StoredAccountMaterial;
 use crate::providers::observe_selected_account;
@@ -8,6 +10,16 @@ use crate::storage;
 
 use super::adapter_for;
 use super::authority_client::{account_authority, AccountAuthority};
+
+/// Return authority-owned selection metadata without resolving any credential.
+#[tauri::command]
+pub fn selected_account_binding(provider_id: String) -> Result<Option<SelectedAccountBinding>> {
+    adapter_for(&provider_id)?;
+    match account_authority()? {
+        AccountAuthority::InProcess(registry) => registry.selected_binding(&provider_id),
+        AccountAuthority::Remote(client) => client.selected_binding(&provider_id),
+    }
+}
 
 /// Observe only the account named by `request.binding`; never auto-selects or rotates.
 #[tauri::command]
@@ -19,7 +31,16 @@ pub(crate) fn observe_account_blocking(
     request: AccountObserveRequest,
 ) -> Result<AccountObserveResult> {
     let adapter = adapter_for(&request.binding.provider_id)?;
-    match account_authority()? {
+    let authority = account_authority()?;
+    observe_account_with_authority(request, adapter.as_ref(), &authority)
+}
+
+fn observe_account_with_authority(
+    request: AccountObserveRequest,
+    adapter: &dyn crate::providers::ProviderAdapter,
+    authority: &AccountAuthority,
+) -> Result<AccountObserveResult> {
+    match authority {
         AccountAuthority::InProcess(registry) => {
             let store = registry
                 .account(&request.binding.provider_id, &request.binding.account_id)
@@ -27,9 +48,8 @@ pub(crate) fn observe_account_blocking(
                 .filter(|account| account.material == StoredAccountMaterial::CredentialStore)
                 .map(|_| storage::default_store())
                 .transpose()?;
-            observe_selected_account(&registry, adapter.as_ref(), request, store.as_deref())
+            observe_selected_account(registry, adapter, request, store.as_deref())
         }
-        #[cfg(unix)]
         AccountAuthority::Remote(client) => client.account_observe(request),
     }
 }
@@ -157,15 +177,21 @@ mod tests {
 
     #[test]
     fn ipc_refuses_empty_categories_fail_closed() {
-        let error = observe_account_blocking(AccountObserveRequest {
-            binding: SelectedAccountBinding {
-                provider_id: "gemini-cli".to_string(),
-                account_id: "work".to_string(),
-                account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
-                selection_revision: 1,
+        let (_dir, adapter, registry) = gemini_fixture();
+        let authority = AccountAuthority::InProcess(registry);
+        let error = observe_account_with_authority(
+            AccountObserveRequest {
+                binding: SelectedAccountBinding {
+                    provider_id: "gemini-cli".to_string(),
+                    account_id: "work".to_string(),
+                    account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+                    selection_revision: 1,
+                },
+                categories: vec![],
             },
-            categories: vec![],
-        })
+            &adapter,
+            &authority,
+        )
         .expect_err("empty categories");
         assert!(matches!(&error, Error::ConfigRead { reason, .. }
             if reason.contains("at least one category")));
@@ -173,15 +199,21 @@ mod tests {
 
     #[test]
     fn ipc_refuses_duplicate_categories_fail_closed() {
-        let error = observe_account_blocking(AccountObserveRequest {
-            binding: SelectedAccountBinding {
-                provider_id: "gemini-cli".to_string(),
-                account_id: "work".to_string(),
-                account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
-                selection_revision: 1,
+        let (_dir, adapter, registry) = gemini_fixture();
+        let authority = AccountAuthority::InProcess(registry);
+        let error = observe_account_with_authority(
+            AccountObserveRequest {
+                binding: SelectedAccountBinding {
+                    provider_id: "gemini-cli".to_string(),
+                    account_id: "work".to_string(),
+                    account_incarnation: "0123456789abcdef0123456789abcdef".to_string(),
+                    selection_revision: 1,
+                },
+                categories: vec![ObserveCategory::Quota, ObserveCategory::Quota],
             },
-            categories: vec![ObserveCategory::Quota, ObserveCategory::Quota],
-        })
+            &adapter,
+            &authority,
+        )
         .expect_err("duplicate categories");
         assert!(matches!(&error, Error::ConfigRead { reason, .. }
             if reason.contains("duplicates")));

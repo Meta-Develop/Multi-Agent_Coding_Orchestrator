@@ -1,6 +1,129 @@
 use super::*;
 use tempfile::TempDir;
 
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_enosys_preserves_no_follow_and_escape_refusals() {
+    use std::os::unix::fs::symlink;
+    let _error = LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let temp = TempDir::new().unwrap();
+    let root = temp.path().join("root");
+    fs::create_dir_all(root.join("nested")).unwrap();
+    fs::write(root.join("nested/file"), "observed").unwrap();
+    let outside = temp.path().join("outside");
+    fs::write(&outside, "outside").unwrap();
+    symlink(&outside, root.join("leaf")).unwrap();
+    symlink(temp.path(), root.join("ancestor")).unwrap();
+    fs::hard_link(&outside, root.join("hardlink")).unwrap();
+    let fifo = c_string(root.join("fifo").as_os_str()).unwrap();
+    // SAFETY: the NUL-terminated path is inside this test's private fixture.
+    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+    let binding = DirectoryBindingGuard::bind(&root).unwrap();
+    assert_eq!(
+        binding.read_relative(Path::new("nested/file"), 64).unwrap(),
+        b"observed"
+    );
+    assert!(binding
+        .read_relative_optional(Path::new("missing"), 64)
+        .unwrap()
+        .is_none());
+    assert!(binding
+        .read_relative_optional(Path::new("nested"), 64)
+        .unwrap()
+        .is_none());
+    for relative in [
+        Path::new("leaf"),
+        Path::new("ancestor/outside"),
+        Path::new("../outside"),
+        outside.as_path(),
+        Path::new("hardlink"),
+        Path::new("fifo"),
+    ] {
+        assert!(
+            binding.read_relative(relative, 64).is_err(),
+            "{}",
+            relative.display()
+        );
+        assert!(
+            binding.read_relative_optional(relative, 64).is_err(),
+            "{}",
+            relative.display()
+        );
+    }
+    assert_eq!(fs::read_to_string(outside).unwrap(), "outside");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_enosys_refuses_device_and_same_device_mount_crossings() {
+    for statx_enosys in [false, true] {
+        let mut error = LinuxOpenat2Error::force(libc::ENOSYS);
+        if statx_enosys {
+            error = error.with_statx_enosys();
+        }
+        let _error = error;
+        let root = open_unix_directory(Path::new("/")).unwrap();
+        let error = open_repository_relative_linux_fd(root.as_raw_fd(), Path::new("proc/version"))
+            .unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+        // The journal policy deliberately admits the same real mount crossing.
+        assert!(open_relative_no_follow_linux(
+            root.as_raw_fd(),
+            Path::new("proc/version"),
+            libc::O_RDONLY,
+            false
+        )
+        .is_ok());
+
+        let temp = TempDir::new().unwrap();
+        fs::write(temp.path().join("file"), "content").unwrap();
+        let root = open_unix_directory(temp.path()).unwrap();
+        // The descriptor's actual st_dev matches; inject only a different mount
+        // ID, as with a same-filesystem bind mount. The real comparison refuses.
+        inject_next_linux_mount_mismatch("component walk");
+        let error =
+            open_repository_relative_linux_fd(root.as_raw_fd(), Path::new("file")).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(libc::EXDEV)
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn repository_reader_fallback_only_retries_enosys() {
+    let temp = TempDir::new().unwrap();
+    fs::write(temp.path().join("file"), "content").unwrap();
+    let binding = DirectoryBindingGuard::bind(temp.path()).unwrap();
+    for errno in [
+        libc::EPERM,
+        libc::EACCES,
+        libc::EINVAL,
+        libc::ELOOP,
+        libc::EXDEV,
+    ] {
+        let _error = LinuxOpenat2Error::force(errno);
+        let error = binding.read_relative(Path::new("file"), 64).unwrap_err();
+        assert_eq!(
+            error
+                .downcast_ref::<std::io::Error>()
+                .unwrap()
+                .raw_os_error(),
+            Some(errno)
+        );
+    }
+}
+
 #[test]
 fn signed_and_unsigned_device_id_bits_are_preserved() {
     let negative_one = device_id_bits_to_u64(-1);
@@ -1093,6 +1216,17 @@ fn forged_or_legacy_deletion_quarantine_is_never_removed() {
         .contains("version is unsupported"));
 }
 
+#[test]
+fn scavenge_deadline_hook_is_cleared_when_guard_unwinds() {
+    let panic = std::panic::catch_unwind(|| {
+        let _guard = set_scavenge_deadline_hook(|_| true);
+        panic!("injected panic before hook triggers");
+    });
+    assert!(panic.is_err());
+    ensure_before_deadline(None, "after hook guard unwinds")
+        .expect("untriggered hook must not leak into later scavenging");
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
@@ -1115,7 +1249,7 @@ fn deadline_interrupted_scavenge_resumes_from_authenticated_quarantine() {
         max_duration: Duration::from_secs(5),
     };
     let mut child_quarantines = 0usize;
-    set_scavenge_deadline_hook(move |phase| {
+    let _hook_guard = set_scavenge_deadline_hook(move |phase| {
         if phase == "before child quarantine" {
             child_quarantines = child_quarantines.saturating_add(1);
         }
@@ -1150,6 +1284,141 @@ fn inventory_limits(max_entries: usize) -> BoundedTreeWalkLimits {
         max_duration: Duration::from_secs(5),
         same_device: true,
     }
+}
+
+#[cfg(any(unix, windows))]
+fn walk_inventory_with_budget_for_test<F>(
+    binding: &DirectoryBindingGuard,
+    limits: BoundedTreeWalkLimits,
+    budget: &mut InventoryBudget,
+    mut action: F,
+) -> Result<()>
+where
+    F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+{
+    let mut entries = Vec::new();
+    let mut boundaries = Vec::new();
+    #[cfg(unix)]
+    {
+        let root_stat = fstat(binding.directory.as_raw_fd())?;
+        #[cfg(target_os = "linux")]
+        let root_mount_id = if limits.same_device {
+            Some(linux_mount_identity_for_fd(binding.directory.as_raw_fd())?.mount_id)
+        } else {
+            None
+        };
+        InventoryWalkState {
+            root_device: root_stat.st_dev,
+            #[cfg(target_os = "linux")]
+            root_mount_id,
+            limits,
+            options: BoundedTreeWalkOptions::default(),
+            budget,
+            action: &mut action,
+            entries: &mut entries,
+            nested_repository_boundaries: &mut boundaries,
+        }
+        .walk(binding.directory.as_raw_fd(), Path::new(""), 0)
+    }
+    #[cfg(windows)]
+    {
+        walk_bound_windows_dir(
+            binding,
+            Path::new(""),
+            0,
+            binding.identity.device,
+            limits,
+            BoundedTreeWalkOptions::default(),
+            budget,
+            &mut action,
+            &mut entries,
+            &mut boundaries,
+        )
+    }
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_timeout_reports_context_without_counting_enumeration_as_inspection() {
+    let mut budget = InventoryBudget::new(inventory_limits(2)).expect("inventory budget");
+    budget.current_relative_directory = PathBuf::from("vendor/sdk");
+    budget.consume_entry().expect("first enumerated name");
+    budget.consume_entry().expect("second enumerated name");
+    budget.started_at = Instant::now()
+        .checked_sub(Duration::from_millis(50))
+        .expect("earlier start");
+    budget.deadline = Instant::now();
+
+    let error = budget
+        .ensure_before_deadline("before directory stream open")
+        .expect_err("expired inventory must fail closed");
+    let message = format!("{error:#}");
+    assert!(message.contains("time limit before directory stream open"));
+    assert!(message.contains("failure_class=inventory_timeout"));
+    assert!(message.contains("relative_directory=\"vendor/sdk\""));
+    assert!(message.contains("entries_inspected=0"));
+    let elapsed_ms = message
+        .split("elapsed_ms=")
+        .nth(1)
+        .and_then(|value| value.split_whitespace().next())
+        .expect("elapsed milliseconds")
+        .parse::<u128>()
+        .expect("numeric elapsed milliseconds");
+    assert!(elapsed_ms >= 50);
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_diagnostics_count_inspections_and_restore_parent_directory() {
+    let temp = TempDir::new().expect("tempdir");
+    let root = temp.path().join("repo");
+    fs::create_dir_all(root.join("a-dir")).expect("child directory");
+    fs::write(root.join("a-dir/leaf.txt"), "leaf\n").expect("child file");
+    fs::write(root.join("z.txt"), "last\n").expect("root file");
+    let binding = DirectoryBindingGuard::bind(&root).expect("bind repository root");
+    let limits = inventory_limits(3);
+    let mut budget = InventoryBudget::new(limits).expect("inventory budget");
+    walk_inventory_with_budget_for_test(&binding, limits, &mut budget, |entry| {
+        Ok(if entry.kind == BoundedTreeEntryKind::Directory {
+            BoundedTreeWalkAction::RecordAndDescend
+        } else {
+            BoundedTreeWalkAction::Record
+        })
+    })
+    .expect("inspect child and later root entries");
+
+    assert_eq!(budget.remaining_entries, 0);
+    assert_eq!(budget.entries_inspected, 3);
+    assert!(budget.current_relative_directory.as_os_str().is_empty());
+    budget.deadline = Instant::now();
+    let message = format!(
+        "{:#}",
+        budget
+            .ensure_before_deadline("after repository traversal")
+            .expect_err("completed traversal still obeys its deadline")
+    );
+    assert!(message.contains("relative_directory=\".\""));
+    assert!(message.contains("entries_inspected=3"));
+    assert!(!message.contains(&format!("{:?}", root)));
+}
+
+#[cfg(any(unix, windows))]
+#[test]
+fn inventory_diagnostics_count_the_entry_before_a_callback_failure() {
+    let temp = TempDir::new().expect("tempdir");
+    fs::write(temp.path().join("a.txt"), "first\n").expect("first file");
+    fs::write(temp.path().join("z.txt"), "last\n").expect("last file");
+    let binding = DirectoryBindingGuard::bind(temp.path()).expect("bind repository root");
+    let limits = inventory_limits(2);
+    let mut budget = InventoryBudget::new(limits).expect("inventory budget");
+    let error = walk_inventory_with_budget_for_test(&binding, limits, &mut budget, |_| {
+        bail!("callback failure sentinel")
+    })
+    .expect_err("callback error must stop traversal");
+
+    assert!(format!("{error:#}").contains("callback failure sentinel"));
+    assert_eq!(budget.remaining_entries, 0);
+    assert_eq!(budget.entries_inspected, 1);
 }
 
 #[cfg(any(unix, windows))]

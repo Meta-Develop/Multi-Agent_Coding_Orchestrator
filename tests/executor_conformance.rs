@@ -2802,27 +2802,30 @@ fn staged_input_digest_is_deterministic_and_binds_workspace_bytes() {
 }
 
 #[test]
-fn grok_46_and_47_xhigh_writable_capabilities_require_the_bounded_leaf_contract() {
+fn grok_headless_capabilities_require_the_bounded_protocol_without_model_effort_preferences() {
     let workspace = TempDir::new().expect("typed Grok workspace");
     let prompt = workspace.path().join("prompt.txt");
     let output = workspace.path().join("output.jsonl");
     let config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
-    for (model, expected_runtime) in [
-        ("grok-4.6", TypedRuntime::Grok46Xhigh),
-        ("grok-4.7", TypedRuntime::Grok47Xhigh),
+    for (model, effort) in [
+        ("grok-4.6", "xhigh"),
+        ("grok-4.7", "xhigh"),
+        ("grok-4.7", "high"),
+        ("grok-4.7-build-fast", "high"),
+        ("grok-4.5", "high"),
     ] {
         let context = LaunchContext {
             prompt: &prompt,
             model: Some(model),
-            effort: Some("xhigh"),
+            effort: Some(effort),
             cwd: workspace.path(),
             output: &output,
         };
         let contract = config
             .typed_runtime_contract(AdapterId::Grok, &context)
-            .expect("canonical typed Grok/xhigh contract");
+            .expect("canonical native headless descriptor");
 
-        assert_eq!(contract.runtime(), expected_runtime);
+        assert_eq!(contract.runtime(), TypedRuntime::GrokHeadlessStreamingJson);
         assert!(contract.has_bounded_cwd());
         assert!(contract.has_bounded_output());
         assert!(contract.subagents_disabled());
@@ -2850,6 +2853,10 @@ fn grok_46_and_47_xhigh_writable_capabilities_require_the_bounded_leaf_contract(
             .argv
             .windows(2)
             .any(|pair| pair[0] == "--model" && pair[1] == model));
+        assert!(launch
+            .argv
+            .windows(2)
+            .any(|pair| pair[0] == "--reasoning-effort" && pair[1] == effort));
         assert_eq!(
             launch
                 .argv
@@ -2894,19 +2901,27 @@ fn grok_47_xhigh_acp_keeps_immutable_argv_but_refuses_capability_elevation() {
     let launch = config
         .render(&context)
         .expect("render typed Grok ACP launch");
-    assert!(launch
-        .argv
-        .windows(2)
-        .any(|pair| { pair[0] == "-m" && pair[1] == "grok-4.7" }));
-    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
-        assert_eq!(
-            launch
-                .argv
-                .iter()
-                .filter(|argument| argument.as_str() == required)
-                .count(),
-            1,
-            "missing or duplicated immutable ACP argument {required}"
+    assert_eq!(
+        launch.argv,
+        [
+            "--no-auto-update",
+            "--sandbox",
+            "strict",
+            "--disable-web-search",
+            "agent",
+            "--always-approve",
+            "--no-leader",
+            "-m",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "stdio",
+        ]
+    );
+    for unsupported in ["--no-memory", "--no-subagents"] {
+        assert!(
+            !launch.argv.iter().any(|argument| argument == unsupported),
+            "unsupported ACP argument {unsupported}"
         );
     }
 }
@@ -2919,12 +2934,12 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
     let canonical = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
 
     for (model, effort) in [
-        (Some("grok-4.5"), Some("xhigh")),
-        (Some("grok-4.6"), Some("high")),
-        (Some("grok-4.7"), Some("high")),
-        (Some("grok-4.7-build-fast"), Some("xhigh")),
         (None, Some("xhigh")),
         (Some("grok-4.6"), None),
+        (Some(""), Some("high")),
+        (Some("--other-flag"), Some("high")),
+        (Some("grok-4.7"), Some("")),
+        (Some("grok-4.7"), Some("unmapped-effort")),
     ] {
         let launch = LaunchContext {
             prompt: &prompt,
@@ -2958,6 +2973,11 @@ fn grok_capability_elevation_fails_closed_and_other_runtimes_do_not_change() {
         .is_none());
 
     let mut mutations = Vec::new();
+    let mut missing_no_auto_update = canonical.clone();
+    missing_no_auto_update
+        .argument_template
+        .retain(|argument| argument != "--no-auto-update");
+    mutations.push(missing_no_auto_update);
     let mut missing_no_subagents = canonical.clone();
     missing_no_subagents
         .argument_template

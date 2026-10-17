@@ -446,7 +446,11 @@ pub(super) fn validate_supervisor_plan_in_repo(
         }
     }
     validate_generated_follow_up_plan(&plan, &mut metadata)?;
-    validate_orchestrator_assignment_collisions(&plan.assignments, &metadata.assignment_schedule)?;
+    validate_orchestrator_assignment_collisions(
+        &plan.assignments,
+        &metadata.assignment_schedule,
+        plan.semantic_coordination,
+    )?;
 
     metadata.spec_fragment_ids =
         normalize_spec_fragment_ids(std::mem::take(&mut metadata.spec_fragment_ids))?;
@@ -978,6 +982,7 @@ fn validate_licensed_breakage_declaration(assignment: &mut OrchestratorAssignmen
 fn validate_orchestrator_assignment_collisions(
     assignments: &[OrchestratorAssignment],
     schedule: &[AssignmentScheduleEntry],
+    semantic_coordination: SemanticCoordinationMode,
 ) -> Result<()> {
     for (left_index, left) in assignments.iter().enumerate() {
         for (right_index, right) in assignments
@@ -986,6 +991,9 @@ fn validate_orchestrator_assignment_collisions(
             .skip(left_index.saturating_add(1))
         {
             if schedule_entries_share_strict_lineage(schedule, left_index, right_index) {
+                continue;
+            }
+            if coordinated_terminal_workers_may_overlap(semantic_coordination, left, right) {
                 continue;
             }
             if let Some((left_path, right_path)) =
@@ -1009,6 +1017,25 @@ fn validate_orchestrator_assignment_collisions(
         }
     }
     Ok(())
+}
+
+fn coordinated_terminal_workers_may_overlap(
+    semantic_coordination: SemanticCoordinationMode,
+    left: &OrchestratorAssignment,
+    right: &OrchestratorAssignment,
+) -> bool {
+    matches!(
+        semantic_coordination,
+        SemanticCoordinationMode::Warn | SemanticCoordinationMode::Block
+    ) && is_controlled_execution_terminal_worker(left)
+        && is_controlled_execution_terminal_worker(right)
+}
+
+fn is_controlled_execution_terminal_worker(assignment: &OrchestratorAssignment) -> bool {
+    assignment.phase == AssignmentPhase::Execution
+        && assignment.role == AgentRole::Worker
+        && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+        && assignment.worker_assignments.is_empty()
 }
 
 pub(super) fn schedule_entries_share_strict_lineage(
@@ -1194,8 +1221,11 @@ fn normalize_optional_model_field(value: Option<String>, field: &str) -> Result<
 }
 
 pub(super) fn validate_consultant_plan(consultant: &SupervisorConsultantPlan) -> Result<()> {
-    if !matches!(consultant.runtime.as_str(), "fake" | "codex" | "claude") {
-        bail!("consultant.runtime must be one of: fake, codex, claude");
+    if !matches!(
+        consultant.runtime.as_str(),
+        "fake" | "codex" | "claude" | "gemini"
+    ) {
+        bail!("consultant.runtime must be one of: fake, codex, claude, gemini");
     }
     if consultant.enabled && consultant.max_consultations == 0 {
         bail!("consultant.max_consultations must be greater than zero when consultant is enabled");

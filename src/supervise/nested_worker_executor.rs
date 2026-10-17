@@ -18,6 +18,31 @@ pub(super) struct NestedWorkerAttemptEvidence {
 }
 
 impl NestedWorkerAttemptEvidence {
+    /// Private supervisor producer for the separate isolated route. Its caller
+    /// seals the live request, independent lease, claim and actual settlement.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn from_isolated_parts(
+        report: WorkerReport,
+        journals: WorkerExecutionJournalEvidenceSet,
+        artifacts: ChildAttemptArtifacts,
+        run: ExternalAgentRun,
+        observed_changed_paths: Vec<PathBuf>,
+        model_provenance: CompletedLaunchModelProvenance,
+        candidate_before: PrimaryWorktreeSnapshot,
+        candidate_after: PrimaryWorktreeSnapshot,
+    ) -> Self {
+        Self {
+            report,
+            journals,
+            artifacts,
+            run,
+            observed_changed_paths,
+            model_provenance,
+            candidate_before,
+            candidate_after,
+        }
+    }
+
     pub(super) fn report(&self) -> &WorkerReport {
         &self.report
     }
@@ -254,8 +279,8 @@ pub(super) fn execute_nested_worker_attempt(
         ),
         &context.budget_policy,
     );
-    if runtime != SupervisorRuntime::Codex {
-        bail!("nested executor currently requires the verified Codex launch path");
+    if runtime == SupervisorRuntime::Fake {
+        bail!("nested executor requires a real managed launch path");
     }
     subject.runtime = Some(runtime);
     let scratch_index = nested_scratch_index(
@@ -329,6 +354,7 @@ pub(super) fn execute_nested_worker_attempt(
         runtime,
         &catalog,
         metadata.mechanical_duty,
+        &ChildAttemptPurpose::Ordinary,
     )?;
     let mut command = bind_runtime_output_schema(bound.command, runtime, &schema)?;
     command = bind_runtime_read_only_schema_files(command, runtime, &[&schema]);
@@ -346,6 +372,13 @@ pub(super) fn execute_nested_worker_attempt(
         command,
         AssignmentPhase::Execution,
         &subject.assigned_paths,
+    )?;
+    command = bind_selected_native_execution_workspace(
+        command,
+        &subject,
+        runtime,
+        &preflight.worktree.path,
+        true,
     )?;
     let mut grant = admit_assignment_child_process_intent(
         context.options.run_id.as_str(),
@@ -417,12 +450,11 @@ pub(super) fn execute_nested_worker_attempt(
                 .timeout
                 .min(validation.admit(&preflight.assignment.id, cancellation)?);
         }
-        let admission = authority.admit(worker_id, &command, runtime)?;
         let mut reservation = match reserve_dispatch_budget(
             &budget_plan,
             context.budget_config,
             context.budget_ledger,
-            AgentRole::Worker,
+            (AgentRole::Worker, runtime),
             &command,
         )? {
             DispatchBudgetAdmission::Admitted(reservation) => reservation,
@@ -430,6 +462,17 @@ pub(super) fn execute_nested_worker_attempt(
                 bail!("nested worker budget refused: {refusal:?}")
             }
         };
+        // Whole-command admission must capture the final immutable live grant.
+        bind_final_dispatch_live_budget(&mut command, &reservation)?;
+        if runtime == SupervisorRuntime::Grok {
+            command = authority.seal_nested_grok_worktree_confinement(
+                preflight,
+                permit,
+                worker_id,
+                command.clone(),
+            )?;
+        }
+        let admission = authority.admit(worker_id, &command, runtime)?;
         record_shared_orchestration_event(
             context.artifacts,
             worker_id,
@@ -461,6 +504,7 @@ pub(super) fn execute_nested_worker_attempt(
         }
         admission.revalidate(&authority, worker_id, &command)?;
         permit.revalidate(preflight, parent_attempt)?;
+        super::runtime_executables::validate_launch(&command)?;
         reservation.mark_invoked_for_runtime(runtime)?;
         invoked = true;
         let mut review_journal = SupervisorPreActionJournalSink {
@@ -529,13 +573,8 @@ pub(super) fn execute_nested_worker_attempt(
                 &run, &command, runtime,
             ));
         let settlement = settlement?;
-        if let Some(usage) = settlement.reliable_usage() {
-            outcome.usage_samples.push(RoleUsageSample {
-                role: AgentRole::Worker,
-                lens_id: None,
-                model: command.model.clone(),
-                usage,
-            });
+        if let Some(sample) = settlement.role_sample(AgentRole::Worker, None) {
+            outcome.usage_samples.push(sample);
         } else if settlement.is_degraded() {
             outcome.usage_incomplete = true;
         }
@@ -566,12 +605,7 @@ pub(super) fn execute_nested_worker_attempt(
             bail!("nested worker report differs from observed per-attempt changes");
         }
         let journals = journals?;
-        if !journals
-            .values()
-            .all(|j| matches!(j.status, WorkerExecutionJournalStatus::Loaded(_)))
-        {
-            bail!("nested worker journal evidence is incomplete");
-        }
+        require_complete_nested_worker_journals(&journals)?;
         Ok(NestedWorkerAttemptEvidence {
             report,
             journals,
@@ -634,10 +668,66 @@ pub(super) fn execute_nested_worker_attempt(
     result
 }
 
+fn require_complete_nested_worker_journals(
+    journals: &WorkerExecutionJournalEvidenceSet,
+) -> Result<()> {
+    let failures = journals
+        .iter()
+        .filter_map(|(worker_id, journal)| {
+            let cause = match &journal.status {
+                WorkerExecutionJournalStatus::Loaded(_) => return None,
+                WorkerExecutionJournalStatus::Missing => "missing trusted runner capture",
+                WorkerExecutionJournalStatus::Invalid(cause) => cause.as_str(),
+            };
+            Some(format!(
+                "{worker_id} ({}): {cause}",
+                journal.evidence_relative_path.display()
+            ))
+        })
+        .collect::<Vec<_>>();
+    if !failures.is_empty() {
+        bail!(
+            "nested worker journal evidence is incomplete: {}",
+            failures.join("; ")
+        );
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn nested_worker_journal_refusal_retains_invalid_and_missing_capture_causes() {
+        let mut journals = WorkerExecutionJournalEvidenceSet::new();
+        for (worker, status) in [
+            ("invalid", WorkerExecutionJournalStatus::Invalid(
+                "failed to parse worker execution journal line 2: expected `,` at line 1 column 85".to_string(),
+            )),
+            ("missing", WorkerExecutionJournalStatus::Missing),
+        ] {
+            journals.insert(worker.to_string(), WorkerExecutionJournalEvidence {
+                incoming_relative_path: PathBuf::from(format!("worker-journals/{worker}.jsonl")),
+                evidence_relative_path: PathBuf::from(format!("logs/workers/{worker}.jsonl")),
+                command_binding: None,
+                status,
+            });
+        }
+        let error = require_complete_nested_worker_journals(&journals)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("invalid (logs/workers/invalid.jsonl): failed to parse"));
+        assert!(error.contains("line 1 column 85"));
+        assert!(
+            error.contains("missing (logs/workers/missing.jsonl): missing trusted runner capture")
+        );
+        for journal in journals.values_mut() {
+            journal.status = WorkerExecutionJournalStatus::Loaded(Vec::new());
+        }
+        assert!(require_complete_nested_worker_journals(&journals).is_ok());
+    }
 
     fn parent() -> OrchestratorAssignment {
         serde_json::from_value(json!({
@@ -805,7 +895,13 @@ mod tests {
         let signature = git2::Signature::now("test", "test@example.com")?;
         git.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])?;
         let parent = parent();
-        let plan = plan(parent.clone());
+        let mut plan = plan(parent.clone());
+        let mut worker_selection = configured_role_model_selection(&plan, AgentRole::Worker);
+        worker_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+        plan.role_models.insert(AgentRole::Worker, worker_selection);
+        if case.starts_with("live-") {
+            plan.child_timeout_seconds = 300;
+        }
         let subject = terminal_subject(&parent, "worker")?;
         let run_id = RunId::new("nested-executor-test")?;
         let manager = WorktreeManager::new(&repo);
@@ -920,11 +1016,41 @@ mod tests {
                 hard_tokens: Some(1),
                 ..Default::default()
             }
+        } else if matches!(case, "live-budget" | "live-report" | "live-partial") {
+            RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            }
         } else {
             RunBudgetLimits::default()
         };
         let ledger = RunBudgetLedger::new(limits)?;
-        let metadata = AssignmentMetadata::new();
+        let mut metadata = AssignmentMetadata::new();
+        if case.starts_with("live-") {
+            let validation_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                RunId::new("nested-live-deadline")?,
+                "test",
+            )?));
+            metadata.parent_validation = Some(held_out::ParentValidationAuthority::new(
+                held_out::HeldOutRunBinding {
+                    manifest_sha256: "a".repeat(64),
+                    profile_sha256: "b".repeat(64),
+                    profile_id: "profile".into(),
+                    repetition: 0,
+                    experiment_run_id: "experiment".into(),
+                    supervisor_run_id: run_id.as_str().into(),
+                    assignment_id: preflight.assignment.id.clone(),
+                    baseline_head: "c".repeat(40),
+                    baseline_tree: "d".repeat(40),
+                },
+                Vec::new(),
+                std::time::Instant::now() + Duration::from_secs(180),
+                1,
+                validation_writer,
+            ));
+        }
         let consultant = SupervisorConsultantPlan::default();
         let guide = SupervisorFieldGuidePrompt::empty()?;
         let catalog =
@@ -942,6 +1068,19 @@ mod tests {
             );
             assert!(command.assignment_messaging_launch().is_none());
             assert_eq!(command.worker_journal_artifacts.len(), 1);
+            if case.starts_with("live-") {
+                assert!(
+                    command.timeout > Duration::ZERO
+                        && command.timeout <= Duration::from_secs(180)
+                        && command.timeout < Duration::from_secs(plan.child_timeout_seconds)
+                );
+                assert_eq!(
+                    command
+                        .live_token_grant_for_test()
+                        .map(|grant| grant.tokens()),
+                    (case != "live-cost-only").then_some(220_000)
+                );
+            }
             assert!(fs::read_to_string(&command.prompt)
                 .unwrap()
                 .contains("worker task"));
@@ -979,7 +1118,14 @@ mod tests {
             if case == "quiescence" {
                 run.process_tree = None;
             }
-            if case == "report" {
+            if case.starts_with("live-") {
+                super::super::decomposition_tests::retain_worker_app_server_usage_fixture(
+                    &mut run,
+                    command,
+                    case == "live-partial",
+                );
+            }
+            if matches!(case, "report" | "live-report") {
                 run.output_last_message = Some(b"{}".to_vec());
             }
             if case == "scope" {
@@ -1032,6 +1178,84 @@ mod tests {
             cancellation: cancellation.clone(),
             external_runner: &runner,
         };
+        if case == "grok-proof" {
+            let grok_binding = crate::account_authority::FrozenGrokSelectedBinding {
+                authority_socket: None,
+                authority_id: Some("authority".into()),
+                provider_id: crate::account_authority::GROK_CLI_PROVIDER_ID.into(),
+                account_id: "account".into(),
+                account_incarnation: "incarnation".into(),
+                selection_revision: 5,
+            };
+            crate::account_authority::admit_grok_run_account_binding(
+                run_id.as_str(),
+                Some(grok_binding),
+            );
+            let mut command = ExternalAgentCommand::codex(
+                "grok",
+                &worktree.path,
+                run_dir.join("nested-proof-prompt.md"),
+                run_dir.join("nested-proof-events.jsonl"),
+                run_dir.join("nested-proof-report.json"),
+                Duration::from_secs(7),
+            )
+            .with_runtime_adapter(
+                SupervisorRuntime::Grok,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+            )
+            .with_model_selection(Some("grok-4.7".into()), Some("xhigh".into()))
+            .with_agent_lifecycle(&repo, "worker", run_id.as_str(), "worker")
+            .with_agent_parent("parent");
+            command.output_schema = Some(run_dir.join("schemas/worker-report.schema.json"));
+            command = configure_assignment_phase_command(
+                command,
+                AssignmentPhase::Execution,
+                &subject.assigned_paths,
+            )?;
+            command = bind_selected_grok_execution_workspace(
+                command,
+                &subject,
+                SupervisorRuntime::Grok,
+                &worktree.path,
+                true,
+            )?;
+            let grant = admit_assignment_child_process_intent(
+                run_id.as_str(),
+                "worker",
+                1,
+                Path::new("codex"),
+                command.model.as_deref(),
+                ASSIGNMENT_CHILD_PROCESS_DUTY,
+            )?;
+            command = command
+                .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+                .with_worker_journal_artifact(
+                    "worker",
+                    run_dir.join("incoming"),
+                    run_dir.join("incoming/worker-journals/worker.jsonl"),
+                );
+            let authority = AssignmentAttemptAuthority::from_preflight(&context, &preflight, 1)?;
+            let mut permit = preflight.issue_nested_turn(1)?;
+            command = authority.seal_nested_grok_worktree_confinement(
+                &preflight,
+                &mut permit,
+                "worker",
+                command,
+            )?;
+            assert!(command
+                .verified_writable_capabilities_for_test(SupervisorRuntime::Grok)?
+                .admits_worktree_writable());
+            permit.revalidate(&preflight, 1)?;
+            let mut stale = command.clone();
+            stale.timeout += Duration::from_secs(1);
+            assert!(stale
+                .verified_writable_capabilities_for_test(SupervisorRuntime::Grok)
+                .is_err());
+            assert_eq!(sync_store.snapshot()?.len(), 1);
+            assert_eq!(manager.list_managed_verified()?.len(), 1);
+            crate::account_authority::admit_grok_run_account_binding(run_id.as_str(), None);
+            return Ok(());
+        }
         let claims_before = sync_store.snapshot()?;
         if case == "revoked" {
             sync_store.release(claim.token)?;
@@ -1067,7 +1291,7 @@ mod tests {
                 "worker"
             },
         );
-        if case == "happy" {
+        if matches!(case, "happy" | "live-budget" | "live-cost-only") {
             let evidence = result?;
             assert_eq!(evidence.report.id, "worker");
             assert_eq!(evidence.journals.len(), 1);
@@ -1118,7 +1342,13 @@ mod tests {
                 calls.load(Ordering::SeqCst),
                 usize::from(matches!(
                     case,
-                    "quiescence" | "panic" | "report" | "scope" | "revoked-after"
+                    "quiescence"
+                        | "panic"
+                        | "report"
+                        | "scope"
+                        | "revoked-after"
+                        | "live-report"
+                        | "live-partial"
                 ))
             );
         }
@@ -1167,7 +1397,7 @@ mod tests {
             assert_eq!(terminal[0]["payload"]["attempt"], 1);
             assert_eq!(
                 terminal[0]["payload"]["status"],
-                if case == "happy" {
+                if matches!(case, "happy" | "live-budget" | "live-cost-only") {
                     "completed"
                 } else {
                     "failed"
@@ -1191,6 +1421,24 @@ mod tests {
             0,
             "budget reservation leaked for {case}"
         );
+        if case.starts_with("live-") {
+            assert_eq!(
+                ledger.report()?.consumed.tokens,
+                37_000,
+                "settlement must precede rejected report/drain handling"
+            );
+            if case == "live-partial" {
+                assert!(!ledger.report()?.usage_complete);
+                assert!(matches!(
+                    ledger.reserve(BudgetReservationRequest {
+                        role: AgentRole::Worker,
+                        tokens: 1,
+                        cost_usd: None,
+                    })?,
+                    BudgetAdmission::Refused { .. }
+                ));
+            }
+        }
         assert_eq!(
             manager.list_managed_verified()?.len(),
             if case == "foreign-permit" { 2 } else { 1 }
@@ -1214,8 +1462,35 @@ mod tests {
         not(target_os = "linux"),
         ignore = "requires Linux authenticated managed resources"
     )]
+    fn nested_worker_final_live_budget_preserves_shortened_timeout_none_and_failed_report_floor(
+    ) -> Result<()> {
+        for case in [
+            "live-budget",
+            "live-cost-only",
+            "live-report",
+            "live-partial",
+        ] {
+            execution_fixture(case)?;
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
     fn nested_executor_happy_path_reuses_parent_and_rejects_replay() -> Result<()> {
         execution_fixture("happy")
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn nested_grok_proof_binds_live_parent_resources_and_serial_permit() -> Result<()> {
+        execution_fixture("grok-proof")
     }
 
     #[test]

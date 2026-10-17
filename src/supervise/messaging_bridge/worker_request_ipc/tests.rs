@@ -51,10 +51,14 @@ impl FreshFixture {
     }
 
     fn claim(&self) -> Result<WorkerRequestBinding> {
+        self.claim_at(0)
+    }
+
+    fn claim_at(&self, index: usize) -> Result<WorkerRequestBinding> {
         with_supervisor_messaging_session(self.writer.run_dir(), |factory| {
             factory.claim_fresh_worker_request_binding(
                 &RunId::new("run")?,
-                &self.plan.assignments[0],
+                &self.plan.assignments[index],
                 1,
                 SupervisorRuntime::Codex,
             )
@@ -77,34 +81,62 @@ fn fresh_worker_admission_claims_once_with_stable_authenticated_generation() -> 
     assert_eq!(original["parent"], "parent");
     assert_eq!(original["attempt"], 1);
     assert!(!original["generation"].as_str().unwrap().is_empty());
-    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+    let second = with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
         assert_eq!(
             original["state_instance"],
             factory.persistent.as_ref().unwrap().state_instance_id()
         );
         binding.verify_session(factory, "parent")?;
+        let second = factory.claim_fresh_worker_request_binding(
+            &RunId::new("run")?,
+            &fixture.plan.assignments[1],
+            1,
+            SupervisorRuntime::Codex,
+        )?;
+        let second_value = serde_json::to_value(&second)?;
+        assert_eq!(second_value["parent"], "second-parent");
+        assert_eq!(second_value["run"], "run");
+        assert_eq!(second_value["attempt"], 1);
+        assert_eq!(original["state_instance"], second_value["state_instance"]);
+        assert_ne!(original["generation"], second_value["generation"]);
+        assert!(!second_value["generation"].as_str().unwrap().is_empty());
+        second.verify_session(factory, "second-parent")?;
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &fixture.plan.assignments[0],
+                1,
+                SupervisorRuntime::Codex,
+            )
+            .is_err());
         assert!(factory
             .claim_fresh_worker_request_binding(
                 &RunId::new("run")?,
                 &fixture.plan.assignments[1],
                 1,
-                SupervisorRuntime::Codex
+                SupervisorRuntime::Codex,
             )
             .is_err());
-        Ok(())
+        Ok(second)
     })?;
     assert!(fixture.claim().is_err());
+    assert!(fixture.claim_at(1).is_err());
+    let second_value = serde_json::to_value(&second)?;
     let foreign = FreshFixture::new()?;
     with_supervisor_messaging_session(foreign.writer.run_dir(), |factory| {
         assert!(binding.verify_session(factory, "parent").is_err());
+        assert!(second.verify_session(factory, "second-parent").is_err());
         Ok(())
     })?;
     recover_supervisor_messaging_session(fixture.writer.run_dir())?;
     with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
-        binding.verify_session(factory, "parent")
+        binding.verify_session(factory, "parent")?;
+        second.verify_session(factory, "second-parent")
     })?;
-    assert_eq!(original, serde_json::to_value(binding)?);
+    assert_eq!(original, serde_json::to_value(&binding)?);
+    assert_eq!(second_value, serde_json::to_value(&second)?);
     assert!(fixture.claim().is_err());
+    assert!(fixture.claim_at(1).is_err());
     Ok(())
 }
 
@@ -130,6 +162,61 @@ fn fresh_worker_admission_concurrent_claims_have_one_winner() -> Result<()> {
 }
 
 #[test]
+fn fresh_worker_admission_concurrent_distinct_parents_each_succeed() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        let run = RunId::new("run")?;
+        let parents = [&fixture.plan.assignments[0], &fixture.plan.assignments[1]];
+        let barrier = std::sync::Barrier::new(2);
+        let results = std::thread::scope(|scope| {
+            let mut joins = Vec::new();
+            for parent in parents {
+                let barrier = &barrier;
+                let run = run.clone();
+                joins.push(scope.spawn(move || {
+                    barrier.wait();
+                    factory.claim_fresh_worker_request_binding(
+                        &run,
+                        parent,
+                        1,
+                        SupervisorRuntime::Codex,
+                    )
+                }));
+            }
+            joins
+                .into_iter()
+                .map(|join| join.join().unwrap())
+                .collect::<Vec<_>>()
+        });
+        let bindings = results.into_iter().collect::<Result<Vec<_>>>()?;
+        let first = serde_json::to_value(&bindings[0])?;
+        let second = serde_json::to_value(&bindings[1])?;
+        assert_eq!(first["parent"], "parent");
+        assert_eq!(second["parent"], "second-parent");
+        assert_ne!(first["generation"], second["generation"]);
+        bindings[0].verify_session(factory, "parent")?;
+        bindings[1].verify_session(factory, "second-parent")?;
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &run,
+                &fixture.plan.assignments[0],
+                1,
+                SupervisorRuntime::Codex,
+            )
+            .is_err());
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &run,
+                &fixture.plan.assignments[1],
+                1,
+                SupervisorRuntime::Codex,
+            )
+            .is_err());
+        Ok(())
+    })
+}
+
+#[test]
 fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result<()> {
     for mutation in 0..8 {
         let fixture = FreshFixture::new()?;
@@ -142,7 +229,7 @@ fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result
             1 => parent.id = "foreign-parent".into(),
             2 => attempt = 0,
             3 => attempt = 2,
-            4 => runtime = SupervisorRuntime::Grok,
+            4 => runtime = SupervisorRuntime::Fake,
             5 => parent.worker_assignments[0].id = "second-worker".into(),
             6 => parent.worker_assignments.reverse(),
             7 => parent.assigned_paths.push(PathBuf::from("widened")),
@@ -157,7 +244,146 @@ fn fresh_worker_admission_invalid_claim_burns_authority_before_retry() -> Result
             );
             Ok(())
         })?;
+        if mutation == 1 {
+            assert!(
+                fixture.claim().is_ok(),
+                "foreign id must leave the authored parent"
+            );
+            assert!(
+                fixture.claim_at(1).is_ok(),
+                "foreign id must leave the other authored parent"
+            );
+            continue;
+        }
         assert!(fixture.claim().is_err(), "retry after mutation {mutation}");
+        assert!(
+            fixture.claim_at(1).is_ok(),
+            "second parent remains after mutation {mutation}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_accepts_omitted_runtime_projected_to_codex() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    let mut projected = fixture.plan.assignments[0].clone();
+    projected.runtime = Some(SupervisorRuntime::Codex);
+    let binding = with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        let binding = factory.claim_fresh_worker_request_binding(
+            &RunId::new("run")?,
+            &projected,
+            1,
+            SupervisorRuntime::Codex,
+        )?;
+        binding.verify_session(factory, "parent")?;
+        assert!(factory
+            .claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &projected,
+                1,
+                SupervisorRuntime::Codex,
+            )
+            .is_err());
+        Ok(binding)
+    })?;
+    assert_eq!(serde_json::to_value(&binding)?["parent"], "parent");
+    assert!(fixture.claim().is_err());
+    assert!(fixture.claim_at(1).is_ok());
+
+    let explicit = FreshFixture::with_parent(json!({
+        "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"codex",
+        "worker_assignments":[{"id":"worker", "role":"worker"}]
+    }))?;
+    let explicit_binding = explicit.claim()?;
+    with_supervisor_messaging_session(explicit.writer.run_dir(), |factory| {
+        explicit_binding.verify_session(factory, "parent")
+    })?;
+    assert!(explicit.claim().is_err());
+    assert!(explicit.claim_at(1).is_ok());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_selected_adapter_projection_retains_one_shot_identity() -> Result<()> {
+    for runtime in [
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ] {
+        let fixture = FreshFixture::new()?;
+        let mut parent = fixture.plan.assignments[0].clone();
+        parent.runtime = Some(runtime);
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            let binding = factory.claim_fresh_worker_request_binding(
+                &RunId::new("run")?,
+                &parent,
+                1,
+                runtime,
+            )?;
+            binding.verify_session(factory, "parent")?;
+            assert!(factory
+                .claim_fresh_worker_request_binding(&RunId::new("run")?, &parent, 1, runtime,)
+                .is_err());
+            Ok(())
+        })?;
+        assert!(fixture.claim_at(1).is_ok());
+    }
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_runtime_projection_refuses_other_drift_and_burns_parent() -> Result<()> {
+    for mutation in 0..7 {
+        let fixture = match mutation {
+            0..=3 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            4..=5 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"codex",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            6 => FreshFixture::with_parent(json!({
+                "id":"parent", "phase":"execution", "role":"child_orchestrator", "runtime":"grok",
+                "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["kept.rs"]}]
+            }))?,
+            _ => unreachable!(),
+        };
+        let mut parent = fixture.plan.assignments[0].clone();
+        parent.runtime = Some(SupervisorRuntime::Codex);
+        match mutation {
+            0 => parent.runtime = Some(SupervisorRuntime::Grok),
+            1 => parent.worker_assignments[0].id = "replaced-worker".into(),
+            2 => parent.worker_assignments[0]
+                .assigned_paths
+                .push(PathBuf::from("widened.rs")),
+            3 => parent.task = Some("rewritten parent task".into()),
+            4 => parent.runtime = None,
+            5 => parent.runtime = Some(SupervisorRuntime::Grok),
+            6 => {}
+            _ => unreachable!(),
+        }
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            assert!(
+                factory
+                    .claim_fresh_worker_request_binding(
+                        &RunId::new("run")?,
+                        &parent,
+                        1,
+                        SupervisorRuntime::Codex,
+                    )
+                    .is_err(),
+                "mutation {mutation}"
+            );
+            Ok(())
+        })?;
+        assert!(fixture.claim().is_err(), "retry after mutation {mutation}");
+        assert!(
+            fixture.claim_at(1).is_ok(),
+            "second parent remains after mutation {mutation}"
+        );
     }
     Ok(())
 }
@@ -239,6 +465,10 @@ fn fresh_worker_admission_refuses_reopened_recovered_and_refreshed_sessions() ->
         }
         assert!(fixture.claim().is_err(), "mode {mode}");
         assert!(fixture.claim().is_err(), "retry mode {mode}");
+        assert!(
+            fixture.claim_at(1).is_err(),
+            "recovered session must not remint the other parent in mode {mode}"
+        );
     }
     Ok(())
 }
@@ -390,6 +620,70 @@ impl Drop for Fixture {
     fn drop(&mut self) {
         run_sessions().lock().unwrap().remove(&self.directory);
     }
+}
+
+#[test]
+fn captured_control_uses_authenticated_inbox_and_retains_cancellation() -> Result<()> {
+    let fixture = Fixture::new()?;
+    let cancellation = ProcessCancellation::new();
+    let server = fixture.start(false, cancellation.clone())?;
+    let body = json!({"version":1,"outcome":"yield_workers","run_id":"run",
+        "parent_id":"parent","parent_attempt":1,
+        "requests":[{"request_id":"r1","worker_id":"worker"},
+                    {"request_id":"r2","worker_id":"other"}]});
+    let mut forged = body.clone();
+    forged["requests"][0]["assigned_paths"] = json!(["foreign.rs"]);
+    assert!(crate::supervise::parent_broker::submit_captured_envelope(
+        &serde_json::to_vec(&forged)?,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )
+    .is_err());
+    let before = server.launch().forward_worker_request(
+        "run",
+        "parent",
+        &json!({
+            "operation":"worker_request_status","request_id":"r1"
+        }),
+        &|| cancellation.is_cancelled(),
+    );
+    assert!(before.is_err());
+    let bytes = serde_json::to_vec(&body)?;
+    crate::supervise::parent_broker::submit_captured_envelope(
+        &bytes,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )?;
+    for (request_id, worker_id) in [("r1", "worker"), ("r2", "other")] {
+        let status = server.launch().forward_worker_request(
+            "run",
+            "parent",
+            &json!({
+                "operation":"worker_request_status","request_id":request_id
+            }),
+            &|| cancellation.is_cancelled(),
+        )?;
+        assert_eq!(status["record"]["worker_id"], worker_id);
+        assert_eq!(status["record"]["status"], "queued");
+        assert_eq!(status["requires_reconciliation"], false);
+    }
+    cancellation.cancel();
+    assert!(crate::supervise::parent_broker::submit_captured_envelope(
+        &bytes,
+        "run",
+        &fixture.parent,
+        1,
+        &server.launch(),
+        &|| cancellation.is_cancelled(),
+    )
+    .is_err());
+    Ok(())
 }
 
 fn exchange(

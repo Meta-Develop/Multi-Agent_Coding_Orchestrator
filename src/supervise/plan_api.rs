@@ -339,6 +339,16 @@ pub fn supervisor_plan_document_from_task_planning_session(
     )
 }
 
+fn remaining_routing_proposal(
+    session: &planning::TaskPlanningSession,
+) -> planning::TaskDecompositionProposal {
+    let mut proposal = session.proposal().clone();
+    proposal
+        .fragments
+        .retain(|fragment| !session.completed_fragment_ids().contains(&fragment.id));
+    proposal
+}
+
 fn supervisor_plan_and_consultant_from_task_planning_session(
     goal: &str,
     spec: &str,
@@ -355,7 +365,7 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
                 goal,
                 spec,
                 task_file,
-                session.proposal().clone(),
+                remaining_routing_proposal(session),
                 repo,
             )
         }
@@ -365,6 +375,18 @@ fn supervisor_plan_and_consultant_from_task_planning_session(
             )
         }
     }
+}
+
+fn goal_spec_proposal_admits_task_routing_assessment(
+    proposal: &planning::TaskDecompositionProposal,
+) -> bool {
+    !proposal.diagnostics.degraded
+        && proposal.fragments.iter().all(|fragment| {
+            proposal
+                .assignments
+                .iter()
+                .any(|assignment| assignment.fragment_ids.contains(&fragment.id))
+        })
 }
 
 fn supervisor_plan_and_consultant_from_goal_spec_proposal(
@@ -379,6 +401,83 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     }
     planning::validate_task_assignment_disjointness(&proposal.assignments)
         .context("goal/spec workstreams are not independently assignable")?;
+
+    // Resolve the bounded repository policy before lowering; this exact receipt
+    // travels with the plan and must not be reloaded during launch selection.
+    let resolved_routing_policy = repo
+        .map(crate::selection::routing_policy::load_routing_policy)
+        .transpose()?;
+    let task = combined_goal_spec(goal, spec);
+    let task_routing_assessment = resolved_routing_policy
+        .as_ref()
+        .filter(|frozen| frozen.policy.task_estimation.is_some())
+        .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
+        .map(|frozen| super::task_routing::assess_task_routing(&task, &proposal, frozen))
+        .transpose()?;
+    let has_declared_dependencies = proposal
+        .assignments
+        .iter()
+        .any(|assignment| !assignment.decision_dependencies.is_empty());
+    let (direct_worker, coordinated_workers) = if let Some(frozen) = resolved_routing_policy
+        .as_ref()
+        .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
+    {
+        let assessment = crate::selection::routing_policy::TaskRoutingFeatures {
+            scope_paths: 0,
+            scope_modules: 0,
+            complexity: 0,
+            risk: 0,
+            horizon: 0,
+            context_tokens: 0,
+            dependency_edges: 0,
+            independent_groups: 0,
+            evidence: vec![
+                "score_and_context_lower_bounds_unassessed_at_structural_lowering".into(),
+            ],
+        };
+        let assessment_features = task_routing_assessment
+            .as_ref()
+            .map(|assessment| &assessment.features)
+            .unwrap_or(&assessment);
+        let (features, grain) = super::task_routing::classify_proposal(
+            &proposal,
+            assessment_features,
+            &frozen.policy.tree,
+        )?;
+        (
+            grain == crate::selection::routing_policy::TaskGrain::DirectWorker
+                && !(proposal.assignments.len() > 1 && has_declared_dependencies),
+            grain == crate::selection::routing_policy::TaskGrain::CoordinatedWorkers
+                && features.independent_groups == proposal.assignments.len()
+                && proposal.assignments.len() >= 2
+                && !has_declared_dependencies
+                && proposal
+                    .assignments
+                    .iter()
+                    .all(|assignment| !assignment.assigned_paths.is_empty()),
+        )
+    } else {
+        // Document-only callers without a resolved repository, and incomplete
+        // or degraded proposals, keep the existing conservative graph. Never
+        // read an ambient repository's policy here.
+        (false, false)
+    };
+    if coordinated_workers {
+        return lower_coordinated_execution_proposal(
+            goal,
+            spec,
+            task_file,
+            proposal,
+            resolved_routing_policy.context("coordinated lowering lost its frozen policy")?,
+            task_routing_assessment,
+            repo,
+        );
+    }
+    let proposal = if direct_worker {
+        collapse_direct_worker_proposal(proposal)?
+    } else {
+        proposal
+    };
 
     let explicit_new_file_workstream = authoritative_new_file_workstream_id(&proposal);
     let explicit_existing_file_edit_workstream =
@@ -404,8 +503,20 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
     let assignment_metadata = AssignmentMetadata::new();
     let workstream_count = proposal.assignments.len();
     let assignment_capacity = workstream_count
-        .checked_mul(2)
+        .checked_mul(if direct_worker { 1 } else { 2 })
         .context("goal/spec workstream count overflowed the assignment capacity")?;
+    let planned_depth = if direct_worker {
+        MIN_SUPERVISOR_DEPTH
+    } else {
+        MIN_SUPERVISOR_DEPTH.saturating_add(1)
+    };
+    if let Some(frozen) = &resolved_routing_policy {
+        if workstream_count > frozen.policy.tree.max_workers
+            || usize::from(planned_depth) > frozen.policy.tree.max_depth
+        {
+            bail!("validated workstreams exceed the frozen routing tree limits");
+        }
+    }
     let mut assignments = Vec::with_capacity(assignment_capacity);
     let mut assignment_schedule = Vec::with_capacity(assignment_capacity);
     for assignment in proposal.assignments {
@@ -418,7 +529,17 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             explicit_new_file_workstream.as_deref() == Some(assignment.id.as_str());
         let is_explicit_existing_file_edit_workstream =
             explicit_existing_file_edit_workstream.as_deref() == Some(assignment.id.as_str());
-        let generated_preclaim_notes = if is_explicit_new_file_workstream {
+        let generated_preclaim_notes = if direct_worker && is_explicit_new_file_workstream {
+            Some(direct_file_preclaim_directive(
+                &assignment,
+                "direct_explicit_new_file_creation",
+            )?)
+        } else if direct_worker && is_explicit_existing_file_edit_workstream {
+            Some(direct_file_preclaim_directive(
+                &assignment,
+                "direct_existing_git_visible_regular_file_edit",
+            )?)
+        } else if is_explicit_new_file_workstream {
             Some(explicit_new_file_preclaim_directive(
                 &assignment,
                 &planning_id,
@@ -433,35 +554,37 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         } else {
             None
         };
-        let planning_index = assignments.len();
-        assignments.push(OrchestratorAssignment {
-            id: planning_id.clone(),
-            phase: AssignmentPhase::Planning,
-            runtime: None,
-            role: AgentRole::ChildOrchestrator,
-            role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
-            selection_source: None,
-            assigned_paths: assignment.assigned_paths.clone(),
-            semantic_symbols: assignment.semantic_symbols.clone(),
-            semantic_modules: assignment.semantic_modules.clone(),
-            task: Some(planning_task),
-            worker_assignments: Vec::new(),
-            environment_requirements: Vec::new(),
-            licensed_breakage: None,
-            notes: generated_preclaim_notes.clone().or_else(|| {
-                Some(
-                    "MACO-visible read-only planning root; its execution child is parent-gated"
-                        .to_string(),
-                )
-            }),
-            decision_refs: Vec::new(),
-        });
-        assignment_schedule.push(AssignmentScheduleEntry {
-            assignment_id: planning_id.clone(),
-            parent_assignment_id: None,
-            depth: MIN_SUPERVISOR_DEPTH,
-            flattened_index: planning_index,
-        });
+        if !direct_worker {
+            let planning_index = assignments.len();
+            assignments.push(OrchestratorAssignment {
+                id: planning_id.clone(),
+                phase: AssignmentPhase::Planning,
+                runtime: None,
+                role: AgentRole::ChildOrchestrator,
+                role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+                selection_source: None,
+                assigned_paths: assignment.assigned_paths.clone(),
+                semantic_symbols: assignment.semantic_symbols.clone(),
+                semantic_modules: assignment.semantic_modules.clone(),
+                task: Some(planning_task),
+                worker_assignments: Vec::new(),
+                environment_requirements: Vec::new(),
+                licensed_breakage: None,
+                notes: generated_preclaim_notes.clone().or_else(|| {
+                    Some(
+                        "MACO-visible read-only planning root; its execution child is parent-gated"
+                            .to_string(),
+                    )
+                }),
+                decision_refs: Vec::new(),
+            });
+            assignment_schedule.push(AssignmentScheduleEntry {
+                assignment_id: planning_id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: planning_index,
+            });
+        }
 
         spec_fragment_ids_by_assignment
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
@@ -481,6 +604,9 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             environment_requirements: Vec::new(),
             licensed_breakage: None,
             notes: generated_preclaim_notes.or_else(|| {
+                if direct_worker {
+                    return Some("Direct terminal Worker selected from validated task grain by frozen routing policy".into());
+                }
                 Some(format!(
                     "Execution child admitted only after read-only planning root '{planning_id}' succeeds"
                 ))
@@ -489,8 +615,8 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         });
         assignment_schedule.push(AssignmentScheduleEntry {
             assignment_id: assignment.id,
-            parent_assignment_id: Some(planning_id),
-            depth: MIN_SUPERVISOR_DEPTH.saturating_add(1),
+            parent_assignment_id: (!direct_worker).then_some(planning_id),
+            depth: planned_depth,
             flattened_index: execution_index,
         });
     }
@@ -502,13 +628,16 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         &assignment_schedule,
         &declared_dependencies,
     )?;
-    let task = combined_goal_spec(goal, spec);
     let plan = SupervisorPlan {
         version: SUPERVISOR_SCHEMA_VERSION,
         task,
         task_file,
-        max_depth: MIN_SUPERVISOR_DEPTH.saturating_add(1),
-        max_child_assignments: assignment_capacity.max(DEFAULT_MAX_CHILD_ASSIGNMENTS),
+        max_depth: planned_depth,
+        max_child_assignments: if resolved_routing_policy.is_some() {
+            assignment_capacity
+        } else {
+            assignment_capacity.max(DEFAULT_MAX_CHILD_ASSIGNMENTS)
+        },
         max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
         max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
@@ -535,6 +664,10 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         generated_follow_up: None,
         path_proposal: proposal.diagnostics.clone(),
         router: SupervisorRouterConfig::default(),
+        resolved_routing_policy,
+        task_routing_assessment,
+        normal_intake_selection: None,
+        normal_intake_decision: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)?;
     Ok(LoadedSupervisorPlan {
@@ -543,6 +676,1246 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+/// A newly authored Execution parent owns the exact union. Nested Workers remain
+/// proposal data until its authenticated, quiescent frozen turn issues grants.
+fn lower_coordinated_execution_proposal(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    proposal: planning::TaskDecompositionProposal,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+    task_routing_assessment: Option<TaskRoutingAssessment>,
+    repo: Option<&Path>,
+) -> Result<LoadedSupervisorPlan> {
+    let worker_count = proposal.assignments.len();
+    let depth = MIN_SUPERVISOR_DEPTH
+        .checked_add(1)
+        .context("coordinated depth overflow")?;
+    if worker_count > frozen.policy.tree.max_workers
+        || usize::from(depth) > frozen.policy.tree.max_depth
+    {
+        bail!("coordinated Execution tree exceeds the frozen routing limits");
+    }
+    let task = combined_goal_spec(goal, spec);
+    let task_hash = crate::artifacts::state_auth::sha256_hex(task.as_bytes());
+    let mut parent_id = format!("coordinated-execution-{}", &task_hash[..16]);
+    while proposal
+        .assignments
+        .iter()
+        .any(|worker| worker.id == parent_id)
+    {
+        parent_id.push_str("-parent");
+    }
+    let spec_fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<Vec<_>>();
+    let mut fragments_by_assignment =
+        BTreeMap::from([(parent_id.clone(), spec_fragment_ids.clone())]);
+    let mut paths = BTreeSet::new();
+    let mut symbols = BTreeSet::new();
+    let mut modules = BTreeSet::new();
+    let mut workers = Vec::with_capacity(worker_count);
+    for assignment in proposal.assignments {
+        let worker_paths = assignment
+            .assigned_paths
+            .into_iter()
+            .map(crate::sync::normalize_repo_relative_path)
+            .collect::<crate::sync::Result<BTreeSet<_>>>()?;
+        paths.extend(worker_paths.iter().cloned());
+        symbols.extend(assignment.semantic_symbols.iter().cloned());
+        modules.extend(assignment.semantic_modules.iter().cloned());
+        fragments_by_assignment.insert(assignment.id.clone(), assignment.fragment_ids);
+        workers.push(WorkerAssignment {
+            id: assignment.id,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: None,
+            assigned_paths: worker_paths.into_iter().collect(),
+            semantic_symbols: assignment.semantic_symbols,
+            semantic_modules: assignment.semantic_modules,
+            task: Some(assignment.task),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+    }
+    let parent = OrchestratorAssignment {
+        id:parent_id.clone(), phase:AssignmentPhase::Execution, runtime:None,
+        role:AgentRole::ChildOrchestrator, role_category:Some(RoleCategory::DelegatingCoordinator),
+        selection_source:None, assigned_paths:paths.into_iter().collect(),
+        semantic_symbols:symbols.into_iter().collect(), semantic_modules:modules.into_iter().collect(),
+        task:Some(task.clone()), worker_assignments:workers, environment_requirements:Vec::new(),
+        licensed_breakage:None, notes:Some("Execution parent selected by frozen coordinated task grain; nested scopes require live authenticated frozen grants and actual isolated captures".into()),
+        decision_refs:Vec::new(),
+    };
+    // No Planning identity is copied and no nested Worker is scheduled twice.
+    let schedule = vec![AssignmentScheduleEntry {
+        assignment_id: parent_id,
+        parent_assignment_id: None,
+        depth: MIN_SUPERVISOR_DEPTH,
+        flattened_index: 0,
+    }];
+    let plan = SupervisorPlan {
+        version: SUPERVISOR_SCHEMA_VERSION,
+        task,
+        task_file,
+        max_depth: depth,
+        max_child_assignments: worker_count
+            .checked_add(1)
+            .context("coordinated assignment capacity overflow")?,
+        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
+        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+        semantic_coordination: SemanticCoordinationMode::Off,
+        role_models: BTreeMap::new(),
+        model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+        assignments: vec![parent],
+    };
+    let metadata = SupervisorPlanMetadata {
+        spec_fragment_ids,
+        spec_fragment_ids_by_assignment: fragments_by_assignment,
+        assignment_schedule: schedule,
+        run_budget: conservative_generated_role_budget(),
+        path_proposal: proposal.diagnostics,
+        resolved_routing_policy: Some(frozen),
+        task_routing_assessment,
+        ..SupervisorPlanMetadata::default()
+    };
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)?;
+    Ok(LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata,
+    })
+}
+
+/// One terminal Worker may own multiple inseparable workstreams. Collapse only
+/// an already validated, complete proposal; preserve every task, fragment and
+/// declared decision dependency instead of silently dropping work to fit a lane.
+fn collapse_direct_worker_proposal(
+    mut proposal: planning::TaskDecompositionProposal,
+) -> Result<planning::TaskDecompositionProposal> {
+    if proposal.assignments.len() <= 1 {
+        return Ok(proposal);
+    }
+    let mut assignments = proposal.assignments.into_iter();
+    let mut combined = assignments
+        .next()
+        .context("direct Worker lost its workstream")?;
+    for assignment in assignments {
+        combined
+            .task
+            .push_str("\n\nAdditional required workstream:\n");
+        combined.task.push_str(&assignment.task);
+        combined.fragment_ids.extend(assignment.fragment_ids);
+        combined.assigned_paths.extend(assignment.assigned_paths);
+        combined
+            .semantic_symbols
+            .extend(assignment.semantic_symbols);
+        combined
+            .semantic_modules
+            .extend(assignment.semantic_modules);
+        combined
+            .decision_dependencies
+            .extend(assignment.decision_dependencies);
+    }
+    combined.assigned_paths = combined
+        .assigned_paths
+        .into_iter()
+        .map(crate::sync::normalize_repo_relative_path)
+        .collect::<crate::sync::Result<BTreeSet<_>>>()?
+        .into_iter()
+        .collect();
+    combined.semantic_symbols.sort();
+    combined.semantic_symbols.dedup();
+    combined.semantic_modules.sort();
+    combined.semantic_modules.dedup();
+    combined.decision_dependencies.sort();
+    combined.decision_dependencies.dedup();
+    proposal.assignments = vec![combined];
+    planning::validate_task_assignment_disjointness(&proposal.assignments)?;
+    Ok(proposal)
+}
+
+fn direct_file_preclaim_directive(
+    assignment: &planning::TaskAssignmentProposal,
+    kind: &str,
+) -> Result<String> {
+    let [assigned_path] = assignment.assigned_paths.as_slice() else {
+        bail!("direct file contract requires one exact assigned path");
+    };
+    let payload = json!({"verification_contract": {
+        "kind":kind,
+        "assigned_path": assigned_path.to_str().context("direct file path must be UTF-8")?,
+        "execution_assignment": {
+            "id": assignment.id,
+            "phase": AssignmentPhase::Execution,
+            "role": AgentRole::Worker,
+            "role_category": AgentRole::Worker.authority_category(),
+            "task_sha256": crate::artifacts::state_auth::sha256_hex(assignment.task.as_bytes()),
+        }
+    }});
+    Ok(format!(
+        "{GENERATED_PRECLAIM_DIRECTIVE_PREFIX}{}",
+        serde_json::to_string(&payload)?
+    ))
+}
+
+#[cfg(test)]
+mod task_routing_lowering_tests {
+    use super::*;
+
+    fn proposal() -> planning::TaskDecompositionProposal {
+        serde_json::from_value(json!({
+            "fragments":[{"id":"a","text":"Create marker.txt with one line: ready"}],
+            "assignments":[{"id":"a","task":"Create marker.txt with one line: ready",
+                "fragment_ids":["a"],"assigned_paths":["marker.txt"],
+                "semantic_symbols":[],"semantic_modules":[]}],
+            "diagnostics":{"degraded":false,"notes":[AUTHORITATIVE_NEW_FILE_DIAGNOSTIC]},
+            "disjointness":{"disjoint":true,"conflicts":[]}
+        }))
+        .unwrap()
+    }
+
+    fn loaded(repo: &Path, proposal: planning::TaskDecompositionProposal) -> LoadedSupervisorPlan {
+        supervisor_plan_and_consultant_from_goal_spec_proposal(
+            "Complete the assigned work",
+            "Complete and verify all fragments",
+            None,
+            proposal,
+            Some(repo),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn assessed_task_carrier_round_trips_and_refuses_declaration_or_estimate_drift() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let loaded = loaded(repo.path(), proposal());
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap();
+        assessment
+            .validate_for_task(frozen, &loaded.plan.task)
+            .unwrap();
+        assert!(assessment.features.context_tokens > 0);
+        let value = intake_document(&loaded);
+        let parsed = load_normal_intake_document(value.clone(), repo.path()).unwrap();
+        assert_eq!(
+            parsed.plan_metadata.task_routing_assessment,
+            loaded.plan_metadata.task_routing_assessment
+        );
+        assert_eq!(
+            task_routing_assessment_from_plan_document(&parsed.plan, &value).unwrap(),
+            loaded.plan_metadata.task_routing_assessment
+        );
+        assert_eq!(
+            intake_document(&parsed)["task_routing_assessment"],
+            value["task_routing_assessment"]
+        );
+
+        let mut changed_task = value.clone();
+        changed_task["task"] = json!("A different declared task");
+        assert!(load_normal_intake_document(changed_task, repo.path()).is_err());
+        let mut changed_score = value.clone();
+        changed_score["task_routing_assessment"]["features"]["risk"] = json!(9999);
+        assert!(load_normal_intake_document(changed_score, repo.path()).is_err());
+        let mut changed_digest = value.clone();
+        changed_digest["task_routing_assessment"]["declared_input_sha256"] = json!("0".repeat(64));
+        assert!(load_normal_intake_document(changed_digest, repo.path()).is_err());
+        let mut null = value.clone();
+        null["task_routing_assessment"] = Value::Null;
+        assert!(load_normal_intake_document(null, repo.path()).is_err());
+        let mut orphan = value;
+        orphan
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_routing_policy");
+        assert!(load_normal_intake_document(orphan, repo.path()).is_err());
+    }
+
+    #[test]
+    fn legacy_task_carrier_is_omitted_and_incompatible_frozen_policy_refuses() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut loaded = loaded(repo.path(), proposal());
+        let mut incompatible = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .clone()
+            .unwrap();
+        incompatible.policy.task_estimation = None;
+        incompatible.sha256 = crate::artifacts::state_auth::sha256_hex(
+            &serde_json::to_vec(&incompatible.policy).unwrap(),
+        );
+        assert!(loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap()
+            .validate(&incompatible)
+            .is_err());
+        loaded.plan_metadata.task_routing_assessment = None;
+        loaded.plan_metadata.resolved_routing_policy = Some(incompatible);
+        let value = intake_document(&loaded);
+        assert!(value.get("task_routing_assessment").is_none());
+        let parsed = load_normal_intake_document(value.clone(), repo.path()).unwrap();
+        assert!(parsed.plan_metadata.task_routing_assessment.is_none());
+        assert!(
+            task_routing_assessment_from_plan_document(&parsed.plan, &value)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn small_scope_is_one_worker_with_actual_direct_preclaim_identity() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let loaded = loaded(repo.path(), proposal());
+        assert_eq!(loaded.plan.assignments.len(), 1);
+        let worker = &loaded.plan.assignments[0];
+        assert_eq!(worker.role, AgentRole::Worker);
+        assert_eq!(worker.phase, AssignmentPhase::Execution);
+        assert!(worker.runtime.is_none());
+        assert!(loaded.plan.role_models.is_empty());
+        assert!(loaded.plan_metadata.assignment_schedule[0]
+            .parent_assignment_id
+            .is_none());
+        let directive: Value = serde_json::from_str(
+            worker
+                .notes
+                .as_ref()
+                .unwrap()
+                .strip_prefix(GENERATED_PRECLAIM_DIRECTIVE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        let contract = &directive["verification_contract"];
+        assert_eq!(contract["kind"], "direct_explicit_new_file_creation");
+        assert!(contract.get("planning_assignment").is_none());
+        assert_eq!(contract["execution_assignment"]["id"], worker.id);
+        assert_eq!(
+            contract["execution_assignment"]["task_sha256"],
+            crate::artifacts::state_auth::sha256_hex(worker.task.as_ref().unwrap().as_bytes())
+        );
+    }
+
+    #[test]
+    fn frozen_policy_round_trip_refuses_tampering_and_ignores_later_file_change() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let loaded = loaded(repo.path(), proposal());
+        let value = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        fs::write(
+            repo.path()
+                .join(crate::selection::routing_policy::ROUTING_POLICY_FILE),
+            "invalid later policy",
+        )
+        .unwrap();
+        let parsed = load_normal_intake_document(value.clone(), repo.path()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert!(parsed.plan_metadata.normal_intake_decision.is_none());
+        assert!(value.get("normal_intake_decision").is_none());
+        assert!(value.get("normal_intake_decision_sha256").is_none());
+        assert_eq!(
+            parsed.plan_metadata.resolved_routing_policy,
+            loaded.plan_metadata.resolved_routing_policy
+        );
+        let mut missing_receipt = value.clone();
+        missing_receipt
+            .as_object_mut()
+            .unwrap()
+            .remove("resolved_routing_policy");
+        assert!(load_normal_intake_document(missing_receipt, repo.path()).is_err());
+        let mut tampered = value.clone();
+        tampered["resolved_routing_policy"]["policy"]["tree"]["max_workers"] = json!(99);
+        assert!(
+            parse_supervisor_plan_with_consultant(&serde_json::to_string(&tampered).unwrap())
+                .is_err()
+        );
+        let mut unknown = value;
+        unknown["resolved_routing_policy"]["authority"] = json!("child-supplied");
+        assert!(
+            parse_supervisor_plan_with_consultant(&serde_json::to_string(&unknown).unwrap())
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn normal_intake_receipt_round_trip_preserves_scope_and_refuses_policy_or_schema_changes() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut loaded = loaded(repo.path(), proposal());
+        let policy_digest = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap()
+            .sha256
+            .clone();
+        // This legacy schema fixture deliberately has no assessed task carrier.
+        loaded.plan_metadata.task_routing_assessment = None;
+        // Parsing this fixture proves schema preservation only, never observed
+        // account support or dispatch authority. Scheduler must recheck those.
+        loaded.plan_metadata.normal_intake_selection = Some(
+            serde_json::from_value(json!({
+                "candidate":{"runtime":"fixture", "model":"fixture-model", "effort":"minimal"},
+                "account_binding":{"provider_id":"fixture", "account_id":"fixture-account",
+                    "account_incarnation":"fixture-incarnation", "selection_revision":1},
+                "catalog_revision":"fixture-revision", "catalog_digest":"fixture-digest",
+                "policy_digest":policy_digest,
+                "task_features":{"scope_paths":1, "scope_modules":1, "complexity":0,
+                    "risk":0, "horizon":0, "context_tokens":0, "dependency_edges":0,
+                    "independent_groups":1, "evidence":["schema-fixture-only"]},
+                "control_transport":null
+            }))
+            .unwrap(),
+        );
+        let value = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        let parsed = load_normal_intake_document(value.clone(), repo.path()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            parsed.plan_metadata.normal_intake_selection,
+            loaded.plan_metadata.normal_intake_selection
+        );
+        let round_trip = supervisor_plan_value(
+            &parsed.plan,
+            &parsed.consultant,
+            &parsed.assignment_metadata,
+            &parsed.plan_metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            round_trip["normal_intake_selection"],
+            value["normal_intake_selection"]
+        );
+        let mut digest_changed = value.clone();
+        digest_changed["normal_intake_selection"]["policy_digest"] = json!("different");
+        assert!(load_normal_intake_document(digest_changed, repo.path()).is_err());
+        let mut unknown = value.clone();
+        unknown["normal_intake_selection"]["authority"] = json!("dispatch");
+        assert!(load_normal_intake_document(unknown, repo.path()).is_err());
+        let mut unknown_account = value;
+        unknown_account["normal_intake_selection"]["account_binding"]["credential"] =
+            json!("invalid");
+        assert!(load_normal_intake_document(unknown_account, repo.path()).is_err());
+        loaded
+            .plan_metadata
+            .normal_intake_selection
+            .as_mut()
+            .unwrap()
+            .policy_digest = "different".into();
+        assert!(supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .is_err());
+    }
+
+    fn loaded_with_intake_decision(repo: &Path) -> LoadedSupervisorPlan {
+        let mut loaded = loaded(repo, proposal());
+        // This fixture tests historical receipt data, not task estimation.
+        loaded.plan_metadata.task_routing_assessment = None;
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .clone()
+            .unwrap();
+        let features = serde_json::from_value(json!({
+            "scope_paths":1, "scope_modules":1, "complexity":0, "risk":0,
+            "horizon":0, "context_tokens":0, "dependency_edges":0,
+            "independent_groups":1, "evidence":["typed-decision-schema-fixture"]
+        }))
+        .unwrap();
+        let receipt = crate::selection::routing_policy::RoutingPolicyReceipt {
+            frozen: frozen.clone(),
+            role: "worker".into(),
+            features,
+        };
+        let mut decision = crate::selection::select_with_loaded_routing_policy(
+            &crate::selection::selection_test_base_input(),
+            &[],
+            Some(&receipt),
+        )
+        .unwrap();
+        assert_eq!(decision.status, crate::selection::DecisionStatus::Selected);
+        decision.outcome_history = Some(crate::selection::AuthenticatedOutcomeHistoryProvenance {
+            snapshot_sha256: "1".repeat(64),
+            source_digests: vec!["2".repeat(64)],
+            exclusions: vec!["fixture excluded an unauthenticated source".into()],
+            projected_attempt_count: 1,
+        });
+        decision.operator_prior_data = Some(crate::selection::OperatorPriorDataProvenance {
+            relative_path: "fixture/prior.json".into(),
+            raw_sha256: "3".repeat(64),
+            effective_sha256: "4".repeat(64),
+        });
+        // This fixture exercises evidence persistence, never account support or authority.
+        loaded.plan_metadata.normal_intake_selection = Some(
+            serde_json::from_value(json!({
+                "candidate":decision.choice.as_ref().unwrap().candidate,
+                "account_binding":{"provider_id":"fixture", "account_id":"fixture-account",
+                    "account_incarnation":"fixture-incarnation", "selection_revision":1},
+                "catalog_revision":"fixture-revision", "catalog_digest":"fixture-account-digest",
+                "policy_digest":frozen.sha256, "task_features":receipt.features,
+                "control_transport":null
+            }))
+            .unwrap(),
+        );
+        loaded.plan_metadata.normal_intake_decision = Some(decision);
+        loaded
+    }
+
+    fn intake_document(loaded: &LoadedSupervisorPlan) -> Value {
+        supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap()
+    }
+
+    fn reseal_intake_decision(document: &mut Value) {
+        let decision: crate::selection::SelectionProvenance =
+            serde_json::from_value(document["normal_intake_decision"].clone()).unwrap();
+        document["normal_intake_decision_sha256"] =
+            json!(normal_intake_decision_sha256(&decision).unwrap());
+    }
+
+    #[test]
+    fn assessed_normal_intake_pair_round_trips_with_selector_provenance() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut loaded = loaded(repo.path(), proposal());
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .clone()
+            .unwrap();
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .clone()
+            .unwrap();
+        assessment
+            .validate_for_task(&frozen, &loaded.plan.task)
+            .unwrap();
+        let role = loaded.plan.assignments[0].role;
+        let features = super::super::selection_bridge::routing_features_with_assessment(
+            &loaded.plan,
+            Some(&assessment),
+            Some(&frozen),
+        )
+        .unwrap();
+        let profile = super::super::selection_bridge::task_profile_with_assessment(
+            role,
+            Some(&assessment),
+            Some(&features),
+            Some(&frozen),
+        )
+        .unwrap();
+        let mut input = crate::selection::selection_test_base_input();
+        input.task = profile.clone();
+        let receipt = crate::selection::routing_policy::RoutingPolicyReceipt {
+            frozen: frozen.clone(),
+            role: role.as_str().to_string(),
+            features: features.clone(),
+        };
+        let decision =
+            crate::selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))
+                .unwrap();
+        assert_eq!(decision.status, crate::selection::DecisionStatus::Selected);
+        assert_eq!(decision.normalized_input.task, profile);
+        assert_eq!(decision.normalized_task, profile);
+        assert_eq!(decision.routing_policy.as_ref(), Some(&receipt));
+        let candidate = decision.choice.as_ref().unwrap().candidate.clone();
+        assert!(decision
+            .candidate_set
+            .iter()
+            .any(|entry| entry.eligible && entry.candidate == candidate));
+
+        // Reuse the historical schema-only account carrier, not launch authority.
+        // Candidate, features and policy come from the current real selector result.
+        let fixture = loaded_with_intake_decision(repo.path());
+        let mut selected = serde_json::to_value(
+            fixture
+                .plan_metadata
+                .normal_intake_selection
+                .as_ref()
+                .unwrap(),
+        )
+        .unwrap();
+        selected["candidate"] = json!(candidate);
+        selected["task_features"] = json!(features);
+        selected["policy_digest"] = json!(frozen.sha256);
+        loaded.plan_metadata.normal_intake_selection =
+            Some(serde_json::from_value(selected).unwrap());
+        loaded.plan_metadata.normal_intake_decision = Some(decision.clone());
+        assert!(loaded.plan_metadata.task_routing_assessment.is_some());
+        assert!(loaded.plan_metadata.normal_intake_decision.is_some());
+
+        let document = intake_document(&loaded);
+        let encoded = serde_json::to_string(&document).unwrap();
+        let decoded: Value = serde_json::from_str(&encoded).unwrap();
+        let parsed = load_normal_intake_document(decoded, repo.path()).unwrap();
+        assert_eq!(parsed.plan.task, loaded.plan.task);
+        assert_eq!(
+            parsed.plan_metadata.task_routing_assessment.as_ref(),
+            Some(&assessment)
+        );
+        assert_eq!(
+            parsed.plan_metadata.normal_intake_decision.as_ref(),
+            Some(&decision)
+        );
+        let parsed_assessment = parsed
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        parsed_assessment
+            .validate_for_task(&frozen, &parsed.plan.task)
+            .unwrap();
+        let parsed_selection = parsed
+            .plan_metadata
+            .normal_intake_selection
+            .as_ref()
+            .unwrap();
+        assert_eq!(parsed_selection.candidate(), &candidate);
+        assert_eq!(parsed_selection.task_features, receipt.features);
+        assert_eq!(parsed_selection.policy_digest, assessment.policy_sha256);
+        assert_eq!(receipt.frozen, frozen);
+        assert_eq!(receipt.features.complexity, assessment.features.complexity);
+        assert_eq!(receipt.features.risk, assessment.features.risk);
+        assert_eq!(receipt.features.horizon, assessment.features.horizon);
+        assert_eq!(
+            receipt.features.context_tokens,
+            assessment.features.context_tokens
+        );
+        assert_eq!(
+            document["normal_intake_decision_sha256"],
+            json!(normal_intake_decision_sha256(&decision).unwrap())
+        );
+        let round_trip = intake_document(&parsed);
+        for field in [
+            "task_routing_assessment",
+            "normal_intake_decision",
+            "normal_intake_decision_sha256",
+            "normal_intake_selection",
+            "resolved_routing_policy",
+        ] {
+            assert!(
+                !document[field].is_null(),
+                "missing paired carrier field: {field}"
+            );
+            assert_eq!(round_trip[field], document[field]);
+        }
+    }
+
+    #[test]
+    fn normal_intake_decision_round_trip_retains_why_history_and_typed_digest() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let loaded = loaded_with_intake_decision(repo.path());
+        let value = intake_document(&loaded);
+        let parsed = load_normal_intake_document(value.clone(), repo.path()).unwrap();
+        assert_eq!(
+            parsed.plan_metadata.normal_intake_decision,
+            loaded.plan_metadata.normal_intake_decision
+        );
+        let decision = parsed
+            .plan_metadata
+            .normal_intake_decision
+            .as_ref()
+            .unwrap();
+        assert!(!decision.decision_reason.is_empty());
+        assert!(decision.outcome_history.is_some());
+        assert!(decision.operator_prior_data.is_some());
+        assert_eq!(
+            value["normal_intake_decision_sha256"],
+            json!(normal_intake_decision_sha256(decision).unwrap())
+        );
+        let round_trip = intake_document(&parsed);
+        assert_eq!(
+            round_trip["normal_intake_decision"],
+            value["normal_intake_decision"]
+        );
+        assert_eq!(
+            round_trip["normal_intake_decision_sha256"],
+            value["normal_intake_decision_sha256"]
+        );
+    }
+
+    #[test]
+    fn normal_intake_decision_refuses_mismatched_or_malformed_evidence() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut loaded = loaded_with_intake_decision(repo.path());
+        let value = intake_document(&loaded);
+        for (path, replacement) in [
+            (
+                "/normal_intake_decision/choice/candidate/model",
+                json!("different-model"),
+            ),
+            ("/normal_intake_decision/status", json!("fail_closed")),
+            ("/normal_intake_decision/schema_version", json!(999)),
+            ("/normal_intake_decision/choice", Value::Null),
+            (
+                "/normal_intake_decision/routing_policy/frozen/sha256",
+                json!("different"),
+            ),
+            (
+                "/normal_intake_decision/routing_policy/frozen/source",
+                json!("different-source"),
+            ),
+            (
+                "/normal_intake_decision/routing_policy/features/risk",
+                json!(1),
+            ),
+            ("/normal_intake_decision/routing_policy", Value::Null),
+        ] {
+            let mut changed = value.clone();
+            *changed.pointer_mut(path).unwrap() = replacement;
+            reseal_intake_decision(&mut changed);
+            assert!(
+                load_normal_intake_document(changed, repo.path()).is_err(),
+                "accepted mismatch at {path}"
+            );
+        }
+        for field in [
+            "normal_intake_decision_sha256",
+            "normal_intake_selection",
+            "resolved_routing_policy",
+            "normal_intake_decision",
+        ] {
+            let mut changed = value.clone();
+            changed.as_object_mut().unwrap().remove(field);
+            assert!(
+                load_normal_intake_document(changed, repo.path()).is_err(),
+                "accepted orphan without {field}"
+            );
+        }
+        for (field, replacement) in [
+            ("normal_intake_decision_sha256", json!("different")),
+            ("normal_intake_decision_sha256", Value::Null),
+            ("normal_intake_decision_sha256", json!(7)),
+            ("normal_intake_decision", Value::Null),
+            ("normal_intake_decision", json!("malformed")),
+        ] {
+            let mut changed = value.clone();
+            changed[field] = replacement;
+            assert!(
+                load_normal_intake_document(changed, repo.path()).is_err(),
+                "accepted malformed {field}"
+            );
+        }
+        let mut changed = value.clone();
+        changed["normal_intake_decision"]["decision_reason"] = json!("changed without resealing");
+        assert!(load_normal_intake_document(changed, repo.path()).is_err());
+        let mut changed = value.clone();
+        changed["normal_intake_decision"]["authority"] = json!("dispatch");
+        assert!(load_normal_intake_document(changed, repo.path()).is_err());
+        loaded
+            .plan_metadata
+            .normal_intake_decision
+            .as_mut()
+            .unwrap()
+            .choice
+            .as_mut()
+            .unwrap()
+            .candidate
+            .model = "different-model".into();
+        assert!(supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .is_err());
+        let mut legacy = value;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("normal_intake_decision");
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("normal_intake_decision_sha256");
+        assert!(load_normal_intake_document(legacy, repo.path())
+            .unwrap()
+            .plan_metadata
+            .normal_intake_decision
+            .is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn normal_intake_decision_survives_authenticated_evidence_only_reaudit() {
+        for assessed in [false, true] {
+            use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily};
+            let repo = tempfile::tempdir().unwrap();
+            git2::Repository::init(repo.path()).unwrap();
+            let loaded = if assessed {
+                loaded(repo.path(), proposal())
+            } else {
+                loaded_with_intake_decision(repo.path())
+            };
+            let assignment = &loaded.plan.assignments[0];
+            let run_id = RunId::new("typed-intake-reaudit-source").unwrap();
+            let binding = CandidateValidationBinding {
+                version: 1,
+                agent_id: assignment.id.clone(),
+                primary_head: Some("1".repeat(40)),
+                agent_head: Some("2".repeat(40)),
+                merge_base: Some("1".repeat(40)),
+                diff_oid: "3".repeat(40),
+            };
+            let denial = GateDenial::new(
+                run_id.as_str(),
+                GateDenialReason::AuditorRepair {
+                    rejection: AuditorRejectionKind::EvidenceQuality,
+                },
+                VerifiedGateContext::new(
+                    &assignment.id,
+                    GateCheckSource::Auditor,
+                    std::iter::empty::<&Path>(),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+            let report: SupervisorFinalReport = serde_json::from_value(json!({
+                "version":1, "run_id":run_id, "role":"supervisor", "repo":".",
+                "plan_file":"plan.json", "run_dir":".", "publishable":false,
+                "success":false, "accepted":false, "rejected":true, "status":"rejected",
+                "run_lifecycle":"finalized", "remaining_risk":"fixture", "next_safe_action":"re-audit",
+                "orchestrator_reports":[{"id":assignment.id, "role":assignment.role,
+                    "accepted":false, "rejected":true, "status":"rejected", "gate_denials":[denial]}],
+                "assignment_traceability":[{"assignment_id":assignment.id, "depth":2,
+                    "flattened_index":0, "produced_diff_binding":binding}]
+            }))
+            .unwrap();
+            let mut writer = ArtifactRunWriter::reserve(
+                repo.path(),
+                RunArtifactFamily::Supervise,
+                run_id.clone(),
+                "typed-intake-reaudit-fixture",
+            )
+            .unwrap();
+            writer
+                .write_bytes(
+                    "assignments/supervisor-plan.json",
+                    &serde_json::to_vec(&intake_document(&loaded)).unwrap(),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .unwrap();
+            writer
+                .write_bytes(
+                    RunArtifactFamily::Supervise.final_report_relative_path(),
+                    &serde_json::to_vec(&report).unwrap(),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .unwrap();
+            writer
+                .finalize(
+                    RunArtifactFamily::Supervise.final_report_relative_path(),
+                    false,
+                )
+                .unwrap();
+            let reaudit =
+                evidence_only_reaudit_plan_from_source(repo.path(), &run_id, &assignment.id)
+                    .unwrap();
+            assert_ne!(reaudit.plan.task, loaded.plan.task);
+            assert!(reaudit.plan_metadata.evidence_only_reaudit.is_some());
+            assert_eq!(
+                reaudit.plan_metadata.normal_intake_decision,
+                loaded.plan_metadata.normal_intake_decision
+            );
+            let parsed =
+                load_normal_intake_document(intake_document(&reaudit), repo.path()).unwrap();
+            assert_eq!(
+                parsed.plan_metadata.normal_intake_decision,
+                loaded.plan_metadata.normal_intake_decision
+            );
+
+            assert_eq!(
+                reaudit.plan_metadata.task_routing_assessment,
+                loaded.plan_metadata.task_routing_assessment
+            );
+            assert_eq!(
+                parsed.plan_metadata.task_routing_assessment,
+                loaded.plan_metadata.task_routing_assessment
+            );
+            let operation = reaudit
+                .plan_metadata
+                .evidence_only_reaudit
+                .as_ref()
+                .unwrap();
+            let expected_assignment = &reaudit.plan.assignments[0];
+            let expected = reaudit.plan_metadata.task_routing_assessment.as_ref();
+            verify_evidence_only_reaudit_source(
+                repo.path(),
+                operation,
+                expected_assignment,
+                expected,
+            )
+            .unwrap();
+            let frozen = loaded
+                .plan_metadata
+                .resolved_routing_policy
+                .as_ref()
+                .unwrap();
+            if let Some(original) = expected {
+                original
+                    .validate_for_task(frozen, &loaded.plan.task)
+                    .unwrap();
+                assert!(original
+                    .validate_for_task(frozen, &reaudit.plan.task)
+                    .is_err());
+                let error = verify_evidence_only_reaudit_source(
+                    repo.path(),
+                    operation,
+                    expected_assignment,
+                    None,
+                )
+                .expect_err("removing authenticated assessment must refuse");
+                assert!(error.to_string().contains("task assessment differs"));
+            }
+            // This is a valid, recomputed heuristic witness, never source authority.
+            let replacement = super::super::task_routing::assess_task_routing(
+                "Foreign independently sealed declaration",
+                &proposal(),
+                frozen,
+            )
+            .unwrap();
+            replacement.validate(frozen).unwrap();
+            let error = verify_evidence_only_reaudit_source(
+                repo.path(),
+                operation,
+                expected_assignment,
+                Some(&replacement),
+            )
+            .expect_err("replacement or addition must refuse");
+            assert!(error.to_string().contains("task assessment differs"));
+        }
+    }
+
+    #[test]
+    fn coordinated_route_authors_distinct_execution_parent_and_exact_nested_workers() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut proposal = proposal();
+        proposal.diagnostics.notes.clear();
+        proposal.fragments.push(planning::TaskSpecFragment {
+            id: "b".into(),
+            text: "Edit b.rs".into(),
+        });
+        let mut second = proposal.assignments[0].clone();
+        second.id = "b".into();
+        second.task = "Edit b.rs".into();
+        second.fragment_ids = vec!["b".into()];
+        second.assigned_paths = vec![PathBuf::from("b.rs")];
+        proposal.assignments.push(second);
+        let expected = proposal.assignments.clone();
+        let loaded = loaded(repo.path(), proposal);
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap();
+        assessment
+            .validate_for_task(frozen, &loaded.plan.task)
+            .unwrap();
+        assert!(assessment.features.context_tokens > 0);
+        let recounted = super::super::selection_bridge::routing_features_with_assessment(
+            &loaded.plan,
+            Some(assessment),
+            Some(frozen),
+        )
+        .unwrap();
+        assert_eq!(recounted.complexity, assessment.features.complexity);
+        assert_eq!(recounted.scope_paths, 2);
+        assert_eq!(loaded.plan.assignments.len(), 1);
+        let parent = &loaded.plan.assignments[0];
+        assert_eq!(parent.role, AgentRole::ChildOrchestrator);
+        assert_eq!(parent.phase, AssignmentPhase::Execution);
+        assert_eq!(parent.worker_assignments.len(), 2);
+        assert!(parent.runtime.is_none());
+        assert_eq!(loaded.plan_metadata.assignment_schedule.len(), 1);
+        for (worker, proposal) in parent.worker_assignments.iter().zip(expected) {
+            assert_ne!(worker.id, parent.id);
+            assert_eq!(worker.id, proposal.id);
+            assert_eq!(worker.assigned_paths, proposal.assigned_paths);
+            assert_eq!(worker.task.as_ref(), Some(&proposal.task));
+            assert_eq!(
+                crate::artifacts::state_auth::sha256_hex(worker.task.as_ref().unwrap().as_bytes()),
+                crate::artifacts::state_auth::sha256_hex(proposal.task.as_bytes())
+            );
+            assert_eq!(
+                loaded.plan_metadata.spec_fragment_ids_by_assignment[&worker.id],
+                proposal.fragment_ids
+            );
+        }
+        assert_eq!(
+            parent.assigned_paths,
+            vec![PathBuf::from("b.rs"), PathBuf::from("marker.txt")]
+        );
+        let document = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        let parsed = load_normal_intake_document(document, repo.path()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            parsed.plan_metadata.task_routing_assessment,
+            loaded.plan_metadata.task_routing_assessment
+        );
+        assert_eq!(
+            parsed.plan_metadata.spec_fragment_ids_by_assignment,
+            loaded.plan_metadata.spec_fragment_ids_by_assignment
+        );
+    }
+
+    #[test]
+    fn shared_decision_dependencies_keep_conservative_planning_graph() {
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let mut proposal = proposal();
+        proposal.diagnostics.notes.clear();
+        proposal.fragments.push(planning::TaskSpecFragment {
+            id: "b".into(),
+            text: "Edit b.rs".into(),
+        });
+        proposal.assignments[0]
+            .decision_dependencies
+            .push("api-choice".into());
+        let mut second = proposal.assignments[0].clone();
+        second.id = "b".into();
+        second.task = "Edit b.rs".into();
+        second.fragment_ids = vec!["b".into()];
+        second.assigned_paths = vec![PathBuf::from("b.rs")];
+        proposal.assignments.push(second);
+        let loaded = loaded(repo.path(), proposal);
+        assert_eq!(loaded.plan.assignments.len(), 4);
+        for pair in loaded.plan.assignments.chunks_exact(2) {
+            assert_eq!(pair[0].phase, AssignmentPhase::Planning);
+            assert!(pair[0].worker_assignments.is_empty());
+            assert_eq!(pair[1].role, AgentRole::Worker);
+        }
+    }
+
+    fn lowered_provider_tree() -> (Vec<OrchestratorAssignment>, u8) {
+        let first = planning::ProviderTaskAssignmentTree::from(proposal().assignments.remove(0));
+        let mut second = first.clone();
+        second.id = "b".into();
+        second.assigned_paths = vec![PathBuf::from("second.txt")];
+        second.fragment_ids = vec!["b".into()];
+        let mut root = first.clone();
+        root.id = "parent".into();
+        root.assigned_paths.extend(second.assigned_paths.clone());
+        root.child_assignments = vec![first, second];
+        let mut assignments = Vec::new();
+        let mut depth = MIN_SUPERVISOR_DEPTH;
+        lower_provider_assignment_tree(
+            &root,
+            None,
+            MIN_SUPERVISOR_DEPTH,
+            &mut assignments,
+            &mut Vec::new(),
+            &mut BTreeMap::new(),
+            &mut BTreeSet::new(),
+            &mut depth,
+        )
+        .unwrap();
+        (assignments, depth)
+    }
+
+    #[test]
+    fn provider_lowering_refuses_worker_count_above_frozen_policy() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut frozen =
+            crate::selection::routing_policy::load_routing_policy(repo.path()).unwrap();
+        let (assignments, depth) = lowered_provider_tree();
+        frozen.policy.tree.max_workers = 1;
+        assert!(
+            validate_provider_routing_limits(&assignments, depth, &frozen)
+                .unwrap_err()
+                .to_string()
+                .contains("max_workers")
+        );
+    }
+
+    #[test]
+    fn provider_lowering_refuses_depth_above_frozen_policy() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut frozen =
+            crate::selection::routing_policy::load_routing_policy(repo.path()).unwrap();
+        let (assignments, depth) = lowered_provider_tree();
+        frozen.policy.tree.max_workers = 2;
+        frozen.policy.tree.max_depth = usize::from(depth - 1);
+        assert!(
+            validate_provider_routing_limits(&assignments, depth, &frozen)
+                .unwrap_err()
+                .to_string()
+                .contains("max_depth")
+        );
+    }
+
+    #[test]
+    fn provider_lowering_accepts_actual_tree_within_frozen_policy_without_reclassification() {
+        let repo = tempfile::tempdir().unwrap();
+        let mut frozen =
+            crate::selection::routing_policy::load_routing_policy(repo.path()).unwrap();
+        let (assignments, depth) = lowered_provider_tree();
+        frozen.policy.tree.max_workers = 2;
+        frozen.policy.tree.max_depth = usize::from(depth);
+        validate_provider_routing_limits(&assignments, depth, &frozen).unwrap();
+        assert_eq!(assignments[0].role, AgentRole::ChildOrchestrator);
+        assert_eq!(assignments[0].phase, AssignmentPhase::Planning);
+        assert!(assignments[1..]
+            .iter()
+            .all(|assignment| assignment.role == AgentRole::Worker));
+    }
+
+    #[test]
+    fn remaining_complete_feedback_replan_assesses_without_dropping_session_history() {
+        let temp = tempfile::tempdir().unwrap();
+        let repo = temp.path();
+        git2::Repository::init(repo).unwrap();
+        std::fs::create_dir_all(repo.join("src")).unwrap();
+        std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").unwrap();
+        std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").unwrap();
+        std::fs::write(repo.join("src/gamma.rs"), "pub fn gamma_task() {}\n").unwrap();
+        let config = planning::ProviderPlanningConfig::new("replan", "planner-model");
+        let spec = "- Update alpha_task in src/alpha.rs.\n- Update beta_task in src/beta.rs.";
+        let mut session = planning::propose_task_decomposition_with_optional_provider(
+            repo, "", spec, None, &config,
+        )
+        .unwrap();
+        let feedback = planning::TaskExecutionFeedback {
+            completed_assignment_ids: vec!["assignment-001".to_string()],
+            failed_assignment_ids: vec!["assignment-002".to_string()],
+            coverage_gap_fragment_ids: vec!["fragment-002".to_string()],
+            notes: vec!["execution found the implementation in src/gamma.rs".to_string()],
+        };
+        planning::replan_task_decomposition_from_feedback(repo, &mut session, &feedback).unwrap();
+        assert!(session.completed_fragment_ids().contains("fragment-001"));
+        assert!(session
+            .proposal()
+            .fragments
+            .iter()
+            .any(|fragment| fragment.id == "fragment-001"));
+        assert!(session
+            .completed_assignments()
+            .iter()
+            .any(|assignment| assignment.id == "assignment-001"));
+
+        let loaded = supervisor_plan_and_consultant_from_task_planning_session(
+            "",
+            spec,
+            None,
+            &session,
+            Some(repo),
+        )
+        .unwrap();
+        assert!(loaded.plan_metadata.resolved_routing_policy.is_some());
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        assessment
+            .validate_for_task(
+                loaded
+                    .plan_metadata
+                    .resolved_routing_policy
+                    .as_ref()
+                    .unwrap(),
+                &loaded.plan.task,
+            )
+            .unwrap();
+        assert!(!loaded
+            .plan_metadata
+            .spec_fragment_ids
+            .iter()
+            .any(|id| id == "fragment-001"));
+        assert!(loaded
+            .plan_metadata
+            .spec_fragment_ids
+            .iter()
+            .any(|id| id == "fragment-002"));
+        assert!(loaded.plan.assignments.iter().any(|assignment| {
+            assignment
+                .assigned_paths
+                .contains(&PathBuf::from("src/gamma.rs"))
+        }));
+        assert!(loaded
+            .plan
+            .assignments
+            .iter()
+            .all(|assignment| assignment.id != "assignment-001"));
+
+        let document = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        let parsed = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            parsed.plan_metadata.task_routing_assessment,
+            loaded.plan_metadata.task_routing_assessment
+        );
+        assert_eq!(
+            parsed.plan_metadata.resolved_routing_policy,
+            loaded.plan_metadata.resolved_routing_policy
+        );
+        assert!(session.completed_fragment_ids().contains("fragment-001"));
+        assert!(session
+            .proposal()
+            .fragments
+            .iter()
+            .any(|fragment| fragment.id == "fragment-001"));
+    }
 }
 
 const AUTHORITATIVE_NEW_FILE_DIAGNOSTIC: &str =
@@ -600,12 +1973,20 @@ fn authoritative_existing_file_edit_workstream_id(
         && assignment_fragment_ids == fragment_ids
         && assignment.semantic_symbols.is_empty()
         && assignment.semantic_modules.is_empty()
+        // Literal append contracts must originate from the complete raw goal.
+        // Fragment normalization alone can flatten an invalid multiline payload.
+        && (planning::explicit_existing_file_line_edit_target(&assignment.task).is_none()
+            || proposal.diagnostics.notes.iter().filter(|note|
+                note.as_str() == planning::AUTHORITATIVE_LITERAL_FILE_EDIT_DIAGNOSTIC
+            ).count() == 1)
         && explicit_existing_file_edit_verification_task(&assignment.task, assigned_path))
     .then(|| assignment.id.clone())
 }
 
 pub(super) fn explicit_existing_file_edit_verification_task(task: &str, target: &Path) -> bool {
-    if explicit_existing_file_rust_test_contract_task(task, target) {
+    if planning::explicit_existing_file_line_edit_target(task).as_deref() == Some(target)
+        || explicit_existing_file_rust_test_contract_task(task, target)
+    {
         return true;
     }
     let Some(target) = target.to_str() else {
@@ -1227,6 +2608,16 @@ fn supervisor_plan_and_consultant_from_provider_session(
     session: &planning::TaskPlanningSession,
     repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
+    let resolved_routing_policy = repo
+        .map(crate::selection::routing_policy::load_routing_policy)
+        .transpose()?;
+    let task = combined_goal_spec(goal, spec);
+    let remaining_proposal = remaining_routing_proposal(session);
+    let task_routing_assessment = resolved_routing_policy
+        .as_ref()
+        .filter(|frozen| frozen.policy.task_estimation.is_some())
+        .map(|frozen| super::task_routing::assess_task_routing(&task, &remaining_proposal, frozen))
+        .transpose()?;
     let roots = session.provider_assignment_tree();
     if roots.is_empty() {
         bail!("provider planning session has no validated provider assignment tree");
@@ -1250,6 +2641,9 @@ fn supervisor_plan_and_consultant_from_provider_session(
             &mut actual_max_depth,
         )?;
     }
+    if let Some(frozen) = &resolved_routing_policy {
+        validate_provider_routing_limits(&assignments, actual_max_depth, frozen)?;
+    }
     let declared_dependencies = collect_provider_tree_decision_dependencies(roots);
     apply_generated_design_decisions(
         repo,
@@ -1263,7 +2657,6 @@ fn supervisor_plan_and_consultant_from_provider_session(
         bail!("provider planning session has no executable remaining work");
     }
     let actual_assignment_count = assignments.len();
-    let task = combined_goal_spec(goal, spec);
     let plan = SupervisorPlan {
         version: SUPERVISOR_SCHEMA_VERSION,
         task,
@@ -1296,6 +2689,10 @@ fn supervisor_plan_and_consultant_from_provider_session(
         generated_follow_up: None,
         path_proposal: session.proposal().diagnostics.clone(),
         router: SupervisorRouterConfig::default(),
+        resolved_routing_policy,
+        task_routing_assessment,
+        normal_intake_selection: None,
+        normal_intake_decision: None,
     };
     let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)
         .context("validated provider planning session could not be lowered safely")?;
@@ -1305,6 +2702,24 @@ fn supervisor_plan_and_consultant_from_provider_session(
         assignment_metadata,
         plan_metadata,
     })
+}
+
+fn validate_provider_routing_limits(
+    assignments: &[OrchestratorAssignment],
+    actual_max_depth: u8,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> Result<()> {
+    let workers = assignments
+        .iter()
+        .filter(|assignment| assignment.role == AgentRole::Worker)
+        .count();
+    if workers > frozen.policy.tree.max_workers {
+        bail!("provider Worker count exceeds the frozen routing policy max_workers");
+    }
+    if usize::from(actual_max_depth) > frozen.policy.tree.max_depth {
+        bail!("provider assignment depth exceeds the frozen routing policy max_depth");
+    }
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2190,6 +3605,7 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
     plan.assignments = assignments_from_plan_value(&value)?;
     let (mut plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, repo)?;
     bind_assignment_role_categories(&mut plan);
+    validate_task_routing_assessment_binding(&plan, &plan_metadata)?;
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
     validate_consultant_plan(&consultant)?;
     Ok(LoadedSupervisorPlan {
@@ -2213,6 +3629,8 @@ pub(crate) fn validate_generated_follow_up_plan_document_in_repo(
         || loaded.plan_metadata.assignment_schedule != generated.assignment_schedule
         || loaded.plan_metadata.run_budget != generated.run_budget
         || loaded.plan_metadata.generated_follow_up != Some(generated.generated_follow_up.clone())
+        || loaded.plan_metadata.resolved_routing_policy != generated.resolved_routing_policy
+        || loaded.plan_metadata.task_routing_assessment != generated.task_routing_assessment
         || !loaded.plan_metadata.spec_fragment_ids.is_empty()
     {
         bail!("ordinary full-document loader changed generated follow-up authority");
@@ -2267,6 +3685,68 @@ fn supervisor_plan_metadata_from_value(
     value: &Value,
     max_depth: u8,
 ) -> Result<SupervisorPlanMetadata> {
+    let resolved_routing_policy = value
+        .get("resolved_routing_policy")
+        .map(
+            |receipt| -> Result<crate::selection::routing_policy::FrozenRoutingPolicy> {
+                let frozen = serde_json::from_value(receipt.clone())
+                    .context("resolved_routing_policy is invalid")?;
+                validate_frozen_routing_policy(&frozen)?;
+                Ok(frozen)
+            },
+        )
+        .transpose()?;
+    let task_routing_assessment = value
+        .get("task_routing_assessment")
+        .map(|assessment| {
+            serde_json::from_value::<TaskRoutingAssessment>(assessment.clone())
+                .context("task_routing_assessment is invalid")
+        })
+        .transpose()?;
+    if let Some(assessment) = &task_routing_assessment {
+        assessment.validate(
+            resolved_routing_policy
+                .as_ref()
+                .context("task_routing_assessment requires its frozen routing policy")?,
+        )?;
+    }
+    let normal_intake_selection = value
+        .get("normal_intake_selection")
+        .map(
+            |receipt| -> Result<crate::selection::routing_policy::SelectedLaunchRequest> {
+                let selection = serde_json::from_value(receipt.clone())
+                    .context("normal_intake_selection is invalid")?;
+                validate_normal_intake_policy_binding(
+                    &selection,
+                    resolved_routing_policy.as_ref(),
+                )?;
+                Ok(selection)
+            },
+        )
+        .transpose()?;
+    let normal_intake_decision = value
+        .get("normal_intake_decision")
+        .map(|receipt| -> Result<crate::selection::SelectionProvenance> {
+            let decision = serde_json::from_value(receipt.clone())
+                .context("normal_intake_decision is invalid")?;
+            validate_normal_intake_decision_binding(
+                &decision,
+                normal_intake_selection.as_ref(),
+                resolved_routing_policy.as_ref(),
+            )?;
+            let supplied_digest = value
+                .get("normal_intake_decision_sha256")
+                .and_then(Value::as_str)
+                .context("normal_intake_decision requires its SHA256 receipt")?;
+            if supplied_digest != normal_intake_decision_sha256(&decision)? {
+                bail!("normal_intake_decision SHA256 differs from its typed receipt");
+            }
+            Ok(decision)
+        })
+        .transpose()?;
+    if normal_intake_decision.is_none() && value.get("normal_intake_decision_sha256").is_some() {
+        bail!("normal_intake_decision_sha256 requires its typed decision");
+    }
     let objective_profile = value
         .get("objective_profile")
         .map(|profile| {
@@ -2363,6 +3843,10 @@ fn supervisor_plan_metadata_from_value(
         execution_target,
         path_proposal,
         router,
+        resolved_routing_policy,
+        task_routing_assessment,
+        normal_intake_selection,
+        normal_intake_decision,
         ..SupervisorPlanMetadata::default()
     };
     bind_live_router_config(metadata.router.clone());
@@ -2390,6 +3874,156 @@ fn supervisor_plan_metadata_from_value(
         metadata.assignment_schedule = supplied_schedule;
     }
     Ok(metadata)
+}
+
+fn validate_frozen_routing_policy(
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> Result<()> {
+    frozen.policy.validate()?;
+    let digest = crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
+    if frozen.sha256 != digest || frozen.source.trim().is_empty() {
+        bail!("frozen routing policy digest or source identity is invalid");
+    }
+    Ok(())
+}
+
+fn validate_normal_intake_policy_binding(
+    selection: &crate::selection::routing_policy::SelectedLaunchRequest,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<()> {
+    let frozen = frozen.context("normal_intake_selection requires its frozen routing policy")?;
+    validate_frozen_routing_policy(frozen)?;
+    if selection.policy_digest != frozen.sha256 {
+        bail!("normal_intake_selection policy digest differs from its frozen routing policy");
+    }
+    Ok(())
+}
+
+/// Load the same typed metadata emitted by lowering, without granting execution authority.
+pub(crate) fn task_routing_assessment_from_plan_document(
+    plan: &SupervisorPlan,
+    document: &Value,
+) -> Result<Option<TaskRoutingAssessment>> {
+    let metadata = supervisor_plan_metadata_from_value(document, plan.max_depth)?;
+    if metadata.evidence_only_reaudit.is_some() {
+        bail!("current normal intake cannot reuse a historical re-audit assessment");
+    }
+    validate_task_routing_assessment_binding(plan, &metadata)?;
+    Ok(metadata.task_routing_assessment)
+}
+
+fn validate_task_routing_assessment_binding(
+    plan: &SupervisorPlan,
+    metadata: &SupervisorPlanMetadata,
+) -> Result<()> {
+    let Some(assessment) = &metadata.task_routing_assessment else {
+        return Ok(());
+    };
+    let frozen = metadata
+        .resolved_routing_policy
+        .as_ref()
+        .context("task_routing_assessment requires its frozen routing policy")?;
+    assessment.validate(frozen)?;
+    let historical = metadata.evidence_only_reaudit.is_some();
+    if !historical {
+        assessment.validate_for_task(frozen, &plan.task)?;
+        if metadata.generated_follow_up.is_some()
+            && *assessment
+                != GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(plan, frozen)?
+        {
+            bail!(
+                "generated task assessment differs from the exact dependent declaration or scope"
+            );
+        }
+    }
+    if let Some(selected) = &metadata.normal_intake_selection {
+        let features = &selected.task_features;
+        if features.complexity != assessment.features.complexity
+            || features.risk != assessment.features.risk
+            || features.horizon != assessment.features.horizon
+            || features.context_tokens != assessment.features.context_tokens
+        {
+            bail!("normal intake assessed dimensions differ from the stored assessment");
+        }
+        if !historical
+            && *features
+                != super::selection_bridge::routing_features_with_assessment(
+                    plan,
+                    Some(assessment),
+                    Some(frozen),
+                )?
+        {
+            bail!("normal intake features differ from revalidated final plan scopes");
+        }
+    }
+    if let Some(decision) = &metadata.normal_intake_decision {
+        let receipt = decision
+            .routing_policy
+            .as_ref()
+            .context("assessed normal intake decision requires its routing receipt")?;
+        let role: AgentRole = serde_json::from_value(Value::String(receipt.role.clone()))
+            .context("assessed normal intake receipt has an invalid authority role")?;
+        let projected = super::selection_bridge::task_profile_with_assessment(
+            role,
+            Some(assessment),
+            Some(&receipt.features),
+            Some(frozen),
+        )?;
+        if decision.normalized_input.task != projected {
+            bail!("normal intake task profile differs from its policy assessment projection");
+        }
+    }
+    // Historical task/features remain tied to their original declaration and receipt.
+    // Authentication and live launch/account qualification remain downstream duties.
+    Ok(())
+}
+
+fn normal_intake_decision_sha256(
+    decision: &crate::selection::SelectionProvenance,
+) -> Result<String> {
+    Ok(crate::artifacts::state_auth::sha256_hex(
+        &serde_json::to_vec(decision).context("failed to encode typed normal intake decision")?,
+    ))
+}
+
+fn validate_normal_intake_decision_binding(
+    decision: &crate::selection::SelectionProvenance,
+    selection: Option<&crate::selection::routing_policy::SelectedLaunchRequest>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<()> {
+    let selection =
+        selection.context("normal_intake_decision requires its selected launch receipt")?;
+    validate_normal_intake_policy_binding(selection, frozen)?;
+    if decision.schema_version != 4 || decision.status != crate::selection::DecisionStatus::Selected
+    {
+        bail!("normal_intake_decision must be a supported selected decision");
+    }
+    let choice = decision
+        .choice
+        .as_ref()
+        .context("normal_intake_decision has no selected choice")?;
+    if choice.candidate.runtime.trim().is_empty()
+        || choice.candidate.model.trim().is_empty()
+        || &choice.candidate != selection.candidate()
+    {
+        bail!("normal_intake_decision candidate differs from its selected launch receipt");
+    }
+    let receipt = decision
+        .routing_policy
+        .as_ref()
+        .context("normal_intake_decision requires its routing policy receipt")?;
+    let frozen = frozen.context("normal_intake_decision requires its frozen routing policy")?;
+    validate_frozen_routing_policy(&receipt.frozen)?;
+    if &receipt.frozen != frozen || receipt.frozen.sha256 != selection.policy_digest {
+        bail!("normal_intake_decision routing policy differs from its frozen launch policy");
+    }
+    if receipt.features != selection.task_features || receipt.role.trim().is_empty() {
+        bail!("normal_intake_decision routing receipt constraints differ from its selection");
+    }
+    // This binds historical evidence, not account or execution authority. Its
+    // initial role/features are retained even when a re-audit changes the plan.
+    // The combined catalog digest and account-observation digest have different domains.
+    Ok(())
 }
 
 fn validate_generated_follow_up_document_sections(value: &Value) -> Result<()> {
@@ -2550,6 +4184,30 @@ fn collect_assignment_plan_metadata(
         metadata
             .spec_fragment_ids_by_assignment
             .insert(assignment_id.clone(), fragments);
+        if let Some(workers) = raw_assignment
+            .get("worker_assignments")
+            .and_then(Value::as_array)
+        {
+            for worker in workers {
+                if worker.get("spec_fragment_ids").is_none() {
+                    continue;
+                }
+                let worker_id = normalize_agent_id(
+                    worker.get("id").and_then(Value::as_str).unwrap_or_default(),
+                )?;
+                if worker_id == assignment_id
+                    || metadata
+                        .spec_fragment_ids_by_assignment
+                        .contains_key(&worker_id)
+                {
+                    bail!("nested spec fragment identity duplicates a normalized assignment");
+                }
+                metadata.spec_fragment_ids_by_assignment.insert(
+                    worker_id,
+                    optional_string_array(worker, "spec_fragment_ids")?,
+                );
+            }
+        }
         let children = raw_assignment
             .get("child_assignments")
             .map(|children| {
@@ -2629,6 +4287,22 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        if let Some(raw_inputs) = raw_assignment.get("source_inputs") {
+            use crate::external_agent::researcher_inputs::{
+                validate_declarations, ResearcherSourceInput,
+            };
+            if assignment.role != AgentRole::Researcher {
+                bail!(
+                    "source_inputs are only supported on operator-authored Researcher assignments"
+                );
+            }
+            let inputs: Vec<ResearcherSourceInput> = serde_json::from_value(raw_inputs.clone())
+                .context("invalid Researcher source_inputs")?;
+            validate_declarations(&inputs)?;
+            metadata_by_worker
+                .source_inputs
+                .insert(assignment.id.clone(), inputs);
+        }
         if let Some(effort) = raw_assignment.get("reasoning_effort") {
             let effort =
                 serde_json::from_value::<ReasoningEffort>(effort.clone()).with_context(|| {
@@ -2656,6 +4330,9 @@ fn collect_assignment_metadata(
             .map(Vec::as_slice)
             .unwrap_or_default();
         for raw_worker in raw_workers {
+            if raw_worker.get("source_inputs").is_some() {
+                bail!("source_inputs cannot be delegated to nested Workers");
+            }
             let raw_worker_id = raw_worker
                 .get("id")
                 .and_then(Value::as_str)
@@ -2733,6 +4410,7 @@ pub(super) fn supervisor_plan_value(
     assignment_metadata: &AssignmentMetadata,
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<Value> {
+    validate_task_routing_assessment_binding(plan, plan_metadata)?;
     let mut value =
         serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
     let assignments = value
@@ -2740,6 +4418,12 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        if let Some(inputs) = assignment_metadata.source_inputs.get(&assignment.id) {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment is not an object")?
+                .insert("source_inputs".to_string(), serde_json::to_value(inputs)?);
+        }
         if let Some(effort) = assignment_metadata.reasoning_effort(&assignment.id) {
             assignment_value
                 .as_object_mut()
@@ -2765,11 +4449,20 @@ pub(super) fn supervisor_plan_value(
             .and_then(Value::as_array_mut)
             .context("normalized worker_assignments did not serialize to an array")?;
         for (worker_value, worker) in workers.iter_mut().zip(&assignment.worker_assignments) {
-            let Some(metadata) =
-                assignment_metadata.get(&(assignment.id.clone(), worker.id.clone()))
-            else {
-                continue;
-            };
+            if let Some(fragments) = plan_metadata
+                .spec_fragment_ids_by_assignment
+                .get(&worker.id)
+                .filter(|fragments| !fragments.is_empty())
+            {
+                worker_value
+                    .as_object_mut()
+                    .context("normalized Worker did not serialize to an object")?
+                    .insert("spec_fragment_ids".into(), serde_json::to_value(fragments)?);
+            }
+            let metadata = assignment_metadata
+                .get(&(assignment.id.clone(), worker.id.clone()))
+                .cloned()
+                .unwrap_or_default();
             let metadata_value = serde_json::to_value(metadata)
                 .context("failed to serialize worker assignment metadata")?;
             let worker_object = worker_value
@@ -2802,6 +4495,47 @@ pub(super) fn supervisor_plan_value(
         object.insert(
             "objective_profile".to_string(),
             Value::String(objective_profile.clone()),
+        );
+    }
+    if let Some(frozen) = &plan_metadata.resolved_routing_policy {
+        validate_frozen_routing_policy(frozen)?;
+        object.insert(
+            "resolved_routing_policy".to_string(),
+            serde_json::to_value(frozen).context("failed to serialize frozen routing policy")?,
+        );
+    }
+    if let Some(assessment) = &plan_metadata.task_routing_assessment {
+        object.insert(
+            "task_routing_assessment".to_string(),
+            serde_json::to_value(assessment)
+                .context("failed to serialize task routing assessment")?,
+        );
+    }
+    if let Some(selection) = &plan_metadata.normal_intake_selection {
+        validate_normal_intake_policy_binding(
+            selection,
+            plan_metadata.resolved_routing_policy.as_ref(),
+        )?;
+        object.insert(
+            "normal_intake_selection".to_string(),
+            serde_json::to_value(selection)
+                .context("failed to serialize normal intake selection")?,
+        );
+    }
+    if let Some(decision) = &plan_metadata.normal_intake_decision {
+        validate_normal_intake_decision_binding(
+            decision,
+            plan_metadata.normal_intake_selection.as_ref(),
+            plan_metadata.resolved_routing_policy.as_ref(),
+        )?;
+        object.insert(
+            "normal_intake_decision".to_string(),
+            serde_json::to_value(decision)
+                .context("failed to serialize typed normal intake decision")?,
+        );
+        object.insert(
+            "normal_intake_decision_sha256".to_string(),
+            Value::String(normal_intake_decision_sha256(decision)?),
         );
     }
     if !plan_metadata.spec_fragment_ids.is_empty() || plan_metadata.generated_follow_up.is_some() {
@@ -3146,6 +4880,10 @@ impl FrozenHeldOutRuntimeAllowlist {
             .map(|binding| binding.executable.as_path())
     }
 
+    pub(crate) fn bindings(&self) -> &[FrozenHeldOutRuntimeBinding] {
+        &self.bindings
+    }
+
     pub(crate) fn artifact_value(&self) -> Value {
         json!({
             "primary": {
@@ -3181,6 +4919,31 @@ pub(crate) fn freeze_held_out_runtime_allowlist(
     )];
     for (runtime, executable) in additional {
         refuse_held_out_production_runtime_executable_binding(*runtime, executable, options)?;
+        bindings.push((
+            *runtime,
+            assignment_execution::canonicalize_explicit_runtime_executable(executable)?,
+        ));
+    }
+    FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(bindings)
+}
+
+/// Freeze an ordinary supervise run's explicit executable allowlist without
+/// consulting the ambient runtime configuration. The caller must archive this
+/// value before dispatch and use it for every selected launch in the run.
+pub(crate) fn freeze_supervise_runtime_allowlist(
+    primary_runtime: SupervisorRuntime,
+    primary_executable: &Path,
+    additional: &[(SupervisorRuntime, PathBuf)],
+) -> Result<FrozenHeldOutRuntimeAllowlist> {
+    if primary_runtime == SupervisorRuntime::Fake {
+        bail!("explicit supervise runtime bindings refuse Fake as the primary runtime");
+    }
+    refuse_held_out_additional_runtime_bindings(primary_runtime, additional)?;
+    let mut bindings = vec![(
+        primary_runtime,
+        assignment_execution::canonicalize_explicit_runtime_executable(primary_executable)?,
+    )];
+    for (runtime, executable) in additional {
         bindings.push((
             *runtime,
             assignment_execution::canonicalize_explicit_runtime_executable(executable)?,
@@ -3578,16 +5341,94 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
 ) -> Result<SupervisorCascadeOutcome> {
     let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
     validate_max_concurrent_children(max_concurrent_children)?;
-    let outer_run_id = options.run_id.clone();
     let repo = discover_repo_root(&options.repo)?;
-    let mut loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
-    apply_objective_profile_override(&mut loaded, objective_profile_override.as_deref());
+    let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
+    run_loaded_supervisor_normal_cascade(
+        options,
+        loaded,
+        &repo,
+        concurrency_policy,
+        max_concurrent_children,
+        allow_primary_worktree,
+        objective_profile_override.as_deref(),
+    )
+}
+
+/// Execute the same normalized document used for deterministic normal intake.
+/// Its frozen policy receipt is required: this entrypoint neither lowers the
+/// task again nor falls back to reading a later repository routing policy.
+pub(crate) fn run_supervisor_normal_document_cascade(
+    options: SupervisorRunOptions,
+    document: Value,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    allow_primary_worktree: bool,
+    objective_profile_override: Option<String>,
+) -> Result<SupervisorCascadeOutcome> {
+    let max_concurrent_children = concurrency_policy.resolve(HostProcessCapacity::measured());
+    validate_max_concurrent_children(max_concurrent_children)?;
+    let repo = discover_repo_root(&options.repo)?;
+    let loaded = load_normal_intake_document(document, &repo)?;
+    run_loaded_supervisor_normal_cascade(
+        options,
+        loaded,
+        &repo,
+        concurrency_policy,
+        max_concurrent_children,
+        allow_primary_worktree,
+        objective_profile_override.as_deref(),
+    )
+}
+
+fn load_normal_intake_document(document: Value, repo: &Path) -> Result<LoadedSupervisorPlan> {
+    let contents = serde_json::to_string(&document)
+        .context("failed to encode normalized normal-intake document")?;
+    if contents.len() as u64 > MAX_SUPERVISOR_INPUT_BYTES {
+        bail!("normalized normal-intake document exceeds supervisor input bounds");
+    }
+    let loaded = parse_supervisor_plan_with_consultant_in_repo(&contents, Some(repo))
+        .context("normalized normal-intake document failed ordinary plan validation")?;
+    if loaded.plan_metadata.resolved_routing_policy.is_none() {
+        bail!("normal-intake document requires its frozen routing policy receipt");
+    }
+    Ok(loaded)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loaded_supervisor_normal_cascade(
+    options: SupervisorRunOptions,
+    mut loaded: LoadedSupervisorPlan,
+    repo: &Path,
+    concurrency_policy: SupervisorConcurrencyPolicy,
+    max_concurrent_children: usize,
+    allow_primary_worktree: bool,
+    objective_profile_override: Option<&str>,
+) -> Result<SupervisorCascadeOutcome> {
+    let outer_run_id = options.run_id.clone();
+    apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
     let source_loaded = loaded.clone();
     let template = options.clone();
-    let runtime_model_catalog =
-        admit_production_supervisor_catalog_preflight_grant(&options, &repo)
-            .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
+    let runtime_model_catalog = admit_production_supervisor_catalog_preflight_grant(&options, repo)
+        .and_then(|grant| {
+            if let Some(selected) = &source_loaded.plan_metadata.normal_intake_selection {
+                super::scheduler::acquire_normal_intake_catalog(
+                    &options,
+                    selected,
+                    source_loaded
+                        .plan_metadata
+                        .resolved_routing_policy
+                        .as_ref()
+                        .ok_or_else(|| {
+                            Box::new(EnvironmentFailure::runtime_model_catalog(
+                                "normal intake catalog requires the frozen routing policy"
+                                    .to_string(),
+                            ))
+                        })?,
+                )
+            } else {
+                RuntimeModelCatalog::for_supervisor(&options, repo, grant)
+            }
+        });
     let source_report = if template.runtime == SupervisorRuntime::Fake {
         if source_loaded.plan_metadata.execution_target.is_some() {
             bail!("nonpublishable Fake cascade cannot use primary-worktree execution");
@@ -3608,7 +5449,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
             &no_external_runner,
         )?
     } else {
-        let manager = WorktreeManager::new(&repo);
+        let manager = WorktreeManager::new(repo);
         let cleanliness = manager.acquire_repository_cleanliness()?;
         run_supervisor_plan_with_runner_and_creation(
             loaded,
@@ -3623,7 +5464,7 @@ pub fn run_supervisor_goal_spec_cascade_with_concurrency_policy_and_primary_work
     let mut permit = |_plan: &SupervisorPlan| Ok(None);
     let cancellation_observed = AtomicBool::new(false);
     run_generated_follow_up_cascade(
-        &repo,
+        repo,
         &source_loaded,
         source_report,
         &template,
@@ -4144,7 +5985,12 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         attempt,
         preserved_candidate_binding: binding,
     };
-    verify_evidence_only_reaudit_source(repo, &operation, &source_assignment)?;
+    verify_evidence_only_reaudit_source(
+        repo,
+        &operation,
+        &source_assignment,
+        source_loaded.plan_metadata.task_routing_assessment.as_ref(),
+    )?;
 
     let mut plan = source_loaded.plan;
     plan.task = format!(
@@ -4192,6 +6038,10 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
         execution_target: None,
         path_proposal: source_loaded.plan_metadata.path_proposal.clone(),
         router: source_loaded.plan_metadata.router.clone(),
+        resolved_routing_policy: source_loaded.plan_metadata.resolved_routing_policy.clone(),
+        task_routing_assessment: source_loaded.plan_metadata.task_routing_assessment.clone(),
+        normal_intake_selection: source_loaded.plan_metadata.normal_intake_selection.clone(),
+        normal_intake_decision: source_loaded.plan_metadata.normal_intake_decision.clone(),
     };
     let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, Some(repo))?;
     Ok(LoadedSupervisorPlan {
@@ -4206,6 +6056,7 @@ pub(super) fn verify_evidence_only_reaudit_source(
     repo: &Path,
     operation: &EvidenceOnlyReauditPlan,
     expected_assignment: &OrchestratorAssignment,
+    expected_assessment: Option<&TaskRoutingAssessment>,
 ) -> Result<EvidenceOnlyReauditSource> {
     let reader =
         ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &operation.source_run_id)
@@ -4226,6 +6077,9 @@ pub(super) fn verify_evidence_only_reaudit_source(
         .context("authenticated source plan does not contain the re-audit assignment")?;
     if source_assignment != expected_assignment {
         bail!("evidence-only re-audit assignment differs from its authenticated source plan");
+    }
+    if source_loaded.plan_metadata.task_routing_assessment.as_ref() != expected_assessment {
+        bail!("evidence-only re-audit task assessment differs from its authenticated source plan");
     }
     let source_child = source_report
         .orchestrator_reports
@@ -5542,6 +7396,22 @@ mod diagnostics_emission_tests {
         assert!(assignment_tasks
             .iter()
             .all(|task| !task.contains("Planning inventory diagnostics:")));
+
+        let nested_workers = document["assignments"]
+            .as_array()
+            .expect("assignments")
+            .iter()
+            .flat_map(|assignment| {
+                assignment["worker_assignments"]
+                    .as_array()
+                    .expect("worker_assignments")
+                    .iter()
+            })
+            .collect::<Vec<_>>();
+        assert!(!nested_workers.is_empty());
+        assert!(nested_workers
+            .iter()
+            .all(|worker| worker["kind"] == "ordinary"));
 
         let serialized = serde_json::to_string(&document).expect("serialize");
         let reloaded = parse_supervisor_plan_with_consultant(&serialized).expect("reload");

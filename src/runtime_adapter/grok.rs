@@ -3,7 +3,7 @@
 //! The launch descriptor fixes headless output, tool approval, and the
 //! inner-sandbox posture; the NDJSON parser accepts only bounded, terminally
 //! complete event streams.
-//! Catalog membership still comes only from one bounded `grok models`
+//! Catalog membership still comes only from one bounded `grok --no-auto-update models`
 //! observation or from the typed constructed-entry injection seam. Policy code
 //! may classify returned slugs, but this adapter does not embed a live model
 //! list or infer authority from a model name.
@@ -51,6 +51,8 @@ const GROK_CATALOG_MAX_MODELS: usize = 512;
 const GROK_MODEL_SLUG_MAX_BYTES: usize = 256;
 const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
 const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
+pub(crate) const GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED: &str =
+    "Grok runtime model catalog requires owner authentication";
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
 const GROK_AUTH_FILE: &str = "auth.json";
@@ -171,6 +173,7 @@ impl GrokRuntimeDescriptor {
     /// Canonical argv template. Dynamic values occupy whole argv elements.
     pub fn immutable_argument_template(self) -> Vec<String> {
         [
+            "--no-auto-update",
             "--prompt-file",
             "{prompt}",
             "--model",
@@ -219,13 +222,12 @@ impl GrokAcpRuntimeDescriptor {
 
     pub fn immutable_argument_template(self) -> Vec<String> {
         [
+            "--no-auto-update",
             "--sandbox",
             self.sandbox_profile,
-            self.headless_approval_flag,
             "--disable-web-search",
-            "--no-memory",
-            "--no-subagents",
             "agent",
+            self.headless_approval_flag,
             "--no-leader",
             "-m",
             "{model}",
@@ -236,6 +238,21 @@ impl GrokAcpRuntimeDescriptor {
         .into_iter()
         .map(str::to_string)
         .collect()
+    }
+}
+
+impl GrokAcpRuntimeDescriptor {
+    /// ACP's agent branch does not forward the pager's memory/subagent flags.
+    /// These forced values outrank local/remote configuration in that branch.
+    pub(crate) fn required_environment(self) -> BTreeMap<String, String> {
+        BTreeMap::from([
+            ("GROK_SUBAGENTS".to_string(), "0".to_string()),
+            ("GROK_MEMORY".to_string(), "0".to_string()),
+        ])
+    }
+
+    pub(crate) fn apply_required_environment(self, environment: &mut BTreeMap<String, String>) {
+        environment.extend(self.required_environment());
     }
 }
 
@@ -458,7 +475,7 @@ pub enum GrokStreamEvent {
     },
 }
 
-/// Successful terminal metadata from a Grok stream.
+/// Terminal metadata from a Grok stream; the stop reason determines success.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GrokEndEvent {
     stop_reason: String,
@@ -542,11 +559,106 @@ impl GrokNativeUsage {
     }
 }
 
+/// Parent-capture observation, deliberately not Serde. The native cache buckets
+/// remain distinct; only the allocation consumed by the generic ledger combines
+/// them into input tokens. This does not attest a provider model, effort or cost.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GrokNativeUsageObservation {
+    native: GrokNativeUsage,
+    terminal_complete: bool,
+}
+
+impl GrokNativeUsageObservation {
+    pub(crate) fn allocation(&self) -> (crate::llm::provider::Usage, bool) {
+        let native = &self.native;
+        // u128 accommodates all four disjoint u64 counters without overflow.
+        // An absent cache bucket is not asserted to be zero: this is a floor.
+        let input_floor = u128::from(native.input_tokens)
+            + u128::from(native.cache_read_input_tokens.unwrap_or(0))
+            + u128::from(native.cache_creation_input_tokens.unwrap_or(0));
+        let output = u128::from(native.output_tokens);
+        let floor = input_floor + output;
+        let total = native.total_tokens.map(u128::from);
+        let total_consistent = total.is_some_and(|total| {
+            total >= floor
+                && (native.cache_read_input_tokens.is_none()
+                    || native.cache_creation_input_tokens.is_none()
+                    || total == floor)
+        });
+        let observed = total.filter(|_| total_consistent).unwrap_or(floor);
+        let fits = usize::try_from(observed).is_ok();
+        // Unrepresentable totals cannot be complete. Retain a representable
+        // lower bound so overflow cannot refund already observed native spend.
+        let bounded = usize::try_from(observed).unwrap_or(usize::MAX);
+        let bounded_output =
+            usize::try_from(output.min(bounded as u128)).expect("bounded output fits usize");
+        let usage = crate::llm::provider::Usage {
+            input_tokens: bounded - bounded_output,
+            output_tokens: bounded_output,
+            total_tokens: bounded,
+        };
+        let complete = self.terminal_complete
+            && total_consistent
+            && fits
+            && native
+                .reasoning_tokens
+                .is_none_or(|reasoning| reasoning <= native.output_tokens);
+        (usage, complete)
+    }
+}
+
+/// Retain the first valid native terminal snapshot from a bounded parent-held
+/// stream. Trailing damage, a second terminal, or raw truncation cannot replace
+/// that snapshot or make it complete. ACP and Codex-shaped events are not usage.
+pub(crate) fn observe_grok_native_usage(
+    bytes: &[u8],
+    raw_truncated: bool,
+) -> Option<GrokNativeUsageObservation> {
+    let mut end = 0usize;
+    for line in bytes
+        .split_inclusive(|byte| *byte == b'\n')
+        .take(GROK_EVENT_STREAM_MAX_EVENTS)
+    {
+        end = end.checked_add(line.len())?;
+        if end > GROK_EVENT_STREAM_MAX_BYTES
+            || !line.ends_with(b"\n")
+            || line.len() - 1 > GROK_EVENT_LINE_MAX_BYTES
+        {
+            return None;
+        }
+        let raw: RawGrokStreamEvent = serde_json::from_slice(line).ok()?;
+        if raw.event_type == "error" {
+            return None;
+        }
+        if raw.event_type != "end" {
+            continue;
+        }
+        // Reuse the full protocol validator, including event ordering, field
+        // placement, terminal metadata and all prefix/line limits.
+        parse_grok_event_stream(&bytes[..end]).ok()?;
+        let usage = raw.usage?;
+        return Some(GrokNativeUsageObservation {
+            native: GrokNativeUsage {
+                input_tokens: usage.input_tokens,
+                output_tokens: usage.output_tokens,
+                cache_read_input_tokens: usage.cache_read_input_tokens,
+                cache_creation_input_tokens: usage.cache_creation_input_tokens,
+                reasoning_tokens: usage.reasoning_tokens,
+                total_tokens: usage.total_tokens,
+            },
+            terminal_complete: !raw_truncated
+                && end == bytes.len()
+                && raw.usage_is_incomplete != Some(true),
+        });
+    }
+    None
+}
+
 /// Honest adapter-boundary spend status for a bounded Grok stream.
 ///
 /// Native `end` events may omit spend entirely, mark it incomplete, or carry
-/// exact token fields. MACO does not convert those fields into Codex events or
-/// `Usage` counts; the capability matrix remains `UsageReporting::None`.
+/// exact token fields. This public protocol status is not private settlement
+/// custody; the capability matrix remains `UsageReporting::None`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GrokUsageStatus {
     NotProcessObservable,
@@ -636,8 +748,19 @@ impl GrokParsedEventStream {
         &self.outcome
     }
 
+    /// Whether an end terminal is present, independently of its success reason.
     pub const fn completed(&self) -> bool {
         matches!(self.outcome, GrokStreamOutcome::Completed(_))
+    }
+
+    /// Only a normal turn end establishes successful stream completion.
+    pub fn successful_completion(&self) -> bool {
+        match &self.outcome {
+            GrokStreamOutcome::Completed(end) => {
+                matches!(end.stop_reason(), "end_turn" | "EndTurn")
+            }
+            GrokStreamOutcome::Failed { .. } => false,
+        }
     }
 
     /// Spend status for this bounded stream. Failed terminals stay
@@ -947,6 +1070,176 @@ fn grok_end_usage_status(
     }
 }
 
+#[cfg(test)]
+mod native_budget_observation_tests {
+    use super::*;
+
+    fn stream(usage: Value, incomplete: bool) -> Vec<u8> {
+        let mut bytes = serde_json::to_vec(&serde_json::json!({
+            "type": "end", "stopReason": "stop", "sessionId": "session",
+            "requestId": "request", "usage": usage, "usage_is_incomplete": incomplete,
+        }))
+        .unwrap();
+        bytes.push(b'\n');
+        bytes
+    }
+
+    fn native() -> Value {
+        serde_json::json!({"input_tokens":12,"output_tokens":5,
+            "cache_read_input_tokens":4,"cache_creation_input_tokens":3,
+            "reasoning_tokens":2,"total_tokens":24})
+    }
+
+    #[test]
+    fn native_stop_reason_gates_success_without_discarding_terminal_usage() {
+        for reason in [
+            "end_turn",
+            "EndTurn",
+            "max_tokens",
+            "max_turn_requests",
+            "refusal",
+            "cancelled",
+            "unknown_reason",
+        ] {
+            for incomplete in [false, true] {
+                let mut event: Value =
+                    serde_json::from_slice(&stream(native(), incomplete)).unwrap();
+                event["stopReason"] = reason.into();
+                let mut bytes = serde_json::to_vec(&event).unwrap();
+                bytes.push(b'\n');
+                let parsed = parse_grok_event_stream(&bytes).unwrap();
+                assert!(parsed.completed(), "end remains terminal evidence");
+                let expected_success = matches!(reason, "end_turn" | "EndTurn");
+                assert_eq!(parsed.successful_completion(), expected_success);
+                let GrokStreamOutcome::Completed(end) = parsed.outcome() else {
+                    panic!("terminal metadata must remain available");
+                };
+                assert_eq!(end.stop_reason(), reason);
+                assert_eq!(end.session_id(), "session");
+                assert_eq!(end.request_id(), "request");
+                if incomplete {
+                    assert_eq!(parsed.usage_status(), GrokUsageStatus::Incomplete);
+                } else {
+                    let GrokUsageStatus::Native(usage) = parsed.usage_status() else {
+                        panic!("charged native usage must remain available");
+                    };
+                    assert_eq!(usage.total_tokens(), Some(24));
+                }
+                let (usage, complete) = observe_grok_native_usage(&bytes, false)
+                    .unwrap()
+                    .allocation();
+                assert_eq!(usage.total_tokens, 24);
+                assert_eq!(complete, !incomplete);
+            }
+        }
+    }
+
+    #[test]
+    fn native_budget_preserves_disjoint_cache_buckets_and_reasoning_subset() {
+        let observed = observe_grok_native_usage(&stream(native(), false), false).unwrap();
+        assert_eq!(observed.native.input_tokens(), 12);
+        assert_eq!(observed.native.cache_read_input_tokens(), Some(4));
+        assert_eq!(observed.native.cache_creation_input_tokens(), Some(3));
+        assert_eq!(observed.native.reasoning_tokens(), Some(2));
+        let (usage, complete) = observed.allocation();
+        assert!(complete);
+        assert_eq!(
+            (usage.input_tokens, usage.output_tokens, usage.total_tokens),
+            (19, 5, 24)
+        );
+    }
+
+    #[test]
+    fn native_budget_absence_and_incomplete_counts_do_not_invent_completeness() {
+        assert!(observe_grok_native_usage(&stream(Value::Null, false), false).is_none());
+        let mut no_total = native();
+        no_total.as_object_mut().unwrap().remove("total_tokens");
+        for bytes in [stream(no_total, false), stream(native(), true)] {
+            let observed = observe_grok_native_usage(&bytes, false).unwrap();
+            assert_eq!(observed.allocation().0.total_tokens, 24);
+            assert!(!observed.allocation().1);
+        }
+        let bytes = stream(
+            serde_json::json!({"input_tokens":12,"output_tokens":5,"total_tokens":24}),
+            false,
+        );
+        let observed = observe_grok_native_usage(&bytes, false).unwrap();
+        assert_eq!(observed.native.cache_read_input_tokens(), None);
+        assert_eq!(observed.native.cache_creation_input_tokens(), None);
+        assert_eq!(observed.allocation().0.input_tokens, 19);
+        assert!(
+            observed.allocation().1,
+            "explicit native total includes the unclassified cache tokens"
+        );
+    }
+
+    #[test]
+    fn native_budget_conflicts_and_overflow_keep_only_incomplete_lower_bounds() {
+        for (field, value) in [
+            ("total_tokens", 23u64),
+            ("total_tokens", 25),
+            ("reasoning_tokens", 6),
+        ] {
+            let mut usage = native();
+            usage[field] = value.into();
+            let (allocation, complete) = observe_grok_native_usage(&stream(usage, false), false)
+                .unwrap()
+                .allocation();
+            assert_eq!(allocation.total_tokens, 24);
+            assert!(!complete);
+        }
+        let mut usage = native();
+        usage["input_tokens"] = u64::MAX.into();
+        let observed = observe_grok_native_usage(&stream(usage, false), false).unwrap();
+        assert_eq!(observed.allocation().0.total_tokens, usize::MAX);
+        assert!(!observed.allocation().1);
+    }
+
+    #[test]
+    fn native_budget_trailing_damage_and_truncation_cannot_replace_first_snapshot() {
+        let original = stream(native(), false);
+        let mut duplicate = original.clone();
+        duplicate.extend(stream(
+            serde_json::json!({"input_tokens":1,"output_tokens":0,"total_tokens":1}),
+            false,
+        ));
+        let mut damaged = original.clone();
+        damaged.extend_from_slice(b"broken");
+        for (bytes, truncated) in [
+            (original.clone(), true),
+            (duplicate, false),
+            (damaged, false),
+        ] {
+            let (usage, complete) = observe_grok_native_usage(&bytes, truncated)
+                .unwrap()
+                .allocation();
+            assert_eq!(usage.total_tokens, 24);
+            assert!(!complete);
+        }
+        assert!(observe_grok_native_usage(&original[..original.len() - 1], false).is_none());
+    }
+
+    #[test]
+    fn native_budget_rejects_malformed_foreign_and_unbounded_observations() {
+        for bytes in [
+            b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":12,\"output_tokens\":5}}\n".as_slice(),
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"session/update\",\"params\":{\"cost\":1}}\n",
+            b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":1,\"input_tokens\":2,\"output_tokens\":3}}\n",
+        ] {
+            assert!(observe_grok_native_usage(bytes, false).is_none());
+        }
+        for bad in [serde_json::json!(-1), serde_json::json!("12"), Value::Null] {
+            let mut usage = native();
+            usage["input_tokens"] = bad;
+            assert!(observe_grok_native_usage(&stream(usage, false), false).is_none());
+        }
+        let mut bytes = vec![b' '; GROK_EVENT_LINE_MAX_BYTES + 1];
+        bytes.push(b'\n');
+        bytes.extend(stream(native(), false));
+        assert!(observe_grok_native_usage(&bytes, false).is_none());
+    }
+}
+
 fn validate_grok_event_type(event_type: &str) -> Result<()> {
     if event_type.is_empty()
         || event_type.len() > GROK_EVENT_TYPE_MAX_BYTES
@@ -981,11 +1274,11 @@ pub struct GrokCatalogCommandSpec {
 }
 
 impl GrokCatalogCommandSpec {
-    /// Construct the stable catalog request `grok models`.
+    /// Construct the stable catalog request `grok --no-auto-update models`.
     pub fn new(current_dir: impl Into<PathBuf>) -> Self {
         Self {
             program: PathBuf::from(TRUSTED_SYSTEM_GROK_EXECUTABLE),
-            args: vec![OsString::from("models")],
+            args: vec![OsString::from("--no-auto-update"), OsString::from("models")],
             current_dir: current_dir.into(),
             environment: BTreeMap::from([
                 ("NO_COLOR".to_string(), "1".to_string()),
@@ -1051,7 +1344,7 @@ pub trait GrokCatalogCommandRunner {
     fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput>;
 }
 
-/// Screened production runner for one bounded `grok models` observation.
+/// Screened production runner for one bounded `grok --no-auto-update models` observation.
 ///
 /// The runner resolves the executable, screens the environment, requests
 /// verified process-tree cleanup and a Grok-compatible side-effect profile,
@@ -1385,6 +1678,9 @@ fn parse_grok_model_line(line: &str) -> Result<(&str, bool)> {
 }
 
 fn validate_grok_login_line(line: &str) -> Result<()> {
+    if line == "You are not authenticated." {
+        bail!(GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
+    }
     let provider = line
         .strip_prefix("You are logged in with ")
         .and_then(|rest| rest.strip_suffix('.'))
@@ -1960,6 +2256,7 @@ mod tests {
         assert_eq!(
             GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(),
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "{prompt}",
                 "--model",
@@ -1985,13 +2282,12 @@ mod tests {
         assert_eq!(
             GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
             [
+                "--no-auto-update",
                 "--sandbox",
                 "strict",
-                "--always-approve",
                 "--disable-web-search",
-                "--no-memory",
-                "--no-subagents",
                 "agent",
+                "--always-approve",
                 "--no-leader",
                 "-m",
                 "{model}",
@@ -2431,7 +2727,10 @@ mod tests {
         let spec = GrokCatalogCommandSpec::new("/workspace");
         assert_eq!(spec.program(), Path::new(default_grok_executable()));
         assert!(spec.program().is_absolute());
-        assert_eq!(spec.args(), [OsString::from("models")]);
+        assert_eq!(
+            spec.args(),
+            [OsString::from("--no-auto-update"), OsString::from("models")]
+        );
         assert_eq!(
             spec.environment(),
             &BTreeMap::from([
@@ -2513,8 +2812,8 @@ mod tests {
     }
 
     #[test]
-    fn captured_47_catalog_preserves_standard_and_fast_slugs_without_granting_fast_authority(
-    ) -> Result<()> {
+    fn captured_47_catalog_preserves_slugs_without_using_names_for_protocol_admission() -> Result<()>
+    {
         let catalog = parse_grok_model_catalog(CAPTURED_47_CATALOG)?;
         assert_eq!(
             catalog.slugs().collect::<Vec<_>>(),
@@ -2526,14 +2825,14 @@ mod tests {
                 Some("grok-4.7"),
                 Some("xhigh")
             ),
-            Some(crate::runtime_adapter::TypedRuntime::Grok47Xhigh)
+            Some(crate::runtime_adapter::TypedRuntime::GrokHeadlessStreamingJson)
         ));
         assert!(crate::runtime_adapter::TypedRuntime::from_launch(
             AdapterId::Grok,
             Some("grok-4.7-build-fast"),
             Some("xhigh")
         )
-        .is_none());
+        .is_some());
         Ok(())
     }
 
@@ -2610,6 +2909,26 @@ mod tests {
                 .to_string();
             assert!(error.contains(expected), "{label}: {error}");
         }
+    }
+
+    #[test]
+    fn unauthenticated_public_models_catalog_fails_closed_before_advertising() {
+        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+        assert_eq!(
+            sha256_hex(UNAUTHENTICATED_PUBLIC_PAYLOAD),
+            "028d0f4e90faa109b2a8c061728829287302687df51a521b8d0226ef7856cf34"
+        );
+        let error = parse_grok_model_catalog(UNAUTHENTICATED_PUBLIC_PAYLOAD)
+            .expect_err("unauthenticated public models listing must fail closed")
+            .to_string();
+        assert_eq!(error, GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
+        assert!(
+            !error.contains("grok-4.7")
+                && !error.contains("grok-4.6")
+                && !error.contains("grok-4.5")
+                && !error.contains("grok-4.7-build-fast"),
+            "{error}"
+        );
     }
 
     #[test]

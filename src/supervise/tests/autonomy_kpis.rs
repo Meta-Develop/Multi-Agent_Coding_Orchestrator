@@ -445,11 +445,16 @@ fn producer_path_join_report(
     unreviewed_first: bool,
 ) -> (AutonomyKpiReport, GateDenial, GateDenial) {
     let (_temp, repo_path) = injected_repository();
-    let run_id = RunId::new(if unreviewed_first {
-        "autonomy-kpi-producer-reverse"
+    // Both order tests call the forward path, so the direction alone is not unique.
+    let direction = if unreviewed_first {
+        "reverse"
     } else {
-        "autonomy-kpi-producer-forward"
-    })
+        "forward"
+    };
+    let run_id = RunId::new(format!(
+        "autonomy-kpi-producer-{direction}-{}",
+        crate::artifacts::state_auth::random_identifier().expect("unique producer-path run id")
+    ))
     .expect("valid producer-path run id");
     let mut writer = ArtifactRunWriter::reserve(
         &repo_path,

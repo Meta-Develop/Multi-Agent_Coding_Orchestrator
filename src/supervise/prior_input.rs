@@ -231,17 +231,8 @@ fn bind_from_bytes(
                     row.model
                 );
             }
-            if (base.prohibited && !row.prohibited)
-                || !base
-                    .prohibited_authority_roles
-                    .is_subset(&row.prohibited_authority_roles)
-                || (!base.long_context_eligible && row.long_context_eligible)
-                || !row
-                    .strong_gate_fallback_efforts
-                    .is_subset(&base.strong_gate_fallback_efforts)
-            {
-                bail!("operator prior data weakens bundled prohibition, role, long-context, or strong-gate effort policy for '{}:{}'", row.runtime, row.model);
-            }
+            // Dated routing recommendations may be revised by newer evidence.
+            // This snapshot grants no account, adapter, path or budget authority.
             priors
                 .models
                 .retain(|prior| prior.runtime != row.runtime || prior.model != row.model);
@@ -274,11 +265,11 @@ fn bind_from_bytes(
             );
         }
         if let Some(base) = capability_policy.lookup(&row.model) {
-            if row.as_of < base.as_of
-                || (row.eligible && !base.eligible)
-                || row.capability > base.capability
-            {
-                bail!("operator capability row '{}' weakens bundled model eligibility or capability ceiling", row.model);
+            if row.as_of < base.as_of {
+                bail!(
+                    "operator capability row '{}' predates the evidence it updates",
+                    row.model
+                );
             }
         } else if !priors.models.iter().any(|prior| prior.model == row.model) {
             bail!("operator capability row '{}' has no dated prior", row.model);
@@ -414,13 +405,14 @@ mod tests {
             .context("bundled Sol prior")?
             .clone();
         prior.model = model.to_string();
+        prior.observed_on = base.published_on.clone();
         prior.source_id = "operator-declared-new-model".to_string();
         prior.prior_scope = "operator dated prior for focused admission test".to_string();
         Ok(OperatorPriorSnapshot {
             schema_version: PRIOR_INPUT_SCHEMA_VERSION,
             dataset_id: "operator-prior-test".to_string(),
-            revision: "2026-09-13.1".to_string(),
-            published_on: "2026-09-13".to_string(),
+            revision: format!("{}+operator-prior-test", base.revision),
+            published_on: base.published_on.clone(),
             models: vec![prior],
             capability_policy: ModelCapabilityPolicy {
                 id: "operator-capability-test".to_string(),
@@ -431,7 +423,7 @@ mod tests {
                     capability: ModelCapabilityClass::CriticalJudgment,
                     eligible: true,
                     evidence: "operator-declared capability fixture".to_string(),
-                    as_of: "2026-09-13".to_string(),
+                    as_of: base.published_on,
                 }],
             },
         })
@@ -445,6 +437,25 @@ mod tests {
             raw,
         )?;
         Ok(install(Some(binding)))
+    }
+
+    #[test]
+    fn predating_operator_dataset_is_refused() -> Result<()> {
+        let base = selection::built_in_prior_dataset()?;
+        let mut snapshot = new_model_snapshot("new-advertised-model")?;
+        let year = base.published_on[..4].parse::<u32>()?;
+        snapshot.published_on = format!("{:04}-01-01", year - 1);
+        assert!(snapshot.published_on < base.published_on);
+        let error = bind_fixture(&snapshot)
+            .err()
+            .context("predating operator dataset must refuse")?;
+        assert!(
+            error
+                .to_string()
+                .contains("operator prior data predates the bundled dataset it extends"),
+            "{error:#}"
+        );
+        Ok(())
     }
 
     #[test]
@@ -505,9 +516,11 @@ mod tests {
     }
 
     #[test]
-    fn bundled_prohibitions_and_capability_ceilings_cannot_be_weakened() -> Result<()> {
+    fn dated_recommendations_can_change_without_granting_launch_authority() -> Result<()> {
         let base = base_selector_priors_with_terminal_worker_economics()?;
         let mut snapshot = new_model_snapshot("new-advertised-model")?;
+        let invalid_evidence_capability = snapshot.capability_policy.models[0].clone();
+        snapshot.capability_policy.models.clear();
         let mut luna = base
             .models
             .iter()
@@ -516,7 +529,22 @@ mod tests {
             .clone();
         luna.prohibited_authority_roles.clear();
         snapshot.models = vec![luna];
-        assert!(bind_fixture(&snapshot).is_err());
+        {
+            let bound = bind_fixture(&snapshot);
+            assert!(bound.is_ok());
+            let _guard = bound?;
+            assert!(
+                validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-luna"))
+                    .is_err()
+            );
+            let shipped = super::super::model_policy::default_model_capability_policy();
+            assert_eq!(
+                current_capability_policy()
+                    .expect("advisory luna capability")
+                    .capability_for("gpt-5.6-luna"),
+                shipped.capability_for("gpt-5.6-luna")
+            );
+        }
         let mut terra = base
             .models
             .iter()
@@ -525,9 +553,26 @@ mod tests {
             .clone();
         terra.prohibited = false;
         snapshot.models = vec![terra];
-        assert!(bind_fixture(&snapshot).is_err());
+        {
+            let bound = bind_fixture(&snapshot);
+            assert!(bound.is_ok());
+            let _guard = bound?;
+            assert!(
+                validate_known_judgment_role_model(AgentRole::Auditor, Some("gpt-5.6-terra"))
+                    .is_err()
+            );
+            let shipped = super::super::model_policy::default_model_capability_policy();
+            assert_eq!(
+                current_capability_policy()
+                    .expect("advisory terra capability")
+                    .capability_for("gpt-5.6-terra"),
+                shipped.capability_for("gpt-5.6-terra")
+            );
+        }
         snapshot.models.clear();
+        snapshot.capability_policy.models = vec![invalid_evidence_capability];
         snapshot.capability_policy.models[0].model = "gpt-5.6-luna".to_string();
+        snapshot.capability_policy.models[0].evidence.clear();
         assert!(bind_fixture(&snapshot).is_err());
         Ok(())
     }
@@ -540,7 +585,7 @@ mod tests {
         snapshot.models.pop();
         snapshot.models[0].observed_on = "2026-02-30".to_string();
         assert!(bind_fixture(&snapshot).is_err());
-        snapshot.models[0].observed_on = "2026-09-13".to_string();
+        snapshot.models[0].observed_on = snapshot.published_on.clone();
         snapshot.capability_policy.models[0].evidence.clear();
         assert!(bind_fixture(&snapshot).is_err());
         let mut value = serde_json::to_value(new_model_snapshot("new-advertised-model")?)?;

@@ -1,10 +1,11 @@
 //! Opt-in submit/status transport for a supervisor-held inbox. No launch authority.
 //!
-//! A fresh session may mint one supervisor-owned first-turn binding below. The staged
-//! transport caller supplies the frozen authored parent, current binding and an
-//! already-opened inbox. It must persist/reuse that generation, reconcile recovery,
-//! and cancel/drop the endpoint at attempt end. There is no automatic fresh/recover
-//! fallback here. Ordinary assignment endpoints do not gain Worker request access.
+//! A fresh session may mint one supervisor-owned first-turn binding per authored
+//! parent. The staged transport caller supplies the frozen authored parent, current
+//! binding and an already-opened inbox. It must persist/reuse that generation,
+//! reconcile recovery, and cancel/drop the endpoint at attempt end. There is no
+//! automatic fresh/recover fallback here. Ordinary assignment endpoints do not gain
+//! Worker request access.
 
 use super::{
     persistence::PersistentMessagingBinding,
@@ -44,12 +45,18 @@ impl SupervisorMessagingSessionFactory {
         Ok(())
     }
 
-    /// Claims the session's sole fresh inbox identity, before any broker reopen.
+    /// Claims one fresh inbox identity for an exact authored parent, before any broker reopen.
     /// `parent`, `attempt`, and the resolved runtime must come from supervisor launch
-    /// context. Exact authored equality prevents substituting another parent's Workers.
-    /// Even a refused claim consumes authority; callers must retain the returned binding
-    /// for this live turn, never retry construction after downstream failure. This is
-    /// inbox admission only, not permission to dispatch or recover any Worker.
+    /// context. The critical section removes only the entry with that parent id. Exact
+    /// authored equality then prevents substituting another parent's Workers. The only
+    /// supervisor-controlled exception is runtime projection: the requested-plan freeze
+    /// may still have `runtime: None` when the trusted selector has set the live parent
+    /// to its selected runtime. An explicit frozen runtime must match exactly. No other field,
+    /// including nested Workers, may differ. A known parent is consumed even when the
+    /// claim is later refused, so callers must retain the returned binding for this live
+    /// turn and never retry that parent after downstream failure. An unknown parent id
+    /// leaves every remaining permit. This is inbox admission only, not permission to
+    /// dispatch or recover any Worker.
     #[allow(dead_code)] // No production caller until the complete turn controller lands.
     pub(in crate::supervise) fn claim_fresh_worker_request_binding(
         &self,
@@ -58,21 +65,30 @@ impl SupervisorMessagingSessionFactory {
         attempt: usize,
         resolved_runtime: SupervisorRuntime,
     ) -> Result<WorkerRequestBinding> {
-        // Consume before verification, randomness, or any other fallible downstream work.
-        let parents = self
-            .fresh_worker_request_parents
-            .lock()
-            .map_err(|_| anyhow::anyhow!("fresh Worker request admission is poisoned"))?
-            .take()
-            .context("fresh Worker request admission is unavailable or already consumed")?;
+        // Remove only this parent id before verification, randomness, or any other
+        // fallible downstream work. A foreign id must not burn a different permit.
+        let authored = {
+            let mut admission = self
+                .fresh_worker_request_parents
+                .lock()
+                .map_err(|_| anyhow::anyhow!("fresh Worker request admission is poisoned"))?;
+            let parents = admission
+                .as_mut()
+                .context("fresh Worker request admission is unavailable or already consumed")?;
+            let index = parents
+                .iter()
+                .position(|authored| authored.id == parent.id)
+                .context("fresh Worker request admission does not include that authored parent")?;
+            parents.remove(index)
+        };
         if attempt != 1
-            || resolved_runtime != SupervisorRuntime::Codex
+            || resolved_runtime == SupervisorRuntime::Fake
             || parent
                 .runtime
-                .is_some_and(|runtime| runtime != SupervisorRuntime::Codex)
-            || !parents.iter().any(|authored| authored == parent)
+                .is_some_and(|runtime| runtime != resolved_runtime)
+            || !authored_parent_accepts_runtime_projection(&authored, parent, resolved_runtime)
         {
-            bail!("fresh Worker request admission requires the exact authored first Codex parent turn");
+            bail!("fresh Worker request admission requires the exact authored first selected parent turn");
         }
         let generation =
             random_identifier().context("failed to mint fresh Worker inbox generation")?;
@@ -103,6 +119,30 @@ impl SupervisorMessagingSessionFactory {
         )?;
         expected.verify_session(self, &parent.id)?;
         Ok(expected)
+    }
+}
+
+/// Requested-plan admission freezes assignments before the selector writes a runtime.
+/// Only an omitted frozen runtime may match the live selected runtime. Every other
+/// field, including nested Workers, stays under authored `PartialEq`.
+fn authored_parent_accepts_runtime_projection(
+    authored: &OrchestratorAssignment,
+    parent: &OrchestratorAssignment,
+    resolved_runtime: SupervisorRuntime,
+) -> bool {
+    match (authored.runtime, parent.runtime) {
+        (None, None) => authored == parent,
+        (Some(authored_runtime), Some(runtime))
+            if authored_runtime == resolved_runtime && runtime == resolved_runtime =>
+        {
+            authored == parent
+        }
+        (None, Some(runtime)) if runtime == resolved_runtime => {
+            let mut projected = parent.clone();
+            projected.runtime = None;
+            authored == &projected
+        }
+        _ => false,
     }
 }
 

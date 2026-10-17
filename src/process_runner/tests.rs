@@ -3,6 +3,7 @@ use super::*;
 #[cfg(target_os = "linux")]
 fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
     ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: workspace_root.to_path_buf(),
         current_dir: workspace_root.to_path_buf(),
@@ -12,7 +13,8 @@ fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -683,6 +685,147 @@ fn verified_contained_interactive_session_proves_tree_and_side_effects() {
     assert!(result.process.safety_evidence_verified());
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn private_peer_identity_refusal_is_fixed_and_preserves_guard_order() {
+    use std::os::unix::net::UnixStream;
+
+    let (stream, _peer) = UnixStream::pair().expect("socket pair");
+    let pid = std::process::id();
+    let start = crate::agent_lifecycle::process_start_time(pid).expect("current identity");
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing = temp.path().join("private-missing-cgroup");
+    let cancellation = ProcessCancellation::new();
+    let empty_reader = |stream| PipeReader {
+        stream,
+        receiver: None,
+        thread: None,
+        tee_helper: None,
+        capture: BoundedBuffer::new(64),
+        complete: true,
+        error: None,
+    };
+    // This exercises the peer guard directly, not launched-child containment.
+    let session = |peer_binding| ContainedProcessSession {
+        peer_binding,
+        label: "private peer guard fixture".into(),
+        cancellation: &cancellation,
+        operation_deadline: None,
+        stdin: None,
+        stdin_bytes_written: 0,
+        max_stdin_bytes: 64,
+        pending_stdout: Vec::new(),
+        stdout_eof: false,
+        io_error: None,
+        output_drainers: OutputDrainers {
+            stdout: empty_reader("stdout"),
+            stderr: empty_reader("stderr"),
+            label: "private peer guard fixture".into(),
+        },
+    };
+
+    let mut no_binding = session(None);
+    assert_eq!(
+        no_binding.verify_private_peer(&stream).unwrap_err(),
+        "private peer lacks verified containment"
+    );
+    assert!(no_binding.io_error.is_none());
+
+    let mut wrong_pid = session(Some((
+        pid.checked_add(1).expect("next PID"),
+        "private-start-sentinel".into(),
+        missing.clone(),
+    )));
+    let error = wrong_pid.verify_private_peer(&stream).unwrap_err();
+    assert_eq!(error, "private peer identity mismatch: peer_pid");
+    assert_eq!(wrong_pid.io_error.as_deref(), Some(error.as_str()));
+
+    let mut wrong_start = session(Some((
+        pid,
+        "private-start-sentinel".into(),
+        missing.clone(),
+    )));
+    assert_eq!(
+        wrong_start.verify_private_peer(&stream).unwrap_err(),
+        "private peer identity mismatch: peer_start_changed"
+    );
+
+    for (expected, observed, reason) in [
+        ("1:2", "1:2", None),
+        (
+            "1:2",
+            "3:2",
+            Some("private peer identity mismatch: peer_start_boot_changed"),
+        ),
+        (
+            "1:2",
+            "1:3",
+            Some("private peer identity mismatch: peer_start_ticks_changed"),
+        ),
+        (
+            "1:2",
+            "3:4",
+            Some("private peer identity mismatch: peer_start_changed"),
+        ),
+        (
+            "private-start-sentinel",
+            "1:2",
+            Some("private peer identity mismatch: peer_start_changed"),
+        ),
+    ] {
+        assert_eq!(
+            private_peer_start_refusal(expected, Ok(observed.into())),
+            reason
+        );
+    }
+    for error in [
+        anyhow::Error::new(io::Error::new(io::ErrorKind::NotFound, "private-secret"))
+            .context("failed to read process identity /private-owner-path/stat"),
+        anyhow::Error::msg("process stat identity is malformed"),
+    ] {
+        let refusal = private_peer_start_refusal("1:2", Err(error));
+        assert_eq!(
+            refusal,
+            Some("private peer identity mismatch: peer_start_read_failed")
+        );
+        assert!(!refusal.unwrap().contains("private-secret"));
+        assert!(!refusal.unwrap().contains("private-owner-path"));
+    }
+
+    let cgroup = temp.path().join("cgroup.procs");
+    fs::write(&cgroup, "0\n").expect("nonmember fixture");
+    let mut nonmember = session(Some((pid, start.clone(), temp.path().to_path_buf())));
+    assert_eq!(
+        nonmember.verify_private_peer(&stream).unwrap_err(),
+        "private peer identity mismatch: cgroup_membership"
+    );
+    fs::write(&cgroup, format!("{pid}\n")).expect("member fixture");
+    let mut matching = session(Some((pid, start.clone(), temp.path().to_path_buf())));
+    assert!(matching.verify_private_peer(&stream).is_ok());
+    assert!(matching.io_error.is_none());
+
+    let mut unavailable = session(Some((pid, start, missing.clone())));
+    assert_eq!(
+        unavailable.verify_private_peer(&stream).unwrap_err(),
+        "private peer cgroup unavailable"
+    );
+    assert!(unavailable.io_error.is_none());
+
+    let mut expired = session(None);
+    expired.operation_deadline = Some(Instant::now());
+    assert_eq!(
+        expired.verify_private_peer(&stream).unwrap_err(),
+        "contained interactive session reached its operation deadline"
+    );
+    cancellation.cancel();
+    let mut cancelled = session(None);
+    cancelled.operation_deadline = Some(Instant::now());
+    assert_eq!(
+        cancelled.verify_private_peer(&stream).unwrap_err(),
+        "contained interactive session was cancelled"
+    );
+}
+
 #[test]
 fn failed_host_capacity_measurement_falls_back_to_one_lane() {
     let capacity = HostProcessCapacity::from_measurement(Err(io::Error::other("injected failure")));
@@ -1039,7 +1182,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         "--property=CapabilityBoundingSet=".to_string(),
         "--property=AmbientCapabilities=".to_string(),
         "--property=PrivateUsers=yes".to_string(),
-        "--property=RestrictNamespaces=yes".to_string(),
+        "--property=RestrictNamespaces=no".to_string(),
         "--property=PrivateNetwork=no".to_string(),
         "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string(),
         format!(
@@ -1065,7 +1208,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
     ] {
         assert!(arguments.contains(&expected), "missing {expected}");
     }
-    assert!(!arguments.contains("--property=RestrictNamespaces=no"));
+    assert!(!arguments.contains("--property=RestrictNamespaces=yes"));
     assert!(arguments
         .iter()
         .all(|argument| !argument.contains("AF_NETLINK")));
@@ -1073,7 +1216,7 @@ fn external_grok_profile_projects_exact_systemd_properties() {
         .iter()
         .find_map(|argument| argument.strip_prefix("--property=SystemCallFilter="))
         .expect("ExternalGrok system call filter");
-    assert!(system_call_filter
+    assert!(!system_call_filter
         .split_whitespace()
         .any(|token| token.trim_start_matches('~') == "@mount"));
 
@@ -1877,6 +2020,7 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
     // This absent root is a fail-if-traversed sentinel for an irrelevant large read-only tree.
     let irrelevant_read_only_root = temp.path().join("irrelevant-large-read-only-root");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace,
@@ -1886,7 +2030,8 @@ fn protected_alias_scan_skips_read_only_roots_without_a_writable_surface() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1911,6 +2056,7 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
     // such as a whole repository mounted only so Git can read the worktree.
     let disjoint_read_only_root = temp.path().join("disjoint-large-read-only-root");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace,
@@ -1920,7 +2066,8 @@ fn protected_alias_scan_skips_disjoint_read_only_roots_when_writable_files_are_s
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -1957,6 +2104,7 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
     let protected_file = protected_root.join("policy.md");
     fs::write(&protected_file, "policy\n").expect("protected file");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: writable_root.clone(),
         current_dir: writable_root.clone(),
@@ -1966,7 +2114,8 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -2760,6 +2909,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
     let exception = policy_root.join("docs/worker.md");
     let incoming = PathBuf::from("/run/maco/incoming");
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: workspace.clone(),
         current_dir: workspace.clone(),
@@ -2769,7 +2919,8 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: vec![exception.clone()],
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: vec![incoming.clone()],
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -2818,6 +2969,7 @@ fn same_filesystem_mount_identity_rejects_rw_aliases_and_nested_conflicts() {
 #[test]
 fn ordinary_external_codex_exact_path_properties_reject_drift() {
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::ExternalCodex,
         workspace_root: PathBuf::from("/worktree"),
         current_dir: PathBuf::from("/worktree"),
@@ -2827,7 +2979,8 @@ fn ordinary_external_codex_exact_path_properties_reject_drift() {
         visible_read_write_roots: vec![PathBuf::from("/worktree/.agents/docs")],
         visible_read_write_files: vec![PathBuf::from("/worktree/AGENTS.md")],
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/primary")],
         isolated_host_view: false,
@@ -2913,12 +3066,680 @@ fn ordinary_external_codex_exact_path_properties_reject_drift() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn external_claude_network_properties_require_private_loopback_and_unix_only() {
+    let mut properties = BTreeMap::from([
+        (
+            "RestrictAddressFamilies".to_string(),
+            "AF_INET AF_UNIX".to_string(),
+        ),
+        ("PrivateNetwork".to_string(), "yes".to_string()),
+    ]);
+    verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .expect("exact ExternalClaude private relay network properties");
+
+    properties.insert("PrivateNetwork".to_string(), "no".to_string());
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .is_err());
+    properties.insert("PrivateNetwork".to_string(), "yes".to_string());
+    properties.insert(
+        "RestrictAddressFamilies".to_string(),
+        "AF_INET AF_INET6 AF_UNIX".to_string(),
+    );
+    assert!(verify_systemd_network_properties(
+        SideEffectConfinementProfileKind::ExternalClaude,
+        &properties,
+    )
+    .is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn space_containing_claude_policy_root_uses_and_verifies_systemd_v255_quoting() {
+    let claude_policy = Path::new("/mnt/c/Program Files/ClaudeCode");
+    assert_eq!(
+        systemd_path_property("InaccessiblePaths=", claude_policy, false),
+        OsString::from("--property=InaccessiblePaths=\"/mnt/c/Program Files/ClaudeCode\""),
+    );
+    assert_eq!(
+        systemd_path_property("InaccessiblePaths=", claude_policy, true),
+        OsString::from("--property=InaccessiblePaths=\"-/mnt/c/Program Files/ClaudeCode\""),
+    );
+
+    let expected = BTreeSet::from([
+        PathBuf::from("/etc/claude-code"),
+        claude_policy.to_path_buf(),
+    ]);
+    let systemctl_show = "/etc/claude-code \"/mnt/c/Program Files/ClaudeCode\"";
+    verify_exact_property_paths("InaccessiblePaths", systemctl_show, &expected)
+        .expect("systemd v255 shell_maybe_quote output");
+    require_property_path("InaccessiblePaths", systemctl_show, claude_policy)
+        .expect("quoted Claude WSL policy root");
+
+    for malformed in [
+        "\"/mnt/c/Program Files/ClaudeCode",
+        "\"/mnt/c/Program Files/ClaudeCode\"suffix",
+        "\"/mnt/c/Program\\nFiles/ClaudeCode\"",
+        "/etc/claude-code /mnt/c/Program\tFiles/ClaudeCode",
+    ] {
+        assert!(
+            verify_exact_property_paths("InaccessiblePaths", malformed, &expected).is_err(),
+            "malformed/control property must fail closed: {malformed:?}"
+        );
+    }
+
+    for unsupported in [
+        Path::new("/mnt/c/Program\tFiles/ClaudeCode"),
+        Path::new("/mnt/c/Program\nFiles/ClaudeCode"),
+        Path::new("/mnt/c/Program:Files/ClaudeCode"),
+        Path::new("/mnt/c/Program\\Files/ClaudeCode"),
+    ] {
+        assert!(validate_systemd_hidden_root_syntax(unsupported, "hidden root").is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
 fn joined_property_paths(paths: &BTreeSet<PathBuf>) -> String {
     paths
         .iter()
         .map(|path| path.to_string_lossy())
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_unit_fixture(runtime: &Path, helper_search_path: Option<OsString>) -> SystemdUnit {
+    SystemdUnit {
+        _permit: SystemdUnitPermit {
+            file: tempfile::tempfile().expect("private fixture permit descriptor"),
+        },
+        systemd_run: PathBuf::from("/usr/bin/systemd-run"),
+        systemctl: PathBuf::from("/usr/bin/systemctl"),
+        env_program: PathBuf::from("/usr/bin/env"),
+        shell: PathBuf::from("/bin/sh"),
+        sleep_program: PathBuf::from("/usr/bin/sleep"),
+        stat_program: PathBuf::from("/usr/bin/stat"),
+        findmnt_program: PathBuf::from("/usr/bin/findmnt"),
+        helper_search_path,
+        name: "maco-cursor-helper-command-fixture.service".to_string(),
+        cgroup_membership: "/maco-cursor-helper-command-fixture".to_string(),
+        cgroup_path: PathBuf::from("/sys/fs/cgroup/maco-cursor-helper-command-fixture"),
+        runtime_dir: runtime.to_path_buf(),
+        client_runtime: runtime
+            .parent()
+            .expect("fixture runtime parent")
+            .to_path_buf(),
+        isolated_root: None,
+        environment_file: runtime.join("environment"),
+        ready_path: runtime.join("environment-ready"),
+        waiting_path: runtime.join("guardian-waiting"),
+        environment_fifo_path: runtime.join("environment-gate"),
+        start_fifo_path: runtime.join("start-gate"),
+        target_pid_path: runtime.join("target-pid"),
+        owner_fifo_path: runtime.join("owner-liveness"),
+        fifo_waiting_path: runtime.join("fifo-waiting"),
+        sandbox_report_path: runtime.join("sandbox-mount-report"),
+        owner_channel: None,
+        pending_environment: None,
+        prepared_native_entry: None,
+        pending_runtime_files: Vec::new(),
+        runtime_file_paths: Vec::new(),
+        staged_codex_home: None,
+        target_program_path: None,
+        sandbox: None,
+        sandbox_verified: false,
+        prepared_read_only: None,
+        pending_read_only: None,
+        environment_published: false,
+        environment_released: false,
+        fifos_prepared: false,
+        launcher_spawned: false,
+        launcher_completed: false,
+        observed_owned: false,
+        cleaned: false,
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_start_gate_timeout_preserves_bounded_redacted_diagnostics_before_cleanup() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let mut unit = systemd_unit_fixture(&runtime, None);
+    unit.observed_owned = true;
+    unit.fifos_prepared = true;
+    unit.owner_channel = Some(tempfile::tempfile().unwrap());
+    unit.environment_published = true;
+    unit.environment_released = true;
+    fs::write(&unit.fifo_waiting_path, b"").unwrap();
+    fs::write(&unit.waiting_path, b"").unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf '%s\\n' 'maco containment guardian: could not inspect sandbox mount: /private/credential-path' 'untrusted argv=SECRET env=SECRET' >&2; printf .; read -r token"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut ready = [0_u8; 1];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    assert_eq!(ready, *b".");
+    let error = unit
+        .confirm_attached(
+            &mut child,
+            Some(Instant::now() + Duration::from_millis(30)),
+            &ProcessCancellation::new(),
+        )
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::TimedOut);
+    let message = error.to_string();
+    assert!(
+        message.contains("did not reach its start gate"),
+        "{message}"
+    );
+    assert!(message.contains("pre-cleanup gate: owned=true fifo_waiting=true fifos_prepared=true owner_channel=true guardian_waiting=true environment_published=true environment_released=true ready=false sandbox_verified=false"), "{message}");
+    assert!(
+        message.contains("maco containment guardian: could not inspect sandbox mount"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("credential-path") && !message.contains("SECRET"),
+        "{message}"
+    );
+    assert!(!unit.cleaned && unit.waiting_path.is_file() && unit.owner_channel.is_some());
+    assert!(child.try_wait().unwrap().is_none());
+    child.kill().unwrap();
+    child.wait().unwrap();
+
+    // A cancelled admission observes the same bounded path, including output beyond the capture limit.
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf '%4097s' SECRET >&2; printf .; read -r token"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    use std::os::fd::AsRawFd;
+    // Resize only this anonymous fixture pipe, so >4096 bytes can precede readiness
+    // without blocking the producer. No service/profile/host setting is changed.
+    let stderr_fd = child.stderr.as_ref().unwrap().as_raw_fd();
+    // SAFETY: stderr_fd is borrowed from this live fixture pipe; its ownership is unchanged.
+    let capacity = unsafe { libc::fcntl(stderr_fd, libc::F_SETPIPE_SZ, 8192) };
+    assert!(capacity >= 4097, "fixture pipe capacity: {capacity}");
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut ready)
+        .unwrap();
+    let cancellation = ProcessCancellation::new();
+    cancellation.cancel();
+    let error = unit
+        .confirm_attached(&mut child, None, &cancellation)
+        .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(error
+        .to_string()
+        .contains("bytes=4096 capacity_reached=true"));
+    assert!(!error.to_string().contains("SECRET"));
+    child.kill().unwrap();
+    child.wait().unwrap();
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cursor_offline_uds_build_command_pins_helpers_and_refuses_host_fallback() {
+    use std::os::unix::fs::MetadataExt;
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let path = env::var_os("PATH").expect("run with the reviewed Nix helper closure in PATH");
+    let program = required_trusted_nix_store_executable("env", &path)
+        .expect("reviewed Nix env helper must be available; never skip this regression");
+    let spec = ProcessSpec::direct(
+        "Cursor offline UDS actual launcher construction",
+        &program,
+        ["--version"],
+        &workspace,
+        128,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+    .with_private_runtime_home(true)
+    .with_private_runtime_cursor_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::CursorProviderlessOfflineUds(
+        CursorProviderlessOfflineUdsProfile::read_write(&workspace),
+    ));
+    let mut unit = systemd_unit_fixture(&temp.path().join("runtime"), Some(path));
+    let command = unit
+        .build_command(&spec)
+        .expect("actual isolated launcher path");
+    assert_eq!(command.get_program(), OsStr::new("/usr/bin/systemd-run"));
+    let args = command.get_args().collect::<Vec<_>>();
+    let boundary = args
+        .iter()
+        .position(|arg| *arg == OsStr::new("--"))
+        .unwrap();
+    assert_eq!(args[boundary + 1], unit.env_program.as_os_str());
+    assert_eq!(args[boundary + 2], OsStr::new("-i"));
+    assert_eq!(args[boundary + 3], unit.shell.as_os_str());
+    assert_eq!(args[boundary + 5], OsStr::new(SYSTEMD_GUARDIAN_SCRIPT));
+    let guardian = args
+        .iter()
+        .position(|arg| *arg == OsStr::new("maco-containment-guardian"))
+        .unwrap();
+    assert_eq!(args[guardian + 9], unit.sleep_program.as_os_str());
+    assert_eq!(args[guardian + 11], unit.stat_program.as_os_str());
+    assert_eq!(args[guardian + 12], unit.findmnt_program.as_os_str());
+    assert_eq!(args[guardian + 13], unit.env_program.as_os_str());
+    let sandbox = unit.sandbox.as_ref().expect("identity-bound sandbox");
+    for (name, helper) in [
+        ("env", &unit.env_program),
+        ("sh", &unit.shell),
+        ("sleep", &unit.sleep_program),
+        ("stat", &unit.stat_program),
+        ("findmnt", &unit.findmnt_program),
+    ] {
+        assert_eq!(
+            helper.file_name(),
+            Some(OsStr::new(name)),
+            "applet basename"
+        );
+        assert!(helper.parent().unwrap().starts_with("/nix/store"));
+        assert_eq!(
+            fs::canonicalize(helper.parent().unwrap()).unwrap(),
+            helper.parent().unwrap()
+        );
+        let canonical = fs::canonicalize(helper).expect("canonical trusted helper");
+        assert!(canonical.starts_with("/nix/store"));
+        let metadata = fs::metadata(helper).unwrap();
+        assert!(sandbox.visible_read_only_files.contains(helper));
+        assert!(sandbox.path_identities.iter().any(|identity| {
+            identity.path == canonical
+                && identity.device == metadata.dev()
+                && identity.inode == metadata.ino()
+        }));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path == *helper
+                && check.access == SandboxMountAccess::ReadOnly
+                && check.device == metadata.dev()
+                && check.inode == metadata.ino()
+        }));
+        assert!(args.contains(&OsStr::new(&format!(
+            "--property=BindReadOnlyPaths={}",
+            helper.display()
+        ))));
+    }
+    assert!(args.contains(&OsStr::new("--property=PrivateNetwork=yes")));
+    assert!(args.contains(&OsStr::new("--property=RestrictAddressFamilies=AF_UNIX")));
+    assert!(args.contains(&OsStr::new("--property=ProtectSystem=no")));
+    assert!(args.contains(&OsStr::new("--property=TemporaryFileSystem=/:ro")));
+    assert!(!args.contains(&OsStr::new("--property=ProtectSystem=strict")));
+    assert!(!unit.launcher_spawned);
+
+    // A final target linking back into Nix cannot make an outside alias parent trusted.
+    let outside = temp.path().join("outside-bin");
+    fs::create_dir(&outside).unwrap();
+    std::os::unix::fs::symlink(&program, outside.join("env")).unwrap();
+    let escaped = Path::new("/nix/store/../..").join(outside.strip_prefix("/").unwrap());
+    for rejected_path in [
+        None,
+        Some(OsString::from("/usr/bin:/bin")),
+        Some(escaped.into_os_string()),
+    ] {
+        let mut refused = systemd_unit_fixture(&temp.path().join("refused-runtime"), rejected_path);
+        let error = refused
+            .build_command(&spec)
+            .expect_err("no ambient helper fallback");
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+        assert!(error.to_string().contains("Nix-store PATH"));
+        assert_eq!(refused.env_program, Path::new("/usr/bin/env"));
+        assert!(refused.target_program_path.is_none());
+        assert!(refused.sandbox.is_none());
+        assert!(!refused.launcher_spawned);
+    }
+
+    let ordinary = ProcessSpec::direct(
+        "ordinary fixed helper launcher policy",
+        &program,
+        ["--version"],
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        StrictOfflineWorkspaceProfile::read_only(&workspace),
+    ));
+    let mut unchanged = systemd_unit_fixture(&temp.path().join("ordinary-runtime"), None);
+    let command = unchanged
+        .build_command(&ordinary)
+        .expect("ordinary fixed-path launcher");
+    let args = command.get_args().collect::<Vec<_>>();
+    let boundary = args
+        .iter()
+        .position(|arg| *arg == OsStr::new("--"))
+        .unwrap();
+    assert_eq!(args[boundary + 1], OsStr::new("/usr/bin/env"));
+    assert_eq!(args[boundary + 3], OsStr::new("/bin/sh"));
+    assert_eq!(unchanged.sleep_program, Path::new("/usr/bin/sleep"));
+    assert_eq!(unchanged.stat_program, Path::new("/usr/bin/stat"));
+    assert_eq!(unchanged.findmnt_program, Path::new("/usr/bin/findmnt"));
+    assert!(args.contains(&OsStr::new("--property=ProtectSystem=strict")));
+    assert!(!args.contains(&OsStr::new("--property=ProtectSystem=no")));
+    assert!(!args.contains(&OsStr::new("--property=TemporaryFileSystem=/:ro")));
+    assert!(!unchanged.launcher_spawned);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_root_guardian_parses_one_unshadowed_row_and_refuses_malformed_or_unsafe_roots() {
+    // Execute the actual production functions, not a parallel parser implementation.
+    let functions = SYSTEMD_GUARDIAN_SCRIPT
+        .split_once("fail_guardian() {")
+        .unwrap()
+        .1
+        .split_once("case \"$target_environment_mode\" in")
+        .unwrap()
+        .0;
+    let script = format!("fail_guardian() {{{functions}\nisolated_root=$1\nisolated_kernel_type=$2\nsandbox_path=$3\nvalidate_isolated_root_report\nprintf ROOT_VALID\n");
+    for (label, report, magic, path, pass, fstype, count) in [
+        (
+            "plain",
+            "PRIVATE_SOURCE tmpfs ro,nodev",
+            "1021994",
+            "/",
+            true,
+            "tmpfs",
+            1,
+        ),
+        (
+            "padding",
+            "  PRIVATE_SOURCE\t tmpfs   ro,nodev  ",
+            "1021994",
+            "/",
+            true,
+            "tmpfs",
+            1,
+        ),
+        (
+            "malformed",
+            "PRIVATE_SOURCE tmpfs",
+            "1021994",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "extra",
+            "PRIVATE_SOURCE tmpfs ro PRIVATE_EXTRA",
+            "1021994",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "multiple",
+            "PRIVATE_SOURCE tmpfs ro\nPRIVATE_SECOND ext4 rw",
+            "1021994",
+            "/",
+            false,
+            "tmpfs",
+            2,
+        ),
+        (
+            "wrong-type",
+            "PRIVATE_SOURCE ext4 ro",
+            "1021994",
+            "/",
+            false,
+            "ext4",
+            1,
+        ),
+        (
+            "unknown-type",
+            "PRIVATE_SOURCE PRIVATE_TYPE ro",
+            "1021994",
+            "/",
+            false,
+            "other",
+            1,
+        ),
+        (
+            "wrong-kernel",
+            "PRIVATE_SOURCE tmpfs ro",
+            "ef53",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "unsafe-kernel",
+            "PRIVATE_SOURCE tmpfs ro",
+            "PRIVATE_MAGIC",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "writable",
+            "PRIVATE_SOURCE tmpfs rw",
+            "1021994",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "conflicting",
+            "PRIVATE_SOURCE tmpfs ro,rw",
+            "1021994",
+            "/",
+            false,
+            "tmpfs",
+            1,
+        ),
+        (
+            "wrong-root",
+            "PRIVATE_SOURCE tmpfs ro",
+            "1021994",
+            "/PRIVATE_PATH",
+            false,
+            "other",
+            0,
+        ),
+    ] {
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script, "root-parser", report, magic, path])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.success(), pass, "{label}: {output:?}");
+        if pass {
+            assert_eq!(output.stdout, b"ROOT_VALID");
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(output.status.code(), Some(125), "{label}");
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr.len() < 320 && !stderr.contains("PRIVATE_"),
+                "{label}: {stderr}"
+            );
+            assert!(
+                stderr.contains(&format!("results={count} "))
+                    && stderr.contains(&format!("fstype={fstype} ")),
+                "{label}: {stderr}"
+            );
+        }
+    }
+    assert!(SYSTEMD_GUARDIAN_SCRIPT
+        .contains("--raw --noheadings --uniq --output SOURCE,FSTYPE,VFS-OPTIONS --mountpoint"));
+    assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("\"$stat_program\" -f -c '%t' -- \"$sandbox_path\""));
+
+    // The real bounded timeout capture accepts only canonical metadata tokens.
+    let temp = tempfile::tempdir().unwrap();
+    let unit = systemd_unit_fixture(temp.path(), None);
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf '%s\\n' 'maco containment guardian root: results=2 shape=valid fstype=tmpfs kernel_type=1021994 ro=true' 'maco containment guardian root: results=1 shape=valid fstype=PRIVATE_TYPE kernel_type=PRIVATE_MAGIC ro=true' 'maco containment guardian: isolated root kernel type did not match tmpfs' >&2; printf .; read -r token"])
+        .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped()).spawn().unwrap();
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut [0_u8; 1])
+        .unwrap();
+    let diagnostic = unit.start_gate_diagnostics(&mut child);
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(diagnostic.contains("results=2 shape=valid fstype=tmpfs kernel_type=1021994 ro=true"));
+    assert!(diagnostic.contains("isolated root kernel type did not match tmpfs"));
+    assert!(!diagnostic.contains("PRIVATE_"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn ordinary_mount_options_writer_refuses_multiline_and_access_drift() {
+    // Exercise the production guardian validator; real alias-stack selection is separately
+    // qualified by the pinned findmnt namespace diagnostic and the installed launcher gate.
+    let functions = SYSTEMD_GUARDIAN_SCRIPT
+        .split_once("fail_guardian() {")
+        .unwrap()
+        .1
+        .split_once("case \"$target_environment_mode\" in")
+        .unwrap()
+        .0;
+    let script = format!("fail_guardian() {{{functions}\nsandbox_mode=$1\nsandbox_options=$2\nvalidate_sandbox_mount_options\nprintf 'mounted 1 2 %s\\n' \"$sandbox_options\"\n");
+    for (mode, options, pass) in [
+        ("ro", "ro", true),
+        ("ro", "ro,nosuid,nodev,relatime", true),
+        ("rw", "rw,relatime", true),
+        ("ro", "rw,relatime\nrw,relatime\nro,relatime", false),
+        ("ro", "ro\nro", false),
+        ("ro", "", false),
+        ("ro", "ro relatime", false),
+        ("ro", "ro\trelatime", false),
+        ("ro", "ro\r", false),
+        ("ro", "PRIVATE_OPTIONS", false),
+        ("ro", ",ro", false),
+        ("ro", "ro,", false),
+        ("ro", "ro,,relatime", false),
+        ("ro", "ro,rw", false),
+        ("rw", "rw,ro", false),
+        ("ro", "rw", false),
+        ("rw", "ro", false),
+        ("other", "ro", false),
+    ] {
+        let output = Command::new("/bin/sh")
+            .args(["-c", &script, "guardian-option-framing", mode, options])
+            .output()
+            .expect("guardian option validation");
+        if pass {
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("mounted 1 2 {options}\n")
+            );
+            assert!(output.stderr.is_empty());
+        } else {
+            assert_eq!(output.status.code(), Some(125));
+            assert!(
+                output.stdout.is_empty(),
+                "refusal must not append a report row"
+            );
+            let stderr = String::from_utf8(output.stderr).unwrap();
+            assert!(
+                stderr == "maco containment guardian: sandbox mount options were not one well-formed row\n"
+                    || stderr == "maco containment guardian: sandbox mount options did not match the declared access\n"
+            );
+            assert!(!stderr.contains("PRIVATE_OPTIONS"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_runtime_helper_prefers_nix_store_over_ubuntu_host_helper() {
+    if !Path::new("/nix/store").is_dir() {
+        eprintln!("skipping Nix-store-dependent isolated runtime helper test");
+        return;
+    }
+
+    let path = env::var_os("PATH").expect("test PATH");
+    let fixed_candidates = ["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"];
+    let fixed = find_trusted_unix_executable("env", &fixed_candidates);
+    let isolated = find_trusted_nix_store_executable_in_path("env", &path)
+        .expect("Nix development PATH env helper");
+    let canonical_isolated = fs::canonicalize(&isolated).expect("canonical Nix env");
+
+    assert!(isolated.starts_with("/nix/store"));
+    assert!(canonical_isolated.starts_with("/nix/store"));
+    let smoke = Command::new(&isolated)
+        .args(["-i", "MACO_ISOLATED_ENV_SMOKE=present"])
+        .output()
+        .expect("execute selected Nix env alias");
+    assert!(smoke.status.success());
+    assert_eq!(smoke.stdout, b"MACO_ISOLATED_ENV_SMOKE=present\n");
+    assert!(smoke.stderr.is_empty());
+    if trusted_canonical_unix_executable(Path::new("/usr/bin/env")).is_some() {
+        assert_eq!(fixed, Some(PathBuf::from("/usr/bin/env")));
+    }
+    if let Some(fixed) = fixed {
+        let canonical_fixed = fs::canonicalize(fixed).expect("canonical fixed env");
+        if !canonical_fixed.starts_with("/nix/store") {
+            assert_ne!(canonical_fixed, canonical_isolated);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn isolated_runtime_helper_rejects_unavailable_outside_and_untrusted_candidates() {
+    use std::os::unix::fs::PermissionsExt;
+
+    assert!(
+        find_trusted_nix_store_executable_in_path("env", OsStr::new(":relative:/usr/bin"))
+            .is_none()
+    );
+    assert!(find_trusted_nix_store_executable_in_path(
+        "maco-helper-that-does-not-exist",
+        &env::var_os("PATH").unwrap_or_default()
+    )
+    .is_none());
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let untrusted = temp.path().join("env");
+    fs::write(&untrusted, "#!/bin/sh\nexit 0\n").expect("untrusted helper");
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).expect("untrusted mode");
+    assert!(trusted_canonical_unix_executable(&untrusted).is_none());
+
+    if let Some(actual) =
+        find_trusted_nix_store_executable_in_path("env", &env::var_os("PATH").expect("test PATH"))
+    {
+        let outside_bin = temp.path().join("bin");
+        fs::create_dir(&outside_bin).expect("outside alias directory");
+        std::os::unix::fs::symlink(&actual, outside_bin.join("env"))
+            .expect("outside alias to actual Nix helper");
+        let escaped = Path::new("/nix/store").join("../..").join(
+            outside_bin
+                .strip_prefix("/")
+                .expect("absolute temporary directory"),
+        );
+        assert!(find_trusted_nix_store_executable_in_path("env", escaped.as_os_str()).is_none());
+    } else {
+        eprintln!("skipping Nix-store alias-parent subcase: no trusted Nix env helper");
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3011,6 +3832,261 @@ fn isolated_host_view_resolves_disjoint_required_mounts_and_root_tmpfs() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn gemini_isolated_host_view_allows_only_candidate_descendant_masks() {
+    if !Path::new("/nix/store").is_dir() {
+        eprintln!("skipping Nix-store-dependent Gemini descendant-mask test");
+        return;
+    }
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let hidden_directory = workspace.join(".gemini");
+    let hidden_env = workspace.join(".env");
+    let hidden_git = workspace.join(".git");
+    let control = temp.path().join("control");
+    let profile = control.join("profile");
+    fs::create_dir_all(&hidden_directory).expect("hidden Gemini directory");
+    fs::write(&hidden_env, "GEMINI_API_KEY=ambient\n").expect("hidden environment file");
+    fs::write(&hidden_git, "gitdir: ../gitdir\n").expect("linked-worktree Git file");
+    fs::create_dir_all(&profile).expect("private profile");
+    let program = workspace.join("probe");
+    fs::write(&program, "probe\n").expect("workspace program");
+
+    let gemini = GeminiOfflineBridgeProfile::new(&workspace, &control, &profile)
+        .with_hidden_root(&hidden_directory)
+        .with_hidden_root(&hidden_env)
+        .with_hidden_root(&hidden_git);
+    let gemini_spec = ProcessSpec::direct(
+        "Gemini candidate descendant mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOfflineBridge(gemini));
+    let sandbox = resolve_systemd_sandbox(&gemini_spec)
+        .expect("Gemini descendant mask must resolve")
+        .expect("Gemini sandbox config");
+    assert_eq!(
+        sandbox.kind,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge
+    );
+    for hidden in [&hidden_directory, &hidden_env, &hidden_git] {
+        assert!(sandbox.hidden_roots.contains(hidden));
+        assert!(sandbox.mount_checks.iter().any(|check| {
+            check.path.as_path() == hidden.as_path()
+                && check.access == SandboxMountAccess::Inaccessible
+        }));
+    }
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &control);
+    for hidden in [&hidden_directory, &hidden_env, &hidden_git] {
+        assert!(command.get_args().any(|argument| {
+            argument == systemd_rooted_path_property("InaccessiblePaths=", hidden, true)
+        }));
+        assert!(!command
+            .get_args()
+            .any(|argument| argument == systemd_path_property("InaccessiblePaths=", hidden, true)));
+    }
+    let expected_rooted = BTreeSet::from([
+        hidden_directory.clone(),
+        hidden_env.clone(),
+        hidden_git.clone(),
+    ]);
+    let rooted_value = expected_rooted
+        .iter()
+        .map(|path| format!("-+{}", path.display()))
+        .collect::<Vec<_>>()
+        .join(" ");
+    verify_exact_rooted_property_paths("InaccessiblePaths", &rooted_value, &expected_rooted)
+        .expect("exact rooted masks");
+    assert!(verify_exact_rooted_property_paths(
+        "InaccessiblePaths",
+        &joined_property_paths(&expected_rooted),
+        &expected_rooted,
+    )
+    .is_err());
+
+    let ordinary = StrictOfflineWorkspaceProfile::read_only(&workspace)
+        .with_visible_read_only_root("/nix/store")
+        .with_hidden_root(&hidden_directory)
+        .with_isolated_host_view();
+    let ordinary_spec = ProcessSpec::direct(
+        "ordinary isolated descendant mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        ordinary,
+    ));
+    let ordinary_error = match resolve_systemd_sandbox(&ordinary_spec) {
+        Err(error) => error,
+        Ok(_) => panic!("ordinary isolated profiles must still reject overlapping roots"),
+    };
+    assert!(ordinary_error
+        .to_string()
+        .contains("overlapping visible and inaccessible roots"));
+
+    let ordinary_file = StrictOfflineWorkspaceProfile::read_only(&workspace)
+        .with_visible_read_only_root("/nix/store")
+        .with_hidden_root(&hidden_env)
+        .with_isolated_host_view();
+    let ordinary_file_spec = ProcessSpec::direct(
+        "ordinary isolated regular-file mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        ordinary_file,
+    ));
+    let ordinary_file_error = match resolve_systemd_sandbox(&ordinary_file_spec) {
+        Err(error) => error,
+        Ok(_) => panic!("ordinary profiles must keep directory-only hidden roots"),
+    };
+    assert!(ordinary_file_error.to_string().contains("not a directory"));
+
+    let equal_workspace = GeminiOfflineBridgeProfile::new(&workspace, &control, &profile)
+        .with_hidden_root(&workspace);
+    let equal_spec = ProcessSpec::direct(
+        "Gemini equal workspace mask",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOfflineBridge(
+        equal_workspace,
+    ));
+    assert!(resolve_systemd_sandbox(&equal_spec).is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gemini_online_profile_projects_only_the_trusted_resolver_file() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    // This test checks file binding and mount projection, not DNS contents or a
+    // provider launch. Reuse the reviewed root-owned Nix input instead of the
+    // host resolver, which systemd-resolved may legitimately own as a nonroot uid.
+    let path = env::var_os("PATH").expect("run with the reviewed Nix helper closure in PATH");
+    let resolver_source = fs::canonicalize(
+        required_trusted_nix_store_executable("env", &path)
+            .expect("reviewed root-owned Nix input must be available; never skip this regression"),
+    )
+    .expect("canonical Nix resolver projection fixture");
+    let resolver_binding = GeminiOnlineReadOnlyFileBinding::new(
+        resolver_source.clone(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .expect("trusted root-owned resolver projection fixture");
+
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let control = temp.path().join("control");
+    let profile = temp.path().join("profile");
+    for directory in [&workspace, &control, &profile] {
+        fs::create_dir(directory).expect("fixture directory");
+    }
+    let program = workspace.join("probe");
+    fs::write(&program, "probe\n").expect("workspace program");
+    // Assemble only the test profile with the validated fixture binding. The
+    // production constructor must keep resolving the fixed /etc/resolv.conf.
+    let mut config = WorkspaceSandboxConfig::new(&workspace, WorkspaceAccess::ReadWrite)
+        .with_isolated_host_view()
+        .with_visible_read_only_root(Path::new("/nix/store"))
+        .with_visible_read_only_root(&control)
+        .with_writable_artifact_root(&profile);
+    config
+        .gemini_online_read_only_file_bindings
+        .push(resolver_binding);
+    let confinement = GeminiOnlineBridgeProfile { config };
+    let spec = ProcessSpec::direct(
+        "Gemini online resolver projection",
+        &program,
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOnlineBridge(
+        confinement,
+    ));
+    let sandbox = resolve_systemd_sandbox(&spec)
+        .expect("resolve Gemini online sandbox")
+        .expect("Gemini online sandbox config");
+    assert_eq!(sandbox.gemini_online_read_only_file_bindings.len(), 1);
+    let binding = &sandbox.gemini_online_read_only_file_bindings[0];
+    assert_eq!(binding.source, resolver_source);
+    assert_eq!(binding.target, Path::new("/etc/resolv.conf"));
+    binding
+        .verify_source()
+        .expect("stable trusted resolver source");
+    assert!(sandbox.mount_checks.iter().any(|check| {
+        check.path == binding.target
+            && check.device == binding.identity.device
+            && check.inode == binding.identity.inode
+            && check.access == SandboxMountAccess::ReadOnly
+    }));
+
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, &control);
+    let arguments = command.get_args().collect::<Vec<_>>();
+    let expected_binding =
+        systemd_path_binding_property("BindReadOnlyPaths=", &binding.source, &binding.target);
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new(&expected_binding)));
+    let expected_read_only_target = systemd_path_property("ReadOnlyPaths=", &binding.target, false);
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new(&expected_read_only_target)));
+    assert!(arguments
+        .iter()
+        .any(|argument| *argument == OsStr::new("--property=PrivateNetwork=no")));
+    assert!(arguments.iter().any(|argument| {
+        *argument == OsStr::new("--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6")
+    }));
+
+    let untrusted = temp.path().join("writable-resolver.conf");
+    fs::write(&untrusted, "nameserver 127.0.0.1\n").expect("untrusted resolver fixture");
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o666))
+        .expect("untrusted resolver mode");
+    assert!(GeminiOnlineReadOnlyFileBinding::new(
+        fs::canonicalize(&untrusted).unwrap(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .is_err());
+
+    // Isolate the owner refusal from the existing group/world-writable control.
+    fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o644))
+        .expect("mode-safe nonroot resolver fixture");
+    let metadata = fs::metadata(&untrusted).expect("nonroot resolver fixture metadata");
+    assert!(metadata.is_file());
+    assert_ne!(
+        metadata.uid(),
+        0,
+        "run in the existing nonroot CI user scope"
+    );
+    assert_eq!(metadata.permissions().mode() & 0o022, 0);
+    assert_eq!(metadata.nlink(), 1);
+    let error = GeminiOnlineReadOnlyFileBinding::new(
+        fs::canonicalize(&untrusted).unwrap(),
+        PathBuf::from("/etc/resolv.conf"),
+    )
+    .expect_err("a mode-safe nonroot-owned resolver must remain untrusted");
+    assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
+    assert_eq!(
+        error.to_string(),
+        "Gemini online resolver source is not a trusted root-owned file"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn isolated_root_property_requires_exact_single_read_only_root() {
     for value in ["/:ro", "  /:ro\n"] {
         assert!(
@@ -3042,8 +4118,9 @@ fn isolated_root_property_requires_exact_single_read_only_root() {
 #[cfg(target_os = "linux")]
 #[test]
 fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
-    let sandbox = ResolvedSystemdSandbox {
-        kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+    let mut sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
+        kind: SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
         workspace_root: PathBuf::from("/view"),
         current_dir: PathBuf::from("/view"),
         workspace_access: WorkspaceAccess::ReadOnly,
@@ -3052,7 +4129,8 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: vec![PathBuf::from("/source")],
         isolated_host_view: true,
@@ -3060,18 +4138,58 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
         path_identities: Vec::new(),
         mount_checks: Vec::new(),
     };
-    let mut properties = BTreeMap::from([("TemporaryFileSystem".to_string(), "/:ro".to_string())]);
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, Path::new("/runtime"));
+    let args = command.get_args().collect::<Vec<_>>();
+    assert!(args.contains(&OsStr::new("--property=ProtectSystem=no")));
+    assert!(args.contains(&OsStr::new("--property=TemporaryFileSystem=/:ro")));
+    assert!(!args.contains(&OsStr::new("--property=ProtectSystem=strict")));
+    let properties = BTreeMap::from([
+        ("ProtectSystem".to_string(), "no".to_string()),
+        ("TemporaryFileSystem".to_string(), "/:ro".to_string()),
+    ]);
     verify_isolated_host_view_property(&sandbox, &properties)
-        .expect("exact isolated root property");
-    properties.insert("TemporaryFileSystem".to_string(), "/tmp:ro".to_string());
-    assert!(verify_isolated_host_view_property(&sandbox, &properties).is_err());
+        .expect("empty read-only tmpfs without a competing root remount");
+    for (protect, temporary) in [
+        ("strict", "/:ro"),
+        ("full", "/:ro"),
+        ("no", ""),
+        ("no", "/tmp:ro"),
+        ("no", "/:rw"),
+        ("no", "/:ro /:ro"),
+    ] {
+        let drift = BTreeMap::from([
+            ("ProtectSystem".to_string(), protect.to_string()),
+            ("TemporaryFileSystem".to_string(), temporary.to_string()),
+        ]);
+        assert!(verify_isolated_host_view_property(&sandbox, &drift).is_err());
+    }
+    sandbox.kind = SideEffectConfinementProfileKind::StrictOfflineWorkspace;
+    sandbox.isolated_host_view = false;
+    let ordinary = BTreeMap::from([
+        ("ProtectSystem".to_string(), "strict".to_string()),
+        ("TemporaryFileSystem".to_string(), String::new()),
+    ]);
+    verify_isolated_host_view_property(&sandbox, &ordinary)
+        .expect("ordinary root protection remains strict");
+    for drift in [
+        properties,
+        BTreeMap::from([
+            ("ProtectSystem".to_string(), "no".to_string()),
+            ("TemporaryFileSystem".to_string(), String::new()),
+        ]),
+    ] {
+        assert!(verify_isolated_host_view_property(&sandbox, &drift).is_err());
+    }
+    sandbox.kind = SideEffectConfinementProfileKind::CursorProviderlessOfflineUds;
+    sandbox.isolated_host_view = true;
 
     use std::os::unix::fs::PermissionsExt;
     let temp = tempfile::tempdir().expect("tempdir");
     let report = temp.path().join("report");
     fs::write(
             &report,
-            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible\ninaccessible-missing\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev 1 2\ninaccessible\ninaccessible-missing\n",
         )
         .expect("write report");
     fs::set_permissions(&report, fs::Permissions::from_mode(0o600)).expect("report mode");
@@ -3101,11 +4219,97 @@ fn isolated_root_property_and_required_inaccessible_report_fail_closed() {
     verify_sandbox_mount_report(&report, &checks).expect("isolated mount evidence");
     fs::write(
             &report,
-            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev\ninaccessible-missing\ninaccessible-missing\n",
+            "security 0000000000000000 0000000000000000 0000000000000000 0000000000000000 1 2\nisolated-root tmpfs tmpfs ro,nodev 1 2\ninaccessible-missing\ninaccessible-missing\n",
         )
         .expect("replace report");
     assert!(verify_sandbox_mount_report(&report, &checks).is_err());
     assert!(SYSTEMD_GUARDIAN_SCRIPT.contains("required inaccessible path was not mounted"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gemini_private_root_is_fresh_owned_exact_and_lifetime_bound_for_both_profiles() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let runtime = tempfile::tempdir().expect("private runtime fixture");
+    fs::set_permissions(runtime.path(), fs::Permissions::from_mode(0o700))
+        .expect("private runtime mode");
+    for kind in [
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+    ] {
+        let root = create_gemini_isolated_root(runtime.path()).expect("fresh Gemini root");
+        let root_path = root.path().to_path_buf();
+        let metadata = fs::symlink_metadata(&root_path).expect("Gemini root metadata");
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        let effective_uid = unsafe { libc::geteuid() };
+        assert!(metadata.is_dir());
+        assert!(!metadata.file_type().is_symlink());
+        assert_eq!(metadata.uid(), effective_uid);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o700);
+        assert_eq!(root_path.parent(), Some(runtime.path()));
+
+        let mut sandbox = ResolvedSystemdSandbox {
+            read_only_input_snapshots: Vec::new(),
+            kind,
+            workspace_root: PathBuf::from("/candidate"),
+            current_dir: PathBuf::from("/candidate"),
+            workspace_access: WorkspaceAccess::ReadOnly,
+            visible_read_only_roots: Vec::new(),
+            visible_read_only_files: Vec::new(),
+            visible_read_write_roots: Vec::new(),
+            visible_read_write_files: Vec::new(),
+            external_codex_writable_file_capabilities: Vec::new(),
+            external_managed_read_only_file_capabilities: Vec::new(),
+            gemini_online_read_only_file_bindings: Vec::new(),
+            writable_artifact_roots: Vec::new(),
+            hidden_roots: Vec::new(),
+            isolated_host_view: true,
+            resource_limits: ProcessResourceLimits::default(),
+            path_identities: Vec::new(),
+            mount_checks: vec![SandboxMountCheck {
+                path: PathBuf::from("/"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::IsolatedRoot,
+                optional: false,
+            }],
+        };
+        bind_gemini_isolated_root_identity(&mut sandbox, &root_path)
+            .expect("bind exact private root identity");
+        let root_check = sandbox
+            .mount_checks
+            .iter()
+            .find(|check| check.access == SandboxMountAccess::IsolatedRoot)
+            .expect("private root check");
+        assert_eq!(root_check.device, metadata.dev());
+        assert_eq!(root_check.inode, metadata.ino());
+        let mut command = Command::new("systemd-run");
+        apply_gemini_isolated_root_properties(&mut command, &sandbox, &root_path)
+            .expect("Gemini private root properties");
+        apply_systemd_sandbox_properties(&mut command, &sandbox, runtime.path());
+        let arguments = command.get_args().collect::<Vec<_>>();
+        assert!(arguments.iter().any(|argument| {
+            *argument == systemd_path_property("RootDirectory=", &root_path, false)
+        }));
+        assert!(arguments
+            .iter()
+            .any(|argument| *argument == OsStr::new("--property=MountAPIVFS=yes")));
+        assert!(!arguments
+            .iter()
+            .any(|argument| *argument == OsStr::new("--property=TemporaryFileSystem=/:ro")));
+
+        let properties = BTreeMap::from([
+            ("RootDirectory".to_string(), root_path.display().to_string()),
+            ("MountAPIVFS".to_string(), "yes".to_string()),
+        ]);
+        verify_gemini_isolated_root_properties(&sandbox, &properties, Some(&root_path))
+            .expect("exact retained Gemini root");
+        assert!(verify_gemini_isolated_root_properties(&sandbox, &properties, None).is_err());
+
+        root.close().expect("remove Gemini root");
+        assert!(!root_path.exists());
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3282,6 +4486,7 @@ fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
     // SAFETY: fifo_name is a valid NUL-terminated path and mode has no invalid bits.
     assert_eq!(unsafe { libc::mkfifo(fifo_name.as_ptr(), 0o600) }, 0);
     let sandbox = ResolvedSystemdSandbox {
+        read_only_input_snapshots: Vec::new(),
         kind: SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         workspace_root: workspace.clone(),
         current_dir: workspace.clone(),
@@ -3291,7 +4496,8 @@ fn sandbox_scan_rejects_fifo_and_external_hardlink_alias() {
         visible_read_write_roots: Vec::new(),
         visible_read_write_files: Vec::new(),
         external_codex_writable_file_capabilities: Vec::new(),
-        external_grok_read_only_file_capabilities: Vec::new(),
+        external_managed_read_only_file_capabilities: Vec::new(),
+        gemini_online_read_only_file_bindings: Vec::new(),
         writable_artifact_roots: Vec::new(),
         hidden_roots: Vec::new(),
         isolated_host_view: false,
@@ -3387,7 +4593,7 @@ fn system_call_filter_accepts_retained_and_complete_expanded_deny_forms() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
+fn external_codex_and_grok_admit_inner_bubblewrap_namespaces_and_mounts() {
     let mut external = program_visibility_sandbox(Path::new("/worktree"));
     external.kind = SideEffectConfinementProfileKind::ExternalCodex;
     let mut command = Command::new("systemd-run");
@@ -3407,6 +4613,7 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         .iter()
         .any(|argument| argument == "--property=PrivateUsers=yes"));
     for expected in [
+        "--property=NoNewPrivileges=yes",
         "--property=CapabilityBoundingSet=",
         "--property=AmbientCapabilities=",
     ] {
@@ -3427,18 +4634,42 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
         external_filter,
     )
     .expect("ExternalCodex bubblewrap-compatible deny list");
-    verify_effective_namespace_restriction(SideEffectConfinementProfileKind::ExternalCodex, "no")
-        .expect("ExternalCodex namespaces are available to bubblewrap");
-    assert!(verify_effective_namespace_restriction(
-        SideEffectConfinementProfileKind::ExternalCodex,
-        "yes",
+    external.kind = SideEffectConfinementProfileKind::ExternalGrok;
+    let mut grok_command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(
+        &mut grok_command,
+        &external,
+        Path::new("/run/user/1000/maco-test-runtime"),
+    );
+    let grok_arguments = grok_command
+        .get_args()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+    let expected_grok_arguments = arguments
+        .iter()
+        .map(|argument| {
+            if argument == "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+            {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6".to_string()
+            } else {
+                argument.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(grok_arguments, expected_grok_arguments);
+    verify_effective_system_call_filter(
+        SideEffectConfinementProfileKind::ExternalGrok,
+        external_filter,
     )
-    .is_err());
+    .expect("ExternalGrok has the same bubblewrap-compatible deny list as ExternalCodex");
 
     for kind in [
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
-        SideEffectConfinementProfileKind::ExternalGrok,
+        SideEffectConfinementProfileKind::ExternalClaude,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        SideEffectConfinementProfileKind::ExternalCursor,
         SideEffectConfinementProfileKind::TrustedCompatibility,
     ] {
         let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
@@ -3475,18 +4706,25 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
             );
         }
         let expected_address_families = match kind {
-            SideEffectConfinementProfileKind::StrictOfflineWorkspace => {
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            | SideEffectConfinementProfileKind::GeminiOfflineBridge
+            | SideEffectConfinementProfileKind::CursorProviderlessOfflineUds => {
                 "--property=RestrictAddressFamilies=AF_UNIX"
             }
             SideEffectConfinementProfileKind::TrustedFixedNetwork
             | SideEffectConfinementProfileKind::TrustedCompatibility => {
                 "--property=RestrictAddressFamilies=AF_INET AF_INET6"
             }
-            SideEffectConfinementProfileKind::ExternalGrok => {
+            SideEffectConfinementProfileKind::GeminiOnlineBridge
+            | SideEffectConfinementProfileKind::ExternalCursor => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
             }
-            SideEffectConfinementProfileKind::ExternalCodex => {
-                unreachable!("ExternalCodex is checked separately")
+            SideEffectConfinementProfileKind::ExternalClaude => {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET"
+            }
+            SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok => {
+                unreachable!("bubblewrap profiles are checked separately")
             }
         };
         assert!(
@@ -3516,11 +4754,32 @@ fn external_codex_alone_admits_inner_bubblewrap_namespaces_and_mounts() {
     }
 
     let ordinary_filter = retained_system_call_filter_fixture();
-    assert!(verify_effective_system_call_filter(
+    for kind in [
         SideEffectConfinementProfileKind::ExternalCodex,
-        &ordinary_filter,
-    )
-    .is_err());
+        SideEffectConfinementProfileKind::ExternalGrok,
+    ] {
+        verify_effective_namespace_restriction(kind, "no").expect("bubblewrap requires namespaces");
+        assert!(verify_effective_namespace_restriction(kind, "yes").is_err());
+        assert!(verify_effective_system_call_filter(kind, &ordinary_filter).is_err());
+        for (group, representatives) in required_denied_group_representatives() {
+            if group == "@mount" {
+                for denied_mount in std::iter::once(group).chain(representatives.iter().copied()) {
+                    assert!(verify_effective_system_call_filter(
+                        kind,
+                        &format!("{external_filter} {denied_mount}"),
+                    )
+                    .is_err());
+                }
+            } else {
+                let incomplete_filter = external_filter
+                    .split_whitespace()
+                    .filter(|token| token.trim_start_matches('~') != group)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                assert!(verify_effective_system_call_filter(kind, &incomplete_filter).is_err());
+            }
+        }
+    }
     assert!(verify_effective_system_call_filter(
         SideEffectConfinementProfileKind::TrustedFixedNetwork,
         external_filter,

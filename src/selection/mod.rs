@@ -6,6 +6,7 @@
 //! candidate considered.
 
 mod quota_input;
+pub mod routing_policy;
 mod schema;
 mod selector;
 mod types;
@@ -16,7 +17,8 @@ pub use quota_input::{
 pub(crate) use schema::selection_event_schema_value;
 pub use selector::{
     built_in_prior_dataset, measured_authority_eligibility, select,
-    select_with_switch_cost_estimates, validate_prior_dataset, validate_prior_date, SelectionError,
+    select_with_loaded_routing_policy, select_with_switch_cost_estimates, validate_prior_dataset,
+    validate_prior_date, SelectionError,
 };
 pub use types::*;
 

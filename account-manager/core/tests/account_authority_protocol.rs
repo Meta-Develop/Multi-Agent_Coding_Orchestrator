@@ -14,14 +14,17 @@ use coding_agent_manager_lib::account_authority::{
 };
 use coding_agent_manager_lib::error::Error;
 use coding_agent_manager_lib::login::{
-    LoginAccountBinding, LoginHandle, LoginService, LoginStartRequest, LoginState, LoginStatus,
+    LoginAccountBinding, LoginAuthorization, LoginBrowserMode, LoginHandle, LoginService,
+    LoginStartRequest, LoginState, LoginStatus,
 };
 use coding_agent_manager_lib::model::{
     Account, AuthKind, InstallState, Maturity, ProviderDescriptor, StoredAccountMaterial,
+    StoredAccountState,
 };
 use coding_agent_manager_lib::paths::stored_accounts_path;
 use coding_agent_manager_lib::providers::{
-    claude_code::ClaudeCodeAdapter, gemini_cli::GeminiCliAdapter, ProviderAdapter,
+    claude_code::ClaudeCodeAdapter, cursor::CursorAdapter, gemini_cli::GeminiCliAdapter,
+    ProviderAdapter,
 };
 
 struct ActivateProbeAdapter {
@@ -472,8 +475,45 @@ fn production_login_port_starts_claude_code() {
 }
 
 #[test]
-fn production_login_port_leaves_cursor_and_github_copilot_unimplemented() {
-    let (_dir, registry) = isolated_registry();
+fn production_login_port_starts_cursor_and_leaves_github_copilot_unimplemented() {
+    fn fake_cursor_login(home: &std::path::Path) -> std::io::Result<i32> {
+        use std::io::Write;
+
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create_new(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(0o600);
+        }
+        let mut auth = options.open(home.join(".cursor/auth.json"))?;
+        auth.write_all(b"FAKE-cursor-oauth-fixture\n")?;
+        Ok(0)
+    }
+
+    let (dir, registry) = isolated_registry();
+    let home = dir.path().join("home");
+    let data = dir.path().join("data");
+    let cwd = dir.path().join("cwd");
+    std::fs::create_dir_all(&home).expect("home");
+    std::fs::create_dir_all(&cwd).expect("cwd");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for path in [&home, &data, &cwd] {
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+                .expect("private fixture directory");
+        }
+    }
+    let program = cwd.join("fixture-cursor-agent-must-not-run");
+    assert!(!program.exists());
+    let managed_home = data.join("accounts/cursor/work");
+    assert!(!managed_home.exists());
+    let cursor = CursorAdapter::with_home(&home)
+        .with_data_dir(&data)
+        .with_working_directory(&cwd)
+        .with_program(&program)
+        .with_login_runner(fake_cursor_login);
     let runtime = tokio::runtime::Runtime::new().expect("runtime");
     let service = LoginService::new(
         StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
@@ -482,28 +522,102 @@ fn production_login_port_leaves_cursor_and_github_copilot_unimplemented() {
     let ctx = AuthorityContext::new(registry).without_registry_fallback();
     let config = AuthorityServerConfig::new(ctx)
         .expect("config")
-        .with_gemini_login(service, GeminiCliAdapter::default());
-    for provider_id in ["cursor", "github-copilot"] {
-        let body = serde_json::json!({
-            "protocolVersion": PROTOCOL_VERSION,
-            "requestId": "login",
-            "operation": "login.start",
-            "providerId": provider_id,
-            "accountId": "work",
-            "label": "Work",
-            "authKind": "oauth",
-            "idempotencyKey": format!("key-{provider_id}")
+        .with_login_port(Arc::new(
+            GeminiLoginPort::new(
+                service,
+                GeminiCliAdapter::default(),
+                ClaudeCodeAdapter::default(),
+            )
+            .with_cursor_adapter(cursor),
+        ));
+    let provider_id = "github-copilot";
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login",
+        "operation": "login.start",
+        "providerId": provider_id,
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": format!("key-{provider_id}")
+    });
+    let response = dispatch_json(&config.context, &body.to_string());
+    assert_eq!(
+        response["error"]["code"], "unsupported-operation",
+        "{provider_id}"
+    );
+    assert_eq!(
+        response["error"]["message"], "operation is not implemented",
+        "{provider_id}"
+    );
+    assert!(config.context.registry.load().expect("metadata").is_empty());
+    assert!(!managed_home.exists());
+
+    let body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "login-cursor",
+        "operation": "login.start",
+        "providerId": "cursor",
+        "accountId": "work",
+        "label": "Work",
+        "authKind": "oauth",
+        "idempotencyKey": "key-cursor"
+    });
+    let started = dispatch_json(&config.context, &body.to_string());
+    assert!(started["error"].is_null(), "{started}");
+    assert_eq!(started["result"]["state"], "waiting-for-user");
+    assert_eq!(started["result"]["binding"]["providerId"], "cursor");
+    assert_eq!(started["result"]["binding"]["accountId"], "work");
+    let status_body = serde_json::json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": "cursor-status",
+        "operation": "login.status",
+        "handle": started["result"]["handle"],
+        "binding": started["result"]["binding"]
+    });
+    let mut ready = false;
+    for _ in 0..200 {
+        let status = dispatch_json(&config.context, &status_body.to_string());
+        assert!(status["error"].is_null(), "{status}");
+        assert_eq!(status["result"]["binding"], started["result"]["binding"]);
+        if status["result"]["state"] == "ready" {
+            ready = true;
+            break;
+        }
+        assert!(
+            matches!(
+                status["result"]["state"].as_str(),
+                Some("waiting-for-user" | "in-progress")
+            ),
+            "{status}"
+        );
+        runtime.block_on(async {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         });
-        let response = dispatch_json(&config.context, &body.to_string());
-        assert_eq!(
-            response["error"]["code"], "unsupported-operation",
-            "{provider_id}"
-        );
-        assert_eq!(
-            response["error"]["message"], "operation is not implemented",
-            "{provider_id}"
-        );
     }
+    assert!(ready, "fake Cursor login did not complete within 200 polls");
+    let account = config
+        .context
+        .registry
+        .complete("cursor", "work")
+        .expect("complete");
+    assert_eq!(account.state, StoredAccountState::Complete);
+    assert!(!account.is_selected);
+    assert!(config
+        .context
+        .registry
+        .selected_binding("cursor")
+        .expect("selection")
+        .is_none());
+    assert_eq!(config.context.registry.load().expect("metadata").len(), 1);
+    assert_eq!(
+        std::fs::read(managed_home.join(".cursor/auth.json"))
+            .expect("fake runner output")
+            .as_slice(),
+        b"FAKE-cursor-oauth-fixture\n"
+    );
+    assert!(!home.join(".cursor").exists());
+    assert!(!program.exists());
 }
 
 #[test]
@@ -1009,4 +1123,155 @@ mod unix {
         assert_eq!(second["result"]["handle"], "login-handle-1");
         assert_eq!(login.starts.lock().expect("starts").len(), 2);
     }
+}
+
+#[test]
+fn login_browser_mode_defaults_to_automatic_and_rejects_unknown_values() {
+    let (_dir, registry) = isolated_registry();
+    let login = Arc::new(FakeLogin::new());
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::clone(&login) as Arc<dyn LoginPort>);
+    let mut body = serde_json::json!({"protocolVersion":1,"requestId":"mode","operation":"login.start","providerId":"gemini-cli","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"mode"});
+    assert!(
+        dispatch_json(&ctx, &body.to_string())["error"].is_null(),
+        "legacy request uses automatic port"
+    );
+    body["browserMode"] = serde_json::json!("caller-managed");
+    let manual = dispatch_json(&ctx, &body.to_string());
+    assert_eq!(
+        manual["error"]["code"], "unsupported-operation",
+        "a port without caller-managed capability refuses explicit mode"
+    );
+    assert_eq!(login.starts.lock().expect("starts").len(), 1);
+    body["browserMode"] = serde_json::json!("arbitrary-opener");
+    assert_eq!(
+        decode_request(body.to_string().as_bytes())
+            .expect_err("closed mode")
+            .code,
+        ErrorCode::InvalidRequest
+    );
+}
+
+struct HandoffLogin {
+    login: FakeLogin,
+    live: AtomicBool,
+}
+
+impl LoginPort for HandoffLogin {
+    fn start(
+        &self,
+        request: LoginStartRequest,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.login.start(request)
+    }
+    fn start_with_browser_mode(
+        &self,
+        request: LoginStartRequest,
+        mode: LoginBrowserMode,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        assert_eq!(mode, LoginBrowserMode::CallerManaged);
+        self.live.store(true, Ordering::SeqCst);
+        self.start(request)
+    }
+    fn status(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.login.status(handle, binding)
+    }
+    fn cancel(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<LoginStatus> {
+        self.live.store(false, Ordering::SeqCst);
+        let mut status = self.status(handle, binding)?;
+        status.state = LoginState::Cancelled;
+        Ok(status)
+    }
+    fn authorization(
+        &self,
+        handle: &LoginHandle,
+        binding: &LoginAccountBinding,
+    ) -> coding_agent_manager_lib::error::Result<Option<LoginAuthorization>> {
+        let status = self.status(handle, binding)?;
+        Ok(
+            (self.live.load(Ordering::SeqCst) && status.state == LoginState::WaitingForUser).then(
+                || LoginAuthorization {
+                    authorization_url:
+                        "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-protocol".into(),
+                    expires_at_unix_ms: None,
+                },
+            ),
+        )
+    }
+}
+
+#[test]
+fn login_url_wire_status_binds_handle_and_clears_after_cancel() {
+    let (_dir, registry) = isolated_registry();
+    let ctx = AuthorityContext::new(registry)
+        .without_registry_fallback()
+        .with_login(Arc::new(HandoffLogin {
+            login: FakeLogin::new(),
+            live: AtomicBool::new(false),
+        }));
+    let start = serde_json::json!({"protocolVersion":1,"requestId":"start-url","operation":"login.start","providerId":"gemini-cli","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"url-key","browserMode":"caller-managed"});
+    let response = dispatch_json(&ctx, &start.to_string());
+    assert!(response["error"].is_null());
+    assert!(response["result"]["authorization"]["authorizationUrl"]
+        .as_str()
+        .expect("public URL")
+        .starts_with("https://accounts.google.com/"));
+    assert!(
+        response["result"]["authorization"]
+            .get("expiresAtUnixMs")
+            .is_none(),
+        "unknown expiry must remain absent"
+    );
+    let legacy: LoginStatus = serde_json::from_value(response["result"].clone())
+        .expect("legacy GUI status remains compatible");
+    let mut status = serde_json::json!({"protocolVersion":1,"requestId":"get-url","operation":"login.status","handle":legacy.handle,"binding":legacy.binding});
+    let active = dispatch_json(&ctx, &status.to_string());
+    assert_eq!(
+        active["result"]["authorization"],
+        response["result"]["authorization"]
+    );
+    let mut wrong = status.clone();
+    wrong["binding"]["accountIncarnation"] = serde_json::json!("fedcba9876543210fedcba9876543210");
+    assert!(dispatch_json(&ctx, &wrong.to_string())["result"]
+        .get("authorization")
+        .is_none());
+    status["operation"] = serde_json::json!("login.cancel");
+    let cancelled = dispatch_json(&ctx, &status.to_string());
+    assert_eq!(cancelled["result"]["state"], "cancelled");
+    assert!(cancelled["result"].get("authorization").is_none());
+    for key in [
+        "code_verifier",
+        "access_token",
+        "refresh_token",
+        "FAKE-owner-code",
+    ] {
+        assert!(!response.to_string().contains(key));
+    }
+}
+
+#[test]
+fn production_port_refuses_caller_managed_mode_for_other_providers_before_registration() {
+    let (_dir, registry) = isolated_registry();
+    let runtime = tokio::runtime::Runtime::new().expect("runtime");
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        runtime.handle().clone(),
+    );
+    let ctx = AuthorityServerConfig::new(AuthorityContext::new(registry))
+        .expect("config")
+        .with_gemini_login(service, GeminiCliAdapter::default())
+        .context;
+    let body = serde_json::json!({"protocolVersion":1,"requestId":"other-mode","operation":"login.start","providerId":"claude-code","accountId":"work","label":"Work","authKind":"oauth","idempotencyKey":"other-mode","browserMode":"caller-managed"});
+    let response = dispatch_json(&ctx, &body.to_string());
+    assert_eq!(response["error"]["code"], "unsupported-operation");
+    assert!(ctx.registry.load().expect("metadata").is_empty());
 }

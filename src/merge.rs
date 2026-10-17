@@ -16,17 +16,12 @@ use crate::{
     },
     decision_ref::{check_required_decision_ref_in_store, DecisionRef},
     external_agent::{
-        run_external_agent, ExternalAgentCommand, ExternalAgentInvocation,
-        ExternalMachineGlobalRetentionBinding,
+        run_external_agent, ExternalAgentCommand, ExternalMachineGlobalRetentionBinding,
     },
     gate_denial::{GateCheckSource, GateDenial},
     llm::Redactor,
     megafile::{MegafileAssessment, MegafileStore, MegafileThresholds},
     merge_semantic::{classify_semantic_candidate_pair, classify_semantic_conflicts},
-    mutation_taxonomy::{
-        admit_merge_arbiter_process_intent, AssignmentProcessLaunchGrantError,
-        AssignmentProcessLaunchKind, MERGE_ARBITER_PROCESS_DUTY,
-    },
     orchestration_event::{
         ArbitrationOutcome, ArbitrationOutcomeDetails, ArbitrationSide, OrchestrationEventJournal,
         OrchestrationRole,
@@ -48,6 +43,14 @@ use crate::{
     worktree::{
         normalize_agent_id, ManagedWorktreeReadLease, ManagedWorktreeWriteLease,
         NeutralWorktreeCreateOptions, WorktreeLifecycleReport, WorktreeManager, WorktreeRecord,
+    },
+};
+#[cfg(any(test, not(target_os = "linux")))]
+use crate::{
+    external_agent::ExternalAgentInvocation,
+    mutation_taxonomy::{
+        admit_merge_arbiter_process_intent, AssignmentProcessLaunchGrantError,
+        AssignmentProcessLaunchKind, MERGE_ARBITER_PROCESS_DUTY,
     },
 };
 use anyhow::{anyhow, bail, Context, Result};
@@ -86,6 +89,7 @@ const ARBITRATION_RATIONALE_PATH: &str = "reports/arbitration-rationale.json";
 const ARBITRATION_CANDIDATE_PATH: &str = "reports/arbitration-candidate.patch";
 const ARBITRATION_FINAL_REPORT_PATH: &str = "reports/supervisor-final.json";
 const ARBITRATION_INCOMING_DIR: &str = "arbiter-incoming";
+#[cfg(any(test, not(target_os = "linux")))]
 const MERGE_ARBITER_PROCESS_LAUNCH_ATTEMPT: usize = 1;
 const LOCK_RECORD_VERSION: u32 = 3;
 const REPOSITORY_MUTATION_LOCK_FILE: &str = "repository-mutation.lock";
@@ -505,6 +509,9 @@ struct ArbitrationRunnerRequest {
     hidden_primary_root: PathBuf,
     run_id: String,
     arbiter_id: String,
+    /// Canonical source proposal scope; decision data, never an access grant.
+    #[cfg(target_os = "linux")]
+    reviewed_paths: Vec<PathBuf>,
 }
 
 trait ArbitrationRunner {
@@ -595,30 +602,62 @@ trait ArbitrationEnvironment {
 #[derive(Debug, Clone, Copy, Default)]
 struct ProductionArbitrationEnvironment;
 
+/// Actual runner settlement only. Unclassified errors confer no scratch cleanup authority.
+#[derive(Debug, Clone, Copy)]
+struct ArbitrationRunnerFailure {
+    scratch_quiescent: bool,
+}
+
+impl std::fmt::Display for ArbitrationRunnerFailure {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("neutral arbitration runner settlement")
+    }
+}
+
+impl std::error::Error for ArbitrationRunnerFailure {}
+
 impl ArbitrationRunner for ExternalArbitrationRunner {
     fn run(&self, request: &ArbitrationRunnerRequest) -> Result<ArbitrationRunnerResult> {
+        #[cfg(target_os = "linux")]
+        let frozen =
+            crate::selection::routing_policy::load_routing_policy(&request.hidden_primary_root)?;
+        #[cfg(target_os = "linux")]
+        let _policy_guard =
+            crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+        #[cfg(target_os = "linux")]
+        let command = prepare_selected_merge_arbiter_command(self, request, frozen)?;
+        #[cfg(not(target_os = "linux"))]
         let command = prepare_merge_arbiter_command(self, request)?;
         let run = run_external_agent(&command);
-        let execution = ArbitrationRunnerExecution {
-            kind: "external_local_agent".to_string(),
-            trusted_local_boundary: run.succeeded(),
-            command: run.command.clone(),
-            exit_code: run.exit_code,
-            timed_out: run.timed_out,
+        let settlement = ArbitrationRunnerFailure {
+            scratch_quiescent: run.scratch_quiescence_verified(),
         };
+        #[cfg(not(target_os = "linux"))]
         if !run.succeeded() {
-            bail!(
+            return Err(anyhow!(
                 "neutral arbiter did not complete through the trusted local execution boundary: {}",
                 run.error
                     .as_deref()
                     .or_else(|| (!run.stderr.text.is_empty()).then_some(run.stderr.text.as_str()))
                     .unwrap_or("trusted execution evidence was incomplete")
-            );
+            ))
+            .context(settlement);
         }
+        #[cfg(target_os = "linux")]
+        let output = qualified_selected_merge_output(&run, &command)?;
+        #[cfg(not(target_os = "linux"))]
         let output = run
             .output_last_message()
-            .context("neutral arbiter produced no held final-message output")?;
-        let proposal = parse_arbitration_proposal(output)?;
+            .context("neutral arbiter produced no held final-message output")
+            .context(settlement)?;
+        let proposal = parse_arbitration_proposal(output).context(settlement)?;
+        let execution = ArbitrationRunnerExecution {
+            kind: "external_local_agent".to_string(),
+            trusted_local_boundary: true,
+            command: run.command.clone(),
+            exit_code: run.exit_code,
+            timed_out: run.timed_out,
+        };
         Ok(ArbitrationRunnerResult {
             proposal,
             execution,
@@ -626,6 +665,185 @@ impl ArbitrationRunner for ExternalArbitrationRunner {
     }
 }
 
+#[cfg(target_os = "linux")]
+fn qualified_selected_merge_output<'a>(
+    run: &'a crate::external_agent::ExternalAgentRun,
+    command: &ExternalAgentCommand,
+) -> Result<&'a [u8]> {
+    let settlement = ArbitrationRunnerFailure {
+        scratch_quiescent: run.scratch_quiescence_verified(),
+    };
+    run.qualified_merge_arbiter_output(command)
+        .with_context(|| {
+            run.error
+                .clone()
+                .unwrap_or_else(|| "neutral arbiter execution qualification failed".to_string())
+        })
+        .context(settlement)
+}
+
+#[cfg(target_os = "linux")]
+fn merge_arbiter_selection_plan(
+    runner: &ExternalArbitrationRunner,
+    request: &ArbitrationRunnerRequest,
+) -> Result<crate::supervise::SupervisorPlan> {
+    serde_json::from_value(serde_json::json!({
+        "task": format!("Independently review the exact neutral merge input for run {}. Compare both source proposals, preserve required changes, and return only the schema-bound readonly arbitration proposal. Do not apply or publish it.", request.run_id),
+        "child_timeout_seconds": runner.timeout.as_secs(),
+        "max_child_assignments": 1,
+        "assignments": [{
+            "id": request.arbiter_id,
+            "phase": "execution",
+            "role": "auditor",
+            "assigned_paths": &request.reviewed_paths
+        }]
+    })).context("failed to construct the readonly merge review task")
+}
+
+#[cfg(target_os = "linux")]
+fn merge_arbiter_task_assessment(
+    plan: &crate::supervise::SupervisorPlan,
+    frozen: &crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> Result<crate::supervise::TaskRoutingAssessment> {
+    use crate::planning::{
+        TaskAssignmentProposal, TaskDecompositionProposal, TaskDisjointnessReport,
+        TaskPathProposalDiagnostics, TaskSpecFragment,
+    };
+    let [assignment] = plan.assignments.as_slice() else {
+        bail!("merge review assessment requires its single declared assignment");
+    };
+    let proposal = TaskDecompositionProposal {
+        fragments: vec![TaskSpecFragment {
+            id: assignment.id.clone(),
+            text: plan.task.clone(),
+        }],
+        assignments: vec![TaskAssignmentProposal {
+            id: assignment.id.clone(),
+            task: plan.task.clone(),
+            fragment_ids: vec![assignment.id.clone()],
+            assigned_paths: assignment.assigned_paths.clone(),
+            semantic_symbols: assignment.semantic_symbols.clone(),
+            semantic_modules: assignment.semantic_modules.clone(),
+            decision_dependencies: assignment
+                .decision_refs
+                .iter()
+                .map(|reference| reference.question_key().to_owned())
+                .collect(),
+        }],
+        coverage_gaps: Vec::new(),
+        diagnostics: TaskPathProposalDiagnostics::default(),
+        disjointness: TaskDisjointnessReport {
+            disjoint: true,
+            ..Default::default()
+        },
+    };
+    crate::supervise::assess_task_routing(&plan.task, &proposal, frozen)
+}
+
+#[cfg(target_os = "linux")]
+fn prepare_selected_merge_arbiter_command(
+    runner: &ExternalArbitrationRunner,
+    request: &ArbitrationRunnerRequest,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+) -> Result<ExternalAgentCommand> {
+    use crate::runtime_adapter::{RuntimeAdapterConfig, RuntimeId};
+    use crate::supervise::{
+        SupervisorAdmissionConfig, SupervisorAdmissionPolicyInput, SupervisorRuntime,
+    };
+    let plan = merge_arbiter_selection_plan(runner, request)?;
+    let assessment = merge_arbiter_task_assessment(&plan, &frozen)?;
+    let admission = SupervisorAdmissionPolicyInput::resolve(
+        &request.hidden_primary_root,
+        1,
+        SupervisorAdmissionConfig::default(),
+        SupervisorAdmissionConfig::default(),
+    )?;
+    let objective =
+        crate::objective_profile::resolve_objective_profile(&request.hidden_primary_root, None)?;
+    let observations = crate::supervise::account_observations_for_selection(
+        SupervisorRuntime::Codex,
+        Some(&request.run_id),
+    )?;
+    let (selected, decision) = crate::supervise::select_account_review_auditor_with_assessment(
+        &plan,
+        &frozen,
+        &observations,
+        &admission,
+        &objective,
+        Some(&assessment),
+    )?;
+    let selected = selected.context("merge review has no admissible selected Auditor account")?;
+    let candidate = selected.candidate();
+    let provider = &selected.account_binding().provider_id;
+    let live = if let Some(socket) =
+        crate::account_authority::cam_socket_for_run_selection(&request.run_id, provider)?
+    {
+        crate::account_authority::selected_binding_via_authority_socket(&socket, provider)?
+            .map(|(_, binding)| binding)
+    } else {
+        use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+        use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
+        let data_dir = project_dirs().context("account metadata directory is unavailable")?;
+        StoredAccountRegistry::new(stored_accounts_path(data_dir.data_dir()))
+            .selected_binding(provider)
+            .map_err(|error| anyhow!("failed to revalidate merge review selection: {error}"))?
+    }
+    .context("merge review selected account disappeared")?;
+    selected.validate_binding(&(&live).into())?;
+    crate::selection::routing_policy::validate_selected_launch(
+        AgentRole::Auditor.as_str(),
+        &candidate.runtime,
+        &candidate.model,
+        candidate.effort.as_str(),
+    )?;
+    let runtime: RuntimeId = serde_json::from_value(Value::String(candidate.runtime.clone()))
+        .context("selected merge runtime has no declared adapter")?;
+    if runtime == RuntimeId::Fake {
+        bail!("selected merge requires a native account-backed runtime");
+    }
+    let config = RuntimeAdapterConfig::try_from_environment(runtime)?;
+    let program = match runtime {
+        RuntimeId::Codex => runner.codex_bin.clone(),
+        RuntimeId::Grok => crate::runtime_adapter::grok::resolve_configured_grok_executable(
+            config.binary.as_ref().map(|path| path.as_os_str()),
+        )?,
+        _ => config.binary_path().to_path_buf(),
+    };
+    let mut command = ExternalAgentCommand::codex(
+        program,
+        &request.neutral_worktree_path,
+        &request.prompt_path,
+        &request.json_log_path,
+        &request.output_last_message_path,
+        runner.timeout,
+    )
+    .with_runtime_adapter(runtime, config)
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_hidden_root(&request.hidden_primary_root)
+    .with_model_selection(
+        Some(candidate.model.clone()),
+        Some(candidate.effort.as_str().to_string()),
+    )
+    .with_agent_lifecycle(
+        &request.hidden_primary_root,
+        AgentRole::Auditor.as_str(),
+        &request.run_id,
+        &request.arbiter_id,
+    )
+    .with_machine_global_retention(ExternalMachineGlobalRetentionBinding {
+        config: runner.machine_global_config.clone(),
+        root_id: runner.machine_global_runtime_root_id.clone(),
+        owner: request.arbiter_id.clone(),
+        correction_correlation_id: request.run_id.clone(),
+    });
+    command.output_schema = Some(request.output_schema_path.clone());
+    if runtime == RuntimeId::Grok {
+        command = command.with_read_only_target_executable_pin()?;
+    }
+    command.with_selected_merge_arbiter(selected, decision, frozen)
+}
+
+#[cfg(any(not(target_os = "linux"), test))]
 fn prepare_merge_arbiter_command(
     runner: &ExternalArbitrationRunner,
     request: &ArbitrationRunnerRequest,
@@ -656,6 +874,7 @@ fn prepare_merge_arbiter_command(
     attach_merge_arbiter_process_launch(command, request)
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn merge_arbiter_command_matches_request(
     command: &ExternalAgentCommand,
     request: &ArbitrationRunnerRequest,
@@ -678,6 +897,7 @@ fn merge_arbiter_command_matches_request(
         })
 }
 
+#[cfg(any(test, not(target_os = "linux")))]
 fn attach_merge_arbiter_process_launch(
     command: ExternalAgentCommand,
     request: &ArbitrationRunnerRequest,
@@ -890,9 +1110,16 @@ fn arbitrate_merge_with_environment(
         hidden_primary_root: repo_root.clone(),
         run_id: options.run_id.as_str().to_string(),
         arbiter_id: options.arbiter_agent_id.clone(),
+        #[cfg(target_os = "linux")]
+        reviewed_paths: arbitration_candidate_scope(&prepared.input.sides)?,
     };
     let runner_result = runner.run(&runner_request);
-    if runner_result.is_err() {
+    if runner_result
+        .as_ref()
+        .err()
+        .and_then(|error| error.downcast_ref::<ArbitrationRunnerFailure>())
+        .is_some_and(|failure| failure.scratch_quiescent)
+    {
         writer
             .discard_scratch(&incoming)
             .context("failed to discard failed arbiter invocation scratch")?;

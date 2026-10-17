@@ -1,5 +1,228 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
+fn managed_parent_collection<'a>(
+    assignment: &'a OrchestratorAssignment,
+    metadata: &'a AssignmentMetadata,
+    report_path: &'a Path,
+    external_run: &'a ExternalAgentRun,
+    external_command: &'a ExternalAgentCommand,
+    worktree_path: &'a Path,
+    child_base_head: &'a git2::Oid,
+    journals: &'a WorkerExecutionJournalEvidenceSet,
+    observed_changed_paths: Option<&'a [PathBuf]>,
+) -> ChildReportCollectionContext<'a> {
+    ChildReportCollectionContext {
+        assignment,
+        assignment_metadata: metadata,
+        report_path,
+        external_run,
+        external_command,
+        worktree_path,
+        child_base_head,
+        worker_journals: journals,
+        evidence_only_source: None,
+        observed_changed_paths,
+    }
+}
+
+fn injected_repository_head(repo_path: &Path) -> git2::Oid {
+    git2::Repository::open(repo_path)
+        .expect("open injected repository")
+        .head()
+        .expect("injected repository HEAD")
+        .target()
+        .expect("injected repository HEAD oid")
+}
+
+fn asserted_review_lens_aggregate() -> ReviewLensAggregate {
+    serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "policy": ReviewAggregationPolicy::AllMustAccept,
+        "decision": "accept",
+        "required_accepts": 1,
+        "validated_accepts": 1,
+        "rejected_lenses": 0,
+        "procedural_failures": 0,
+        "required_coverage": {"worker_ids": [], "paths": []},
+        "lens_verdicts": []
+    }))
+    .expect("review lens aggregate fixture")
+}
+
+#[test]
+fn managed_parent_report_rejects_asserted_codex_parent_evidence() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    assert_eq!(assignment.role, AgentRole::ChildOrchestrator);
+    assert!(!assignment.worker_assignments.is_empty());
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-codex-evidence.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new()));
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let mut asserted = injected_child_report(&assignment);
+    asserted.accepted = true;
+    asserted.rejected = false;
+    asserted.status = ReviewStatus::Succeeded;
+    let mut record = command_record_from_external(&external_run, &command);
+    record.codex_parent_evidence = Some(forged_codex_parent_evidence());
+    asserted.commands_run.push(record);
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, _) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: asserted,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(finding_messages(&report)
+        .contains("child report attempted to self-assert parent-process Codex model, effort, and usage evidence"));
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.codex_parent_evidence.is_none()));
+}
+
+#[test]
+fn managed_parent_report_rejects_self_supplied_audit_and_aggregate_evidence() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-audit-aggregate.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(Vec::new()));
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let mut asserted = injected_child_report(&assignment);
+    asserted.accepted = true;
+    asserted.rejected = false;
+    asserted.status = ReviewStatus::Succeeded;
+    let auditor = injected_auditor_report(&assignment, &asserted);
+    asserted.audit_reports.push(auditor);
+    asserted.review_lens_aggregate = Some(asserted_review_lens_aggregate());
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, _) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: asserted,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert!(report.audit_reports.is_empty());
+    assert!(report.review_lens_aggregate.is_none());
+    let messages = finding_messages(&report);
+    assert!(
+        messages.contains("child report attempted to self-assert supervisor-owned audit reports")
+    );
+    assert!(messages.contains(
+        "child report attempted to self-assert a supervisor-owned review-lens aggregate"
+    ));
+}
+
+#[test]
+fn managed_parent_parsed_error_or_wrong_role_cannot_become_accepted() {
+    let (_temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let metadata = AssignmentMetadata::new();
+    let report_path = Path::new("managed-parent-parse-error.json");
+    let command = control_test_command(&repo_path, _temp.path());
+    let external_run = injected_verified_run(&command);
+    let journals = injected_worker_journal_evidence(WorkerExecutionJournalStatus::Missing);
+    let observed = Vec::new();
+    let child_base_head = injected_repository_head(&repo_path);
+    let context = managed_parent_collection(
+        &assignment,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, problems) = collect_managed_parent_report_for_runtime(
+        context,
+        SupervisorRuntime::Codex,
+        Err(anyhow!("managed parent parser rejected the continuation")),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(problems.iter().any(|problem| {
+        problem.contains("required assignment report is missing or invalid")
+            && problem.contains("managed parent parser rejected the continuation")
+    }));
+
+    let mut wrong_role = injected_assignment(true);
+    wrong_role.role = AgentRole::Worker;
+    let mut success = injected_child_report(&assignment);
+    success.accepted = true;
+    success.rejected = false;
+    success.status = ReviewStatus::Succeeded;
+    success.role = AgentRole::Worker;
+    let wrong_context = managed_parent_collection(
+        &wrong_role,
+        &metadata,
+        report_path,
+        &external_run,
+        &command,
+        &repo_path,
+        &child_base_head,
+        &journals,
+        Some(&observed),
+    );
+    let (report, problems) = collect_managed_parent_report_for_runtime(
+        wrong_context,
+        SupervisorRuntime::Codex,
+        Ok(ParsedReport {
+            report: success,
+            recovered: false,
+        }),
+    );
+    assert!(!report.accepted);
+    assert!(report.rejected);
+    assert_eq!(report.status, ReviewStatus::Failed);
+    assert!(problems.iter().any(|problem| {
+        problem.contains("required assignment report is missing or invalid")
+            && problem.contains("restricted to a Codex child orchestrator")
+    }));
+    assert!(!finding_messages(&report).contains("Codex model, effort, and usage evidence"));
+}
+
 #[test]
 #[cfg(unix)]
 fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_sentinels() {
@@ -46,11 +269,12 @@ fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_se
         injected_verified_run(command)
     };
 
-    let error = run_supervisor_plan_with_runner(
+    let error = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect_err("rebound supervisor final slot must fail closed");
@@ -95,11 +319,12 @@ fn injected_parent_auditor_primary_mutation_is_rejected() {
         }
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected auditor mutation");
@@ -194,11 +419,12 @@ fn injected_missing_child_or_auditor_and_failed_child_propagate_final_failure() 
             injected_verified_run(command)
         };
 
-        let report = run_supervisor_plan_with_runner(
+        let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect("collect injected missing or failed report");
@@ -257,11 +483,12 @@ fn injected_diff_reconciliation_rejects_unattributed_worker_diff() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected diff reconciliation");
@@ -304,11 +531,12 @@ fn injected_runner_rejects_missing_worker_execution_journal() {
         injected_verified_run_without_journals(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected missing journal");
@@ -349,17 +577,19 @@ fn injected_runner_rejects_unexpected_worker_journal_capture() {
                 .parent()
                 .expect("incoming report root")
                 .join("worker-journals/worker-extra.jsonl"),
+            command_binding: None,
             status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
         });
         run.replace_worker_journal_artifacts(captures);
         run
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("unexpected journal capture should produce a finalized rejection report");
@@ -400,16 +630,18 @@ fn injected_zero_worker_assignment_rejects_nonempty_worker_journal_capture_set()
                 .parent()
                 .expect("incoming report root")
                 .join("worker-journals/worker-extra.jsonl"),
+            command_binding: None,
             status: WorkerJournalArtifactCaptureStatus::Loaded(Vec::new()),
         }]);
         run
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("zero-worker unexpected capture should produce a finalized rejection report");
@@ -1154,6 +1386,134 @@ fn injected_worker_execution_journals_reject_material_mismatches() {
         .contains("commands_run entries are not supported by execution journal"));
 }
 
+#[cfg(target_os = "linux")]
+fn observed_parent_journal(
+    script: &str,
+) -> (
+    tempfile::TempDir,
+    PathBuf,
+    Oid,
+    Vec<WorkerExecutionJournalEntry>,
+) {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    let temp = tempfile::tempdir().unwrap();
+    let worktree = temp.path().canonicalize().unwrap().join("worktree");
+    let repo = Repository::init(&worktree).unwrap();
+    fs::write(worktree.join("README.md"), "original\n").unwrap();
+    let mut index = repo.index().unwrap();
+    index.add_path(Path::new("README.md")).unwrap();
+    index.write().unwrap();
+    let tree_id = index.write_tree().unwrap();
+    let tree = repo.find_tree(tree_id).unwrap();
+    let signature = git2::Signature::now("Fixture", "fixture@example.invalid").unwrap();
+    let base = repo
+        .commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])
+        .unwrap();
+    let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&journal)
+        .unwrap();
+    let identity = crate::safe_state::FileIdentity {
+        device: file.metadata().unwrap().dev(),
+        file: file.metadata().unwrap().ino(),
+    };
+    let entry = WorkerExecutionJournalEntry {
+        command: vec!["/bin/sh".to_string(), "-c".to_string(), script.to_string()],
+        cwd: worktree.clone(),
+        ..injected_journal_entry(Vec::new())
+    };
+    run_worker_execution_journal_command(&journal, &identity, &entry, false).unwrap();
+    let entries = parse_worker_execution_journal(&fs::read(&journal).unwrap(), &journal).unwrap();
+    (temp, worktree, base, entries)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_worker_journal_accepts_edit_without_declared_path_and_rejects_outside_scope() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let assignment = injected_assignment(true);
+    for (script, accepted) in [
+        ("printf edited >> README.md", true),
+        (
+            "printf edited >> README.md; printf outside > Cargo.toml",
+            false,
+        ),
+    ] {
+        let (_temp, worktree, base, entries) = observed_parent_journal(script);
+        let mut report = injected_child_report(&assignment);
+        report.files_changed = entries[1].changed_paths.clone();
+        report.worker_reports[0].files_changed = report.files_changed.clone();
+        let journals =
+            injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(entries));
+        validate_worker_journal_worktree_binding(&journals, &worktree, &base, &mut report);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("report.json"),
+            &journals,
+            &mut report,
+        );
+        assert_eq!(report.accepted, accepted, "{}", finding_messages(&report));
+        assert_eq!(
+            report.status,
+            if accepted {
+                ReviewStatus::Succeeded
+            } else {
+                ReviewStatus::Failed
+            }
+        );
+        if !accepted {
+            assert!(finding_messages(&report).contains("outside assigned_paths"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_worker_journal_parent_rejects_forged_delta_worktree_and_base() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let assignment = injected_assignment(true);
+    let (_temp, worktree, base, entries) = observed_parent_journal("printf edited >> README.md");
+    for spoof in ["delta", "worktree", "identity", "head"] {
+        let mut forged = entries.clone();
+        match spoof {
+            "delta" => forged[1].changed_paths.clear(),
+            "worktree" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().worktree = PathBuf::from("/unrelated");
+                }
+            }
+            "identity" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().worktree_identity.file += 1;
+                }
+            }
+            "head" => {
+                for entry in &mut forged {
+                    entry.observation.as_mut().unwrap().head_oid = Some("0".repeat(40));
+                }
+            }
+            _ => unreachable!(),
+        }
+        let mut report = injected_child_report(&assignment);
+        report.files_changed = vec![PathBuf::from("README.md")];
+        report.worker_reports[0].files_changed = report.files_changed.clone();
+        let journals =
+            injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(forged));
+        validate_worker_journal_worktree_binding(&journals, &worktree, &base, &mut report);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("report.json"),
+            &journals,
+            &mut report,
+        );
+        assert!(!report.accepted, "spoof {spoof} accepted");
+        assert_eq!(report.status, ReviewStatus::Failed);
+    }
+}
+
 #[test]
 fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_identities() {
     let assignment = injected_assignment(true);
@@ -1187,6 +1547,7 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
             start_timestamp: "2026-08-25T02:16:22Z".to_string(),
             end_timestamp: "2026-08-25T02:16:22Z".to_string(),
             changed_paths: Vec::new(),
+            observation: None,
         },
         WorkerExecutionJournalEntry {
             command: failed_command,
@@ -1194,6 +1555,7 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
             start_timestamp: "2026-08-25T02:15:49Z".to_string(),
             end_timestamp: "2026-08-25T02:15:49Z".to_string(),
             changed_paths: Vec::new(),
+            observation: None,
         },
     ]));
 
@@ -1227,6 +1589,797 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
     assert!(paraphrased.rejected);
     assert!(finding_messages(&paraphrased)
         .contains("commands_run entries are not supported by execution journal"));
+}
+
+#[cfg(target_os = "linux")]
+fn wrapper_journal_fixture(
+    observe: bool,
+) -> (
+    tempfile::TempDir,
+    WorkerExecutionJournalEvidenceSet,
+    Vec<String>,
+) {
+    use std::os::unix::fs::MetadataExt;
+    let (temp, cwd, _, mut entries) =
+        observed_parent_journal("printf '%s\\n' 'literal $value' > /dev/null");
+    let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+    let metadata = fs::metadata(&journal).unwrap();
+    let binding = WorkerJournalCommandBinding {
+        executable: PathBuf::from("/run/provided MACO/maco"),
+        journal: journal.clone(),
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        cwd: cwd.clone(),
+    };
+    if observe {
+        let entry = WorkerExecutionJournalEntry {
+            command: vec!["true".into()],
+            cwd,
+            ..injected_journal_entry(Vec::new())
+        };
+        run_worker_execution_journal_command(
+            &journal,
+            &crate::safe_state::FileIdentity {
+                device: binding.device,
+                file: binding.inode,
+            },
+            &entry,
+            true,
+        )
+        .unwrap();
+        entries = parse_worker_execution_journal(&fs::read(&journal).unwrap(), &journal).unwrap();
+    }
+    let entry = entries.last().unwrap();
+    let mut wrapper = vec![
+        binding.executable.to_str().unwrap().to_string(),
+        "supervise".into(),
+        "journal-append".into(),
+        "--journal".into(),
+        binding.journal.to_str().unwrap().to_string(),
+        "--device".into(),
+        binding.device.to_string(),
+        "--inode".into(),
+        binding.inode.to_string(),
+        "--cwd".into(),
+        binding.cwd.to_str().unwrap().to_string(),
+        "--start-timestamp".into(),
+        entry.start_timestamp.clone(),
+        "--end-timestamp".into(),
+        entry.end_timestamp.clone(),
+    ];
+    if observe {
+        wrapper.push("--observe-changes".into());
+    }
+    wrapper.push("--".into());
+    wrapper.extend(entry.command.clone());
+    let mut journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(entries));
+    journals.get_mut("worker-a").unwrap().command_binding = Some(binding);
+    (temp, journals, wrapper)
+}
+
+#[cfg(target_os = "linux")]
+fn shell_quote_wrapper(argv: &[String]) -> String {
+    argv.iter()
+        .map(|arg| format!("'{}'", arg.replace('\'', "'\\''")))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(target_os = "linux")]
+fn reconcile_wrapper(
+    journals: &WorkerExecutionJournalEvidenceSet,
+    wrapper: Vec<String>,
+) -> OrchestratorReviewReport {
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.cwd = journals["worker-a"]
+        .command_binding
+        .as_ref()
+        .unwrap()
+        .cwd
+        .clone();
+    record.command = wrapper.clone();
+    report.worker_reports[0].commands_run = vec![record];
+    report.worker_reports[0]
+        .validation_results
+        .push(ValidationResult {
+            name: "wrapper validation".into(),
+            command: wrapper,
+            status: ReviewStatus::Succeeded,
+            message: None,
+        });
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("wrapper-report.json"),
+        journals,
+        &mut report,
+    );
+    report
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_forms_canonicalize_only_to_finished_bound_records() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    for observe in [false, true] {
+        let (_temp, journals, wrapper) = wrapper_journal_fixture(observe);
+        let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+            panic!("loaded")
+        };
+        let expected = &entries.last().unwrap().command;
+        let mut dynamic = wrapper.clone();
+        dynamic[12] = "$start_ts".into();
+        dynamic[14] = "$(date -u +%FT%TZ)".into();
+        let dynamic_script = shell_quote_wrapper(&dynamic)
+            .replace("'$start_ts'", "\"$start_ts\"")
+            .replace("'$(date -u +%FT%TZ)'", "\"$(date -u +%FT%TZ)\"");
+        for command in [
+            wrapper.clone(),
+            // clap also accepts literal --flag=value options.
+            wrapper[..3]
+                .iter()
+                .cloned()
+                .chain(
+                    wrapper[3..15]
+                        .chunks(2)
+                        .map(|pair| format!("{}={}", pair[0], pair[1])),
+                )
+                .chain(wrapper[15..].iter().cloned())
+                .collect(),
+            vec![
+                "/bin/bash".into(),
+                "-lc".into(),
+                shell_quote_wrapper(&wrapper),
+            ],
+            vec![
+                "/bin/bash".into(),
+                "-c".into(),
+                shell_quote_wrapper(&wrapper),
+            ],
+            vec![
+                "/bin/bash".into(),
+                "-lc".into(),
+                format!("start_ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ'); {dynamic_script}"),
+            ],
+        ] {
+            let report = reconcile_wrapper(&journals, command.clone());
+            assert!(
+                report.accepted,
+                "observe={observe}, command={command:?}, findings={:?}",
+                report.findings
+            );
+            assert_eq!(&report.worker_reports[0].commands_run[0].command, expected);
+            assert_eq!(
+                &report.worker_reports[0]
+                    .validation_results
+                    .last()
+                    .unwrap()
+                    .command,
+                expected
+            );
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_forms_refuse_wrong_bindings_missing_commands_and_ambiguous_shell() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    for index in [0, 4, 6, 8, 10, 12, 14, 16] {
+        let mut wrong = wrapper.clone();
+        if matches!(index, 6 | 8) {
+            wrong[index] = (wrong[index].parse::<u64>().unwrap() + 1).to_string();
+        } else {
+            wrong[index].push_str("-wrong");
+        }
+        for command in [
+            wrong.clone(),
+            vec![
+                "/bin/bash".into(),
+                "-lc".into(),
+                shell_quote_wrapper(&wrong),
+            ],
+        ] {
+            let report = reconcile_wrapper(&journals, command.clone());
+            assert!(!report.accepted, "index={index} command={command:?}");
+            assert!(finding_messages(&report).contains("commands_run entries are not supported"));
+            assert_eq!(report.worker_reports[0].commands_run[0].command, command);
+        }
+    }
+    let script = shell_quote_wrapper(&wrapper);
+    for ambiguous in [
+        format!("false; {script}"),
+        format!("{script}; true"),
+        format!("{script} && true"),
+        format!("{script}\ntrue"),
+        format!("{script} > /tmp/output"),
+        format!("start_ts=$(other-command); {script}"),
+        format!("start_ts=$(date -u +%FT%TZ); {script};"),
+        script.replace(&format!("'{}'", wrapper[12]), "\"$unknown\""),
+        script.replace(&format!("'{}'", wrapper[12]), "\"$(date -u +%FT%TZ"),
+        script.replace(
+            &format!("'{}'", wrapper[12]),
+            "\"$(date -u +%FT%TZ; false)\"",
+        ),
+        format!(
+            "start_ts=$(date -u +%FT%TZ); {}",
+            script.replace(&format!("'{}'", wrapper[12]), "\"$start_ts\"'suffix'")
+        ),
+        format!("{} --cwd '{}'", script, wrapper[10]),
+    ] {
+        let report = reconcile_wrapper(
+            &journals,
+            vec!["/bin/bash".into(), "-lc".into(), ambiguous.clone()],
+        );
+        assert!(!report.accepted, "ambiguous={ambiguous}");
+    }
+    for flag in [
+        "--journal",
+        "--device",
+        "--inode",
+        "--cwd",
+        "--start-timestamp",
+        "--end-timestamp",
+    ] {
+        let mut missing = wrapper.clone();
+        let index = missing.iter().position(|arg| arg == flag).unwrap();
+        missing.drain(index..index + 2);
+        assert!(
+            !reconcile_wrapper(&journals, missing).accepted,
+            "missing {flag}"
+        );
+        let mut duplicate = wrapper.clone();
+        duplicate.splice(3..3, [flag.to_string(), wrapper[index + 1].clone()]);
+        assert!(
+            !reconcile_wrapper(&journals, duplicate).accepted,
+            "duplicate {flag}"
+        );
+    }
+    let mut absent = journals.clone();
+    absent.get_mut("worker-a").unwrap().status = WorkerExecutionJournalStatus::Loaded(Vec::new());
+    assert!(!reconcile_wrapper(&absent, wrapper.clone()).accepted);
+    let mut legacy = journals.clone();
+    let WorkerExecutionJournalStatus::Loaded(entries) =
+        &mut legacy.get_mut("worker-a").unwrap().status
+    else {
+        panic!("loaded")
+    };
+    for entry in entries {
+        entry.observation = None;
+    }
+    assert!(!reconcile_wrapper(&legacy, wrapper.clone()).accepted);
+    let mut wrong_declaration = wrapper.clone();
+    wrong_declaration.splice(3..3, ["--changed-path".into(), "absent.txt".into()]);
+    assert!(!reconcile_wrapper(&journals, wrong_declaration).accepted);
+    let mut no_separator = wrapper.clone();
+    no_separator.remove(15);
+    assert!(!reconcile_wrapper(&journals, no_separator).accepted);
+    for mismatch in [
+        "report-cwd",
+        "missing-launch-binding",
+        "wrong-mode",
+        "unfinished",
+    ] {
+        let assignment = injected_assignment(true);
+        let mut report = injected_child_report(&assignment);
+        let mut record = injected_command_record();
+        record.command = wrapper.clone();
+        record.cwd = journals["worker-a"]
+            .command_binding
+            .as_ref()
+            .unwrap()
+            .cwd
+            .clone();
+        let mut evidence = journals.clone();
+        match mismatch {
+            "report-cwd" => record.cwd.push("wrong"),
+            "missing-launch-binding" => {
+                evidence.get_mut("worker-a").unwrap().command_binding = None
+            }
+            "wrong-mode" => record.command.insert(15, "--observe-changes".into()),
+            "unfinished" => {
+                let WorkerExecutionJournalStatus::Loaded(entries) =
+                    &mut evidence.get_mut("worker-a").unwrap().status
+                else {
+                    panic!("loaded")
+                };
+                entries.pop();
+            }
+            _ => unreachable!(),
+        }
+        report.worker_reports[0].commands_run = vec![record];
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("wrapper-report.json"),
+            &evidence,
+            &mut report,
+        );
+        assert!(!report.accepted, "{mismatch}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_repeated_wrappers_require_literal_timestamps_and_exact_paths() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, mut journals, wrapper) = wrapper_journal_fixture(false);
+    let WorkerExecutionJournalStatus::Loaded(entries) =
+        &mut journals.get_mut("worker-a").unwrap().status
+    else {
+        panic!("loaded")
+    };
+    let mut repeated = entries.clone();
+    for entry in &mut repeated {
+        entry.start_timestamp = "2026-01-01T00:00:02Z".into();
+        entry.end_timestamp = "2026-01-01T00:00:03Z".into();
+    }
+    entries.extend(repeated);
+    assert!(validate_worker_journal_observations(entries).is_ok());
+    let script = shell_quote_wrapper(&wrapper)
+        .replace(&format!("'{}'", wrapper[12]), "\"$(date -u +%FT%TZ)\"")
+        .replace(&format!("'{}'", wrapper[14]), "\"$(date -u +%FT%TZ)\"");
+    let command = vec!["/bin/bash".into(), "-lc".into(), script];
+    let report = reconcile_wrapper(&journals, command.clone());
+    assert!(!report.accepted, "{}", finding_messages(&report));
+    assert_eq!(report.worker_reports[0].commands_run[0].command, command);
+    assert!(reconcile_wrapper(&journals, wrapper.clone()).accepted);
+
+    // Exercise row selection directly: repeated argv requires an explicit exact
+    // declaration, even when literal timestamps identify just one row.
+    let journal = &journals["worker-a"];
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
+        panic!("loaded")
+    };
+    let mut candidates = entries.clone();
+    candidates[1].changed_paths = vec![PathBuf::from("README.md")];
+    let mut record = injected_command_record();
+    record.cwd = journal.command_binding.as_ref().unwrap().cwd.clone();
+    record.command = wrapper.clone();
+    assert!(journal_command::canonicalize_wrapper(&record, journal, &candidates).is_none());
+    record
+        .command
+        .splice(3..3, ["--changed-path".into(), "README.md".into()]);
+    assert_eq!(
+        journal_command::canonicalize_wrapper(&record, journal, &candidates),
+        Some(candidates[1].command.clone())
+    );
+    record.command[4] = "other.txt".into();
+    assert!(journal_command::canonicalize_wrapper(&record, journal, &candidates).is_none());
+    // Identical literal identities still cannot choose between two finished rows.
+    candidates.push(candidates[1].clone());
+    record.command[4] = "README.md".into();
+    assert!(journal_command::canonicalize_wrapper(&record, journal, &candidates).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_rejects_non_shell_whitespace() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let script = shell_quote_wrapper(&wrapper);
+    for whitespace in ['\u{a0}', '\u{b}', '\u{2028}', '\r'] {
+        for script in [
+            format!("{whitespace}{script}"),
+            format!("start_ts=$(date -u +%FT%TZ);{whitespace}{script}"),
+        ] {
+            let command = vec!["/bin/bash".into(), "-lc".into(), script];
+            let report = reconcile_wrapper(&journals, command.clone());
+            assert!(!report.accepted, "whitespace={whitespace:?}");
+            assert_eq!(report.worker_reports[0].commands_run[0].command, command);
+        }
+    }
+    assert!(
+        reconcile_wrapper(
+            &journals,
+            vec!["bash".into(), "-lc".into(), format!(" \t\n{script}\n")],
+        )
+        .accepted
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_prefixed_shell_wrapper_is_rejected_and_left_unchanged() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let assignment = injected_assignment(true);
+    let command = vec![
+        "bash".into(),
+        "-lc".into(),
+        format!("LC_ALL=C {}", shell_quote_wrapper(&wrapper)),
+    ];
+    for location in 0..3 {
+        let mut report = injected_child_report(&assignment);
+        let mut record = injected_command_record();
+        record.cwd = journals["worker-a"]
+            .command_binding
+            .as_ref()
+            .unwrap()
+            .cwd
+            .clone();
+        record.command = wrapper.clone();
+        report.worker_reports[0].commands_run = vec![record.clone()];
+        match location {
+            0 => {
+                record.command = command.clone();
+                report.commands_run = vec![record];
+            }
+            1 => report.validation_results[0].command = command.clone(),
+            _ => report.worker_reports[0].validation_results[0].command = command.clone(),
+        }
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("prefixed-wrapper.json"),
+            &journals,
+            &mut report,
+        );
+        assert!(!report.accepted, "location={location}");
+        let actual = match location {
+            0 => &report.commands_run[0].command,
+            1 => &report.validation_results[0].command,
+            _ => &report.worker_reports[0].validation_results[0].command,
+        };
+        assert_eq!(actual, &command, "location={location}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_started_only_is_rejected_by_canonicalizer_phase_filter() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let journal = &journals["worker-a"];
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
+        panic!("loaded")
+    };
+    let mut record = injected_command_record();
+    record.cwd = journal.command_binding.as_ref().unwrap().cwd.clone();
+    record.command = wrapper;
+    assert!(journal_command::canonicalize_wrapper(&record, journal, entries).is_some());
+    assert_eq!(
+        entries[0].observation.as_ref().unwrap().phase,
+        WorkerJournalObservationPhase::Started
+    );
+    // Bypass observation validation so only the canonicalizer can reject this.
+    assert!(journal_command::canonicalize_wrapper(&record, journal, &entries[..1]).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_child_envelope_and_distinct_validation_wrappers_are_rewritten() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let assignment = injected_assignment(true);
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let expected = &entries.last().unwrap().command;
+    for invalid_top_level in [false, true] {
+        let mut report = injected_child_report(&assignment);
+        let mut record = injected_command_record();
+        record.cwd = journals["worker-a"]
+            .command_binding
+            .as_ref()
+            .unwrap()
+            .cwd
+            .clone();
+        record.command = wrapper.clone();
+        report.worker_reports[0].commands_run = vec![record.clone()];
+        report.worker_reports[0].validation_results[0].command =
+            vec!["bash".into(), "-lc".into(), shell_quote_wrapper(&wrapper)];
+        record.command = report.worker_reports[0].validation_results[0]
+            .command
+            .clone();
+        if invalid_top_level {
+            record.command[2].insert(0, '\u{a0}');
+        }
+        report.commands_run = vec![record];
+        report.validation_results[0].command = wrapper.clone();
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("child-wrapper.json"),
+            &journals,
+            &mut report,
+        );
+        assert_eq!(
+            report.accepted,
+            !invalid_top_level,
+            "{}",
+            finding_messages(&report)
+        );
+        assert_eq!(&report.worker_reports[0].commands_run[0].command, expected);
+        assert_eq!(
+            &report.worker_reports[0].validation_results[0].command,
+            expected
+        );
+        assert_eq!(&report.validation_results[0].command, expected);
+        if !invalid_top_level {
+            assert_eq!(&report.commands_run[0].command, expected);
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_direct_envelope_requires_matching_rewritten_evidence() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let mut assignment = injected_assignment(true);
+    let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
+    assignment.id = worker.id.clone();
+    assignment.role = AgentRole::Worker;
+    assignment.worker_assignments.clear();
+    let mut record = injected_command_record();
+    record.cwd = journals["worker-a"]
+        .command_binding
+        .as_ref()
+        .unwrap()
+        .cwd
+        .clone();
+    record.command = wrapper.clone();
+    worker.commands_run = vec![record];
+    worker.validation_results[0].command = wrapper.clone();
+    for mismatch in [
+        "none",
+        "omitted-commands",
+        "omitted-commands-plain-wrapper",
+        "omitted-commands-prefixed-wrapper",
+        "metadata",
+        "validation",
+        "missing-worker",
+        "extra-worker",
+    ] {
+        let mut journals = journals.clone();
+        let mut report = direct_worker_report_envelope(worker.clone());
+        report.commands_run[0].command =
+            vec!["bash".into(), "-lc".into(), shell_quote_wrapper(&wrapper)];
+        match mismatch {
+            "omitted-commands" => report.commands_run.clear(),
+            "omitted-commands-plain-wrapper" | "omitted-commands-prefixed-wrapper" => {
+                report.commands_run.clear();
+                let command = if mismatch == "omitted-commands-plain-wrapper" {
+                    wrapper.clone()
+                } else {
+                    vec![
+                        "bash".into(),
+                        "-lc".into(),
+                        format!("LC_ALL=C {}", shell_quote_wrapper(&wrapper)),
+                    ]
+                };
+                let journal = journals.get_mut("worker-a").unwrap();
+                let WorkerExecutionJournalStatus::Loaded(entries) = &mut journal.status else {
+                    panic!("loaded")
+                };
+                // Keep validation evidence equal and free of wrappers so only
+                // the nested commands_run backstop can reject this report.
+                report.validation_results[0].command = entries.last().unwrap().command.clone();
+                report.worker_reports[0].validation_results = report.validation_results.clone();
+                for entry in entries.iter_mut() {
+                    entry.command = command.clone();
+                }
+                report.worker_reports[0].commands_run[0].command = command;
+            }
+            "metadata" => report.commands_run[0].stdout = "different output".into(),
+            "validation" => report.validation_results[0].command = vec!["unrelated".into()],
+            "missing-worker" => report.worker_reports.clear(),
+            "extra-worker" => report.worker_reports.push(worker.clone()),
+            _ => {}
+        }
+        let original_command = report
+            .worker_reports
+            .first()
+            .map(|worker| worker.commands_run[0].command.clone());
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("direct-wrapper.json"),
+            &journals,
+            &mut report,
+        );
+        assert_eq!(
+            report.accepted,
+            matches!(mismatch, "none" | "omitted-commands"),
+            "{mismatch}: {}",
+            finding_messages(&report)
+        );
+        if matches!(mismatch, "none" | "omitted-commands") {
+            if mismatch == "omitted-commands" {
+                assert!(report.commands_run.is_empty());
+            } else {
+                assert_eq!(report.commands_run, report.worker_reports[0].commands_run);
+            }
+            let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+                panic!("loaded")
+            };
+            assert_eq!(
+                report.worker_reports[0].commands_run[0].command,
+                entries.last().unwrap().command
+            );
+            assert_eq!(
+                report.validation_results,
+                report.worker_reports[0].validation_results
+            );
+        } else if matches!(
+            mismatch,
+            "omitted-commands-plain-wrapper" | "omitted-commands-prefixed-wrapper"
+        ) {
+            assert!(report.rejected);
+            assert!(report.commands_run.is_empty());
+            assert_eq!(
+                report.worker_reports[0].commands_run[0].command,
+                original_command.unwrap()
+            );
+            assert_eq!(
+                report.validation_results,
+                report.worker_reports[0].validation_results
+            );
+            assert_eq!(
+                finding_messages(&report),
+                "report command references contain journal wrappers unsupported by execution journal evidence"
+            );
+        } else {
+            let expected = match mismatch {
+                "metadata" | "validation" => "direct worker envelope and its single nested report disagree after journal command canonicalization".to_string(),
+                "missing-worker" | "extra-worker" => format!(
+                    "direct worker envelope must contain exactly one report bound to assignment '{}' (found {} WorkerReport entries)",
+                    assignment.id, report.worker_reports.len()
+                ),
+                _ => unreachable!("handled mismatch: {mismatch}"),
+            };
+            assert!(
+                finding_messages(&report).contains(&expected),
+                "{mismatch}: {}",
+                finding_messages(&report)
+            );
+        }
+    }
+}
+
+#[test]
+fn worker_journal_real_missing_report_is_not_an_envelope_disagreement() {
+    let mut assignment = injected_assignment(true);
+    let worker = injected_child_report(&assignment).worker_reports.remove(0);
+    assignment.id = worker.id.clone();
+    assignment.role = AgentRole::Worker;
+    assignment.worker_assignments.clear();
+    let mut report = direct_worker_report_envelope(worker);
+    // Minimal supervisor fallback from both R27 real runs. The sole command is
+    // the failed host process, not a command emitted by a nested WorkerReport.
+    let mut host = injected_command_record();
+    host.command = vec!["codex".into(), "app-server".into(), "--stdio".into()];
+    host.status = ReviewStatus::Failed;
+    host.exit_code = Some(255);
+    host.error = Some(
+        "unexpected app-server message during turn: unsupported method turn/moderationMetadata"
+            .into(),
+    );
+    report.commands_run = vec![host.clone()];
+    report.worker_reports.clear();
+    report.validation_results.clear();
+    report.status = ReviewStatus::Missing;
+    report.accepted = false;
+    report.rejected = true;
+    report.findings.clear();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("evidence/incoming/assignment-001.json"),
+        &WorkerExecutionJournalEvidenceSet::default(),
+        &mut report,
+    );
+    assert!(report.rejected);
+    assert!(!report.accepted);
+    assert_eq!(report.commands_run, vec![host]);
+    assert!(finding_messages(&report).contains("exactly one report bound to assignment"));
+    assert!(!finding_messages(&report).contains("disagree after journal command canonicalization"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_native_payload_preserves_shell_metacharacters() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, mut journals, mut wrapper) = wrapper_journal_fixture(true);
+    let command = vec![
+        "apply_patch".to_string(),
+        "*** Begin Patch\n*** Add File: a b\n+'$HOME' `date` \\\"\n*** End Patch".to_string(),
+    ];
+    let WorkerExecutionJournalStatus::Loaded(entries) =
+        &mut journals.get_mut("worker-a").unwrap().status
+    else {
+        panic!("loaded")
+    };
+    entries.last_mut().unwrap().command = command.clone();
+    wrapper.truncate(17);
+    wrapper.extend(command.clone());
+    let report = reconcile_wrapper(
+        &journals,
+        vec![
+            "/bin/bash".into(),
+            "-lc".into(),
+            shell_quote_wrapper(&wrapper),
+        ],
+    );
+    assert!(report.accepted, "{:?}", report.findings);
+    assert_eq!(report.worker_reports[0].commands_run[0].command, command);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_wrapper_direct_envelope_preserves_failed_command_metadata() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, mut journals, mut wrapper) = wrapper_journal_fixture(false);
+    let journal = journals.get_mut("worker-a").unwrap();
+    let binding = journal.command_binding.as_ref().unwrap();
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
+        panic!("loaded")
+    };
+    let entry = WorkerExecutionJournalEntry {
+        command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+        observation: None,
+        ..entries.last().unwrap().clone()
+    };
+    assert!(run_worker_execution_journal_command(
+        &binding.journal,
+        &crate::safe_state::FileIdentity {
+            device: binding.device,
+            file: binding.inode,
+        },
+        &entry,
+        false,
+    )
+    .is_err());
+    wrapper.truncate(16);
+    wrapper.extend(entry.command.clone());
+    journal.status = WorkerExecutionJournalStatus::Loaded(
+        parse_worker_execution_journal(&fs::read(&binding.journal).unwrap(), &binding.journal)
+            .unwrap(),
+    );
+    let mut assignment = injected_assignment(true);
+    assignment.id = "worker-a".into();
+    assignment.role = AgentRole::Worker;
+    assignment.worker_assignments.clear();
+    let mut worker = injected_child_report(&injected_assignment(true))
+        .worker_reports
+        .remove(0);
+    let mut record = injected_command_record();
+    record.command = wrapper.clone();
+    record.cwd = entry.cwd;
+    record.status = ReviewStatus::Failed;
+    record.exit_code = Some(7);
+    record.stderr = "failed validation".into();
+    worker.commands_run = vec![record.clone()];
+    worker.validation_results = vec![ValidationResult {
+        name: "failed check".into(),
+        command: wrapper,
+        status: ReviewStatus::Failed,
+        message: Some("exit 7".into()),
+    }];
+    let mut report = direct_worker_report_envelope(worker);
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("direct-wrapper.json"),
+        &journals,
+        &mut report,
+    );
+    record.command = entry.command.clone();
+    assert_eq!(report.commands_run, vec![record]);
+    assert_eq!(report.commands_run, report.worker_reports[0].commands_run);
+    assert_eq!(report.validation_results[0].command, entry.command);
+    assert_eq!(
+        report.validation_results,
+        report.worker_reports[0].validation_results
+    );
+    assert!(!finding_messages(&report).contains("commands_run entries are not supported"));
+    // Canonicalization is idempotent and does not add execution evidence.
+    let normalized = report.clone();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("direct-wrapper.json"),
+        &journals,
+        &mut report,
+    );
+    assert_eq!(report, normalized);
 }
 
 #[test]
@@ -3015,11 +4168,12 @@ fn researcher_foreign_id_collision_after_retry_keeps_final_evidence_on_authored_
         write_injected_json(&command.output_last_message, &wire);
         injected_verified_run(command)
     };
-    let final_report = run_supervisor_plan_with_runner(
+    let final_report = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("finalize exhausted researcher attempts");
@@ -3499,6 +4653,7 @@ fn generated_direct_workers_reject_missing_invalid_and_inconsistent_journals() {
                         &assignment.id,
                         &assignment.id,
                     ),
+                    command_binding: None,
                     status,
                 },
             )])

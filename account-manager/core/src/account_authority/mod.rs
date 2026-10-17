@@ -21,9 +21,11 @@ pub mod test_worker;
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use observe::{
-    validate_observed_models, AccountObserveRequest, AccountObserveResult, AuthObservation,
-    CategoryObservation, ModelsObservation, ObservationError, ObservationErrorKind,
-    ObservationOutcome, ObserveCategory, ObservedModel, QuotaObservation,
+    validate_observed_models, validate_observed_models_for_binding, AccountObserveRequest,
+    AccountObserveResult, AuthObservation, CategoryObservation, ModelAccessBasis,
+    ModelAccessOutcome, ModelCatalogProvenance, ModelCatalogSourceKind, ModelsObservation,
+    ObservationError, ObservationErrorKind, ObservationOutcome, ObserveCategory, ObservedModel,
+    QuotaObservation,
 };
 pub use operation::{
     canonical_binding_digest, OperationHandle, OperationPrepareIdentity, OperationPrepareRequest,

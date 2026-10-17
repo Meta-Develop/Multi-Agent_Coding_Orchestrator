@@ -4,6 +4,8 @@
 # confinement exposes this one executable, not sibling interpreters or helpers.
 # Synthetic model/cost only — not production account economics.
 set -eu
+[ "${1:-}" = "--no-auto-update" ] || exit 2
+shift
 
 MODE="${MACO_WRITABLE_GROK_ACP_FIXTURE_MODE:-success}"
 SESSION="maco-fixture-acp-session"
@@ -11,25 +13,28 @@ RESOLVED_MODEL="grok-4.6"
 RESOLVED_EFFORT="xhigh"
 COST_TICKS=20000000
 
-expected_count=13
+expected_count=11
 if [ "$#" -ne "$expected_count" ]; then
 	printf '%s\n' "unexpected argv count: $#" "$@" >&2
 	exit 2
 fi
 if [ "$1" != "--sandbox" ] \
 	|| [ "$2" != "strict" ] \
-	|| [ "$3" != "--always-approve" ] \
-	|| [ "$4" != "--disable-web-search" ] \
-	|| [ "$5" != "--no-memory" ] \
-	|| [ "$6" != "--no-subagents" ] \
-	|| [ "$7" != "agent" ] \
-	|| [ "$8" != "--no-leader" ] \
-	|| [ "$9" != "-m" ] \
-	|| [ "${10}" != "grok-4.6" ] \
-	|| [ "${11}" != "--reasoning-effort" ] \
-	|| [ "${12}" != "xhigh" ] \
-	|| [ "${13}" != "stdio" ]; then
+	|| [ "$3" != "--disable-web-search" ] \
+	|| [ "$4" != "agent" ] \
+	|| [ "$5" != "--always-approve" ] \
+	|| [ "$6" != "--no-leader" ] \
+	|| [ "$7" != "-m" ] \
+	|| [ "$8" != "grok-4.6" ] \
+	|| [ "$9" != "--reasoning-effort" ] \
+	|| [ "${10}" != "xhigh" ] \
+	|| [ "${11}" != "stdio" ]; then
 	printf '%s\n' "unexpected argv:" "$@" >&2
+	exit 2
+fi
+
+if [ "${GROK_MEMORY:-}" != "0" ] || [ "${GROK_SUBAGENTS:-}" != "0" ]; then
+	printf '%s\n' "ACP memory/subagent isolation environment missing" >&2
 	exit 2
 fi
 

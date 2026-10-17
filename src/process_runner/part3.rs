@@ -16,7 +16,12 @@ fn verify_effective_system_call_filter(
     // architecture-specific expansion. Require either the group token or every selected
     // architecture-common member from each requested group.
     for (group, representatives) in required_denied_group_representatives() {
-        if kind == SideEffectConfinementProfileKind::ExternalCodex && group == "@mount" {
+        if matches!(
+            kind,
+            SideEffectConfinementProfileKind::ExternalCodex
+                | SideEffectConfinementProfileKind::ExternalGrok
+        ) && group == "@mount"
+        {
             let denied_group = tokens
                 .iter()
                 .any(|token| token.trim_start_matches('~') == group);
@@ -29,7 +34,7 @@ fn verify_effective_system_call_filter(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!(
-                        "effective SystemCallFilter denied ExternalCodex inner bubblewrap mount operations: {}",
+                        "effective SystemCallFilter denied {kind:?} inner bubblewrap mount operations: {}",
                         denied_member.copied().unwrap_or(group)
                     ),
                 ));
@@ -66,8 +71,22 @@ fn verify_effective_system_call_filter(
             ));
         }
     }
-    if kind == SideEffectConfinementProfileKind::StrictOfflineWorkspace {
-        for syscall in ["socket", "socketpair", "socketcall"] {
+    if matches!(
+        kind,
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace
+            | SideEffectConfinementProfileKind::GeminiOfflineBridge
+            | SideEffectConfinementProfileKind::GeminiOnlineBridge
+    ) {
+        let syscalls: &[&str] = if matches!(
+            kind,
+            SideEffectConfinementProfileKind::GeminiOfflineBridge
+                | SideEffectConfinementProfileKind::GeminiOnlineBridge
+        ) {
+            &["socketpair", "socketcall"]
+        } else {
+            &["socket", "socketpair", "socketcall"]
+        };
+        for &syscall in syscalls {
             if !tokens
                 .iter()
                 .any(|token| token.trim_start_matches('~') == syscall)
@@ -75,6 +94,29 @@ fn verify_effective_system_call_filter(
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
                     format!("effective SystemCallFilter omitted denied syscall {syscall}"),
+                ));
+            }
+        }
+    } else if kind == SideEffectConfinementProfileKind::CursorProviderlessOfflineUds {
+        for syscall in CURSOR_PROVIDERLESS_OFFLINE_UDS_DENIED_SOCKET_SYSCALLS {
+            if !tokens
+                .iter()
+                .any(|token| token.trim_start_matches('~') == *syscall)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("effective SystemCallFilter omitted denied syscall {syscall}"),
+                ));
+            }
+        }
+        for syscall in ["socket", "connect"] {
+            if tokens
+                .iter()
+                .any(|token| token.trim_start_matches('~') == syscall)
+            {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("effective SystemCallFilter denied required syscall {syscall}"),
                 ));
             }
         }
@@ -87,7 +129,11 @@ fn verify_effective_namespace_restriction(
     kind: SideEffectConfinementProfileKind,
     value: &str,
 ) -> std::io::Result<()> {
-    let expected = if kind == SideEffectConfinementProfileKind::ExternalCodex {
+    let expected = if matches!(
+        kind,
+        SideEffectConfinementProfileKind::ExternalCodex
+            | SideEffectConfinementProfileKind::ExternalGrok
+    ) {
         "no"
     } else {
         "yes"
@@ -104,21 +150,48 @@ fn verify_effective_namespace_restriction(
 
 #[cfg(target_os = "linux")]
 fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let mut property = OsString::from("--property=");
+    property.push(name);
+    let path_bytes = path.as_os_str().as_bytes();
+    if path_bytes.contains(&b' ') {
+        let mut quoted = Vec::with_capacity(path_bytes.len() + if optional { 3 } else { 2 });
+        quoted.push(b'"');
+        if optional {
+            quoted.push(b'-');
+        }
+        for byte in path_bytes {
+            if matches!(*byte, b'"' | b'\\') {
+                quoted.push(b'\\');
+            }
+            quoted.push(*byte);
+        }
+        quoted.push(b'"');
+        property.push(OsString::from_vec(quoted));
+    } else {
+        if optional {
+            property.push("-");
+        }
+        property.push(path.as_os_str());
+    }
+    property
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_rooted_path_property(name: &str, path: &Path, optional: bool) -> OsString {
     let mut property = OsString::from("--property=");
     property.push(name);
     if optional {
         property.push("-");
     }
+    property.push("+");
     property.push(path.as_os_str());
     property
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_path_binding_property(
-    name: &str,
-    source: &Path,
-    destination: &Path,
-) -> OsString {
+fn systemd_path_binding_property(name: &str, source: &Path, destination: &Path) -> OsString {
     let mut property = systemd_path_property(name, source, false);
     property.push(":");
     property.push(destination.as_os_str());
@@ -152,7 +225,9 @@ fn known_sensitive_socket_paths() -> Vec<PathBuf> {
         PathBuf::from("/run/credentials"),
         PathBuf::from("/run/secrets"),
         PathBuf::from("/run/keys"),
-        PathBuf::from("/nix/var/nix/daemon-socket/socket"),
+        // Mask the daemon-socket parent so systemd does not need to traverse the
+        // non-searchable directory to look up the leaf, and all children stay blocked.
+        PathBuf::from("/nix/var/nix/daemon-socket"),
     ]
     .into_iter()
     .collect()
@@ -168,10 +243,13 @@ struct SystemdUnit {
     sleep_program: PathBuf,
     stat_program: PathBuf,
     findmnt_program: PathBuf,
+    helper_search_path: Option<OsString>,
     name: String,
+    cgroup_membership: String,
     cgroup_path: PathBuf,
     runtime_dir: PathBuf,
     client_runtime: PathBuf,
+    isolated_root: Option<tempfile::TempDir>,
     environment_file: PathBuf,
     ready_path: PathBuf,
     waiting_path: PathBuf,
@@ -183,12 +261,16 @@ struct SystemdUnit {
     sandbox_report_path: PathBuf,
     owner_channel: Option<File>,
     pending_environment: Option<EnvironmentMode>,
+    // Kept outside PrivateUsers through gate release, result and cleanup.
+    prepared_native_entry: Option<Arc<crate::pinned_exec::PreparedNativeEntry>>,
     pending_runtime_files: Vec<PrivateRuntimeFile>,
     runtime_file_paths: Vec<PathBuf>,
     staged_codex_home: Option<PathBuf>,
     target_program_path: Option<PathBuf>,
     sandbox: Option<ResolvedSystemdSandbox>,
     sandbox_verified: bool,
+    prepared_read_only: Option<Box<PreparedReadOnlyFilesystem>>,
+    pending_read_only: Option<Box<VerifiedReadOnlyFilesystem>>,
     environment_published: bool,
     environment_released: bool,
     fifos_prepared: bool,
@@ -414,6 +496,7 @@ impl SystemdUnit {
                 "strict containment requires a root-owned, non-writable findmnt helper at a trusted system path",
             )
         })?;
+        let helper_search_path = env::var_os("PATH");
         let manager_cgroup = systemd_user_manager_cgroup()?;
         let manager_path = Path::new("/sys/fs/cgroup").join(
             manager_cgroup
@@ -436,6 +519,11 @@ impl SystemdUnit {
         let name = format!("maco-process-{runner_pid}-{sequence}.service");
         #[cfg(test)]
         record_systemd_unit_name_for_test(&name);
+        let cgroup_membership = manager_cgroup
+            .join("app.slice")
+            .join(&name)
+            .to_string_lossy()
+            .into_owned();
         let cgroup_path = manager_path.join("app.slice").join(&name);
         let runtime_dir = client_runtime
             .clone()
@@ -458,10 +546,13 @@ impl SystemdUnit {
             sleep_program,
             stat_program,
             findmnt_program,
+            helper_search_path,
             name,
+            cgroup_membership,
             cgroup_path,
             runtime_dir,
             client_runtime,
+            isolated_root: None,
             environment_file,
             ready_path,
             waiting_path,
@@ -473,12 +564,15 @@ impl SystemdUnit {
             sandbox_report_path,
             owner_channel: None,
             pending_environment: None,
+            prepared_native_entry: None,
             pending_runtime_files: Vec::new(),
             runtime_file_paths: Vec::new(),
             staged_codex_home: None,
             target_program_path: None,
             sandbox: None,
             sandbox_verified: false,
+            prepared_read_only: None,
+            pending_read_only: None,
             environment_published: false,
             environment_released: false,
             fifos_prepared: false,
@@ -490,6 +584,14 @@ impl SystemdUnit {
     }
 
     fn build_command(&mut self, spec: &ProcessSpec) -> std::io::Result<Command> {
+        if let Some(profile) = spec.side_effects.external_claude() {
+            profile
+                .containment_owner()
+                .bind(ClaudeContainmentOwnerIdentity {
+                    unit: self.name.clone(),
+                    cgroup: self.cgroup_membership.clone(),
+                })?;
+        }
         if let Some(home) = spec.staged_codex_home.as_deref() {
             validate_systemd_path_syntax(home, "staged Codex home")?;
             if !home.is_absolute() {
@@ -502,6 +604,7 @@ impl SystemdUnit {
         let target_environment = if spec.private_runtime_home
             || spec.private_runtime_codex_home
             || spec.private_runtime_grok_home
+            || spec.private_runtime_cursor_home
             || spec.staged_codex_home.is_some()
         {
             environment_with_private_runtime_home(
@@ -510,6 +613,7 @@ impl SystemdUnit {
                 spec.private_runtime_home,
                 spec.private_runtime_codex_home,
                 spec.private_runtime_grok_home,
+                spec.private_runtime_cursor_home,
                 spec.staged_codex_home.as_deref(),
             )?
         } else {
@@ -517,9 +621,9 @@ impl SystemdUnit {
         };
         let mut private_runtime_files = spec.private_runtime_files.clone();
         if spec.staged_codex_home.is_none()
-            && private_runtime_files.iter().any(|file| {
-                file.destination == PrivateRuntimeFileDestination::StagedCodexHome
-            })
+            && private_runtime_files
+                .iter()
+                .any(|file| file.destination == PrivateRuntimeFileDestination::StagedCodexHome)
         {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -534,7 +638,7 @@ impl SystemdUnit {
                     "pinned executable capability requires a direct command",
                 ));
             };
-            let helper = pinned_exec::validated_current_helper_path()?;
+            let helper = pinned.executable.validated_launch_helper_path()?;
             let environment = effective_environment(&target_environment)
                 .into_iter()
                 .collect::<Vec<_>>();
@@ -545,7 +649,12 @@ impl SystemdUnit {
                 bytes,
                 destination: PrivateRuntimeFileDestination::RuntimeDirectory,
             });
-            Some((helper, digest))
+            let marker = if self.prepared_native_entry.is_some() {
+                crate::pinned_exec::SEALED_NATIVE_HELPER_ARGUMENT
+            } else {
+                pinned.executable.hidden_helper_argument()
+            };
+            Some((helper, digest, marker))
         } else {
             None
         };
@@ -558,8 +667,25 @@ impl SystemdUnit {
             target_environment
         });
         let mut sandbox = resolve_systemd_sandbox(spec)?;
-        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref())
+        if sandbox.as_ref().is_some_and(|sandbox| {
+            sandbox.kind == SideEffectConfinementProfileKind::CursorProviderlessOfflineUds
+        }) {
+            self.select_cursor_providerless_offline_uds_helpers()?;
+        } else if sandbox
+            .as_ref()
+            .is_some_and(|sandbox| sandbox.isolated_host_view)
         {
+            self.select_isolated_runtime_helpers()?;
+        }
+        if let Some(sandbox) = sandbox
+            .as_mut()
+            .filter(|sandbox| is_gemini_bridge_kind(sandbox.kind))
+        {
+            let root = create_gemini_isolated_root(&self.client_runtime)?;
+            bind_gemini_isolated_root_identity(sandbox, root.path())?;
+            self.isolated_root = Some(root);
+        }
+        if let (Some(home), Some(sandbox)) = (spec.staged_codex_home.as_deref(), sandbox.as_ref()) {
             sandbox.validate_staged_codex_home(home)?;
         }
         let target_current_dir = sandbox
@@ -568,7 +694,7 @@ impl SystemdUnit {
                 sandbox.current_dir.as_path()
             });
         let target_program_path = match &pinned_launch {
-            Some((helper, _)) => helper.clone(),
+            Some((helper, _, _)) => helper.clone(),
             None => match &spec.command {
                 ProcessCommand::Shell { .. } => self.shell.clone(),
                 ProcessCommand::Direct { program, .. } if program.is_absolute() => {
@@ -593,7 +719,7 @@ impl SystemdUnit {
             ] {
                 sandbox.add_isolated_runtime_file(helper)?;
             }
-            if let Some((helper, _)) = &pinned_launch {
+            if let Some((helper, _, _)) = &pinned_launch {
                 sandbox.add_isolated_runtime_file(helper)?;
             }
             sandbox.add_private_runtime_root(&self.runtime_dir)?;
@@ -641,6 +767,12 @@ impl SystemdUnit {
                 runtime_max.as_millis()
             ));
         if let Some(sandbox) = &sandbox {
+            if is_gemini_bridge_kind(sandbox.kind) {
+                let isolated_root = self.isolated_root.as_ref().ok_or_else(|| {
+                    std::io::Error::other("Gemini private isolated root was not retained")
+                })?;
+                apply_gemini_isolated_root_properties(&mut command, sandbox, isolated_root.path())?;
+            }
             apply_systemd_sandbox_properties(&mut command, sandbox, &self.runtime_dir);
             command
                 .arg(systemd_path_property(
@@ -697,6 +829,14 @@ impl SystemdUnit {
             for check in &sandbox.mount_checks {
                 command
                     .arg(match check.access {
+                        SandboxMountAccess::ReadOnly if is_gemini_bridge_kind(sandbox.kind) => {
+                            "ro-mountpoint"
+                        }
+                        SandboxMountAccess::ReadWrite | SandboxMountAccess::PrivateRuntime
+                            if is_gemini_bridge_kind(sandbox.kind) =>
+                        {
+                            "rw-mountpoint"
+                        }
                         SandboxMountAccess::ReadOnly => "ro",
                         SandboxMountAccess::ReadWrite => "rw",
                         SandboxMountAccess::PrivateRuntime => "rw",
@@ -709,10 +849,22 @@ impl SystemdUnit {
                     .arg(&check.path);
             }
         }
-        if let Some((helper, digest)) = pinned_launch {
+        let pinned_descriptor_digest = pinned_launch.as_ref().map(|(_, digest, _)| digest.clone());
+        if let Some((helper, digest, helper_argument)) = pinned_launch {
+            command.arg(helper);
+            if let Some(profile) = spec.side_effects.external_claude() {
+                // SAFETY: geteuid has no preconditions and does not access Rust memory.
+                let effective_uid = unsafe { libc::geteuid() };
+                command
+                    .arg(claude::HIDDEN_CLAUDE_RELAY_ARGUMENT)
+                    .arg(profile.parent_relay_socket())
+                    .arg(profile.deadline_unix_millis().to_string())
+                    .arg(effective_uid.to_string())
+                    .arg(&self.name)
+                    .arg(profile.helper_registration_nonce());
+            }
             command
-                .arg(helper)
-                .arg(HIDDEN_PINNED_EXEC_ARGUMENT)
+                .arg(helper_argument)
                 .arg(self.runtime_dir.join(PINNED_EXEC_DESCRIPTOR_NAME))
                 .arg(digest);
         } else {
@@ -736,10 +888,179 @@ impl SystemdUnit {
                 }
             }
         }
+        self.prepared_read_only = self.sandbox.as_ref().and_then(|sandbox| {
+            prepared_read_only_filesystem(
+                spec,
+                sandbox,
+                &self.runtime_dir,
+                pinned_descriptor_digest,
+            )
+        });
         Ok(command)
     }
 
+    fn select_isolated_runtime_helpers(&mut self) -> std::io::Result<()> {
+        let path = env::var_os("PATH").ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "isolated host view requires a pinned Nix-store PATH",
+            )
+        })?;
+        self.env_program = required_trusted_nix_store_executable("env", &path)?;
+        self.shell = required_trusted_nix_store_executable("sh", &path)?;
+        self.sleep_program = required_trusted_nix_store_executable("sleep", &path)?;
+        self.stat_program = required_trusted_nix_store_executable("stat", &path)?;
+        self.findmnt_program = required_trusted_nix_store_executable("findmnt", &path)?;
+        Ok(())
+    }
+
+    fn select_cursor_providerless_offline_uds_helpers(&mut self) -> std::io::Result<()> {
+        let path = self.helper_search_path.as_deref().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "providerless Cursor offline UDS containment requires a pinned Nix-store PATH",
+            )
+        })?;
+        self.env_program = required_trusted_nix_store_executable("env", path)?;
+        self.shell = required_trusted_nix_store_executable("sh", path)?;
+        self.sleep_program = required_trusted_nix_store_executable("sleep", path)?;
+        self.stat_program = required_trusted_nix_store_executable("stat", path)?;
+        self.findmnt_program = required_trusted_nix_store_executable("findmnt", path)?;
+        Ok(())
+    }
+
     fn confirm_attached(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<()> {
+        let result = self.confirm_attached_inner(child, operation_deadline, cancellation);
+        match result {
+            Err(source)
+                if matches!(
+                    source.kind(),
+                    io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
+                ) =>
+            {
+                // Observe before attach() rolls back the unit and removes its gate files.
+                let diagnostics = self.start_gate_diagnostics(child);
+                Err(io::Error::new(
+                    source.kind(),
+                    format!("{source}; {diagnostics}"),
+                ))
+            }
+            other => other,
+        }
+    }
+
+    fn start_gate_diagnostics(&self, child: &mut Child) -> String {
+        let stage = format!(
+            "pre-cleanup gate: owned={} fifo_waiting={} fifos_prepared={} owner_channel={} guardian_waiting={} environment_published={} environment_released={} ready={} sandbox_verified={}",
+            self.observed_owned,
+            self.fifo_waiting_path.is_file(),
+            self.fifos_prepared,
+            self.owner_channel.is_some(),
+            self.waiting_path.is_file(),
+            self.environment_published,
+            self.environment_released,
+            self.ready_path.is_file(),
+            self.sandbox_verified,
+        );
+        let Some(stderr) = child.stderr.as_mut() else {
+            return format!("{stage}; guardian stderr unavailable");
+        };
+        if let Err(error) = configure_cancellable_io(stderr) {
+            return format!(
+                "{stage}; guardian stderr observation failed: {:?}",
+                error.kind()
+            );
+        }
+        // One nonblocking bounded snapshot: never wait beyond the original setup deadline.
+        let mut bytes = [0_u8; 4096];
+        let count = match stderr.read(&mut bytes) {
+            Ok(count) => count,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => 0,
+            Err(error) => {
+                return format!(
+                    "{stage}; guardian stderr observation failed: {:?}",
+                    error.kind()
+                );
+            }
+        };
+        // Only the guardian's literal messages are reportable. Dynamic sandbox paths and
+        // unrelated launcher output may contain argv/environment data and remain redacted.
+        let output = String::from_utf8_lossy(&bytes[..count]);
+        let mut messages = Vec::new();
+        for line in output.lines() {
+            if let Some(metadata) = line.strip_prefix("maco containment guardian root: ") {
+                let fields = metadata.split_whitespace().collect::<Vec<_>>();
+                if fields.len() == 5
+                    && matches!(fields[0], "results=0" | "results=1" | "results=2")
+                    && matches!(fields[1], "shape=valid" | "shape=malformed")
+                    && matches!(
+                        fields[2],
+                        "fstype=tmpfs"
+                            | "fstype=ext4"
+                            | "fstype=overlay"
+                            | "fstype=rootfs"
+                            | "fstype=9p"
+                            | "fstype=squashfs"
+                            | "fstype=proc"
+                            | "fstype=xfs"
+                            | "fstype=btrfs"
+                            | "fstype=other"
+                    )
+                    && fields[3].strip_prefix("kernel_type=").is_some_and(|value| {
+                        value == "unknown"
+                            || (!value.is_empty()
+                                && value.len() <= 16
+                                && value.bytes().all(|b| b.is_ascii_hexdigit()))
+                    })
+                    && matches!(fields[4], "ro=true" | "ro=false")
+                {
+                    let report = format!("maco containment guardian root: {}", fields.join(" "));
+                    if !messages.contains(&report) {
+                        messages.push(report);
+                    }
+                }
+                continue;
+            }
+            let Some(message) = line.strip_prefix("maco containment guardian: ") else {
+                continue;
+            };
+            for literal in ["fail_guardian \"", "fail_isolated_root \""]
+                .into_iter()
+                .flat_map(|prefix| SYSTEMD_GUARDIAN_SCRIPT.split(prefix).skip(1))
+            {
+                let Some((literal, _)) = literal.split_once('"') else {
+                    continue;
+                };
+                let (safe, dynamic) = match literal.split_once(": $sandbox_path") {
+                    Some((safe, _)) => (safe, true),
+                    None => (literal, false),
+                };
+                if (!dynamic && message == safe)
+                    || (dynamic
+                        && message
+                            .strip_prefix(safe)
+                            .is_some_and(|suffix| suffix.starts_with(": ")))
+                {
+                    let report = format!("maco containment guardian: {safe}");
+                    if !messages.contains(&report) {
+                        messages.push(report);
+                    }
+                    break;
+                }
+            }
+        }
+        format!(
+            "{stage}; bounded guardian stderr bytes={count} capacity_reached={} messages={messages:?}; other stderr redacted",
+            count == bytes.len(),
+        )
+    }
+
+    fn confirm_attached_inner(
         &mut self,
         child: &mut Child,
         operation_deadline: Option<Instant>,
@@ -832,6 +1153,16 @@ impl SystemdUnit {
                 if self.sandbox.is_some() && !self.sandbox_verified {
                     self.verify_effective_sandbox()?;
                     self.sandbox_verified = true;
+                    // Only this successful native verification can issue pending proof.
+                    self.pending_read_only = self.prepared_read_only.take().map(|prepared| {
+                        Box::new(VerifiedReadOnlyFilesystem {
+                            prepared: prepared.prepared,
+                            evidence: ReadOnlyFilesystemEvidence {
+                                facts: prepared.facts,
+                                native_entry: self.prepared_native_entry.clone(),
+                            },
+                        })
+                    });
                 }
                 #[cfg(test)]
                 if env::var_os("MACO_TEST_ABORT_BEFORE_START_RELEASE").is_some() {
@@ -877,7 +1208,12 @@ impl SystemdUnit {
             &self.name,
             SYSTEMD_SANDBOX_SHOW_PROPERTIES,
         )?;
-        verify_systemd_sandbox_properties(sandbox, &properties, &self.runtime_dir)
+        verify_systemd_sandbox_properties(
+            sandbox,
+            &properties,
+            &self.runtime_dir,
+            self.isolated_root.as_ref().map(tempfile::TempDir::path),
+        )
     }
 
     fn release_start_gate(
@@ -886,7 +1222,39 @@ impl SystemdUnit {
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
+        // Immutable-entry authenticity revalidation is required before FIFO release, but it
+        // must not consume the 3s platform start-gate grace. Enforce the original total
+        // operation deadline around that work, then start platform grace after it returns.
+        if cancellation.is_cancelled() {
+            return Err(io::Error::new(
+                io::ErrorKind::Interrupted,
+                "sealed native start gate was cancelled",
+            ));
+        }
+        enforce_total_operation_deadline(operation_deadline)?;
+        if let Some(entry) = &self.prepared_native_entry {
+            entry.revalidate()?;
+            if cancellation.is_cancelled() {
+                return Err(io::Error::new(
+                    io::ErrorKind::Interrupted,
+                    "sealed native start gate was cancelled",
+                ));
+            }
+            enforce_total_operation_deadline(operation_deadline).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "sealed native start gate exceeded the operation deadline",
+                )
+            })?;
+        }
         let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+        if let Some(sandbox) = &self.sandbox {
+            // The verified read-only mount owns the inode now. Remove the private
+            // host pathname before releasing any target; retain only read handles.
+            for snapshot in &sandbox.read_only_input_snapshots {
+                snapshot.unlink_before_release()?;
+            }
+        }
         remove_file_if_present(&self.environment_file).map_err(|error| {
             std::io::Error::new(
                 error.kind(),
@@ -1043,7 +1411,9 @@ impl SystemdUnit {
 
     fn cleanup(&mut self, _child: &mut Child, label: &str, context: &str) -> TreeCleanup {
         if self.cleaned {
+            self.pending_read_only.take();
             return TreeCleanup {
+                read_only: None,
                 error: None,
                 process_tree: ProcessTreeEvidence::VerifiedEmpty(
                     ContainmentBackend::SystemdUserService,
@@ -1053,17 +1423,34 @@ impl SystemdUnit {
                 ),
             };
         }
-        let error = self.kill_and_verify(label, context).err().map(|error| {
+        let mut error = self.kill_and_verify(label, context).err().map(|error| {
             format!(
                 "{label} {context} could not verify empty systemd containment unit {}: {error}",
                 self.name
             )
         });
+        if let Some(entry) = &self.prepared_native_entry {
+            if let Err(source) = entry.revalidate() {
+                error = append_error(
+                    error,
+                    Some(format!(
+                        "{label} {context} sealed native parent custody changed: {source}"
+                    )),
+                );
+            }
+        }
         if error.is_none() && self.observed_owned {
             self.cleaned = true;
             self.remove_runtime_files();
         }
+        let read_only = take_fresh_read_only_filesystem(
+            &mut self.pending_read_only,
+            false,
+            self.observed_owned,
+            error.is_none(),
+        );
         TreeCleanup {
+            read_only,
             process_tree: if error.is_none() && self.observed_owned {
                 ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
             } else {
@@ -1183,7 +1570,7 @@ impl SystemdUnit {
         }
     }
 
-    fn remove_runtime_files(&self) {
+    fn remove_runtime_files(&mut self) {
         for path in &self.runtime_file_paths {
             let _ = fs::remove_file(path);
         }
@@ -1197,7 +1584,41 @@ impl SystemdUnit {
         let _ = fs::remove_file(&self.ready_path);
         let _ = fs::remove_file(&self.environment_file);
         let _ = fs::remove_dir(&self.runtime_dir);
+        if let Some(root) = self.isolated_root.take() {
+            let _ = root.close();
+        }
     }
+}
+
+#[cfg(target_os = "linux")]
+fn create_gemini_isolated_root(client_runtime: &Path) -> std::io::Result<tempfile::TempDir> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let root = tempfile::Builder::new()
+        .prefix("maco-gemini-root-")
+        .tempdir_in(client_runtime)?;
+    fs::set_permissions(root.path(), fs::Permissions::from_mode(0o700))?;
+    let metadata = fs::symlink_metadata(root.path())?;
+    // SAFETY: geteuid has no preconditions and does not access Rust memory.
+    let effective_uid = unsafe { libc::geteuid() };
+    let canonical_runtime = fs::canonicalize(client_runtime)?;
+    let canonical_root = fs::canonicalize(root.path())?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_dir()
+        || metadata.uid() != effective_uid
+        || metadata.permissions().mode() & 0o777 != 0o700
+        || canonical_root.parent() != Some(canonical_runtime.as_path())
+        || canonical_root != root.path()
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "unsafe Gemini private isolated root {}",
+                root.path().display()
+            ),
+        ));
+    }
+    Ok(root)
 }
 
 #[cfg(target_os = "linux")]
@@ -1516,16 +1937,48 @@ fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
 
 #[cfg(unix)]
 fn find_trusted_unix_executable(_name: &str, candidates: &[&str]) -> Option<PathBuf> {
+    candidates.iter().find_map(|candidate| {
+        trusted_canonical_unix_executable(Path::new(candidate)).map(|_| PathBuf::from(candidate))
+    })
+}
+
+#[cfg(unix)]
+fn trusted_canonical_unix_executable(candidate: &Path) -> Option<PathBuf> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
-    candidates.iter().find_map(|candidate| {
-        let canonical = fs::canonicalize(candidate).ok()?;
-        let metadata = canonical.metadata().ok()?;
-        (metadata.is_file()
-            && metadata.uid() == 0
-            && metadata.permissions().mode() & 0o111 != 0
-            && metadata.permissions().mode() & 0o022 == 0)
-            .then(|| PathBuf::from(candidate))
+    let canonical = fs::canonicalize(candidate).ok()?;
+    let metadata = canonical.metadata().ok()?;
+    (metadata.is_file()
+        && metadata.uid() == 0
+        && metadata.permissions().mode() & 0o111 != 0
+        && metadata.permissions().mode() & 0o022 == 0)
+        .then_some(canonical)
+}
+
+#[cfg(unix)]
+fn find_trusted_nix_store_executable_in_path(name: &str, path: &OsStr) -> Option<PathBuf> {
+    env::split_paths(path)
+        .filter(|directory| directory.is_absolute() && directory.starts_with("/nix/store"))
+        .find_map(|directory| {
+            let directory = fs::canonicalize(directory).ok()?;
+            if !directory.starts_with("/nix/store") {
+                return None;
+            }
+            let candidate = directory.join(name);
+            let canonical = trusted_canonical_unix_executable(&candidate)?;
+            canonical.starts_with("/nix/store").then_some(candidate)
+        })
+}
+
+#[cfg(unix)]
+fn required_trusted_nix_store_executable(name: &str, path: &OsStr) -> io::Result<PathBuf> {
+    find_trusted_nix_store_executable_in_path(name, path).ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "isolated host view requires trusted {name} from an absolute Nix-store PATH entry"
+            ),
+        )
     })
 }
 
@@ -1561,6 +2014,7 @@ fn environment_with_private_runtime_home(
     set_home: bool,
     set_codex_home: bool,
     set_grok_home: bool,
+    set_cursor_home: bool,
     staged_codex_home: Option<&Path>,
 ) -> std::io::Result<EnvironmentMode> {
     let runtime_dir = runtime_dir.to_str().ok_or_else(|| {
@@ -1583,10 +2037,7 @@ fn environment_with_private_runtime_home(
             home.to_str().ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    format!(
-                        "staged Codex home is not valid UTF-8: {}",
-                        home.display()
-                    ),
+                    format!("staged Codex home is not valid UTF-8: {}", home.display()),
                 )
             })
         })
@@ -1607,6 +2058,19 @@ fn environment_with_private_runtime_home(
     }
     if set_grok_home {
         values.insert("GROK_HOME".to_string(), runtime_dir.to_string());
+    }
+    if set_cursor_home {
+        values.insert("HOME".to_string(), runtime_dir.to_string());
+        values.insert("TMPDIR".to_string(), runtime_dir.to_string());
+        values.insert(
+            "CURSOR_CONFIG_DIR".to_string(),
+            format!("{runtime_dir}/.cursor"),
+        );
+        values.insert("AGENT_CLI_CREDENTIAL_STORE".to_string(), "file".to_string());
+        values.insert(
+            "MACO_CURSOR_PARENT_SOCKET".to_string(),
+            format!("{runtime_dir}/maco-cursor-parent.sock"),
+        );
     }
     Ok(if clear {
         EnvironmentMode::ClearAndSet(values)
@@ -1776,17 +2240,31 @@ fn systemd_runtime_max(timeout: Option<Duration>) -> std::io::Result<Duration> {
 }
 
 #[cfg(target_os = "linux")]
-fn bounded_operation_deadline(
-    platform_grace: Duration,
-    operation_deadline: Option<Instant>,
-) -> std::io::Result<Instant> {
-    let now = Instant::now();
-    if operation_deadline.is_some_and(|deadline| now >= deadline) {
+fn enforce_total_operation_deadline(operation_deadline: Option<Instant>) -> std::io::Result<()> {
+    if operation_deadline.is_some_and(|deadline| Instant::now() >= deadline) {
         return Err(std::io::Error::new(
             std::io::ErrorKind::TimedOut,
             "the total operation deadline was exhausted during containment setup",
         ));
     }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn bounded_operation_deadline(
+    platform_grace: Duration,
+    operation_deadline: Option<Instant>,
+) -> std::io::Result<Instant> {
+    enforce_total_operation_deadline(operation_deadline)?;
+    clamp_platform_operation_deadline(Instant::now(), platform_grace, operation_deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn clamp_platform_operation_deadline(
+    now: Instant,
+    platform_grace: Duration,
+    operation_deadline: Option<Instant>,
+) -> std::io::Result<Instant> {
     let platform_deadline = now.checked_add(platform_grace).ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
@@ -2425,6 +2903,8 @@ impl PreparedChildIo {
             std::io::Error::other("failed to open contained interactive stdin pipe")
         })?;
         Ok(ContainedProcessSession {
+            #[cfg(target_os = "linux")]
+            peer_binding: None,
             label: label.to_string(),
             cancellation,
             operation_deadline,
@@ -2452,7 +2932,25 @@ impl PreparedChildIo {
 /// All fields are private and the value is constructed only after containment attachment and the
 /// start gate. The callback receives `&mut ContainedProcessSession`, so neither this value nor any
 /// stdio handle can be retained after [`run_process_interactive`] returns.
+/// Read-only identities exposed while a strict Linux target remains blocked at its start gate.
+pub(crate) struct ContainedProcessStartGate<'a> {
+    runtime_directory: &'a Path,
+    cgroup_path: &'a Path,
+}
+
+impl ContainedProcessStartGate<'_> {
+    pub(crate) fn runtime_directory(&self) -> &Path {
+        self.runtime_directory
+    }
+
+    pub(crate) fn cgroup_path(&self) -> &Path {
+        self.cgroup_path
+    }
+}
+
 pub(crate) struct ContainedProcessSession<'a> {
+    #[cfg(target_os = "linux")]
+    peer_binding: Option<(u32, String, PathBuf)>,
     label: String,
     cancellation: &'a ProcessCancellation,
     operation_deadline: Option<Instant>,
@@ -2465,7 +2963,89 @@ pub(crate) struct ContainedProcessSession<'a> {
     output_drainers: OutputDrainers,
 }
 
+#[cfg(target_os = "linux")]
+fn private_peer_start_refusal(
+    expected: &str,
+    observed: anyhow::Result<String>,
+) -> Option<&'static str> {
+    match observed {
+        Ok(observed) if observed == expected => None,
+        Ok(observed) => Some(match (expected.split_once(':'), observed.split_once(':')) {
+            (Some((boot, ticks)), Some((observed_boot, observed_ticks)))
+                if boot != observed_boot && ticks == observed_ticks =>
+            {
+                "private peer identity mismatch: peer_start_boot_changed"
+            }
+            (Some((boot, ticks)), Some((observed_boot, observed_ticks)))
+                if boot == observed_boot && ticks != observed_ticks =>
+            {
+                "private peer identity mismatch: peer_start_ticks_changed"
+            }
+            _ => "private peer identity mismatch: peer_start_changed",
+        }),
+        Err(_) => Some("private peer identity mismatch: peer_start_read_failed"),
+    }
+}
+
 impl ContainedProcessSession<'_> {
+    /// Verify the kernel peer against the guardian's exact target PID, its
+    /// start-time identity and owned cgroup. Only the Gemini profile fills it.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn verify_private_peer(
+        &mut self,
+        stream: &std::os::unix::net::UnixStream,
+    ) -> Result<(), String> {
+        use std::os::fd::AsRawFd;
+        self.ensure_interactive_live()?;
+        let (pid, start, cgroup) = self
+            .peer_binding
+            .as_ref()
+            .ok_or("private peer lacks verified containment")?;
+        let mut credentials: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut length = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: writable ucred storage and its exact size are passed to getsockopt.
+        let result = unsafe {
+            libc::getsockopt(
+                stream.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut credentials as *mut libc::ucred).cast(),
+                &mut length,
+            )
+        };
+        let refusal = if result != 0 {
+            Some("private peer identity mismatch: peercred_syscall")
+        } else if length as usize != std::mem::size_of::<libc::ucred>() {
+            Some("private peer identity mismatch: peercred_length")
+        } else if u32::try_from(credentials.pid).ok() != Some(*pid) {
+            Some("private peer identity mismatch: peer_pid")
+        } else if credentials.uid != unsafe { libc::geteuid() } {
+            Some("private peer identity mismatch: peer_uid")
+        } else if let Some(reason) =
+            private_peer_start_refusal(start, crate::agent_lifecycle::process_start_time(*pid))
+        {
+            Some(reason)
+        } else if !fs::read_to_string(cgroup.join("cgroup.procs"))
+            .map_err(|_| "private peer cgroup unavailable")?
+            .lines()
+            .any(|line| line.trim() == pid.to_string())
+        {
+            Some("private peer identity mismatch: cgroup_membership")
+        } else {
+            None
+        };
+        if let Some(refusal) = refusal {
+            return self.fail_io(refusal);
+        }
+        Ok(())
+    }
+
+    pub(crate) fn check_private_channel_live(&mut self) -> Result<(), String> {
+        self.ensure_interactive_live()?;
+        self.output_drainers.drain_ready();
+        Ok(())
+    }
+
     pub(crate) fn receive_line(
         &mut self,
         wait: Duration,
@@ -3387,4 +3967,31 @@ impl BoundedBuffer {
 
 fn duration_millis(duration: Duration) -> u64 {
     duration.as_millis().min(u64::MAX as u128) as u64
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod start_gate_deadline_phase_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn platform_start_gate_grace_is_clamped_from_the_supplied_now() {
+        let now = Instant::now();
+        let remaining_total = now + Duration::from_secs(90);
+        let deadline =
+            clamp_platform_operation_deadline(now, SYSTEMD_OPERATION_GRACE, Some(remaining_total))
+                .expect("platform grace should fit inside Instant");
+        assert_eq!(deadline, now + SYSTEMD_OPERATION_GRACE);
+        assert!(deadline < remaining_total);
+    }
+
+    #[test]
+    fn remaining_total_operation_deadline_still_caps_platform_grace() {
+        let now = Instant::now();
+        let remaining_total = now + Duration::from_millis(250);
+        let deadline =
+            clamp_platform_operation_deadline(now, SYSTEMD_OPERATION_GRACE, Some(remaining_total))
+                .expect("short remaining total should still be representable");
+        assert_eq!(deadline, remaining_total);
+    }
 }

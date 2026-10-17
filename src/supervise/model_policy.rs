@@ -245,34 +245,8 @@ impl ModelCapabilityPolicy {
 /// model. `gpt-5.6-terra` is recorded as ineligible: weaker than luna on
 /// agentic coding and more expensive per solved task.
 pub fn default_model_capability_policy() -> ModelCapabilityPolicy {
-    ModelCapabilityPolicy {
-        id: "maco-default-model-capability-v1".to_string(),
-        version: 1,
-        source: "agent-registry#38 dated 2026-07/08 priors; cost per accepted task".to_string(),
-        models: vec![
-            ModelCapabilityEvidence {
-                model: super::FRONTIER_PROFILE_MODEL.to_string(),
-                capability: ModelCapabilityClass::CriticalJudgment,
-                eligible: true,
-                evidence: "repo-task pass 63.7%; SWE-Bench Pro 64.6%; planner/gate tier".to_string(),
-                as_of: "2026-08-17".to_string(),
-            },
-            ModelCapabilityEvidence {
-                model: super::ECONOMY_PROFILE_MODEL.to_string(),
-                capability: ModelCapabilityClass::GeneralJudgment,
-                eligible: true,
-                evidence: "Coding Agent Index 75 at ~20% of Sol per-task cost; Terminal-Bench 2.1 84.7%; SWE-Bench Pro 62.7%; tightly specified leaves only".to_string(),
-                as_of: "2026-08-17".to_string(),
-            },
-            ModelCapabilityEvidence {
-                model: super::BALANCED_PROFILE_MODEL.to_string(),
-                capability: ModelCapabilityClass::WeakMechanical,
-                eligible: false,
-                evidence: "agentic rank #112/302; repo-task pass 40.7%; ~2.65x tokens/solved task so higher cost per accepted task than Sol; do not use".to_string(),
-                as_of: "2026-08-17".to_string(),
-            },
-        ],
-    }
+    ModelCapabilityPolicy::from_json(include_bytes!("../selection/data/model-capabilities.json"))
+        .expect("bundled dated model capability data must validate")
 }
 
 #[derive(Default)]
@@ -520,6 +494,14 @@ pub fn authorize_resolved_judgment_model(
         return validate_known_judgment_role_model(role, Some(model));
     }
     match (runtime, observation) {
+        // An explicitly fake, model-less selection is deterministic simulation,
+        // including the catalog's empty-candidate PreferredModel resolution.
+        // Configured and resolved slugs still take the capability checks.
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::PreferredModel
+            | super::ModelResolutionObservation::RuntimeDefault,
+        ) if configured_model.is_none() => Ok(()),
         (
             super::SupervisorRuntime::Fake,
             super::ModelResolutionObservation::LocalDeterministicFake,
@@ -537,6 +519,10 @@ pub fn authorize_resolved_judgment_model(
 /// close the adapter skip without treating unclassified adapter slugs (Grok
 /// `grok-4.6`) as mechanical.
 pub fn recorded_model_is_weak_mechanical(model: &str) -> bool {
+    // A historical tier is a recommendation, not a physical adapter constraint.
+    if crate::selection::routing_policy::current_routing_policy().is_some() {
+        return false;
+    }
     matches!(
         recorded_model_capability_class(model),
         Some(ModelCapabilityClass::WeakMechanical)
@@ -561,6 +547,13 @@ pub fn authorize_resolved_executor_model(
         return authorize_known_executor_role_model(role, Some(model), mechanical_duty);
     }
     match (runtime, observation) {
+        // The CLI fake runtime has no provider model to authorize. Admit only
+        // resolved, model-less simulation; never infer real-runtime authority.
+        (
+            super::SupervisorRuntime::Fake,
+            super::ModelResolutionObservation::PreferredModel
+            | super::ModelResolutionObservation::RuntimeDefault,
+        ) if configured_model.is_none() => Ok(()),
         (
             super::SupervisorRuntime::Fake,
             super::ModelResolutionObservation::LocalDeterministicFake,
@@ -584,6 +577,9 @@ pub fn authorize_known_executor_role_model(
             role.as_str()
         );
     };
+    if crate::selection::routing_policy::current_routing_policy().is_some() {
+        return crate::selection::routing_policy::validate_selected_model(role.as_str(), model);
+    }
     reject_static_tier_override_of_measured(role, model)?;
     let Some(capability) = trusted_model_capability(model) else {
         bail!("model '{model}' has no trusted capability policy");
@@ -656,6 +652,9 @@ pub fn validate_known_judgment_role_model(role: AgentRole, model: Option<&str>) 
             role.as_str()
         );
     };
+    if crate::selection::routing_policy::current_routing_policy().is_some() {
+        return crate::selection::routing_policy::validate_selected_model(role.as_str(), model);
+    }
     reject_static_tier_override_of_measured(role, model)?;
     let Some(capability) = trusted_model_capability(model) else {
         bail!("model '{model}' has no trusted capability policy");
@@ -1008,6 +1007,115 @@ mod tests {
             SupervisorRuntime::Codex,
         )
         .expect_err("unknown resolved slugs stay fail-closed");
+    }
+
+    #[test]
+    fn model_less_fake_binding_is_resolved_simulation_only() {
+        for observation in [
+            ModelResolutionObservation::PreferredModel,
+            ModelResolutionObservation::RuntimeDefault,
+            ModelResolutionObservation::LocalDeterministicFake,
+        ] {
+            for result in [
+                authorize_resolved_executor_model(
+                    AgentRole::ChildOrchestrator,
+                    None,
+                    None,
+                    observation,
+                    SupervisorRuntime::Fake,
+                    None,
+                ),
+                authorize_resolved_judgment_model(
+                    AgentRole::ChildOrchestrator,
+                    None,
+                    None,
+                    observation,
+                    SupervisorRuntime::Fake,
+                ),
+            ] {
+                result.expect("explicit model-less fake resolution is simulation");
+            }
+            for runtime in [
+                SupervisorRuntime::Codex,
+                SupervisorRuntime::Grok,
+                SupervisorRuntime::Cursor,
+                SupervisorRuntime::ClaudeCode,
+                SupervisorRuntime::GeminiCli,
+            ] {
+                for result in [
+                    authorize_resolved_executor_model(
+                        AgentRole::ChildOrchestrator,
+                        None,
+                        None,
+                        observation,
+                        runtime,
+                        None,
+                    ),
+                    authorize_resolved_judgment_model(
+                        AgentRole::ChildOrchestrator,
+                        None,
+                        None,
+                        observation,
+                        runtime,
+                    ),
+                ] {
+                    let error = result.expect_err("real runtimes require model identity");
+                    assert!(error
+                        .to_string()
+                        .contains("without an authoritative trusted model identity"));
+                }
+            }
+        }
+        for observation in [
+            ModelResolutionObservation::NotResolved,
+            ModelResolutionObservation::CatalogFallback,
+        ] {
+            assert!(authorize_resolved_executor_model(
+                AgentRole::ChildOrchestrator,
+                None,
+                None,
+                observation,
+                SupervisorRuntime::Fake,
+                None,
+            )
+            .is_err());
+            assert!(authorize_resolved_judgment_model(
+                AgentRole::ChildOrchestrator,
+                None,
+                None,
+                observation,
+                SupervisorRuntime::Fake,
+            )
+            .is_err());
+        }
+    }
+
+    #[test]
+    fn fake_binding_keeps_configured_and_resolved_role_prohibitions() {
+        let model = "fixture-fake-bind-weak-mechanical";
+        let _guard = install_test_fixture_models(&[(model, ModelCapabilityClass::WeakMechanical)])
+            .expect("install mechanical-only fixture");
+        for (configured, resolved) in [(Some(model), None), (None, Some(model))] {
+            for result in [
+                authorize_resolved_executor_model(
+                    AgentRole::ChildOrchestrator,
+                    configured,
+                    resolved,
+                    ModelResolutionObservation::RuntimeDefault,
+                    SupervisorRuntime::Fake,
+                    None,
+                ),
+                authorize_resolved_judgment_model(
+                    AgentRole::ChildOrchestrator,
+                    configured,
+                    resolved,
+                    ModelResolutionObservation::RuntimeDefault,
+                    SupervisorRuntime::Fake,
+                ),
+            ] {
+                result.expect_err("fake runtime must not hide a model's role prohibition");
+            }
+        }
     }
 
     #[test]

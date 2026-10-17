@@ -6,10 +6,45 @@
 //! runtime selection a vendor enum again.
 
 mod capabilities;
+pub(crate) mod claude;
 pub mod cursor;
+#[cfg(target_os = "linux")]
+#[path = "cursor/managed_parent.rs"]
+pub(crate) mod cursor_managed_parent;
+pub mod gemini;
 pub mod grok;
 pub(crate) mod grok_acp;
 pub mod hosted_callback;
+
+/// Exact owned bootstrap selection. This is not a capability or identity claim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeminiBootstrapDescriptor;
+
+impl GeminiBootstrapDescriptor {
+    pub(crate) const NODE: &str =
+        "/nix/store/6x6v11xjf0psckgqmyhfyhw9bdma0rn6-nodejs-22.22.2/bin/node";
+    pub(crate) const NODE_RESOLVED: &str =
+        "/nix/store/vs03s8q30qg698zzpbszk08j4shb0gsl-nodejs-slim-22.22.2/bin/node";
+    pub(crate) const NODE_SHA256: &str =
+        "ee614b3f5d9fb5aa59845aa18fb620e5b259a3cd907353b4fd43d904a76c5191";
+    pub(crate) const GEMINI: &str =
+        "/nix/store/xxd1smzi0a54ldwpc3l8d4v7k2bgjcpl-gemini-cli-0.41.2/bin/gemini";
+    pub(crate) const BOOTSTRAP: &str = include_str!("gemini_managed_bootstrap.mjs");
+    pub(crate) const WIRE: &str = include_str!("gemini_code_assist_wire.mjs");
+
+    pub(crate) fn select(config: &RuntimeAdapterConfig, program: &Path) -> Result<Self> {
+        let mut expected = RuntimeAdapterConfig::defaults_for(AdapterId::GeminiCli);
+        expected.binary = config.binary.clone();
+        if config != &expected
+            || std::fs::canonicalize(program)? != std::fs::canonicalize(Self::GEMINI)?
+        {
+            bail!(
+                "Gemini managed bootstrap requires the exact pinned executable and default adapter arguments"
+            );
+        }
+        Ok(Self)
+    }
+}
 
 pub use capabilities::{
     parse_adapter_allowlist, registered_adapter_ids, AdapterId, AdapterTrustClass,
@@ -356,12 +391,41 @@ pub enum OutputCaptureMode {
     StdoutAndStderr,
 }
 
+/// Parent-owned evidence from one managed Cursor bridge operation.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(default, rename_all = "camelCase", deny_unknown_fields)]
+pub struct CursorManagedParentEvidence {
+    pub peer_verified: bool,
+    pub shared_services_acks: u64,
+    pub shared_services_refusals: u64,
+    pub session_resource_acks: u64,
+    pub admitted_attempts: u64,
+    pub captured_events: u64,
+    pub completed_attempts: u64,
+    pub refused_actions: u64,
+    pub filesystem_reads: u64,
+    pub filesystem_writes: u64,
+    pub offline_checks: u64,
+    pub client_selected_model: Option<String>,
+    pub client_selected_effort: Option<String>,
+    pub actual_provider_model: Option<String>,
+    pub actual_effort: Option<String>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+    pub cache_write_tokens: Option<u64>,
+    pub usage_attempts_covered: u64,
+    pub usage_attempts_incomplete: u64,
+    pub usage_is_incomplete: Option<bool>,
+    pub usd: Option<String>,
+}
+
 #[cfg(test)]
 const GROK_NO_SUBAGENTS_ARG: &str = "--no-subagents";
 #[cfg(test)]
 const GROK_ALWAYS_APPROVE_ARG: &str = "--always-approve";
 
-/// A model/effort runtime identity whose launch contract is known precisely.
+/// A native protocol identity whose launch contract is known precisely.
 ///
 /// This identity is not capability evidence by itself. Call
 /// [`RuntimeAdapterConfig::typed_runtime_contract`] to obtain the opaque proof
@@ -369,29 +433,23 @@ const GROK_ALWAYS_APPROVE_ARG: &str = "--always-approve";
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum TypedRuntime {
+    /// Retained wire identity; live admission uses the protocol descriptor.
     #[serde(rename = "grok-4.6-xhigh")]
     Grok46Xhigh,
+    /// Retained wire identity; live admission uses the protocol descriptor.
     #[serde(rename = "grok-4.7-xhigh")]
     Grok47Xhigh,
+    GrokHeadlessStreamingJson,
+    GrokAcpStdio,
 }
 
 impl TypedRuntime {
     pub const fn adapter_id(self) -> AdapterId {
         match self {
-            Self::Grok46Xhigh | Self::Grok47Xhigh => AdapterId::Grok,
-        }
-    }
-
-    pub const fn model(self) -> &'static str {
-        match self {
-            Self::Grok46Xhigh => "grok-4.6",
-            Self::Grok47Xhigh => "grok-4.7",
-        }
-    }
-
-    pub const fn reasoning_effort(self) -> &'static str {
-        match self {
-            Self::Grok46Xhigh | Self::Grok47Xhigh => "xhigh",
+            Self::Grok46Xhigh
+            | Self::Grok47Xhigh
+            | Self::GrokHeadlessStreamingJson
+            | Self::GrokAcpStdio => AdapterId::Grok,
         }
     }
 
@@ -399,11 +457,9 @@ impl TypedRuntime {
         if adapter != AdapterId::Grok {
             return None;
         }
-        match model {
-            Some("grok-4.6") => Some(Self::Grok46Xhigh),
-            Some("grok-4.7") => Some(Self::Grok47Xhigh),
-            _ => None,
-        }
+        let model = model?;
+        grok::GrokModelCatalogEntry::new(model, model).ok()?;
+        Some(Self::GrokHeadlessStreamingJson)
     }
 
     pub fn from_launch(
@@ -411,8 +467,17 @@ impl TypedRuntime {
         model: Option<&str>,
         reasoning_effort: Option<&str>,
     ) -> Option<Self> {
-        let runtime = Self::from_model(adapter, model)?;
-        (reasoning_effort == Some(runtime.reasoning_effort())).then_some(runtime)
+        // These are native canonical spellings, not a preference or a per-model
+        // support claim. Account access and the selected model's effort menu
+        // remain separate admission inputs. Aliased option ids need an explicit
+        // provider mapping before they reach this canonical boundary.
+        if !matches!(
+            reasoning_effort,
+            Some("none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max")
+        ) {
+            return None;
+        }
+        Self::from_model(adapter, model)
     }
 }
 
@@ -443,19 +508,18 @@ impl TypedRuntimeContract {
     /// Capability elevation is available only after the adapter proof exists.
     pub const fn capabilities(self) -> RuntimeCapabilities {
         match self.runtime {
-            TypedRuntime::Grok46Xhigh => RuntimeCapabilities::GROK_4_6_XHIGH,
-            TypedRuntime::Grok47Xhigh => RuntimeCapabilities::GROK_4_7_XHIGH,
+            TypedRuntime::GrokAcpStdio => RuntimeCapabilities::GROK_ACP,
+            _ => RuntimeCapabilities::GROK_HEADLESS,
         }
     }
 
     /// Parse the output protocol selected by this proof. The Grok parser
     /// enforces byte, line, event-count, and terminal-event bounds.
     pub fn parse_output(self, bytes: &[u8]) -> Result<grok::GrokParsedEventStream> {
-        match self.runtime {
-            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh => {
-                grok::parse_grok_event_stream(bytes)
-            }
+        if self.runtime == TypedRuntime::GrokAcpStdio {
+            bail!("Grok ACP requires parent protocol evidence, not a headless event stream");
         }
+        grok::parse_grok_event_stream(bytes)
     }
 
     /// Exact native Grok spend status for a bounded stream. Codex usage events
@@ -517,17 +581,9 @@ impl RuntimeAdapterConfig {
                 true,
             ),
             AdapterId::ClaudeCode => (
-                vec![
-                    "-p".into(),
-                    "--output-format".into(),
-                    "json".into(),
-                    "--model".into(),
-                    "{model}".into(),
-                    "--effort".into(),
-                    "{effort}".into(),
-                ],
-                // claude --print writes the JSON envelope to stdout; there is no
-                // --output file flag and no --cwd flag. Prompt text is fed on stdin.
+                claude::immutable_argument_template(),
+                // The pinned fresh bare Worker emits raw stream-json on stdout.
+                // Prompt text is fed on stdin and cwd remains process-owned.
                 OutputCaptureMode::Stdout,
                 true,
             ),
@@ -545,8 +601,13 @@ impl RuntimeAdapterConfig {
             ),
             AdapterId::Codex | AdapterId::Fake => (Vec::new(), OutputCaptureMode::default(), false),
         };
+        let binary = if adapter == AdapterId::ClaudeCode {
+            claude::CLAUDE_NATIVE_EXECUTABLE
+        } else {
+            adapter.default_binary()
+        };
         Self {
-            binary: Some(PathBuf::from(adapter.default_binary())),
+            binary: Some(PathBuf::from(binary)),
             argument_template: template,
             env_passthrough: Vec::new(),
             working_dir_flag: None,
@@ -589,10 +650,14 @@ impl RuntimeAdapterConfig {
         lookup: impl Fn(&str) -> Result<String, env::VarError>,
     ) -> Result<Self> {
         let mut config = Self::load_adapter_environment(adapter, &lookup);
-        if adapter == AdapterId::Grok {
-            config.grok_interaction_protocol =
-                grok_interaction_protocol_from_operator_env(&lookup)?;
-            config.restore_immutable_grok_descriptor();
+        match adapter {
+            AdapterId::Grok => {
+                config.grok_interaction_protocol =
+                    grok_interaction_protocol_from_operator_env(&lookup)?;
+                config.restore_immutable_grok_descriptor();
+            }
+            AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            _ => {}
         }
         Ok(config)
     }
@@ -630,14 +695,16 @@ impl RuntimeAdapterConfig {
         if let Ok(stdin) = lookup(&format!("{prefix}_STDIN_PROMPT")) {
             config.feed_prompt_on_stdin = matches!(stdin.as_str(), "1" | "true" | "stdin");
         }
-        if adapter == AdapterId::Grok {
-            config.restore_immutable_grok_descriptor();
+        match adapter {
+            AdapterId::Grok => config.restore_immutable_grok_descriptor(),
+            AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            _ => {}
         }
         config
     }
 
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
-        if adapter == AdapterId::Grok {
+        if matches!(adapter, AdapterId::Grok | AdapterId::ClaudeCode) {
             return;
         }
         self.argument_template = args.split_whitespace().map(str::to_string).collect();
@@ -655,6 +722,24 @@ impl RuntimeAdapterConfig {
         self.working_dir_flag = None;
         self.output_capture = OutputCaptureMode::Stdout;
         self.feed_prompt_on_stdin = false;
+    }
+
+    fn restore_immutable_claude_descriptor(&mut self) {
+        self.binary = Some(PathBuf::from(claude::CLAUDE_NATIVE_EXECUTABLE));
+        self.argument_template = claude::immutable_argument_template();
+        self.env_passthrough.clear();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = true;
+    }
+
+    /// Prove one exact fresh bare Claude managed-Worker invocation. This does
+    /// not alter the static Claude capability row or admit primary writes.
+    pub(crate) fn claude_managed_launch_contract(
+        &self,
+        context: &LaunchContext<'_>,
+    ) -> Option<claude::ClaudeManagedLaunchContract> {
+        claude::prove_managed_launch(self, context)
     }
 
     pub const fn grok_interaction_protocol(&self) -> GrokInteractionProtocol {
@@ -700,7 +785,7 @@ impl RuntimeAdapterConfig {
     ) -> Option<TypedRuntimeContract> {
         let runtime = TypedRuntime::from_launch(adapter, context.model, context.effort)?;
         match runtime {
-            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh => {
+            TypedRuntime::GrokHeadlessStreamingJson => {
                 if !context.cwd.is_absolute()
                     || !self.env_passthrough.is_empty()
                     || self.feed_prompt_on_stdin
@@ -719,16 +804,9 @@ impl RuntimeAdapterConfig {
                 expected_config.restore_immutable_grok_descriptor();
                 match self.grok_interaction_protocol {
                     GrokInteractionProtocol::AcpStdio => {
-                        if runtime == TypedRuntime::Grok47Xhigh {
-                            return None;
-                        }
-                        // ACP structured output is parent/protocol-owned, never an argv flag.
-                        let actual = self.render(context).ok()?;
-                        let expected = expected_config.render(context).ok()?;
-                        if actual != expected {
-                            return None;
-                        }
-                        Some(TypedRuntimeContract { runtime })
+                        // ACP uses different identity/output/permission evidence.
+                        // A headless descriptor cannot qualify that protocol.
+                        None
                     }
                     GrokInteractionProtocol::HeadlessStreamingJson => {
                         let actual = self
@@ -744,7 +822,66 @@ impl RuntimeAdapterConfig {
                     }
                 }
             }
+            TypedRuntime::Grok46Xhigh | TypedRuntime::Grok47Xhigh | TypedRuntime::GrokAcpStdio => {
+                None
+            }
         }
+    }
+
+    /// ACP proof is separate from the generic headless admission surface. The
+    /// caller must deliver this forced environment to the contained process;
+    /// `grok_acp_process_contract` rechecks the actual prepared launch.
+    pub(crate) fn grok_acp_runtime_contract(
+        &self,
+        context: &LaunchContext<'_>,
+        environment: &BTreeMap<String, String>,
+    ) -> Option<TypedRuntimeContract> {
+        TypedRuntime::from_launch(AdapterId::Grok, context.model, context.effort)?;
+        if self.grok_interaction_protocol != GrokInteractionProtocol::AcpStdio
+            || !context.cwd.is_absolute()
+        {
+            return None;
+        }
+        let mut expected = Self::defaults_for(AdapterId::Grok);
+        expected.binary = self.binary.clone();
+        expected.grok_interaction_protocol = GrokInteractionProtocol::AcpStdio;
+        expected.restore_immutable_grok_descriptor();
+        if self != &expected
+            || grok::GROK_ACP_RUNTIME_DESCRIPTOR
+                .required_environment()
+                .iter()
+                .any(|(key, value)| environment.get(key) != Some(value))
+        {
+            return None;
+        }
+        Some(TypedRuntimeContract {
+            runtime: TypedRuntime::GrokAcpStdio,
+        })
+    }
+
+    /// Executable identity, selected account and OS confinement are separately
+    /// enforced by the external-agent launch gates. This proof binds the ACP
+    /// descriptor, interactive transport, cwd and forced environment to the
+    /// actual process about to enter that runner.
+    pub(crate) fn grok_acp_process_contract(
+        &self,
+        context: &LaunchContext<'_>,
+        process: &crate::process_runner::ProcessSpec,
+    ) -> Option<TypedRuntimeContract> {
+        use crate::process_runner::{EnvironmentMode, ProcessCommand, StdinMode};
+        let EnvironmentMode::ClearAndSet(environment) = &process.environment else {
+            return None;
+        };
+        let ProcessCommand::Direct { args, .. } = &process.command else {
+            return None;
+        };
+        if process.current_dir != context.cwd
+            || process.stdin != StdinMode::Interactive
+            || *args != self.render_os_argv(context).ok()?
+        {
+            return None;
+        }
+        self.grok_acp_runtime_contract(context, environment)
     }
 
     /// Capabilities for one concrete launch. Static adapter capabilities remain
@@ -878,6 +1015,34 @@ impl RuntimeAdapterConfig {
             .into_iter()
             .map(OsString::from)
             .collect())
+    }
+
+    /// Render the only Cursor argv admitted by the managed bridge. Operator
+    /// argv, environment, cwd-flag, capture, and stdin overrides are refused;
+    /// the selected executable pathname remains the source-pin input.
+    pub(crate) fn render_managed_cursor_argv(
+        &self,
+        context: &LaunchContext<'_>,
+    ) -> Result<Vec<String>> {
+        let mut expected = Self::defaults_for(AdapterId::Cursor);
+        expected.binary = self.binary.clone();
+        if self.env_passthrough != expected.env_passthrough
+            || self.working_dir_flag != expected.working_dir_flag
+            || self.output_capture != OutputCaptureMode::Stdout
+            || !self.feed_prompt_on_stdin
+            || self.grok_interaction_protocol != GrokInteractionProtocol::default()
+            || self.argument_template != Self::defaults_for(AdapterId::Cursor).argument_template
+        {
+            bail!("managed Cursor refuses operator launch overrides");
+        }
+        if !context.cwd.is_absolute() {
+            bail!("managed Cursor workspace must be absolute");
+        }
+        // The bound 414/357/361/156 chunk set belongs to Cursor's hidden ACP
+        // command. Print mode loads a different, unbound constructor and is not
+        // an admissible substitute. Model and effort travel in the parent ACP
+        // session requests rather than on the vendor command line.
+        Ok(vec!["acp".to_string()])
     }
 
     /// Fail-closed argv for a subprocess runtime. Callers must propagate the
@@ -1109,7 +1274,7 @@ fn denied_passthrough_env_reason(name: &str) -> Option<&'static str> {
         | "RUSTC_WORKSPACE_WRAPPER"
         | "GIT_EXEC_PATH"
         | "GIT_TEMPLATE_DIR" => Some("shell-startup or interpreter code-loading hook"),
-        "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
+        "ANTHROPIC_API_KEY" | "OPENAI_API_KEY" | "CODEX_API_KEY" | "CODEX_ACCESS_TOKEN" => {
             Some("credential name tracked by the redactor")
         }
         _ => None,
@@ -1136,6 +1301,194 @@ fn resolve_binary(binary: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use std::fs;
+
+    #[test]
+    fn grok_protocol_identity_preserves_legacy_wire_values_without_live_preference_gates(
+    ) -> Result<()> {
+        for (wire, legacy) in [
+            ("grok-4.6-xhigh", TypedRuntime::Grok46Xhigh),
+            ("grok-4.7-xhigh", TypedRuntime::Grok47Xhigh),
+        ] {
+            let encoded = serde_json::to_string(&legacy)?;
+            assert_eq!(encoded, format!("\"{wire}\""));
+            assert_eq!(serde_json::from_str::<TypedRuntime>(&encoded)?, legacy);
+        }
+        for (model, effort) in [
+            ("grok-4.7", "high"),
+            ("grok-4.7-build-fast", "low"),
+            ("grok-4.5", "medium"),
+            ("fixture-native-menu", "none"),
+        ] {
+            assert_eq!(
+                TypedRuntime::from_launch(AdapterId::Grok, Some(model), Some(effort)),
+                Some(TypedRuntime::GrokHeadlessStreamingJson)
+            );
+        }
+        // An option id has no implicit mapping to a canonical effort value.
+        assert!(
+            TypedRuntime::from_launch(AdapterId::Grok, Some("grok-4.7"), Some("deep")).is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn grok_headless_proof_does_not_qualify_acp_by_model_name() -> Result<()> {
+        let config = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "acp_stdio")],
+        )?;
+        for (model, effort) in [
+            ("grok-4.6", "xhigh"),
+            ("grok-4.7", "high"),
+            ("grok-4.7-build-fast", "low"),
+        ] {
+            let context = launch_context(
+                Path::new("prompt.txt"),
+                Some(model),
+                Some(effort),
+                Path::new("/tmp/work"),
+                Path::new("out.txt"),
+            );
+            let launch = config.render(&context)?;
+            assert!(launch.argv.iter().any(|argument| argument == "stdio"));
+            assert!(config
+                .typed_runtime_contract(AdapterId::Grok, &context)
+                .is_none());
+            assert_eq!(
+                config.capabilities_for_launch(AdapterId::Grok, &context),
+                AdapterId::Grok.capabilities()
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn grok_acp_proof_binds_actual_process_and_keeps_protocols_distinct() -> Result<()> {
+        use crate::process_runner::{EnvironmentMode, ProcessCommand, ProcessSpec, StdinMode};
+        let config = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::Grok,
+            &[("MACO_GROK_INTERACTION_PROTOCOL", "acp_stdio")],
+        )?;
+        let workspace = tempfile::tempdir()?;
+        let context = launch_context(
+            Path::new("prompt.txt"),
+            Some("fixture-catalog-model"),
+            Some("high"),
+            workspace.path(),
+            Path::new("out.txt"),
+        );
+        // Forced values replace conflicting enablement while preserving other
+        // admitted environment values. They are delivered to the process, not
+        // merely supplied to a proof-only predicate.
+        let mut environment = BTreeMap::from([
+            ("GROK_SUBAGENTS".to_string(), "1".to_string()),
+            ("GROK_MEMORY".to_string(), "1".to_string()),
+            ("OTHER".to_string(), "retained".to_string()),
+        ]);
+        grok::GROK_ACP_RUNTIME_DESCRIPTOR.apply_required_environment(&mut environment);
+        assert_eq!(
+            environment.get("OTHER").map(String::as_str),
+            Some("retained")
+        );
+        let process = ProcessSpec::direct(
+            "ACP proof fixture",
+            config.binary_path(),
+            config.render_os_argv(&context)?,
+            context.cwd,
+            1024,
+        )
+        .with_environment(EnvironmentMode::ClearAndSet(environment))
+        .with_stdin(StdinMode::Interactive);
+        let proof = config
+            .grok_acp_process_contract(&context, &process)
+            .expect("immutable ACP process has a distinct bounded proof");
+        assert_eq!(proof.runtime(), TypedRuntime::GrokAcpStdio);
+        assert!(proof.subagents_disabled());
+        assert_eq!(
+            proof.capabilities().side_effect_confinement,
+            SideEffectConfinement::Verified
+        );
+        assert_eq!(
+            proof.capabilities().blocking_pre_action_callback,
+            BlockingPreActionCallback::None
+        );
+        assert_eq!(
+            proof.capabilities().session_resume,
+            SessionResume::Unsupported
+        );
+        assert!(proof.parse_output(b"{\"type\":\"done\"}\n").is_err());
+        assert!(proof.usage_status(b"{}").is_err());
+        assert!(config
+            .typed_runtime_contract(AdapterId::Grok, &context)
+            .is_none());
+        assert_eq!(
+            config.capabilities_for_launch(AdapterId::Grok, &context),
+            AdapterId::Grok.capabilities()
+        );
+        for key in ["GROK_SUBAGENTS", "GROK_MEMORY"] {
+            for value in [None, Some("1")] {
+                let mut changed = process.clone();
+                let EnvironmentMode::ClearAndSet(environment) = &mut changed.environment else {
+                    unreachable!();
+                };
+                match value {
+                    Some(value) => {
+                        environment.insert(key.to_string(), value.to_string());
+                    }
+                    None => {
+                        environment.remove(key);
+                    }
+                }
+                assert!(
+                    config
+                        .grok_acp_process_contract(&context, &changed)
+                        .is_none(),
+                    "{key}={value:?}"
+                );
+            }
+        }
+        let mut changed = process.clone();
+        changed.environment = EnvironmentMode::Inherit;
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        changed.current_dir = workspace.path().join("elsewhere");
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        changed.stdin = StdinMode::Null;
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        changed = process.clone();
+        let ProcessCommand::Direct { args, .. } = &mut changed.command else {
+            unreachable!();
+        };
+        args.push("--leader".into());
+        assert!(config
+            .grok_acp_process_contract(&context, &changed)
+            .is_none());
+        let mut changed_config = config.clone();
+        changed_config
+            .env_passthrough
+            .push("GROK_SUBAGENTS".to_string());
+        assert!(changed_config
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
+        changed_config = config.clone();
+        changed_config
+            .argument_template
+            .retain(|arg| arg != "--no-leader");
+        assert!(changed_config
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
+        assert!(RuntimeAdapterConfig::defaults_for(AdapterId::Grok)
+            .grok_acp_process_contract(&context, &process)
+            .is_none());
+        Ok(())
+    }
 
     #[test]
     fn selection_precedence_is_cli_then_assignment_then_codex() {
@@ -1175,6 +1528,7 @@ mod tests {
         assert_eq!(
             config.argument_template,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "{prompt}",
                 "--model",
@@ -1204,6 +1558,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1253,6 +1608,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1310,6 +1666,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--reasoning-effort",
@@ -1341,6 +1698,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--cwd",
@@ -1448,6 +1806,7 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--prompt-file",
                 "prompt.txt",
                 "--model",
@@ -1643,13 +2002,12 @@ mod tests {
         assert_eq!(
             spec.argv,
             [
+                "--no-auto-update",
                 "--sandbox",
                 "strict",
-                "--always-approve",
                 "--disable-web-search",
-                "--no-memory",
-                "--no-subagents",
                 "agent",
+                "--always-approve",
                 "--no-leader",
                 "-m",
                 "grok-4.6",
@@ -1758,26 +2116,21 @@ mod tests {
     }
 
     #[test]
-    fn claude_defaults_match_print_json_and_feed_prompt_on_stdin() -> Result<()> {
+    fn claude_defaults_match_contained_native_worker_and_feed_prompt_on_stdin() -> Result<()> {
         let adapter = ClaudeCodeAdapter::from_environment();
         assert_eq!(adapter.adapter_id(), AdapterId::ClaudeCode);
         assert_eq!(adapter.capabilities(), RuntimeCapabilities::CLAUDE_CODE);
         assert!(!adapter.capabilities().admits_writable_release());
         let config = adapter.config();
-        assert_eq!(config.binary_path(), Path::new("claude"));
+        assert_eq!(
+            config.binary_path(),
+            Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+        );
         assert_eq!(config.output_capture, OutputCaptureMode::Stdout);
         assert!(config.feed_prompt_on_stdin);
         assert_eq!(
             config.argument_template,
-            [
-                "-p",
-                "--output-format",
-                "json",
-                "--model",
-                "{model}",
-                "--effort",
-                "{effort}",
-            ]
+            claude::immutable_argument_template()
         );
 
         let spec = config.render(&launch_context(
@@ -1792,7 +2145,18 @@ mod tests {
             [
                 "-p",
                 "--output-format",
-                "json",
+                "stream-json",
+                "--verbose",
+                "--include-partial-messages",
+                "--bare",
+                "--setting-sources",
+                "",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--tools",
+                "Read,Glob,Grep,Edit,Write",
+                "--allowedTools",
+                "Read,Glob,Grep,Edit,Write",
                 "--model",
                 "sonnet",
                 "--effort",
@@ -1803,6 +2167,21 @@ mod tests {
             .argv
             .iter()
             .any(|arg| arg == "--output" || arg == "--cwd"));
+        for forbidden in [
+            "--resume",
+            "--continue",
+            "--add-dir",
+            "--plugin-dir",
+            "--permission-mode",
+            "Agent",
+            "Task",
+            "Bash",
+            "WebFetch",
+            "WebSearch",
+        ] {
+            assert!(!spec.argv.iter().any(|argument| argument == forbidden));
+        }
+        assert!(config.env_passthrough.is_empty());
         Ok(())
     }
 
@@ -2053,6 +2432,7 @@ mod tests {
         assert_eq!(
             argv,
             [
+                OsString::from("--no-auto-update"),
                 OsString::from("--prompt-file"),
                 OsString::from("prompt.txt"),
                 OsString::from("--model"),
@@ -2234,7 +2614,11 @@ mod tests {
             assert_eq!(adapter.capabilities(), id.capabilities());
             assert_eq!(
                 adapter.config().binary_path(),
-                Path::new(id.default_binary())
+                if id == AdapterId::ClaudeCode {
+                    Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+                } else {
+                    Path::new(id.default_binary())
+                }
             );
             assert!(
                 !adapter.capabilities().admits_writable_release(),
@@ -2251,7 +2635,14 @@ mod tests {
     fn shared_conformance_suite_covers_every_known_adapter() -> Result<()> {
         for adapter in AdapterId::ALL {
             let config = RuntimeAdapterConfig::defaults_for(adapter);
-            assert_eq!(config.binary_path(), Path::new(adapter.default_binary()));
+            assert_eq!(
+                config.binary_path(),
+                if adapter == AdapterId::ClaudeCode {
+                    Path::new(claude::CLAUDE_NATIVE_EXECUTABLE)
+                } else {
+                    Path::new(adapter.default_binary())
+                }
+            );
             assert!(
                 adapter.capabilities().writable_refusal().is_some(),
                 "{adapter} must refuse primary-writable release until a hosted All-callback exists"
@@ -2282,7 +2673,14 @@ mod tests {
                 Path::new("/tmp/work"),
                 Path::new("out.txt"),
             ))?;
-            assert_eq!(spec.program, PathBuf::from(adapter.default_binary()));
+            assert_eq!(
+                spec.program,
+                PathBuf::from(if adapter == AdapterId::ClaudeCode {
+                    claude::CLAUDE_NATIVE_EXECUTABLE
+                } else {
+                    adapter.default_binary()
+                })
+            );
             assert_eq!(spec.cwd, PathBuf::from("/tmp/work"));
         }
         Ok(())
@@ -2370,6 +2768,14 @@ mod tests {
             &[
                 "--print",
                 "--output-format",
+                "--verbose",
+                "--include-partial-messages",
+                "--bare",
+                "--setting-sources",
+                "--strict-mcp-config",
+                "--disable-slash-commands",
+                "--tools",
+                "--allowedTools",
                 "--model",
                 "--effort",
                 "--resume",
@@ -2454,7 +2860,7 @@ mod tests {
             return;
         }
         assert_claude_help_contract(
-            &require_installed_cli_help("claude"),
+            &require_installed_cli_help(claude::CLAUDE_NATIVE_EXECUTABLE),
             "installed claude help",
         );
     }

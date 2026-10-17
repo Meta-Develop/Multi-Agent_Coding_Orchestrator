@@ -17,6 +17,7 @@ use crate::error::Error;
 use crate::login::LoginService;
 use crate::providers::claude_code::ClaudeCodeAdapter;
 use crate::providers::codex_cli::CodexCliAdapter;
+use crate::providers::cursor::CursorAdapter;
 use crate::providers::gemini_cli::GeminiCliAdapter;
 use crate::providers::grok_cli::GrokCliAdapter;
 
@@ -108,6 +109,7 @@ pub struct GeminiLoginPort {
     service: LoginService,
     adapter: GeminiCliAdapter,
     claude: ClaudeCodeAdapter,
+    cursor: CursorAdapter,
 }
 
 impl GeminiLoginPort {
@@ -121,11 +123,60 @@ impl GeminiLoginPort {
             service,
             adapter,
             claude,
+            cursor: CursorAdapter::default(),
         }
+    }
+
+    /// Use an explicitly configured Cursor adapter for managed login.
+    pub fn with_cursor_adapter(mut self, cursor: CursorAdapter) -> Self {
+        self.cursor = cursor;
+        self
     }
 }
 
 impl LoginPort for GeminiLoginPort {
+    fn start_with_browser_mode(
+        &self,
+        request: crate::login::LoginStartRequest,
+        browser_mode: crate::login::LoginBrowserMode,
+    ) -> crate::error::Result<crate::login::LoginStatus> {
+        if browser_mode == crate::login::LoginBrowserMode::Automatic {
+            return self.start(request);
+        }
+        match request.provider_id.as_str() {
+            "gemini-cli" => {
+                self.service
+                    .start_with_browser_mode(request, &self.adapter, browser_mode)
+            }
+            "codex-cli" => self.service.start_pending_oauth_with_browser_mode(
+                request,
+                &CodexCliAdapter::default(),
+                browser_mode,
+            ),
+            "grok-cli" => self.service.start_pending_oauth_with_browser_mode(
+                request,
+                &GrokCliAdapter::default(),
+                browser_mode,
+            ),
+            "cursor" => self.service.start_pending_oauth_with_browser_mode(
+                request,
+                &self.cursor,
+                browser_mode,
+            ),
+            _ => Err(crate::error::Error::NotImplemented(
+                "caller-managed browser login",
+            )),
+        }
+    }
+
+    fn authorization(
+        &self,
+        handle: &crate::login::LoginHandle,
+        binding: &crate::login::LoginAccountBinding,
+    ) -> crate::error::Result<Option<crate::login::LoginAuthorization>> {
+        self.service.authorization(handle, binding)
+    }
+
     fn start(
         &self,
         request: crate::login::LoginStartRequest,
@@ -139,8 +190,8 @@ impl LoginPort for GeminiLoginPort {
             "grok-cli" => self
                 .service
                 .start_pending_oauth(request, &GrokCliAdapter::default()),
-            // cursor and github-copilot are allow-listed; PendingOAuthLogin
-            // is not implemented.
+            "cursor" => self.service.start_pending_oauth(request, &self.cursor),
+            // github-copilot is allow-listed; PendingOAuthLogin is not implemented.
             _ => Err(Error::NotImplemented("login.start")),
         }
     }

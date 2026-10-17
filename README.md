@@ -29,6 +29,50 @@ reviewable and recoverable:
 
 ## Current Status
 
+### Quickstart: one supervised Codex task on Linux
+
+`maco init`, `maco repo`, `maco llm`, and `maco supervise plan` stay local, including on Windows. `maco supervise run` needs Linux. The process must already sit in a delegated systemd user manager (`user@<uid>.service` on the unified cgroup v2 hierarchy). Windows refuses writable-runtime admission before spawn.
+
+Operator command sequence for that host, including Codex and Grok: [operator quickstart](docs/OPERATOR_QUICKSTART.md).
+
+That Linux host also needs:
+
+- an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
+- root-owned, non-writable, executable `systemd-run`, `systemctl`, `sh`, `env`, `sleep`, `stat`, and `findmnt` at `/usr/bin`, `/bin`, or `/run/current-system/sw/bin`
+- logical `codex` at `/usr/bin/codex`, `/bin/codex`, or `/run/current-system/sw/bin/codex` (root-owned, executable, not group- or world-writable, not a symlink). Catalog preflight runs `codex debug models` with a 30-second limit
+- `MACO_CAM_AUTHORITY_SOCKET` left unset for default CAM discovery
+
+Without a CAM authority service (both the implicit socket and its `maco` parent absent), MACO uses the local CAM registry selection if one exists; otherwise Codex uses `$CODEX_HOME/auth.json` or `~/.codex/auth.json` (a non-symlink regular file). An installed CAM authority service at `/run/user/<uid>/maco/account-authority.sock` is used and must be healthy; see [packaging](docs/PACKAGING.md).
+
+Reviewed `machine-global.json` (version 1). The root named by `--machine-global-runtime-root-id` is an existing canonical directory inside `/run/user/<uid>`. `state_root` is a different owner-private `0700` directory and does not overlap that root. The config file is current-user-owned, has one hard link, and is not group- or world-writable.
+
+```json
+{
+  "version": 1,
+  "state_root": "/run/user/1000/maco-task/state",
+  "roots": [
+    {
+      "id": "runtime",
+      "path": "/run/user/1000/maco-task/runtime",
+      "protected_paths": [],
+      "quarantine_grace_seconds": 86400
+    }
+  ]
+}
+```
+
+`1000` is the operator uid. Create both directories before launch. `goal.md` is the goal file read by `--from-goal`.
+
+```bash
+maco supervise run --runtime codex --repo . --run-id one-task \
+  --from-goal goal.md --codex-bin codex \
+  --machine-global-config /exact/path/to/machine-global.json \
+  --machine-global-runtime-root-id runtime --json
+maco supervise collect one-task --repo . --json
+```
+
+The durable report is `.maco/o2/runs/one-task/reports/supervisor-final.json`. `supervise run` exits successfully only when its printed cascade has `follow_up_cascade_success` set to true; otherwise it exits with `supervise run failed`.
+
 The current implementation covers a local-first command-line slice:
 
 - `maco init` initializes a Git repository.
@@ -115,7 +159,28 @@ The current implementation covers a local-first command-line slice:
   successful zero-diff result. Reports must attest read-only execution and no
   further delegation; reported or observed changes are rejected. Other runtimes
   and primary-worktree execution are refused. Generated goal/provider lowering
-  does not emit Researchers. Execution-phase implementation children retain native workspace-write and their
+  does not emit Researchers. For source packets, an operator-authored Researcher assignment
+  may declare `"source_inputs": [{"path": "review-packets/source.diff", "sha256": "<64 lowercase hex digits>"}]`.
+  These are exact, non-hidden, repo-relative regular files **already present in the selected
+  managed snapshot**, not parent-machine paths. Prepare/commit the packet in the chosen
+  source snapshot before launching; an untracked packet in a different checkout is unavailable.
+  No files are copied automatically and prose paths grant no mounts. At most eight nonempty
+  files of 1 MiB each are accepted; duplicate paths, traversal, symlinks, hard-link aliases,
+  unknown fields (including writable access), and hash mismatches are refused.
+  The parent checks the snapshot, then reads each entire file with the actual read-only child
+  confinement profile before provider dispatch and revalidates identity/content before release.
+  The probe and target mount private copies of the same verified bytes at each declared path;
+  later host-side in-place writes cannot replace the packet visible to the target. A verified,
+  quiescent local-only input refusal releases the unused provider reservation as `NotStarted`.
+  Unverified helper ownership remains conservative and cannot authorize cleanup or acceptance.
+  `researcher_input_receipts` in the private execution artifact record path, SHA256, byte count,
+  file identity and profile visibility. Receipts establish preparation only; the Researcher must
+  still inspect the substantive source and pass the existing independent acceptance gates.
+  A prelaunch refusal has no provider launch evidence; it is not an observed zero-token response.
+  Source inputs cannot be declared by nested Workers and do not change credential, network,
+  write, delegation or publication authority. Legacy plans without this optional declaration
+  retain their behavior; only explicitly declared packets receive this prelaunch guarantee.
+  Execution-phase implementation children retain native workspace-write and their
   existing bounded writable Git metadata; the optional app-server duplex
   reviewer is not their release path. Writable access to the
   primary checkout remains fail-closed because Codex cannot force a blocking
@@ -824,7 +889,7 @@ crosses away from its declared root's mount is refused.
   "roots": [
     {
       "id": "runtime-sessions",
-      "path": "/srv/agent-runtime/sessions",
+      "path": "/run/user/1000/maco/runtime-sessions",
       "protected_paths": [
         {
           "coordinate": {
@@ -3919,11 +3984,12 @@ The shipped spine is `maco <instruction>`, `maco supervise run`, and
 `--from-goal <file>` through the same planner as `supervise plan`, then
 executes the validated plan through the live supervisor gates. Pass
 `--runtime fake` for the deterministic in-process Fake runtime. A bare
-`maco <instruction>` is an explicit live Codex launch: the rewriter injects
-`--runtime codex` after `--literal-goal` and treats extra words as goal
-text. Omitting `--runtime` on `supervise run` sniffs a loadable plan
-assignment runtime and otherwise fail-closes, naming `--runtime`; it does
-not silently choose Codex for `--literal-goal` or `--from-goal`. Omitting
+`maco <instruction>` routes through `--literal-goal`, with extra words kept
+as goal text. New goal/spec runs without `--runtime` use provider-neutral,
+account-bound normal intake and the loaded routing policy before dispatch;
+required account, model, and admission evidence must pass the existing gates.
+Explicit `--runtime` retains operator selection; positional plans and resumed
+runs retain plan-runtime sniffing when it is omitted. Omitting
 `--codex-bin` does not select Fake. Stay local with
 `supervise run --literal-goal ... --runtime fake`.
 Explicit `supervise run` must name the reviewed machine-global

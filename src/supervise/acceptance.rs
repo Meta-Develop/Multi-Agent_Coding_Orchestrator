@@ -327,9 +327,45 @@ pub(super) fn assignment_attempt_report_role(role: AgentRole, evidence_only: boo
     }
 }
 
+enum ChildReportSource {
+    CapturedBytes,
+    ManagedParentParsed(Box<Result<ParsedReport<OrchestratorReviewReport>>>),
+}
+
 pub(super) fn collect_child_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report_from_source(context, runtime, ChildReportSource::CapturedBytes)
+}
+
+pub(super) fn collect_managed_parent_report_for_runtime(
+    context: ChildReportCollectionContext<'_>,
+    runtime: SupervisorRuntime,
+    parsed: Result<ParsedReport<OrchestratorReviewReport>>,
+) -> (OrchestratorReviewReport, Vec<String>) {
+    collect_child_report_from_source(
+        context,
+        runtime,
+        ChildReportSource::ManagedParentParsed(Box::new(parsed)),
+    )
+}
+
+fn managed_parent_continuation_admitted(
+    assignment: &OrchestratorAssignment,
+    runtime: SupervisorRuntime,
+    evidence_only: bool,
+) -> bool {
+    assignment.role == AgentRole::ChildOrchestrator
+        && !assignment.worker_assignments.is_empty()
+        && runtime == SupervisorRuntime::Codex
+        && !evidence_only
+}
+
+fn collect_child_report_from_source(
+    context: ChildReportCollectionContext<'_>,
+    runtime: SupervisorRuntime,
+    source: ChildReportSource,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let ChildReportCollectionContext {
         assignment,
@@ -360,23 +396,52 @@ pub(super) fn collect_child_report_for_runtime(
         assignment_attempt_report_role(assignment.role, evidence_only_source.is_some());
     let direct_worker = report_role == AgentRole::Worker
         && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker);
+    let managed_parent_admitted = matches!(source, ChildReportSource::ManagedParentParsed(_))
+        && managed_parent_continuation_admitted(
+            assignment,
+            runtime,
+            evidence_only_source.is_some(),
+        );
     let mut report_shape_problems = Vec::new();
-    let parsed_report = if direct_worker {
-        read_direct_worker_report(external_run.output_last_message(), report_path).map(|parsed| {
-            let mut worker = parsed.report;
-            reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
-            reject_worker_asserted_grok_acp_parent_evidence(report_path, &mut worker);
-            reject_worker_asserted_codex_parent_evidence(report_path, &mut worker);
-            reject_worker_asserted_fixed_version_probe_evidence(report_path, &mut worker);
-            ParsedReport {
-                report: direct_worker_report_envelope(worker),
-                recovered: parsed.recovered,
+    let parsed_report = match source {
+        ChildReportSource::CapturedBytes => {
+            if direct_worker {
+                read_direct_worker_report(external_run.output_last_message(), report_path).map(
+                    |parsed| {
+                        let mut worker = parsed.report;
+                        reject_worker_asserted_grok_stream_usage_evidence(report_path, &mut worker);
+                        reject_worker_asserted_grok_acp_parent_evidence(report_path, &mut worker);
+                        reject_worker_asserted_codex_parent_evidence(report_path, &mut worker);
+                        reject_worker_asserted_fixed_version_probe_evidence(
+                            report_path,
+                            &mut worker,
+                        );
+                        ParsedReport {
+                            report: direct_worker_report_envelope(worker),
+                            recovered: parsed.recovered,
+                        }
+                    },
+                )
+            } else if assignment.role == AgentRole::Researcher {
+                if runtime == SupervisorRuntime::GeminiCli && external_command.uses_gemini_bridge()
+                {
+                    read_researcher_native_report(external_run.output_last_message(), report_path)
+                } else {
+                    read_researcher_report(external_run.output_last_message(), report_path)
+                }
+            } else {
+                read_child_report(external_run.output_last_message(), report_path)
             }
-        })
-    } else if assignment.role == AgentRole::Researcher {
-        read_researcher_report(external_run.output_last_message(), report_path)
-    } else {
-        read_child_report(external_run.output_last_message(), report_path)
+        }
+        ChildReportSource::ManagedParentParsed(parsed) => {
+            if managed_parent_admitted {
+                *parsed
+            } else {
+                Err(anyhow!(
+                    "managed parent continuation is restricted to a Codex child orchestrator with authored workers and no evidence-only source"
+                ))
+            }
+        }
     };
     let mut report = match parsed_report {
         Ok(parsed) => {
@@ -477,6 +542,18 @@ pub(super) fn collect_child_report_for_runtime(
             paths: vec![report_path.to_path_buf()],
         });
     }
+    if managed_parent_admitted && !report.audit_reports.is_empty() {
+        report.audit_reports.clear();
+        report.status = ReviewStatus::Failed;
+        report.accepted = false;
+        report.rejected = true;
+        report.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "child report attempted to self-assert supervisor-owned audit reports"
+                .to_string(),
+            paths: vec![report_path.to_path_buf()],
+        });
+    }
     if report.licensed_breakage_review.take().is_some()
         || !report.generated_follow_up_tasks.is_empty()
     {
@@ -512,6 +589,30 @@ pub(super) fn collect_child_report_for_runtime(
                 &report,
                 external_run.codex_command_execution_evidence(),
             )
+        } else if runtime == SupervisorRuntime::GeminiCli {
+            crate::external_agent::gemini_bridge::verify_read_only_evidence(
+                external_run,
+                external_command,
+                report.status == ReviewStatus::Succeeded,
+            )
+            .and_then(|paths| {
+                if !report.commands_run.is_empty() || !report.validation_results.is_empty() {
+                    bail!("Gemini native research cannot attest shell or check commands");
+                }
+                for assigned in &assignment.assigned_paths {
+                    if report.status == ReviewStatus::Succeeded
+                        && !paths
+                            .iter()
+                            .any(|p| p == assigned || p.starts_with(assigned))
+                    {
+                        bail!(
+                            "Gemini native research did not read assigned path {}",
+                            assigned.display()
+                        );
+                    }
+                }
+                Ok(())
+            })
         } else {
             Err(anyhow!(
                 "researcher command evidence requires a trusted read-only Codex launch"
@@ -530,11 +631,50 @@ pub(super) fn collect_child_report_for_runtime(
             });
         }
     }
+    if runtime == SupervisorRuntime::GeminiCli
+        && external_command.workspace_access == WorkspaceAccess::ReadOnly
+        && assignment.role != AgentRole::Researcher
+    {
+        let native = crate::external_agent::gemini_bridge::verify_read_only_evidence(
+            external_run,
+            external_command,
+            false,
+        )
+        .and_then(|_| {
+            if !report.commands_run.is_empty()
+                || report
+                    .validation_results
+                    .iter()
+                    .any(|v| !v.command.is_empty())
+            {
+                bail!("Gemini read-only review cannot attest shell or check commands");
+            }
+            Ok(())
+        });
+        if let Err(error) = native {
+            let message = format!("Gemini read-only review custody rejected: {error:#}");
+            report_shape_problems.push(message.clone());
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+    }
     validate_worker_report_evidence(assignment, assignment_metadata, report_path, &mut report);
     validate_assignment_report_plumbing(assignment, assignment_metadata, report_path, &mut report);
     if let Some(source) = evidence_only_source {
         validate_evidence_only_report_preservation(source, report_path, &mut report);
     } else {
+        validate_worker_journal_worktree_binding(
+            worker_journals,
+            worktree_path,
+            child_base_head,
+            &mut report,
+        );
         validate_worker_execution_journal_evidence(
             assignment,
             report_path,
@@ -943,10 +1083,25 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 handoff: handoff.clone(),
                 operator_defaults: generated_follow_up_operator_defaults(),
             };
+            // The scheduler binds and propagates this validated parent policy.
+            // Legacy unassessed inputs remain unassessed and fail closed at selection.
+            let resolved_routing_policy = crate::selection::routing_policy::current_routing_policy();
+            let task_routing_assessment = resolved_routing_policy
+                .as_ref()
+                .filter(|frozen| frozen.policy.task_estimation.is_some())
+                .map(|frozen| {
+                    GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+                        &ordinary_plan,
+                        frozen,
+                    )
+                })
+                .transpose()?;
             let mut supervisor_plan = GeneratedFollowUpSupervisorPlan {
                 version: ordinary_plan.version,
                 task: ordinary_plan.task.clone(),
                 task_file: ordinary_plan.task_file.clone(),
+                resolved_routing_policy,
+                task_routing_assessment,
                 max_depth: ordinary_plan.max_depth,
                 max_child_assignments: ordinary_plan.max_child_assignments,
                 max_child_retries: ordinary_plan.max_child_retries,
@@ -976,6 +1131,10 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 || loaded.plan_metadata.run_budget != supervisor_plan.run_budget
                 || loaded.plan_metadata.generated_follow_up
                     != Some(supervisor_plan.generated_follow_up.clone())
+                || loaded.plan_metadata.resolved_routing_policy
+                    != supervisor_plan.resolved_routing_policy
+                || loaded.plan_metadata.task_routing_assessment
+                    != supervisor_plan.task_routing_assessment
             {
                 bail!("generated follow-up supervisor plan changed across the ordinary plan loader");
             }
@@ -1091,6 +1250,34 @@ pub(super) fn collect_parent_auditor_report(
     reject_auditor_asserted_grok_stream_usage_evidence(report_path, &mut report);
     reject_auditor_asserted_grok_acp_parent_evidence(report_path, &mut report);
     reject_auditor_asserted_codex_parent_evidence(report_path, &mut report);
+    if runtime == SupervisorRuntime::GeminiCli {
+        let native = crate::external_agent::gemini_bridge::verify_read_only_evidence(
+            external_run,
+            external_command,
+            false,
+        )
+        .and_then(|_| {
+            if !report.commands_run.is_empty()
+                || report
+                    .validation_results
+                    .iter()
+                    .any(|v| !v.command.is_empty())
+            {
+                bail!("Gemini native auditor cannot attest shell or check commands");
+            }
+            Ok(())
+        });
+        if let Err(error) = native {
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: format!("Gemini native auditor custody rejected: {error:#}"),
+                paths: vec![report_path.to_path_buf()],
+            });
+        }
+    }
     if command_records_contain_fixed_version_probe_evidence(&report.commands_run) {
         strip_fixed_version_probe_evidence_from_command_records(&mut report.commands_run);
         report.status = ReviewStatus::Failed;
@@ -1118,6 +1305,7 @@ pub(super) fn review_lens_verdict_from_auditor(
     expected_request: &ReviewLensRequest,
     expected_auditor_id: &str,
     report: &AuditorReport,
+    parent_process_record: &CommandRunRecord,
     licensed_breakage_review: Option<&LicensedBreakageReview>,
     process_procedural_failure: bool,
 ) -> Result<ReviewLensVerdict> {
@@ -1164,8 +1352,7 @@ pub(super) fn review_lens_verdict_from_auditor(
     } else {
         vec![(
             ReviewLensEvidenceKind::ModelReview,
-            serde_json::to_string(report)
-                .context("failed to recompute parent-owned review-lens evidence")?,
+            review_lens_auditor_evidence(report, parent_process_record)?,
         )]
     };
     ReviewLensVerdict::for_lens(
@@ -1175,6 +1362,46 @@ pub(super) fn review_lens_verdict_from_auditor(
         coverage,
         evidence,
     )
+}
+
+#[derive(Serialize)]
+struct ReviewLensParentProcessReference {
+    serialized_bytes: usize,
+    sha256: String,
+}
+
+#[derive(Serialize)]
+struct ReviewLensAuditorEvidence<'a> {
+    version: u32,
+    auditor_report: &'a AuditorReport,
+    parent_process_record: ReviewLensParentProcessReference,
+}
+
+fn review_lens_auditor_evidence(
+    report: &AuditorReport,
+    parent_process_record: &CommandRunRecord,
+) -> Result<String> {
+    // Collection appends this parent-owned record after the auditor's commands.
+    // Its stdout can already fill the evidence limit before JSON escaping, and
+    // includes runtime events rather than the auditor's review. Keep the full
+    // record in the collected report/logs and bind it here by content digest.
+    // Auditor-authored commands and findings remain subject to the size limit.
+    if report.commands_run.last() != Some(parent_process_record) {
+        bail!("review lens auditor report lacks its appended parent process record");
+    }
+    let mut auditor_report = report.clone();
+    auditor_report.commands_run.pop();
+    let process_bytes = serde_json::to_vec(parent_process_record)
+        .context("failed to serialize review-lens parent process record")?;
+    serde_json::to_string(&ReviewLensAuditorEvidence {
+        version: 1,
+        auditor_report: &auditor_report,
+        parent_process_record: ReviewLensParentProcessReference {
+            serialized_bytes: process_bytes.len(),
+            sha256: crate::artifacts::state_auth::sha256_hex(&process_bytes),
+        },
+    })
+    .context("failed to recompute parent-owned review-lens evidence")
 }
 
 fn auditor_accepted_licensed_breakage(
@@ -2531,14 +2758,63 @@ pub(super) fn validate_worker_report_evidence(
         "inspect worker reports and rerun the child scope with corrected evidence".to_string();
 }
 
+pub(super) fn validate_worker_journal_worktree_binding(
+    journals: &WorkerExecutionJournalEvidenceSet,
+    worktree: &Path,
+    base: &Oid,
+    report: &mut OrchestratorReviewReport,
+) {
+    for (worker_id, journal) in journals {
+        let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
+            continue;
+        };
+        let observations = entries
+            .iter()
+            .filter_map(|entry| entry.observation.as_ref())
+            .collect::<Vec<_>>();
+        if observations.is_empty() {
+            continue;
+        }
+        let binding = crate::safe_state::DirectoryBindingGuard::bind(worktree);
+        let valid = binding.as_ref().is_ok_and(|binding| {
+            observations.iter().all(|observation| {
+                observation.worktree == worktree
+                    && observation.worktree_identity == *binding.identity()
+                    && observation.head_oid.as_deref() == Some(base.to_string().as_str())
+            }) && binding.verify().is_ok()
+        });
+        if !valid {
+            let message = format!("worker '{worker_id}' journal observation is not bound to the supervisor's assigned worktree identity and base HEAD");
+            let paths = vec![journal.evidence_relative_path.clone()];
+            for worker in &mut report.worker_reports {
+                if worker.id == *worker_id {
+                    mark_worker_report_structural_inconsistency(
+                        worker,
+                        message.clone(),
+                        paths.clone(),
+                    );
+                }
+            }
+            report.status = ReviewStatus::Failed;
+            report.accepted = false;
+            report.rejected = true;
+            report.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message,
+                paths,
+            });
+        }
+    }
+}
+
 pub(super) fn validate_worker_execution_journal_evidence(
     assignment: &OrchestratorAssignment,
     report_path: &Path,
     journals: &WorkerExecutionJournalEvidenceSet,
     report: &mut OrchestratorReviewReport,
 ) {
-    if (assignment.role != AgentRole::Worker && assignment.worker_assignments.is_empty())
-        || report.worker_reports.is_empty()
+    if assignment.role != AgentRole::Worker
+        && (assignment.worker_assignments.is_empty() || report.worker_reports.is_empty())
     {
         return;
     }
@@ -2610,6 +2886,20 @@ pub(super) fn validate_worker_execution_journal_evidence(
             }
         };
 
+        if let Err(error) = validate_worker_journal_observations(entries) {
+            let message = format!(
+                "worker '{}' execution journal observation is invalid: {error:#}",
+                worker_report.id
+            );
+            let paths = vec![journal.evidence_relative_path.clone()];
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                paths.clone(),
+            );
+            blocking_messages.push((message, paths));
+            continue;
+        }
         let mut journal_paths = BTreeSet::<PathBuf>::new();
         let mut journal_unauthorized_paths = BTreeSet::<PathBuf>::new();
         for entry in entries {
@@ -2667,8 +2957,29 @@ pub(super) fn validate_worker_execution_journal_evidence(
             blocking_messages.push((message, finding_paths));
         }
 
+        canonicalize_journal_command_references(
+            &mut worker_report.commands_run,
+            &mut worker_report.validation_results,
+            journal,
+            entries,
+        );
+        canonicalize_journal_command_references(
+            &mut report.commands_run,
+            &mut report.validation_results,
+            journal,
+            entries,
+        );
         let journal_commands = entries
             .iter()
+            .filter(|entry| {
+                entry.observation.as_ref().is_none_or(|observation| {
+                    matches!(
+                        observation.phase,
+                        WorkerJournalObservationPhase::Completed
+                            | WorkerJournalObservationPhase::NativeEdit
+                    )
+                })
+            })
             .map(|entry| (entry.command.clone(), entry.cwd.clone()))
             .collect::<BTreeSet<_>>();
         let reported_commands_without_journal = worker_report
@@ -2745,6 +3056,53 @@ pub(super) fn validate_worker_execution_journal_evidence(
         }
     }
 
+    if report
+        .commands_run
+        .iter()
+        .chain(
+            report
+                .worker_reports
+                .iter()
+                .flat_map(|worker| &worker.commands_run),
+        )
+        .any(|record| journal_command::is_wrapper(&record.command))
+        || report
+            .validation_results
+            .iter()
+            .chain(
+                report
+                    .worker_reports
+                    .iter()
+                    .flat_map(|worker| &worker.validation_results),
+            )
+            .any(|validation| journal_command::is_wrapper(&validation.command))
+    {
+        blocking_messages.push((
+            "report command references contain journal wrappers unsupported by execution journal evidence"
+                .to_string(),
+            vec![report_path.to_path_buf()],
+        ));
+    }
+
+    // Finalization takes command evidence from the single nested worker. An
+    // envelope may omit that duplicate list, but must not contradict it.
+    if assignment.role == AgentRole::Worker {
+        let problem = match report.worker_reports.as_slice() {
+            [worker] if worker.id == assignment.id && report.id == worker.id => {
+                (!(report.commands_run.is_empty() || report.commands_run == worker.commands_run)
+                    || report.validation_results != worker.validation_results)
+                    .then(|| "direct worker envelope and its single nested report disagree after journal command canonicalization".to_string())
+            }
+            _ => Some(format!(
+                "direct worker envelope must contain exactly one report bound to assignment '{}' (found {} WorkerReport entries)",
+                assignment.id, report.worker_reports.len()
+            )),
+        };
+        if let Some(message) = problem {
+            blocking_messages.push((message, vec![report_path.to_path_buf()]));
+        }
+    }
+
     if blocking_messages.is_empty() {
         return;
     }
@@ -2764,6 +3122,32 @@ pub(super) fn validate_worker_execution_journal_evidence(
     report.next_safe_action =
         "inspect worker execution journals and rerun the child scope with corrected process evidence"
             .to_string();
+}
+
+fn canonicalize_journal_command_references(
+    commands: &mut [CommandRunRecord],
+    validations: &mut [ValidationResult],
+    journal: &WorkerExecutionJournalEvidence,
+    entries: &[WorkerExecutionJournalEntry],
+) {
+    for record in commands {
+        if let Some(command) = journal_command::canonicalize_wrapper(record, journal, entries) {
+            record.command = command;
+        }
+    }
+    // ValidationResult has no cwd; use the launcher's bound assignment cwd.
+    if let Some(binding) = &journal.command_binding {
+        for validation in validations {
+            if let Some(command) = journal_command::canonicalize_command(
+                &validation.command,
+                &binding.cwd,
+                journal,
+                entries,
+            ) {
+                validation.command = command;
+            }
+        }
+    }
 }
 
 fn mark_worker_report_structural_inconsistency(
@@ -2887,3 +3271,7 @@ pub(super) fn mark_auditor_primary_integrity_violation(
     report.next_safe_action =
         "inspect and restore the primary worktree before rerunning supervise".to_string();
 }
+
+#[cfg(test)]
+#[path = "tests/review_lens_evidence.rs"]
+mod review_lens_evidence_tests;

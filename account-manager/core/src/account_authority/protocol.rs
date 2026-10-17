@@ -19,7 +19,10 @@ use crate::account_authority::{
     SelectedAccountBinding, StoredAccountRegistry,
 };
 use crate::error::Error;
-use crate::login::{LoginAccountBinding, LoginHandle, LoginStartRequest, LoginStatus};
+use crate::login::{
+    LoginAccountBinding, LoginAuthorization, LoginBrowserMode, LoginHandle, LoginStartRequest,
+    LoginStatus,
+};
 use crate::model::{AuthKind, StoredAccountState};
 use crate::providers::{observe_selected_account, ProviderAdapter};
 use crate::storage::CredentialStore;
@@ -178,6 +181,27 @@ impl ProtocolBounds {
 /// Login seam used by dispatch so the protocol does not own OAuth.
 pub trait LoginPort: Send + Sync {
     fn start(&self, request: LoginStartRequest) -> crate::error::Result<LoginStatus>;
+
+    fn start_with_browser_mode(
+        &self,
+        request: LoginStartRequest,
+        browser_mode: LoginBrowserMode,
+    ) -> crate::error::Result<LoginStatus> {
+        match browser_mode {
+            LoginBrowserMode::Automatic => self.start(request),
+            LoginBrowserMode::CallerManaged => {
+                Err(Error::NotImplemented("caller-managed browser login"))
+            }
+        }
+    }
+
+    fn authorization(
+        &self,
+        _handle: &LoginHandle,
+        _binding: &LoginAccountBinding,
+    ) -> crate::error::Result<Option<LoginAuthorization>> {
+        Ok(None)
+    }
     fn status(
         &self,
         handle: &LoginHandle,
@@ -276,6 +300,7 @@ pub enum DecodedOperation {
         label: String,
         auth_kind: AuthKind,
         idempotency_key: String,
+        browser_mode: LoginBrowserMode,
     },
     LoginStatus {
         handle: LoginHandle,
@@ -346,6 +371,8 @@ struct LoginStartParams {
     idempotency_key: String,
     #[serde(default)]
     account_incarnation: Option<String>,
+    #[serde(default)]
+    browser_mode: LoginBrowserMode,
 }
 
 #[derive(Debug, Deserialize)]
@@ -572,6 +599,7 @@ fn decode_operation(
                 label: parsed.label,
                 auth_kind: parsed.auth_kind,
                 idempotency_key: parsed.idempotency_key,
+                browser_mode: parsed.browser_mode,
             }
         }
         "login.status" => {
@@ -752,14 +780,18 @@ pub fn dispatch(ctx: &AuthorityContext, request: &DecodedRequest) -> AuthorityRe
             label,
             auth_kind,
             idempotency_key,
+            browser_mode,
         } => login_start(
             ctx,
             &request.request_id,
-            provider_id,
-            account_id,
-            label,
-            *auth_kind,
-            idempotency_key,
+            LoginStartRequest {
+                provider_id: provider_id.clone(),
+                account_id: account_id.clone(),
+                label: label.clone(),
+                auth_kind: *auth_kind,
+                idempotency_key: idempotency_key.clone(),
+            },
+            *browser_mode,
         ),
         DecodedOperation::LoginStatus { handle, binding } => {
             login_status(ctx, &request.request_id, handle, binding)
@@ -985,11 +1017,8 @@ fn account_observe(
 fn login_start(
     ctx: &AuthorityContext,
     request_id: &str,
-    provider_id: &str,
-    account_id: &str,
-    label: &str,
-    auth_kind: AuthKind,
-    idempotency_key: &str,
+    request: LoginStartRequest,
+    browser_mode: LoginBrowserMode,
 ) -> AuthorityResponse {
     if ![
         "gemini-cli",
@@ -999,7 +1028,7 @@ fn login_start(
         "cursor",
         "github-copilot",
     ]
-    .contains(&provider_id)
+    .contains(&request.provider_id.as_str())
     {
         return AuthorityResponse::error(
             request_id,
@@ -1014,14 +1043,8 @@ fn login_start(
             "login service is not configured",
         );
     };
-    match login.start(LoginStartRequest {
-        provider_id: provider_id.to_string(),
-        account_id: account_id.to_string(),
-        label: label.to_string(),
-        auth_kind,
-        idempotency_key: idempotency_key.to_string(),
-    }) {
-        Ok(status) => login_status_result(request_id, status),
+    match login.start_with_browser_mode(request, browser_mode) {
+        Ok(status) => login_status_result(request_id, status, login.as_ref()),
         Err(error) => map_core_error(request_id, &error),
     }
 }
@@ -1040,7 +1063,7 @@ fn login_status(
         );
     };
     match login.status(handle, binding) {
-        Ok(status) => login_status_result(request_id, status),
+        Ok(status) => login_status_result(request_id, status, login.as_ref()),
         Err(error) => map_core_error(request_id, &error),
     }
 }
@@ -1059,14 +1082,32 @@ fn login_cancel(
         );
     };
     match login.cancel(handle, binding) {
-        Ok(status) => login_status_result(request_id, status),
+        Ok(status) => login_status_result(request_id, status, login.as_ref()),
         Err(error) => map_core_error(request_id, &error),
     }
 }
 
-fn login_status_result(request_id: &str, status: LoginStatus) -> AuthorityResponse {
+fn login_status_result(
+    request_id: &str,
+    status: LoginStatus,
+    login: &dyn LoginPort,
+) -> AuthorityResponse {
+    let authorization = match login.authorization(&status.handle, &status.binding) {
+        Ok(value) => value,
+        Err(error) => return map_core_error(request_id, &error),
+    };
     match serde_json::to_value(status) {
-        Ok(value) => AuthorityResponse::result(request_id, value),
+        Ok(mut value) => {
+            if let Some(authorization) = authorization {
+                match serde_json::to_value(authorization) {
+                    Ok(authorization) => {
+                        value["authorization"] = authorization;
+                    }
+                    Err(error) => return map_core_error(request_id, &Error::from(error)),
+                }
+            }
+            AuthorityResponse::result(request_id, value)
+        }
         Err(error) => map_core_error(request_id, &Error::from(error)),
     }
 }

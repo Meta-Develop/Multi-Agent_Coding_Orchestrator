@@ -6,9 +6,7 @@ use super::environment_observation::{
     environment_cost_microunits_from_account_observe, AccountObserveOutcomeKind,
 };
 use super::*;
-use crate::external_agent::{
-    CodexParentEvidence, CodexParentResolutionStatus, CodexParentTurnUsage, ExternalAgentRun,
-};
+use crate::external_agent::{CodexParentEvidence, CodexParentResolutionStatus, ExternalAgentRun};
 use crate::llm::provider::ModelPricing;
 use crate::runtime_adapter::grok::{
     GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
@@ -331,9 +329,14 @@ fn parent_attempt_observation(
     let Some(external_run) = external_run else {
         return (None, None);
     };
+    if external_run.grok_acp_parent_evidence.is_some()
+        && external_run.codex_parent_evidence.is_some()
+    {
+        return (None, None);
+    }
     match (
         external_run.grok_acp_parent_evidence.as_ref(),
-        external_run.codex_parent_evidence.as_ref(),
+        external_run.authenticated_codex_evidence(),
     ) {
         (Some(_), Some(_)) => (None, None),
         (Some(parent_evidence), None) => {
@@ -354,7 +357,7 @@ fn parent_attempt_observation(
                     })
                 });
             let execution_cost_microunits =
-                attributable_codex_execution_cost_microunits(parent_evidence, dated_plan_pricing);
+                attributable_codex_execution_cost_microunits(external_run, dated_plan_pricing);
             (observed_candidate, execution_cost_microunits)
         }
         (None, None) => (None, None),
@@ -365,7 +368,7 @@ fn complete_codex_session(evidence: &CodexParentEvidence) -> Option<(&str, Reaso
     if evidence.resolution_status != CodexParentResolutionStatus::Complete.label() {
         return None;
     }
-    let model = evidence.observed_model.known()?;
+    let model = evidence.usage_model()?;
     let effort_label = evidence.observed_effort.known()?;
     let effort = reasoning_effort_from_observed_label(effort_label)?;
     Some((model, effort))
@@ -390,7 +393,9 @@ fn resolved_field_known(field: &GrokAcpParentResolvedField) -> Option<&str> {
 
 fn reasoning_effort_from_observed_label(label: &str) -> Option<ReasoningEffort> {
     Some(match label {
-        "minimal" | "low" => ReasoningEffort::Low,
+        "none" => ReasoningEffort::None,
+        "minimal" => ReasoningEffort::Minimal,
+        "low" => ReasoningEffort::Low,
         "medium" => ReasoningEffort::Medium,
         "high" => ReasoningEffort::High,
         "xhigh" => ReasoningEffort::Xhigh,
@@ -428,23 +433,20 @@ fn attributable_execution_cost_microunits(evidence: &GrokAcpParentEvidence) -> O
 }
 
 fn attributable_codex_execution_cost_microunits(
-    evidence: &CodexParentEvidence,
+    external_run: &ExternalAgentRun,
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
 ) -> Option<u64> {
-    let (model, _) = complete_codex_session(evidence)?;
-    let CodexParentTurnUsage::Known {
-        input_tokens,
-        output_tokens,
-        ..
-    } = &evidence.turn_usage
-    else {
-        return None;
-    };
+    let (model, _) = complete_codex_session(external_run.authenticated_codex_evidence()?)?;
+    let usage = external_run.authenticated_codex_usage()?;
     let pricing = dated_plan_pricing.get(model).copied()?;
     if !pricing.is_valid() {
         return None;
     }
-    dated_plan_token_cost_microunits(pricing, *input_tokens, *output_tokens)
+    dated_plan_token_cost_microunits(
+        pricing,
+        u64::try_from(usage.input_tokens).ok()?,
+        u64::try_from(usage.output_tokens).ok()?,
+    )
 }
 
 #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
@@ -474,14 +476,19 @@ fn attributable_parent_auditor_cost_microunits(
     external_run: &ExternalAgentRun,
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
 ) -> Option<u64> {
+    if external_run.grok_acp_parent_evidence.is_some()
+        && external_run.codex_parent_evidence.is_some()
+    {
+        return None;
+    }
     match (
         external_run.grok_acp_parent_evidence.as_ref(),
-        external_run.codex_parent_evidence.as_ref(),
+        external_run.authenticated_codex_evidence(),
     ) {
         (Some(_), Some(_)) => None,
         (Some(parent_evidence), None) => attributable_execution_cost_microunits(parent_evidence),
-        (None, Some(parent_evidence)) => {
-            attributable_codex_execution_cost_microunits(parent_evidence, dated_plan_pricing)
+        (None, Some(_)) => {
+            attributable_codex_execution_cost_microunits(external_run, dated_plan_pricing)
         }
         (None, None) => None,
     }
@@ -1222,6 +1229,8 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
         return None;
     }
     let requested_effort = match binding.requested_candidate.effort {
+        crate::selection::ReasoningEffort::None => "none",
+        crate::selection::ReasoningEffort::Minimal => "minimal",
         crate::selection::ReasoningEffort::Low => "low",
         crate::selection::ReasoningEffort::Medium => "medium",
         crate::selection::ReasoningEffort::High => "high",
@@ -1494,6 +1503,8 @@ mod tests {
         evidence.requested_model = Some(selected.candidate.model.clone());
         evidence.requested_effort = Some(
             match selected.candidate.effort {
+                ReasoningEffort::None => "none",
+                ReasoningEffort::Minimal => "minimal",
                 ReasoningEffort::Low => "low",
                 ReasoningEffort::Medium => "medium",
                 ReasoningEffort::High => "high",
@@ -2144,11 +2155,14 @@ mod tests {
         Ok(())
     }
 
-    fn automatic_selector_for_this_run() -> Result<(
+    fn automatic_selector_for_this_run(
+        repo: &Path,
+    ) -> Result<(
         RuntimeModelCatalog,
         SupervisorAutomaticSelectionState,
         CandidateKey,
         TaskProfile,
+        crate::selection::routing_policy::RoutingPolicyGuard,
     )> {
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
@@ -2203,17 +2217,30 @@ mod tests {
             review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
             assignments: Vec::new(),
         };
+        plan.assignments
+            .push(serde_json::from_value(serde_json::json!({
+                "id": "assignment-1", "phase": "execution", "role": "worker",
+                "task": &plan.task, "assigned_paths": [ATTEMPT_EVIDENCE_DIR],
+                "role_category": "non_delegating_terminal_worker"
+            }))?);
+        let mut metadata = SupervisorPlanMetadata::default();
+        let routing_policy =
+            crate::supervise::bind_assessed_injected_plan(&plan, repo, &mut metadata)?;
         let resolved = ResolvedObjectiveProfile {
             profile: crate::objective_profile::default_objective_profile().binding()?,
             source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
         };
-        let resolution = initialize_supervisor_selection(
+        let resolution = initialize_supervisor_selection_with_assessment(
             &mut plan,
             SupervisorRuntime::Codex,
             &catalog,
             &admission,
             &AdvertisedCatalogSet::empty(),
             Some(&resolved),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            metadata.task_routing_assessment.as_ref(),
         )?;
         let state = resolution
             .automatic_state
@@ -2235,6 +2262,7 @@ mod tests {
             state,
             candidate,
             worker.provenance.normalized_input.task.clone(),
+            routing_policy,
         ))
     }
 
@@ -2318,10 +2346,11 @@ mod tests {
 
     #[test]
     fn this_run_terminal_accept_moves_reselect_posterior() -> Result<()> {
-        let (catalog, state, candidate, task) = automatic_selector_for_this_run()?;
         let temp = tempfile::TempDir::new()?;
         let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
         std::fs::create_dir_all(&attempts)?;
+        let (catalog, state, candidate, task, _routing_policy) =
+            automatic_selector_for_this_run(temp.path())?;
         let mut evidence = unset_terminal_parent_result(fixture());
         evidence.run_id = "this-run-terminal-accept".to_string();
         evidence.selection = Some(AttemptSelectionBinding {
@@ -2389,10 +2418,11 @@ mod tests {
 
     #[test]
     fn this_run_exclusions_surface_on_reselect_provenance() -> Result<()> {
-        let (catalog, mut state, candidate, task) = automatic_selector_for_this_run()?;
         let temp = tempfile::TempDir::new()?;
         let attempts = temp.path().join(ATTEMPT_EVIDENCE_DIR);
         std::fs::create_dir_all(&attempts)?;
+        let (catalog, mut state, candidate, task, _routing_policy) =
+            automatic_selector_for_this_run(temp.path())?;
         let mut evidence = unset_terminal_parent_result(fixture());
         evidence.run_id = "this-run-exclusions".to_string();
         evidence.selection = Some(AttemptSelectionBinding {
@@ -2648,7 +2678,18 @@ mod tests {
     ) -> ExternalAgentRun {
         let mut external_run =
             super::super::tests::injected_verified_run(&injected_parent_command(temp, repo));
+        let stdout = match &evidence.turn_usage {
+            CodexParentTurnUsage::Known {
+                input_tokens,
+                output_tokens,
+                ..
+            } => format!(
+                r#"{{"type":"turn.completed","usage":{{"input_tokens":{input_tokens},"output_tokens":{output_tokens}}}}}"#
+            ),
+            CodexParentTurnUsage::Unknown { .. } => String::new(),
+        };
         external_run.codex_parent_evidence = Some(evidence);
+        external_run.retain_cli_parent_evidence_for_test(stdout.as_bytes());
         external_run
     }
 
@@ -3578,6 +3619,7 @@ mod tests {
             output_last_message: None,
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: None,
             codex_parent_evidence: None,
         }
     }
@@ -3955,6 +3997,90 @@ mod tests {
     }
 
     #[test]
+    fn model_attribution_codex_multiple_turns_price_execution_rework_review_and_rereview(
+    ) -> Result<()> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let mut external_run = parent_run_with_codex_evidence(
+            &temp,
+            &repo,
+            trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: CodexParentTurnUsage::Known {
+                    input_tokens: 25,
+                    output_tokens: 7,
+                    cached_input_tokens: 5,
+                    reasoning_output_tokens: 2,
+                },
+                resolution_status: "complete",
+            }),
+        );
+        external_run.retain_cli_parent_evidence_for_test(b"{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":10,\"output_tokens\":4,\"cached_input_tokens\":3,\"reasoning_output_tokens\":1}}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":25,\"output_tokens\":7,\"cached_input_tokens\":5,\"reasoning_output_tokens\":2}}\n");
+        let pricing = BTreeMap::from([(
+            "gpt-5.6-sol".to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: 7.0,
+                output_usd_per_million_tokens: 7.0,
+            },
+        )]);
+        let usage = external_run.authenticated_codex_usage().unwrap();
+        assert_eq!(usage.total_tokens, 46);
+        assert_eq!(pricing["gpt-5.6-sol"].cost_usd(usage), 0.000322);
+        // The existing economics format stores 100,000 units/USD and rounds.
+        let expected = Some(32);
+        assert_eq!(
+            attributable_codex_execution_cost_microunits(&external_run, &pricing),
+            expected
+        );
+        for attempt in [1, 2] {
+            let recorded = record_codex_attempt(
+                external_run.clone(),
+                "multi-turn-codex-attempt",
+                attempt,
+                "gpt-5.6-sol",
+                &pricing,
+                None,
+            )?;
+            if attempt == 1 {
+                assert_eq!(recorded.costs.execution_cost_microunits, expected);
+            } else {
+                assert_eq!(recorded.costs.rework_cost_microunits, expected);
+            }
+        }
+        for slot in [
+            ParentDispatchedReviewCycleSlot::FirstCycle,
+            ParentDispatchedReviewCycleSlot::SubsequentCycle,
+        ] {
+            let recorded = persist_parent_auditor_review_cost(
+                "multi-turn-codex-review",
+                1,
+                slot,
+                &external_run,
+                &pricing,
+                None,
+            )?;
+            if slot == ParentDispatchedReviewCycleSlot::FirstCycle {
+                assert_eq!(recorded.costs.review_cost_microunits, expected);
+            } else {
+                assert_eq!(recorded.costs.rereview_cost_microunits, expected);
+            }
+        }
+        let max = usize::MAX;
+        let turn = format!(
+            r#"{{"type":"turn.completed","usage":{{"input_tokens":{max},"output_tokens":0}}}}"#
+        );
+        external_run.retain_cli_parent_evidence_for_test(format!("{turn}\n{turn}\n").as_bytes());
+        assert!(attributable_codex_execution_cost_microunits(&external_run, &pricing).is_none());
+        assert!(attributable_parent_auditor_cost_microunits(&external_run, &pricing).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn record_child_attempt_outcome_retains_parent_codex_identity_and_execution_cost() -> Result<()>
     {
         let (temp, repo) = super::super::tests::injected_repository();
@@ -4035,7 +4161,7 @@ mod tests {
             trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
                 requested_model: Some("gpt-5.6-sol"),
                 requested_effort: Some("high"),
-                rollout_model: "gpt-5.6-sol",
+                rollout_model: "gpt-5.6-luna",
                 rollout_effort: "high",
                 observed_model: "gpt-5.6-luna",
                 observed_effort: "high",
@@ -4065,7 +4191,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_codex_reroute_prices_observed_target_not_requested_or_rollout() -> Result<()> {
+    fn parent_codex_reroute_keeps_whole_turn_cost_unallocated() -> Result<()> {
         let (temp, repo) = super::super::tests::injected_repository();
         let external_run = parent_run_with_codex_evidence(
             &temp,
@@ -4093,16 +4219,9 @@ mod tests {
             &dated_codex_plan_pricing(),
             None,
         )?;
-        assert_eq!(
-            recorded
-                .observed_candidate
-                .as_ref()
-                .map(|key| key.model.as_str()),
-            Some("gpt-5.6-luna")
-        );
-        assert_eq!(recorded.costs.execution_cost_microunits, Some(1_000_000));
-        assert_ne!(recorded.costs.execution_cost_microunits, Some(5_000_000));
-        assert_ne!(recorded.costs.execution_cost_microunits, Some(200_000));
+        assert!(recorded.observed_candidate.is_none());
+        assert!(recorded.costs.execution_cost_microunits.is_none());
+        assert!(project_numeric_row(&recorded).is_none());
         Ok(())
     }
 
@@ -4354,7 +4473,7 @@ mod tests {
             trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
                 requested_model: Some("gpt-5.6-sol"),
                 requested_effort: Some("high"),
-                rollout_model: "gpt-5.6-sol",
+                rollout_model: "gpt-5.6-luna",
                 rollout_effort: "high",
                 observed_model: "gpt-5.6-luna",
                 observed_effort: "high",
@@ -4379,8 +4498,7 @@ mod tests {
     }
 
     #[test]
-    fn codex_parent_auditor_reroute_prices_observed_target_not_requested_or_rollout() -> Result<()>
-    {
+    fn codex_parent_auditor_reroute_keeps_review_cost_unallocated() -> Result<()> {
         let (temp, repo) = super::super::tests::injected_repository();
         let external_run = parent_run_with_codex_evidence(
             &temp,
@@ -4408,9 +4526,7 @@ mod tests {
             &dated_codex_plan_pricing(),
             None,
         )?;
-        assert_eq!(recorded.costs.review_cost_microunits, Some(1_000_000));
-        assert_ne!(recorded.costs.review_cost_microunits, Some(5_000_000));
-        assert_ne!(recorded.costs.review_cost_microunits, Some(200_000));
+        assert!(recorded.costs.review_cost_microunits.is_none());
         assert!(recorded.costs.environment_cost_microunits.is_none());
         Ok(())
     }

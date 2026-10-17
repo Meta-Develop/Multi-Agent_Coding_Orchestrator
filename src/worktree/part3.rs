@@ -502,9 +502,7 @@ impl ManagedRegistryAdmission {
         }
     }
 
-    fn try_acquire(
-        self: &std::sync::Arc<Self>,
-    ) -> Result<Option<ManagedRegistryAdmissionPermit>> {
+    fn try_acquire(self: &std::sync::Arc<Self>) -> Result<Option<ManagedRegistryAdmissionPermit>> {
         let mut permit = ManagedRegistryAdmissionPermit::disarmed(Arc::clone(self));
         let mut state = self.lock_queue()?;
         // A queued waiter stays ahead of a nonblocking caller.
@@ -615,9 +613,9 @@ impl ManagedWorktreeRegistryStore {
     }
 
     fn lock_with_timeout(&self, timeout: Duration) -> Result<ManagedWorktreeRegistryLock> {
-        let deadline = Instant::now().checked_add(timeout).context(
-            "managed worktree registry lock timeout overflowed",
-        )?;
+        let deadline = Instant::now()
+            .checked_add(timeout)
+            .context("managed worktree registry lock timeout overflowed")?;
         self.state_root.verify()?;
         let lock_path = self.state_root.direct_child("managed_worktrees.lock")?;
         let admission = managed_registry_admission_queue(&self.state_root)?;
@@ -786,19 +784,17 @@ impl ManagedWorktreeRegistryStore {
             ExistingExclusiveLock::Busy => Ok(CreateRecoveryAdmission::Busy),
             ExistingExclusiveLock::Missing => Ok(CreateRecoveryAdmission::Admitted(None)),
             ExistingExclusiveLock::Acquired(kernel_lock) => {
-                let process_lease = match ManagedProcessLease::acquire_exclusive(
-                    &lease_name,
-                    kernel_lock.path(),
-                ) {
-                    Ok(process_lease) => process_lease,
-                    Err(error) => {
-                        drop(kernel_lock);
-                        if ManagedProcessLease::is_active(&lease_name) {
-                            return Ok(CreateRecoveryAdmission::Busy);
+                let process_lease =
+                    match ManagedProcessLease::acquire_exclusive(&lease_name, kernel_lock.path()) {
+                        Ok(process_lease) => process_lease,
+                        Err(error) => {
+                            drop(kernel_lock);
+                            if ManagedProcessLease::is_active(&lease_name) {
+                                return Ok(CreateRecoveryAdmission::Busy);
+                            }
+                            return Err(error);
                         }
-                        return Err(error);
-                    }
-                };
+                    };
                 Ok(CreateRecoveryAdmission::Admitted(Some(
                     ManagedWorktreeCreateLease {
                         name: name.to_string(),
@@ -1399,7 +1395,9 @@ impl<'a> CreateRegistryContext<'a> {
 
     fn verify_registry(&self, store: &ManagedWorktreeRegistryStore) -> Result<()> {
         match self {
-            Self::Borrowed { lock, registry } => store.verify_authenticated_registry(lock, registry),
+            Self::Borrowed { lock, registry } => {
+                store.verify_authenticated_registry(lock, registry)
+            }
             Self::Owned { state, .. } => {
                 let state = state
                     .as_ref()
@@ -1452,7 +1450,12 @@ impl<'a> CreateRegistryContext<'a> {
         };
         self.with_locked_registry(|lock, registry| {
             authenticate_create_checkpoint(registry, &scan.checkpoint)?;
-            authenticate_create_lease(store, lock, &lease, create_checkpoint_name(&scan.checkpoint))
+            authenticate_create_lease(
+                store,
+                lock,
+                &lease,
+                create_checkpoint_name(&scan.checkpoint),
+            )
         })?;
         let witness = capture_create_clean_witness(
             &store.repository,
@@ -1468,7 +1471,9 @@ impl<'a> CreateRegistryContext<'a> {
             Self::Owned { state, .. } => *state
                 .take()
                 .context("owned create registry lock is empty")?,
-            Self::Borrowed { .. } => bail!("borrowed create recovery cannot drop its registry lock"),
+            Self::Borrowed { .. } => {
+                bail!("borrowed create recovery cannot drop its registry lock")
+            }
         };
         drop(stale_registry);
         drop(lock);
@@ -1481,12 +1486,8 @@ impl<'a> CreateRegistryContext<'a> {
         let subject = create_checkpoint_name(&scan.checkpoint).to_string();
         authenticate_create_checkpoint(&registry, &scan.checkpoint)?;
         authenticate_create_lease(store, &lock, &lease, &subject)?;
-        let current = capture_create_clean_witness(
-            &store.repository,
-            &subject,
-            &scan.branch,
-            &scan.path,
-        )?;
+        let current =
+            capture_create_clean_witness(&store.repository, &subject, &scan.branch, &scan.path)?;
         if current.path_identity != witness.path_identity || current.metadata != witness.metadata {
             bail!("worktree '{subject}' changed during off-lock cleanliness");
         }
@@ -1556,7 +1557,8 @@ fn authenticate_create_checkpoint(
             expected_operation,
             expected_record,
         } => {
-            if registry.operations.get(&expected_operation.name) != Some(expected_operation.as_ref())
+            if registry.operations.get(&expected_operation.name)
+                != Some(expected_operation.as_ref())
             {
                 bail!(
                     "create operation '{}' changed around off-lock cleanliness",
@@ -1728,9 +1730,10 @@ fn require_scan_path_identity(
             expected_operation, ..
         } => {
             if path == expected_operation.path {
-                let staged = expected_operation.staged_path_identity.as_ref().context(
-                    "final create path has no staged worktree identity",
-                )?;
+                let staged = expected_operation
+                    .staged_path_identity
+                    .as_ref()
+                    .context("final create path has no staged worktree identity")?;
                 if identity != staged {
                     bail!(
                         "final worktree '{}' is not the staged worktree identity",
@@ -4530,6 +4533,59 @@ fn reject_default_exclude_negations(
     Ok(())
 }
 
+fn io_root_error_kind(error: &anyhow::Error) -> Option<ErrorKind> {
+    error
+        .root_cause()
+        .downcast_ref::<std::io::Error>()
+        .map(std::io::Error::kind)
+}
+
+fn ensure_optional_common_git_info_directory(common: &SafeRoot) -> Result<SafeRoot> {
+    common.verify()?;
+    match common.bind_existing_managed_direct_child_directory("info") {
+        Ok(reserved) => {
+            reserved.verify(common)?;
+            let info = SafeRoot::open_existing(reserved.path())?;
+            if info.identity() != reserved.identity() {
+                bail!("common Git info identity changed while binding it");
+            }
+            common.verify()?;
+            Ok(info)
+        }
+        Err(error) if io_root_error_kind(&error) == Some(ErrorKind::NotFound) => {
+            common.verify()?;
+            match common.reserve_direct_child_directory("info") {
+                Ok(reserved) => {
+                    reserved.verify(common)?;
+                    let info = SafeRoot::open_existing(reserved.path())?;
+                    if info.identity() != reserved.identity() {
+                        bail!("common Git info identity changed while creating it");
+                    }
+                    common.verify()?;
+                    Ok(info)
+                }
+                Err(error) if io_root_error_kind(&error) == Some(ErrorKind::AlreadyExists) => {
+                    common.verify()?;
+                    let reserved = common.bind_existing_managed_direct_child_directory("info")?;
+                    reserved.verify(common)?;
+                    let info = SafeRoot::open_existing(reserved.path())?;
+                    if info.identity() != reserved.identity() {
+                        bail!(
+                            "common Git info identity changed while binding a concurrent directory"
+                        );
+                    }
+                    common.verify()?;
+                    Ok(info)
+                }
+                Err(error) => {
+                    Err(error).context("failed to initialize optional common Git info directory")
+                }
+            }
+        }
+        Err(error) => Err(error).context("failed to bind common Git info directory"),
+    }
+}
+
 fn ensure_default_worktree_exclude(
     repo: &Repository,
     store: &ManagedWorktreeRegistryStore,
@@ -4609,7 +4665,24 @@ fn ensure_default_worktree_exclude(
         .filter(|(path, _)| path != Path::new(".gitignore"))
         .map(|(_, file)| file.as_ref().map_or(0, |file| file.contents().len()))
         .sum::<usize>();
-    let info = SafeRoot::open_existing(binding.common_dir().join("info"))?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    let common_root = SafeRoot::open_existing(binding.common_dir.path())?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    if common_root.identity() != common.identity()
+        || common_root.identity() != binding.common_dir.identity()
+        || common_root.path() != common.path()
+        || common_root.path() != binding.common_dir.path()
+    {
+        bail!(
+            "authenticated common Git directory identity changed while opening a managed SafeRoot"
+        );
+    }
+    let info = ensure_optional_common_git_info_directory(&common_root)?;
+    common.verify()?;
+    binding.common_dir.verify()?;
+    common_root.verify()?;
     let exclude = info.direct_child("exclude")?;
     let old_metadata = match fs::symlink_metadata(&exclude) {
         Ok(metadata) => Some(metadata),
@@ -5457,7 +5530,7 @@ pub(crate) fn bounded_repository_status_paths_bound(
     max_output_bytes: usize,
     timeout: Duration,
 ) -> Result<BoundedStatusPathRecords> {
-    let (paths, _) = bounded_repository_status_paths_bound_with_process_wait(
+    let (paths, _, _) = bounded_repository_status_paths_bound_with_process_wait(
         binding,
         max_entries,
         max_output_bytes,
@@ -5471,7 +5544,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(BoundedStatusPathRecords, Duration)> {
+) -> Result<(BoundedStatusPathRecords, Duration, Duration)> {
     binding.verify()?;
     let records =
         bounded_worktree_records(binding.worktree(), max_entries, max_output_bytes, timeout)?;
@@ -5479,6 +5552,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait(
     Ok((
         parse_porcelain_v1_z(&records.status, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5487,7 +5561,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(BoundedStatusPathRecords, Duration)> {
+) -> Result<(BoundedStatusPathRecords, Duration, Duration)> {
     binding.verify()?;
     let records = bounded_worktree_records_trusted(
         binding.worktree(),
@@ -5499,6 +5573,7 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
     Ok((
         parse_porcelain_v1_z(&records.status, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5507,7 +5582,7 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     max_entries: usize,
     max_output_bytes: usize,
     timeout: Duration,
-) -> Result<(Vec<PathBuf>, Duration)> {
+) -> Result<(Vec<PathBuf>, Duration, Duration)> {
     binding.verify()?;
     let records = bounded_worktree_records_trusted(
         binding.worktree(),
@@ -5519,6 +5594,7 @@ pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     Ok((
         parse_nul_paths(&records.visible, max_entries)?,
         records.process_queue_wait,
+        records.cleanup_elapsed,
     ))
 }
 
@@ -5527,4 +5603,5 @@ struct BoundedWorktreeRecords {
     status: Vec<u8>,
     ignored: Vec<u8>,
     process_queue_wait: Duration,
+    cleanup_elapsed: Duration,
 }

@@ -173,21 +173,25 @@ fn capture_repository_map_snapshot(
     binding: &crate::worktree::RepositoryBindingGuard,
     deadline: &mut Instant,
 ) -> Result<RepositoryMapSnapshot> {
-    let (statuses, process_queue_wait) =
+    let (statuses, process_queue_wait, cleanup_elapsed) =
         crate::worktree::bounded_repository_status_paths_bound_with_process_wait_trusted(
             binding,
             REPOSITORY_MAP_MAX_ENTRIES,
             REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
             remaining_map_time(*deadline, "before bounded Git status")?,
         )?;
-    // The worktree status path excludes only process-local serializer queue
-    // wait from its own budget. Keep repository-map's outer deadline aligned
-    // so unrelated in-process status callers do not spend this map's real
-    // status, descriptor-walk, and classification budget.
+    // Queue wait and final cleanup run outside the status execution budget.
+    // Exclude their measured durations once per snapshot from the outer budget
+    // too, preserving time for later snapshots, inventory, and classification.
     extend_map_deadline(
         deadline,
         process_queue_wait,
         "bounded Git status queue wait",
+    )?;
+    extend_map_deadline(
+        deadline,
+        cleanup_elapsed,
+        "bounded Git status final cleanup",
     )?;
     let statuses = statuses.into_iter().collect::<BTreeMap<_, _>>();
     let inventory = BoundedTreeWalker::walk_bound_with(

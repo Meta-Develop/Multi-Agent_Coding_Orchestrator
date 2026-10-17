@@ -27,6 +27,21 @@ export function isActiveLoginState(state: LoginState): boolean {
   return state === 'waiting-for-user' || state === 'in-progress'
 }
 
+/** Only availability is kept in React state; native code validates and opens the URL. */
+export function hasLiveAuthorization(
+  status: LoginStatus,
+  now = Date.now(),
+): boolean {
+  const authorization = status.authorization
+  return (
+    isActiveLoginState(status.state) &&
+    authorization !== undefined &&
+    authorization.authorizationUrl.trim() !== '' &&
+    (authorization.expiresAtUnixMs === undefined ||
+      authorization.expiresAtUnixMs > now)
+  )
+}
+
 /** States that stop automatic polling (unknown still allows explicit check). */
 export function shouldStopAutomaticPoll(state: LoginState): boolean {
   return !isActiveLoginState(state)
@@ -39,7 +54,7 @@ export function newIdempotencyKey(): string {
   return `login-${Date.now()}-${Math.random().toString(36).slice(2)}`
 }
 
-export function geminiOAuthProgressMessage(
+export function oauthProgressMessage(
   accountId: string,
   displayName: string,
   state: LoginState,
@@ -49,43 +64,43 @@ export function geminiOAuthProgressMessage(
     return `Cancelling sign-in to ${displayName} as ${accountId}. Waiting for the login flow to settle…`
   }
   if (state === 'waiting-for-user') {
-    return `Signing in to ${displayName} as ${accountId}. Finish Google sign-in in the browser you open; this window never takes a password and does not control that browser. Leaving this page does not cancel sign-in.`
+    return `Signing in to ${displayName} as ${accountId}. Complete the provider's sign-in when its authorization instructions are available. This window never takes a password or token. Leaving this page does not cancel sign-in.`
   }
   if (state === 'in-progress') {
-    return `Completing sign-in to ${displayName} as ${accountId}. The browser stays under your control; this application only tracks progress here.`
+    return `Completing sign-in to ${displayName} as ${accountId}. This application is tracking the provider's login; waiting for completion does not prove account or model access.`
   }
   return `Sign-in to ${displayName} as ${accountId} is still in progress…`
 }
 
-export function geminiOAuthPollErrorMessage(
+export function oauthPollErrorMessage(
   accountId: string,
   displayName: string,
 ): string {
-  return `Could not confirm sign-in progress for ${displayName} as ${accountId}. The login may still be running in your browser. Use Check status when you are ready; this application will not retry automatically.`
+  return `Could not confirm sign-in progress for ${displayName} as ${accountId}. The provider's login may still be running. Use Check status when you are ready; this application will not retry automatically.`
 }
 
-export function geminiOAuthUnknownMessage(
+export function oauthUnknownMessage(
   accountId: string,
   displayName: string,
 ): string {
-  return `Sign-in outcome for ${displayName} as ${accountId} is unknown. The account may or may not have been added. Check status or start again with the same nickname if you still need to recover a pending sign-in.`
+  return `Sign-in outcome for ${displayName} as ${accountId} is unknown. A pending account may remain. Use Check status; starting again with the same nickname may be refused.`
 }
 
-export function geminiOAuthReadyMessage(
+export function oauthReadyMessage(
   accountId: string,
   displayName: string,
 ): string {
-  return `Added ${accountId} to ${displayName}. Refresh the list below and select an account yourself if you want app-owned launches; nothing was activated automatically.`
+  return `Added ${accountId} to ${displayName}. Refresh the list below and select an account yourself if you want app-owned launches; nothing was activated automatically. Model access is not established by this login status.`
 }
 
-export function geminiOAuthCancelledMessage(
+export function oauthCancelledMessage(
   accountId: string,
   displayName: string,
 ): string {
   return `Sign-in to ${displayName} as ${accountId} was cancelled.`
 }
 
-export function geminiOAuthFailedMessage(
+export function oauthFailedMessage(
   accountId: string,
   displayName: string,
   failureReason: string | undefined,

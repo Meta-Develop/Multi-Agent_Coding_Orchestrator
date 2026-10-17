@@ -1548,7 +1548,10 @@
         )
         .expect_err("injected setup failure");
 
-        assert!(error.to_string().contains("injected setup failure"));
+        assert!(
+            error.to_string().contains("injected setup failure"),
+            "{error:#}"
+        );
         assert_status_root_contains_only_lock(&runtime_root);
     }
 
@@ -1610,8 +1613,19 @@
     }
 
     #[cfg(target_os = "linux")]
+    struct WorktreeStatusTestClockGuard;
+
+    #[cfg(target_os = "linux")]
+    impl Drop for WorktreeStatusTestClockGuard {
+        fn drop(&mut self) {
+            WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(None));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     #[test]
-    fn bounded_status_expired_setup_leaves_resumable_runtime() {
+    fn bounded_status_expired_setup_keeps_its_cleanup_budget() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
         let temp = TempDir::new().expect("tempdir");
         let repo_path = temp.path().join("repo");
         WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
@@ -1619,33 +1633,244 @@
         commit_readme(&repo).expect("initial commit");
         let runtime_root =
             SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let started_at = Instant::now();
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started_at)));
+        let expired_at = started_at + WORKTREE_STATUS_TIMEOUT + Duration::from_secs(1);
+        let snapshot_observed = std::cell::Cell::new(false);
 
         let error = bounded_worktree_is_clean_in_runtime_unlocked(
             &repo_path,
             MAX_WORKTREE_STATUS_ENTRIES,
             MAX_WORKTREE_STATUS_OUTPUT_BYTES,
-            Duration::from_millis(500),
+            WORKTREE_STATUS_TIMEOUT,
             &runtime_root,
             |_| {
-                std::thread::sleep(Duration::from_millis(600));
+                snapshot_observed.set(true);
+                WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(expired_at)));
                 Ok(())
             },
         )
-        .expect_err("setup callback must consume the same total deadline");
-        assert!(format!("{error:#}").contains("total time budget"));
+        .expect_err("setup callback must consume the main deadline");
         assert!(
-            fs::read_dir(runtime_root.path())
-                .expect("runtime entries")
-                .count()
-                > 1,
-            "expired cleanup should leave an authenticated resumable residue"
+            snapshot_observed.get(),
+            "test must reach the private snapshot"
         );
-
-        let _lock = KernelStateLock::acquire_direct(&runtime_root, WORKTREE_STATUS_RUNTIME_LOCK)
-            .expect("recovery lock");
-        scavenge_bounded_status_runtimes(&runtime_root, WORKTREE_STATUS_SCAVENGE_LIMITS)
-            .expect("resume cleanup");
+        let message = format!("{error:#}");
+        assert!(message.contains("total time budget"), "{message}");
+        assert!(
+            message.contains("after bounded-status setup callback"),
+            "{message}"
+        );
+        assert!(!message.contains("cleanup also failed"), "{message}");
         assert_status_root_contains_only_lock(&runtime_root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_final_cleanup_has_a_thirty_second_ceiling() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let lock = KernelStateLock::acquire_direct(&root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("runtime lock");
+        // Cross the ceiling only after cleanup starts. Also check an elapsed
+        // duration below it so accounting reports actual work, not the allowance.
+        for elapsed_secs in [29, 31] {
+            let runtime = root
+                .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+                .expect("private runtime");
+            let runtime_root = SafeRoot::open_existing(runtime.path()).expect("open runtime");
+            AtomicStateWriter::write_direct(&runtime_root, "index", b"private index")
+                .expect("private snapshot");
+            let started_at = Instant::now();
+            WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started_at)));
+            let reached_cleanup = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed_cleanup = reached_cleanup.clone();
+            let _hook_guard = crate::safe_state::set_scavenge_deadline_hook(move |phase| {
+                if phase == "before private directory scavenging" {
+                    observed_cleanup.set(true);
+                    WORKTREE_STATUS_TEST_CLOCK.with(|clock| {
+                        clock.set(Some(started_at + Duration::from_secs(elapsed_secs)));
+                    });
+                }
+                false
+            });
+            let result = finish_bounded_status_runtime(Ok(()), &root, &lock);
+            assert!(reached_cleanup.get(), "clock must advance during cleanup");
+            if elapsed_secs < 30 {
+                let (_, cleanup_elapsed) = result.expect("cleanup below ceiling must succeed");
+                assert_eq!(cleanup_elapsed, Duration::from_secs(elapsed_secs));
+            } else {
+                let error = result.expect_err("cleanup must stop after thirty seconds");
+                let message = format!("{error:#}");
+                assert!(message.contains("total time budget"), "{message}");
+                assert!(message.contains("after bounded-status runtime cleanup"), "{message}");
+            }
+        }
+        assert_status_root_contains_only_lock(&root);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_cleanup_exhaustion_fails_closed_and_remains_resumable() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let lock = KernelStateLock::acquire_direct(&root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("runtime lock");
+        for (phase, main_failed, residue_count) in [
+            ("before child quarantine", false, 1),
+            ("before child quarantine", true, 1),
+            ("after private residue cleanup", false, 0),
+            ("after private residue cleanup", true, 0),
+        ] {
+            let runtime = root
+                .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+                .expect("private runtime");
+            let runtime_root = SafeRoot::open_existing(runtime.path()).expect("open runtime");
+            AtomicStateWriter::write_direct(&runtime_root, "index", b"private index")
+                .expect("private snapshot");
+            let _hook_guard =
+                crate::safe_state::set_scavenge_deadline_hook(move |observed| observed == phase);
+            let result = if main_failed {
+                Err(anyhow::anyhow!("injected main operation failure"))
+            } else {
+                Ok(())
+            };
+            let error = finish_bounded_status_runtime(result, &root, &lock)
+                .expect_err("cleanup deadline must prevent success");
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("failed to remove bounded-status private runtime"),
+                "{message}"
+            );
+            assert!(
+                message.contains("private directory scavenging exceeded its total time budget"),
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("cleanup also failed"),
+                main_failed,
+                "{message}"
+            );
+            assert_eq!(
+                message.contains("injected main operation failure"),
+                main_failed,
+                "{message}"
+            );
+            assert_eq!(
+                scavenge_bounded_status_runtimes(&root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+                    .expect("resume bounded cleanup"),
+                residue_count
+            );
+            assert_status_root_contains_only_lock(&root);
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_scavenging_preserves_local_and_outer_deadlines() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let _lock = KernelStateLock::acquire_direct(&root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("runtime lock");
+        let runtime = root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("private runtime");
+        let error = scavenge_bounded_status_runtimes_until(
+            &root,
+            PrivateDirectoryScavengeLimits {
+                max_duration: Duration::ZERO,
+                ..WORKTREE_STATUS_SCAVENGE_LIMITS
+            },
+            Instant::now() + WORKTREE_STATUS_TIMEOUT,
+        )
+        .expect_err("outer budget must not replace the local scavenging cap");
+        assert!(format!("{error:#}").contains("time budget"));
+        assert!(runtime.path().exists());
+        let error = scavenge_bounded_status_runtimes_until(
+            &root,
+            WORKTREE_STATUS_SCAVENGE_LIMITS,
+            Instant::now(),
+        )
+        .expect_err("startup scavenging must obey the main deadline");
+        assert!(format!("{error:#}").contains("total time budget"));
+        assert!(runtime.path().exists());
+        scavenge_bounded_status_runtimes(&root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+            .expect("recover residue after exhausted budgets");
+        assert_status_root_contains_only_lock(&root);
+    }
+
+    /// Run explicitly on the affected host; this also reports how far setup
+    /// got when strict containment is unavailable in a development sandbox.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "manual WSL filesystem and containment latency probe"]
+    fn bounded_status_latency_probe() {
+        let _ = tracing_subscriber::fmt()
+            .with_env_filter("multi_agent_coding_orchestrator::worktree=debug")
+            .with_test_writer()
+            .try_init();
+        for (isolation, sample) in [BoundedGitIsolation::Trusted, BoundedGitIsolation::Verified]
+            .into_iter()
+            .flat_map(|isolation| (1..=3).map(move |sample| (isolation, sample)))
+        {
+            let temp = TempDir::new().expect("tempdir");
+            let repo_path = temp.path().join("repo");
+            WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+            let repo = crate::git_repository::open(&repo_path).expect("open repo");
+            commit_readme(&repo).expect("initial commit");
+            let root =
+                SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+            let started = Instant::now();
+            let snapshot_at = std::cell::Cell::new(None);
+            let result = bounded_worktree_status_in_runtime_until(
+                &repo_path,
+                MAX_WORKTREE_STATUS_ENTRIES,
+                MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+                &root,
+                |_| {
+                    snapshot_at.set(Some(started.elapsed()));
+                    Ok(())
+                },
+                worktree_status_deadline(Duration::from_secs(120)).expect("deadline"),
+                false,
+                isolation,
+            );
+            eprintln!(
+                "bounded-status {isolation:?} sample {sample}: index setup={:?}, total={:?}, outcome={:?}",
+                snapshot_at.get(),
+                started.elapsed(),
+                result
+                    .as_ref()
+                    .map(|_| ())
+                    .map_err(|error| format!("{error:#}"))
+            );
+            assert_status_root_contains_only_lock(&root);
+        }
+
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).expect("runtime root");
+        let lock = KernelStateLock::acquire_direct(&root, WORKTREE_STATUS_RUNTIME_LOCK)
+            .expect("runtime lock");
+        let runtime = root
+            .reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)
+            .expect("private runtime");
+        let runtime_root = SafeRoot::open_existing(runtime.path()).expect("open runtime");
+        let started = Instant::now();
+        for name in ["HEAD", "index"] {
+            let step = Instant::now();
+            AtomicStateWriter::write_direct(&runtime_root, name, b"private status snapshot\n")
+                .expect("snapshot write");
+            eprintln!("bounded-status atomic {name}: {:?}", step.elapsed());
+        }
+        let setup = started.elapsed();
+        let cleanup_started = Instant::now();
+        finish_bounded_status_runtime(Ok(()), &root, &lock).expect("runtime cleanup");
+        eprintln!(
+            "bounded-status snapshot writes={setup:?}, minimal runtime cleanup={:?}",
+            cleanup_started.elapsed()
+        );
+        assert_status_root_contains_only_lock(&root);
     }
 
     #[cfg(target_os = "linux")]

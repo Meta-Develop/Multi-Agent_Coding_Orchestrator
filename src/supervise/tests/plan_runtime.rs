@@ -166,8 +166,10 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
 
     let mut first = injected_named_assignment("quota-first", "README.md");
     first.role = AgentRole::Worker;
+    first.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut second = injected_named_assignment("quota-second", "SECOND.md");
     second.role = AgentRole::Worker;
+    second.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     let mut plan = injected_multi_plan(vec![first.clone(), second.clone()], 0);
     let options = injected_options(&repo_path, temp.path(), "quota-live-sequential");
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
@@ -193,7 +195,11 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         .attach_quota_config(&repo_path, options.run_id.as_str(), &quota_config)
         .expect("attach quota config to shared run budget ledger");
     let resolved_profile = default_resolved_objective_profile();
-    let selection = initialize_supervisor_selection_with_quota(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual quota-refresh task");
+    let selection = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
@@ -204,6 +210,9 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             context: Some(&quota_context),
             ledger: Some(&budget_ledger),
         },
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize automatic live quota selection");
     assert!(selection.selection_preflight_failure.is_none());
@@ -289,6 +298,22 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
                 run.publishable = false;
                 run.program_trust = ExternalProgramTrust::ExplicitCustom;
                 run.codex_permissions = None;
+                run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalCursor,
+                ));
+                run.cursor_managed_parent_evidence =
+                    Some(crate::runtime_adapter::CursorManagedParentEvidence {
+                        peer_verified: true,
+                        admitted_attempts: 1,
+                        completed_attempts: 1,
+                        usage_attempts_covered: 1,
+                        usage_is_incomplete: Some(false),
+                        input_tokens: Some(2),
+                        output_tokens: Some(1),
+                        cache_read_tokens: Some(0),
+                        cache_write_tokens: Some(0),
+                        ..Default::default()
+                    });
             }
             run
         }
@@ -317,7 +342,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         &plan,
         &budget_config,
         &budget_ledger,
-        AgentRole::Worker,
+        (AgentRole::Worker, first_launch_runtime),
         &first_command,
     )
     .expect("reserve first assignment budget")
@@ -402,6 +427,68 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
             output_usd_per_million_tokens: 1.0,
         },
     );
+    #[cfg(target_os = "linux")]
+    let _cursor_account = {
+        use crate::account_authority::CURSOR_PROVIDER_ID;
+        use coding_agent_manager_lib::{
+            account_authority::{authority_id_for, StoredAccountRegistry},
+            model::{AuthKind, StoredAccountMaterial},
+            paths::stored_accounts_path,
+        };
+
+        struct CursorAccountGuard<'a> {
+            run: &'a RunId,
+            _registry: StoredAccountRegistry,
+        }
+        impl Drop for CursorAccountGuard<'_> {
+            fn drop(&mut self) {
+                crate::account_authority::record_observed_cursor_selection(
+                    Some(self.run.as_str()),
+                    CURSOR_PROVIDER_ID,
+                    None,
+                    None,
+                );
+            }
+        }
+
+        assert!(repo_path.starts_with(temp.path()));
+        assert!(
+            crate::account_authority::cursor_run_account_binding(options.run_id.as_str()).is_none()
+        );
+        let registry = StoredAccountRegistry::new(stored_accounts_path(
+            &temp.path().join("quota-cursor-account"),
+        ));
+        registry
+            .begin_add(
+                CURSOR_PROVIDER_ID,
+                "quota-cursor-fixture",
+                "Synthetic quota-refresh Cursor account",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin owned synthetic Cursor account");
+        registry
+            .complete_add(CURSOR_PROVIDER_ID, "quota-cursor-fixture")
+            .expect("complete owned synthetic Cursor account");
+        registry
+            .select_complete_revision(CURSOR_PROVIDER_ID, "quota-cursor-fixture", None)
+            .expect("select owned synthetic Cursor account");
+        let binding = registry
+            .selected_binding(CURSOR_PROVIDER_ID)
+            .expect("read owned Cursor account")
+            .expect("selected owned Cursor account");
+        crate::account_authority::record_observed_cursor_selection(
+            Some(options.run_id.as_str()),
+            CURSOR_PROVIDER_ID,
+            Some(authority_id_for(registry.metadata_path())),
+            Some(&binding),
+        )
+        .expect("freeze owned quota-refresh Cursor account");
+        CursorAccountGuard {
+            run: &options.run_id,
+            _registry: registry,
+        }
+    };
     let second_command = ExternalAgentCommand::codex(
         &options.codex_bin,
         &repo_path,
@@ -424,7 +511,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         &second_plan,
         &budget_config,
         &budget_ledger,
-        AgentRole::Worker,
+        (AgentRole::Worker, second_launch_runtime),
         &second_command,
     )
     .expect("reserve second assignment budget")
@@ -616,14 +703,27 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
     )
     .expect("write objective profile override");
 
-    let plan_document = serde_json::to_value(injected_plan(injected_assignment(false), 0))
-        .expect("serialize injected plan");
+    let mut assignment = injected_assignment(false);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let plan_document =
+        serde_json::to_value(injected_plan(assignment, 0)).expect("serialize injected plan");
     let mut authored_document = plan_document.clone();
     authored_document["objective_profile"] = json!(profile_id);
     let mut default_loaded =
         parse_supervisor_plan_with_consultant(&plan_document.to_string()).expect("default plan");
     let mut authored_loaded = parse_supervisor_plan_with_consultant(&authored_document.to_string())
         .expect("authored objective-profile plan");
+    let _routing_policy = bind_assessed_injected_plan(
+        &default_loaded.plan,
+        &repo_path,
+        &mut default_loaded.plan_metadata,
+    )
+    .expect("assess the actual objective-profile fixture task");
+    authored_loaded.plan_metadata.resolved_routing_policy =
+        default_loaded.plan_metadata.resolved_routing_policy.clone();
+    authored_loaded.plan_metadata.task_routing_assessment =
+        default_loaded.plan_metadata.task_routing_assessment.clone();
     assert_eq!(
         authored_loaded.plan_metadata.objective_profile.as_deref(),
         Some(profile_id)
@@ -641,6 +741,14 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         .expect("Codex selector catalog"),
     );
     let catalog = Ok(catalog);
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        catalog
+            .as_ref()
+            .expect("successful supplied fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation for both profiles");
     let admission = SupervisorAdmissionPolicyInput::resolve(
         &repo_path,
         1,
@@ -700,7 +808,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
     assert_ne!(default_choice.candidate, adjusted_choice.candidate);
     assert_eq!(
         adjusted_choice.reason,
-        crate::selection::ChoiceReason::LowestLegacyBaselinePlusCostProxyAdjustments
+        crate::selection::ChoiceReason::LoadedRoutingPolicy
     );
 
     let resolved = &adjusted_worker.provenance.resolved_objective_profile;
@@ -723,7 +831,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         .expect("selected candidate score evidence");
     assert_eq!(
         selected_score.routing_score_semantics,
-        crate::selection::RoutingScoreSemantics::LegacyBaselinePlusCostProxyAdjustmentsV1
+        crate::selection::RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
     );
     assert_eq!(
         selected_score.routing_tradeoff_weights,
@@ -1147,25 +1255,25 @@ fn default_stacked_uncorrelated_review_lenses_return_three_distinct_scopes() {
         lenses[0].information_scope,
         ReviewInformationScope::FullChildTranscript
     );
-    assert_eq!(lenses[0].backend.backend_id(), "openai");
-    assert_eq!(lenses[0].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[0].backend.backend_id(), "automatic");
+    assert_eq!(lenses[0].backend.model(), "automatic");
+    assert_eq!(lenses[0].backend.reasoning_effort(), None);
     assert_eq!(lenses[1].id, "output-only");
     assert_eq!(
         lenses[1].information_scope,
         ReviewInformationScope::OutputReportOnly
     );
-    assert_eq!(lenses[1].backend.backend_id(), "openai");
-    assert_eq!(lenses[1].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[1].backend.backend_id(), "automatic");
+    assert_eq!(lenses[1].backend.model(), "automatic");
+    assert_eq!(lenses[1].backend.reasoning_effort(), None);
     assert_eq!(lenses[2].id, "diff-only");
     assert_eq!(
         lenses[2].information_scope,
         ReviewInformationScope::DiffOnly
     );
-    assert_eq!(lenses[2].backend.backend_id(), "openai");
-    assert_eq!(lenses[2].backend.model(), DEFAULT_PROFILE_MODEL);
-    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].backend.backend_id(), "automatic");
+    assert_eq!(lenses[2].backend.model(), "automatic");
+    assert_eq!(lenses[2].backend.reasoning_effort(), None);
     assert_ne!(lenses[0].information_scope, lenses[1].information_scope);
     assert_ne!(lenses[0].information_scope, lenses[2].information_scope);
     assert_ne!(lenses[1].information_scope, lenses[2].information_scope);
@@ -1181,19 +1289,19 @@ fn default_supervisor_review_lenses_are_the_stacked_uncorrelated_scopes() {
         lenses[0].information_scope,
         ReviewInformationScope::FullChildTranscript
     );
-    assert_eq!(lenses[0].backend.reasoning_effort(), Some("xhigh"));
+    assert_eq!(lenses[0].backend.reasoning_effort(), None);
     assert_eq!(lenses[1].id, "output-only");
     assert_eq!(
         lenses[1].information_scope,
         ReviewInformationScope::OutputReportOnly
     );
-    assert_eq!(lenses[1].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[1].backend.reasoning_effort(), None);
     assert_eq!(lenses[2].id, "diff-only");
     assert_eq!(
         lenses[2].information_scope,
         ReviewInformationScope::DiffOnly
     );
-    assert_eq!(lenses[2].backend.reasoning_effort(), Some("high"));
+    assert_eq!(lenses[2].backend.reasoning_effort(), None);
 
     let omitted = parse_supervisor_plan_with_consultant(
         std::str::from_utf8(&bounded_loader_plan_json()).expect("utf8 plan"),
@@ -1526,6 +1634,8 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
             .collect::<Vec<_>>(),
         vec!["fragment-001", "fragment-004"]
     );
+    assert!(document.get("task_routing_assessment").is_none());
+    assert!(document.get("resolved_routing_policy").is_some());
 
     let repeated = supervisor_plan_document_from_goal_spec(
         repo,
@@ -1540,6 +1650,8 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     )
     .expect("reparse generated plan");
     assert!(reparsed.assignment_metadata.workers.is_empty());
+    assert!(reparsed.plan_metadata.task_routing_assessment.is_none());
+    assert!(reparsed.plan_metadata.resolved_routing_policy.is_some());
     let schedule = &reparsed.plan_metadata.assignment_schedule;
     let mut outcomes = vec![None, None, None, None];
     assert_eq!(
@@ -1586,6 +1698,30 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     .expect("renormalize generated plan");
     assert_eq!(renormalized, document);
 
+    #[cfg(target_os = "linux")]
+    match super::super::scheduler::select_normal_intake(
+        repo,
+        &RunId::new("gap-unassessed-intake").expect("gap-unassessed-intake run id"),
+        &reparsed.plan,
+        reparsed
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .expect("frozen routing policy present"),
+        None,
+        super::super::scheduler::NormalIntakeConfig {
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            max_concurrent_children: 1,
+            objective_profile: None,
+        },
+    ) {
+        Ok(_) => panic!("unassessed gap document must refuse normal intake"),
+        Err(error) => assert!(
+            format!("{error:#}").contains("automatic task assessment is unassessed"),
+            "unexpected intake error: {error:#}"
+        ),
+    }
+
     let mut stripped = document;
     for assignment in stripped["assignments"]
         .as_array_mut()
@@ -1602,7 +1738,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
 }
 
 #[test]
-fn authoritative_single_file_goal_lowers_to_one_planning_execution_pair() {
+fn authoritative_single_file_goal_lowers_to_one_direct_worker() {
     skip_without_containment!();
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
@@ -1635,20 +1771,30 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 2);
-    assert_eq!(assignments[0]["id"], "assignment-001-planning");
-    assert_eq!(assignments[1]["id"], "assignment-001");
-    for assignment in assignments {
-        assert_eq!(assignment["assigned_paths"], json!(["RELEASE_NOTES.md"]));
-        assert_eq!(assignment["semantic_symbols"], json!([]));
-        assert_eq!(assignment["semantic_modules"], json!([]));
-    }
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "worker");
     assert_eq!(
-        document["assignment_schedule"]
-            .as_array()
-            .expect("assignment schedule")
-            .len(),
-        2
+        assignments[0]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!(["RELEASE_NOTES.md"])
+    );
+    assert_eq!(assignments[0]["semantic_symbols"], json!([]));
+    assert_eq!(assignments[0]["semantic_modules"], json!([]));
+    assert_eq!(
+        document["assignment_schedule"],
+        json!([
+            {
+                "assignment_id": "assignment-001",
+                "depth": 2,
+                "flattened_index": 0
+            }
+        ])
     );
     assert!(document.get("coverage_gaps").is_none());
 }
@@ -1660,11 +1806,9 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
     let task = "In README.md, replace baseline with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
     let mut plan =
         supervisor_plan_from_goal_spec(&repo, "", task).expect("plan literal existing-file edit");
-    let [planning, execution] = plan.assignments.as_slice() else {
-        panic!("literal existing-file plan must contain one planning/execution pair");
+    let [execution] = plan.assignments.as_slice() else {
+        panic!("literal existing-file plan must contain one direct execution worker");
     };
-    assert_eq!(planning.phase, AssignmentPhase::Planning);
-    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
     assert_eq!(execution.phase, AssignmentPhase::Execution);
     assert_eq!(execution.role, AgentRole::Worker);
     assert_eq!(
@@ -1675,7 +1819,7 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
     assert!(execution
         .notes
         .as_deref()
-        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+        .is_some_and(|notes| notes.contains("direct_existing_git_visible_regular_file_edit")));
 
     plan.role_models.insert(
         AgentRole::Worker,
@@ -1685,7 +1829,7 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
-    let execution = plan.assignments[1].clone();
+    let execution = plan.assignments[0].clone();
     let resolved = runtime_resolved_prompt_plan(
         &plan,
         &execution,
@@ -1704,16 +1848,16 @@ fn literal_existing_file_edit_lowers_to_direct_grok_eligible_worker() {
 
     let mut ordinary = supervisor_plan_from_goal_spec(&repo, "", "Update README.md.")
         .expect("plan ordinary README task");
-    assert_eq!(ordinary.assignments[1].role, AgentRole::Worker);
-    assert!(ordinary.assignments[1].worker_assignments.is_empty());
-    assert!(!ordinary.assignments[1]
+    assert_eq!(ordinary.assignments[0].role, AgentRole::Worker);
+    assert!(ordinary.assignments[0].worker_assignments.is_empty());
+    assert!(!ordinary.assignments[0]
         .notes
         .as_deref()
         .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
     ordinary.role_models = plan.role_models.clone();
     let resolved = runtime_resolved_prompt_plan(
         &ordinary,
-        &ordinary.assignments[1],
+        &ordinary.assignments[0],
         SupervisorRuntime::Grok,
         SupervisorRuntime::Grok,
         &RuntimeModelCatalog::OperatorDeclared,
@@ -1769,7 +1913,99 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 4);
+    assert_eq!(assignments.len(), 1);
+    let assignment_id = assignments[0]["id"]
+        .as_str()
+        .expect("coordinated Execution parent id");
+    assert!(
+        assignment_id.starts_with("coordinated-execution-"),
+        "coordinated Execution identity uses coordinated-execution- prefix, got {assignment_id}"
+    );
+    let hash_suffix = assignment_id
+        .strip_prefix("coordinated-execution-")
+        .expect("combined assignment prefix");
+    assert_eq!(hash_suffix.len(), 16);
+    assert!(
+        hash_suffix
+            .chars()
+            .all(|ch| matches!(ch, '0'..='9' | 'a'..='f')),
+        "combined identity suffix must be 16 lowercase hex, got {hash_suffix}"
+    );
+    let repeated = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect("repeat plan policy/script task");
+    assert_eq!(
+        repeated["assignments"][0]["id"]
+            .as_str()
+            .expect("repeated coordinated Execution parent id"),
+        assignment_id
+    );
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "child_orchestrator");
+    assert_eq!(assignments[0]["role_category"], "delegating_coordinator");
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!([
+            ".agents/scripts/o2-autopilot",
+            ".agents/skills/agent-orchestration/SKILL.md"
+        ])
+    );
+    let parent_task = assignments[0]["task"]
+        .as_str()
+        .expect("coordinated Execution parent task");
+    let original_task = fs::read_to_string(&task_file).expect("read original task");
+    assert_eq!(parent_task.trim(), original_task.trim());
+    assert!(parent_task.contains(".agents/skills/agent-orchestration/SKILL.md"));
+    assert!(parent_task.contains(".agents/scripts/o2-autopilot"));
+    assert_eq!(
+        assignments[0]["spec_fragment_ids"],
+        json!(["fragment-001", "fragment-002"])
+    );
+    let workers = assignments[0]["worker_assignments"]
+        .as_array()
+        .expect("nested worker_assignments");
+    assert_eq!(workers.len(), 2);
+    assert_eq!(workers[0]["id"], "assignment-001");
+    assert_eq!(workers[1]["id"], "assignment-002");
+    for worker in workers {
+        assert_eq!(worker["role"], "worker");
+        assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+        assert!(worker.get("worker_assignments").is_none());
+        let worker_paths = worker["assigned_paths"].as_array().expect("worker paths");
+        assert_eq!(worker_paths.len(), 1);
+        let worker_task = worker["task"].as_str().expect("worker task");
+        let path = worker_paths[0].as_str().expect("worker path");
+        assert!(worker_task.contains(path));
+        let fragments = worker["spec_fragment_ids"]
+            .as_array()
+            .expect("worker spec_fragment_ids");
+        assert_eq!(fragments.len(), 1);
+    }
+    assert_eq!(
+        workers[0]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/SKILL.md"])
+    );
+    assert_eq!(
+        workers[1]["assigned_paths"],
+        json!([".agents/scripts/o2-autopilot"])
+    );
+    assert_eq!(workers[0]["spec_fragment_ids"], json!(["fragment-001"]));
+    assert_eq!(workers[1]["spec_fragment_ids"], json!(["fragment-002"]));
+    let worker_path_set: BTreeSet<String> = workers
+        .iter()
+        .map(|worker| {
+            worker["assigned_paths"][0]
+                .as_str()
+                .expect("worker path")
+                .to_string()
+        })
+        .collect();
+    assert_eq!(
+        worker_path_set,
+        BTreeSet::from([
+            ".agents/scripts/o2-autopilot".to_string(),
+            ".agents/skills/agent-orchestration/SKILL.md".to_string(),
+        ])
+    );
     let scopes = assignments
         .iter()
         .map(|assignment| {
@@ -1783,10 +2019,10 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
         .collect::<BTreeSet<_>>();
     assert_eq!(
         scopes,
-        BTreeSet::from([
-            vec![".agents/scripts/o2-autopilot".to_string()],
-            vec![".agents/skills/agent-orchestration/SKILL.md".to_string()],
-        ])
+        BTreeSet::from([vec![
+            ".agents/scripts/o2-autopilot".to_string(),
+            ".agents/skills/agent-orchestration/SKILL.md".to_string(),
+        ]])
     );
 }
 
@@ -1815,7 +2051,20 @@ fn plain_text_gitignored_policy_path_emits_workstream() {
     let assignments = document["assignments"]
         .as_array()
         .expect("assignments array");
-    assert_eq!(assignments.len(), 2);
+    assert_eq!(assignments.len(), 1);
+    assert_eq!(assignments[0]["id"], "assignment-001");
+    assert_eq!(assignments[0]["phase"], "execution");
+    assert_eq!(assignments[0]["role"], "worker");
+    assert_eq!(
+        assignments[0]["role_category"],
+        "non_delegating_terminal_worker"
+    );
+    assert_eq!(assignments[0]["worker_assignments"], json!([]));
+    assert_eq!(
+        assignments[0]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/SKILL.md"])
+    );
+    assert_eq!(assignments[0]["spec_fragment_ids"], json!(["fragment-001"]));
     let scopes = assignments
         .iter()
         .map(|assignment| {
@@ -2435,6 +2684,10 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         generated_follow_up: None,
         path_proposal: Default::default(),
         router: SupervisorRouterConfig::default(),
+        task_routing_assessment: None,
+        normal_intake_selection: None,
+        normal_intake_decision: None,
+        resolved_routing_policy: None,
     };
     let mut report_a = injected_child_report(&plan.assignments[0]);
     report_a.files_changed = vec![PathBuf::from("src/a.rs")];
@@ -2490,6 +2743,10 @@ fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
         generated_follow_up: None,
         path_proposal: Default::default(),
         router: SupervisorRouterConfig::default(),
+        task_routing_assessment: None,
+        normal_intake_selection: None,
+        normal_intake_decision: None,
+        resolved_routing_policy: None,
     };
     let mut report = injected_child_report(&plan.assignments[0]);
     report.files_changed = vec![PathBuf::from("src/a.rs")];
@@ -2643,6 +2900,10 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         generated_follow_up: None,
         path_proposal: Default::default(),
         router: SupervisorRouterConfig::default(),
+        task_routing_assessment: None,
+        normal_intake_selection: None,
+        normal_intake_decision: None,
+        resolved_routing_policy: None,
     };
     let inspections = BTreeMap::from([(
         execution.id.clone(),
@@ -2780,24 +3041,159 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     let run_id = options.run_id.clone();
     let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
         .expect("construct selector-backed Codex catalog with a deterministic runner-up");
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(&temp, &catalog)
+        .expect("hold isolated injected CAM observation with the same selector fixture");
     let mut child_commands = Vec::new();
+    let mut observed_turns = Vec::new();
+    let mut child_report = injected_child_report(&assignment);
+    let mut worker_report = child_report
+        .worker_reports
+        .first()
+        .expect("authored worker report")
+        .clone();
     let mut runner = |command: &ExternalAgentCommand| {
+        use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
+        use std::collections::BTreeMap;
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        use std::time::Duration;
+
         let name = command
             .output_last_message
             .file_name()
             .and_then(OsStr::to_str)
             .expect("UTF-8 output name");
+        let role = command
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str());
         if name.contains("review-auditor") {
+            observed_turns.push("review-auditor");
             write_injected_json(
                 &command.output_last_message,
-                &injected_auditor_report(&assignment, &injected_child_report(&assignment)),
+                &injected_auditor_report(&assignment, &child_report),
             );
-        } else {
-            child_commands.push(command.clone());
-            write_injected_assignment_report(command, &assignment);
+            write_injected_usage(command, 8, 3);
+            return injected_verified_run(command);
         }
+        if command.codex_managed_worker_requests_enabled() {
+            observed_turns.push("initial-parent");
+            assert_eq!(role, Some("child_orchestrator"));
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadOnly
+            );
+            assert!(command.codex_native_delegation_is_disabled());
+            assert!(!command.codex_managed_readonly_continuation_enabled());
+            let launch = command
+                .assignment_messaging_launch()
+                .expect("managed parent inbox launch");
+            let env: BTreeMap<_, _> = launch
+                .environment_for(run_id.as_str(), assignment.id.as_str())
+                .expect("sealed parent launch environment")
+                .into_iter()
+                .collect();
+            let mut stream = TcpStream::connect(&env[ENV_MESSAGE_ENDPOINT])
+                .expect("connect managed parent inbox");
+            stream
+                .set_write_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request write");
+            stream
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .expect("bound worker-request read");
+            writeln!(
+                stream,
+                "{}",
+                json!({"bearer": env[ENV_MESSAGE_TOKEN], "request": {
+                    "operation": "submit_worker_request",
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }})
+            )
+            .expect("submit authored worker request");
+            stream.flush().expect("flush authored worker request");
+            let mut response = String::new();
+            BufReader::new(stream)
+                .read_line(&mut response)
+                .expect("read worker-request admission");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&response).expect("decode admission")
+                    ["ok"],
+                true
+            );
+            let yield_turn = json!({
+                "version": 1,
+                "outcome": "yield_workers",
+                "run_id": run_id.as_str(),
+                "parent_id": assignment.id,
+                "parent_attempt": 1,
+                "requests": [{
+                    "request_id": "r1",
+                    "worker_id": worker_report.id.clone()
+                }]
+            });
+            write_injected_json(&command.output_last_message, &yield_turn);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            run.output_last_message =
+                Some(serde_json::to_vec(&yield_turn).expect("encode parent yield"));
+            child_commands.push(command.clone());
+            return run;
+        }
+        if role == Some("worker") {
+            observed_turns.push("worker");
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadWrite
+            );
+            assert_eq!(worker_report.id, "worker-a");
+            let active_claims = SyncStore::open(&repo_path)
+                .expect("open active selector claims")
+                .snapshot()
+                .expect("snapshot active selector claims");
+            assert_eq!(active_claims.len(), 1);
+            assert_eq!(active_claims[0].agent_id, assignment.id);
+            assert_eq!(active_claims[0].paths, assignment.assigned_paths);
+            let claim_token = active_claims[0].token.get();
+            worker_report.claim_token = Some(claim_token);
+            worker_report.semantic_intent_token = None;
+            child_report.claim_token = Some(claim_token);
+            child_report.semantic_intent_token = None;
+            child_report.worker_reports = vec![worker_report.clone()];
+            write_injected_json(&command.output_last_message, &worker_report);
+            write_injected_usage(command, 8, 3);
+            let mut run = injected_verified_run(command);
+            run.stdout.target_launch_attempted = true;
+            return run;
+        }
+        observed_turns.push("final-parent");
+        assert_eq!(role, Some("child_orchestrator"));
+        assert_eq!(
+            command.workspace_access,
+            crate::process_runner::WorkspaceAccess::ReadOnly
+        );
+        assert!(command.codex_native_delegation_is_disabled());
+        assert!(command.codex_managed_readonly_continuation_enabled());
+        assert!(!command.codex_managed_worker_requests_enabled());
+        assert!(command.assignment_messaging_launch().is_none());
+        let final_turn = json!({
+            "version": 1,
+            "run_id": run_id.as_str(),
+            "parent_id": assignment.id,
+            "source_parent_attempt": 1,
+            "parent_attempt": 2,
+            "completed_worker_ids": [worker_report.id.clone()],
+            "turn": {"outcome": "final_report", "report": &child_report}
+        });
+        write_injected_json(&command.output_last_message, &final_turn);
         write_injected_usage(command, 8, 3);
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        run.stdout.target_launch_attempted = true;
+        run.output_last_message =
+            Some(serde_json::to_vec(&final_turn).expect("encode final parent"));
+        run
     };
 
     let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
@@ -2811,6 +3207,10 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     .expect("run verified selector-backed supervise dispatch");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
+    assert_eq!(
+        observed_turns,
+        ["initial-parent", "worker", "final-parent", "review-auditor"]
+    );
     assert_eq!(child_commands.len(), 1);
     let economics = report
         .role_economics_profile
@@ -3002,55 +3402,22 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
         AgentRole::GateClassifier,
         AgentRole::Auditor,
     ] {
-        assert_eq!(
-            profile.role_models[&role].model.as_deref(),
-            Some(FRONTIER_PROFILE_MODEL),
-            "default {role:?} binding diverged from the standard slug"
-        );
-        let UnavailableModelFallback::OrderedCatalogChain(chain) =
-            &profile.role_models[&role].unavailable_model_fallback
-        else {
-            panic!("default {role:?} binding lost catalog-chain data");
-        };
         assert!(
-            chain.models.is_empty(),
-            "default {role:?} availability chain names a nonstandard slug"
+            profile.role_models[&role].model.is_none(),
+            "omitted {role:?} model must remain selector input"
         );
+        assert!(profile.role_models[&role].reasoning_effort.is_none());
+        assert!(matches!(
+            &profile.role_models[&role].unavailable_model_fallback,
+            UnavailableModelFallback::FailClosed
+        ));
         let resolved = catalog
             .resolve_role_model_selection(&profile.role_models[&role], SupervisorRuntime::Codex)
             .unwrap_or_else(|error| panic!("default {role:?} binding did not resolve: {error:#}"));
-        assert_eq!(
-            resolved.selection.model.as_deref(),
-            Some(FRONTIER_PROFILE_MODEL),
-            "default {role:?} binding resolved away from the standard slug"
-        );
+        assert_eq!(resolved.selection, profile.role_models[&role]);
+        assert!(resolved.configured_model_chain.is_empty());
+        assert_eq!(resolved.resolved_candidate_index, None);
     }
-    assert_eq!(
-        profile.role_models[&AgentRole::ChildOrchestrator]
-            .reasoning_effort
-            .as_deref(),
-        Some("xhigh")
-    );
-    assert_eq!(
-        profile.role_models[&AgentRole::Worker]
-            .reasoning_effort
-            .as_deref(),
-        Some("medium")
-    );
-    assert!(matches!(
-        &profile.role_models[&AgentRole::GateClassifier].unavailable_model_fallback,
-        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-            on_exhausted: TerminalUnavailableModelFallback::LocalDeterministicFake,
-            ..
-        })
-    ));
-    assert!(matches!(
-        &profile.role_models[&AgentRole::Auditor].unavailable_model_fallback,
-        UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
-            on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
-            ..
-        })
-    ));
 
     let base_command = || {
         ExternalAgentCommand::codex(
@@ -3070,16 +3437,44 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     let runtime_profile = plan.effective_role_economics_profile_for_runtime(&catalog);
     assert_eq!(
         runtime_profile.model_availability,
-        RoleModelAvailability::Available
+        RoleModelAvailability::Unavailable
     );
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        let error = match apply_role_model_selection(
+            base_command(),
+            &plan,
+            role,
+            SupervisorRuntime::Codex,
+            &catalog,
+        ) {
+            Err(error) => error,
+            Ok(_) => panic!("an omitted {role:?} model must not authorize a real-runtime command"),
+        };
+        assert!(error
+            .to_string()
+            .contains("without an authoritative trusted model identity"));
+    }
+
+    // Explicit fixture bindings exercise argv projection without supplying routing defaults.
+    let mut configured_plan = plan.clone();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        configured_plan.role_models.insert(
+            role,
+            RoleModelSelection {
+                model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+                reasoning_effort: Some("xhigh".to_string()),
+                unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+            },
+        );
+    }
     let child = apply_role_model_selection(
         base_command(),
-        &plan,
+        &configured_plan,
         AgentRole::ChildOrchestrator,
         SupervisorRuntime::Codex,
         &catalog,
     )
-    .expect("apply no-override child selection");
+    .expect("apply explicit child fixture selection");
     let child_argv = crate::external_agent::app_server_command_argv(&child)
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -3088,7 +3483,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
         child_argv
             .windows(2)
             .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
-        "writable child app-server argv did not select the provisional model: {child_argv:?}"
+        "writable child app-server argv did not preserve the explicit fixture model: {child_argv:?}"
     );
     assert!(child_argv
         .windows(2)
@@ -3096,12 +3491,12 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
 
     let auditor = apply_role_model_selection(
         base_command(),
-        &plan,
+        &configured_plan,
         AgentRole::Auditor,
         SupervisorRuntime::Codex,
         &catalog,
     )
-    .expect("apply no-override auditor selection");
+    .expect("apply explicit auditor fixture selection");
     let auditor_argv = crate::external_agent::command_argv(&auditor)
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
@@ -3122,19 +3517,44 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
     .expect("base plan")
     .plan;
     plan.role_models = provisional_default_role_models();
+    // Defaults are deliberately unresolved. Author the chain this test round-trips.
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: Some("xhigh".to_string()),
+            unavailable_model_fallback: UnavailableModelFallback::OrderedCatalogChain(
+                OrderedCatalogFallback {
+                    models: Vec::new(),
+                    budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                    on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+                },
+            ),
+        },
+    );
     let document = serde_json::to_string(&plan).expect("serialize tiered plan");
     assert!(document.contains("ordered_catalog_chain"));
     let loaded = parse_supervisor_plan_with_consultant(&document).expect("reload tiered plan");
     assert_eq!(loaded.plan.role_models, plan.role_models);
 
     plan.role_models = all_frontier_role_models();
+    for selection in plan.role_models.values_mut() {
+        selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+        selection.reasoning_effort = Some("xhigh".to_string());
+        selection.unavailable_model_fallback =
+            UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
+                models: Vec::new(),
+                budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
+                on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
+            });
+    }
     let document = serde_json::to_string(&plan).expect("serialize all-frontier plan");
     let loaded =
         parse_supervisor_plan_with_consultant(&document).expect("reload all-frontier plan");
     assert_eq!(loaded.plan.role_models, plan.role_models);
     assert_eq!(
         loaded.plan.effective_role_economics_profile().name,
-        ALL_FRONTIER_PROFILE_NAME
+        PROVISIONAL_DEFAULT_HYBRID_PROFILE_NAME
     );
     assert!(loaded
         .plan
@@ -3153,10 +3573,26 @@ fn single_slug_profile_with_budget_chains_round_trips_through_plan_json() {
         UnavailableModelFallback::OrderedCatalogChain(OrderedCatalogFallback {
             models: Vec::new(),
             // gpt-5.6-terra is recorded as ineligible in the shipped capability
-            // policy, so the default degrade ladder may only name luna.
+            // policy, so this authored fixture ladder only names luna.
             budget_degrade_models: vec![ECONOMY_PROFILE_MODEL.to_string()],
             on_exhausted: TerminalUnavailableModelFallback::RuntimeDefault,
         })
+    );
+
+    // Unmodified all_frontier_role_models() is what selects ALL_FRONTIER_PROFILE_NAME.
+    let mut frontier_plan = parse_supervisor_plan_with_consultant(
+        std::str::from_utf8(&bounded_loader_plan_json()).expect("UTF-8 plan"),
+    )
+    .expect("base plan")
+    .plan;
+    frontier_plan.role_models = all_frontier_role_models();
+    let document = serde_json::to_string(&frontier_plan).expect("serialize frontier profile plan");
+    let loaded =
+        parse_supervisor_plan_with_consultant(&document).expect("reload frontier profile plan");
+    assert_eq!(loaded.plan.role_models, frontier_plan.role_models);
+    assert_eq!(
+        loaded.plan.effective_role_economics_profile().name,
+        ALL_FRONTIER_PROFILE_NAME
     );
 }
 
@@ -3263,6 +3699,10 @@ fn assignment_scoped_prompt_resolution_skips_irrelevant_cross_runtime_worker() {
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
     );
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
     let assignment = plan.assignments[0].clone();
     let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
 
@@ -3354,6 +3794,10 @@ fn assignment_scoped_prompt_resolution_resolves_same_runtime_nested_worker() {
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
     );
+    let mut child_selection = configured_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    child_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+    plan.role_models
+        .insert(AgentRole::ChildOrchestrator, child_selection);
     let mut assignment = plan.assignments[0].clone();
     assignment.worker_assignments.push(WorkerAssignment {
         id: "nested-worker".to_string(),
@@ -3456,7 +3900,7 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
     );
     assert_eq!(
         profile.role_models[&AgentRole::Auditor].model.as_deref(),
-        Some(FRONTIER_PROFILE_MODEL)
+        None
     );
     assert_eq!(profile.overridden_roles, vec![AgentRole::GateClassifier]);
 
@@ -3465,11 +3909,11 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
         .expect("runtime-default fallback");
     assert!(fallback.model.is_none());
     assert_eq!(fallback.reasoning_effort.as_deref(), Some("high"));
+    let mut fake_only = provisional_default_role_model_selection(AgentRole::GateClassifier);
+    fake_only.model = Some("classifier-model".to_string());
+    fake_only.unavailable_model_fallback = UnavailableModelFallback::LocalDeterministicFake;
     let local_fake = RuntimeModelCatalog::LocalDeterministicFake
-        .resolve_role_model_selection(
-            &provisional_default_role_model_selection(AgentRole::GateClassifier),
-            SupervisorRuntime::Fake,
-        )
+        .resolve_role_model_selection(&fake_only, SupervisorRuntime::Fake)
         .expect("local fake fallback");
     assert_eq!(local_fake.selection, RoleModelSelection::default());
     assert_eq!(
@@ -3477,10 +3921,7 @@ fn gate_classifier_override_and_unavailable_fallback_are_independent() {
         ModelResolutionObservation::LocalDeterministicFake
     );
     assert!(injected_codex_runtime_catalog(&["unrelated-model"])
-        .resolve_role_model_selection(
-            &provisional_default_role_model_selection(AgentRole::GateClassifier),
-            SupervisorRuntime::Codex,
-        )
+        .resolve_role_model_selection(&fake_only, SupervisorRuntime::Codex,)
         .expect_err("local fake cannot replace a Codex model")
         .to_string()
         .contains("valid only for the fake runtime"));
@@ -3701,11 +4142,25 @@ fn invalid_objective_profile_file_fails_before_external_dispatch() {
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor() {
+fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_authorized_lens_effort()
+{
     skip_without_containment!();
     let _capability =
-        install_named_test_models(&["available-child-model", "unavailable-auditor-model"]);
+        install_named_test_models(&["available-child-model", "available-auditor-model"]);
     let (temp, repo_path) = injected_repository();
+    let mut policy = crate::selection::routing_policy::load_routing_policy(&repo_path)
+        .expect("load fixture routing policy")
+        .policy;
+    let mut auditor_policy = policy.role(AgentRole::Auditor.as_str()).clone();
+    auditor_policy.minimum_effort = Some(crate::selection::ReasoningEffort::Low);
+    policy
+        .role_preferences
+        .insert(AgentRole::Auditor.as_str().to_string(), auditor_policy);
+    fs::write(
+        repo_path.join(crate::selection::routing_policy::ROUTING_POLICY_FILE),
+        serde_json::to_vec(&policy).expect("serialize fixture routing policy"),
+    )
+    .expect("write fixture Auditor effort minimum");
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
@@ -3719,7 +4174,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
     plan.role_models.insert(
         AgentRole::Auditor,
         RoleModelSelection {
-            model: Some("unavailable-auditor-model".to_string()),
+            model: Some("available-auditor-model".to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -3733,13 +4188,14 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         panic!("default supervisor lens must be model-backed");
     };
     *model = "available-child-model".to_string();
+    // The selected fixture supplies evidence for this exact lens profile.
+    // This low-effort lens meets the fixture's explicit Auditor minimum.
+    // Below-minimum refusal is covered by selection_bridge::tests::
+    // authored_review_lens_refusals_and_scope_exit_preserve_outer_authority.
     *reasoning_effort = Some("low".to_string());
-    let options = injected_options(
-        &repo_path,
-        temp.path(),
-        "known-unavailable-auditor-runtime-default",
-    );
-    let catalog = injected_codex_runtime_catalog(&["available-child-model"]);
+    let options = injected_options(&repo_path, temp.path(), "independent-auditor-preference");
+    let catalog =
+        injected_codex_runtime_catalog(&["available-child-model", "available-auditor-model"]);
     let mut child_seen = false;
     let mut auditor_seen = false;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -3753,9 +4209,20 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
             assert_eq!(command.model.as_deref(), Some("available-child-model"));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
+            assert_eq!(
+                AgentRole::Auditor.reasoning_effort_floor(),
+                Some(ReasoningEffort::Low)
+            );
+            crate::selection::routing_policy::validate_selected_launch(
+                AgentRole::Auditor.as_str(),
+                SupervisorRuntime::Codex.as_str(),
+                "available-child-model",
+                "low",
+            )
+            .expect("lens launch must match its exact selector authorization");
             assert!(fs::read_to_string(&command.prompt)
                 .expect("read resolved auditor prompt")
-                .contains("Reasoning effort: xhigh"));
+                .contains("Reasoning effort: low"));
             let argv = crate::external_agent::command_argv(command)
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
@@ -3765,7 +4232,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
                 .any(|arguments| arguments == ["-m", "available-child-model"]));
             assert!(argv
                 .windows(2)
-                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"xhigh\""] }));
+                .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"low\""] }));
             let child = injected_child_report(&assignment);
             write_injected_json(
                 &command.output_last_message,
@@ -3786,15 +4253,17 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
-    .expect("run production command path with unavailable auditor model");
+    .expect("run selected child and independent configured lens");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert!(child_seen);
@@ -3804,7 +4273,7 @@ fn configured_lens_selection_supersedes_role_model_and_clamps_to_auditor_floor()
             .role_economics_profile
             .as_ref()
             .map(|profile| profile.model_availability),
-        Some(RoleModelAvailability::Unavailable)
+        Some(RoleModelAvailability::Available)
     );
 }
 
@@ -4089,6 +4558,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     *model = "auditor-model".to_string();
     let samples = vec![
         RoleUsageSample {
+            cost_usd: Some(0.0036),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4099,6 +4569,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.0018),
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4109,6 +4580,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.0009),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4119,6 +4591,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
             },
         },
         RoleUsageSample {
+            cost_usd: Some(0.00045),
             role: AgentRole::Auditor,
             lens_id: Some("parent-acceptance".to_string()),
             model: Some("auditor-model".to_string()),
@@ -4207,6 +4680,20 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
     assert_eq!(lens_total_cost_usd, lens_reports[0].cost_usd);
 
     plan.model_pricing.clear();
+    let retained = role_usage_report(&plan, samples.clone())
+        .expect("retain settled costs after plan pricing changes");
+    assert_eq!(retained.total_cost_usd, cost);
+    assert_eq!(retained.lens_total_cost_usd, lens_total_cost_usd);
+    for (role, report) in &by_role {
+        assert_eq!(retained.reports[role].cost_usd, report.cost_usd);
+    }
+    let unpriced_samples = samples
+        .into_iter()
+        .map(|mut sample| {
+            sample.cost_usd = None;
+            sample
+        })
+        .collect();
     let RoleUsageAggregation {
         reports: unpriced,
         lens_reports: unpriced_lenses,
@@ -4214,7 +4701,7 @@ fn process_role_usage_aggregation_prices_children_and_auditors() {
         total_cost_usd: unpriced_cost,
         lens_total_usage: unpriced_lens_total,
         lens_total_cost_usd: unpriced_lens_cost,
-    } = role_usage_report(&plan, samples).expect("aggregate unpriced process usage");
+    } = role_usage_report(&plan, unpriced_samples).expect("aggregate unpriced process usage");
     assert_eq!(unpriced_total, total);
     assert!(unpriced.values().all(|report| report.cost_usd.is_none()));
     assert!(unpriced_cost.is_none());
@@ -4271,12 +4758,14 @@ fn process_role_usage_aggregation_prices_direct_workers() {
         &plan,
         vec![
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["worker-primary"].cost_usd(first_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-primary".to_string()),
                 usage: first_usage,
             },
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["worker-fallback"].cost_usd(second_usage)),
                 role: AgentRole::Worker,
                 lens_id: None,
                 model: Some("worker-fallback".to_string()),
@@ -4352,12 +4841,14 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
         &plan,
         vec![
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["auditor-initial"].cost_usd(rejected_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-initial".to_string()),
                 usage: rejected_usage,
             },
             RoleUsageSample {
+                cost_usd: Some(plan.model_pricing["auditor-active"].cost_usd(accepted_usage)),
                 role: AgentRole::Auditor,
                 lens_id: Some(lens_id.clone()),
                 model: Some("auditor-active".to_string()),
@@ -4413,21 +4904,22 @@ fn final_usage_evidence_preserves_rejected_and_active_auditor_models() {
     assert_eq!(persisted.review_lens_usage[1].model, "auditor-initial");
     assert_eq!(persisted.review_lens_total_usage, Some(expected_total));
 
-    let missing_model_error = match role_usage_report(
+    let missing_model = role_usage_report(
         &plan,
         vec![RoleUsageSample {
+            cost_usd: None,
             role: AgentRole::Auditor,
             lens_id: Some(plan.review_lenses[0].id.clone()),
             model: None,
             usage: Usage::default(),
         }],
-    ) {
-        Ok(_) => panic!("lens usage without model attribution must fail closed"),
-        Err(error) => error,
-    };
-    assert!(missing_model_error
-        .to_string()
-        .contains("omitted the dispatched model attribution"));
+    )
+    .expect("unknown identity retains tokens without allocating cost");
+    assert_eq!(missing_model.lens_reports[0].model, "unknown");
+    assert_eq!(missing_model.lens_reports[0].usage, Some(Usage::default()));
+    assert!(missing_model.lens_reports[0].cost_usd.is_none());
+    assert!(missing_model.lens_reports[0].unavailable_reason.is_some());
+    assert!(missing_model.total_cost_usd.is_none());
 }
 
 #[test]
@@ -4482,6 +4974,7 @@ fn nested_process_usage_has_no_synthetic_worker_totals() {
     let nested = role_usage_report(
         &nested_plan,
         vec![RoleUsageSample {
+            cost_usd: None,
             role: AgentRole::ChildOrchestrator,
             lens_id: None,
             model: Some("planner-model".to_string()),
@@ -4527,10 +5020,18 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     skip_without_containment!();
-    let _capability = install_named_test_models(&["model-alpha", "model-beta"]);
+    let _capability = install_named_test_models(&["model-alpha", "model-beta", "child-model"]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some("child-model".to_string()),
+            reasoning_effort: None,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
     plan.review_lenses = vec![
         ReviewLensConfig {
             id: "diff-security".to_string(),
@@ -4570,8 +5071,12 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     ]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog =
-        injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL, "model-alpha", "model-beta"]);
+    let catalog = injected_codex_runtime_catalog(&[
+        FRONTIER_PROFILE_MODEL,
+        "model-alpha",
+        "model-beta",
+        "child-model",
+    ]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -4599,14 +5104,53 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             write_injected_assignment_report(command, &assignment);
             write_injected_usage(command, 50, 10);
         }
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        if name.contains("review-auditor") {
+            let observed_model = if name.contains("lens-0") {
+                "model-alpha"
+            } else {
+                "model-beta"
+            };
+            let observed_effort = command.reasoning_effort.as_deref().unwrap();
+            crate::selection::routing_policy::validate_selected_launch(
+                "auditor",
+                "codex",
+                observed_model,
+                observed_effort,
+            )
+            .expect("current lens has exact selector authority before dispatch");
+            let (other_model, other_effort) = if name.contains("lens-0") {
+                ("model-beta", "xhigh")
+            } else {
+                ("model-alpha", "high")
+            };
+            assert!(
+                crate::selection::routing_policy::validate_selected_launch(
+                    "auditor",
+                    "codex",
+                    other_model,
+                    other_effort,
+                )
+                .is_err(),
+                "a different lens is not simultaneously authorized"
+            );
+            retain_priced_single_turn_fixture(
+                &mut run,
+                command,
+                observed_model,
+                &fs::read(&command.json_log).expect("complete lens capture"),
+            );
+        }
+        run
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
     .expect("run stacked review lenses");
@@ -4622,7 +5166,8 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         Some("provider-alpha")
     );
     assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
-    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("xhigh"));
+    // Preserve each lens's exact selected effort.
+    assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")
@@ -4664,6 +5209,41 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open stacked-lens artifacts");
     let events = read_finalized_orchestration_events(&reader);
+    let selections = reader
+        .read("evidence/review_lens_selections.jsonl")
+        .expect("authenticated per-lens selection evidence");
+    let selections = std::str::from_utf8(&selections)
+        .unwrap()
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<SupervisorSelectionEvent>(line)
+                .expect("retained lens selector decision")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        selections.len(),
+        2,
+        "each dispatched lens retains its selector decision"
+    );
+    for (selection, command) in selections.into_iter().zip(&lens_commands) {
+        let choice = selection.provenance.choice.as_ref().unwrap();
+        assert_eq!(
+            selection.provenance.status,
+            crate::selection::DecisionStatus::Selected
+        );
+        assert_eq!(
+            choice.candidate.model.as_str(),
+            command.model.as_deref().unwrap()
+        );
+        assert_eq!(
+            choice.candidate.effort.as_str(),
+            command.reasoning_effort.as_deref().unwrap()
+        );
+        assert_eq!(
+            selection.provenance.normalized_task.authority_role,
+            crate::selection::AuthorityRole::ReviewAuditor
+        );
+    }
     let aggregate_event = events
         .iter()
         .find(|event| {
@@ -4736,12 +5316,14 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
         write_injected_usage(command, 50, 10);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runtime_model_catalog_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
-        Ok(catalog),
+        Some(catalog),
+        &temp,
         &mut runner,
     )
     .expect("finalize unavailable-lens procedural report");
@@ -4798,7 +5380,13 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
             .iter()
             .map(|assignment| assignment.id.as_str())
             .collect::<Vec<_>>(),
-        vec!["assignment-001-planning", "assignment-001"]
+        vec!["assignment-001"]
+    );
+    assert_eq!(loaded.plan.assignments[0].phase, AssignmentPhase::Execution);
+    assert_eq!(loaded.plan.assignments[0].role, AgentRole::Worker);
+    assert_eq!(
+        loaded.plan.assignments[0].role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
     );
     assert_eq!(
         loaded.plan.assignments[0].assigned_paths,
@@ -4806,27 +5394,13 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     );
     assert!(loaded.plan.assignments[0].worker_assignments.is_empty());
     assert_eq!(
-        loaded.plan.assignments[1].assigned_paths,
-        vec![PathBuf::from("README.md")]
-    );
-    assert_eq!(loaded.plan.assignments[1].role, AgentRole::Worker);
-    assert!(loaded.plan.assignments[1].worker_assignments.is_empty());
-    assert_eq!(
         loaded.plan_metadata.assignment_schedule,
-        vec![
-            AssignmentScheduleEntry {
-                assignment_id: "assignment-001-planning".to_string(),
-                parent_assignment_id: None,
-                depth: 2,
-                flattened_index: 0,
-            },
-            AssignmentScheduleEntry {
-                assignment_id: "assignment-001".to_string(),
-                parent_assignment_id: Some("assignment-001-planning".to_string()),
-                depth: 3,
-                flattened_index: 1,
-            },
-        ]
+        vec![AssignmentScheduleEntry {
+            assignment_id: "assignment-001".to_string(),
+            parent_assignment_id: None,
+            depth: 2,
+            flattened_index: 0,
+        }]
     );
 
     let plan = temp.path().join("plan.json");
@@ -5013,17 +5587,36 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
         .expect("lower heuristic feedback re-plan");
 
     assert_eq!(session.replans_used(), 1);
-    assert_eq!(plan.assignments.len(), 2);
-    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001-planning");
-    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Planning);
-    assert_eq!(plan.assignments[1].id, "assignment-replan-01-001");
-    assert_eq!(plan.assignments[1].phase, AssignmentPhase::Execution);
+    assert!(session.completed_fragment_ids().contains("fragment-001"));
+    assert!(session
+        .completed_assignments()
+        .iter()
+        .any(|assignment| assignment.id == "assignment-001"));
+    assert!(session
+        .proposal()
+        .fragments
+        .iter()
+        .any(|fragment| fragment.id == "fragment-001"));
+    assert!(session
+        .proposal()
+        .fragments
+        .iter()
+        .any(|fragment| fragment.id == "fragment-002"));
+    assert_eq!(plan.assignments.len(), 1);
+    assert_eq!(plan.assignments[0].id, "assignment-replan-01-001");
+    assert_eq!(plan.assignments[0].phase, AssignmentPhase::Execution);
+    assert_eq!(plan.assignments[0].role, AgentRole::Worker);
+    assert_eq!(
+        plan.assignments[0].role_category,
+        Some(RoleCategory::NonDelegatingTerminalWorker)
+    );
+    assert!(plan.assignments[0].worker_assignments.is_empty());
     assert!(
-        plan.assignments[1]
+        plan.assignments[0]
             .assigned_paths
             .contains(&PathBuf::from("src/gamma.rs")),
         "remaining work should pick up the feedback path: {:?}",
-        plan.assignments[1].assigned_paths
+        plan.assignments[0].assigned_paths
     );
     assert!(plan
         .assignments
@@ -5183,6 +5776,13 @@ fn empty_scope_invalid_parks_without_worker_launch_while_sibling_still_dispatche
 
     let loaded = parse_supervisor_plan_with_consultant(&empty_scope_invalid_plan_json(true))
         .expect("empty-scope mixed plan must pass production plan validation");
+    #[cfg(target_os = "linux")]
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let viable = loaded
         .plan
         .assignments

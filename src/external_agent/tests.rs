@@ -14,19 +14,534 @@ pub(super) fn run_grok_preflight_hook() {
 
 #[cfg(target_os = "linux")]
 #[test]
+#[ignore = "requires the exact installed Cursor pin and delegated user-systemd containment"]
+fn cursor_managed_actual_pinned_import_is_preconfined_and_parent_acked() -> Result<()> {
+    const DEFAULT_ROOT: &str = "/nix/store/cfyqr2wp1rs4wmjqvm10fckkb3n566z0-cursor-cli-0-unstable-2026-04-08/share/cursor-agent";
+    const MARKER: &str = "MACO_CURSOR_PINNED_IMPORT_GATE1_PASS";
+    let root = PathBuf::from(
+        std::env::var_os("MACO_CURSOR_PINNED_ROOT_FOR_TEST")
+            .unwrap_or_else(|| OsString::from(DEFAULT_ROOT)),
+    );
+    let node = root.join("node");
+    let temp = tempfile::tempdir()?;
+    let bridge_path = temp.path().join("managed_bridge.cjs");
+    let gate_path = temp.path().join("gate.cjs");
+    fs::write(
+        &bridge_path,
+        include_bytes!("../runtime_adapter/cursor/managed_bridge.cjs"),
+    )?;
+    fs::write(
+        &gate_path,
+        format!(
+            r#""use strict";
+const bridge = require(process.argv[2]);
+const root = process.argv[3];
+const calls = [];
+const operation = new AbortController();
+const deny = (name) => (..._args) => {{ calls.push(name); throw new Error(`unexpected parent call ${{name}}`); }};
+const parent = {{
+  operationSignal: operation.signal,
+  operationDeadlineUnixMillis: Date.now() + 10000,
+  createSharedServices: deny("createSharedServices"),
+  createSessionResources: deny("createSessionResources"),
+  authorizeResourceAction: deny("authorizeResourceAction"),
+  executeResourceAction: deny("executeResourceAction"),
+  admitRpcAttempt: deny("admitRpcAttempt"),
+  authorizeAction: deny("authorizeAction"),
+  captureRawEvent: deny("captureRawEvent"),
+  completeRpcAttempt: deny("completeRpcAttempt"),
+}};
+process.argv = [process.execPath, `${{root}}/index.js`, "acp"];
+const installed = bridge.installPinnedCursorBridge({{ root, parent }});
+setImmediate(() => {{
+  const binding = installed.binding;
+  if (calls.length !== 0 || binding.primaryAuthorityEnabled !== false ||
+      binding.originalFactoriesInvoked.sharedServices !== false ||
+      binding.originalFactoriesInvoked.sessionResources !== false ||
+      installed.activeAttemptCount() !== 0 || installed.pendingCompletionCount() !== 0) {{
+    throw new Error("providerless pinned import crossed an authority boundary");
+  }}
+  process.stdout.write("{MARKER}\n");
+  process.exit(0);
+}});
+"#
+        ),
+    )?;
+    let output = crate::process_runner::run_process(
+        ProcessSpec::direct(
+            "Cursor providerless pinned import gate",
+            &node,
+            [
+                gate_path.into_os_string(),
+                bridge_path.into_os_string(),
+                root.as_os_str().to_os_string(),
+            ],
+            temp.path(),
+            64 * 1024,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_private_runtime_home(true)
+        .with_timeout(Some(Duration::from_secs(15)))
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::from([
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("NO_COLOR".to_string(), "1".to_string()),
+            ("TERM".to_string(), "dumb".to_string()),
+        ])))
+        .with_side_effect_confinement(
+            SideEffectConfinementProfile::StrictOfflineWorkspace(
+                StrictOfflineWorkspaceProfile::read_only(temp.path())
+                    .with_visible_read_only_root(&root),
+            ),
+        ),
+    )?;
+    assert!(
+        output.status.is_some_and(|status| status.success()),
+        "{output:?}"
+    );
+    assert!(output.safety_evidence_verified(), "{output:?}");
+    assert!(output.process_tree.is_verified_empty(), "{output:?}");
+    let stdout = std::str::from_utf8(output.stdout.as_bytes())?;
+    assert_eq!(stdout.matches(MARKER).count(), 1, "{stdout}");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cursor_providerless_offline_uds_profile_is_exact_and_rejects_foreign_endpoints() -> Result<()> {
+    fn property<'a>(properties: &'a [String], name: &str) -> Result<&'a str> {
+        let prefix = format!("--property={name}=");
+        let values = properties
+            .iter()
+            .filter_map(|argument| argument.strip_prefix(&prefix))
+            .collect::<Vec<_>>();
+        if values.len() != 1 {
+            bail!("expected one {name} property, observed {values:?}");
+        }
+        Ok(values[0])
+    }
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("child");
+    let hidden = temp.path().join("primary");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&hidden)?;
+    let profile =
+        crate::process_runner::CursorProviderlessOfflineUdsProfile::read_write(&workspace)
+            .with_hidden_root(&hidden);
+    let properties =
+        crate::process_runner::cursor_providerless_offline_uds_systemd_properties_for_test(
+            profile,
+            Path::new("/nix/store/maco-cursor-fixture/bin/node"),
+            &workspace,
+        )?;
+    assert_eq!(property(&properties, "PrivateNetwork")?, "yes");
+    assert_eq!(property(&properties, "RestrictAddressFamilies")?, "AF_UNIX");
+    assert_eq!(property(&properties, "TemporaryFileSystem")?, "/:ro");
+    let filter = property(&properties, "SystemCallFilter")?;
+    let denied = filter
+        .trim_start_matches('~')
+        .split_whitespace()
+        .collect::<BTreeSet<_>>();
+    assert!(!denied.contains("socket"));
+    assert!(!denied.contains("connect"));
+    for syscall in ["bind", "listen", "accept", "socketpair", "socketcall"] {
+        assert!(denied.contains(syscall), "missing {syscall}: {filter}");
+    }
+    let bind_paths = properties
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--property=BindPaths="))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    assert_eq!(
+        bind_paths,
+        BTreeSet::from([
+            workspace.to_string_lossy().into_owned(),
+            "/run/user/1000/maco-test-runtime".to_string(),
+        ])
+    );
+    let read_only_bindings = properties
+        .iter()
+        .filter_map(|argument| argument.strip_prefix("--property=BindReadOnlyPaths="))
+        .collect::<BTreeSet<_>>();
+    assert_eq!(read_only_bindings, BTreeSet::from(["/nix/store"]));
+    assert!(!properties
+        .iter()
+        .any(|argument| argument.contains("AF_INET") || argument.contains("AF_INET6")));
+    assert!(properties.iter().any(|argument| {
+        argument == &format!("--property=InaccessiblePaths=-{}", hidden.display())
+    }));
+
+    crate::process_runner::verify_cursor_providerless_offline_uds_network_for_test(
+        "yes", "AF_UNIX",
+    )?;
+    assert!(
+        crate::process_runner::verify_cursor_providerless_offline_uds_network_for_test(
+            "yes",
+            "AF_UNIX AF_INET",
+        )
+        .is_err()
+    );
+    assert!(
+        crate::process_runner::verify_cursor_providerless_offline_uds_network_for_test(
+            "no", "AF_UNIX",
+        )
+        .is_err()
+    );
+    crate::process_runner::verify_cursor_providerless_offline_uds_filter_for_test(filter)?;
+    let missing_socketpair = filter
+        .split_whitespace()
+        .filter(|token| token.trim_start_matches('~') != "socketpair")
+        .collect::<Vec<_>>()
+        .join(" ");
+    assert!(
+        crate::process_runner::verify_cursor_providerless_offline_uds_filter_for_test(
+            &missing_socketpair,
+        )
+        .is_err()
+    );
+    let denied_socket = format!("{filter} socket");
+    assert!(
+        crate::process_runner::verify_cursor_providerless_offline_uds_filter_for_test(
+            &denied_socket,
+        )
+        .is_err()
+    );
+
+    let foreign_socket = workspace.join("foreign.sock");
+    let _foreign_listener = std::os::unix::net::UnixListener::bind(&foreign_socket)?;
+    let error = crate::process_runner::cursor_providerless_offline_uds_systemd_properties_for_test(
+        crate::process_runner::CursorProviderlessOfflineUdsProfile::read_write(&workspace),
+        Path::new("/nix/store/maco-cursor-fixture/bin/node"),
+        &workspace,
+    )
+    .expect_err("foreign workspace socket must refuse before launch");
+    assert!(
+        error.to_string().contains("socket, FIFO, or device node"),
+        "{error}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn cursor_managed_bootstrap_argv_roundtrips_utf8_and_escaped_controls() -> Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let source = "aé🙂z\n\t\0\"\\";
+    let vendor = vec!["acp".to_string()];
+    let argv = cursor_managed_bootstrap_argv(source, vendor.clone())?;
+    assert_eq!(argv.len(), 6);
+    assert_eq!(argv[0], "-e");
+    assert_eq!(argv[2], "--");
+    assert_eq!(argv[5], vendor[0].as_str());
+    for argument in &argv {
+        let bytes = argument.as_os_str().as_bytes();
+        assert!(!bytes.is_empty());
+        assert!(bytes.len() <= 64 * 1024);
+        assert!(!bytes.iter().any(u8::is_ascii_control));
+    }
+    let first: String = serde_json::from_str(argv[3].to_str().context("first source operand")?)?;
+    let second: String = serde_json::from_str(argv[4].to_str().context("second source operand")?)?;
+    assert_eq!(first + &second, source);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires the exact installed Cursor pin and delegated user-systemd containment"]
+fn cursor_managed_worker_writes_only_assigned_path_and_runs_parent_owned_check() -> Result<()> {
+    const DEFAULT_ROOT: &str = "/nix/store/cfyqr2wp1rs4wmjqvm10fckkb3n566z0-cursor-cli-0-unstable-2026-04-08/share/cursor-agent";
+    const MARKER: &str = "MACO_CURSOR_PROVIDERLESS_GATE2_PASS";
+    const ASSIGNED: &str = "assigned.txt";
+    const EXPECTED: &str = "managed Cursor providerless qualification\n";
+
+    let root = PathBuf::from(
+        std::env::var_os("MACO_CURSOR_PINNED_ROOT_FOR_TEST")
+            .unwrap_or_else(|| OsString::from(DEFAULT_ROOT)),
+    );
+    let prefix = root
+        .parent()
+        .and_then(Path::parent)
+        .context("pinned Cursor fixture root has no package prefix")?;
+    let selected_program = prefix.join("bin/cursor-agent");
+    let install = crate::runtime_adapter::cursor_managed_parent::CursorManagedInstall::bind(
+        &selected_program,
+    )?;
+
+    let temp = tempfile::tempdir()?;
+    let primary = temp.path().join("primary");
+    let child = temp.path().join("child");
+    let repository = git2::Repository::init(&primary)?;
+    fs::write(primary.join(ASSIGNED), "before\n")?;
+    fs::write(primary.join("sibling.txt"), "sibling\n")?;
+    let mut index = repository.index()?;
+    index.add_path(Path::new(ASSIGNED))?;
+    index.add_path(Path::new("sibling.txt"))?;
+    index.write()?;
+    let tree_id = index.write_tree()?;
+    let tree = repository.find_tree(tree_id)?;
+    let signature = git2::Signature::now("Fixture Owner", "fixture@example.invalid")?;
+    repository.commit(Some("HEAD"), &signature, &signature, "initial", &tree, &[])?;
+    drop(tree);
+    repository.worktree("child", &child, Some(&git2::WorktreeAddOptions::new()))?;
+
+    let timeout = Duration::from_secs(30);
+    let command = ExternalAgentCommand::codex(
+        &selected_program,
+        &child,
+        child.join("prompt.md"),
+        child.join("events.jsonl"),
+        child.join("result.json"),
+        timeout,
+    )
+    .with_runtime_adapter(
+        RuntimeId::Cursor,
+        RuntimeAdapterConfig::defaults(RuntimeId::Cursor),
+    );
+    let argv = cursor_managed_argv(&command, &install)?;
+    let main_helper =
+        crate::pinned_exec::SourceBoundMainHelper::capture_qualification_environment()?;
+    let deadline = Instant::now()
+        .checked_add(timeout)
+        .context("Cursor Gate2 deadline overflowed")?;
+    let deadline_unix_millis =
+        crate::runtime_adapter::cursor_managed_parent::operation_deadline_unix_millis(timeout)?;
+    let cancellation = ProcessCancellation::new();
+    let mut parent = None;
+    let output = crate::process_runner::run_process_cancellable_with_start_gate(
+        ProcessSpec::direct(
+            "Cursor providerless assigned write and check gate",
+            install.node(),
+            argv,
+            &child,
+            256 * 1024,
+        )
+        .with_stdin(StdinMode::Null)
+        .with_private_runtime_home(true)
+        .with_private_runtime_cursor_home(true)
+        .with_timeout(Some(timeout))
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::from([
+            ("LANG".to_string(), "C.UTF-8".to_string()),
+            ("LC_ALL".to_string(), "C.UTF-8".to_string()),
+            ("NO_COLOR".to_string(), "1".to_string()),
+            ("TERM".to_string(), "dumb".to_string()),
+            (
+                "MACO_CURSOR_PINNED_ROOT".to_string(),
+                root.to_string_lossy().into_owned(),
+            ),
+            (
+                "MACO_CURSOR_OPERATION_DEADLINE_UNIX_MILLIS".to_string(),
+                deadline_unix_millis.to_string(),
+            ),
+            (
+                "MACO_CURSOR_PROVIDERLESS_QUALIFICATION".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "MACO_CURSOR_PROVIDERLESS_PATH".to_string(),
+                ASSIGNED.to_string(),
+            ),
+            (
+                "MACO_CURSOR_PROVIDERLESS_TEXT_JSON".to_string(),
+                serde_json::to_string(EXPECTED)?,
+            ),
+            (
+                "MACO_CURSOR_PROVIDERLESS_WORKSPACE".to_string(),
+                child.to_string_lossy().into_owned(),
+            ),
+        ])))
+        .with_side_effect_confinement(
+            SideEffectConfinementProfile::CursorProviderlessOfflineUds(
+                crate::process_runner::CursorProviderlessOfflineUdsProfile::read_write(&child)
+                    .with_hidden_root(&primary),
+            ),
+        ),
+        &cancellation,
+        |gate| {
+            parent = Some(
+                crate::runtime_adapter::cursor_managed_parent::CursorManagedParent::start_providerless_qualification(
+                    gate,
+                    &child,
+                    vec![PathBuf::from(ASSIGNED)],
+                    cancellation.clone(),
+                    deadline,
+                    main_helper.clone(),
+                )
+                .map_err(|error| error.to_string())?,
+            );
+            Ok(())
+        },
+    )?;
+    // Record only bounded flags and fixed labels before parent.finish() can refuse.
+    let stderr_bytes = output.stderr.as_bytes();
+    let diagnostic_bytes = &stderr_bytes[..stderr_bytes.len().min(4096)];
+    let diagnostic = String::from_utf8_lossy(diagnostic_bytes);
+    let fixed_bootstrap_errors = [
+        "pinned webpack bootstrap anchor drifted",
+        "pinned CLI entry tail drifted",
+        "isolated webpack loader shape drifted",
+        "pinned model chunk shape drifted",
+        "pinned ACP chunk table shape drifted",
+        "pinned Q/Y module factories are unavailable",
+        "ACP chunk already has a runtime hook",
+        "isolated loader did not install the guarded PW client",
+        "shared-services factory lacks the live webpack loader",
+        "pinned hO/PW/P3 constructors drifted",
+        "parent operation deadline elapsed",
+        "Cursor providerless qualification text JSON must encode a string",
+        "Cannot find module",
+        "Cannot read properties of",
+        "is not a function",
+        "is not defined",
+        "SyntaxError",
+        "ENOENT",
+        "EACCES",
+        "EPERM",
+    ];
+    let matched_errors: Vec<_> = fixed_bootstrap_errors
+        .into_iter()
+        .filter(|message| diagnostic.contains(message))
+        .collect();
+    let bootstrap_refusal = diagnostic
+        .lines()
+        .find_map(|line| line.strip_prefix("MACO_CURSOR_BOOTSTRAP_REFUSAL "))
+        .and_then(|line| serde_json::from_str::<serde_json::Value>(line).ok());
+    let known_refusal_codes: BTreeSet<_> =
+        include_str!("../runtime_adapter/cursor/managed_bridge.cjs")
+            .split('"')
+            .filter(|value| {
+                value.starts_with("CURSOR_")
+                    && value.bytes().all(|byte| {
+                        byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                    })
+            })
+            .collect();
+    let bootstrap_code = bootstrap_refusal
+        .as_ref()
+        .and_then(|value| value.get("code"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|code| {
+            known_refusal_codes.contains(*code)
+                || [
+                    "MODULE_NOT_FOUND",
+                    "ERR_REQUIRE_ESM",
+                    "ERR_DLOPEN_FAILED",
+                    "ENOENT",
+                    "EACCES",
+                    "EPERM",
+                ]
+                .contains(code)
+        });
+    let bootstrap_class = bootstrap_refusal
+        .as_ref()
+        .and_then(|value| value.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| {
+            [
+                "CursorBridgeRefusal",
+                "CursorManagedParentRefusal",
+                "Error",
+                "TypeError",
+                "SyntaxError",
+                "unrecognized",
+            ]
+            .contains(name)
+        });
+    let bootstrap_message_sha256 = bootstrap_refusal
+        .as_ref()
+        .and_then(|value| value.get("message_sha256"))
+        .and_then(serde_json::Value::as_str)
+        .filter(|hash| {
+            hash.len() == 64
+                && hash
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        });
+    eprintln!(
+        "MACO_CURSOR_PROVIDERLESS_CHILD_OUTCOME {}",
+        serde_json::json!({
+            "exit_code": output.status.and_then(|status| status.code()),
+            "exit_signal": output.status.and_then(|status| {
+                std::os::unix::process::ExitStatusExt::signal(&status)
+            }),
+            "status_success": output.status.map(|status| status.success()),
+            "safety_sensitive_succeeded": output.safety_sensitive_succeeded(),
+            "timed_out": output.timed_out,
+            "duration_ms": output.duration_ms(),
+            "process_tree": output.process_tree,
+            "side_effects": output.side_effects,
+            "process_error_present": output.process_error.is_some(),
+            "stdin_error_present": output.stdin_error.is_some(),
+            "stdout_captured_bytes": output.stdout.as_bytes().len(),
+            "stdout_truncated": output.stdout.is_truncated(),
+            "stderr_captured_bytes": stderr_bytes.len(),
+            "stderr_capture_truncated": output.stderr.is_truncated(),
+            "stderr_diagnostic_bytes": diagnostic_bytes.len(),
+            "stderr_diagnostic_truncated": output.stderr.is_truncated()
+                || stderr_bytes.len() > diagnostic_bytes.len(),
+            "stderr_diagnostic_sha256": sha256_hex(diagnostic_bytes),
+            "bootstrap_refusal_present": diagnostic.contains("managed Cursor bootstrap refused:")
+                || diagnostic.contains("MACO_CURSOR_BOOTSTRAP_REFUSAL "),
+            "bootstrap_record_parsed": bootstrap_refusal.is_some(),
+            "bootstrap_refusal_code": bootstrap_code,
+            "bootstrap_error_class": bootstrap_class,
+            "bootstrap_message_sha256": bootstrap_message_sha256,
+            "fixed_bootstrap_errors": matched_errors,
+        })
+    );
+    let evidence = parent
+        .context("Cursor Gate2 parent was not created")?
+        .finish()?;
+
+    assert!(output.safety_sensitive_succeeded(), "{output:?}");
+    assert_eq!(
+        output.side_effects,
+        SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
+        )
+    );
+    let stdout = std::str::from_utf8(output.stdout.as_bytes())?;
+    assert_eq!(stdout.matches(MARKER).count(), 1, "{stdout}");
+    assert_eq!(fs::read_to_string(child.join(ASSIGNED))?, EXPECTED);
+    assert_eq!(fs::read_to_string(child.join("sibling.txt"))?, "sibling\n");
+    assert_eq!(fs::read_to_string(primary.join(ASSIGNED))?, "before\n");
+    assert_eq!(
+        fs::read_to_string(primary.join("sibling.txt"))?,
+        "sibling\n"
+    );
+    assert!(evidence.peer_verified);
+    assert_eq!(evidence.shared_services_acks, 1);
+    assert_eq!(evidence.shared_services_refusals, 0);
+    assert_eq!(evidence.session_resource_acks, 1);
+    assert_eq!(evidence.filesystem_writes, 1);
+    assert_eq!(evidence.offline_checks, 1);
+    assert_eq!(evidence.refused_actions, 0);
+    assert_eq!(evidence.admitted_attempts, 0);
+    assert_eq!(evidence.captured_events, 0);
+    assert!(evidence.actual_provider_model.is_none());
+    assert!(evidence.actual_effort.is_none());
+    assert!(evidence.usd.is_none());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn verified_grok_preflight_launch_evidence_and_source_replacement() -> Result<()> {
     let _no_socket = CamSocketEnvGuard::unset();
     for mutation in ["none", "missing", "replaced"] {
         let temp = tempfile::tempdir()?;
         let (harness, home, binding) = build_cam_grok_test_harness("account-a")?;
-        let command = admitted_verified_grok_cam_command(temp.path())?
-            .with_environment_requirement(EnvironmentRequirement::executable(
-                EnvironmentExecutable::Git,
-                None,
-            ))
-            .with_environment_requirement(EnvironmentRequirement::network(
-                EnvironmentNetworkAccess::Enabled,
-            ));
+        let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+            command
+                .with_environment_requirement(EnvironmentRequirement::executable(
+                    EnvironmentExecutable::Git,
+                    None,
+                ))
+                .with_environment_requirement(EnvironmentRequirement::network(
+                    EnvironmentNetworkAccess::Enabled,
+                ))
+        })?;
         GROK_PREFLIGHT_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move || {
                 if mutation != "none" {
@@ -91,9 +606,11 @@ fn verified_grok_preflight_rejects_unavailable_offline_requirement_before_launch
     let _no_socket = CamSocketEnvGuard::unset();
     let temp = tempfile::tempdir()?;
     let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
-    let command = admitted_verified_grok_cam_command(temp.path())?.with_environment_requirement(
-        EnvironmentRequirement::network(EnvironmentNetworkAccess::Disabled),
-    );
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_environment_requirement(EnvironmentRequirement::network(
+            EnvironmentNetworkAccess::Disabled,
+        ))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert!(!report.stdout.target_launch_attempted, "{report:#?}");
     assert!(report.environment_preflight_results().iter().any(|result| {
@@ -163,6 +680,14 @@ fn build_cam_grok_test_harness_unselected(
 
 #[cfg(target_os = "linux")]
 fn admitted_verified_grok_cam_command(temp: &std::path::Path) -> Result<ExternalAgentCommand> {
+    admitted_verified_grok_cam_command_with_setup(temp, |command| command)
+}
+
+#[cfg(target_os = "linux")]
+fn admitted_verified_grok_cam_command_with_setup(
+    temp: &std::path::Path,
+    setup: impl FnOnce(ExternalAgentCommand) -> ExternalAgentCommand,
+) -> Result<ExternalAgentCommand> {
     use std::os::unix::fs::PermissionsExt;
 
     const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
@@ -184,6 +709,9 @@ fn admitted_verified_grok_cam_command(temp: &std::path::Path) -> Result<External
         &program,
         r#"#!/bin/sh
 set -eu
+no_auto_update="${1:-}"
+[ "$no_auto_update" = "--no-auto-update" ]
+shift
 [ "$#" -eq 18 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
@@ -211,6 +739,7 @@ exit 42
         writable_grok_command_before_runtime_selection(&program, &child, &prompt, &incoming)?
             .with_agent_lifecycle(&primary, "worker", "verified-grok-cam", "grok-worker");
     command.output_schema = Some(schema);
+    let command = setup(command);
     Ok(command
         .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
         .with_worktree_writable_confinement(writable_grok_confinement(
@@ -504,35 +1033,41 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     .with_workspace_access(WorkspaceAccess::ReadOnly)
     .with_agent_lifecycle("/registry", "researcher", "research-run", "research-task");
     let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified);
     assert_eq!(selected, cfg!(target_os = "linux"));
     assert!(!should_use_duplex_review(
         &spec,
         ExternalExecutionRuntime::Verified,
         true
     ));
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &spec,
         ExternalExecutionRuntime::NonpublishableSimulation
     ));
-    for role in ["worker", "auditor", "child_orchestrator", "Researcher"] {
+    let mut auditor = spec.clone();
+    auditor.agent_lifecycle.as_mut().unwrap().role = "auditor".to_string();
+    assert_eq!(
+        should_use_read_only_terminal_app_server(&auditor, ExternalExecutionRuntime::Verified),
+        cfg!(target_os = "linux")
+    );
+    for role in ["worker", "child_orchestrator", "Researcher", "Auditor"] {
         let mut other = spec.clone();
         other.agent_lifecycle.as_mut().unwrap().role = role.to_string();
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
     }
     let mut other = spec.clone();
     other.agent_lifecycle = None;
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
     other = spec
         .clone()
         .with_workspace_access(WorkspaceAccess::ReadWrite);
-    assert!(!should_use_read_only_researcher_app_server(
+    assert!(!should_use_read_only_terminal_app_server(
         &other,
         ExternalExecutionRuntime::Verified
     ));
@@ -542,7 +1077,7 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
     ] {
         other = spec.clone();
         other.invocation = invocation;
-        assert!(!should_use_read_only_researcher_app_server(
+        assert!(!should_use_read_only_terminal_app_server(
             &other,
             ExternalExecutionRuntime::Verified
         ));
@@ -597,36 +1132,38 @@ fn read_only_researcher_app_server_refuses_custom_version_claim_before_launch() 
         ),
     )?;
     fs::set_permissions(&shim, fs::Permissions::from_mode(0o700))?;
-    let spec = ExternalAgentCommand::codex(
-        &shim,
-        temp.path(),
-        temp.path().join("prompt.md"),
-        temp.path().join("events.jsonl"),
-        temp.path().join("report.json"),
-        Duration::from_secs(5),
-    )
-    .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(temp.path(), "researcher", "custom-run", "custom-task");
-    assert!(should_use_read_only_researcher_app_server(
-        &spec,
-        ExternalExecutionRuntime::Verified
-    ));
-    assert_eq!(
-        external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
-        ExternalProgramTrust::ExplicitCustom
-    );
-    let report = run_external_agent(&spec);
-    assert!(
-        report.error.as_deref().is_some_and(
-            |error| error.contains("requires a verified TrustedSystemCodex executable")
-        ),
-        "{report:?}"
-    );
-    assert!(report.environment_blocked());
-    assert!(!report.stdout.target_launch_attempted);
-    assert!(!marker.exists());
-    assert!(report.codex_command_execution_evidence().is_none());
-    assert!(!report.publishable);
+    for role in ["researcher", "auditor"] {
+        let spec = ExternalAgentCommand::codex(
+            &shim,
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("events.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(5),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_agent_lifecycle(temp.path(), role, "custom-run", "custom-task");
+        assert!(should_use_read_only_terminal_app_server(
+            &spec,
+            ExternalExecutionRuntime::Verified
+        ));
+        assert_eq!(
+            external_program_trust_for_resolved_executable(&spec, &fs::canonicalize(&shim)?),
+            ExternalProgramTrust::ExplicitCustom
+        );
+        let report = run_external_agent(&spec);
+        assert!(
+            report.error.as_deref().is_some_and(
+                |error| error.contains("requires a verified TrustedSystemCodex executable")
+            ),
+            "{report:?}"
+        );
+        assert!(report.environment_blocked());
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(!marker.exists());
+        assert!(report.codex_command_execution_evidence().is_none());
+        assert!(!report.publishable);
+    }
     Ok(())
 }
 
@@ -659,15 +1196,15 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
         messages_received: 1,
         bytes_received: 1,
     };
-    assert!(validate_read_only_researcher_app_server_outcome(&outcome, false).is_ok());
+    assert!(validate_read_only_terminal_app_server_outcome(&outcome, false).is_ok());
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, true)
+        validate_read_only_terminal_app_server_outcome(&outcome, true)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
     // No fileChange item and no gate-denial payload are needed to keep a permission refusal.
     outcome.refused_ceiling_expansions = 1;
     assert!(
-        validate_read_only_researcher_app_server_outcome(&outcome, false)
+        validate_read_only_terminal_app_server_outcome(&outcome, false)
             .is_err_and(|error| error.contains("refused an approval request"))
     );
 }
@@ -676,8 +1213,18 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
 fn contained_read_only_researcher_app_server(
     mode: &str,
 ) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
-    use std::os::unix::fs::PermissionsExt;
+    contained_read_only_terminal_app_server(mode, "researcher", None)
+}
 
+#[cfg(target_os = "linux")]
+fn contained_read_only_terminal_app_server(
+    mode: &str,
+    role: &str,
+    grant: Option<crate::supervise_budget::LiveTokenGrant>,
+) -> Result<(ExternalAgentRun, PathBuf, tempfile::TempDir)> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let worker = role == "worker";
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     create_mandatory_control_roots(&workspace)?;
@@ -703,8 +1250,12 @@ import json, pathlib, sys
 mode, workspace, argv = sys.argv[1], pathlib.Path(sys.argv[2]), sys.argv[3:]
 assert argv[:3] == ["app-server", "--stdio", "--strict-config"]
 permissions = next(x for x in argv if x.startswith("permissions.maco_external_codex.filesystem="))
-assert '\":workspace_roots\"={\".\"=\"read\"}' in permissions
-assert '\":workspace_roots\"={\".\"=\"write\"}' not in permissions
+worker = mode.startswith("worker-")
+assert ('\":workspace_roots\"={\".\"=\"write\"}' if worker else '\":workspace_roots\"={\".\"=\"read\"}') in permissions
+if not worker:
+    assert '\":workspace_roots\"={\".\"=\"write\"}' not in permissions
+for feature in ("multi_agent", "goals"):
+    assert any(argv[i:i+2] == ["--disable", feature] for i in range(len(argv)-1))
 assert 'permissions.maco_external_codex.network={enabled=false}' in argv
 def receive():
     line = sys.stdin.readline()
@@ -722,19 +1273,22 @@ assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
-    "model":"gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else "xhigh",
+    "model":"gpt-5.6-astra" if mode == "model-mismatch" else "gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else ("high" if mode == "low-effort" else "xhigh"),
     "approvalPolicy":"on-request", "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
 turn = receive()
 assert turn["method"] == "turn/start"
+if worker:
+    assert start["params"]["dynamicTools"] == []
+    assert "journal-append" in turn["params"]["input"][0]["text"]
 send({"id":turn["id"], "result":{"turn":{"id":"research-turn", "status":"inProgress"}}})
 send({"method":"turn/started", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"inProgress"}}})
 def item_event(method, item):
     send({"method":method, "params":{"threadId":"research-thread", "turnId":"research-turn", "item":item}})
 item = {"id":"read-command", "type":"commandExecution", "command":"cat README.md",
         "cwd":str(workspace), "status":"inProgress", "exitCode":None}
-if mode in ("file-approval", "write"):
+if mode in ("file-approval", "write") or worker:
     item = {"id":"write-item", "type":"fileChange", "status":"inProgress"}
 item_event("item/started", item)
 if mode.endswith("approval"):
@@ -752,7 +1306,10 @@ if mode.endswith("approval"):
     else:
         assert response["result"]["decision"] == "cancel"
         sys.exit(0)
-if mode == "write":
+if worker:
+    (workspace / "README.md").write_text("permitted native Worker edit\n")
+    item["status"] = "completed"
+elif mode == "write":
     try:
         (workspace / "README.md").write_text("unauthorized write")
     except OSError:
@@ -768,6 +1325,12 @@ usage = {"inputTokens":35000, "outputTokens":2000, "cachedInputTokens":30000,
          "reasoningOutputTokens":1000, "totalTokens":37000}
 send({"method":"thread/tokenUsage/updated", "params":{"threadId":"research-thread",
       "turnId":"research-turn", "tokenUsage":{"last":usage, "total":usage, "modelContextWindow":None}}})
+if mode in ("budget", "worker-budget"):
+    interrupt = receive()
+    assert interrupt["method"] == "turn/interrupt"
+    assert interrupt["params"]["threadId"] == "research-thread"
+    send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"interrupted"}}})
+    sys.exit(0)
 if mode == "partial":
     send({"method":"unexpected/protocol/error", "params":{}})
     sys.exit(0)
@@ -776,7 +1339,7 @@ item_event("item/completed", {"id":"answer", "type":"agentMessage", "text":'{"su
 send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":{"id":"research-turn", "status":"completed"}}})
 "#,
     )?;
-    let spec = ExternalAgentCommand::codex(
+    let mut spec = ExternalAgentCommand::codex(
         &python,
         &workspace,
         workspace.join("prompt.md"),
@@ -785,9 +1348,49 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
         Duration::from_secs(15),
     )
     .with_workspace_access(WorkspaceAccess::ReadOnly)
-    .with_agent_lifecycle(&workspace, "researcher", "research-run", "research-task");
-    let selected =
-        should_use_read_only_researcher_app_server(&spec, ExternalExecutionRuntime::Verified);
+    .with_agent_lifecycle(&workspace, role, "research-run", "research-task")
+    .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("xhigh".to_string()));
+    if worker {
+        let journal = incoming.join("worker-journals/research-task.jsonl");
+        fs::create_dir(incoming.join("worker-journals"))?;
+        fs::set_permissions(
+            incoming.join("worker-journals"),
+            fs::Permissions::from_mode(0o700),
+        )?;
+        for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+            let path = incoming.join("worker-journals").join(name);
+            fs::create_dir(&path)?;
+            fs::set_permissions(&path, fs::Permissions::from_mode(0o700))?;
+        }
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&journal)?;
+        // Only the intent carrier is Codex. The lower-level transport fixture
+        // remains Python/Custom and cannot pass production executable trust.
+        let authority = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "research-run",
+            "research-task",
+            1,
+            Path::new("codex"),
+            Some("gpt-5.6-sol"),
+            "worker-duty",
+        )?;
+        spec = spec
+            .with_workspace_access(WorkspaceAccess::ReadWrite)
+            .with_codex_native_delegation_disabled()
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, authority)
+            .with_worker_journal_artifact("research-task", &incoming, &journal);
+    }
+    spec.bind_live_token_grant(grant);
+    let selected = if worker {
+        classify_managed_worker_app_server(&spec, ExternalExecutionRuntime::Verified)
+            .map_err(anyhow::Error::msg)?
+    } else {
+        should_use_read_only_terminal_app_server(&spec, ExternalExecutionRuntime::Verified)
+    };
     assert!(selected);
     assert!(!should_use_duplex_review(
         &spec,
@@ -799,7 +1402,36 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
     staging.stage_codex_home()?;
     let mut controls = protected_worktree_controls(&spec)?;
     controls.writable_artifact_root = Some(staging.root_path().to_path_buf());
-    let argv = codex_app_server_argv(&spec, &controls);
+    let mut argv =
+        audited_codex_app_server_argv(&spec, &controls, EnvironmentVersion::new(0, 144, 4))?;
+    let mut effective_prompt = b"read the fixture".to_vec();
+    let mut worker_profile = if worker {
+        Some(external_side_effect_profile(
+            &spec,
+            &python,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?)
+    } else {
+        None
+    };
+    // The protocol fixture is synthetic; it does not qualify Python as Codex.
+    let helper = if worker {
+        bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut effective_prompt,
+            &mut worker_profile,
+            &mut argv,
+        )?
+    } else {
+        None
+    };
+    if let Some(helper) = &helper {
+        helper.revalidate()?;
+    }
     let digest = argv_digest(&argv)?;
     let identity = external_program_identity(&python)?;
     let args = [
@@ -823,16 +1455,27 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
     .with_stdin(external_agent_stdin_mode(&spec, selected, Vec::new()))
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(spec.timeout))
-    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
-        StrictOfflineWorkspaceProfile::read_only(&workspace)
-            .with_visible_read_only_root(python.parent().context("python parent")?),
-    ));
-    let interactive = run_read_only_researcher_app_server_process(
-        process_spec,
-        &ProcessCancellation::new(),
-        &spec,
-        "read the fixture".to_string(),
-    )?;
+    .with_side_effect_confinement(worker_profile.unwrap_or_else(|| {
+        SideEffectConfinementProfile::StrictOfflineWorkspace(
+            StrictOfflineWorkspaceProfile::read_only(&workspace)
+                .with_visible_read_only_root(python.parent().expect("canonical python parent")),
+        )
+    }));
+    let interactive = if worker {
+        run_managed_worker_app_server_process(
+            process_spec,
+            &ProcessCancellation::new(),
+            &spec,
+            String::from_utf8(effective_prompt)?,
+        )?
+    } else {
+        run_read_only_terminal_app_server_process(
+            process_spec,
+            &ProcessCancellation::new(),
+            &spec,
+            String::from_utf8(effective_prompt)?,
+        )?
+    };
     assert!(
         interactive.process.safety_evidence_verified(),
         "{interactive:?}"
@@ -859,11 +1502,13 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
             runtime: ExternalExecutionRuntime::Verified,
             codex_version: Some((0, 144, 4)),
             spec: &spec,
+            original_spec: &spec,
             protected_controls: &controls,
             argv_digest: &digest,
             program_identity: &identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
     Ok((report, workspace, temp))
@@ -1364,7 +2009,7 @@ fn worktree_writable_codex_launch_is_not_blocked_by_coverage() -> Result<()> {
 
 #[cfg(unix)]
 #[test]
-fn worktree_writable_claude_refuses_unverified_selected_runtime_confinement() -> Result<()> {
+fn worktree_writable_claude_without_reservation_refuses_before_confinement() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let temp = tempfile::tempdir()?;
@@ -1395,11 +2040,11 @@ fn worktree_writable_claude_refuses_unverified_selected_runtime_confinement() ->
     let report = run_external_agent(&spec);
     assert!(!marker.exists());
     assert!(!report.stdout.target_launch_attempted);
-    assert!(report.environment_blocked());
-    assert!(report.error.as_deref().is_some_and(|error| {
-        error.contains("writable claude-code failed closed before launch")
-            && error.contains("side_effect_confinement != verified")
-    }));
+    assert!(!report.environment_blocked());
+    assert_eq!(
+        report.error.as_deref(),
+        Some("Claude managed-Worker reservation identity binding is missing")
+    );
     assert_eq!(
         crate::runtime_adapter::AdapterId::ClaudeCode
             .writable_launch_refusal(WritableLaunchTarget::ManagedChildWorktree),
@@ -3737,6 +4382,79 @@ fn exact_read_only_inputs_are_files_in_both_layers_without_parent_visibility() -
 
 #[cfg(unix)]
 #[test]
+fn immutable_researcher_input_omits_only_redundant_inner_workspace_file_rule() -> Result<()> {
+    let (root, mut command) = researcher_inputs::tests::fixture()?;
+    git2::Repository::init(&command.cwd)?;
+    create_mandatory_control_roots(&command.cwd)?;
+    let incoming = root.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    command.output_last_message = incoming.join("report.json");
+    let nested = command.cwd.join("src/runtime_adapter/source.rs");
+    fs::create_dir_all(nested.parent().unwrap())?;
+    fs::write(&nested, b"immutable source\n")?;
+    let schema = root.path().join("schema.json");
+    fs::write(&schema, b"{}\n")?;
+    command.read_only_input_files = vec![nested.clone(), schema.clone()];
+    command.researcher_source_inputs = vec![researcher_inputs::ResearcherSourceInput {
+        path: "src/runtime_adapter/source.rs".into(),
+        sha256: sha256_hex(b"immutable source\n"),
+    }];
+    researcher_inputs::validate_command(&command)?;
+    let controls = protected_worktree_controls(&command)?;
+    let rendered = codex_filesystem_permissions(&command, &controls);
+    let rule = |path: &Path| format!("{}=\"read\"", toml_basic_string(path.to_str().unwrap()));
+    assert!(rendered.contains("\":workspace_roots\"={\".\"=\"read\"}"));
+    assert!(!rendered.contains(&rule(&nested)));
+    assert!(rendered.contains(&rule(&schema)));
+    assert!(
+        !rendered.contains(&rule(root.path())),
+        "no new ancestor grant"
+    );
+    let profile = external_side_effect_profile(
+        &command,
+        Path::new("/usr/bin/cat"),
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(
+        profile.visible_read_only_files().contains(&nested),
+        "outer exact-file binding remains"
+    );
+
+    for variant in [
+        "undeclared",
+        "writable",
+        "other-role",
+        "malformed-hash",
+        "mismatched-hash",
+    ] {
+        let mut changed = command.clone();
+        match variant {
+            "undeclared" => changed.researcher_source_inputs.clear(),
+            "writable" => changed.workspace_access = WorkspaceAccess::ReadWrite,
+            "other-role" => changed.agent_lifecycle.as_mut().unwrap().role = "auditor".into(),
+            "malformed-hash" => changed.researcher_source_inputs[0].sha256 = "invalid".into(),
+            "mismatched-hash" => changed.researcher_source_inputs[0].sha256 = "0".repeat(64),
+            _ => unreachable!(),
+        }
+        assert!(
+            codex_filesystem_permissions(&changed, &controls).contains(&rule(&nested)),
+            "{variant}"
+        );
+    }
+    let mut hidden = command.clone();
+    hidden
+        .hidden_roots
+        .push(nested.parent().unwrap().to_path_buf());
+    assert!(protected_worktree_controls(&hidden).is_err());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn exact_read_only_inputs_reject_alias_and_writable_overlap() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (_primary, child, _common, _child_git_dir) =
@@ -4424,6 +5142,8 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         "tokens": {"access_token": auth_secret}
     }))?;
     let auth = ValidatedCodexAuth {
+        #[cfg(target_os = "linux")]
+        managed_authority: None,
         path: PathBuf::from("/private/auth.json"),
         length: auth_bytes.len() as u64,
         modified: None,
@@ -4433,7 +5153,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         inode: 2,
         bytes: auth_bytes,
     };
-    let redactor = CredentialRedactor::from_runtime(&environment, Some(&auth))?;
+    let redactor = CredentialRedactor::from_runtime(&environment, Some(&auth), None)?;
     let output = format!(
         "raw={environment_secret} escaped={} auth={auth_secret}",
         serde_json::to_string(environment_secret)?
@@ -4459,6 +5179,8 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         .collect::<Vec<_>>();
     let oversized_bytes = serde_json::to_vec(&oversized_values)?;
     let oversized_auth = ValidatedCodexAuth {
+        #[cfg(target_os = "linux")]
+        managed_authority: None,
         path: PathBuf::from("/private/oversized-auth.json"),
         length: oversized_bytes.len() as u64,
         modified: None,
@@ -4469,13 +5191,15 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: oversized_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&oversized_auth), None)
             .expect_err("oversized redaction pattern set must fail closed")
             .to_string()
             .contains("fixed count or aggregate-byte safety bound")
     );
     let short_auth_bytes = serde_json::to_vec(&serde_json::json!({"access_token": "too-short"}))?;
     let short_auth = ValidatedCodexAuth {
+        #[cfg(target_os = "linux")]
+        managed_authority: None,
         path: PathBuf::from("/private/short-auth.json"),
         length: short_auth_bytes.len() as u64,
         modified: None,
@@ -4486,13 +5210,15 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: short_auth_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&short_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&short_auth), None)
             .expect_err("short credential-bearing auth value must fail closed")
             .to_string()
             .contains("shorter than the safe redaction bound")
     );
     let opaque_bytes = vec![b'x'; MAX_CREDENTIAL_BYTES + 1];
     let opaque_auth = ValidatedCodexAuth {
+        #[cfg(target_os = "linux")]
+        managed_authority: None,
         path: PathBuf::from("/private/opaque-auth.json"),
         length: opaque_bytes.len() as u64,
         modified: None,
@@ -4503,7 +5229,7 @@ fn credential_redaction_covers_reports_json_logs_and_materialized_auth_values() 
         bytes: opaque_bytes,
     };
     assert!(
-        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&opaque_auth))
+        CredentialRedactor::from_runtime(&BTreeMap::new(), Some(&opaque_auth), None)
             .expect_err("opaque oversized auth must fail closed")
             .to_string()
             .contains("not valid JSON for bounded redaction")
@@ -4529,6 +5255,7 @@ fn private_output_staging_redacts_atomic_publication_and_cleans_up() -> Result<(
     let secret = "private-staging-secret-value-31";
     let redactor = CredentialRedactor::from_runtime(
         &BTreeMap::from([("OPENAI_API_KEY".to_string(), secret.to_string())]),
+        None,
         None,
     )?;
 
@@ -5073,6 +5800,10 @@ done
             })
         );
         assert!(evidence.model_mismatch);
+        // Successful fixture transport is not qualified provider acceptance.
+        assert!(report.error.is_none());
+        assert!(!report.publishable);
+        assert!(!report.succeeded());
         Ok(())
     }
 
@@ -5903,6 +6634,99 @@ fn orchestration_lifecycle_roles_enable_multi_agent_goals_without_ephemeral() {
 }
 
 #[test]
+fn opted_in_child_orchestrator_disables_native_delegation_and_keeps_role() {
+    let baseline = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle("/registry", "child_orchestrator", "run", "task");
+    let opted_in = baseline.clone().with_codex_native_delegation_disabled();
+    assert_eq!(
+        baseline
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+    assert_eq!(
+        opted_in
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.role.as_str()),
+        Some("child_orchestrator")
+    );
+
+    let argv = |command: &ExternalAgentCommand| {
+        command_argv(command)
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>()
+    };
+    let legacy = argv(&baseline);
+    let actual = argv(&opted_in);
+
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .windows(2)
+            .filter(|arguments| *arguments == ["--enable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        legacy
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        0
+    );
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "multi_agent"]));
+    assert!(!legacy
+        .windows(2)
+        .any(|arguments| arguments == ["--disable", "goals"]));
+
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "multi_agent"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .windows(2)
+            .filter(|arguments| *arguments == ["--disable", "goals"])
+            .count(),
+        1
+    );
+    assert_eq!(
+        actual
+            .iter()
+            .filter(|argument| argument.as_str() == "--ephemeral")
+            .count(),
+        1
+    );
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "multi_agent"]));
+    assert!(!actual
+        .windows(2)
+        .any(|arguments| arguments == ["--enable", "goals"]));
+}
+
+#[test]
 fn non_multi_agent_hardened_argv_retains_ephemeral() {
     let command = ExternalAgentCommand::codex_read_only_consultant(
         "codex",
@@ -6116,13 +6940,12 @@ fn grok_acp_runtime_adapter_argv_uses_contained_agent_stdio() {
     assert_eq!(
         argv,
         [
+            "--no-auto-update",
             "--sandbox",
             "strict",
-            "--always-approve",
             "--disable-web-search",
-            "--no-memory",
-            "--no-subagents",
             "agent",
+            "--always-approve",
             "--no-leader",
             "-m",
             "grok-4.6",
@@ -6225,7 +7048,7 @@ fn write_fake_grok_acp_stdio_provider(workspace: &Path, mode: &str) -> Result<Pa
     fs::write(
         &provider,
         format!(
-            "#!/bin/sh\nset -eu\nMODE={mode}\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
+            "#!/bin/sh\nset -eu\nMODE={mode}\n[ \"${{1:-}}\" = --no-auto-update ] || exit 3\nshift\ncase \" $* \" in *\" agent \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" --no-leader \"*) ;; *) exit 3;; esac\ncase \" $* \" in *\" stdio \"*) ;; *) exit 4;; esac\nexec python3 \"$(dirname \"$0\")/fake-grok-acp-driver.py\" \"$MODE\"\n"
         ),
     )?;
     #[cfg(unix)]
@@ -6270,6 +7093,44 @@ fn managed_child_grok_acp_stdio_command(
     command.reasoning_effort = Some("low".to_string());
     command.output_schema = output_schema;
     command
+}
+
+#[test]
+fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut command = ExternalAgentCommand::codex(
+        temp.path().join("cursor-agent"),
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("events.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(10),
+    );
+    command.invocation = ExternalAgentInvocation::Cursor;
+    command.workspace_access = WorkspaceAccess::ReadOnly;
+    command.model = Some("cursor-selected-model".to_string());
+    command.reasoning_effort = Some("high".to_string());
+    let mut evidence = crate::runtime_adapter::CursorManagedParentEvidence {
+        peer_verified: true,
+        shared_services_acks: 1,
+        session_resource_acks: 1,
+        admitted_attempts: 1,
+        captured_events: 1,
+        completed_attempts: 1,
+        usage_attempts_covered: 1,
+        usage_is_incomplete: Some(false),
+        client_selected_model: command.model.clone(),
+        client_selected_effort: command.reasoning_effort.clone(),
+        ..Default::default()
+    };
+    assert_eq!(
+        cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+        Some("managed Cursor observed model or effort does not match the selected launch")
+    );
+    evidence.actual_provider_model = command.model.clone();
+    evidence.actual_effort = command.reasoning_effort.clone();
+    assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_none());
+    Ok(())
 }
 
 #[test]
@@ -6610,6 +7471,7 @@ fn record_verified_acp_publication(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     };
     let output = ProcessOutput {
@@ -6640,11 +7502,13 @@ fn record_verified_acp_publication(
             runtime: ExternalExecutionRuntime::Verified,
             codex_version: None,
             spec: &command,
+            original_spec: &command,
             protected_controls: &protected_controls,
             argv_digest: "digest",
             program_identity: &program_identity,
             grok_acp_parent_evidence: Some(evidence),
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
     Ok(report)
@@ -7192,6 +8056,7 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
     assert_eq!(
         grok_argv,
         [
+            "--no-auto-update",
             "--prompt-file",
             "/run/prompt.md",
             "--model",
@@ -7272,6 +8137,7 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
     assert_eq!(
         argv,
         [
+            "--no-auto-update",
             "--prompt-file",
             "/run/prompt.md",
             "--model",
@@ -7293,6 +8159,7 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
         ]
     );
     for fixed in [
+        "--no-auto-update",
         "--output-format",
         "streaming-json",
         "--sandbox",
@@ -7378,6 +8245,349 @@ fn writable_grok_confinement(
     }
 }
 
+fn selected_writable_claude_command(temp: &Path) -> Result<ExternalAgentCommand> {
+    let workspace = temp.join("claude-worker");
+    let incoming = temp.join("incoming");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&incoming)?;
+    let program = PathBuf::from(crate::runtime_adapter::claude::CLAUDE_NATIVE_EXECUTABLE);
+    let prompt = temp.join("prompt.md");
+    fs::write(&prompt, b"bounded Claude task\n")?;
+    ExternalAgentCommand::codex(
+        &program,
+        &workspace,
+        &prompt,
+        temp.join("events.jsonl"),
+        incoming.join("report.json"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    )
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_writable_runtime_selection("claude-worker", RuntimeId::ClaudeCode, true)
+    .map(|command| {
+        command.with_claude_run_account_binding(Some(FrozenClaudeSelectedBinding {
+            authority_socket: None,
+            authority_id: Some("test-claude-authority".to_string()),
+            provider_id: crate::account_authority::CLAUDE_CODE_PROVIDER_ID.to_string(),
+            account_id: "test-claude-account".to_string(),
+            account_incarnation: "test-claude-incarnation".to_string(),
+            selection_revision: 1,
+        }))
+    })
+}
+
+fn writable_claude_confinement() -> WorktreeWritableAdmission {
+    WorktreeWritableAdmission {
+        version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+        assignment_id: "claude-worker".to_string(),
+        attempt: 1,
+        target: WritableLaunchTarget::ManagedChildWorktree,
+        worktree: ManagedWorktreeAdmission {
+            kind: ManagedWorktreeAdmissionKind::ManagedDisposable,
+            worktree_id: "claude-worker".to_string(),
+        },
+        claims: HeldPathClaimsAdmission {
+            state: HeldPathClaimsAdmissionState::Held,
+            token: 11,
+            paths: vec![PathBuf::from("bounded-result.txt")],
+        },
+        native_sandbox: NativeSandboxAdmission {
+            runtime: RuntimeId::ClaudeCode,
+            workspace_access: WorkspaceAccess::ReadWrite,
+            side_effect_confinement: SideEffectConfinement::Verified,
+        },
+    }
+}
+
+fn exact_claude_native_stream() -> Vec<u8> {
+    [
+        serde_json::json!({"type":"system","subtype":"init","session_id":"session-1","tools":["Read","Glob","Grep","Edit","Write"],"mcp_servers":[]}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_start","message":{"id":"message-1","model":"claude-sonnet-4-6","usage":{"input_tokens":10,"cache_creation_input_tokens":5,"cache_read_input_tokens":3,"output_tokens":0,"cache_creation":{"ephemeral_5m_input_tokens":2,"ephemeral_1h_input_tokens":3}}}}}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_delta","usage":{"output_tokens":7}}}),
+        serde_json::json!({"type":"stream_event","session_id":"session-1","event":{"type":"message_stop"}}),
+        serde_json::json!({"type":"assistant","session_id":"session-1","message":{"id":"message-1","model":"claude-sonnet-4-6"}}),
+        serde_json::json!({"type":"result","subtype":"success","is_error":false,"session_id":"session-1","num_turns":1,"result":"native final","modelUsage":{"claude-sonnet-4-6":{"inputTokens":10,"cacheCreationInputTokens":5,"cacheReadInputTokens":3,"outputTokens":7}}}),
+    ]
+    .into_iter()
+    .map(|value| serde_json::to_string(&value).unwrap())
+    .collect::<Vec<_>>()
+    .join("\n")
+    .into_bytes()
+}
+
+#[test]
+fn writable_claude_qualification_is_invocation_bound_and_refuses_drift_and_primary() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let arbitrary_program = temp.path().join("operator-claude");
+    fs::write(&arbitrary_program, b"operator-supplied-executable")?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&arbitrary_program, fs::Permissions::from_mode(0o700))?;
+    }
+    let arbitrary = ExternalAgentCommand::codex(
+        &arbitrary_program,
+        temp.path(),
+        temp.path().join("arbitrary-prompt"),
+        temp.path().join("arbitrary-events"),
+        temp.path().join("arbitrary-output"),
+        Duration::from_secs(30),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    );
+    assert!(arbitrary
+        .with_writable_runtime_selection("claude-worker", RuntimeId::ClaudeCode, true)
+        .unwrap_err()
+        .to_string()
+        .contains(WRITABLE_CLAUDE_ADAPTER_CONFIGURATION_UNVERIFIED));
+
+    let _identity = inject_admitted_claude_identity_for_test();
+    let selected = selected_writable_claude_command(temp.path())?;
+    assert_eq!(
+        selected.current_claude_writable_contract()?.auth_mode(),
+        ClaudeAuthMode::BareApiKey
+    );
+    let admitted = selected
+        .clone()
+        .with_worktree_writable_confinement(writable_claude_confinement());
+    assert!(admitted
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)?
+        .admits_worktree_writable());
+    let ledger =
+        crate::supervise_budget::RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_tokens: Some(50_000),
+            ..Default::default()
+        })?;
+    let crate::supervise_budget::BudgetAdmission::Admitted { reservation, .. } =
+        ledger.reserve(crate::supervise_budget::BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Worker,
+            tokens: 10_000,
+            cost_usd: Some(5.0),
+        })?
+    else {
+        bail!("Claude reservation fixture was refused")
+    };
+    let mut reservation_bound = admitted.clone();
+    reservation_bound
+        .bind_claude_managed_reservation(
+            reservation.id.get(),
+            ledger.live_token_grant(reservation.id)?,
+        )
+        .map_err(anyhow::Error::msg)?;
+    let oauth_argv = runtime_adapter_argv(&reservation_bound)?;
+    assert!(!oauth_argv
+        .iter()
+        .any(|argument| argument == OsStr::new("--bare")));
+    assert!(reservation_bound
+        .verified_claude_managed_reservation()
+        .map_err(anyhow::Error::msg)?
+        .is_some());
+    reservation_bound.timeout = reservation_bound
+        .timeout
+        .saturating_add(Duration::from_secs(1));
+    assert!(reservation_bound
+        .verified_claude_managed_reservation()
+        .is_err());
+
+    let no_hard_ledger =
+        crate::supervise_budget::RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_cost_usd: Some(10.0),
+            ..Default::default()
+        })?;
+    let crate::supervise_budget::BudgetAdmission::Admitted {
+        reservation: no_hard_reservation,
+        ..
+    } = no_hard_ledger.reserve(crate::supervise_budget::BudgetReservationRequest {
+        role: crate::supervise::AgentRole::Worker,
+        tokens: 10_000,
+        cost_usd: Some(5.0),
+    })?
+    else {
+        bail!("Claude no-hard-token reservation fixture was refused")
+    };
+    let mut no_hard_bound = admitted.clone();
+    let no_hard_grant = no_hard_ledger.live_token_grant(no_hard_reservation.id)?;
+    assert!(no_hard_grant.is_none());
+    no_hard_bound
+        .bind_claude_managed_reservation(no_hard_reservation.id.get(), no_hard_grant)
+        .map_err(anyhow::Error::msg)?;
+    assert!(no_hard_bound
+        .verified_claude_managed_reservation()
+        .map_err(anyhow::Error::msg)?
+        .is_none());
+
+    let mut missing_account_binding = admitted.clone().with_claude_run_account_binding(None);
+    assert!(missing_account_binding
+        .bind_claude_managed_reservation(no_hard_reservation.id.get(), None)
+        .unwrap_err()
+        .contains("no frozen selected CAM account binding"));
+
+    let mut argv_drift = admitted.clone();
+    argv_drift
+        .runtime_adapter
+        .as_mut()
+        .unwrap()
+        .argument_template
+        .push("--resume".to_string());
+    assert!(argv_drift
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)
+        .unwrap_err()
+        .to_string()
+        .contains(WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE));
+
+    let mut arbitrary_program = admitted.clone();
+    arbitrary_program.program = temp.path().join("operator-claude");
+    fs::write(&arbitrary_program.program, b"operator-supplied-executable")?;
+    assert!(arbitrary_program
+        .verified_writable_capabilities(RuntimeId::ClaudeCode)
+        .is_err());
+
+    let primary = selected.with_writable_launch_target(WritableLaunchTarget::PrimaryWorktree);
+    assert!(primary
+        .selected_writable_capabilities(RuntimeId::ClaudeCode, Some("claude-worker"))
+        .is_err());
+    assert_eq!(
+        RuntimeId::ClaudeCode
+            .capabilities()
+            .blocking_pre_action_callback,
+        crate::runtime_adapter::BlockingPreActionCallback::None
+    );
+    Ok(())
+}
+
+#[test]
+fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_does_not_deserialize(
+) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let _identity = inject_admitted_claude_identity_for_test();
+    let command = selected_writable_claude_command(temp.path())?;
+    let stream = exact_claude_native_stream();
+    assert_eq!(
+        runtime_adapter_captured_output(&command, &stream, b"generic stderr", true)?,
+        RuntimeAdapterCapturedOutput::Captured(b"native final".to_vec())
+    );
+    assert_eq!(
+        runtime_adapter_captured_output(&command, &stream, b"generic stderr", false)?,
+        RuntimeAdapterCapturedOutput::Unavailable
+    );
+    let evidence = crate::runtime_adapter::claude::collect_native_stream(&stream, false);
+    assert!(!evidence.complete());
+    assert!(evidence.usage_lower_bound().is_some());
+    let mut run = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["claude".to_string()],
+        false,
+        "fixture".to_string(),
+    );
+    run.stdout.run_metadata.claude_native_evidence = Some(evidence);
+    assert_eq!(run.authenticated_claude_model(), Some("claude-sonnet-4-6"));
+    let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
+    assert!(restored.authenticated_claude_native_evidence().is_none());
+    assert!(restored.authenticated_claude_usage().is_none());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn claude_profile_masks_native_and_wsl_managed_policy_before_target_start() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let incoming = temp.path().join("incoming");
+    let managed_root = temp.path().join("managed-claude-root");
+    let child_config_home = temp.path().join("child-claude-config");
+    let relay_directory = temp.path().join("claude-relay");
+    fs::create_dir_all(&workspace)?;
+    fs::create_dir_all(&incoming)?;
+    fs::create_dir_all(&managed_root)?;
+    fs::create_dir_all(&child_config_home)?;
+    fs::create_dir_all(&relay_directory)?;
+    fs::set_permissions(&relay_directory, fs::Permissions::from_mode(0o700))?;
+    let parent_relay_socket = relay_directory.join("relay.sock");
+    let program = fs::canonicalize("/bin/true")?;
+    let command = ExternalAgentCommand::codex(
+        &program,
+        &workspace,
+        temp.path().join("prompt"),
+        temp.path().join("events"),
+        incoming.join("report"),
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    );
+    let properties = selected_claude_systemd_properties_for_test(
+        &command,
+        &child_config_home,
+        &managed_root,
+        &parent_relay_socket,
+        1,
+    )?;
+    let child_config_home = fs::canonicalize(child_config_home)?;
+    let managed_root = fs::canonicalize(managed_root)?;
+    assert!(properties
+        .iter()
+        .any(|property| property == "--property=PrivateNetwork=yes"));
+    assert!(properties
+        .iter()
+        .any(|property| { property == "--property=RestrictAddressFamilies=AF_UNIX AF_INET" }));
+    assert!(properties.iter().any(|property| {
+        property == &format!("--property=BindPaths={}", child_config_home.display())
+            || property == &format!("--property=BindPaths=\"{}\"", child_config_home.display())
+    }));
+    assert!(properties.iter().any(|property| {
+        property == &format!("--property=InaccessiblePaths=-{}", managed_root.display())
+    }));
+    assert!(!properties.iter().any(|property| {
+        property == &format!("--property=BindPaths={}", managed_root.display())
+            || property == &format!("--property=BindPaths=\"{}\"", managed_root.display())
+    }));
+    for root in CLAUDE_NATIVE_POLICY_HIDDEN_ROOTS {
+        let required = format!("--property=InaccessiblePaths={root}");
+        let optional = format!("--property=InaccessiblePaths=-{root}");
+        let quoted_required = format!("--property=InaccessiblePaths=\"{root}\"");
+        let quoted_optional = format!("--property=InaccessiblePaths=\"-{root}\"");
+        assert!(
+            properties.iter().any(|property| property == &required
+                || property == &optional
+                || property == &quoted_required
+                || property == &quoted_optional),
+            "missing mandatory Claude policy mask for {root}"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn claude_bare_auth_accepts_only_the_api_key_source() {
+    let oauth_only = BTreeMap::from([(
+        "CLAUDE_CODE_OAUTH_TOKEN".to_string(),
+        "oauth-is-not-bare-api-authority".to_string(),
+    )]);
+    assert!(!claude_bare_api_key_present(&oauth_only));
+    let api_key = BTreeMap::from([(
+        "ANTHROPIC_API_KEY".to_string(),
+        "fixture-api-key-with-bounded-length".to_string(),
+    )]);
+    assert!(claude_bare_api_key_present(&api_key));
+}
+
 #[test]
 fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal() -> Result<()> {
     let generic = ExternalAgentCommand::codex(
@@ -7398,7 +8608,7 @@ fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal
     assert!(generic_report
         .error
         .as_deref()
-        .is_some_and(|error| error.contains(WRITABLE_GROK_EXACT_MODEL_REQUIRED)));
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)));
 
     let non_xhigh = generic
         .clone()
@@ -7408,7 +8618,7 @@ fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal
     assert!(effort_report
         .error
         .as_deref()
-        .is_some_and(|error| error.contains(WRITABLE_GROK_XHIGH_EFFORT_REQUIRED)));
+        .is_some_and(|error| error.contains(WRITABLE_GROK_SELECTION_EVIDENCE_MISSING)));
 
     let exact_without_selection = non_xhigh
         .clone()
@@ -7512,7 +8722,7 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
         ));
     assert_eq!(
         streaming.current_grok_writable_contract()?.runtime(),
-        TypedRuntime::Grok47Xhigh
+        TypedRuntime::GrokHeadlessStreamingJson
     );
     assert!(streaming
         .verified_writable_capabilities(RuntimeId::Grok)?
@@ -7561,58 +8771,89 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
         .with_worktree_writable_confinement(writable_grok_confinement(
             SideEffectConfinement::Verified,
         ));
-    let acp_refusal = acp
-        .current_grok_writable_contract()
-        .expect_err("Grok 4.7 ACP must not receive writable capability elevation")
-        .to_string();
-    assert!(
-        acp_refusal.contains(WRITABLE_GROK_ADAPTER_CONFIGURATION_UNVERIFIED),
-        "{acp_refusal}"
-    );
+    let acp_contract = acp.current_grok_writable_contract()?;
+    assert_eq!(acp_contract.runtime(), TypedRuntime::GrokAcpStdio);
+    assert!(acp
+        .verified_writable_capabilities(RuntimeId::Grok)?
+        .admits_worktree_writable());
+    // Selected ACP admission never grants the generic headless proof.
+    assert!(acp
+        .runtime_adapter
+        .as_ref()
+        .expect("ACP adapter")
+        .typed_runtime_contract(
+            AdapterId::Grok,
+            &LaunchContext {
+                prompt: &acp.prompt,
+                model: acp.model.as_deref(),
+                effort: acp.reasoning_effort.as_deref(),
+                cwd: &acp.cwd,
+                output: &acp.output_last_message,
+            },
+        )
+        .is_none());
     let acp_argv = runtime_adapter_argv(&acp)?
         .into_iter()
         .map(|argument| argument.to_string_lossy().into_owned())
         .collect::<Vec<_>>();
-    assert!(acp_argv
-        .windows(2)
-        .any(|pair| pair[0] == "-m" && pair[1] == "grok-4.7"));
+    assert_eq!(
+        acp_argv,
+        [
+            "--no-auto-update",
+            "--sandbox",
+            "strict",
+            "--disable-web-search",
+            "agent",
+            "--always-approve",
+            "--no-leader",
+            "-m",
+            "grok-4.7",
+            "--reasoning-effort",
+            "xhigh",
+            "stdio",
+        ]
+    );
     assert!(!acp_argv.iter().any(|argument| argument == "--json-schema"));
-    for required in ["--no-subagents", "agent", "--no-leader", "stdio"] {
-        assert_eq!(
-            acp_argv
-                .iter()
-                .filter(|argument| argument.as_str() == required)
-                .count(),
-            1
-        );
-    }
+    let mut acp_environment = BTreeMap::from([
+        ("GROK_MEMORY".to_string(), "1".to_string()),
+        ("GROK_SUBAGENTS".to_string(), "1".to_string()),
+    ]);
+    crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR
+        .apply_required_environment(&mut acp_environment);
+    assert_eq!(
+        acp_environment,
+        BTreeMap::from([
+            ("GROK_MEMORY".to_string(), "0".to_string()),
+            ("GROK_SUBAGENTS".to_string(), "0".to_string()),
+        ])
+    );
 
-    let unsupported_model = selected_writable_grok_command_for_model(
+    let selected_model = selected_writable_grok_command_for_model(
         &program,
         &workspace,
         &prompt,
         &incoming,
         "grok-4.7-build-fast",
-    )?
-    .current_grok_writable_contract()
-    .expect_err("fast Grok 4.7 must not receive the typed writable contract")
-    .to_string();
-    assert!(
-        unsupported_model.contains(WRITABLE_GROK_EXACT_MODEL_REQUIRED),
-        "{unsupported_model}"
+    )?;
+    assert_eq!(
+        selected_model.current_grok_writable_contract()?.runtime(),
+        TypedRuntime::GrokHeadlessStreamingJson
     );
-
-    let unsupported_effort = selected_writable_grok_command_for_model(
-        &program, &workspace, &prompt, &incoming, "grok-4.7",
-    )?
-    .with_model_selection(Some("grok-4.7".to_string()), Some("high".to_string()))
-    .current_grok_writable_contract()
-    .expect_err("Grok 4.7 high must not receive the typed writable contract")
-    .to_string();
-    assert!(
-        unsupported_effort.contains(WRITABLE_GROK_XHIGH_EFFORT_REQUIRED),
-        "{unsupported_effort}"
+    let selected_high = selected_model
+        .clone()
+        .with_model_selection(Some("grok-4.7-build-fast".into()), Some("high".into()))
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?;
+    assert_eq!(
+        selected_high.current_grok_writable_contract()?.runtime(),
+        TypedRuntime::GrokHeadlessStreamingJson
     );
+    let unsafe_model = selected_high
+        .clone()
+        .with_model_selection(Some("model with spaces".into()), Some("high".into()));
+    assert!(unsafe_model.current_grok_writable_contract().is_err());
+    let alias_effort =
+        selected_high.with_model_selection(Some("grok-4.7-build-fast".into()), Some("deep".into()));
+    assert!(alias_effort.current_grok_writable_contract().is_err());
     Ok(())
 }
 
@@ -7882,6 +9123,9 @@ fn writable_grok_run_external_agent_helper() -> Result<()> {
         &program,
         r#"#!/bin/sh
 set -eu
+no_auto_update="${1:-}"
+[ "$no_auto_update" = "--no-auto-update" ]
+shift
 [ "$#" -eq 18 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
@@ -7901,7 +9145,7 @@ set -eu
 [ "$HOME" = "$GROK_HOME" ]
 [ -r "$GROK_HOME/auth.json" ]
 [ ! -e "$GROK_HOME/ambient-secret" ]
-printf '%s\n' 'request-begin' "$@" 'request-end' >&2
+printf '%s\n' 'request-begin' "$no_auto_update" "$@" 'request-end' >&2
 printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
@@ -7925,6 +9169,14 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     let primary_status_before = snapshot_worktree_status(&primary)?;
     let child_status_before = snapshot_worktree_status(&child)?;
 
+    let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+        "run-grok-acceptance",
+        "grok-worker",
+        1,
+        Path::new("codex"),
+        Some("grok-4.6"),
+        crate::mutation_taxonomy::ASSIGNMENT_CHILD_PROCESS_DUTY,
+    )?;
     let unproved = ExternalAgentCommand::codex(
         &program,
         &child,
@@ -7939,7 +9191,10 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     )
     .with_model_selection(Some("grok-4.6".to_string()), Some("xhigh".to_string()))
     .with_workspace_access(WorkspaceAccess::ReadWrite)
-    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
+    .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree)
+    .with_agent_lifecycle(&primary, "worker", "run-grok-acceptance", "grok-worker")
+    .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+    unproved.verify_assignment_child_admission_identity()?;
     let unproved_report = run_external_agent(&unproved);
     assert!(!unproved_report.stdout.target_launch_attempted);
     assert_eq!(unproved_report.environment_failures().len(), 1);
@@ -7953,8 +9208,7 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     }));
     assert!(!child.join("bounded-result.txt").exists());
 
-    let mut declared =
-        unproved.with_agent_lifecycle(&primary, "worker", "run-grok-acceptance", "grok-worker");
+    let mut declared = unproved;
     declared.json_log = incoming.join("events.jsonl");
     declared.output_last_message = incoming.join("report.json");
     declared.output_schema = Some(schema.clone());
@@ -8004,6 +9258,7 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         .contains(&canonical_incoming));
 
     let expected_request = vec![
+        "--no-auto-update".to_string(),
         "--prompt-file".to_string(),
         prompt.to_str().context("UTF-8 prompt path")?.to_string(),
         "--model".to_string(),
@@ -8186,6 +9441,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             output_last_message: None,
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
+            cursor_managed_parent_evidence: None,
             codex_parent_evidence: None,
         };
         let side_effects = if command.invocation == ExternalAgentInvocation::Grok {
@@ -8221,11 +9477,13 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 runtime: ExternalExecutionRuntime::Verified,
                 codex_version: None,
                 spec: command,
+                original_spec: command,
                 protected_controls: &protected_controls,
                 argv_digest: "digest",
                 program_identity: &program_identity,
                 grok_acp_parent_evidence: None,
                 grok_acp_launch_schema_identity: None,
+                claude_broker_witness: None,
             },
         );
         Ok(report)
@@ -8277,6 +9535,46 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 total_tokens: Some(12),
             }
         ))
+    );
+    // Exercise the actual production parser/qualifier/materialization path without
+    // constructing private filesystem authority. Native charges survive both refusals.
+    let read_only_stream =
+        format!("{{\"type\":\"text\",\"data\":\"held response\"}}\n{native_stdout}");
+    let no_filesystem = finish(
+        "completion-without-filesystem",
+        &grok_command("completion-without-filesystem")
+            .with_workspace_access(WorkspaceAccess::ReadOnly),
+        CapturedBytes::from_bytes_for_test(read_only_stream.as_bytes().to_vec()),
+    )?;
+    assert!(no_filesystem
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("lacks matching settled filesystem evidence"));
+    assert!(no_filesystem
+        .held_grok_read_only_completion_facts()
+        .is_none());
+    assert_eq!(
+        no_filesystem.grok_stream_usage_evidence,
+        native_report.grok_stream_usage_evidence
+    );
+    let failed_native_stream = read_only_stream.replace(r#""end_turn""#, r#""refusal""#);
+    let failed_native = finish(
+        "completion-native-refusal",
+        &grok_command("completion-native-refusal").with_workspace_access(WorkspaceAccess::ReadOnly),
+        CapturedBytes::from_bytes_for_test(failed_native_stream.into_bytes()),
+    )?;
+    assert!(failed_native
+        .error
+        .as_deref()
+        .unwrap_or_default()
+        .contains("non-success terminal streaming-json end event"));
+    assert!(failed_native
+        .held_grok_read_only_completion_facts()
+        .is_none());
+    assert_eq!(
+        failed_native.grok_stream_usage_evidence,
+        native_report.grok_stream_usage_evidence
     );
     let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&native_report)?)?;
     assert_eq!(
@@ -8356,6 +9654,141 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     assert!(legacy_run.grok_stream_usage_evidence.is_none());
 
     Ok(())
+}
+
+#[test]
+fn held_grok_completion_controls_remain_requested_and_debug_redacted() {
+    // Plain descriptive test data is not a filesystem witness or launch authority.
+    let facts = HeldGrokReadOnlyCompletionFacts {
+        held_output_sha256: sha256_hex(b"private-held-output"),
+        requested_model: Some("private-requested-model".to_string()),
+        requested_effort: Some("private-requested-effort".to_string()),
+        delivered_pinned_descriptor_digest: Some(sha256_hex(b"private-descriptor")),
+    };
+    assert_eq!(facts.requested_model(), Some("private-requested-model"));
+    assert_eq!(facts.requested_effort(), Some("private-requested-effort"));
+    assert_eq!(
+        facts.held_output_sha256(),
+        sha256_hex(b"private-held-output")
+    );
+    assert!(facts.observed_model().is_none());
+    assert!(facts.observed_effort().is_none());
+    assert!(facts.native_permission_observation().is_none());
+    assert_eq!(
+        facts.delivered_pinned_descriptor_digest(),
+        Some(sha256_hex(b"private-descriptor").as_str())
+    );
+    let mut without_pin = facts.clone();
+    without_pin.delivered_pinned_descriptor_digest = None;
+    assert!(without_pin.delivered_pinned_descriptor_digest().is_none());
+    let debug = format!("{facts:?}");
+    for private in [
+        "private-requested-model",
+        "private-requested-effort",
+        facts.held_output_sha256(),
+        facts.delivered_pinned_descriptor_digest().unwrap(),
+    ] {
+        assert!(!debug.contains(private));
+    }
+    assert!(debug.contains("[redacted]"));
+}
+
+#[test]
+fn held_grok_completion_facts_are_withheld_from_wire_and_public_flags() -> Result<()> {
+    let command = ExternalAgentCommand::codex(
+        "grok",
+        ".",
+        "prompt",
+        "log",
+        "report",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    );
+    let mut report = refused_external_run_before_launch(&command, "test fixture".to_string());
+    report.output_last_message = Some(b"private-held-output".to_vec());
+    // Deliberately injected descriptive data must not create a settled filesystem
+    // capability, even alongside forged public containment assertions.
+    report.stdout.run_metadata.grok_read_only_completion_facts =
+        Some(HeldGrokReadOnlyCompletionFacts {
+            held_output_sha256: sha256_hex(b"private-held-output"),
+            requested_model: Some("wire-private-requested-model".to_string()),
+            requested_effort: Some("wire-private-requested-effort".to_string()),
+            delivered_pinned_descriptor_digest: Some(sha256_hex(b"wire-private-descriptor")),
+        });
+    report.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+        ContainmentBackend::SystemdUserService,
+    ));
+    report.side_effects = Some(SideEffectConfinementEvidence::Verified(
+        SideEffectConfinementProfileKind::ExternalGrok,
+    ));
+    assert!(report.held_grok_read_only_completion_facts().is_none());
+    let wire = serde_json::to_vec(&report)?;
+    let encoded = String::from_utf8(wire.clone())?;
+    assert!(!encoded.contains("wire-private-requested-model"));
+    assert!(!encoded.contains("wire-private-requested-effort"));
+    assert!(!encoded.contains("grok_read_only_completion_facts"));
+    assert!(!encoded.contains("delivered_pinned_descriptor_digest"));
+    assert!(!encoded.contains(&sha256_hex(b"wire-private-descriptor")));
+    let restored: ExternalAgentRun = serde_json::from_slice(&wire)?;
+    assert!(restored
+        .stdout
+        .run_metadata
+        .grok_read_only_completion_facts
+        .is_none());
+    assert!(restored.held_grok_read_only_completion_facts().is_none());
+    assert!(restored.output_last_message().is_none());
+    Ok(())
+}
+
+#[test]
+fn held_grok_completion_retainer_refuses_unsettled_context_without_losing_usage() {
+    let command = ExternalAgentCommand::codex(
+        "grok",
+        ".",
+        "prompt",
+        "log",
+        "report",
+        Duration::from_secs(1),
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly);
+    let captured = CapturedBytes::from_bytes_for_test(
+        b"{\"type\":\"end\",\"sessionId\":\"held-session\",\"requestId\":\"held-request\",\"stopReason\":\"end_turn\",\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12}}\n".to_vec(),
+    );
+    let mut report = refused_external_run_before_launch(&command, "test fixture".to_string());
+    report.error = None;
+    report.exit_code = Some(0);
+    report.output_last_message = Some(b"private-held-output".to_vec());
+    report.retain_grok_native_usage_for_test(&command, &captured, true);
+    assert!(grok_filesystem_original_command_matches(&report, &command));
+    let mut foreign = command.clone();
+    foreign.model = Some("foreign-requested-model".to_string());
+    assert!(!grok_filesystem_original_command_matches(&report, &foreign));
+    retain_held_grok_read_only_completion_facts(
+        &mut report,
+        &foreign,
+        ExternalExecutionRuntime::Verified,
+    );
+    assert!(report
+        .stdout
+        .run_metadata
+        .grok_read_only_completion_facts
+        .is_none());
+    retain_held_grok_read_only_completion_facts(
+        &mut report,
+        &command,
+        ExternalExecutionRuntime::Verified,
+    );
+    assert!(report.held_grok_read_only_completion_facts().is_none());
+    let (usage, complete) = report.authenticated_grok_usage(&command).unwrap();
+    assert_eq!(usage.total_tokens, 12);
+    assert!(complete);
 }
 
 #[test]
@@ -8710,6 +10143,7 @@ fn grok_configuration_preflight_rejects_foreign_source_and_non_grok_profiles() -
         &grok_profile,
     ));
     let codex_auth = ValidatedCodexAuth {
+        managed_authority: None,
         path: temp.path().join("codex-auth.json"),
         length: 2,
         modified: None,
@@ -8793,6 +10227,7 @@ fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Res
     let mut environment = allowed_env(
         ExternalAgentInvocation::Grok,
         ExternalProgramTrust::ExplicitCustom,
+        false,
     );
     insert_admitted_grok_home_environment(&mut environment, &credentials)?;
     assert_eq!(
@@ -8954,6 +10389,7 @@ fn grok_missing_symlinked_and_replaced_auth_fail_typed_without_disclosure() -> R
             sensitive_home.display().to_string(),
         )]),
         None,
+        None,
     )?;
     let redacted_release_error = redactor.redact_string(&format!("{release_gate_error}"));
     assert!(redacted_release_error.contains("identity changed"));
@@ -9076,6 +10512,26 @@ fn app_server_capability_uses_the_existing_external_codex_profile() -> Result<()
 }
 
 #[test]
+fn codex_usage_parser_rejects_component_and_combined_total_overflow() {
+    let max = usize::MAX;
+    for (first, second, reason) in [
+        ((max - 1, 1), (max - 1, 1), "input"),
+        ((1, max - 1), (1, max - 1), "output"),
+        ((max - 1, 0), (0, 2), "total"),
+        ((max, 1), (0, 0), "total"),
+    ] {
+        let stream = [first, second].into_iter().map(|(input, output)| {
+            format!(r#"{{"type":"turn.completed","usage":{{"input_tokens":{input},"output_tokens":{output},"cached_input_tokens":0,"reasoning_output_tokens":0}}}}"#)
+        }).collect::<Vec<_>>().join("\n");
+        let error =
+            codex_usage_from_jsonl(stream.as_bytes()).expect_err("overflow must fail closed");
+        assert!(error
+            .to_string()
+            .contains(&format!("aggregate {reason} token count overflowed")));
+    }
+}
+
+#[test]
 fn codex_usage_parser_sums_only_valid_completed_turns() -> Result<()> {
     let usage = codex_usage_from_jsonl(
         br#"{"type":"thread.started","thread_id":"thread-a"}
@@ -9130,6 +10586,7 @@ fn external_errors_are_composed_and_success_requires_verified_empty_containment(
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     };
     assert!(!report.succeeded());
@@ -9293,6 +10750,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
         output_last_message: None,
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     };
     let output = ProcessOutput {
@@ -9324,11 +10782,13 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
             runtime: ExternalExecutionRuntime::Verified,
             codex_version: Some((0, 142, 3)),
             spec: &command,
+            original_spec: &command,
             protected_controls: &protected_controls,
             argv_digest: "verified-argv-digest",
             program_identity: &program_identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            claude_broker_witness: None,
         },
     );
 
@@ -9453,12 +10913,6 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
             stdout: PathBuf::from("injected-stdout"),
             stderr: PathBuf::from("injected-stderr"),
         },
-        ProcessRunError::Spawn {
-            label: "codex version preflight".to_string(),
-            command: "codex --version".to_string(),
-            current_dir: PathBuf::from("."),
-            source: std::io::Error::other("injected ambiguous spawn failure"),
-        },
         ProcessRunError::SetupTimeout {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -9516,6 +10970,12 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
     }
 
     let pre_spawn_errors = vec![
+        ProcessRunError::Spawn {
+            label: "codex version preflight".to_string(),
+            command: "codex --version".to_string(),
+            current_dir: PathBuf::from("."),
+            source: std::io::Error::other("injected spawn failure before child creation"),
+        },
         ProcessRunError::Cancelled {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -9598,6 +11058,7 @@ fn explicit_custom_environment_never_receives_provider_credentials() {
     let environment = allowed_env(
         ExternalAgentInvocation::CodexSupervisor,
         ExternalProgramTrust::ExplicitCustom,
+        false,
     );
     for name in ["OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"] {
         assert!(
@@ -11125,6 +12586,53 @@ fn codex_argv_and_digest_preserve_non_utf8_paths_without_collision() -> Result<(
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn gemini_consult_intent_is_distinct_and_refuses_wrong_role_access_or_runtime() -> Result<()> {
+    let (_temp, command, _marker) = assignment_process_launch_fixture(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        None,
+        "consult-gemini",
+        "consult-gemini",
+        Some("gemini-2.5-pro"),
+    )?;
+    assert!(assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &command
+    ));
+    for kind in [
+        AssignmentProcessLaunchKind::ConsultCodex,
+        AssignmentProcessLaunchKind::ConsultClaude,
+        AssignmentProcessLaunchKind::InboxIndependentAuditor,
+        AssignmentProcessLaunchKind::MergeArbiter,
+    ] {
+        assert!(!assignment_process_launch_kind_allowed_for_invocation(
+            kind, &command
+        ));
+    }
+    let mut wrong = command.clone();
+    wrong.workspace_access = WorkspaceAccess::ReadWrite;
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    let mut wrong = command.clone();
+    wrong.agent_lifecycle.as_mut().unwrap().role = "worker".into();
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    let wrong = command.with_runtime_adapter(
+        RuntimeId::ClaudeCode,
+        RuntimeAdapterConfig::defaults(RuntimeId::ClaudeCode),
+    );
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::ConsultGemini,
+        &wrong
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn assignment_process_launch_fixture(
     kind: AssignmentProcessLaunchKind,
     grant: Option<crate::mutation_taxonomy::AssignmentProcessLaunchGrant>,
@@ -11175,6 +12683,21 @@ fn assignment_process_launch_fixture(
             incoming.join("last-message.txt"),
             Duration::from_secs(5),
         )
+        .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
+        .with_model_selection(model.map(str::to_string), None),
+        AssignmentProcessLaunchKind::ConsultGemini => ExternalAgentCommand::codex(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_runtime_adapter(
+            RuntimeId::GeminiCli,
+            RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
         .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
         .with_model_selection(model.map(str::to_string), None),
         AssignmentProcessLaunchKind::AssignmentChild
@@ -12317,8 +13840,9 @@ fn verified_grok_no_socket_observe_then_launch_uses_matching_local_registry() ->
         expected_with_authority.authority_id.is_some(),
         "local observation must freeze authority_id"
     );
-    let command = admitted_verified_grok_cam_command(temp.path())?
-        .with_grok_run_account_binding(Some(frozen));
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_grok_run_account_binding(Some(frozen))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -12342,8 +13866,9 @@ fn verified_grok_matching_socket_and_local_authority_launches_frozen_binding() -
         authority_id: frozen.authority_id.clone(),
     };
     let _socket_env = CamSocketEnvGuard::set(&socket_path);
-    let command = admitted_verified_grok_cam_command(temp.path())?
-        .with_grok_run_account_binding(Some(frozen));
+    let command = admitted_verified_grok_cam_command_with_setup(temp.path(), |command| {
+        command.with_grok_run_account_binding(Some(frozen))
+    })?;
     let report = run_external_agent_with_cam_grok_test_harness(harness, &command);
     assert_verified_grok_cam_admitted_provider_failure(&report, &expected_with_authority)?;
     Ok(())
@@ -12416,7 +13941,7 @@ fn assignment_messaging_token_is_redacted_from_runtime_output() -> Result<()> {
     let token = environment
         .get(MACO_MESSAGE_TOKEN_ENV)
         .context("assignment messaging token env")?;
-    let redactor = CredentialRedactor::from_runtime(&environment, None)?;
+    let redactor = CredentialRedactor::from_runtime(&environment, None, None)?;
     let redacted = redactor.redact_string(&format!("seen token={token}"));
     assert!(!redacted.contains(token.as_str()));
     assert!(redacted.contains("[REDACTED]"));
@@ -12498,4 +14023,1044 @@ fn live_token_grant_rejects_tampered_launch_identity() {
     );
     command.model = Some("tampered-model".to_string());
     assert!(command.verified_live_token_grant().is_err());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_retains_private_identity_usage_and_refuses_bad_outcomes() -> Result<()>
+{
+    skip_without_containment!(ok);
+    for mode in [
+        "read",
+        "unknown-effort",
+        "low-effort",
+        "model-mismatch",
+        "truncated-capture",
+        "permission-approval",
+        "write",
+    ] {
+        let (run, workspace, _temp) =
+            contained_read_only_terminal_app_server(mode, "auditor", None)?;
+        assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+        assert_eq!(
+            fs::read_to_string(workspace.join("README.md"))?,
+            "read-only fixture\n"
+        );
+        let held = run
+            .authenticated_app_server_evidence()
+            .context("private Auditor evidence")?;
+        if mode == "read" {
+            assert!(run.error.is_none(), "{run:?}");
+            assert_eq!(held.resolution_status, "complete");
+            assert_eq!(held.observed_model.known(), Some("gpt-5.6-sol"));
+            assert_eq!(held.observed_effort.known(), Some("xhigh"));
+            assert_eq!(
+                run.authenticated_codex_usage().unwrap().total_tokens,
+                37_000
+            );
+            assert!(matches!(
+                held.rollout_model,
+                CodexParentResolvedField::Unknown
+            ));
+            assert_eq!(
+                run.output_last_message(),
+                Some(b"{\"summary\":\"read-only fixture\"}".as_slice())
+            );
+        } else {
+            assert!(run.error.is_some(), "{mode}: {run:?}");
+            if mode == "low-effort" {
+                assert_eq!(held.observed_effort.known(), Some("high"));
+                assert!(!run.codex_auditor_effort_qualified());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+            if mode == "model-mismatch" {
+                assert!(held.model_mismatch);
+            }
+            if mode == "unknown-effort" {
+                assert!(held.observed_effort.known().is_none());
+                assert!(run.authenticated_codex_usage().is_none());
+            }
+        }
+        assert!(
+            !run.publishable,
+            "local transport cannot confer provider trust"
+        );
+        let decoded: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+        assert!(decoded.authenticated_app_server_evidence().is_none());
+        assert!(decoded.authenticated_codex_usage().is_none());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn observed_auditor_transport_interrupts_live_grant_and_retains_partial_usage() -> Result<()> {
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    skip_without_containment!(ok);
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: Some(36_000),
+        ..Default::default()
+    })?;
+    let BudgetAdmission::Admitted { reservation, .. } =
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 16_384,
+            cost_usd: None,
+        })?
+    else {
+        panic!("admission");
+    };
+    let grant = ledger.live_token_grant(reservation.id)?.unwrap();
+    assert_eq!(grant.tokens(), 36_000);
+    let (run, _, _temp) =
+        contained_read_only_terminal_app_server("budget", "auditor", Some(grant.clone()))?;
+    assert!(grant.stopped());
+    assert!(run.process_tree.as_ref().unwrap().is_verified_empty());
+    assert!(!run.publishable);
+    assert!(
+        run.error.as_deref().is_some_and(
+            |error| error.contains("token grant exhausted: observed 37000 >= grant 36000")
+        ),
+        "{run:?}"
+    );
+    assert!(run.output_last_message().is_none_or(<[u8]>::is_empty));
+    assert!(matches!(
+        run.authenticated_app_server_evidence().unwrap().turn_usage,
+        CodexParentTurnUsage::Known {
+            input_tokens: 35_000,
+            output_tokens: 2_000,
+            ..
+        }
+    ));
+    assert!(matches!(
+        ledger.reserve(BudgetReservationRequest {
+            role: crate::supervise::AgentRole::Auditor,
+            tokens: 1,
+            cost_usd: None,
+        })?,
+        BudgetAdmission::Refused { .. }
+    ));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+mod managed_worker_live_budget {
+    use super::*;
+    use crate::supervise_budget::{
+        BudgetAdmission, BudgetReservationRequest, RunBudgetLedger, RunBudgetLimits,
+    };
+    use std::collections::VecDeque;
+
+    // Byte transport only: every protocol and budget decision uses the production driver.
+    struct Transport {
+        incoming: VecDeque<Vec<u8>>,
+        sent: Vec<serde_json::Value>,
+        cancel_on_eof: Option<ProcessCancellation>,
+    }
+
+    impl Transport {
+        fn new(messages: Vec<serde_json::Value>) -> Self {
+            Self {
+                incoming: messages
+                    .into_iter()
+                    .map(|v| v.to_string().into_bytes())
+                    .collect(),
+                sent: Vec::new(),
+                cancel_on_eof: None,
+            }
+        }
+    }
+
+    impl codex_app_server::JsonLineTransport for Transport {
+        fn receive(
+            &mut self,
+            _: Duration,
+            max: usize,
+            bytes: &mut Vec<u8>,
+        ) -> Result<codex_app_server::TransportRead, String> {
+            bytes.clear();
+            match self.incoming.pop_front() {
+                Some(line) if line.len() <= max => {
+                    bytes.extend(line);
+                    Ok(codex_app_server::TransportRead::Line)
+                }
+                Some(_) => Err("bounded test line exceeded".to_string()),
+                None => {
+                    if let Some(cancellation) = self.cancel_on_eof.take() {
+                        cancellation.cancel();
+                        Ok(codex_app_server::TransportRead::Timeout)
+                    } else {
+                        Ok(codex_app_server::TransportRead::Eof)
+                    }
+                }
+            }
+        }
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            self.sent
+                .push(serde_json::from_slice(line).map_err(|error| error.to_string())?);
+            Ok(())
+        }
+    }
+
+    fn command() -> ExternalAgentCommand {
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "worker-run",
+            "worker",
+            1,
+            Path::new("codex"),
+            Some("gpt-5.6-sol"),
+            "worker-duty",
+        )
+        .unwrap();
+        ExternalAgentCommand::codex(
+            "codex",
+            "/workspace",
+            "/private/prompt",
+            "/private/events",
+            "/private/report",
+            Duration::from_secs(3),
+        )
+        .with_agent_lifecycle("/registry", "worker", "worker-run", "worker")
+        .with_model_selection(Some("gpt-5.6-sol".to_string()), Some("high".to_string()))
+        .with_codex_native_delegation_disabled()
+        .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant)
+        .with_worker_journal_artifact(
+            "worker",
+            "/private",
+            "/private/worker-journals/worker.jsonl",
+        )
+    }
+
+    fn turn() -> codex_app_server::AppServerTurn {
+        codex_app_server::AppServerTurn {
+            cwd: "/workspace".into(),
+            permission_profile: "maco_external_codex".into(),
+            prompt: "effective Worker prompt including the bound helper appendix".into(),
+            model: Some("gpt-5.6-sol".into()),
+            minimum_effort: None,
+            output_schema: None,
+        }
+    }
+
+    fn prefix() -> Vec<serde_json::Value> {
+        vec![
+            serde_json::json!({"id":1,"result":{}}),
+            serde_json::json!({"id":2,"result":{"thread":{"id":"worker-thread"},"model":"gpt-5.6-sol","reasoningEffort":"high","approvalPolicy":"on-request","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":"/workspace"}}),
+            serde_json::json!({"id":3,"result":{"turn":{"id":"worker-turn","status":"inProgress"}}}),
+            serde_json::json!({"method":"turn/started","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"inProgress"}}}),
+        ]
+    }
+
+    fn usage(input: u64, output: u64) -> serde_json::Value {
+        let counters = serde_json::json!({"inputTokens":input,"outputTokens":output,"cachedInputTokens":input / 2,"reasoningOutputTokens":output / 2,"totalTokens":input + output});
+        serde_json::json!({"method":"thread/tokenUsage/updated","params":{"threadId":"worker-thread","turnId":"worker-turn","tokenUsage":{"last":counters,"total":counters,"modelContextWindow":null}}})
+    }
+
+    fn observed_tokens(outcome: &codex_app_server::AppServerOutcome) -> Option<u64> {
+        outcome
+            .token_usage
+            .as_ref()
+            .map(|usage| usage.input_tokens.checked_add(usage.output_tokens).unwrap())
+    }
+
+    fn terminal() -> serde_json::Value {
+        serde_json::json!({"method":"turn/completed","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"completed"}}})
+    }
+
+    fn complete_messages() -> Vec<serde_json::Value> {
+        let mut messages = prefix();
+        for (method, status) in [
+            ("item/started", "inProgress"),
+            ("item/completed", "completed"),
+        ] {
+            messages.push(serde_json::json!({"method":method,"params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"edit","type":"fileChange","status":status}}}));
+        }
+        messages.push(usage(35_000, 2_000));
+        messages.push(serde_json::json!({"method":"item/started","params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"report","type":"agentMessage"}}}));
+        messages.push(serde_json::json!({"method":"item/completed","params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"report","type":"agentMessage","text":"{\"summary\":\"native edit\"}"}}}));
+        messages.push(terminal());
+        messages
+    }
+
+    fn reserve(ledger: &RunBudgetLedger) -> crate::supervise_budget::BudgetReservation {
+        let BudgetAdmission::Admitted { reservation, .. } = ledger
+            .reserve(BudgetReservationRequest {
+                role: crate::supervise::AgentRole::Worker,
+                tokens: 16_384,
+                cost_usd: None,
+            })
+            .unwrap()
+        else {
+            panic!("Worker reservation")
+        };
+        reservation
+    }
+
+    #[test]
+    fn worker_selection_requires_private_authority_and_preserves_other_routes() {
+        let spec = command();
+        assert_eq!(
+            classify_managed_worker_app_server(&spec, ExternalExecutionRuntime::Verified),
+            Ok(true)
+        );
+        assert!(spec.uses_live_app_server_budget());
+        assert!(!should_use_duplex_review(
+            &spec,
+            ExternalExecutionRuntime::Verified,
+            true
+        ));
+        for shape in [
+            "readonly",
+            "primary",
+            "researcher",
+            "auditor",
+            "parent",
+            "other-runtime",
+        ] {
+            let mut other = spec.clone();
+            match shape {
+                "readonly" => other.workspace_access = WorkspaceAccess::ReadOnly,
+                "primary" => other.writable_launch_target = WritableLaunchTarget::PrimaryWorktree,
+                "other-runtime" => other.invocation = ExternalAgentInvocation::Grok,
+                role => other.agent_lifecycle.as_mut().unwrap().role = role.to_string(),
+            }
+            assert_eq!(
+                classify_managed_worker_app_server(&other, ExternalExecutionRuntime::Verified),
+                Ok(false),
+                "{shape}"
+            );
+        }
+        assert!(!classify_managed_worker_app_server(
+            &spec,
+            ExternalExecutionRuntime::NonpublishableSimulation
+        )
+        .unwrap());
+        assert!(
+            validate_universal_pre_action_coverage(WritableLaunchTarget::PrimaryWorktree).is_err()
+        );
+        for mutation in [
+            "native", "grant", "kind", "journal", "subject", "attempt", "dynamic",
+        ] {
+            let mut changed = spec.clone();
+            match mutation {
+                "native" => changed.codex_native_delegation_disabled = false,
+                "grant" => changed.assignment_process_launch_grant = None,
+                "kind" => changed.assignment_process_launch_kind = None,
+                "journal" => changed.worker_journal_artifacts.clear(),
+                "subject" => changed.worker_journal_artifacts[0].worker_id = "impostor".into(),
+                "attempt" => changed.assignment_process_launch_attempt = Some(2),
+                "dynamic" => {
+                    changed.codex_managed_readonly_route =
+                        CodexManagedReadonlyRoute::InitialWorkerRequests
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                classify_managed_worker_app_server(&changed, ExternalExecutionRuntime::Verified)
+                    .is_err(),
+                "{mutation}"
+            );
+        }
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let custom = temp.path().join("custom-codex");
+        fs::write(&custom, "#!/bin/sh\nexit 99\n").unwrap();
+        fs::set_permissions(&custom, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut custom_spec = spec;
+        custom_spec.program = custom;
+        let run = run_external_agent_runtime(
+            &custom_spec,
+            ExternalExecutionRuntime::Verified,
+            &ProcessCancellation::new(),
+            None,
+        );
+        assert!(!run.stdout.target_launch_attempted);
+        assert!(
+            run.error
+                .as_deref()
+                .unwrap()
+                .contains("requires a verified TrustedSystemCodex executable"),
+            "{run:?}"
+        );
+    }
+
+    #[test]
+    fn worker_final_argv_prompt_digest_and_helper_survive_audited_preparation() -> Result<()> {
+        let (_temp, spec, controls) = worker_journal_append_binding_tests::fixture();
+        let spec = spec.with_codex_native_delegation_disabled();
+        assert!(audited_codex_app_server_argv(
+            &spec,
+            &controls,
+            EnvironmentVersion::new(0, 144, 3)
+        )
+        .is_err());
+        let mut argv =
+            audited_codex_app_server_argv(&spec, &controls, EnvironmentVersion::new(0, 144, 4))?;
+        let mut prompt = b"original effective prompt".to_vec();
+        let original_profile = external_side_effect_profile(
+            &spec,
+            Path::new("/nix/store/qwpfszqp550yvlwa6sdjwgh4qw3nhdk9-0.144.4-x86_64-unknown-linux-musl/bin/codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let mut profile = Some(original_profile.clone());
+        let unbound_digest = argv_digest(&argv)?;
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        )?
+        .context("actual Worker helper binding")?;
+        binding.revalidate()?;
+        for feature in ["multi_agent", "goals"] {
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair[0] == "--disable" && pair[1] == feature));
+            assert!(!argv
+                .windows(2)
+                .any(|pair| pair[0] == "--enable" && pair[1] == feature));
+        }
+        let permissions = argv
+            .iter()
+            .find(|arg| {
+                arg.to_string_lossy()
+                    .starts_with("permissions.maco_external_codex.filesystem=")
+            })
+            .unwrap()
+            .to_string_lossy();
+        assert!(permissions.contains(&toml_basic_string(&binding.helper_path.to_string_lossy())));
+        assert!(permissions.contains(":workspace_roots\"={\".\"=\"write\"}"));
+        let journal = &controls.exact_writable_artifact_files[0];
+        let carrier = journal.path.parent().context("held journal carrier")?;
+        // Linux Codex grants the carrier, not a regular-file write root. The
+        // production outer profile keeps that directory read-only and mounts
+        // only the descriptor-held journal read-write.
+        assert!(permissions.contains(&format!(
+            "{}=\"write\"",
+            toml_basic_string(&carrier.to_string_lossy())
+        )));
+        assert_ne!(unbound_digest, argv_digest(&argv)?);
+        let effective_prompt = String::from_utf8(prompt)?;
+        assert!(effective_prompt.starts_with("original effective prompt"));
+        assert!(effective_prompt.contains(&serde_json::to_string(&binding.command_prefix()?)?));
+        assert!(effective_prompt.contains(&binding.helper_sha256));
+        let Some(SideEffectConfinementProfile::ExternalCodex(actual)) = profile else {
+            panic!("qualified outer profile")
+        };
+        let SideEffectConfinementProfile::ExternalCodex(original) = original_profile else {
+            panic!("original production profile")
+        };
+        assert!(actual
+            .visible_read_only_roots()
+            .contains(&carrier.to_path_buf()));
+        assert!(!actual
+            .visible_read_write_roots()
+            .contains(&carrier.to_path_buf()));
+        assert_eq!(
+            actual.visible_read_write_files(),
+            std::slice::from_ref(&journal.path)
+        );
+        assert_eq!(
+            actual,
+            original.with_visible_read_only_file(&binding.helper_path)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn worker_live_grant_rejects_changed_inputs_stopped_and_released_reservations() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let held = reserve(&ledger);
+        let mut spec = command();
+        spec.timeout = Duration::from_secs(1);
+        spec.bind_live_token_grant(ledger.live_token_grant(held.id).unwrap());
+        assert_eq!(
+            spec.verified_live_token_grant().unwrap().unwrap().tokens(),
+            220_000
+        );
+        for mutation in [
+            "timeout", "model", "native", "journal", "schema", "hidden", "attempt", "prompt",
+        ] {
+            let mut changed = spec.clone();
+            match mutation {
+                "timeout" => changed.timeout += Duration::from_secs(1),
+                "model" => changed.model = Some("changed".into()),
+                "native" => changed.codex_native_delegation_disabled = false,
+                "journal" => changed.worker_journal_artifacts[0].path = "/other".into(),
+                "schema" => changed.output_schema = Some("/other".into()),
+                "hidden" => changed.hidden_roots.push("/other".into()),
+                "attempt" => changed.assignment_process_launch_attempt = Some(2),
+                "prompt" => changed.prompt = "/other".into(),
+                _ => unreachable!(),
+            }
+            assert!(changed.verified_live_token_grant().is_err(), "{mutation}");
+        }
+        spec.verified_live_token_grant().unwrap().unwrap().exhaust();
+        assert!(spec.verified_live_token_grant().is_err());
+        ledger.release(held.id).unwrap();
+        assert!(spec.verified_live_token_grant().is_err());
+        assert_eq!(ledger.report().unwrap().consumed.tokens, 0);
+        let released_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let released = reserve(&released_ledger);
+        let mut released_spec = command();
+        released_spec.bind_live_token_grant(released_ledger.live_token_grant(released.id).unwrap());
+        released_ledger.release(released.id).unwrap();
+        assert!(released_spec.verified_live_token_grant().is_err());
+        let run = run_external_agent_runtime(
+            &released_spec,
+            ExternalExecutionRuntime::Verified,
+            &ProcessCancellation::new(),
+            None,
+        );
+        assert!(!run.stdout.target_launch_attempted);
+        assert!(run.authenticated_codex_usage().is_none());
+    }
+
+    #[test]
+    fn worker_handler_accepts_native_edit_without_hosted_review_or_dynamic_tools() {
+        let mut transport = Transport::new(complete_messages());
+        let outcome = run_managed_worker_app_server_turn(
+            &mut transport,
+            &turn(),
+            &command(),
+            &ProcessCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.status,
+            codex_app_server::TurnTerminalStatus::Completed
+        );
+        assert!(outcome
+            .item_outcomes
+            .iter()
+            .any(|item| item.item_type == "fileChange"));
+        assert_eq!(observed_tokens(&outcome).unwrap(), 37_000);
+        assert_eq!(
+            outcome.token_usage.as_ref().unwrap().cached_input_tokens,
+            17_500
+        );
+        assert_eq!(
+            outcome
+                .token_usage
+                .as_ref()
+                .unwrap()
+                .reasoning_output_tokens,
+            1_000
+        );
+        assert!(outcome.final_message.is_some());
+        assert!(outcome.auto_reviews.is_empty());
+        assert!(
+            outcome.duplex_fallback_required,
+            "native Worker completion does not manufacture All review coverage"
+        );
+        let start = transport
+            .sent
+            .iter()
+            .find(|v| v["method"] == "thread/start")
+            .unwrap();
+        assert_eq!(start["params"]["dynamicTools"], serde_json::json!([]));
+        let sent_turn = transport
+            .sent
+            .iter()
+            .find(|v| v["method"] == "turn/start")
+            .unwrap();
+        assert_eq!(sent_turn["params"]["input"][0]["text"], turn().prompt);
+        for mode in ["worker-complete", "worker-budget"] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(30_000),
+                ..Default::default()
+            })
+            .unwrap();
+            let held = reserve(&ledger);
+            let grant = (mode == "worker-budget")
+                .then(|| ledger.live_token_grant(held.id).unwrap().unwrap());
+            let (run, workspace, _temp) =
+                contained_read_only_terminal_app_server(mode, "worker", grant).unwrap();
+            assert!(run.scratch_quiescence_verified(), "{run:?}");
+            assert_eq!(
+                fs::read_to_string(workspace.join("README.md")).unwrap(),
+                "permitted native Worker edit\n"
+            );
+            assert_eq!(
+                run.authenticated_codex_partial_usage()
+                    .unwrap()
+                    .total_tokens,
+                37_000
+            );
+            if mode == "worker-budget" {
+                assert!(!run.publishable);
+                assert!(ledger.dispatch_stopped());
+                assert!(!run.authenticated_app_server_usage_complete());
+            } else {
+                assert!(run.error.is_none(), "{run:?}");
+                assert!(
+                    !run.publishable,
+                    "the synthetic executable never acquires provider trust"
+                );
+                assert!(run.authenticated_app_server_usage_complete());
+            }
+        }
+    }
+
+    #[test]
+    fn worker_handler_cancels_approval_expansion_and_unsolicited_worker_requests() {
+        for method in [
+            "item/commandExecution/requestApproval",
+            "item/fileChange/requestApproval",
+            "item/permissions/requestApproval",
+            "item/tool/call",
+        ] {
+            let mut messages = prefix();
+            messages.push(usage(35_000, 2_000));
+            messages.push(serde_json::json!({"id":77,"method":method,"params":{"threadId":"worker-thread","turnId":"worker-turn","itemId":"edit","callId":"call-1","tool":"maco_worker_request","arguments":{},"command":"touch other","cwd":"/workspace","startedAtMs":1}}));
+            messages.push(terminal());
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            let outcome = run_managed_worker_app_server_turn(
+                &mut transport,
+                &turn(),
+                &command(),
+                &cancellation,
+            )
+            .unwrap();
+            assert!(cancellation.is_cancelled(), "{method}");
+            assert_eq!(
+                outcome.status,
+                codex_app_server::TurnTerminalStatus::Failed,
+                "{method}"
+            );
+            assert!(outcome.final_message.is_none());
+            assert_eq!(observed_tokens(&outcome).unwrap(), 37_000);
+            assert!(
+                transport
+                    .sent
+                    .iter()
+                    .any(|v| v["method"] == "turn/interrupt"),
+                "{method}"
+            );
+            assert!(!transport
+                .sent
+                .iter()
+                .any(|v| v["result"]["decision"] == "accept"));
+        }
+    }
+
+    #[test]
+    fn worker_handler_interrupts_equal_and_overshooting_grants_and_keeps_drain_floor() {
+        for first_input in [210_000, 211_000] {
+            let ledger = RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            })
+            .unwrap();
+            let held = reserve(&ledger);
+            let grant = ledger.live_token_grant(held.id).unwrap().unwrap();
+            let mut spec = command();
+            spec.bind_live_token_grant(Some(grant.clone()));
+            let mut messages = prefix();
+            messages.extend([
+                usage(first_input, 10_000),
+                serde_json::json!({"id":77,"method":"item/tool/call","params":{}}),
+                usage(230_000, 12_000),
+                terminal(),
+            ]);
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            let outcome =
+                run_managed_worker_app_server_turn(&mut transport, &turn(), &spec, &cancellation)
+                    .unwrap();
+            assert!(grant.stopped());
+            assert!(cancellation.is_cancelled());
+            assert_eq!(observed_tokens(&outcome).unwrap(), 242_000);
+            assert_eq!(outcome.status, codex_app_server::TurnTerminalStatus::Failed);
+            assert!(outcome
+                .protocol_error
+                .as_ref()
+                .unwrap()
+                .contains("token grant exhausted"));
+            let interrupt = transport
+                .sent
+                .iter()
+                .position(|v| v["method"] == "turn/interrupt")
+                .unwrap();
+            assert_eq!(
+                interrupt + 1,
+                transport.sent.len(),
+                "only observations drain after interrupt"
+            );
+            assert!(matches!(
+                ledger
+                    .reserve(BudgetReservationRequest {
+                        role: crate::supervise::AgentRole::Worker,
+                        tokens: 1,
+                        cost_usd: None
+                    })
+                    .unwrap(),
+                BudgetAdmission::Refused { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn worker_handler_retains_partial_floor_and_missing_usage_on_protocol_failure() {
+        for failure in [
+            "eof",
+            "foreign",
+            "decreasing",
+            "malformed",
+            "duplicate",
+            "truncated",
+            "cancelled",
+            "missing",
+        ] {
+            let mut messages = prefix();
+            if failure != "missing" {
+                messages.push(usage(35_000, 2_000));
+            }
+            let mut invalid = usage(40_000, 2_000);
+            match failure {
+                "foreign" => {
+                    invalid["params"]["turnId"] = serde_json::json!("foreign");
+                    messages.push(invalid);
+                }
+                "decreasing" => messages.push(usage(1, 1)),
+                "malformed" => {
+                    invalid["params"]["tokenUsage"]["total"]["cachedInputTokens"] =
+                        serde_json::json!(50_000);
+                    messages.push(invalid);
+                }
+                "missing" => messages.push(terminal()),
+                _ => {}
+            }
+            let mut transport = Transport::new(messages);
+            let cancellation = ProcessCancellation::new();
+            if failure == "cancelled" {
+                transport.cancel_on_eof = Some(cancellation.clone());
+            }
+            if failure == "duplicate" {
+                let duplicated = usage(40_000, 2_000).to_string().replace(
+                    "\"inputTokens\":40000",
+                    "\"inputTokens\":40000,\"inputTokens\":1",
+                );
+                transport.incoming.push_back(duplicated.into_bytes());
+            }
+            if failure == "truncated" {
+                let mut truncated = usage(40_000, 2_000).to_string().into_bytes();
+                truncated.pop();
+                transport.incoming.push_back(truncated);
+            }
+            let outcome = run_managed_worker_app_server_turn(
+                &mut transport,
+                &turn(),
+                &command(),
+                &cancellation,
+            )
+            .unwrap();
+            if failure == "missing" {
+                assert!(outcome.token_usage.is_none(), "missing usage is never zero");
+            } else {
+                assert_eq!(observed_tokens(&outcome).unwrap(), 37_000, "{failure}");
+                assert_eq!(outcome.status, codex_app_server::TurnTerminalStatus::Failed);
+                assert!(cancellation.is_cancelled());
+                assert!(outcome.final_message.is_none());
+            }
+        }
+    }
+}
+
+fn role_evidence_prelaunch_test_policy() -> crate::selection::routing_policy::FrozenRoutingPolicy {
+    use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+    let policy: LoadedRoutingPolicy = serde_json::from_str(concat!(
+        r#"{"schema_version":1,"policy_id":"public-role-evidence-fixture","tree":{"coordinated_complexity_min":5000,"coordinated_risk_min":5000,"coordinated_horizon_min":5000,"coordinated_context_tokens_min":1000,"coordinated_scope_paths_min":2,"min_independent_groups":2,"max_workers":2,"max_depth":2},"#,
+        r#""default_role":{"preferred_effort":null,"minimum_effort":null,"require_measured_quality":false,"minimum_quality_basis_points":0,"minimum_samples":0},"role_preferences":{},"#,
+        r#""objective":{"accepted_cycle_cost_weight":1,"rejected_attempt_weight":1,"effort_distance_weight":1,"unknown_evidence_penalty":1},"unknown_access_policy":"reject"}"#,
+    )).unwrap();
+    let sha256 = sha256_hex(&serde_json::to_vec(&policy).unwrap());
+    FrozenRoutingPolicy {
+        policy,
+        sha256,
+        source: "public-synthetic-fixture".to_string(),
+    }
+}
+
+#[test]
+fn role_execution_evidence_prelaunch_preserves_absent_and_legacy_policy() {
+    assert!(validate_role_execution_evidence_before_launch(None, None).is_ok());
+    let policy = role_evidence_prelaunch_test_policy();
+    assert!(validate_role_execution_evidence_before_launch(Some(&policy), None).is_ok());
+    assert!(validate_role_execution_evidence_before_launch(Some(&policy), Some("Auditor")).is_ok());
+}
+
+#[test]
+fn role_execution_evidence_prelaunch_refuses_explicit_requirements_and_preserves_whole_role_fallback(
+) {
+    use crate::selection::routing_policy::{
+        ExecutionEvidenceBasis, RoleExecutionEvidenceRequirements,
+    };
+    for basis in [
+        ExecutionEvidenceBasis::NativeObserved,
+        ExecutionEvidenceBasis::SourceQualifiedApplied,
+    ] {
+        let mut policy = role_evidence_prelaunch_test_policy();
+        policy
+            .policy
+            .role_preferences
+            .insert("LegacyRole".to_string(), policy.policy.default_role.clone());
+        policy.policy.default_role.execution_evidence_requirements =
+            Some(RoleExecutionEvidenceRequirements {
+                model: basis,
+                effort: basis,
+                permissions: basis,
+            });
+        policy.sha256 = sha256_hex(&serde_json::to_vec(&policy.policy).unwrap());
+        assert!(
+            validate_role_execution_evidence_before_launch(Some(&policy), Some("Auditor")).is_err()
+        );
+        assert!(
+            validate_role_execution_evidence_before_launch(Some(&policy), Some("LegacyRole"))
+                .is_ok()
+        );
+        for role in [None, Some(""), Some(" ")] {
+            assert_eq!(
+                validate_role_execution_evidence_before_launch(Some(&policy), role),
+                Err("explicit role execution evidence requires an exact lifecycle role binding",)
+            );
+        }
+        policy.sha256 = "0".repeat(64);
+        assert_eq!(
+            validate_role_execution_evidence_before_launch(Some(&policy), Some("LegacyRole")),
+            Err("role execution evidence policy binding is invalid",)
+        );
+    }
+}
+
+#[test]
+fn role_execution_evidence_policy_guard_restores_previous_thread_state() {
+    use crate::selection::routing_policy::{bind_routing_policy, current_routing_policy};
+    let before = current_routing_policy();
+    let policy = role_evidence_prelaunch_test_policy();
+    {
+        let _outer = bind_routing_policy(Some(policy.clone())).unwrap();
+        {
+            let _inner = bind_routing_policy(None).unwrap();
+            assert!(current_routing_policy().is_none());
+        }
+        assert_eq!(current_routing_policy(), Some(policy));
+    }
+    assert_eq!(current_routing_policy(), before);
+}
+
+#[test]
+fn role_execution_evidence_common_entry_refuses_before_executable_preflight() {
+    use crate::selection::routing_policy::{
+        bind_routing_policy, ExecutionEvidenceBasis, RoleExecutionEvidenceRequirements,
+    };
+    for basis in [
+        ExecutionEvidenceBasis::NativeObserved,
+        ExecutionEvidenceBasis::SourceQualifiedApplied,
+    ] {
+        let mut policy = role_evidence_prelaunch_test_policy();
+        policy.policy.default_role.execution_evidence_requirements =
+            Some(RoleExecutionEvidenceRequirements {
+                model: basis,
+                effort: basis,
+                permissions: basis,
+            });
+        policy.sha256 = sha256_hex(&serde_json::to_vec(&policy.policy).unwrap());
+        let _policy_guard = bind_routing_policy(Some(policy)).unwrap();
+        let spec = ExternalAgentCommand::codex_read_only_consultant(
+            "role-evidence-unlaunchable-sentinel",
+            "role-evidence-unlaunchable-sentinel/workspace",
+            "role-evidence-unlaunchable-sentinel/prompt",
+            "role-evidence-unlaunchable-sentinel/log",
+            "role-evidence-unlaunchable-sentinel/report",
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle(
+            "role-evidence-unlaunchable-sentinel/registry",
+            "Auditor",
+            "public-role-evidence-test-run",
+            "arbiter",
+        );
+        let cancellation = ProcessCancellation::new();
+        assert!(!cancellation.is_cancelled());
+        let run = run_external_agent_runtime(
+            &spec,
+            ExternalExecutionRuntime::Verified,
+            &cancellation,
+            None,
+        );
+        assert_eq!(
+            run.error.as_deref(),
+            Some("required role execution evidence is unsupported or unqualified before launch")
+        );
+        assert_eq!(run.environment_failures().len(), 1);
+        assert_eq!(
+            run.environment_failures()[0].category,
+            EnvironmentFailureCategory::SandboxUnavailable
+        );
+        assert!(run.environment_failures()[0].requirement.is_none());
+        let metadata = &run.stdout.run_metadata;
+        assert!(!metadata.environment_preflight_process_started);
+        assert!(metadata.environment_preflight_results.is_empty());
+        assert!(metadata.fixed_version_probe_evidence.is_none());
+        assert!(!run.stdout.target_launch_attempted);
+        assert!(run.process_tree.is_none());
+        assert!(run.side_effects.is_none());
+        assert!(run.output_last_message.is_none());
+        assert!(run.stdout.bytes.is_empty());
+        assert!(run.stderr.bytes.is_empty());
+        assert!(run.stdout.text.is_empty());
+        assert!(run.stderr.text.is_empty());
+        assert!(metadata.grok_native_usage.is_none());
+        assert!(metadata.codex_cli_usage.is_none());
+        assert!(!metadata.codex_cli_usage_complete);
+        assert!(!metadata.codex_app_server_usage_complete);
+        assert!(metadata.codex_app_server_parent_evidence.is_none());
+        assert!(metadata.claude_native_evidence.is_none());
+        assert!(metadata.gemini_bridge.is_none());
+        assert!(metadata.grok_read_only_filesystem.is_none());
+        assert!(metadata.grok_read_only_completion_facts.is_none());
+        assert!(run.grok_stream_usage_evidence.is_none());
+        assert!(run.codex_permissions.is_none());
+        assert!(run.exit_code.is_none());
+        assert!(!run.publishable);
+        assert!(!run.timed_out);
+        assert!(!cancellation.is_cancelled());
+    }
+}
+
+#[test]
+fn selected_merge_snapshot_rejects_command_context_drift() {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/neutral",
+        "/prompt",
+        "/log",
+        "/output",
+        Duration::from_secs(1),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_agent_lifecycle("/primary", "Auditor", "merge-run", "merge-arbiter");
+    let baseline = selected_merge_command_snapshot(&command);
+    for field in 0..9 {
+        let mut drifted = command.clone();
+        match field {
+            0 => drifted.program = "/foreign/executable".into(),
+            1 => drifted.cwd = "/foreign/workspace".into(),
+            2 => drifted.model = Some("foreign-model".into()),
+            3 => drifted.reasoning_effort = Some("foreign-effort".into()),
+            4 => drifted.workspace_access = WorkspaceAccess::ReadWrite,
+            5 => drifted.output_schema = Some("/foreign/schema".into()),
+            6 => drifted.output_last_message = "/foreign/output".into(),
+            7 => drifted.agent_lifecycle.as_mut().unwrap().role = "Worker".into(),
+            8 => drifted.codex_run_account_binding = Some(CodexRunAccountBinding::Missing),
+            _ => unreachable!(),
+        }
+        assert_ne!(
+            baseline,
+            selected_merge_command_snapshot(&drifted),
+            "context field {field}"
+        );
+    }
+}
+
+#[test]
+fn selected_merge_native_public_shape_refuses_at_common_sink() {
+    let _guard = crate::selection::routing_policy::bind_routing_policy(None).unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        "selected-merge-unlaunchable-sentinel",
+        "/neutral",
+        "/prompt",
+        "/log",
+        "/output",
+        Duration::from_secs(1),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_agent_lifecycle(
+        "/primary",
+        crate::supervise::AgentRole::Auditor.as_str(),
+        "merge-run",
+        "merge-arbiter",
+    )
+    .with_runtime_adapter(
+        RuntimeId::Grok,
+        RuntimeAdapterConfig::defaults(RuntimeId::Grok),
+    );
+    command.hidden_roots.push("/primary".into());
+    command.output_schema = Some("/schema".into());
+    command.assignment_process_launch_kind = Some(AssignmentProcessLaunchKind::MergeArbiter);
+    assert!(merge_arbiter_command_is_merge_shaped(&command));
+    assert!(!assignment_process_launch_kind_allowed_for_invocation(
+        AssignmentProcessLaunchKind::MergeArbiter,
+        &command
+    ));
+    let report = run_external_agent_runtime(
+        &command,
+        ExternalExecutionRuntime::Verified,
+        &ProcessCancellation::new(),
+        None,
+    );
+    assert!(report.error.is_some());
+    assert!(
+        !report
+            .stdout
+            .run_metadata
+            .environment_preflight_process_started
+    );
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.process_tree.is_none());
+    assert!(report.output_last_message().is_none());
+    assert!(report
+        .stdout
+        .run_metadata
+        .selected_merge_completion
+        .is_none());
+    assert!(!report.publishable);
+}
+
+#[test]
+fn selected_merge_wire_flags_cannot_restore_private_completion() -> Result<()> {
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        "/neutral",
+        "/prompt",
+        "/log",
+        "/output",
+        Duration::from_secs(1),
+    );
+    let mut report = failed_external_run(
+        &command,
+        Instant::now(),
+        Vec::new(),
+        false,
+        "not executed".to_string(),
+    );
+    report.exit_code = Some(0);
+    report.error = None;
+    report.publishable = true;
+    report.output_last_message = Some(b"public report claims success".to_vec());
+    assert!(report.qualified_merge_arbiter_output(&command).is_err());
+    let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+    assert!(restored
+        .stdout
+        .run_metadata
+        .selected_merge_completion
+        .is_none());
+    assert!(restored.qualified_merge_arbiter_output(&command).is_err());
+    Ok(())
 }

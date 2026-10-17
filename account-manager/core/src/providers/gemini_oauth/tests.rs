@@ -585,11 +585,132 @@ async fn managed_oauth_login_honors_operation_deadline() {
         }
     }
 
-    let outcome = oauth_login_with_deadline(Duration::from_millis(50), async move {
+    let outcome = oauth_login_with_deadline(Duration::from_millis(50), |_| async move {
         let _track = DropTrack(track);
         std::future::pending::<std::result::Result<(), OAuthLoginRunError>>().await
     })
     .await;
     assert!(matches!(outcome, Err(OAuthLoginRunError::Cancelled)));
     assert!(dropped.load(Ordering::SeqCst));
+}
+
+#[tokio::test]
+async fn caller_managed_url_drives_real_loopback_without_opening_browser() {
+    use std::sync::{Arc, Mutex};
+    let session = BrowserSession::bind().await.expect("session");
+    let (published, mut url_rx) = tokio::sync::watch::channel(None::<LoginAuthorization>);
+    let active = Arc::new(Mutex::new(false));
+    let track = Arc::clone(&active);
+    let handoff = LoginUrlHandoff::new(move |authorization| {
+        *track.lock().expect("active") = authorization.is_some();
+        published.send_replace(authorization.map(|url| url.public));
+        true
+    });
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    let receive =
+        receive_authorization_code(&session, Some(&handoff), deadline, &mut cancel_rx, |_| {
+            panic!("caller-managed mode must not open a browser")
+        });
+    let owner = async {
+        url_rx.changed().await.expect("published URL");
+        let public = url_rx.borrow().clone().expect("live URL");
+        let url = Url::parse(&public.authorization_url).expect("public URL");
+        assert_eq!(
+            url.origin().ascii_serialization(),
+            "https://accounts.google.com"
+        );
+        let fields: BTreeMap<_, _> = url.query_pairs().into_owned().collect();
+        assert_eq!(fields["redirect_uri"], session.redirect.as_str());
+        assert_eq!(fields["state"], *session.state);
+        assert_eq!(fields["code_challenge"], pkce_challenge(&session.verifier));
+        for key in [
+            "code",
+            "code_verifier",
+            "access_token",
+            "refresh_token",
+            "client_secret",
+        ] {
+            assert!(!fields.contains_key(key));
+        }
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock")
+            .as_millis();
+        let expiry = u128::from(public.expires_at_unix_ms.expect("known clock expiry"));
+        assert!(expiry > now_ms && expiry <= now_ms + 5000);
+        let address = session.listener.local_addr().expect("callback address");
+        let mut stream = TcpStream::connect(address).await.expect("owner callback");
+        stream.write_all(format!("GET /oauth2callback?state={}&code=FAKE-owner-code HTTP/1.1\r\nHost: {address}\r\n\r\n", fields["state"]).as_bytes()).await.expect("callback frame");
+        let mut reply = Vec::new();
+        stream
+            .read_to_end(&mut reply)
+            .await
+            .expect("callback response");
+        assert!(!String::from_utf8_lossy(&reply).contains("FAKE-owner-code"));
+    };
+    let (result, ()) = tokio::join!(receive, owner);
+    assert!(matches!(result, Ok(ref code) if code.as_str() == "FAKE-owner-code"));
+    assert!(!*active.lock().expect("invalidated after callback"));
+    assert!(url_rx.borrow().is_none());
+}
+
+#[tokio::test]
+async fn automatic_mode_still_opens_browser_and_uses_same_callback() {
+    let session = BrowserSession::bind().await.expect("session");
+    let (_cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+    let mut fixture = None;
+    let result = receive_authorization_code(
+        &session,
+        None,
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        &mut cancel_rx,
+        |url| {
+            assert_eq!(
+                url,
+                session.authorization_url().expect("actual URL").as_str()
+            );
+            let (browser, owned) = opener_fixture(&session, "callback");
+            fixture = Some(owned);
+            Ok(browser)
+        },
+    )
+    .await;
+    assert!(fixture.is_some(), "default mode invoked the opener");
+    assert!(matches!(result, Ok(ref code) if code.as_str() == "FAKE-opened"));
+    drop(fixture);
+}
+
+#[tokio::test]
+async fn caller_managed_url_invalidates_on_cancel_and_whole_flow_deadline() {
+    use std::sync::{Arc, Mutex};
+    for timeout in [false, true] {
+        let active = Arc::new(Mutex::new(false));
+        let track = Arc::clone(&active);
+        let (published, mut published_rx) = tokio::sync::watch::channel(false);
+        let handoff = LoginUrlHandoff::new(move |authorization| {
+            *track.lock().expect("active") = authorization.is_some();
+            published.send_replace(authorization.is_some());
+            true
+        });
+        let session = BrowserSession::bind().await.expect("session");
+        let (cancel_tx, mut cancel_rx) = tokio::sync::watch::channel(false);
+        let flow = oauth_login_with_deadline(Duration::from_millis(100), |deadline| async move {
+            receive_authorization_code(&session, Some(&handoff), deadline, &mut cancel_rx, |_| {
+                panic!("caller-managed mode must not open a browser")
+            })
+            .await
+            .map(|_| ())
+        });
+        let owner = async {
+            published_rx.changed().await.expect("URL publication");
+            assert!(*published_rx.borrow());
+            if !timeout {
+                cancel_tx.send(true).expect("cancel");
+            }
+        };
+        let (result, ()) = tokio::join!(flow, owner);
+        assert!(matches!(result, Err(OAuthLoginRunError::Cancelled)));
+        assert!(!*active.lock().expect("terminal invalidation"));
+    }
 }

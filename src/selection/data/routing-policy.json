@@ -1,0 +1,195 @@
+{
+  "schema_version": 1,
+  "policy_id": "standard-routing-v1",
+  "unknown_access_policy": "unknown_access_for_productive_attempt",
+  "tree": {
+    "coordinated_complexity_min": 5000,
+    "coordinated_risk_min": 5000,
+    "coordinated_horizon_min": 5000,
+    "coordinated_context_tokens_min": 32000,
+    "coordinated_scope_paths_min": 2,
+    "min_independent_groups": 2,
+    "max_workers": 8,
+    "max_depth": 4
+  },
+  "default_role": {
+    "preferred_effort": null,
+    "minimum_effort": null,
+    "require_measured_quality": false,
+    "minimum_quality_basis_points": 6000,
+    "minimum_samples": 1
+  },
+  "role_preferences": {},
+  "task_estimation": {
+    "max_declaration_bytes": 262144,
+    "max_fragments": 256,
+    "max_assignments": 256,
+    "max_scope_items": 2048,
+    "max_rules": 64,
+    "score_cap_basis_points": 10000,
+    "complexity": {
+      "base": 500,
+      "per_declared_kib": 100,
+      "per_fragment": 400,
+      "per_assignment": 600,
+      "per_scope_path": 150,
+      "per_scope_module": 450,
+      "per_dependency_edge": 700
+    },
+    "risk": {
+      "base": 500,
+      "per_declared_kib": 0,
+      "per_fragment": 0,
+      "per_assignment": 0,
+      "per_scope_path": 40,
+      "per_scope_module": 100,
+      "per_dependency_edge": 150
+    },
+    "horizon": {
+      "base": 500,
+      "per_declared_kib": 100,
+      "per_fragment": 350,
+      "per_assignment": 650,
+      "per_scope_path": 80,
+      "per_scope_module": 150,
+      "per_dependency_edge": 400
+    },
+    "rules": [
+      {
+        "id": "declared-deletion",
+        "match_kind": "declared_task_contains_ascii_insensitive",
+        "pattern": "delete",
+        "complexity_basis_points": 0,
+        "risk_basis_points": 6000,
+        "horizon_basis_points": 0
+      },
+      {
+        "id": "declared-migration",
+        "match_kind": "declared_task_contains_ascii_insensitive",
+        "pattern": "migration",
+        "complexity_basis_points": 1500,
+        "risk_basis_points": 3000,
+        "horizon_basis_points": 2000
+      },
+      {
+        "id": "declared-deployment",
+        "match_kind": "declared_task_contains_ascii_insensitive",
+        "pattern": "deploy",
+        "complexity_basis_points": 500,
+        "risk_basis_points": 2500,
+        "horizon_basis_points": 1000
+      },
+      {
+        "id": "declared-multi-stage",
+        "match_kind": "declared_task_contains_ascii_insensitive",
+        "pattern": "multi-stage",
+        "complexity_basis_points": 1000,
+        "risk_basis_points": 0,
+        "horizon_basis_points": 3500
+      },
+      {
+        "id": "declared-long-running",
+        "match_kind": "declared_task_contains_ascii_insensitive",
+        "pattern": "long-running",
+        "complexity_basis_points": 0,
+        "risk_basis_points": 0,
+        "horizon_basis_points": 4500
+      },
+      {
+        "id": "declared-authentication-scope",
+        "match_kind": "scope_path_prefix",
+        "pattern": "src/account_authority",
+        "complexity_basis_points": 500,
+        "risk_basis_points": 3500,
+        "horizon_basis_points": 0
+      }
+    ],
+    "context": {
+      "bytes_per_estimated_token": 4,
+      "base_tokens": 512,
+      "per_scope_path_tokens": 512,
+      "per_scope_module_tokens": 256,
+      "per_assignment_tokens": 512,
+      "max_estimated_tokens": 4000000
+    },
+    "risk_bands": [
+      {
+        "max_inclusive": 2499,
+        "value": "low"
+      },
+      {
+        "max_inclusive": 4999,
+        "value": "medium"
+      },
+      {
+        "max_inclusive": 7499,
+        "value": "high"
+      },
+      {
+        "max_inclusive": 10000,
+        "value": "critical"
+      }
+    ],
+    "horizon_bands": [
+      {
+        "max_inclusive": 2499,
+        "value": "short"
+      },
+      {
+        "max_inclusive": 5999,
+        "value": "medium"
+      },
+      {
+        "max_inclusive": 10000,
+        "value": "long"
+      }
+    ],
+    "context_bands": [
+      {
+        "max_inclusive": 8192,
+        "value": "small"
+      },
+      {
+        "max_inclusive": 32000,
+        "value": "medium"
+      },
+      {
+        "max_inclusive": 128000,
+        "value": "large"
+      },
+      {
+        "max_inclusive": 4000000,
+        "value": "long"
+      }
+    ],
+    "boundedness_bands": [
+      {
+        "max_scope_paths": 1,
+        "max_scope_modules": 1,
+        "max_dependency_edges": 0,
+        "max_complexity": 2499,
+        "value": "tightly_bounded"
+      },
+      {
+        "max_scope_paths": 8,
+        "max_scope_modules": 4,
+        "max_dependency_edges": 4,
+        "max_complexity": 5499,
+        "value": "bounded"
+      },
+      {
+        "max_scope_paths": 2048,
+        "max_scope_modules": 2048,
+        "max_dependency_edges": 2048,
+        "max_complexity": 10000,
+        "value": "cross_cutting"
+      }
+    ]
+  },
+  "objective": {
+    "accepted_cycle_cost_weight": 1,
+    "rejected_attempt_weight": 1,
+    "effort_distance_weight": 1,
+    "unknown_evidence_penalty": 1000000
+  }
+}

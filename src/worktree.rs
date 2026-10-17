@@ -149,21 +149,23 @@ const WORKTREE_STATUS_SCAVENGE_LIMITS: PrivateDirectoryScavengeLimits =
         max_directories: 64,
         max_tree_entries: 65_536,
         max_total_bytes: 64 * 1024 * 1024,
-        max_duration: Duration::from_secs(10),
+        // WSL durable directory operations can stall behind unrelated disk
+        // writes even at low CPU load. Keep a finite recovery window with
+        // headroom beyond the former ten-second scavenging cap.
+        max_duration: Duration::from_secs(30),
     };
 const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 // Authenticated registry mutation can exceed the generic state-lock budget on
 // local NTFS. Checkout runs outside this flock under the incarnation create
 // lease; the 60-second budget stays the bound for registry commits only.
 const MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
-#[cfg(not(test))]
-const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
-// Full library suites share the finite systemd containment slots with other
-// process-runner tests. Preserve the production cap while allowing that
-// bounded slot wait to complete inside the larger test-only status budget.
-#[cfg(test)]
-const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
-const WORKTREE_GC_STATUS_TIMEOUT: Duration = Duration::from_secs(30);
+// Verified Git commands can spend 30 seconds acquiring a containment slot
+// before the three-second start-gate handshakes. Include setup headroom in the
+// command cap on loaded hosts; the caller's absolute deadline still wins.
+const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(40);
+// Leave room for private filesystem staging and the remaining Git commands
+// after one slow containment setup. Final runtime cleanup is separately bound.
+const WORKTREE_GC_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_WORKTREE_GC_SIZE_ENTRIES: usize = 500_000;
 const MAX_WORKTREE_GC_SIZE_TOTAL_PATH_BYTES: usize = 256 * 1024 * 1024;
 const WORKTREE_GC_SIZE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -185,9 +187,12 @@ const WORKTREE_GC_PROC_SCAN_TIMEOUT: Duration = Duration::from_secs(10);
 // Queueing behind another caller in this process is not subprocess or private
 // runtime work, so it must not spend the bounded Git execution budget. Once a
 // caller is admitted, the deadline covers the global runtime lock, startup
-// scavenging, repository/index capture, private Git setup, Git commands, and
-// resumable cleanup. Individual Git commands remain bounded by this same
-// absolute deadline and the per-command cap.
+// scavenging, repository/index capture, private Git setup, and Git commands.
+// Final resumable cleanup gets a separate WORKTREE_STATUS_SCAVENGE_LIMITS
+// budget while the lock stays held, even when the main deadline expires. Thus
+// an admitted call may take its main timeout plus that finite cleanup budget
+// (in addition to any process-runner containment teardown grace).
+// Individual Git commands obey the main deadline and the per-command cap.
 #[cfg(test)]
 const WORKTREE_STATUS_TIMEOUT: Duration = Duration::from_secs(60);
 const REMOVAL_LOCK_REASON: &str = "MACO removal quarantine; child process must be stopped";

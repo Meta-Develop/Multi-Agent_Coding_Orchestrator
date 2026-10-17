@@ -231,7 +231,7 @@ fn launched_child_receives_exact_derived_home_and_absolute_cwd() {
     fs::write(
         &script,
         format!(
-            "#!/bin/sh\nprintf '%s\\n%s\\n%s\\n' \"$GROK_HOME\" \"${{GROK_AUTH_PATH+x}}\" \"$PWD\" > '{}'\n",
+            "#!/bin/sh\ntest \"$#\" = 1 && test \"$1\" = --no-auto-update || exit 7\nprintf '%s\\n%s\\n%s\\n' \"$GROK_HOME\" \"${{GROK_AUTH_PATH+x}}\" \"$PWD\" > '{}'\n",
             output.display()
         ),
     )

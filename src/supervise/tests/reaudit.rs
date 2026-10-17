@@ -31,6 +31,186 @@ fn reaudit_source_child_report(assignment: &OrchestratorAssignment) -> Orchestra
     direct_worker_report_envelope(worker)
 }
 
+fn run_loaded_reaudit_source_with_selected_fixture(
+    mut loaded: LoadedSupervisorPlan,
+    options: SupervisorRunOptions,
+    owner: &tempfile::TempDir,
+    runner: &mut (dyn FnMut(&ExternalAgentCommand, bool) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        if loaded.plan_metadata.evidence_only_reaudit.is_some()
+            || !loaded.plan.role_models.is_empty()
+            || serde_json::to_value(&loaded.plan.review_lenses)?
+                != serde_json::to_value(single_parent_acceptance_review_lenses())?
+        {
+            bail!("selected re-audit source fixture requires its original default parent contract");
+        }
+        let mut document = serde_json::to_value(&loaded.plan)?;
+        {
+            // Add only the parser-validated assessment and frozen policy to the
+            // actual loaded metadata; budget, schedule and assignment data stay.
+            let _assessment = bind_assessed_injected_plan(
+                &loaded.plan,
+                &options.repo,
+                &mut loaded.plan_metadata,
+            )?;
+            document["resolved_routing_policy"] =
+                serde_json::to_value(&loaded.plan_metadata.resolved_routing_policy)?;
+            document["task_routing_assessment"] =
+                serde_json::to_value(&loaded.plan_metadata.task_routing_assessment)?;
+        }
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &options.repo,
+                &mut document,
+                owner,
+            )?;
+        loaded.plan = serde_json::from_value(document)?;
+        let catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+        // Source artifacts snapshot the requested assignment, before scheduler
+        // resolution. Resolve only its runtime through authentic selection now,
+        // so the later exact historical subject comparison sees the same executor.
+        // Leave default role models and all loaded metadata unchanged; dispatch
+        // independently re-evaluates selection and freezes its own actual RunId.
+        let mut selected_plan = loaded.plan.clone();
+        let admission = SupervisorAdmissionPolicyInput::resolve(
+            &options.repo,
+            1,
+            loaded.plan_metadata.admission,
+            options.admission_overrides,
+        )?;
+        let objective = match &loaded.plan_metadata.resolved_objective_profile {
+            Some(profile) => profile.clone(),
+            None => resolve_objective_profile(
+                &options.repo,
+                loaded.plan_metadata.objective_profile.as_deref(),
+            )?,
+        };
+        let accounts =
+            super::super::scheduler::account_observations_for_selection(options.runtime, None)?;
+        let selection =
+            super::super::selection_bridge::initialize_supervisor_selection_with_assessment(
+                &mut selected_plan,
+                options.runtime,
+                &catalog,
+                &admission,
+                &super::super::selection_bridge::AdvertisedCatalogSet::empty(),
+                Some(&objective),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                &accounts,
+                loaded.plan_metadata.task_routing_assessment.as_ref(),
+            )?;
+        if let Some(failure) = selection.selection_preflight_failure {
+            bail!(
+                "re-audit source runtime selection refused: {}",
+                failure.message
+            );
+        }
+        super::super::selection_bridge::bind_selected_assignment_runtimes(
+            &mut loaded.plan,
+            &selection.decisions,
+        )?;
+        if loaded
+            .plan
+            .assignments
+            .first()
+            .is_some_and(|assignment| assignment.role == AgentRole::Worker)
+        {
+            // The existing ordinary fixture admits explicit terminal Workers.
+            // Release the bootstrap observer before installing its owned observer;
+            // the actual source run then selects and freezes its own account again.
+            drop(parent_acceptance);
+            let policy = crate::selection::routing_policy::bind_routing_policy(
+                loaded.plan_metadata.resolved_routing_policy.clone(),
+            )?;
+            let RuntimeModelCatalog::Codex(catalog) = catalog else {
+                bail!("selected direct-worker re-audit source requires its actual Codex catalog");
+            };
+            let _fixture = super::super::scheduler::install_selected_concurrent_fixture(
+                &loaded.plan,
+                &options,
+                &catalog,
+                loaded.plan_metadata.clone(),
+                owner,
+                policy,
+            )?;
+            run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+        } else {
+            let _fixture = super::super::scheduler::bind_selected_licensed_source_fixture(
+                &loaded.plan,
+                &options,
+                &catalog,
+                loaded.plan_metadata.clone(),
+                &parent_acceptance,
+            )?;
+            run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (&mut loaded, owner);
+        run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+    }
+}
+
+fn run_loaded_evidence_only_reaudit_with_selected_fixture(
+    loaded: LoadedSupervisorPlan,
+    options: SupervisorRunOptions,
+    owner: &tempfile::TempDir,
+    runner: &mut (dyn FnMut(&ExternalAgentCommand, bool) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .context("evidence-only fixture historical frozen policy")?;
+        let mut current_metadata = SupervisorPlanMetadata::default();
+        let mut current_document = serde_json::to_value(&loaded.plan)?;
+        {
+            let _historical_policy =
+                crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+            // Assess this task and actual scope in a separate parser document.
+            // Never replace the authenticated historical assessment/operation.
+            let _assessment =
+                bind_assessed_injected_plan(&loaded.plan, &options.repo, &mut current_metadata)?;
+            if current_metadata.resolved_routing_policy.as_ref() != Some(frozen) {
+                bail!("evidence-only fixture current policy differs from its historical frozen policy");
+            }
+            current_document["resolved_routing_policy"] = serde_json::to_value(frozen)?;
+            current_document["task_routing_assessment"] =
+                serde_json::to_value(&current_metadata.task_routing_assessment)?;
+        }
+        // Bootstrap owns only the real current account/policy. Its temporary
+        // selected lens is not copied over the source's executable review contract.
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &options.repo,
+                &mut current_document,
+                owner,
+            )?;
+        let catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
+        let _fixture = super::super::scheduler::bind_selected_evidence_only_reaudit_fixture(
+            &loaded,
+            &options,
+            &catalog,
+            current_metadata
+                .task_routing_assessment
+                .context("evidence-only fixture current parsed assessment")?,
+            &parent_acceptance,
+        )?;
+        run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner;
+        run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+    }
+}
+
 fn run_evidence_rejected_source_with_assignment(
     temp: &tempfile::TempDir,
     repo: &Path,
@@ -118,8 +298,9 @@ fn run_evidence_rejected_source_with_assignment(
             ..SupervisorPlanMetadata::default()
         },
     };
-    let report = run_loaded_supervisor_plan_with_runner(loaded, options, &mut runner)
-        .expect("run typed parent-auditor rejection source");
+    let report =
+        run_loaded_reaudit_source_with_selected_fixture(loaded, options, temp, &mut runner)
+            .expect("run typed parent-auditor rejection source");
     (
         report,
         assignment,
@@ -151,7 +332,15 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
     } else {
         injected_assignment(true)
     };
-    let source_id = RunId::new("reaudit-source-evidence").expect("valid source run id");
+    // Each variant binds its own process-wide run id. The two tests run together.
+    let variant = if generated_direct {
+        "generated-direct"
+    } else {
+        "injected"
+    };
+    let source_id =
+        RunId::new(format!("reaudit-source-evidence-{variant}")).expect("valid source run id");
+    let destination_run_id = format!("reaudit-accepts-preserved-{variant}");
     let (source, assignment, preserved_worktree) = run_evidence_rejected_source_with_assignment(
         &temp,
         &repo,
@@ -208,7 +397,7 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         .expect("evidence-only operation");
     assert_eq!(operation.preserved_candidate_binding, source_binding);
     assert_eq!(loaded.plan.assignments[0].role, assignment.role);
-    let options = injected_options(&repo, temp.path(), "reaudit-accepts-preserved");
+    let options = injected_options(&repo, temp.path(), &destination_run_id);
     let mut evidence_dispatches = 0usize;
     let mut auditor_dispatches = 0usize;
     let mut evidence_pre_action_review = false;
@@ -273,8 +462,9 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         }
         injected_verified_run(command)
     };
-    let report = run_loaded_supervisor_plan_with_runner(loaded, options, &mut runner)
-        .expect("run evidence-only re-audit");
+    let report =
+        run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)
+            .expect("run evidence-only re-audit");
 
     assert!(report.success, "unexpected re-audit failure: {report:#?}");
     assert_eq!(report.orchestrator_reports[0].role, assignment.role);
@@ -345,7 +535,7 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         "terminal-worker evidence must be preserved rather than regenerated"
     );
     let destination_id =
-        RunId::new("reaudit-accepts-preserved").expect("valid evidence-only destination run id");
+        RunId::new(&destination_run_id).expect("valid evidence-only destination run id");
     let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &destination_id)
         .expect("open authenticated re-audit artifacts");
     let plan_snapshot: Value = serde_json::from_slice(
@@ -436,8 +626,9 @@ fn evidence_only_reaudit_refuses_modified_preserved_tree_before_dispatch() {
         write_injected_assignment_report(command, &assignment);
         injected_verified_run(command)
     };
-    let report = run_loaded_supervisor_plan_with_runner(loaded, options, &mut runner)
-        .expect("complete typed content-binding refusal");
+    let report =
+        run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)
+            .expect("complete typed content-binding refusal");
 
     assert!(!report.success);
     assert_eq!(dispatches, 0, "binding refusal must precede every dispatch");
@@ -562,8 +753,9 @@ fi"#,
         }
         injected_verified_run(command)
     };
-    let report = run_loaded_supervisor_plan_with_runner(loaded, options, &mut runner)
-        .expect("run read-only evidence dispatch");
+    let report =
+        run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)
+            .expect("run read-only evidence dispatch");
 
     assert!(mutation_probe_ran);
     assert!(report.success, "unexpected re-audit refusal: {report:#?}");
@@ -631,8 +823,9 @@ fn ordinary_report_refuses_candidate_mismatch_across_parent_audit() {
         }
         injected_verified_run(command)
     };
-    let report = run_loaded_supervisor_plan_with_runner(loaded, options, &mut runner)
-        .expect("complete ordinary across-audit mismatch refusal");
+    let report =
+        run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)
+            .expect("complete ordinary across-audit mismatch refusal");
 
     assert!(auditor_changed_candidate);
     assert!(!report.success);

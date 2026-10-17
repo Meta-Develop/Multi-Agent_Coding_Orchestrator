@@ -336,8 +336,12 @@ fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
     let (_temp, repo_path) = injected_repository();
     let mut first = injected_named_assignment("grok-first", "README.md");
     first.role = AgentRole::Worker;
+    first.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    first.worker_assignments.clear();
     let mut second = injected_named_assignment("grok-second", "SECOND.md");
     second.role = AgentRole::Worker;
+    second.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    second.worker_assignments.clear();
     let mut plan = injected_multi_plan(vec![first, second], 0);
     let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
     let grok_source = include_bytes!(concat!(
@@ -367,13 +371,21 @@ fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
         source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
     };
 
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &advertised,
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("select roles for repeated Grok assignments");
     bind_selected_assignment_runtimes(&mut plan, &resolution.decisions)
@@ -436,13 +448,21 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
             .expect("default objective binding"),
         source: crate::objective_profile::ObjectiveProfileSource::BuiltIn,
     };
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &AdvertisedCatalogSet::empty(),
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize selector evidence fixture");
     let initial = resolution
@@ -595,10 +615,6 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
 #[test]
 fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     reset_live_switch_cost_session();
-    bind_live_router_config(SupervisorRouterConfig {
-        hysteresis_margin_bp: 2_500,
-        oscillation_alarm_threshold: 1,
-    });
 
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("artifact-live-four-arm").expect("valid run id");
@@ -691,13 +707,27 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     switched.runtime_startup_micros = Some(1_200);
     record_live_invocation(switched).expect("record switched invocation");
 
-    let resolution = initialize_supervisor_selection(
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _routing_policy =
+        crate::supervise::bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+            .expect("assess the actual selection-evidence task");
+    // Parsing the assessed plan binds its default router configuration. Apply
+    // the explicit comparison configuration after that parse.
+    bind_live_router_config(SupervisorRouterConfig {
+        hysteresis_margin_bp: 2_500,
+        oscillation_alarm_threshold: 1,
+    });
+    let resolution = initialize_supervisor_selection_with_assessment(
         &mut plan,
         SupervisorRuntime::Codex,
         &catalog,
         &admission,
         &AdvertisedCatalogSet::empty(),
         Some(&resolved_objective_profile),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &[],
+        metadata.task_routing_assessment.as_ref(),
     )
     .expect("initialize selector evidence fixture");
     let initial = resolution
@@ -1415,7 +1445,7 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
         incoming.path(),
         journal_paths[0].clone(),
     );
-    let fake = deterministic_fake_child_run(
+    let mut fake = deterministic_fake_child_run(
         &command,
         &assignment,
         &AssignmentMetadata::new(),
@@ -1443,12 +1473,23 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
     .expect("decode normalized worker report");
     assert_eq!(normalized, parsed.report);
 
+    let binding = WorkerJournalCommandBinding {
+        executable: PathBuf::from("/parent/provided/maco"),
+        journal: journal_paths[0].clone(),
+        device: 123,
+        inode: 456,
+        cwd: repo_path.clone(),
+    };
+    let mut captures = fake.worker_journal_artifacts().to_vec();
+    captures[0].command_binding = Some(binding.clone());
+    fake.replace_worker_journal_artifacts(captures);
     let journals = import_worker_execution_journals(&mut writer, &assignment, &incoming, &fake)
         .expect("import direct worker journal");
     assert!(matches!(
         journals.get("direct-worker").map(|evidence| &evidence.status),
         Some(WorkerExecutionJournalStatus::Loaded(entries)) if entries.is_empty()
     ));
+    assert_eq!(journals["direct-worker"].command_binding, Some(binding));
     discard_invocation_scratches(&mut writer, &incoming, &capture)
         .expect("discard direct worker scratch fixture");
 
@@ -1577,11 +1618,12 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_concurrent_injected_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run direct Worker Codex schema dispatch");
@@ -1773,7 +1815,8 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
     assert!(!shape_problems.is_empty());
     assert_eq!(invalid.role, AgentRole::Worker);
     assert!(invalid.worker_reports.is_empty());
-    assert_eq!(invalid.status, ReviewStatus::Missing);
+    // The journal gate marks an envelope without its bound worker report as failed.
+    assert_eq!(invalid.status, ReviewStatus::Failed);
     assert!(invalid.rejected);
     let report_relative = Path::new("reports/direct-worker.json");
     let report_path = writer.run_dir().join(report_relative);
@@ -1787,6 +1830,12 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
         &invalid,
     )
     .expect("persist invalid direct worker finalization");
+    assert_eq!(
+        fs::read_dir(writer.run_dir().join("reports"))
+            .expect("read persisted direct worker reports")
+            .count(),
+        1
+    );
     write_final_report(&mut writer, &artifact_test_final_report(&run_id))
         .expect("write final report");
     writer
@@ -1807,7 +1856,7 @@ fn invalid_direct_worker_finalization_persists_one_rejection_report_and_decision
     assert_eq!(persisted.id, assignment.id);
     assert!(!persisted.accepted);
     assert!(persisted.rejected);
-    assert_eq!(persisted.status, ReviewStatus::Missing);
+    assert_eq!(persisted.status, ReviewStatus::Failed);
     assert_eq!(persisted.no_further_delegation, None);
     assert!(persisted.findings.iter().any(|finding| finding
         .message
@@ -1843,6 +1892,7 @@ fn worker_journal_append_writes_a_complete_apply_patch_record() {
         start_timestamp: "2026-08-25T00:00:00Z".to_string(),
         end_timestamp: "2026-08-25T00:00:01Z".to_string(),
         changed_paths: vec![PathBuf::from("src/supervise.rs")],
+        observation: None,
     };
     let mut journal = Vec::new();
 
@@ -1866,6 +1916,7 @@ fn worker_journal_append_rejects_blank_mandatory_fields_before_writing() {
         start_timestamp: "2026-08-25T00:00:00Z".to_string(),
         end_timestamp: "2026-08-25T00:00:01Z".to_string(),
         changed_paths: vec![PathBuf::from("src/supervise.rs")],
+        observation: None,
     };
     let existing = b"existing immutable record\n".to_vec();
 
@@ -3261,6 +3312,12 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let plan = injected_plan(assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation");
     let mut options = injected_options(
         &repo_path,
         temp.path(),
@@ -3298,9 +3355,28 @@ fn verified_run_entry_creates_and_materializes_assignment_worktree() {
         correction_correlation_id: options.run_id.as_str().to_string(),
     });
     let run_id = options.run_id.clone();
+    let mut metadata = SupervisorPlanMetadata::default();
+    let _policy = bind_assessed_injected_plan(&plan, &repo_path, &mut metadata)
+        .expect("assess the actual verified entry task");
+    // The assessed binding copies policy and assessment only. An explicit
+    // schedule is required because the writer always emits assignment_schedule,
+    // and an empty list does not cover the flattened assignment.
+    metadata.assignment_schedule = vec![AssignmentScheduleEntry {
+        assignment_id: assignment.id.clone(),
+        parent_assignment_id: None,
+        depth: MIN_SUPERVISOR_DEPTH,
+        flattened_index: 0,
+    }];
+    let document = supervisor_plan_value(
+        &plan,
+        &SupervisorConsultantPlan::default(),
+        &AssignmentMetadata::new(),
+        &metadata,
+    )
+    .expect("serialize assessed entry plan");
     fs::write(
         &options.plan_file,
-        serde_json::to_vec(&plan).expect("serialize verified supervisor plan"),
+        serde_json::to_vec(&document).expect("serialize verified supervisor plan"),
     )
     .expect("write verified supervisor plan");
 
@@ -4276,22 +4352,7 @@ fn journal_append_failure_does_not_block_fake_run_finalization() {
 
 #[test]
 fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
-    let temp = tempfile::tempdir().expect("temporary repository");
-    let repo = Repository::init(temp.path()).expect("initialize repository");
-    fs::write(temp.path().join("README.md"), "baseline\n").expect("write baseline");
-    let mut index = repo.index().expect("open index");
-    index
-        .add_path(Path::new("README.md"))
-        .expect("stage baseline");
-    index.write().expect("write index");
-    let tree_id = index.write_tree().expect("write tree");
-    let tree = repo.find_tree(tree_id).expect("find tree");
-    let signature =
-        Signature::now("maco test", "maco-test@example.invalid").expect("create signature");
-    repo.commit(Some("HEAD"), &signature, &signature, "baseline", &tree, &[])
-        .expect("commit baseline");
-    drop(tree);
-    drop(repo);
+    let (temp, repo_path) = injected_repository();
 
     let assignment_id = "child-unverified";
     let worker_id = "worker-unverified";
@@ -4307,7 +4368,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
         model_pricing: BTreeMap::new(),
-        review_lenses: default_supervisor_review_lenses(),
+        review_lenses: single_parent_acceptance_review_lenses(),
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
@@ -4340,7 +4401,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         }],
     };
     let options = SupervisorRunOptions {
-        repo: temp.path().to_path_buf(),
+        repo: repo_path.clone(),
         plan_file: temp.path().join("plan.json"),
         run_id: RunId::new("unverified-containment-stops-followups").expect("valid run id"),
         parent_node: None,
@@ -4482,16 +4543,18 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
                 output_last_message: Some(contents),
                 grok_stream_usage_evidence: None,
                 grok_acp_parent_evidence: None,
+                cursor_managed_parent_evidence: None,
                 codex_parent_evidence: None,
             };
             injected_target_attempted(run)
         };
 
-        run_supervisor_plan_with_runner(
+        run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect_err("unverified process quiescence must leave the run unfinalized")
@@ -4515,9 +4578,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         "unverified attempt launched a parent auditor"
     );
     assert!(error.to_string().contains("outstanding scratch"));
-    let run_root = temp
-        .path()
-        .join(".maco/o2/runs/unverified-containment-stops-followups");
+    let run_root = repo_path.join(".maco/o2/runs/unverified-containment-stops-followups");
     assert!(run_root.join("incoming").exists());
     assert!(run_root.join("capture").exists());
     assert!(!run_root.join(ARTIFACT_FINALIZATION_MARKER).exists());
@@ -4707,11 +4768,12 @@ fn injected_runner_retries_structural_report_once_then_runs_parent_auditor() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected retry");

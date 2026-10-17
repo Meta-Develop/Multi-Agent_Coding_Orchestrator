@@ -532,6 +532,630 @@ fn injected_machine_global_retention(
     }
 }
 
+#[cfg(target_os = "linux")]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_plan_with_selected_nested_review_fixture(
+    mut plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    budget: SupervisorBudgetConfig,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    supplied_catalog: Option<RuntimeModelCatalog>,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    use super::model_policy::{ModelCapabilityEvidence, ModelCapabilityPolicy};
+    use super::prior_input::{bind_operator_prior_data, OperatorPriorSnapshot};
+    use std::io::Write;
+
+    if execution_runtime != SupervisorExecutionRuntime::NonpublishableSimulation
+        || options.runtime != SupervisorRuntime::Codex
+        || !options
+            .repo
+            .canonicalize()?
+            .starts_with(owner.path().canonicalize()?)
+    {
+        bail!("nested review fixture requires owned Codex NonpublishableSimulation inputs");
+    }
+    let child = effective_role_model_selection(&plan, AgentRole::ChildOrchestrator);
+    let model = child
+        .model
+        .clone()
+        .context("fixture authored child model")?;
+    let effort = child
+        .reasoning_effort
+        .as_deref()
+        .map(|authored| ReasoningEffort::parse(authored).context("fixture child effort"))
+        .transpose()?;
+    if effort.is_none() {
+        let admitted_missing_child_effort = matches!(plan.review_lenses.len(), 2 | 3)
+            || (plan.review_lenses.len() == 1 && plan.review_lenses[0].id == "parent-acceptance");
+        if !admitted_missing_child_effort {
+            bail!("fixture child effort");
+        }
+    }
+    // A lens contract can identify the existing uniform fixture shape, but it
+    // never supplies the absent child effort. Only assessed selection below does.
+    let uniform_effort = effort.map(ReasoningEffort::as_str).or_else(|| {
+        plan.review_lenses
+            .first()
+            .and_then(|lens| lens.backend.reasoning_effort())
+    });
+    let uniform = plan.review_lenses.len() == 3
+        && uniform_effort.is_some()
+        && plan.review_lenses.iter().all(|lens| {
+            lens.backend.model() == model && lens.backend.reasoning_effort() == uniform_effort
+        });
+    if !uniform {
+        plan.role_models
+            .get_mut(&AgentRole::ChildOrchestrator)
+            .context("fixture child preference")?
+            .reasoning_effort = child.reasoning_effort.clone();
+    }
+    // This is an authored preference only. The bootstrap and final initialization
+    // must independently obtain matching account/policy selector decisions.
+    let auditor = RoleModelSelection {
+        model: Some(model.clone()),
+        reasoning_effort: if uniform {
+            None
+        } else {
+            effort.map(|effort| effort.as_str().to_string())
+        },
+        unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+    };
+    if let Some(authored) = plan.role_models.get(&AgentRole::Auditor) {
+        // Keep an explicit independent Auditor preference. Its model and effective
+        // effort receive synthetic observations below and still pass normal selection.
+        if authored.model.is_none() {
+            bail!("nested review fixture requires an explicit authored Auditor model");
+        }
+    } else {
+        plan.role_models.insert(AgentRole::Auditor, auditor);
+    }
+    let actual_catalog = match supplied_catalog {
+        Some(catalog) => catalog,
+        None => test_runtime_model_catalog(&plan, options.runtime)?,
+    };
+    let RuntimeModelCatalog::Codex(catalog) = &actual_catalog else {
+        bail!("nested review fixture requires its actual supplied Codex catalog");
+    };
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = bind_assessed_injected_plan(&plan, &options.repo, &mut metadata)?;
+    let base = super::selection_bridge::base_selector_priors_with_terminal_worker_economics()?;
+    let baseline = base
+        .models
+        .iter()
+        .find(|row| row.runtime == "codex" && row.model == FRONTIER_PROFILE_MODEL)
+        .cloned()
+        .context("nested review fixture baseline prior")?;
+    let mut profiles = BTreeMap::<String, BTreeSet<String>>::new();
+    // For an absent effort, retain the baseline's full existing prior menu.
+    // Do not add review evidence for an invented child effort.
+    profiles
+        .entry(model.clone())
+        .or_default()
+        .extend(effort.map(|effort| effort.as_str().to_string()));
+    for lens in &plan.review_lenses {
+        profiles
+            .entry(lens.backend.model().to_string())
+            .or_default()
+            .insert(resolve_review_lens_reasoning_effort(lens, None).resolved);
+    }
+    if let Some(auditor) = plan.role_models.get(&AgentRole::Auditor) {
+        profiles
+            .entry(auditor.model.clone().context("fixture Auditor model")?)
+            .or_default()
+            .extend(enforce_role_reasoning_effort_floor(
+                AgentRole::Auditor,
+                auditor.reasoning_effort.clone(),
+            ));
+    }
+    let mut priors = Vec::new();
+    let mut capabilities = Vec::new();
+    for (model, efforts) in profiles {
+        let mut prior = baseline.clone();
+        prior.model = model.clone();
+        prior.source_id = "synthetic-nested-review-profile".to_string();
+        prior.prior_scope = "nonlive nested review fixture only".to_string();
+        prior.limitations.push(
+            "synthetic profile; not measured model evidence or account/launch authority"
+                .to_string(),
+        );
+        // Explicit synthetic eligibility for an authored high-effort review.
+        // Production policy and selector hard gates are not changed by this fixture.
+        for effort in efforts {
+            let effort: crate::selection::ReasoningEffort = serde_json::from_value(json!(effort))?;
+            if !prior
+                .class_fit
+                .iter()
+                .any(|row| row.task_class == "review_gate" && row.effort == effort)
+            {
+                let mut row = baseline
+                    .class_fit
+                    .iter()
+                    .find(|row| row.task_class == "review_gate")
+                    .cloned()
+                    .context("fixture baseline review evidence")?;
+                row.effort = effort;
+                prior
+                    .authority_evidence
+                    .push(crate::selection::AuthorityEvidencePrior {
+                        task_class: row.task_class.clone(),
+                        role: crate::selection::AuthorityRole::ReviewAuditor,
+                        effort,
+                        quality_basis_points: row.quality_basis_points,
+                        sample_size: row.sample_size,
+                    });
+                prior.class_fit.push(row);
+            }
+        }
+        priors.push(prior);
+        capabilities.push(ModelCapabilityEvidence {
+            model,
+            capability: ModelCapabilityClass::CriticalJudgment,
+            eligible: true,
+            evidence: "synthetic fixture only; no account or launch authority".to_string(),
+            as_of: base.published_on.clone(),
+        });
+    }
+    let snapshot = OperatorPriorSnapshot {
+        schema_version: 1,
+        dataset_id: "synthetic-nested-review-prior".to_string(),
+        revision: format!("{}+nested-review-fixture", base.revision),
+        published_on: base.published_on.clone(),
+        models: priors,
+        capability_policy: ModelCapabilityPolicy {
+            id: "synthetic-nested-review-capability".to_string(),
+            version: 1,
+            source: "nonlive nested review fixture only".to_string(),
+            models: capabilities,
+        },
+    };
+    let relative = Path::new("nested-review-fixture-prior.json");
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(options.repo.join(relative))?;
+    file.write_all(&serde_json::to_vec(&snapshot)?)?;
+    drop(file);
+    let _prior = bind_operator_prior_data(&options.repo, relative)?;
+    let effort = match effort {
+        Some(effort) => effort,
+        None => {
+            let frozen = metadata
+                .resolved_routing_policy
+                .as_ref()
+                .context("default fixture frozen policy")?;
+            let assessment = metadata
+                .task_routing_assessment
+                .as_ref()
+                .context("default fixture parsed assessment")?;
+            assessment.validate_for_task(frozen, &plan.task)?;
+            let admission = SupervisorAdmissionPolicyInput::resolve(
+                &options.repo,
+                1,
+                metadata.admission,
+                SupervisorAdmissionConfig::default(),
+            )?;
+            let objective =
+                resolve_objective_profile(&options.repo, metadata.objective_profile.as_deref())?;
+            let history = super::outcome_history::load_frozen_outcome_history(
+                &options.repo,
+                &options.run_id,
+            )?;
+            let _bootstrap_account = super::scheduler::install_licensed_autopilot_account_fixture(
+                owner,
+                &actual_catalog,
+            )?;
+            let _bootstrap_policy =
+                crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+            let mut observation = super::scheduler::account_observation_for_launch_runtime(
+                SupervisorRuntime::Codex,
+                None,
+            )?
+            .context("default fixture selected account observation")?;
+            // Preserve the explicit model preference while selecting the missing
+            // effort from its complete genuine current record. Remove alternatives;
+            // never add access, effort, provenance or selected-account evidence.
+            let observed = observation
+                .models
+                .as_mut()
+                .filter(|category| {
+                    category.outcome
+                        == coding_agent_manager_lib::account_authority::ObservationOutcome::Observed
+                })
+                .and_then(|category| category.content.as_mut())
+                .context("default fixture observed model menu")?;
+            observed.models.retain(|row| row.model_id == model);
+            if observed.models.len() != 1 || !catalog.contains(&model) {
+                bail!("default fixture authored model lacks its unique current catalog record");
+            }
+            let observations = [(SupervisorRuntime::Codex, observation)];
+            let (subject, subject_decision) =
+                super::selection_bridge::select_normal_account_intake_with_assessment(
+                    &plan,
+                    frozen,
+                    &observations,
+                    &admission,
+                    &objective,
+                    Some(&history),
+                    Some(assessment),
+                )?;
+            let subject = subject.context("default fixture subject selection refused")?;
+            let (auditor, auditor_decision) =
+                super::selection_bridge::select_account_review_auditor_with_assessment(
+                    &plan,
+                    frozen,
+                    &observations,
+                    &admission,
+                    &objective,
+                    Some(assessment),
+                )?;
+            let auditor = auditor.context("default fixture Auditor selection refused")?;
+            for (role, selected, decision) in [
+                (AgentRole::ChildOrchestrator, &subject, &subject_decision),
+                (AgentRole::Auditor, &auditor, &auditor_decision),
+            ] {
+                let receipt = decision
+                    .routing_policy
+                    .as_ref()
+                    .context("default fixture selector policy receipt")?;
+                let choice = decision
+                    .choice
+                    .as_ref()
+                    .context("default fixture genuine selected choice")?;
+                selected.validate_binding(&(&observations[0].1.binding).into())?;
+                if decision.status != crate::selection::DecisionStatus::Selected
+                    || selected.candidate() != &choice.candidate
+                    || choice.candidate.runtime != SupervisorRuntime::Codex.as_str()
+                    || choice.candidate.model != model
+                    || receipt.frozen != *frozen
+                    || receipt.role != role.as_str()
+                    || selected.policy_digest != frozen.sha256
+                    || selected.task_features != receipt.features
+                    || decision.operator_prior_data != super::prior_input::current_provenance()
+                    || decision.normalized_input.debug_override.is_some()
+                    || !decision.candidate_set.iter().any(|candidate| {
+                        candidate.candidate == choice.candidate
+                            && candidate.eligible
+                            && candidate.ineligibility_reasons.is_empty()
+                    })
+                {
+                    bail!("default fixture profile differs from its genuine assessed selection");
+                }
+            }
+            let selected_effort = ReasoningEffort::parse(subject.candidate().effort.as_str())
+                .context("default fixture selected child effort")?;
+            // Keep authored Nones for the existing uniform bootstrap only when
+            // both selected profiles and the authored lenses actually match.
+            let uniform_selected_profile = uniform
+                && auditor.candidate().effort == subject.candidate().effort
+                && uniform_effort == Some(auditor.candidate().effort.as_str());
+            if !uniform_selected_profile {
+                // Resolve absent preferences only after genuine normal decisions.
+                // Heterogeneous lens triples are never changed by this bootstrap.
+                for (role, selected) in [
+                    (AgentRole::ChildOrchestrator, &subject),
+                    (AgentRole::Auditor, &auditor),
+                ] {
+                    let preference = plan
+                        .role_models
+                        .get_mut(&role)
+                        .context("default fixture authored role preference")?;
+                    if preference.reasoning_effort.is_some() {
+                        bail!("default fixture must not replace an explicit role effort");
+                    }
+                    preference.reasoning_effort =
+                        Some(selected.candidate().effort.as_str().to_string());
+                }
+            }
+            selected_effort
+        }
+    };
+
+    let _fixture = super::scheduler::install_selected_nested_review_fixture(
+        &plan, &options, catalog, metadata, owner, policy, effort,
+    )?;
+    let mut plan_metadata = SupervisorPlanMetadata {
+        run_budget: budget,
+        ..SupervisorPlanMetadata::default()
+    };
+    super::scheduler::carry_selected_concurrent_fixture_metadata(
+        &plan,
+        &options,
+        &actual_catalog,
+        &mut plan_metadata,
+    )?;
+    let serialized_runner = std::sync::Mutex::new(external_runner);
+    super::run_supervisor_plan_with_runner_and_creation(
+        LoadedSupervisorPlan {
+            plan,
+            consultant,
+            assignment_metadata: AssignmentMetadata::new(),
+            plan_metadata,
+        },
+        options,
+        1,
+        execution_runtime,
+        SupervisorWorktreeCreation::TestOnly,
+        Ok(actual_catalog),
+        &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+            Ok(mut runner) => runner(command),
+            Err(poisoned) => poisoned.into_inner()(command),
+        },
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+#[allow(clippy::too_many_arguments)]
+fn run_supervisor_plan_with_selected_nested_review_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    budget: SupervisorBudgetConfig,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    supplied_catalog: Option<RuntimeModelCatalog>,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    // Match the existing fixture wrapper's unsupported-platform behavior; the
+    // Linux branch always requires its selected-account binding and assessment.
+    let _ = owner;
+    let catalog = match supplied_catalog {
+        Some(catalog) => catalog,
+        None => test_runtime_model_catalog(&plan, options.runtime)?,
+    };
+    run_supervisor_plan_with_budget_catalog_and_runner(
+        plan,
+        consultant,
+        budget,
+        options,
+        execution_runtime,
+        Ok(catalog),
+        external_runner,
+    )
+}
+
+fn run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let SupervisorExecutionRuntime::NonpublishableSimulation = execution_runtime else {
+            bail!("selected default parent-acceptance fixture requires NonpublishableSimulation");
+        };
+        if options.runtime != SupervisorRuntime::Codex
+            || !plan.role_models.is_empty()
+            || serde_json::to_value(&plan.review_lenses)?
+                != serde_json::to_value(single_parent_acceptance_review_lenses())?
+        {
+            bail!("selected default parent-acceptance fixture requires its default Codex input contract");
+        }
+        let mut document = serde_json::to_value(&plan)?;
+        let mut metadata = SupervisorPlanMetadata::default();
+        {
+            // Retain the parsed assessment, then restore this temporary policy
+            // before creating the guard that owns the account and frozen policy.
+            let _assessment = bind_assessed_injected_plan(&plan, &options.repo, &mut metadata)?;
+            document["resolved_routing_policy"] =
+                serde_json::to_value(&metadata.resolved_routing_policy)?;
+            document["task_routing_assessment"] =
+                serde_json::to_value(&metadata.task_routing_assessment)?;
+        }
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &options.repo,
+                &mut document,
+                owner,
+            )?;
+        let plan: SupervisorPlan = serde_json::from_value(document)?;
+        let catalog = test_runtime_model_catalog(&plan, options.runtime)?;
+        // This existing binder admits bounded nested workers and carries the
+        // assessment into normal selection for this exact run and repository.
+        let _selected_source = super::scheduler::bind_selected_licensed_source_fixture(
+            &plan,
+            &options,
+            &catalog,
+            metadata,
+            &parent_acceptance,
+        )?;
+        let serialized_runner = std::sync::Mutex::new(external_runner);
+        super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            consultant,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner;
+        run_supervisor_plan_with_runner(
+            plan,
+            consultant,
+            options,
+            execution_runtime,
+            external_runner,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn selected_concurrent_injected_fixture<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+) -> Result<super::scheduler::SelectedConcurrentFixtureGuard<'a>> {
+    let RuntimeModelCatalog::Codex(catalog) = test_runtime_model_catalog(plan, options.runtime)?
+    else {
+        bail!("selected concurrent fixture requires an actual supplied Codex catalog");
+    };
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
+    super::scheduler::install_selected_concurrent_fixture(
+        plan, options, &catalog, metadata, owner, policy,
+    )
+}
+
+fn run_supervisor_plan_with_selected_concurrent_injected_fixture(
+    plan: SupervisorPlan,
+    consultant: SupervisorConsultantPlan,
+    options: SupervisorRunOptions,
+    execution_runtime: SupervisorExecutionRuntime,
+    owner: &tempfile::TempDir,
+    external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
+) -> Result<SupervisorFinalReport> {
+    #[cfg(target_os = "linux")]
+    {
+        let SupervisorExecutionRuntime::NonpublishableSimulation = execution_runtime else {
+            bail!("selected concurrent injected fixture helper requires NonpublishableSimulation");
+        };
+        let _fixture = selected_concurrent_injected_fixture(&plan, &options, owner)?;
+        let serialized_runner = std::sync::Mutex::new(external_runner);
+        super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            consultant,
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = owner;
+        run_supervisor_plan_with_runner(
+            plan,
+            consultant,
+            options,
+            execution_runtime,
+            external_runner,
+        )
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn selected_concurrent_parent_custody<'a>(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    owner: &'a tempfile::TempDir,
+    ready: &Path,
+) -> Result<super::scheduler::ParentConcurrentFixtureCustody<'a>> {
+    let RuntimeModelCatalog::Codex(_catalog) = test_runtime_model_catalog(plan, options.runtime)?
+    else {
+        bail!("inherited concurrent fixture requires an actual supplied Codex catalog");
+    };
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
+    // tempfile 3.27.0 only applies a directory mode when Builder::permissions is
+    // Some; the default TempDir may remain Managed-legal while custody create
+    // requires an owner-private root. Pin only this creator-owned fixture.
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let path = owner.path();
+        let before = fs::symlink_metadata(path)?;
+        if !before.is_dir() || before.file_type().is_symlink() {
+            bail!("inherited concurrent fixture owner is not a non-symlink directory");
+        }
+        // SAFETY: geteuid reads only the calling process's effective UID.
+        if before.uid() != unsafe { libc::geteuid() } {
+            bail!("inherited concurrent fixture owner is not owned by the current euid");
+        }
+        let mut permissions = before.permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(path, permissions)?;
+        let after = fs::symlink_metadata(path)?;
+        if !after.is_dir()
+            || after.file_type().is_symlink()
+            || after.uid() != unsafe { libc::geteuid() }
+            || after.mode() & 0o077 != 0
+            || after.dev() != before.dev()
+            || after.ino() != before.ino()
+        {
+            bail!("inherited concurrent fixture owner did not remain the pinned private directory");
+        }
+    }
+    super::scheduler::ParentConcurrentFixtureCustody::create(
+        plan, options, &metadata, owner, ready, policy,
+    )
+}
+
+#[cfg(target_os = "linux")]
+struct InheritedSelectedConcurrentFixture {
+    custody: super::scheduler::InheritedConcurrentFixtureRoot,
+    registry_owner: tempfile::TempDir,
+    catalog: CodexRuntimeModelCatalog,
+    metadata: Option<SupervisorPlanMetadata>,
+    policy: Option<crate::selection::routing_policy::RoutingPolicyGuard>,
+}
+
+#[cfg(target_os = "linux")]
+fn selected_concurrent_inherited_fixture(
+    plan: &SupervisorPlan,
+    options: &SupervisorRunOptions,
+    root: &Path,
+    ready: &Path,
+    witness: &Path,
+) -> Result<InheritedSelectedConcurrentFixture> {
+    let RuntimeModelCatalog::Codex(catalog) = test_runtime_model_catalog(plan, options.runtime)?
+    else {
+        bail!("inherited concurrent fixture requires an actual supplied Codex catalog");
+    };
+    let mut metadata = SupervisorPlanMetadata::default();
+    let policy = bind_assessed_injected_plan(plan, &options.repo, &mut metadata)?;
+    let custody = super::scheduler::InheritedConcurrentFixtureRoot::open(
+        plan, options, &metadata, root, ready, witness,
+    )?;
+    // Only a fresh registry subdirectory is child-owned, never the inherited root.
+    // Parent TempDir cleanup also covers the intentional SIGKILL before child Drop.
+    let registry_owner = tempfile::tempdir_in(root)?;
+    Ok(InheritedSelectedConcurrentFixture {
+        custody,
+        registry_owner,
+        catalog,
+        metadata: Some(metadata),
+        policy: Some(policy),
+    })
+}
+
+#[cfg(target_os = "linux")]
+impl InheritedSelectedConcurrentFixture {
+    fn install(
+        &mut self,
+        plan: &SupervisorPlan,
+        options: &SupervisorRunOptions,
+    ) -> Result<super::scheduler::SelectedConcurrentFixtureGuard<'_>> {
+        let metadata = self
+            .metadata
+            .take()
+            .context("inherited fixture metadata already consumed")?;
+        let policy = self
+            .policy
+            .take()
+            .context("inherited fixture policy already consumed")?;
+        super::scheduler::install_selected_inherited_concurrent_fixture(
+            plan,
+            options,
+            &self.catalog,
+            metadata,
+            &self.registry_owner,
+            policy,
+            &self.custody,
+        )
+    }
+}
+
 fn injected_options(repo: &Path, root: &Path, run_id: &str) -> SupervisorRunOptions {
     SupervisorRunOptions {
         repo: repo.to_path_buf(),
@@ -767,6 +1391,7 @@ fn injected_worker_journal_evidence(
             evidence_relative_path: worker_execution_journal_evidence_relative(
                 "child-a", "worker-a",
             ),
+            command_binding: None,
             status,
         },
     )])
@@ -779,6 +1404,7 @@ fn injected_journal_entry(changed_paths: Vec<PathBuf>) -> WorkerExecutionJournal
         start_timestamp: "2026-01-01T00:00:00Z".to_string(),
         end_timestamp: "2026-01-01T00:00:01Z".to_string(),
         changed_paths,
+        observation: None,
     }
 }
 
@@ -849,6 +1475,7 @@ pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalA
         .map(|artifact| WorkerJournalArtifactCapture {
             worker_id: artifact.worker_id.clone(),
             path: artifact.path.clone(),
+            command_binding: None,
             status: match fs::read(&artifact.path) {
                 Ok(bytes) => WorkerJournalArtifactCaptureStatus::Loaded(bytes),
                 Err(error) => WorkerJournalArtifactCaptureStatus::Invalid(format!(
@@ -859,6 +1486,50 @@ pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalA
         .collect();
     run.replace_worker_journal_artifacts(captures);
     run
+}
+
+// Opt-in synthetic parent capture for explicitly priced, single-turn fixtures.
+// The generic injected runner deliberately retains no observed model identity.
+fn retain_priced_single_turn_fixture(
+    run: &mut ExternalAgentRun,
+    command: &ExternalAgentCommand,
+    observed_model: &str,
+    complete_capture: &[u8],
+) {
+    use crate::external_agent::{
+        CodexParentEvidence, CodexParentResolvedField as Field, CodexParentTurnUsage,
+    };
+    assert_eq!(command.model.as_deref(), Some(observed_model));
+    assert!(!run.stdout.raw_capture_truncated());
+    let usage = codex_usage_from_jsonl(complete_capture)
+        .expect("valid complete priced fixture capture")
+        .expect("priced fixture has observed usage");
+    let completed_turns = complete_capture
+        .split(|byte| *byte == b'\n')
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .filter(|event| event.get("type").and_then(Value::as_str) == Some("turn.completed"))
+        .count();
+    assert_eq!(completed_turns, 1, "single-turn fixture required");
+    run.codex_parent_evidence = Some(CodexParentEvidence {
+        codex_version: Some("0.144.4".to_string()),
+        thread_id: Some("priced-fixture-thread".to_string()),
+        requested_model: command.model.clone(),
+        requested_effort: command.reasoning_effort.clone(),
+        rollout_model: Field::Known(observed_model.to_string()),
+        rollout_effort: Field::Unknown,
+        observed_model: Field::Known(observed_model.to_string()),
+        observed_effort: Field::Unknown,
+        server_rerouted_model: None,
+        model_mismatch: false,
+        turn_usage: CodexParentTurnUsage::Known {
+            input_tokens: u64::try_from(usage.input_tokens).expect("fixture input count fits"),
+            output_tokens: u64::try_from(usage.output_tokens).expect("fixture output count fits"),
+            cached_input_tokens: 0,
+            reasoning_output_tokens: 0,
+        },
+        resolution_status: "complete".to_string(),
+    });
+    run.retain_cli_parent_evidence_for_test(complete_capture);
 }
 
 fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
@@ -981,6 +1652,7 @@ fn injected_verified_run_without_journals(command: &ExternalAgentCommand) -> Ext
         output_last_message: fs::read(&command.output_last_message).ok(),
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
+        cursor_managed_parent_evidence: None,
         codex_parent_evidence: None,
     }
 }
@@ -1050,6 +1722,7 @@ fn injected_worker_journal_entries(worker: &WorkerReport) -> Vec<WorkerExecution
             start_timestamp: "2026-01-01T00:00:00Z".to_string(),
             end_timestamp: "2026-01-01T00:00:01Z".to_string(),
             changed_paths: worker.files_changed.clone(),
+            observation: None,
         })
         .collect()
 }
@@ -1196,6 +1869,20 @@ fn assert_parseable_partial_usage_is_conservative(
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    let existing_effort = plan
+        .review_lenses
+        .first()
+        .expect("partial-usage fixture parent lens")
+        .backend
+        .reasoning_effort()
+        .expect("partial-usage fixture parent-lens effort")
+        .to_string();
+    for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
+        plan.role_models
+            .get_mut(&role)
+            .expect("partial-usage priced process role")
+            .reasoning_effort = Some(existing_effort.clone());
+    }
     let budget = injected_run_budget(None, Some(200), None, Some(1.0), 50, 50);
     let options = injected_options(&repo_path, temp.path(), run_id);
     let mut invocations = 0usize;
@@ -1223,12 +1910,14 @@ fn assert_parseable_partial_usage_is_conservative(
         }
     };
 
-    let report = run_supervisor_plan_with_budget_and_runner(
+    let report = run_supervisor_plan_with_selected_nested_review_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         budget,
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        None,
+        &temp,
         &mut runner,
     )
     .expect("finalize partial-usage run");

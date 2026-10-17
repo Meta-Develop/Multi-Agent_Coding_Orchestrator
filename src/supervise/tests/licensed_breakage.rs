@@ -8,12 +8,81 @@ const LICENSED_SIGNATURE_B: &str =
     "error[E0425]: cannot find function crate::api::server_symbol in dependent server";
 
 #[cfg(target_os = "linux")]
+fn persist_assessed_injected_source_plan(
+    plan: &SupervisorPlan,
+    repo: &Path,
+    plan_file: &Path,
+) -> crate::selection::routing_policy::RoutingPolicyGuard {
+    let mut metadata = SupervisorPlanMetadata::default();
+    let routing_policy = bind_assessed_injected_plan(plan, repo, &mut metadata)
+        .expect("bind assessed injected licensed source plan");
+    let mut document = serde_json::to_value(plan).expect("serialize supervisor plan");
+    document["resolved_routing_policy"] = serde_json::to_value(&metadata.resolved_routing_policy)
+        .expect("serialize resolved routing policy");
+    document["task_routing_assessment"] = serde_json::to_value(&metadata.task_routing_assessment)
+        .expect("serialize task routing assessment");
+    fs::write(
+        plan_file,
+        serde_json::to_vec_pretty(&document).expect("serialize supervisor plan"),
+    )
+    .expect("write assessed licensed source plan");
+    routing_policy
+}
+
+#[cfg(target_os = "linux")]
+fn persist_selected_licensed_source_plan<'a>(
+    plan: &SupervisorPlan,
+    repo: &Path,
+    plan_file: &Path,
+    owner: &'a tempfile::TempDir,
+) -> crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a> {
+    let mut metadata = SupervisorPlanMetadata::default();
+    let mut document = serde_json::to_value(plan).expect("serialize licensed source");
+    {
+        let _assessment = bind_assessed_injected_plan(plan, repo, &mut metadata)
+            .expect("assess licensed source task and scope");
+        document["resolved_routing_policy"] = json!(metadata.resolved_routing_policy);
+        document["task_routing_assessment"] = json!(metadata.task_routing_assessment);
+    }
+    let selected = crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+        repo,
+        &mut document,
+        owner,
+    )
+    .expect("select owned licensed source and parent-acceptance profile");
+    fs::write(plan_file, serde_json::to_vec_pretty(&document).unwrap())
+        .expect("persist selected assessed source plan");
+    selected
+}
+
+#[cfg(target_os = "linux")]
+fn reassess_generated_fixture(plan: &mut GeneratedFollowUpSupervisorPlan) {
+    let frozen = plan
+        .resolved_routing_policy
+        .as_ref()
+        .expect("generated fixture policy");
+    plan.task_routing_assessment = Some(
+        GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(
+            &plan.ordinary_plan(),
+            frozen,
+        )
+        .expect("assess the deliberately distinct generated fixture"),
+    );
+}
+
+#[cfg(target_os = "linux")]
 #[test]
 fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispatch() {
     skip_without_containment!();
     let (temp, repo) = injected_repository();
     let assignment = licensed_assignment();
     let plan = injected_plan(assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation for the complete source lifecycle");
     let run_id = RunId::new("inbox-pr-source-generic-resume").expect("bound source run id");
     let plan_file = temp.path().join("inbox-pr-source-plan.json");
     fs::write(
@@ -76,8 +145,11 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
         write_injected_usage(command, 0, 1);
         injected_verified_run(command)
     };
-    let loaded = load_supervisor_plan_file_with_consultant(&plan_file, None)
+    let mut loaded = load_supervisor_plan_file_with_consultant(&plan_file, None)
         .expect("load parent-owned source plan");
+    let _routing_policy =
+        bind_assessed_injected_plan(&loaded.plan, &repo, &mut loaded.plan_metadata)
+            .expect("bind assessed injected licensed source plan");
     let catalog = test_runtime_model_catalog(&loaded.plan, SupervisorRuntime::Codex)
         .expect("fixture runtime catalog");
     let report = run_supervisor_plan_with_runner_and_creation(
@@ -134,8 +206,10 @@ fn inbox_pr_source_marker_refuses_generic_resume_before_follow_up_queue_or_dispa
     );
 }
 
-struct LicensedScenario {
-    _temp: tempfile::TempDir,
+struct LicensedScenario<'a> {
+    _temp: &'a tempfile::TempDir,
+    #[cfg(target_os = "linux")]
+    _parent_acceptance: crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a>,
     repo: PathBuf,
     run_id: RunId,
     report: SupervisorFinalReport,
@@ -609,8 +683,9 @@ fn assert_leased_post_effect_heartbeat(queue: &GeneratedFollowUpQueue, item_id: 
 }
 
 #[cfg(target_os = "linux")]
-struct LicensedFollowUpEnqueueInterruptionFixture {
-    _temp: tempfile::TempDir,
+struct LicensedFollowUpEnqueueInterruptionFixture<'a> {
+    _parent_acceptance: crate::supervise::InjectedSupervisorParentAcceptanceGuard<'a>,
+    _temp: &'a tempfile::TempDir,
     repo: PathBuf,
     options: SupervisorRunOptions,
     source_run_id: RunId,
@@ -622,9 +697,9 @@ struct LicensedFollowUpEnqueueInterruptionFixture {
 }
 
 #[cfg(target_os = "linux")]
-fn licensed_follow_up_enqueue_interruption_runner(
-    fixture: &LicensedFollowUpEnqueueInterruptionFixture,
-) -> impl FnMut(&ExternalAgentCommand) -> ExternalAgentRun + '_ {
+fn licensed_follow_up_enqueue_interruption_runner<'a>(
+    fixture: &'a LicensedFollowUpEnqueueInterruptionFixture<'_>,
+) -> impl FnMut(&ExternalAgentCommand) -> ExternalAgentRun + 'a {
     let source_assignment = &fixture.source_assignment;
     let follow_up_assignment = &fixture.follow_up_assignment;
     let declaration_sha256 = fixture.declaration_sha256.as_str();
@@ -676,13 +751,20 @@ fn licensed_follow_up_enqueue_interruption_runner(
 
 #[cfg(target_os = "linux")]
 fn run_licensed_follow_up_enqueue_interruption_fixture(
-) -> LicensedFollowUpEnqueueInterruptionFixture {
-    let (temp, repo) = injected_repository();
+    temp: &tempfile::TempDir,
+    repo: PathBuf,
+) -> LicensedFollowUpEnqueueInterruptionFixture<'_> {
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
-    let source_run_id =
-        RunId::new("licensed-cascade-enqueue-resume").expect("cascade resume run id");
+    // CAM launch bindings are process-wide and keyed by run id. The enqueue
+    // interruption and stale-lease tests can run concurrently with different
+    // account registries, so each fixture needs its own source execution id.
+    let source_run_id = RunId::new(format!(
+        "licensed-cascade-enqueue-resume-{}",
+        crate::artifacts::state_auth::random_identifier().expect("unique cascade fixture id")
+    ))
+    .expect("cascade resume run id");
     let plan_file = temp.path().join("licensed-cascade-enqueue-resume.json");
     fs::write(
         &plan_file,
@@ -721,7 +803,9 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     });
     let source_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let follow_up_child_dispatches = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let selected = persist_selected_licensed_source_plan(&plan, &repo, &options.plan_file, temp);
     let fixture = LicensedFollowUpEnqueueInterruptionFixture {
+        _parent_acceptance: selected,
         _temp: temp,
         repo,
         options,
@@ -735,8 +819,18 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     let mut runner = licensed_follow_up_enqueue_interruption_runner(&fixture);
 
     set_interrupt_after_follow_up_enqueue();
-    let error = run_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
-        .expect_err("interrupt after durable follow-up enqueue");
+    let error =
+        match run_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner) {
+            Err(error) => error,
+            Ok(outcome) => panic!(
+                "expected interruption after durable follow-up enqueue; source status: {:?}; \
+             generated tasks: {}; source findings: {:#?}; follow-up environment failures: {:#?}",
+                outcome.source_report.status,
+                outcome.source_report.generated_follow_up_tasks.len(),
+                outcome.source_report.findings,
+                outcome.follow_up_environment_failures,
+            ),
+        };
     assert!(format!("{error:#}")
         .contains("injected interruption after durable generated follow-up enqueue"));
     assert_eq!(
@@ -763,18 +857,63 @@ fn run_licensed_follow_up_enqueue_interruption_fixture(
     fixture
 }
 
-fn run_licensed_scenario(
+fn run_licensed_scenario<'a>(
+    owner: &'a tempfile::TempDir,
+    repo: PathBuf,
     assignment: OrchestratorAssignment,
     mut child: OrchestratorReviewReport,
     auditor_accepts_license: bool,
     run_name: &str,
-) -> LicensedScenario {
-    let (temp, repo) = injected_repository();
+) -> LicensedScenario<'a> {
     let plan = injected_plan(assignment.clone(), 0);
     let run_id = RunId::new(run_name).expect("valid licensed scenario run id");
+    let plan_file = owner.path().join(format!("{run_name}.json"));
+    #[cfg(target_os = "linux")]
+    let (plan, parent_acceptance, source_metadata) = {
+        let mut document =
+            serde_json::to_value(&plan).expect("serialize licensed scenario source plan");
+        let mut source_metadata = SupervisorPlanMetadata::default();
+        {
+            // Parse the actual source scope and freeze its policy before bootstrap.
+            // Drop this temporary binding before the retained parent guard is made.
+            let _assessment = bind_assessed_injected_plan(&plan, &repo, &mut source_metadata)
+                .expect("assess licensed scenario source plan");
+            document["resolved_routing_policy"] =
+                serde_json::to_value(&source_metadata.resolved_routing_policy)
+                    .expect("serialize licensed source frozen policy");
+            document["task_routing_assessment"] =
+                serde_json::to_value(&source_metadata.task_routing_assessment)
+                    .expect("serialize licensed source parsed assessment");
+        }
+        let parent_acceptance =
+            crate::supervise::bind_injected_supervisor_parent_acceptance_for_test(
+                &repo,
+                &mut document,
+                owner,
+            )
+            .expect("bind licensed Autopilot parent-acceptance fixture");
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&document)
+                .expect("serialize bound licensed scenario source plan"),
+        )
+        .expect("write bound licensed scenario source plan");
+        let plan: SupervisorPlan = serde_json::from_value(document)
+            .expect("deserialize bound licensed scenario source plan");
+        (plan, parent_acceptance, source_metadata)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let plan = {
+        fs::write(
+            &plan_file,
+            serde_json::to_vec_pretty(&plan).expect("serialize licensed scenario source plan"),
+        )
+        .expect("write licensed scenario source plan");
+        plan
+    };
     let options = SupervisorRunOptions {
         repo: repo.clone(),
-        plan_file: temp.path().join(format!("{run_name}.json")),
+        plan_file,
         run_id: run_id.clone(),
         parent_node: None,
         codex_bin: PathBuf::from("unused-injected-codex"),
@@ -784,7 +923,7 @@ fn run_licensed_scenario(
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
-        machine_global_retention: Some(injected_machine_global_retention(temp.path())),
+        machine_global_retention: Some(injected_machine_global_retention(owner.path())),
     };
     let declaration_sha256 = assignment
         .licensed_breakage
@@ -820,6 +959,33 @@ fn run_licensed_scenario(
         }
         injected_verified_run(command)
     };
+    #[cfg(target_os = "linux")]
+    let report = {
+        let catalog = test_runtime_model_catalog(&plan, options.runtime)
+            .expect("actual licensed source runtime catalog");
+        let _selected_source = super::super::scheduler::bind_selected_licensed_source_fixture(
+            &plan,
+            &options,
+            &catalog,
+            source_metadata,
+            &parent_acceptance,
+        )
+        .expect("bind assessed licensed source to its held selected account");
+        // Serial adaptation only; the original mutable runner and all its gates stay.
+        let serialized_runner = std::sync::Mutex::new(&mut runner);
+        super::super::run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &|command, _cancellation, _review_runtime| match serialized_runner.lock() {
+                Ok(mut runner) => runner(command),
+                Err(poisoned) => poisoned.into_inner()(command),
+            },
+        )
+        .expect("run licensed breakage scenario")
+    };
+    #[cfg(not(target_os = "linux"))]
     let report = run_supervisor_plan_with_runner(
         plan,
         SupervisorConsultantPlan::default(),
@@ -829,7 +995,9 @@ fn run_licensed_scenario(
     )
     .expect("run licensed breakage scenario");
     LicensedScenario {
-        _temp: temp,
+        _temp: owner,
+        #[cfg(target_os = "linux")]
+        _parent_acceptance: parent_acceptance,
         repo,
         run_id,
         report,
@@ -839,9 +1007,17 @@ fn run_licensed_scenario(
 #[test]
 fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-breakage-e2e");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-breakage-e2e",
+    );
 
     assert!(scenario.report.success, "{:#?}", scenario.report.findings);
     assert_eq!(scenario.report.generated_follow_up_tasks.len(), 1);
@@ -913,9 +1089,44 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
 
     assert_eq!(task.supervisor_plan.assignments.len(), 1);
     assert_eq!(task.supervisor_plan.max_child_assignments, 1);
+    let source_plan_file = scenario
+        ._temp
+        .path()
+        .join(format!("{}.json", scenario.run_id.as_str()));
+    let loaded_source =
+        load_supervisor_plan_file_with_consultant(&source_plan_file, Some(&scenario.repo))
+            .expect("load bound licensed source plan written by the selected scenario");
+    let mut expected_lenses = single_parent_acceptance_review_lenses();
+    match (
+        expected_lenses.as_mut_slice(),
+        loaded_source.plan.review_lenses.as_slice(),
+    ) {
+        (
+            [ReviewLensConfig {
+                backend:
+                    ReviewLensBackendConfig::Model {
+                        backend_id: expected_backend_id,
+                        ..
+                    },
+                ..
+            }],
+            [ReviewLensConfig {
+                backend:
+                    ReviewLensBackendConfig::Model {
+                        backend_id: source_backend_id,
+                        ..
+                    },
+                ..
+            }],
+        ) => {
+            *expected_backend_id = source_backend_id.clone();
+        }
+        _ => panic!("bound source plan must keep a single Model parent-acceptance lens"),
+    }
+    assert_eq!(loaded_source.plan.review_lenses, expected_lenses);
     assert_eq!(
         task.supervisor_plan.review_lenses,
-        single_parent_acceptance_review_lenses()
+        loaded_source.plan.review_lenses
     );
     assert_eq!(
         task.supervisor_plan.review_aggregation_policy,
@@ -974,9 +1185,10 @@ fn declared_scoped_breakage_passes_and_journals_dispatchable_follow_up_plan() {
         collected.generated_follow_up_tasks,
         scenario.report.generated_follow_up_tasks
     );
+    assert!(!collected.publishable);
     assert!(collected
         .remaining_risk
-        .contains("separate cascade outcome determines whether dispatch occurred"));
+        .contains("remain deferred and must be regenerated by an accepted publishable run"));
     assert!(supervisor_final_report_schema_value()["properties"]
         .get("generated_follow_up_tasks")
         .is_some());
@@ -1119,9 +1331,12 @@ fn generated_follow_up_plan_inherits_gate_context_and_closes_budget() {
 #[test]
 fn generated_follow_up_real_loader_rejects_stripped_required_section() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
     let scenario = run_licensed_scenario(
+        &owner,
+        repo,
         assignment,
         child,
         true,
@@ -1158,6 +1373,7 @@ fn generated_follow_up_real_loader_rejects_stripped_required_section() {
 #[test]
 fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let mut assignment = licensed_assignment();
     assignment.worker_assignments = vec![WorkerAssignment {
         id: "worker-a".to_string(),
@@ -1172,7 +1388,14 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
         report_path: None,
     }];
     let child = worker_dependent_failure_child(&assignment);
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-worker-breakage-gates");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-worker-breakage-gates",
+    );
 
     assert!(scenario.report.success, "{:#?}", scenario.report.findings);
     assert_eq!(scenario.report.generated_follow_up_tasks.len(), 1);
@@ -1190,9 +1413,17 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
 
 #[test]
 fn undeclared_breakage_keeps_validation_gate_failure_and_generates_nothing() {
+    let (owner, repo) = injected_repository();
     let assignment = injected_assignment(false);
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, false, "unlicensed-breakage-e2e");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "unlicensed-breakage-e2e",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1218,9 +1449,17 @@ fn undeclared_attribution_guard_is_directly_fail_capable() {
 
 #[test]
 fn failure_outside_declared_path_scope_is_not_licensed() {
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/outside.rs");
-    let scenario = run_licensed_scenario(assignment, child, true, "licensed-scope-enforcement");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "licensed-scope-enforcement",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1238,9 +1477,17 @@ fn failure_outside_declared_path_scope_is_not_licensed() {
 #[test]
 fn auditor_must_accept_exact_declaration_digest_before_tasks_exist() {
     skip_without_containment!();
+    let (owner, repo) = injected_repository();
     let assignment = licensed_assignment();
     let child = dependent_failure_child(&assignment, "src/client.rs");
-    let scenario = run_licensed_scenario(assignment, child, false, "licensed-auditor-refusal");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "licensed-auditor-refusal",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1261,7 +1508,15 @@ fn child_cannot_self_grant_license_or_generate_follow_up_authority() {
         migration_rationale: "self granted".to_string(),
         failures: Vec::new(),
     });
-    let scenario = run_licensed_scenario(assignment, child, false, "licensed-self-grant");
+    let (owner, repo) = injected_repository();
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        false,
+        "licensed-self-grant",
+    );
 
     assert!(!scenario.report.success);
     assert!(scenario.report.generated_follow_up_tasks.is_empty());
@@ -1527,11 +1782,12 @@ fn licensed_follow_up_survives_authenticated_final_report_resume_without_redispa
         injected_verified_run(command)
     };
     install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
-    let error = run_supervisor_plan_with_runner(
+    let error = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect_err("licensed final-report checkpoint interruption");
@@ -1557,13 +1813,15 @@ fn licensed_follow_up_cascade_dispatches_one_authenticated_round_and_keeps_prima
     let source_assignment = licensed_assignment();
     let follow_up_assignment = licensed_follow_up_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation across cascade rounds");
     let run_id = RunId::new("licensed-cascade-depth-two").expect("cascade source run id");
     let plan_file = temp.path().join("licensed-cascade-depth-two.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize licensed cascade source plan"),
-    )
-    .expect("write licensed cascade source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
@@ -1716,14 +1974,16 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation before the intended plan-drift refusal");
     let run_id = RunId::new("licensed-cascade-exact-plan-refusal")
         .expect("exact-plan refusal source run id");
     let plan_file = temp.path().join("licensed-cascade-exact-plan-refusal.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize exact-plan refusal source"),
-    )
-    .expect("write exact-plan refusal source");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
@@ -1761,6 +2021,15 @@ fn generated_follow_up_exact_loaded_plan_drift_refuses_before_child_dispatch() {
             serde_json::from_slice(&bytes).expect("decode generated follow-up plan");
         value["assignments"][0]["assigned_paths"] =
             serde_json::json!(["src/client.rs", "src/expanded.rs"]);
+        // Keep the altered document internally valid: the immutable queued-plan
+        // comparison, rather than the assessment parser, must refuse this expansion.
+        let ordinary: SupervisorPlan = serde_json::from_value(value.clone()).unwrap();
+        let frozen = serde_json::from_value(value["resolved_routing_policy"].clone()).unwrap();
+        value["task_routing_assessment"] = serde_json::to_value(
+            GeneratedFollowUpSupervisorPlan::assess_task_routing_for_plan(&ordinary, &frozen)
+                .unwrap(),
+        )
+        .unwrap();
         fs::write(
             path,
             serde_json::to_vec_pretty(&value).expect("encode drifted generated follow-up plan"),
@@ -1860,13 +2129,15 @@ fn run_generated_round_last_moment_mutation(
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation across source and generated rounds");
     let run_id = RunId::new(run_name).expect("last-moment gate source run id");
     let plan_file = temp.path().join(format!("{run_name}.json"));
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize last-moment gate source plan"),
-    )
-    .expect("write last-moment gate source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let retention = secure_machine_global_retention(temp.path(), run_name);
     let machine_global_config = retention.config.clone();
     let machine_global_config_before =
@@ -1973,6 +2244,7 @@ fn run_generated_round_last_moment_mutation(
     let machine_global_config_after = fs::read(&machine_global_config).ok();
     let queue_observations = queue_observations.borrow().clone();
 
+    drop(_cam);
     GeneratedRoundLastMomentScenario {
         _temp: temp,
         repo,
@@ -2148,14 +2420,16 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
     let (temp, repo) = injected_repository();
     let source_assignment = licensed_assignment();
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold isolated injected CAM observation before the intended retention refusal");
     let run_id = RunId::new("licensed-cascade-initial-retention-deleted")
         .expect("initial deleted-retention source run id");
     let plan_file = temp.path().join("initial-retention-deleted.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize initial deleted-retention source plan"),
-    )
-    .expect("write initial deleted-retention source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let retention =
         secure_machine_global_retention(temp.path(), "licensed-cascade-initial-retention-deleted");
     let config = retention.config.clone();
@@ -2250,7 +2524,8 @@ fn generated_follow_up_initial_deleted_retention_is_typed_without_queue() {
 #[test]
 fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
     skip_without_containment!();
-    let fixture = run_licensed_follow_up_enqueue_interruption_fixture();
+    let (temp, repo) = injected_repository();
+    let fixture = run_licensed_follow_up_enqueue_interruption_fixture(&temp, repo);
     let mut runner = licensed_follow_up_enqueue_interruption_runner(&fixture);
     let outcome =
         resume_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
@@ -2282,7 +2557,8 @@ fn licensed_follow_up_enqueue_interruption_resumes_without_rerunning_source() {
 #[test]
 fn licensed_follow_up_stale_predecessor_lease_recovers_through_cascade_resume() {
     skip_without_containment!();
-    let fixture = run_licensed_follow_up_enqueue_interruption_fixture();
+    let (temp, repo) = injected_repository();
+    let fixture = run_licensed_follow_up_enqueue_interruption_fixture(&temp, repo);
     let predecessor = {
         let mut queue =
             reopen_authenticated_source_follow_up_queue(&fixture.repo, &fixture.source_run_id)
@@ -2297,7 +2573,19 @@ fn licensed_follow_up_stale_predecessor_lease_recovers_through_cascade_resume() 
         resume_supervisor_plan_file_cascade_with_runner(fixture.options.clone(), &mut runner)
             .expect("resume cascade after stale predecessor lease");
     clear_generated_follow_up_queue_observer();
-    assert!(outcome.follow_up_cascade_success, "{outcome:#?}");
+    assert!(
+        outcome.follow_up_cascade_success,
+        "stale-lease cascade failed; source status: {:?}; follow-up status/findings: {:#?}; \
+         gate denials: {:#?}; environment failures: {:#?}",
+        outcome.source_report.status,
+        outcome
+            .follow_up_reports
+            .iter()
+            .map(|report| (&report.status, &report.findings))
+            .collect::<Vec<_>>(),
+        outcome.follow_up_gate_denials,
+        outcome.follow_up_environment_failures,
+    );
     assert!(outcome.generated_follow_up_dispatch_performed());
     assert_eq!(
         fixture
@@ -2372,6 +2660,8 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
         budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage
@@ -2444,6 +2734,7 @@ fn immediate_error_refuses_preexisting_finalized_subordinate_with_different_plan
     different_plan
         .task
         .push_str(" with pre-existing unauthorized plan drift");
+    reassess_generated_fixture(&mut different_plan);
     let subordinate_run_id = RunId::new(format!("follow-up-{}", enqueued.item_ids[0]))
         .expect("deterministic immediate mismatch subordinate run id");
     let subordinate_plan_file = temp.path().join("immediate-mismatch-subordinate.json");
@@ -2608,6 +2899,8 @@ fn run_held_finalized_subordinate_scenario(
         budget_max_duration_seconds: None,
         machine_global_retention: Some(retention.clone()),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage
@@ -2690,6 +2983,7 @@ fn run_held_finalized_subordinate_scenario(
         finalized_plan
             .task
             .push_str(" with unauthorized plan drift");
+        reassess_generated_fixture(&mut finalized_plan);
     }
     let subordinate_plan_file = temp.path().join(format!("{run_name}-subordinate.json"));
     fs::write(
@@ -2765,6 +3059,7 @@ fn run_held_finalized_subordinate_scenario(
     clear_generated_follow_up_queue_observer();
     let primary_after =
         verified_whole_primary_snapshot_sha256(&repo).expect("capture held primary after");
+    drop(_selected_source);
 
     HeldFinalizedSubordinateScenario {
         _temp: temp,
@@ -2954,14 +3249,16 @@ fn licensed_cascade_partial_fan_in_preserves_successful_sibling_across_failure_a
     let follow_up_a = licensed_follow_up_assignment_for_ordinal(1);
     let follow_up_b = licensed_follow_up_assignment_for_ordinal(2);
     let plan = injected_plan(source_assignment.clone(), 0);
+    let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+        &temp,
+        &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+            .expect("supplied positive fixture catalog"),
+    )
+    .expect("hold the same isolated injected CAM observation through cascade failure and resume");
     let source_run_id =
         RunId::new("licensed-cascade-partial-sibling").expect("partial sibling source run id");
     let plan_file = temp.path().join("licensed-cascade-partial-sibling.json");
-    fs::write(
-        &plan_file,
-        serde_json::to_vec_pretty(&plan).expect("serialize partial sibling source plan"),
-    )
-    .expect("write partial sibling source plan");
+    let _routing_policy = persist_assessed_injected_source_plan(&plan, &repo, &plan_file);
     let source_options = SupervisorRunOptions {
         repo: repo.clone(),
         plan_file,
@@ -3272,6 +3569,8 @@ fn licensed_follow_up_heartbeat_interruption_recovers_through_authenticated_fina
             "licensed-cascade-heartbeat-interrupt",
         )),
     };
+    let _selected_source =
+        persist_selected_licensed_source_plan(&plan, &repo, &source_options.plan_file, &temp);
     let declaration_sha256 = licensed_breakage_declaration_sha256(
         source_assignment
             .licensed_breakage

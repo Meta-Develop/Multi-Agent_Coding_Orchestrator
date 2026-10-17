@@ -3,6 +3,7 @@
   "fixture": "writable-managed-child.streaming-json",
   "classification": "hand-authored-grok-compatible",
   "argv": [
+    "--no-auto-update",
     "--prompt-file",
     "{prompt}",
     "--model",

@@ -5,8 +5,6 @@ on:
   push:
     branches: [main]
     tags: ['**']
-    paths-ignore:
-      - maco-coordination.json
   workflow_dispatch:
 
 permissions:
@@ -23,6 +21,11 @@ env:
   RUST_BACKTRACE: "1"
 
 jobs:
+  nix-package:
+    uses: ./.github/workflows/nix-package.yml
+    permissions:
+      contents: read
+
   repository-portability:
     name: Repository portability
     runs-on: ubuntu-latest
@@ -36,22 +39,193 @@ jobs:
       - name: Run repository portability unit tests
         run: python3 -m unittest discover -s scripts/tests -p 'test_*.py'
 
+      - name: Run Linux library shard partition unit tests
+        run: python3 -m unittest discover -s .github/scripts -p test_linux_ci_library_shards.py
+
       - name: Check tracked path portability
         run: python3 scripts/check_repository_portability.py
 
   linux-library:
     name: Linux library tests (${{ matrix.shard }})
+    needs: nix-package
     runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise, rest]
+        shard: [autopilot, supervise-core, supervise-fixtures, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Install checksum-pinned official Nix on the ephemeral runner
+        id: install_nix
+        run: bash .github/scripts/install-github-hosted-ci-nix.sh
+
+      - name: Require the producer's exact artifact handle
+        env:
+          ARTIFACT_ID: ${{ needs.nix-package.outputs.artifact_id }}
+        run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]'
+
+      - name: Download the exact same-run source-bound closure
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.nix-package.outputs.artifact_id }}
+          path: ${{ steps.install_nix.outputs.lane }}/closure
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify independent bindings, import, and qualify the real store package
+        shell: bash
+        env:
+          NIX_CI_LANE: ${{ steps.install_nix.outputs.lane }}
+          EXPECTED_RECEIPT: ${{ needs.nix-package.outputs.receipt_sha256 }}
+          EXPECTED_PAYLOAD: ${{ needs.nix-package.outputs.payload_sha256 }}
+          EXPECTED_SOURCE: ${{ needs.nix-package.outputs.source_revision }}
+          EXPECTED_LOCK: ${{ needs.nix-package.outputs.lock_sha256 }}
+          EXPECTED_MACO_ROOT: ${{ needs.nix-package.outputs.maco_root }}
+          EXPECTED_HELPERS_ROOT: ${{ needs.nix-package.outputs.helpers_root }}
+          EXPECTED_MANIFEST: ${{ needs.nix-package.outputs.source_manifest_sha256 }}
+          EXPECTED_BINARY: ${{ needs.nix-package.outputs.binary_sha256 }}
+          EXPECTED_ENTRY: ${{ needs.nix-package.outputs.main_entry_sha256 }}
+        run: |
+          set -euo pipefail
+          env -i PATH=/usr/bin:/bin LANG=C.UTF-8 LANE="$NIX_CI_LANE" \
+            EXPECTED_RECEIPT="$EXPECTED_RECEIPT" EXPECTED_PAYLOAD="$EXPECTED_PAYLOAD" \
+            EXPECTED_SOURCE="$EXPECTED_SOURCE" EXPECTED_LOCK="$EXPECTED_LOCK" \
+            EXPECTED_MACO_ROOT="$EXPECTED_MACO_ROOT" EXPECTED_HELPERS_ROOT="$EXPECTED_HELPERS_ROOT" \
+            EXPECTED_MANIFEST="$EXPECTED_MANIFEST" EXPECTED_BINARY="$EXPECTED_BINARY" EXPECTED_ENTRY="$EXPECTED_ENTRY" \
+            CI_ENV_FILE="$GITHUB_ENV" CI_PATH_FILE="$GITHUB_PATH" \
+            /usr/bin/python3 -I -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import subprocess
+
+          lane = pathlib.Path(os.environ["LANE"])
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def sha(name):
+              value = os.environ[name]
+              assert re.fullmatch(r"[0-9a-f]{64}", value), name
+              return value
+          revision = os.environ["EXPECTED_SOURCE"]
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          roots = [os.environ[name] for name in ("EXPECTED_MACO_ROOT", "EXPECTED_HELPERS_ROOT")]
+          assert all(re.fullmatch(r"/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+", root) for root in roots)
+          expected = {
+              "schema": "maco-ci-runtime-closure-v1",
+              "source_revision": revision,
+              "lock_sha256": sha("EXPECTED_LOCK"),
+              "maco_root": roots[0],
+              "helpers_root": roots[1],
+              "source_manifest_sha256": sha("EXPECTED_MANIFEST"),
+              "binary_sha256": sha("EXPECTED_BINARY"),
+              "main_entry_sha256": sha("EXPECTED_ENTRY"),
+              "payload_sha256": sha("EXPECTED_PAYLOAD"),
+          }
+          receipt_path = lane / "closure/runtime-closure.json"
+          payload = lane / "closure/runtime-closure.export"
+          assert stat.S_ISREG(receipt_path.lstat().st_mode) and 0 < receipt_path.stat().st_size <= 16384
+          assert stat.S_ISREG(payload.lstat().st_mode) and payload.stat().st_size > 0
+          # Independent job outputs authenticate both files BEFORE JSON parsing or store import.
+          assert digest(receipt_path) == sha("EXPECTED_RECEIPT")
+          assert digest(payload) == expected["payload_sha256"]
+          receipt = json.loads(receipt_path.read_text())
+          assert set(receipt) == set(expected) | {"payload_bytes"}
+          assert all(receipt[key] == value for key, value in expected.items())
+          assert type(receipt["payload_bytes"]) is int and receipt["payload_bytes"] == payload.stat().st_size
+          assert command("git", "rev-parse", "HEAD") == revision
+          assert not command("git", "status", "--porcelain")
+          assert digest(pathlib.Path("flake.lock")) == expected["lock_sha256"]
+          assert digest(pathlib.Path("src/bin/maco.rs")) == expected["main_entry_sha256"]
+          nix = "/nix/var/nix/profiles/default/bin/"
+          clean = {"HOME": str(lane / "home"), "PATH": nix + ":/usr/bin:/bin", "NIX_REMOTE": "daemon"}
+          assert subprocess.check_output([nix + "nix", "--version"], env=clean, text=True).strip() == "nix (Nix) 2.35.2"
+          # Standard privileged store import only; unchanged signature/trust policy, no root user code.
+          with payload.open("rb") as source:
+              subprocess.run([
+                  "/usr/bin/sudo", "-n", "/usr/bin/env", "-i", "HOME=/root", "USER=root", "LOGNAME=root",
+                  "PATH=/usr/bin:/bin", "NIX_REMOTE=daemon", nix + "nix-store", "--import",
+              ], stdin=source, env={"PATH": "/usr/bin:/bin"}, check=True)
+          maco, helpers = map(pathlib.Path, roots)
+          def protected_ancestry(path):
+              for ancestor in reversed(path.parents):
+                  meta = ancestor.lstat()
+                  mode = stat.S_IMODE(meta.st_mode)
+                  assert stat.S_ISDIR(meta.st_mode) and meta.st_uid == 0
+                  if ancestor == pathlib.Path("/nix/store"):
+                      assert mode & 0o6002 == 0 and (mode & 0o020 == 0 or mode & 0o1000 != 0)
+                  else:
+                      assert mode & 0o6022 == 0
+          def protected_file(path, limit):
+              protected_ancestry(path)
+              meta = path.lstat()
+              assert stat.S_ISREG(meta.st_mode) and meta.st_uid == 0 and meta.st_mode & 0o6022 == 0
+              assert 0 < meta.st_size <= limit
+          manifest_path = maco / "share/maco/source-manifest.json"
+          declaration_path = maco / "share/maco/main-helper.json"
+          for path in (manifest_path, declaration_path, maco / "source-manifest.json"):
+              protected_file(path, 1024 * 1024)
+          binary = maco / "bin/maco"
+          protected_file(binary, 256 * 1024 * 1024)
+          assert binary.stat().st_mode & 0o111
+          with binary.open("rb") as source:
+              assert source.read(4) == b"\x7fELF"
+          assert digest(binary) == expected["binary_sha256"]
+          assert digest(manifest_path) == expected["source_manifest_sha256"]
+          assert (maco / "source-manifest.json").read_bytes() == manifest_path.read_bytes()
+          assert json.loads(declaration_path.read_text()) == {
+              "schema": "maco-source-bound-main-helper-v1",
+              "binary_sha256": expected["binary_sha256"],
+              "source_manifest_sha256": expected["source_manifest_sha256"],
+              "main_entry_sha256": expected["main_entry_sha256"],
+          }
+          manifest = json.loads(manifest_path.read_text())
+          assert manifest["schema_version"] == 1
+          assert manifest["source_revision"] == revision and manifest["source_state"] == "clean"
+          names = [entry["path"] for entry in manifest["files"]]
+          assert names and names == sorted(set(names))
+          for entry in manifest["files"]:
+              relative = pathlib.PurePosixPath(entry["path"])
+              assert not relative.is_absolute() and ".." not in relative.parts
+              path = pathlib.Path(*relative.parts)
+              meta = path.lstat()
+              if entry["type"] == "file":
+                  assert stat.S_ISREG(meta.st_mode) and digest(path) == entry["sha256"]
+                  assert meta.st_size == entry["size"] and bool(meta.st_mode & 0o111) == entry["executable"]
+              else:
+                  assert entry["type"] == "symlink" and stat.S_ISLNK(meta.st_mode)
+                  assert hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest() == entry["target_sha256"]
+          for name in ("env", "sh", "sleep", "stat", "findmnt"):
+              candidate = helpers / "bin" / name
+              protected_ancestry(candidate)
+              target = candidate.resolve(strict=True)
+              assert target.is_relative_to("/nix/store")
+              protected_file(target, 256 * 1024 * 1024)
+              assert target.stat().st_mode & 0o111
+              with target.open("rb") as source:
+                  assert source.read(4) == b"\x7fELF"
+          # Set the controller's compile binding before any Cargo compilation.
+          with open(os.environ["CI_ENV_FILE"], "a") as target:
+              target.write(f"MACO_SOURCE_MANIFEST_SHA256={expected['source_manifest_sha256']}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_FOR_TEST={binary}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_SHA256_FOR_TEST={expected['binary_sha256']}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_SOURCE_SHA256_FOR_TEST={expected['source_manifest_sha256']}\n")
+          with open(os.environ["CI_PATH_FILE"], "a") as target:
+              target.write(f"{helpers}/bin\n")
+          print(f"Qualified source {revision}, manifest {expected['source_manifest_sha256']}, main {expected['binary_sha256']}")
+          PY
+
 
       - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
         run: bash .github/scripts/configure-github-hosted-userns.sh
@@ -83,6 +257,29 @@ jobs:
         if: matrix.shard == 'rest'
         run: cargo clippy --locked --all-targets -- -D warnings
 
+      - name: Allow root libtest userns on GitHub-hosted Ubuntu
+        if: matrix.shard == 'rest'
+        run: bash .github/scripts/configure-github-hosted-root-libtest-userns.sh
+
+      - name: Verify sealed native entry regressions before managed runtime checks
+        if: matrix.shard == 'rest'
+        run: |
+          bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh python3 - <<'PY'
+          import runpy
+
+          shards = runpy.run_path(".github/scripts/linux_ci_library_shards.py")
+          cases = (
+              "pinned_exec::tests::mechanical_native_data_refuses_unsealed_drift_scripts_and_false_host_maps",
+              "pinned_exec::tests::mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds",
+          )
+          shards["SAFETY_PREFLIGHTS"]["sealed-native-entry"] = cases
+          raise SystemExit(shards["run_safety_preflights"](
+              ["cargo", "+1.94.1", "test", "--locked", "--lib", "--"],
+              cases,
+              "sealed-native-entry",
+          ))
+          PY
+
       - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
@@ -99,13 +296,181 @@ jobs:
 
   linux-integration:
     name: Linux integration tests
+    needs: nix-package
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
           persist-credentials: false
+
+      - name: Install checksum-pinned official Nix on the ephemeral runner
+        id: install_nix
+        run: bash .github/scripts/install-github-hosted-ci-nix.sh
+
+      - name: Require the producer's exact artifact handle
+        env:
+          ARTIFACT_ID: ${{ needs.nix-package.outputs.artifact_id }}
+        run: '[[ "$ARTIFACT_ID" =~ ^[1-9][0-9]*$ ]]'
+
+      - name: Download the exact same-run source-bound closure
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          artifact-ids: ${{ needs.nix-package.outputs.artifact_id }}
+          path: ${{ steps.install_nix.outputs.lane }}/closure
+          merge-multiple: true
+          digest-mismatch: error
+
+      - name: Verify independent bindings, import, and qualify the real store package
+        shell: bash
+        env:
+          NIX_CI_LANE: ${{ steps.install_nix.outputs.lane }}
+          EXPECTED_RECEIPT: ${{ needs.nix-package.outputs.receipt_sha256 }}
+          EXPECTED_PAYLOAD: ${{ needs.nix-package.outputs.payload_sha256 }}
+          EXPECTED_SOURCE: ${{ needs.nix-package.outputs.source_revision }}
+          EXPECTED_LOCK: ${{ needs.nix-package.outputs.lock_sha256 }}
+          EXPECTED_MACO_ROOT: ${{ needs.nix-package.outputs.maco_root }}
+          EXPECTED_HELPERS_ROOT: ${{ needs.nix-package.outputs.helpers_root }}
+          EXPECTED_MANIFEST: ${{ needs.nix-package.outputs.source_manifest_sha256 }}
+          EXPECTED_BINARY: ${{ needs.nix-package.outputs.binary_sha256 }}
+          EXPECTED_ENTRY: ${{ needs.nix-package.outputs.main_entry_sha256 }}
+        run: |
+          set -euo pipefail
+          env -i PATH=/usr/bin:/bin LANG=C.UTF-8 LANE="$NIX_CI_LANE" \
+            EXPECTED_RECEIPT="$EXPECTED_RECEIPT" EXPECTED_PAYLOAD="$EXPECTED_PAYLOAD" \
+            EXPECTED_SOURCE="$EXPECTED_SOURCE" EXPECTED_LOCK="$EXPECTED_LOCK" \
+            EXPECTED_MACO_ROOT="$EXPECTED_MACO_ROOT" EXPECTED_HELPERS_ROOT="$EXPECTED_HELPERS_ROOT" \
+            EXPECTED_MANIFEST="$EXPECTED_MANIFEST" EXPECTED_BINARY="$EXPECTED_BINARY" EXPECTED_ENTRY="$EXPECTED_ENTRY" \
+            CI_ENV_FILE="$GITHUB_ENV" CI_PATH_FILE="$GITHUB_PATH" \
+            /usr/bin/python3 -I -B - <<'PY'
+          import hashlib
+          import json
+          import os
+          import pathlib
+          import re
+          import stat
+          import subprocess
+
+          lane = pathlib.Path(os.environ["LANE"])
+          def digest(path):
+              with path.open("rb") as source:
+                  return hashlib.file_digest(source, "sha256").hexdigest()
+          def command(*args):
+              return subprocess.check_output(args, text=True).strip()
+          def sha(name):
+              value = os.environ[name]
+              assert re.fullmatch(r"[0-9a-f]{64}", value), name
+              return value
+          revision = os.environ["EXPECTED_SOURCE"]
+          assert re.fullmatch(r"[0-9a-f]{40}", revision)
+          roots = [os.environ[name] for name in ("EXPECTED_MACO_ROOT", "EXPECTED_HELPERS_ROOT")]
+          assert all(re.fullmatch(r"/nix/store/[0-9a-z]{32}-[A-Za-z0-9+._?=-]+", root) for root in roots)
+          expected = {
+              "schema": "maco-ci-runtime-closure-v1",
+              "source_revision": revision,
+              "lock_sha256": sha("EXPECTED_LOCK"),
+              "maco_root": roots[0],
+              "helpers_root": roots[1],
+              "source_manifest_sha256": sha("EXPECTED_MANIFEST"),
+              "binary_sha256": sha("EXPECTED_BINARY"),
+              "main_entry_sha256": sha("EXPECTED_ENTRY"),
+              "payload_sha256": sha("EXPECTED_PAYLOAD"),
+          }
+          receipt_path = lane / "closure/runtime-closure.json"
+          payload = lane / "closure/runtime-closure.export"
+          assert stat.S_ISREG(receipt_path.lstat().st_mode) and 0 < receipt_path.stat().st_size <= 16384
+          assert stat.S_ISREG(payload.lstat().st_mode) and payload.stat().st_size > 0
+          # Independent job outputs authenticate both files BEFORE JSON parsing or store import.
+          assert digest(receipt_path) == sha("EXPECTED_RECEIPT")
+          assert digest(payload) == expected["payload_sha256"]
+          receipt = json.loads(receipt_path.read_text())
+          assert set(receipt) == set(expected) | {"payload_bytes"}
+          assert all(receipt[key] == value for key, value in expected.items())
+          assert type(receipt["payload_bytes"]) is int and receipt["payload_bytes"] == payload.stat().st_size
+          assert command("git", "rev-parse", "HEAD") == revision
+          assert not command("git", "status", "--porcelain")
+          assert digest(pathlib.Path("flake.lock")) == expected["lock_sha256"]
+          assert digest(pathlib.Path("src/bin/maco.rs")) == expected["main_entry_sha256"]
+          nix = "/nix/var/nix/profiles/default/bin/"
+          clean = {"HOME": str(lane / "home"), "PATH": nix + ":/usr/bin:/bin", "NIX_REMOTE": "daemon"}
+          assert subprocess.check_output([nix + "nix", "--version"], env=clean, text=True).strip() == "nix (Nix) 2.35.2"
+          # Standard privileged store import only; unchanged signature/trust policy, no root user code.
+          with payload.open("rb") as source:
+              subprocess.run([
+                  "/usr/bin/sudo", "-n", "/usr/bin/env", "-i", "HOME=/root", "USER=root", "LOGNAME=root",
+                  "PATH=/usr/bin:/bin", "NIX_REMOTE=daemon", nix + "nix-store", "--import",
+              ], stdin=source, env={"PATH": "/usr/bin:/bin"}, check=True)
+          maco, helpers = map(pathlib.Path, roots)
+          def protected_ancestry(path):
+              for ancestor in reversed(path.parents):
+                  meta = ancestor.lstat()
+                  mode = stat.S_IMODE(meta.st_mode)
+                  assert stat.S_ISDIR(meta.st_mode) and meta.st_uid == 0
+                  if ancestor == pathlib.Path("/nix/store"):
+                      assert mode & 0o6002 == 0 and (mode & 0o020 == 0 or mode & 0o1000 != 0)
+                  else:
+                      assert mode & 0o6022 == 0
+          def protected_file(path, limit):
+              protected_ancestry(path)
+              meta = path.lstat()
+              assert stat.S_ISREG(meta.st_mode) and meta.st_uid == 0 and meta.st_mode & 0o6022 == 0
+              assert 0 < meta.st_size <= limit
+          manifest_path = maco / "share/maco/source-manifest.json"
+          declaration_path = maco / "share/maco/main-helper.json"
+          for path in (manifest_path, declaration_path, maco / "source-manifest.json"):
+              protected_file(path, 1024 * 1024)
+          binary = maco / "bin/maco"
+          protected_file(binary, 256 * 1024 * 1024)
+          assert binary.stat().st_mode & 0o111
+          with binary.open("rb") as source:
+              assert source.read(4) == b"\x7fELF"
+          assert digest(binary) == expected["binary_sha256"]
+          assert digest(manifest_path) == expected["source_manifest_sha256"]
+          assert (maco / "source-manifest.json").read_bytes() == manifest_path.read_bytes()
+          assert json.loads(declaration_path.read_text()) == {
+              "schema": "maco-source-bound-main-helper-v1",
+              "binary_sha256": expected["binary_sha256"],
+              "source_manifest_sha256": expected["source_manifest_sha256"],
+              "main_entry_sha256": expected["main_entry_sha256"],
+          }
+          manifest = json.loads(manifest_path.read_text())
+          assert manifest["schema_version"] == 1
+          assert manifest["source_revision"] == revision and manifest["source_state"] == "clean"
+          names = [entry["path"] for entry in manifest["files"]]
+          assert names and names == sorted(set(names))
+          for entry in manifest["files"]:
+              relative = pathlib.PurePosixPath(entry["path"])
+              assert not relative.is_absolute() and ".." not in relative.parts
+              path = pathlib.Path(*relative.parts)
+              meta = path.lstat()
+              if entry["type"] == "file":
+                  assert stat.S_ISREG(meta.st_mode) and digest(path) == entry["sha256"]
+                  assert meta.st_size == entry["size"] and bool(meta.st_mode & 0o111) == entry["executable"]
+              else:
+                  assert entry["type"] == "symlink" and stat.S_ISLNK(meta.st_mode)
+                  assert hashlib.sha256(os.fsencode(os.readlink(path))).hexdigest() == entry["target_sha256"]
+          for name in ("env", "sh", "sleep", "stat", "findmnt"):
+              candidate = helpers / "bin" / name
+              protected_ancestry(candidate)
+              target = candidate.resolve(strict=True)
+              assert target.is_relative_to("/nix/store")
+              protected_file(target, 256 * 1024 * 1024)
+              assert target.stat().st_mode & 0o111
+              with target.open("rb") as source:
+                  assert source.read(4) == b"\x7fELF"
+          # Set the controller's compile binding before any Cargo compilation.
+          with open(os.environ["CI_ENV_FILE"], "a") as target:
+              target.write(f"MACO_SOURCE_MANIFEST_SHA256={expected['source_manifest_sha256']}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_FOR_TEST={binary}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_SHA256_FOR_TEST={expected['binary_sha256']}\n")
+              target.write(f"MACO_CURSOR_MAIN_HELPER_SOURCE_SHA256_FOR_TEST={expected['source_manifest_sha256']}\n")
+          with open(os.environ["CI_PATH_FILE"], "a") as target:
+              target.write(f"{helpers}/bin\n")
+          print(f"Qualified source {revision}, manifest {expected['source_manifest_sha256']}, main {expected['binary_sha256']}")
+          PY
+
 
       - name: Allow systemd-executor userns on GitHub-hosted Ubuntu
         run: bash .github/scripts/configure-github-hosted-userns.sh
@@ -135,6 +500,7 @@ jobs:
     name: Linux fmt, check, clippy, and test
     runs-on: ubuntu-latest
     needs:
+      - nix-package
       - linux-library
       - linux-integration
     if: always()
@@ -144,10 +510,12 @@ jobs:
         # A matrix job succeeds only when every shard succeeds. Cancelled,
         # failed, or skipped shards must not satisfy this required gate.
         env:
+          PACKAGE_RESULT: ${{ needs.nix-package.result }}
           LIBRARY_RESULT: ${{ needs.linux-library.result }}
           INTEGRATION_RESULT: ${{ needs.linux-integration.result }}
         run: |
-          if [[ "${LIBRARY_RESULT}" != "success" || "${INTEGRATION_RESULT}" != "success" ]]; then
+          if [[ "${PACKAGE_RESULT}" != "success" || "${LIBRARY_RESULT}" != "success" || "${INTEGRATION_RESULT}" != "success" ]]; then
+            echo "nix-package result: ${PACKAGE_RESULT}"
             echo "linux-library result: ${LIBRARY_RESULT}"
             echo "linux-integration result: ${INTEGRATION_RESULT}"
             exit 1
@@ -187,6 +555,7 @@ jobs:
     name: Required Rust CI gate
     runs-on: ubuntu-latest
     needs:
+      - nix-package
       - repository-portability
       - linux-gate
       - portable-build
@@ -195,11 +564,13 @@ jobs:
     steps:
       - name: Require portability, Linux tests, and portable builds
         env:
+          PACKAGE_RESULT: ${{ needs.nix-package.result }}
           PORTABILITY_RESULT: ${{ needs.repository-portability.result }}
           LINUX_RESULT: ${{ needs.linux-gate.result }}
           PORTABLE_RESULT: ${{ needs.portable-build.result }}
         run: |
-          if [[ "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" ]]; then
+          if [[ "${PACKAGE_RESULT}" != "success" || "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" ]]; then
+            echo "nix-package result: ${PACKAGE_RESULT}"
             echo "repository-portability result: ${PORTABILITY_RESULT}"
             echo "linux-gate result: ${LINUX_RESULT}"
             echo "portable-build result: ${PORTABLE_RESULT}"

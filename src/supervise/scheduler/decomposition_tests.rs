@@ -338,6 +338,14 @@ fn budget_degrade_ladder_applies_worker_model_effort_fanout_then_halts() {
             ),
         },
     );
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        RoleModelSelection {
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
+            reasoning_effort: None,
+            unavailable_model_fallback: UnavailableModelFallback::FailClosed,
+        },
+    );
     let requested_plan = plan.clone();
     let mut assignment_metadata = AssignmentMetadata::new();
     assignment_metadata.insert(
@@ -1013,7 +1021,11 @@ fn judgment_assignment_is_not_degraded_by_shared_worker_binding() {
         environment_requirements: Vec::new(),
         report_path: None,
     });
-    let plan = worker_degrade_plan(vec![seed_assignment.clone(), assignment.clone()]);
+    let mut plan = worker_degrade_plan(vec![seed_assignment.clone(), assignment.clone()]);
+    plan.role_models.insert(
+        AgentRole::ChildOrchestrator,
+        plan.role_models[&AgentRole::Worker].clone(),
+    );
     let requested_plan = plan.clone();
     let mut metadata = AssignmentMetadata::new();
     insert_mechanical_metadata(&mut metadata, &seed_assignment.id);
@@ -1476,8 +1488,35 @@ fn worker_model_rung_binds_shipped_sol_to_luna_at_advertised_index() {
     assert_eq!(controller.rung, BudgetDegradationRung::Effort);
 }
 
+fn bind_protected_duty_effort_floor_policy(
+) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
+    use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+
+    let mut policy: LoadedRoutingPolicy =
+        serde_json::from_str(include_str!("../../selection/data/routing-policy.json"))?;
+    let mut gate_preference = policy.default_role.clone();
+    gate_preference.minimum_effort = Some(crate::selection::ReasoningEffort::High);
+    policy.role_preferences.insert(
+        AgentRole::GateClassifier.as_str().to_string(),
+        gate_preference,
+    );
+    let mut auditor_preference = policy.default_role.clone();
+    auditor_preference.minimum_effort = Some(crate::selection::ReasoningEffort::Xhigh);
+    policy
+        .role_preferences
+        .insert(AgentRole::Auditor.as_str().to_string(), auditor_preference);
+    let frozen = FrozenRoutingPolicy {
+        sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+        policy,
+        source: "decomposition-effort-floor-fixture".to_string(),
+    };
+    crate::selection::routing_policy::bind_routing_policy(Some(frozen))
+}
+
 #[test]
 fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
+    let _floor_policy =
+        bind_protected_duty_effort_floor_policy().expect("protected duty effort floors");
     let assignment = test_assignment("bounded-task", "bounded.txt");
     let mut plan = test_plan(vec![assignment.clone()]);
     let ReviewLensBackendConfig::Model {
@@ -1549,19 +1588,54 @@ fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
         gate.resolution_observation,
         EffortResolutionObservation::HardFloorClamped
     );
+    let ReviewLensBackendConfig::Model {
+        reasoning_effort: lens_source_effort,
+        ..
+    } = &plan.review_lenses[0].backend
+    else {
+        panic!("default review lens is model-backed");
+    };
+    assert_eq!(lens_source_effort.as_deref(), Some("low"));
+    let ReviewLensBackendConfig::Model {
+        reasoning_effort: effective_lens_effort,
+        ..
+    } = &effective.review_lenses[0].backend
+    else {
+        panic!("effective review lens is model-backed");
+    };
+    assert_eq!(effective_lens_effort.as_deref(), Some("low"));
+    // Duty resolution still clamps Auditor to the hard floor. Admission then stores the active lens effort.
+    let auditor_duty = resolve_reasoning_effort(
+        AgentRole::Auditor,
+        Some(ReasoningEffort::Low),
+        lens_source_effort.as_deref(),
+        0,
+    );
+    assert_eq!(auditor_duty.requested, Some(ReasoningEffort::Low));
+    assert_eq!(auditor_duty.resolved, "xhigh");
+    assert_eq!(
+        auditor_duty.observation,
+        EffortResolutionObservation::HardFloorClamped
+    );
+    let lens_index = 0;
     let auditor = controller
         .assignment_effort_bindings
         .iter()
-        .find(|binding| binding.role == AgentRole::Auditor)
-        .expect("auditor binding");
+        .find(|binding| {
+            binding.role == AgentRole::Auditor
+                && binding.duty_id == super::review_lens_auditor_id(&assignment, lens_index)
+        })
+        .expect("review lens 0 auditor binding");
+    assert_eq!(auditor.assignment_id, assignment.id);
     assert_eq!(
         auditor.requested_reasoning_effort,
         Some(ReasoningEffort::Low)
     );
-    assert_eq!(auditor.resolved_reasoning_effort, "xhigh");
+    assert_eq!(auditor.fallback_reasoning_effort, "low");
+    assert_eq!(auditor.resolved_reasoning_effort, "low");
     assert_eq!(
         auditor.resolution_observation,
-        EffortResolutionObservation::HardFloorClamped
+        EffortResolutionObservation::BudgetDegraded
     );
     let mut construction = test_report_construction(
         &plan,
@@ -1587,6 +1661,8 @@ fn assignment_effort_resolves_per_duty_and_records_hard_floor_clamps() {
 
 #[test]
 fn protected_duty_floors_bound_budget_effort_degradation() {
+    let _floor_policy =
+        bind_protected_duty_effort_floor_policy().expect("protected duty effort floors");
     let gate = resolve_reasoning_effort(
         AgentRole::GateClassifier,
         Some(ReasoningEffort::Xhigh),
@@ -2193,6 +2269,48 @@ fn trusted_requested_plan_claim_override_is_recorded_before_scheduler_claim_stat
     );
 }
 
+fn assessed_requested_preclaim_routing(
+    plan: &SupervisorPlan,
+) -> Result<(
+    TaskRoutingAssessment,
+    crate::selection::routing_policy::FrozenRoutingPolicy,
+)> {
+    use crate::selection::routing_policy::{FrozenRoutingPolicy, LoadedRoutingPolicy};
+
+    assert_eq!(
+        plan.assignments.len(),
+        1,
+        "verified requested-plan override fixture binds one complete assignment"
+    );
+    let assignment = &plan.assignments[0];
+    let assignment_task = assignment
+        .task
+        .as_deref()
+        .expect("verified requested-plan override fixture requires assignment.task");
+
+    let policy: LoadedRoutingPolicy =
+        serde_json::from_str(include_str!("../../selection/data/routing-policy.json"))?;
+    policy.validate()?;
+    let frozen = FrozenRoutingPolicy {
+        sha256: crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&policy)?),
+        policy,
+        source: "public-scheduler-selection-fixture".to_string(),
+    };
+    let proposal: crate::planning::TaskDecompositionProposal = serde_json::from_value(
+        serde_json::json!({
+            "fragments":[{"id": assignment.id.as_str(), "text": &plan.task}],
+            "assignments":[{"id": assignment.id.as_str(), "task": assignment_task,
+                "fragment_ids":[assignment.id.as_str()], "assigned_paths": assignment.assigned_paths,
+                "semantic_symbols":[], "semantic_modules":[]}],
+            "diagnostics":{"degraded":false, "notes":[]},
+            "disjointness":{"disjoint":true, "conflicts":[]}
+        }),
+    )?;
+    let assessment =
+        super::super::task_routing::assess_task_routing(&plan.task, &proposal, &frozen)?;
+    Ok((assessment, frozen))
+}
+
 #[test]
 fn verified_preparation_uses_requested_plan_override_before_assignment_selection_or_claim() {
     let (_temp, repo) = test_repository();
@@ -2202,8 +2320,16 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
         r#"{"operator_override":{"disposition":"claim","rationale":"authenticated caller approved the ambiguous verification path"}}"#,
     ));
     let plan = test_plan(vec![assignment]);
+    let (assessment, frozen) = assessed_requested_preclaim_routing(&plan)
+        .expect("assess verified requested-plan override from public routing policy");
+    let _routing_policy =
+        crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))
+            .expect("bind verified public routing policy through preparation");
     let catalog = test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
         .expect("construct deterministic Codex selector catalog");
+    #[cfg(target_os = "linux")]
+    let _cam = install_positive_injected_cam_fixture(&_temp, &catalog)
+        .expect("hold isolated injected CAM observation");
     let mut options = test_options(&repo, "verified-operator-claim");
     options.runtime = SupervisorRuntime::Codex;
 
@@ -2212,7 +2338,11 @@ fn verified_preparation_uses_requested_plan_override_before_assignment_selection
             plan,
             consultant: SupervisorConsultantPlan::default(),
             assignment_metadata: AssignmentMetadata::new(),
-            plan_metadata: SupervisorPlanMetadata::default(),
+            plan_metadata: SupervisorPlanMetadata {
+                resolved_routing_policy: Some(frozen),
+                task_routing_assessment: Some(assessment),
+                ..SupervisorPlanMetadata::default()
+            },
         },
         &options,
         1,
@@ -3229,23 +3359,14 @@ fn verified_acquire_without_evidence_still_fails_closed() {
 }
 
 #[test]
-fn literal_new_file_lowering_preclaims_planning_root_and_direct_execution_worker() {
+fn literal_new_file_lowering_preclaims_only_direct_execution_worker() {
     let (_temp, repo) = test_repository();
     let task = "Create a new file named LITERAL_E2E.md containing exactly one line: MACO literal routing reached the terminal worker.";
     let (plan, document) = supervisor_plan_and_document_from_goal_spec(&repo, "", task)
         .expect("lower authoritative literal new-file directive");
-    assert_eq!(plan.assignments.len(), 2);
-    let [planning, execution] = plan.assignments.as_slice() else {
-        panic!("literal lowering must emit exactly two assignments");
+    let [execution] = plan.assignments.as_slice() else {
+        panic!("literal lowering must emit exactly one direct execution worker");
     };
-    assert_eq!(planning.id, "assignment-001-planning");
-    assert_eq!(planning.phase, AssignmentPhase::Planning);
-    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
-    assert_eq!(
-        planning.role_category,
-        Some(RoleCategory::DelegatingCoordinator)
-    );
-    assert!(planning.worker_assignments.is_empty());
     assert_eq!(execution.id, "assignment-001");
     assert_eq!(execution.phase, AssignmentPhase::Execution);
     assert_eq!(execution.role, AgentRole::Worker);
@@ -3254,27 +3375,36 @@ fn literal_new_file_lowering_preclaims_planning_root_and_direct_execution_worker
         Some(RoleCategory::NonDelegatingTerminalWorker)
     );
     assert!(execution.worker_assignments.is_empty());
-    for assignment in [planning, execution] {
-        assert_eq!(assignment.assigned_paths, [PathBuf::from("LITERAL_E2E.md")]);
-        assert!(assignment.semantic_symbols.is_empty());
-        assert!(assignment.semantic_modules.is_empty());
-        assert!(assignment.environment_requirements.is_empty());
-        assert!(assignment.licensed_breakage.is_none());
-    }
-    assert_eq!(planning.notes, execution.notes);
+    assert_eq!(execution.assigned_paths, [PathBuf::from("LITERAL_E2E.md")]);
+    assert!(execution.semantic_symbols.is_empty());
+    assert!(execution.semantic_modules.is_empty());
+    assert!(execution.environment_requirements.is_empty());
+    assert!(execution.licensed_breakage.is_none());
+    let notes = execution
+        .notes
+        .as_deref()
+        .expect("direct new-file preclaim notes");
+    assert!(notes.contains("direct_explicit_new_file_creation"));
+    assert!(notes.contains("\"assigned_path\":\"LITERAL_E2E.md\""));
+    assert!(notes.contains("\"id\":\"assignment-001\""));
+    assert!(notes.contains("\"phase\":\"execution\""));
+    assert!(notes.contains("\"role\":\"worker\""));
+    assert!(notes.contains("\"role_category\":\"non_delegating_terminal_worker\""));
+    let task_sha256 = crate::artifacts::state_auth::sha256_hex(
+        execution
+            .task
+            .as_deref()
+            .expect("direct new-file execution task")
+            .as_bytes(),
+    );
+    assert!(notes.contains(&format!("\"task_sha256\":\"{task_sha256}\"")));
     assert_eq!(
         document["assignment_schedule"],
         serde_json::json!([
             {
-                "assignment_id": "assignment-001-planning",
+                "assignment_id": "assignment-001",
                 "depth": 2,
                 "flattened_index": 0
-            },
-            {
-                "assignment_id": "assignment-001",
-                "parent_assignment_id": "assignment-001-planning",
-                "depth": 3,
-                "flattened_index": 1
             }
         ])
     );
@@ -3286,56 +3416,48 @@ fn literal_new_file_lowering_preclaims_planning_root_and_direct_execution_worker
     );
     assert!(evidence.repo_map.is_some());
     assert!(evidence.runtime.is_some());
-    for assignment in &plan.assignments {
-        let risk = evidence
-            .risk_for(&assignment.assigned_paths)
-            .expect("literal assignment risk evidence");
-        let decision = evaluate_preclaim_viability(
-            assignment,
-            &plan.assignments,
-            evidence.repo_map.as_ref(),
-            Some(&risk),
-            evidence.runtime,
-            SupervisorExecutionRuntime::Verified,
-        );
-        assert_eq!(
-            decision.dimensions,
-            preclaim::PreclaimViabilityDimensions {
-                limited_scope: preclaim::ViabilityFinding::Yes,
-                clear_verification_path: preclaim::ViabilityFinding::Yes,
-                autonomously_completable: preclaim::ViabilityFinding::Yes,
-            },
-            "{}: {}",
-            assignment.id,
-            decision.reason
-        );
-        assert_eq!(
-            decision.disposition,
-            preclaim::PreclaimDisposition::Claim,
-            "{}: {}",
-            assignment.id,
-            decision.reason
-        );
-    }
+    let risk = evidence
+        .risk_for(&execution.assigned_paths)
+        .expect("literal assignment risk evidence");
+    let decision = evaluate_preclaim_viability(
+        execution,
+        &plan.assignments,
+        evidence.repo_map.as_ref(),
+        Some(&risk),
+        evidence.runtime,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert_eq!(
+        decision.dimensions,
+        preclaim::PreclaimViabilityDimensions {
+            limited_scope: preclaim::ViabilityFinding::Yes,
+            clear_verification_path: preclaim::ViabilityFinding::Yes,
+            autonomously_completable: preclaim::ViabilityFinding::Yes,
+        },
+        "{}: {}",
+        execution.id,
+        decision.reason
+    );
+    assert_eq!(
+        decision.disposition,
+        preclaim::PreclaimDisposition::Claim,
+        "{}: {}",
+        execution.id,
+        decision.reason
+    );
     assert!(!repo.join("LITERAL_E2E.md").exists());
 }
 
 #[test]
-fn literal_existing_file_edit_preclaims_planning_root_and_direct_execution_worker() {
+fn literal_existing_file_edit_preclaims_only_direct_execution_worker() {
     let (_temp, repo) = test_repository();
     let task = "In README.md, replace scheduler fixture with exactly: MACO literal routing reached the terminal worker. Verify the result with git diff --check and confirm README.md contains exactly that line.";
     let (plan, document) = supervisor_plan_and_document_from_goal_spec(&repo, "", task)
         .expect("lower authoritative literal existing-file directive");
-    let [planning, execution] = plan.assignments.as_slice() else {
-        panic!("literal lowering must emit exactly two assignments");
+    let [execution] = plan.assignments.as_slice() else {
+        panic!("literal lowering must emit exactly one direct execution worker");
     };
-    assert_eq!(planning.phase, AssignmentPhase::Planning);
-    assert_eq!(planning.role, AgentRole::ChildOrchestrator);
-    assert_eq!(
-        planning.role_category,
-        Some(RoleCategory::DelegatingCoordinator)
-    );
-    assert!(planning.worker_assignments.is_empty());
+    assert_eq!(execution.id, "assignment-001");
     assert_eq!(execution.phase, AssignmentPhase::Execution);
     assert_eq!(execution.role, AgentRole::Worker);
     assert_eq!(
@@ -3343,31 +3465,36 @@ fn literal_existing_file_edit_preclaims_planning_root_and_direct_execution_worke
         Some(RoleCategory::NonDelegatingTerminalWorker)
     );
     assert!(execution.worker_assignments.is_empty());
-    for assignment in [planning, execution] {
-        assert_eq!(assignment.assigned_paths, [PathBuf::from("README.md")]);
-        assert!(assignment.semantic_symbols.is_empty());
-        assert!(assignment.semantic_modules.is_empty());
-        assert!(assignment.environment_requirements.is_empty());
-        assert!(assignment.licensed_breakage.is_none());
-    }
-    assert_eq!(planning.notes, execution.notes);
-    assert!(planning
+    assert_eq!(execution.assigned_paths, [PathBuf::from("README.md")]);
+    assert!(execution.semantic_symbols.is_empty());
+    assert!(execution.semantic_modules.is_empty());
+    assert!(execution.environment_requirements.is_empty());
+    assert!(execution.licensed_breakage.is_none());
+    let notes = execution
         .notes
         .as_deref()
-        .is_some_and(|notes| notes.contains("existing_git_visible_regular_file_edit")));
+        .expect("direct existing-file preclaim notes");
+    assert!(notes.contains("direct_existing_git_visible_regular_file_edit"));
+    assert!(notes.contains("\"assigned_path\":\"README.md\""));
+    assert!(notes.contains("\"id\":\"assignment-001\""));
+    assert!(notes.contains("\"phase\":\"execution\""));
+    assert!(notes.contains("\"role\":\"worker\""));
+    assert!(notes.contains("\"role_category\":\"non_delegating_terminal_worker\""));
+    let task_sha256 = crate::artifacts::state_auth::sha256_hex(
+        execution
+            .task
+            .as_deref()
+            .expect("direct existing-file execution task")
+            .as_bytes(),
+    );
+    assert!(notes.contains(&format!("\"task_sha256\":\"{task_sha256}\"")));
     assert_eq!(
         document["assignment_schedule"],
         serde_json::json!([
             {
-                "assignment_id": "assignment-001-planning",
+                "assignment_id": "assignment-001",
                 "depth": 2,
                 "flattened_index": 0
-            },
-            {
-                "assignment_id": "assignment-001",
-                "parent_assignment_id": "assignment-001-planning",
-                "depth": 3,
-                "flattened_index": 1
             }
         ])
     );
@@ -3378,37 +3505,36 @@ fn literal_existing_file_edit_preclaims_planning_root_and_direct_execution_worke
         SupervisorExecutionRuntime::Verified,
     );
     assert!(evidence.repo_map.is_some());
-    for assignment in &plan.assignments {
-        let risk = evidence
-            .risk_for(&assignment.assigned_paths)
-            .expect("existing-file assignment risk evidence");
-        let decision = evaluate_preclaim_viability(
-            assignment,
-            &plan.assignments,
-            evidence.repo_map.as_ref(),
-            Some(&risk),
-            evidence.runtime,
-            SupervisorExecutionRuntime::Verified,
-        );
-        assert_eq!(
-            decision.dimensions,
-            preclaim::PreclaimViabilityDimensions {
-                limited_scope: preclaim::ViabilityFinding::Yes,
-                clear_verification_path: preclaim::ViabilityFinding::Yes,
-                autonomously_completable: preclaim::ViabilityFinding::Yes,
-            },
-            "{}: {}",
-            assignment.id,
-            decision.reason
-        );
-        assert_eq!(
-            decision.disposition,
-            preclaim::PreclaimDisposition::Claim,
-            "{}: {}",
-            assignment.id,
-            decision.reason
-        );
-    }
+    assert!(evidence.runtime.is_some());
+    let risk = evidence
+        .risk_for(&execution.assigned_paths)
+        .expect("existing-file assignment risk evidence");
+    let decision = evaluate_preclaim_viability(
+        execution,
+        &plan.assignments,
+        evidence.repo_map.as_ref(),
+        Some(&risk),
+        evidence.runtime,
+        SupervisorExecutionRuntime::Verified,
+    );
+    assert_eq!(
+        decision.dimensions,
+        preclaim::PreclaimViabilityDimensions {
+            limited_scope: preclaim::ViabilityFinding::Yes,
+            clear_verification_path: preclaim::ViabilityFinding::Yes,
+            autonomously_completable: preclaim::ViabilityFinding::Yes,
+        },
+        "{}: {}",
+        execution.id,
+        decision.reason
+    );
+    assert_eq!(
+        decision.disposition,
+        preclaim::PreclaimDisposition::Claim,
+        "{}: {}",
+        execution.id,
+        decision.reason
+    );
 }
 
 #[test]
@@ -4286,7 +4412,7 @@ fn finalize_does_not_coerce_environment_none_to_zero() {
     assert_eq!(rollup.complete_attempt_count, 1);
     assert_eq!(rollup.complete_accepted_count, 1);
     assert_eq!(rollup.complete_total_cycle_cost_microunits, 12);
-    assert_eq!(rollup.cost_per_accepted_task_microunits, Some(12));
+    assert_eq!(rollup.cost_per_accepted_task_microunits, None);
     assert_ne!(rollup.cost_per_accepted_task_microunits, Some(0));
     assert_ne!(
         rollup.complete_total_cycle_cost_microunits,

@@ -80,6 +80,41 @@ pub(crate) enum ClaimProcessLiveness {
     Unknown,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimProcessLivenessReason {
+    MissingRecordedToken,
+    UnsupportedRecordedToken,
+    UnsupportedObservedToken,
+    ReadFailure {
+        error_kind: Option<std::io::ErrorKind>,
+    },
+    DifferentStartToken {
+        pid: u32,
+        expected: String,
+        observed: String,
+    },
+    Matched,
+}
+
+impl ClaimProcessLivenessReason {
+    pub(crate) fn diagnostic_label(&self) -> &'static str {
+        match self {
+            Self::MissingRecordedToken => "MissingRecordedToken",
+            Self::UnsupportedRecordedToken => "UnsupportedRecordedToken",
+            Self::UnsupportedObservedToken => "UnsupportedObservedToken",
+            Self::ReadFailure { .. } => "ReadFailure",
+            Self::DifferentStartToken { .. } => "DifferentStartToken",
+            Self::Matched => "Matched",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ClaimProcessLivenessObservation {
+    pub(crate) liveness: ClaimProcessLiveness,
+    pub(crate) reason: ClaimProcessLivenessReason,
+}
+
 pub(crate) fn current_claim_process_identity() -> ClaimProcessIdentity {
     let pid = std::process::id();
     ClaimProcessIdentity {
@@ -89,22 +124,70 @@ pub(crate) fn current_claim_process_identity() -> ClaimProcessIdentity {
 }
 
 pub(crate) fn claim_process_liveness(identity: &ClaimProcessIdentity) -> ClaimProcessLiveness {
+    claim_process_liveness_observation(identity).liveness
+}
+
+pub(crate) fn claim_process_liveness_observation(
+    identity: &ClaimProcessIdentity,
+) -> ClaimProcessLivenessObservation {
+    claim_process_liveness_observation_with_probe(identity, process_start_time)
+}
+
+fn claim_process_liveness_observation_with_probe(
+    identity: &ClaimProcessIdentity,
+    probe: impl FnOnce(u32) -> Result<String>,
+) -> ClaimProcessLivenessObservation {
     let Some(expected_start_time) = identity.process_start_time.as_deref() else {
-        return ClaimProcessLiveness::Unknown;
+        return ClaimProcessLivenessObservation {
+            liveness: ClaimProcessLiveness::Unknown,
+            reason: ClaimProcessLivenessReason::MissingRecordedToken,
+        };
     };
-    match process_start_time(identity.pid) {
-        Ok(observed_start_time) if observed_start_time == expected_start_time => {
-            ClaimProcessLiveness::Live
-        }
-        Ok(_) => ClaimProcessLiveness::Interrupted,
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound) =>
+    if !crate::agent_lifecycle::supported_process_start_time(identity.pid, expected_start_time) {
+        return ClaimProcessLivenessObservation {
+            liveness: ClaimProcessLiveness::Unknown,
+            reason: ClaimProcessLivenessReason::UnsupportedRecordedToken,
+        };
+    }
+    match probe(identity.pid) {
+        Ok(observed_start_time)
+            if !crate::agent_lifecycle::supported_process_start_time(
+                identity.pid,
+                &observed_start_time,
+            ) =>
         {
-            ClaimProcessLiveness::Interrupted
+            ClaimProcessLivenessObservation {
+                liveness: ClaimProcessLiveness::Unknown,
+                reason: ClaimProcessLivenessReason::UnsupportedObservedToken,
+            }
         }
-        Err(_) => ClaimProcessLiveness::Unknown,
+        Ok(observed_start_time) if observed_start_time == expected_start_time => {
+            ClaimProcessLivenessObservation {
+                liveness: ClaimProcessLiveness::Live,
+                reason: ClaimProcessLivenessReason::Matched,
+            }
+        }
+        Ok(observed_start_time) => ClaimProcessLivenessObservation {
+            liveness: ClaimProcessLiveness::Interrupted,
+            reason: ClaimProcessLivenessReason::DifferentStartToken {
+                pid: identity.pid,
+                expected: expected_start_time.chars().take(128).collect(),
+                observed: observed_start_time.chars().take(128).collect(),
+            },
+        },
+        Err(error) => {
+            let error_kind = error
+                .downcast_ref::<std::io::Error>()
+                .map(std::io::Error::kind);
+            ClaimProcessLivenessObservation {
+                liveness: if error_kind == Some(std::io::ErrorKind::NotFound) {
+                    ClaimProcessLiveness::Interrupted
+                } else {
+                    ClaimProcessLiveness::Unknown
+                },
+                reason: ClaimProcessLivenessReason::ReadFailure { error_kind },
+            }
+        }
     }
 }
 

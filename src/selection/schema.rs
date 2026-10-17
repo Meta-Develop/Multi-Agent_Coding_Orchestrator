@@ -54,7 +54,9 @@ fn date() -> Value {
 }
 
 fn reasoning_effort() -> Value {
-    enum_schema(&["low", "medium", "high", "xhigh", "max", "ultra"])
+    enum_schema(&[
+        "none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra",
+    ])
 }
 
 fn risk(include_unknown: bool) -> Value {
@@ -135,12 +137,17 @@ fn candidate_capabilities() -> Value {
 }
 
 fn catalog_model() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "model" => nonempty_string(),
         "available" => json!({"type": "boolean"}),
         "supported_efforts" => set(reasoning_effort()),
         "capabilities" => candidate_capabilities(),
-    )
+    );
+    // Additive optional data follows the existing v4 provenance-field pattern.
+    // Older strict readers reject populated access; absence preserves legacy wire bytes.
+    schema["properties"]["access"] =
+        nullable(enum_schema(&["unknown-access", "available", "unavailable"]));
+    schema
 }
 
 fn runtime_catalog() -> Value {
@@ -580,7 +587,11 @@ fn score_breakdown() -> Value {
         "configured_switch_cost_origin" => configured_switch_cost_origin(),
         "applied_switch_cost_microunits" => nonnegative_integer(),
         "switch_cost_microunits" => nonnegative_integer(),
-        "routing_score_semantics" => enum_schema(&["legacy_baseline_plus_cost_proxy_adjustments_v1"]),
+        "routing_score_semantics" => enum_schema(&[
+            "legacy_baseline_plus_cost_proxy_adjustments_v1",
+            "loaded_policy_evidence_penalty_v1",
+            "loaded_policy_evidence_penalty_v2",
+        ]),
         "routing_tradeoff_weights" => routing_tradeoff_weights(),
         "legacy_baseline_score_microunits" => nonnegative_integer(),
         "retry_rework_cost_proxy_microunits" => nonnegative_integer(),
@@ -593,7 +604,7 @@ fn score_breakdown() -> Value {
 }
 
 fn candidate_evaluation() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "candidate" => candidate_key(),
         "prior_source_id" => nullable(nonempty_string()),
         "prior_observed_on" => nullable(date()),
@@ -605,7 +616,14 @@ fn candidate_evaluation() -> Value {
         "quota" => quota_candidate_provenance(),
         "ledger" => ledger_summary(),
         "score" => nullable(score_breakdown()),
-    )
+    );
+    schema["properties"]["loaded_policy_evidence"] = strict_object!(
+        "quality_basis_points" => nullable(basis_points()),
+        "expected_accepted_cycle_cost_microunits" => nullable(nonnegative_integer()),
+        "samples" => nonnegative_integer(),
+        "uncertainty_penalty" => nonnegative_integer(),
+    );
+    schema
 }
 
 fn selected_choice() -> Value {
@@ -623,6 +641,7 @@ fn selected_choice() -> Value {
             "lowest_expected_total_cost_per_accepted_task",
             "lowest_legacy_baseline_plus_cost_proxy_adjustments",
             "strongest_no_evidence_judgment_fallback",
+            "loaded_routing_policy",
             "debug_override",
             "one_shot_environment_fallback",
             "authorized_quota_degrade"
@@ -741,6 +760,7 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "environment_fallback" => nullable(environment_fallback_transition()),
         "quota" => nullable(quota_decision_provenance()),
     );
+    schema["properties"]["routing_policy"] = routing_policy_receipt();
     schema["properties"]["outcome_history"] = strict_object!(
         "snapshot_sha256" => nonempty_string(),
         "source_digests" => array(nonempty_string()),
@@ -753,6 +773,121 @@ pub(crate) fn selection_provenance_schema_value() -> Value {
         "effective_sha256" => json!({"type": "string", "pattern": "^[0-9a-f]{64}$"}),
     );
     schema
+}
+
+fn role_routing_preference() -> Value {
+    let mut role = strict_object!(
+        "preferred_effort" => nullable(reasoning_effort()),
+        "minimum_effort" => nullable(reasoning_effort()),
+        "require_measured_quality" => json!({"type":"boolean"}),
+        "minimum_quality_basis_points" => basis_points(),
+        "minimum_samples" => nonnegative_integer(),
+    );
+    role["properties"]["execution_evidence_requirements"] = strict_object!(
+        "model" => enum_schema(&["native_observed", "source_qualified_applied"]),
+        "effort" => enum_schema(&["native_observed", "source_qualified_applied"]),
+        "permissions" => enum_schema(&["native_observed", "source_qualified_applied"]),
+    );
+    role
+}
+
+fn task_estimation_policy() -> Value {
+    let weights = strict_object!(
+        "base" => nonnegative_integer(),
+        "per_declared_kib" => nonnegative_integer(),
+        "per_fragment" => nonnegative_integer(),
+        "per_assignment" => nonnegative_integer(),
+        "per_scope_path" => nonnegative_integer(),
+        "per_scope_module" => nonnegative_integer(),
+        "per_dependency_edge" => nonnegative_integer(),
+    );
+    strict_object!(
+        "max_declaration_bytes" => positive_integer(),
+        "max_fragments" => positive_integer(),
+        "max_assignments" => positive_integer(),
+        "max_scope_items" => positive_integer(),
+        "max_rules" => positive_integer(),
+        "score_cap_basis_points" => basis_points(),
+        "complexity" => weights.clone(),
+        "risk" => weights.clone(),
+        "horizon" => weights,
+        "rules" => array(strict_object!(
+            "id" => nonempty_string(),
+            "match_kind" => enum_schema(&[
+                "declared_task_contains_ascii_insensitive", "scope_path_prefix"
+            ]),
+            "pattern" => nonempty_string(),
+            "complexity_basis_points" => basis_points(),
+            "risk_basis_points" => basis_points(),
+            "horizon_basis_points" => basis_points(),
+        )),
+        "context" => strict_object!(
+            "bytes_per_estimated_token" => positive_integer(),
+            "base_tokens" => nonnegative_integer(),
+            "per_scope_path_tokens" => nonnegative_integer(),
+            "per_scope_module_tokens" => nonnegative_integer(),
+            "per_assignment_tokens" => nonnegative_integer(),
+            "max_estimated_tokens" => positive_integer(),
+        ),
+        "risk_bands" => array(strict_object!(
+            "max_inclusive" => basis_points(), "value" => risk(true),
+        )),
+        "horizon_bands" => array(strict_object!(
+            "max_inclusive" => basis_points(), "value" => task_horizon(true),
+        )),
+        "context_bands" => array(strict_object!(
+            "max_inclusive" => nonnegative_integer(), "value" => context_size(true),
+        )),
+        "boundedness_bands" => array(strict_object!(
+            "max_scope_paths" => nonnegative_integer(),
+            "max_scope_modules" => nonnegative_integer(),
+            "max_dependency_edges" => nonnegative_integer(),
+            "max_complexity" => basis_points(),
+            "value" => boundedness(true),
+        )),
+    )
+}
+
+fn routing_policy_receipt() -> Value {
+    let role = role_routing_preference();
+    let mut policy = strict_object!(
+                "schema_version" => json!({"type":"integer","const":1}),
+                "policy_id" => nonempty_string(),
+                "unknown_access_policy" => enum_schema(&["reject", "unknown_access_for_productive_attempt"]),
+                "tree" => strict_object!(
+                    "coordinated_complexity_min" => basis_points(),
+                    "coordinated_risk_min" => basis_points(),
+                    "coordinated_horizon_min" => basis_points(),
+                    "coordinated_context_tokens_min" => nonnegative_integer(),
+                    "coordinated_scope_paths_min" => nonnegative_integer(),
+                    "min_independent_groups" => positive_integer(),
+                    "max_workers" => positive_integer(),
+                    "max_depth" => positive_integer(),
+                ),
+                "default_role" => role.clone(),
+                "role_preferences" => json!({"type":"object","additionalProperties":role}),
+                "objective" => strict_object!(
+                    "accepted_cycle_cost_weight" => positive_integer(),
+                    "rejected_attempt_weight" => nonnegative_integer(),
+                    "effort_distance_weight" => nonnegative_integer(),
+                    "unknown_evidence_penalty" => positive_integer(),
+                ),
+    );
+    policy["properties"]["task_estimation"] = task_estimation_policy();
+    strict_object!(
+        "frozen" => strict_object!(
+            "sha256" => json!({"type":"string","pattern":"^[0-9a-f]{64}$"}),
+            "source" => nonempty_string(),
+            "policy" => policy,
+        ),
+        "role" => nonempty_string(),
+        "features" => strict_object!(
+            "scope_paths" => nonnegative_integer(), "scope_modules" => nonnegative_integer(),
+            "complexity" => basis_points(), "risk" => basis_points(), "horizon" => basis_points(),
+            "context_tokens" => nonnegative_integer(), "dependency_edges" => nonnegative_integer(),
+            "independent_groups" => nonnegative_integer(), "evidence" => array(nonempty_string()),
+        ),
+    )
 }
 
 pub(crate) fn selection_event_schema_value() -> Value {
@@ -772,27 +907,48 @@ mod tests {
     use super::*;
 
     fn assert_every_object_is_closed(schema: &Value, path: &str) {
+        let policy_path =
+            "$/properties/provenance/properties/routing_policy/properties/frozen/properties/policy";
+        let role_map_path = format!("{policy_path}/properties/role_preferences");
         match schema {
             Value::Object(object) => {
                 if object.get("type") == Some(&Value::String("object".to_string())) {
-                    assert_eq!(
-                        object.get("additionalProperties"),
-                        Some(&Value::Bool(false))
-                    );
-                    let properties = object["properties"].as_object().expect("object properties");
-                    let required = object["required"].as_array().expect("object required");
-                    let optional = if path == "$/properties/provenance" {
-                        &["outcome_history", "operator_prior_data"][..]
+                    if path == role_map_path {
+                        assert_eq!(object.len(), 2, "only the exact typed role map is open");
+                        assert_eq!(object["additionalProperties"], role_routing_preference());
+                    } else {
+                        assert_eq!(
+                            object.get("additionalProperties"),
+                            Some(&Value::Bool(false))
+                        );
+                        let properties =
+                            object["properties"].as_object().expect("object properties");
+                        let required = object["required"].as_array().expect("object required");
+                        let optional = if path == "$/properties/provenance" {
+                        &["outcome_history", "operator_prior_data", "routing_policy"][..]
+                    } else if path
+                        == "$/properties/provenance/properties/normalized_input/properties/catalogs/items/properties/models/items"
+                    {
+                        &["access"][..]
+                    } else if path == "$/properties/provenance/properties/candidate_set/items" {
+                        &["loaded_policy_evidence"][..]
+                    } else if path == policy_path {
+                        &["task_estimation"][..]
+                    } else if path == format!("{policy_path}/properties/default_role")
+                        || path == format!("{role_map_path}/additionalProperties")
+                    {
+                        &["execution_evidence_requirements"][..]
                     } else {
                         &[][..]
                     };
-                    assert_eq!(required.len() + optional.len(), properties.len(), "{path}");
-                    for field in properties.keys() {
-                        assert_eq!(
-                            required.iter().any(|required| required == field),
-                            !optional.contains(&field.as_str()),
-                            "{path}/{field}"
-                        );
+                        assert_eq!(required.len() + optional.len(), properties.len(), "{path}");
+                        for field in properties.keys() {
+                            assert_eq!(
+                                required.iter().any(|required| required == field),
+                                !optional.contains(&field.as_str()),
+                                "{path}/{field}"
+                            );
+                        }
                     }
                 }
                 for (key, value) in object {
@@ -817,7 +973,7 @@ mod tests {
         let required = provenance["required"]
             .as_array()
             .expect("provenance required");
-        for optional in ["outcome_history", "operator_prior_data"] {
+        for optional in ["outcome_history", "operator_prior_data", "routing_policy"] {
             assert!(provenance["properties"].get(optional).is_some());
             assert!(!required.iter().any(|field| field == optional));
         }
@@ -866,6 +1022,156 @@ mod tests {
                 .as_array()
                 .is_some_and(|required| required.iter().any(|value| value == field)));
         }
+    }
+
+    #[test]
+    fn loaded_routing_receipts_validate_default_and_explicit_evidence_wire() -> anyhow::Result<()> {
+        use crate::selection::routing_policy::{
+            ExecutionEvidenceBasis, RoleExecutionEvidenceRequirements,
+        };
+        let schema_id = "https://example.invalid/selection-provenance";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, selection_provenance_schema_value())
+            .expect("register selector provenance schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile selector provenance schema");
+        let input = crate::selection::selection_test_base_input();
+        let mut receipt = crate::selection::tests::loaded_policy_test_receipt()?;
+        let decision =
+            crate::selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        let default_wire = serde_json::to_value(decision)?;
+        assert!(default_wire["routing_policy"]["frozen"]["policy"]
+            .get("task_estimation")
+            .is_some());
+        schemas
+            .validate(&default_wire, index)
+            .unwrap_or_else(|error| {
+                panic!("default loaded receipt rejected by strict schema: {error:#}")
+            });
+
+        let requirements = RoleExecutionEvidenceRequirements {
+            model: ExecutionEvidenceBasis::NativeObserved,
+            effort: ExecutionEvidenceBasis::SourceQualifiedApplied,
+            permissions: ExecutionEvidenceBasis::NativeObserved,
+        };
+        receipt
+            .frozen
+            .policy
+            .default_role
+            .execution_evidence_requirements = Some(requirements);
+        receipt
+            .frozen
+            .policy
+            .role_preferences
+            .insert("worker".into(), receipt.frozen.policy.default_role.clone());
+        receipt.frozen.sha256 =
+            crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&receipt.frozen.policy)?);
+        let explicit =
+            crate::selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        let explicit_wire = serde_json::to_value(explicit)?;
+        schemas
+            .validate(&explicit_wire, index)
+            .unwrap_or_else(|error| {
+                panic!("explicit execution-evidence receipt rejected by strict schema: {error:#}")
+            });
+
+        // Both additive fields may be absent, but explicit null never selects legacy behavior.
+        let mut legacy = default_wire.clone();
+        legacy["routing_policy"]["frozen"]["policy"]
+            .as_object_mut()
+            .unwrap()
+            .remove("task_estimation");
+        schemas.validate(&legacy, index).unwrap_or_else(|error| {
+            panic!("legacy omitted estimator rejected by strict schema: {error:#}")
+        });
+        for (pointer, malformed) in [
+            ("/routing_policy/frozen/policy/task_estimation", Value::Null),
+            ("/routing_policy/frozen/policy/task_estimation/context/bytes_per_estimated_token", json!("four")),
+            ("/routing_policy/frozen/policy/task_estimation/rules/0/match_kind", json!("arbitrary_match")),
+            ("/routing_policy/frozen/policy/default_role/execution_evidence_requirements", Value::Null),
+            ("/routing_policy/frozen/policy/default_role/execution_evidence_requirements/model", json!("requested")),
+            ("/routing_policy/frozen/policy/role_preferences/worker", json!(true)),
+            ("/routing_policy/frozen/policy/role_preferences/worker/execution_evidence_requirements", Value::Null),
+            ("/routing_policy/frozen/policy/role_preferences/worker/execution_evidence_requirements/permissions", json!(false)),
+        ] {
+            let mut invalid = explicit_wire.clone();
+            *invalid.pointer_mut(pointer).expect("existing serialized field") = malformed;
+            assert!(schemas.validate(&invalid, index).is_err(), "schema accepted malformed {pointer}");
+        }
+        for pointer in [
+            "/routing_policy/frozen/policy/task_estimation",
+            "/routing_policy/frozen/policy/task_estimation/complexity",
+            "/routing_policy/frozen/policy/default_role/execution_evidence_requirements",
+            "/routing_policy/frozen/policy/role_preferences/worker",
+            "/routing_policy/frozen/policy/role_preferences/worker/execution_evidence_requirements",
+        ] {
+            let mut invalid = explicit_wire.clone();
+            invalid
+                .pointer_mut(pointer)
+                .unwrap()
+                .as_object_mut()
+                .unwrap()
+                .insert("unexpected".into(), json!(true));
+            assert!(
+                schemas.validate(&invalid, index).is_err(),
+                "schema accepted extra field at {pointer}"
+            );
+        }
+        let mut missing = explicit_wire;
+        missing["routing_policy"]["frozen"]["policy"]["role_preferences"]["worker"]
+            ["execution_evidence_requirements"]
+            .as_object_mut()
+            .unwrap()
+            .remove("permissions");
+        assert!(schemas.validate(&missing, index).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn catalog_access_schema_is_optional_nullable_closed_and_matches_typed_wire() {
+        use crate::selection::ModelAccessOutcome;
+        let schema = catalog_model();
+        assert_eq!(schema["additionalProperties"], false);
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "access"));
+        assert_eq!(
+            schema["properties"]["access"],
+            nullable(enum_schema(&["unknown-access", "available", "unavailable"]))
+        );
+        let model = crate::selection::selection_test_base_input().catalogs[0].models[0].clone();
+        let legacy = serde_json::to_value(&model).unwrap();
+        assert!(legacy.get("access").is_none());
+        for access in [
+            ModelAccessOutcome::UnknownAccess,
+            ModelAccessOutcome::Available,
+            ModelAccessOutcome::Unavailable,
+        ] {
+            let mut value = legacy.clone();
+            value["access"] = serde_json::to_value(access).unwrap();
+            assert!(schema["properties"]["access"]["oneOf"][0]["enum"]
+                .as_array()
+                .unwrap()
+                .contains(&value["access"]));
+            let decoded: crate::selection::CatalogModel = serde_json::from_value(value).unwrap();
+            assert_eq!(decoded.access, Some(access));
+        }
+        let mut value = legacy.clone();
+        value["access"] = Value::Null;
+        let decoded: crate::selection::CatalogModel = serde_json::from_value(value).unwrap();
+        assert_eq!(decoded.access, None);
+        let mut value = legacy.clone();
+        value["access"] = json!("confirmed-by-login");
+        assert!(serde_json::from_value::<crate::selection::CatalogModel>(value).is_err());
+        let mut value = legacy;
+        value["unexpected_access"] = json!(true);
+        assert!(serde_json::from_value::<crate::selection::CatalogModel>(value).is_err());
     }
 
     #[test]

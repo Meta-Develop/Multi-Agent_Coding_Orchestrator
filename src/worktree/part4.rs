@@ -232,8 +232,8 @@ where
     let common_objects = SafeRoot::open_existing(repository_binding.common_dir().join("objects"))?;
     ensure_worktree_status_deadline(deadline, "after binding bounded-status objects")?;
     let runtime = state_root.reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)?;
-    ensure_worktree_status_deadline(deadline, "after reserving bounded-status runtime")?;
     let result = (|| -> Result<BoundedWorktreeRecords> {
+        ensure_worktree_status_deadline(deadline, "after reserving bounded-status runtime")?;
         let runtime_root = SafeRoot::open_existing(runtime.path())?;
         ensure_worktree_status_deadline(deadline, "after opening bounded-status runtime")?;
         runtime_root.reserve_direct_child_directory("home")?;
@@ -385,27 +385,15 @@ where
             status: bytes,
             ignored,
             process_queue_wait: Duration::ZERO,
+            cleanup_elapsed: Duration::ZERO,
         })
     })();
-    let cleanup = (|| -> Result<usize> {
-        status_lock.verify_direct_binding(state_root)?;
-        let removed = scavenge_bounded_status_runtimes_until(
-            state_root,
-            WORKTREE_STATUS_SCAVENGE_LIMITS,
-            deadline,
-        )
-        .context("failed to remove bounded-status private runtime")?;
-        status_lock.verify_direct_binding(state_root)?;
-        Ok(removed)
-    })();
-    let finished = match (result, cleanup) {
-        (Ok(clean), Ok(_)) => Ok(clean),
-        (Err(error), Ok(_)) => Err(error),
-        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
-            "bounded-status runtime cleanup also failed: {cleanup_error:#}"
-        ))),
-    };
+    let finished = finish_bounded_status_runtime(result, state_root, &status_lock).map(
+        |(mut records, cleanup_elapsed)| {
+            records.cleanup_elapsed = cleanup_elapsed;
+            records
+        },
+    );
     let finished = finish_with_status_lock_verification(
         finished,
         status_lock.verify_direct_binding(state_root),
@@ -414,6 +402,44 @@ where
         finished,
         repository_binding.verify_status_generation(),
     )
+}
+
+/// Final cleanup has its own finite budget. A main-operation timeout must not
+/// prevent removal of the private index and runtime it already created. The
+/// runtime lock stays held until cleanup and the final binding checks finish.
+fn finish_bounded_status_runtime<T>(
+    result: Result<T>,
+    state_root: &SafeRoot,
+    status_lock: &KernelStateLock,
+) -> Result<(T, Duration)> {
+    let cleanup_started = worktree_status_now();
+    let cleanup = (|| -> Result<usize> {
+        let deadline = worktree_status_deadline(WORKTREE_STATUS_SCAVENGE_LIMITS.max_duration)?;
+        status_lock.verify_direct_binding(state_root)?;
+        let removed = scavenge_bounded_status_runtimes_until(
+            state_root,
+            WORKTREE_STATUS_SCAVENGE_LIMITS,
+            deadline,
+        )
+        .context("failed to remove bounded-status private runtime")?;
+        status_lock.verify_direct_binding(state_root)?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status runtime cleanup")?;
+        Ok(removed)
+    })();
+    let cleanup_elapsed = worktree_status_now().saturating_duration_since(cleanup_started);
+    tracing::debug!(
+        elapsed_ms = cleanup_elapsed.as_millis(),
+        completed = cleanup.is_ok(),
+        "bounded-status private runtime cleanup finished"
+    );
+    match (result, cleanup) {
+        (Ok(value), Ok(_)) => Ok((value, cleanup_elapsed)),
+        (Err(error), Ok(_)) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
+        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+            "bounded-status runtime cleanup also failed: {cleanup_error:#}"
+        ))),
+    }
 }
 
 fn validate_bounded_head(bytes: &[u8]) -> Result<()> {
@@ -813,7 +839,9 @@ pub(crate) struct BoundedLocalGitConfig {
     pub(crate) core_hooks_path_present: bool,
 }
 
-pub(crate) fn parse_bounded_local_git_config(bytes: Option<&[u8]>) -> Result<BoundedLocalGitConfig> {
+pub(crate) fn parse_bounded_local_git_config(
+    bytes: Option<&[u8]>,
+) -> Result<BoundedLocalGitConfig> {
     let Some(bytes) = bytes else {
         return Ok(BoundedLocalGitConfig {
             core_filemode: true,
@@ -854,9 +882,7 @@ pub(crate) fn parse_bounded_local_git_config(bytes: Option<&[u8]>) -> Result<Bou
             .position(|byte| byte.is_ascii_whitespace() || *byte == b'=')
             .unwrap_or(line.len());
         let key = &line[..key_end];
-        if !key.eq_ignore_ascii_case(b"filemode")
-            && !key.eq_ignore_ascii_case(b"hookspath")
-        {
+        if !key.eq_ignore_ascii_case(b"filemode") && !key.eq_ignore_ascii_case(b"hookspath") {
             continue;
         }
         let rest = line[key_end..].trim_ascii();
@@ -1091,8 +1117,12 @@ fn validate_bounded_git_text_inputs_bound(
     )?;
     total = total
         .checked_add(
-            u64::try_from(effective_exclude.len().saturating_sub(generated_exclude_start))
-                .unwrap_or(u64::MAX),
+            u64::try_from(
+                effective_exclude
+                    .len()
+                    .saturating_sub(generated_exclude_start),
+            )
+            .unwrap_or(u64::MAX),
         )
         .context("Git metadata aggregate byte count overflowed")?;
     if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
@@ -1206,8 +1236,10 @@ fn scavenge_bounded_status_runtimes_until(
     mut limits: PrivateDirectoryScavengeLimits,
     deadline: Instant,
 ) -> Result<usize> {
-    limits.max_duration =
-        remaining_worktree_status_time(deadline, "before bounded-status runtime scavenging")?;
+    limits.max_duration = limits.max_duration.min(remaining_worktree_status_time(
+        deadline,
+        "before bounded-status runtime scavenging",
+    )?);
     scavenge_private_random_directories_until(
         state_root,
         WORKTREE_STATUS_RUNTIME_LOCK,
@@ -1226,14 +1258,29 @@ fn validate_worktree_status_timeout(timeout: Duration) -> Result<()> {
 
 fn worktree_status_deadline(timeout: Duration) -> Result<Instant> {
     validate_worktree_status_timeout(timeout)?;
-    Instant::now()
+    worktree_status_now()
         .checked_add(timeout)
         .context("worktree status total time budget overflowed")
 }
 
+fn worktree_status_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.get()) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(test)]
+thread_local! {
+    static WORKTREE_STATUS_TEST_CLOCK: std::cell::Cell<Option<Instant>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
 fn remaining_worktree_status_time(deadline: Instant, phase: &str) -> Result<Duration> {
     deadline
-        .checked_duration_since(Instant::now())
+        .checked_duration_since(worktree_status_now())
         .filter(|remaining| !remaining.is_zero())
         .with_context(|| format!("worktree status exhausted its total time budget {phase}"))
 }
@@ -1552,10 +1599,7 @@ fn run_bounded_git_records<const N: usize>(
 ) -> Result<Vec<u8>> {
     let git = crate::merge::resolve_trusted_executable("git")
         .context("failed to resolve trusted Git for bounded worktree status")?;
-    let remaining = deadline
-        .checked_duration_since(Instant::now())
-        .filter(|remaining| !remaining.is_zero())
-        .context("worktree status exhausted its total time budget")?
+    let remaining = remaining_worktree_status_time(deadline, "before bounded Git command")?
         .min(WORKTREE_STATUS_COMMAND_TIMEOUT);
     context.runtime_root.verify()?;
     let mut environment = BTreeMap::new();
@@ -1625,7 +1669,16 @@ fn run_bounded_git_records<const N: usize>(
             )),
         BoundedGitIsolation::Trusted => spec.with_containment(ContainmentPolicy::TrustedBestEffort),
     };
-    let output = run_process(spec).context("bounded worktree status command failed")?;
+    let started = Instant::now();
+    let output = run_process(spec);
+    tracing::debug!(
+        label,
+        elapsed_ms = started.elapsed().as_millis(),
+        budget_ms = remaining.as_millis(),
+        completed = output.is_ok(),
+        "bounded-status Git command finished"
+    );
+    let output = output.context("bounded worktree status command failed")?;
     if output.timed_out {
         bail!(
             "worktree status exceeded its {} millisecond time budget",

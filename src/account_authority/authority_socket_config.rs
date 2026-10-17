@@ -2,14 +2,35 @@
 
 use std::path::PathBuf;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum CamAuthoritySocketEndpoint {
+    Explicit(PathBuf),
+    Default(PathBuf),
+}
+
+impl CamAuthoritySocketEndpoint {
+    fn into_path(self) -> PathBuf {
+        match self {
+            Self::Explicit(path) | Self::Default(path) => path,
+        }
+    }
+}
+
 /// Operator override for the headless CAM authority socket endpoint.
 pub(crate) const CAM_AUTHORITY_SOCKET_ENV: &str = "MACO_CAM_AUTHORITY_SOCKET";
 
 #[cfg(test)]
+#[derive(Clone)]
+enum CamAuthoritySocketTestOverride {
+    Value(Option<std::ffi::OsString>),
+    Default(PathBuf),
+}
+
+#[cfg(test)]
 thread_local! {
     /// `None`: no override, read the process environment.
-    /// `Some(None)`: explicit unset. `Some(Some(value))`: explicit raw value.
-    static CAM_AUTHORITY_SOCKET_OVERRIDE: std::cell::RefCell<Option<Option<std::ffi::OsString>>> =
+    /// `Value(None)`: disable discovery. `Default`: isolated implicit endpoint.
+    static CAM_AUTHORITY_SOCKET_OVERRIDE: std::cell::RefCell<Option<CamAuthoritySocketTestOverride>> =
         const { std::cell::RefCell::new(None) };
 }
 
@@ -21,7 +42,10 @@ pub(crate) fn cam_authority_socket_value() -> Option<std::ffi::OsString> {
     #[cfg(test)]
     {
         if let Some(overridden) = CAM_AUTHORITY_SOCKET_OVERRIDE.with(|slot| slot.borrow().clone()) {
-            return overridden;
+            return match overridden {
+                CamAuthoritySocketTestOverride::Value(value) => value,
+                CamAuthoritySocketTestOverride::Default(_) => None,
+            };
         }
     }
     std::env::var_os(CAM_AUTHORITY_SOCKET_ENV)
@@ -35,7 +59,7 @@ pub(crate) fn set_cam_authority_socket_value(value: &str) {
     #[cfg(test)]
     {
         CAM_AUTHORITY_SOCKET_OVERRIDE.with(|slot| {
-            *slot.borrow_mut() = Some(Some(std::ffi::OsString::from(value)));
+            *slot.borrow_mut() = Some(CamAuthoritySocketTestOverride::Value(Some(value.into())));
         });
     }
     #[cfg(not(test))]
@@ -48,14 +72,22 @@ pub(crate) fn set_cam_authority_socket_value(value: &str) {
 /// Thread-local socket override. `Drop` restores the override captured at `install`.
 #[cfg(test)]
 pub(crate) struct CamAuthoritySocketTestGuard {
-    previous: Option<Option<std::ffi::OsString>>,
+    previous: Option<CamAuthoritySocketTestOverride>,
     _thread_affinity: std::marker::PhantomData<std::rc::Rc<()>>,
 }
 
 #[cfg(test)]
 impl CamAuthoritySocketTestGuard {
     pub(crate) fn install(value: Option<&std::ffi::OsStr>) -> Self {
-        let installed = Some(value.map(std::ffi::OsString::from));
+        Self::install_override(CamAuthoritySocketTestOverride::Value(value.map(Into::into)))
+    }
+
+    pub(crate) fn install_default(path: PathBuf) -> Self {
+        Self::install_override(CamAuthoritySocketTestOverride::Default(path))
+    }
+
+    fn install_override(value: CamAuthoritySocketTestOverride) -> Self {
+        let installed = Some(value);
         let previous = CAM_AUTHORITY_SOCKET_OVERRIDE.with(|slot| slot.replace(installed));
         Self {
             previous,
@@ -65,7 +97,7 @@ impl CamAuthoritySocketTestGuard {
 
     pub(crate) fn set(&self, value: Option<&std::ffi::OsStr>) {
         let _ = self;
-        let installed = Some(value.map(std::ffi::OsString::from));
+        let installed = Some(CamAuthoritySocketTestOverride::Value(value.map(Into::into)));
         CAM_AUTHORITY_SOCKET_OVERRIDE.with(|slot| {
             *slot.borrow_mut() = installed;
         });
@@ -82,13 +114,79 @@ impl Drop for CamAuthoritySocketTestGuard {
     }
 }
 
-/// Returns an explicit operator-configured authority socket path, if any.
+/// Returns the operator override, or an installed Linux user service endpoint.
+/// Only an implicit endpoint with both the socket and its parent absent is
+/// unconfigured. Inspection errors and existing entries still require the normal
+/// connection-time ancestry, ownership and peer authorization checks.
 pub(crate) fn configured_cam_authority_socket() -> Option<PathBuf> {
-    let value = cam_authority_socket_value()?;
-    if value.is_empty() {
-        return None;
+    configured_cam_authority_endpoint().map(CamAuthoritySocketEndpoint::into_path)
+}
+
+fn configured_cam_authority_endpoint() -> Option<CamAuthoritySocketEndpoint> {
+    let endpoint = cam_authority_endpoint()?;
+    if let CamAuthoritySocketEndpoint::Default(path) = &endpoint {
+        let missing = |path: &std::path::Path| {
+            std::fs::symlink_metadata(path)
+                .is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+        };
+        // Do not use exists(): dangling symlinks and inspection failures must
+        // remain configured so callers fail closed through the socket client.
+        if missing(path) && path.parent().is_some_and(missing) {
+            return None;
+        }
     }
-    Some(PathBuf::from(value))
+    Some(endpoint)
+}
+
+fn cam_authority_endpoint() -> Option<CamAuthoritySocketEndpoint> {
+    // Existing isolated authority tests explicitly disable service discovery.
+    // This override is thread-local and does not alter production defaults.
+    #[cfg(test)]
+    if let Some(overridden) = CAM_AUTHORITY_SOCKET_OVERRIDE.with(|slot| slot.borrow().clone()) {
+        return match overridden {
+            CamAuthoritySocketTestOverride::Value(value) => value
+                .filter(|value| !value.is_empty())
+                .map(|value| CamAuthoritySocketEndpoint::Explicit(value.into())),
+            CamAuthoritySocketTestOverride::Default(path) => {
+                Some(CamAuthoritySocketEndpoint::Default(path))
+            }
+        };
+    }
+    resolve_cam_authority_socket(cam_authority_socket_value())
+}
+
+fn resolve_cam_authority_socket(
+    value: Option<std::ffi::OsString>,
+) -> Option<CamAuthoritySocketEndpoint> {
+    if let Some(value) = value {
+        return (!value.is_empty()).then(|| CamAuthoritySocketEndpoint::Explicit(value.into()));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        // SAFETY: geteuid has no preconditions and reads no Rust memory.
+        let uid = unsafe { libc::geteuid() };
+        Some(CamAuthoritySocketEndpoint::Default(
+            default_cam_authority_socket(std::env::var_os("XDG_RUNTIME_DIR").as_deref(), uid),
+        ))
+    }
+    #[cfg(not(target_os = "linux"))]
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn default_cam_authority_socket(runtime_dir: Option<&std::ffi::OsStr>, uid: u32) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    let runtime = runtime_dir
+        .map(PathBuf::from)
+        .filter(|path| {
+            path.is_absolute()
+                && std::fs::symlink_metadata(path).is_ok_and(|metadata| {
+                    metadata.is_dir() && metadata.uid() == uid && metadata.mode() & 0o077 == 0
+                })
+        })
+        .unwrap_or_else(|| PathBuf::from(format!("/run/user/{uid}")));
+    runtime.join("maco/account-authority.sock")
 }
 
 #[cfg(test)]
@@ -98,6 +196,76 @@ mod tests {
     use std::sync::{Arc, Barrier};
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_uses_effective_uid_runtime_path_without_xdg() {
+        assert_eq!(
+            default_cam_authority_socket(None, 1000),
+            PathBuf::from("/run/user/1000/maco/account-authority.sock")
+        );
+        assert_eq!(
+            default_cam_authority_socket(Some(OsStr::new("relative-runtime")), 1000),
+            default_cam_authority_socket(None, 1000)
+        );
+        assert_eq!(
+            resolve_cam_authority_socket(None),
+            Some(CamAuthoritySocketEndpoint::Default(
+                default_cam_authority_socket(
+                    std::env::var_os("XDG_RUNTIME_DIR").as_deref(),
+                    // SAFETY: geteuid has no preconditions.
+                    unsafe { libc::geteuid() },
+                )
+            ))
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn linux_default_accepts_private_owned_xdg_and_rejects_unsafe_directory() {
+        use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+        let runtime = tempfile::tempdir().expect("private runtime fixture");
+        let path = runtime.path();
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))
+            .expect("private runtime mode");
+        let uid = std::fs::symlink_metadata(path)
+            .expect("runtime metadata")
+            .uid();
+        assert_eq!(
+            default_cam_authority_socket(Some(path.as_os_str()), uid),
+            path.join("maco/account-authority.sock")
+        );
+        assert_eq!(
+            default_cam_authority_socket(Some(path.as_os_str()), uid.wrapping_add(1)),
+            default_cam_authority_socket(None, uid.wrapping_add(1))
+        );
+        let link = path.join("runtime-link");
+        symlink(path, &link).expect("symlink runtime fixture");
+        assert_eq!(
+            default_cam_authority_socket(Some(link.as_os_str()), uid),
+            default_cam_authority_socket(None, uid)
+        );
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o770))
+            .expect("unsafe runtime mode");
+        assert_eq!(
+            default_cam_authority_socket(Some(path.as_os_str()), uid),
+            default_cam_authority_socket(None, uid)
+        );
+    }
+
+    #[test]
+    fn production_resolver_preserves_explicit_override_and_empty_value() {
+        assert_eq!(
+            resolve_cam_authority_socket(Some("/explicit/authority.sock".into())),
+            Some(CamAuthoritySocketEndpoint::Explicit(PathBuf::from(
+                "/explicit/authority.sock"
+            )))
+        );
+        assert!(resolve_cam_authority_socket(Some("".into())).is_none());
+        #[cfg(not(target_os = "linux"))]
+        assert!(resolve_cam_authority_socket(None).is_none());
+    }
 
     #[test]
     fn configured_socket_is_absent_by_default() {
@@ -135,9 +303,69 @@ mod tests {
             configured_cam_authority_socket().expect("path"),
             PathBuf::from("/tmp/maco-authority.sock")
         );
+        assert_eq!(
+            configured_cam_authority_endpoint(),
+            Some(CamAuthoritySocketEndpoint::Explicit(PathBuf::from(
+                "/tmp/maco-authority.sock"
+            )))
+        );
         assert_eq!(std::env::var_os(CAM_AUTHORITY_SOCKET_ENV), process_before);
         drop(guard);
         assert_eq!(cam_authority_socket_value(), process_before);
+    }
+
+    #[test]
+    fn default_endpoint_retains_provenance_and_launch_path_and_restores_override() {
+        let _outer = CamAuthoritySocketTestGuard::install(Some(OsStr::new("/explicit.sock")));
+        let runtime = tempfile::tempdir().expect("runtime fixture");
+        let path = runtime.path().join("maco/account-authority.sock");
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        let default = CamAuthoritySocketTestGuard::install_default(path.clone());
+        assert!(cam_authority_socket_value().is_none());
+        assert_eq!(configured_cam_authority_socket(), Some(path.clone()));
+        assert_eq!(
+            configured_cam_authority_endpoint(),
+            Some(CamAuthoritySocketEndpoint::Default(path))
+        );
+        drop(default);
+        assert_eq!(
+            configured_cam_authority_endpoint(),
+            Some(CamAuthoritySocketEndpoint::Explicit(PathBuf::from(
+                "/explicit.sock"
+            )))
+        );
+    }
+
+    #[test]
+    fn only_absent_implicit_socket_and_parent_are_unconfigured() {
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join("maco/account-authority.sock");
+        let _default = CamAuthoritySocketTestGuard::install_default(path.clone());
+        assert!(configured_cam_authority_socket().is_none());
+        {
+            let _explicit = CamAuthoritySocketTestGuard::install(Some(path.as_os_str()));
+            assert_eq!(configured_cam_authority_socket(), Some(path.clone()));
+        }
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        assert_eq!(configured_cam_authority_socket(), Some(path.clone()));
+        std::fs::write(&path, b"not a socket").unwrap();
+        assert_eq!(configured_cam_authority_socket(), Some(path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn implicit_dangling_symlinks_remain_configured() {
+        use std::os::unix::fs::symlink;
+
+        let runtime = tempfile::tempdir().unwrap();
+        let path = runtime.path().join("maco/account-authority.sock");
+        let _default = CamAuthoritySocketTestGuard::install_default(path.clone());
+        symlink("missing-parent", path.parent().unwrap()).unwrap();
+        assert_eq!(configured_cam_authority_socket(), Some(path.clone()));
+        std::fs::remove_file(path.parent().unwrap()).unwrap();
+        std::fs::create_dir(path.parent().unwrap()).unwrap();
+        symlink("missing-socket", &path).unwrap();
+        assert_eq!(configured_cam_authority_socket(), Some(path));
     }
 
     #[test]

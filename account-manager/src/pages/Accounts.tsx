@@ -14,6 +14,7 @@ import AddAccountForm from '@/components/AddAccountForm'
 import InitialMark from '@/components/InitialMark'
 import NotImplemented from '@/components/NotImplemented'
 import PageHeader from '@/components/PageHeader'
+import SelectedAccountObservation from '@/components/SelectedAccountObservation'
 import {
   useAccountMutation,
   type PendingConfirmation,
@@ -130,7 +131,7 @@ export default function Accounts() {
           )}
           {providers.map((provider) => (
             <ProviderAccounts
-              key={provider.id}
+              key={`${provider.id}:${listingEpoch}`}
               provider={provider}
               listing={listingFor(listings, provider.id)}
               busy={busy}
@@ -198,6 +199,10 @@ function ProviderAccounts({
   const canSwitch = hasCapability(provider, 'switch-account')
   const canLaunch = hasCapability(provider, 'launch-tool')
   const canDelete = hasCapability(provider, 'delete-account')
+  const selectedAccount = listing?.accounts.find(
+    (account) =>
+      account.isSelectedForLaunch && account.isStored && !account.isIncomplete,
+  )
 
   return (
     <section
@@ -243,6 +248,14 @@ function ProviderAccounts({
       )}
       {canAdd && (
         <AddAccountForm provider={provider} disabled={busy} onAdd={onAdd} />
+      )}
+      {selectedAccount !== undefined && (
+        <SelectedAccountObservation
+          key={selectedAccount.id}
+          providerId={provider.id}
+          accountId={selectedAccount.id}
+          disabled={busy}
+        />
       )}
     </section>
   )
@@ -734,7 +747,7 @@ function accountRowClass(isActive: boolean): string {
  */
 function statusCell(account: Account, activeKnown: boolean): ReactNode {
   if (account.isIncomplete) {
-    const detail = 'Incomplete — sign-in never finished'
+    const detail = 'Incomplete — sign-in pending or not completed'
     return (
       <span className="chip chip-warn" title={detail}>
         Incomplete
@@ -744,7 +757,12 @@ function statusCell(account: Account, activeKnown: boolean): ReactNode {
   return (
     <span className="inline-flex flex-wrap items-center gap-1.5">
       {account.isSelectedForLaunch && (
-        <span className="chip chip-accent">Selected for app launch</span>
+        <span
+          className="chip chip-accent"
+          title="Selected for this application's next launch. Credential validity and model access are not established by selection."
+        >
+          Selected for app launch
+        </span>
       )}
       {!activeKnown ? (
         <span className="text-ink-muted">Not known</span>

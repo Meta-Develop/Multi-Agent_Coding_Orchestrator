@@ -67,7 +67,7 @@ fn binary_owner_flow_never_launches_login_and_uses_only_managed_home() {
     assert!(prepared.status.success());
     assert!(String::from_utf8(prepared.stdout)
         .unwrap()
-        .contains("grok login --device-auth"));
+        .contains("grok --no-auto-update login --device-auth"));
     let status = run(&["status"]);
     assert!(status.status.success());
     let accounts: Vec<StoredAccountMetadata> = serde_json::from_slice(&status.stdout).unwrap();

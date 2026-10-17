@@ -21,7 +21,8 @@ use std::process::{Command, Stdio};
 
 use super::{
     account_id_is_safe, binary_on_path, home_dir, managed_account_dir, process_named_is_running,
-    ManagedAccountPlan, PendingOAuthHomePlan, PreparedPendingOAuthHome, ProviderAdapter,
+    ActivationMechanism, LaunchSpec, ManagedAccountPlan, PendingOAuthHomePlan,
+    PreparedPendingOAuthHome, ProviderAdapter,
 };
 use crate::backup::{BackupId, BackupStore};
 use crate::error::{Error, Result};
@@ -224,6 +225,7 @@ impl CodexCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<crate::login::LoginUrlHandoff>,
     ) -> std::result::Result<(), super::OAuthLoginRunError> {
         if *cancel.borrow() {
             return Err(super::OAuthLoginRunError::Cancelled);
@@ -233,6 +235,20 @@ impl CodexCliAdapter {
         }
         if self.test_oauth_watch_cancel_driver {
             return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        if let Some(handoff) = handoff {
+            if self.home.is_some() {
+                return Err(super::OAuthLoginRunError::Failed(self.config_write(
+                    "refusing a native authorization handoff against an injected home",
+                )));
+            }
+            let mut command = Command::new("codex");
+            command
+                .arg("login")
+                .env("CODEX_HOME", home)
+                .current_dir(home);
+            return crate::login::run_vendor_oauth_handoff(command, "codex-cli", cancel, handoff)
+                .await;
         }
         let adapter = self.clone_for_login_task();
         let home = home.to_path_buf();
@@ -492,6 +508,7 @@ impl CodexCliAdapter {
         let status = Command::new("codex")
             .arg("login")
             .env("CODEX_HOME", managed_dir)
+            .current_dir(managed_dir)
             .stdin(Stdio::inherit())
             .stdout(Stdio::inherit())
             .stderr(Stdio::inherit())
@@ -946,6 +963,37 @@ impl ProviderAdapter for CodexCliAdapter {
         "codex-cli"
     }
 
+    fn activation_mechanism(&self) -> ActivationMechanism {
+        ActivationMechanism::LaunchEnvironment
+    }
+
+    fn launch_spec(&self, account: &StoredAccountMetadata) -> Result<LaunchSpec> {
+        if account.provider_id != self.id()
+            || !account_id_is_safe(&account.id)
+            || account.state != StoredAccountState::Complete
+            || account.auth_kind != AuthKind::OAuth
+            || account.material != StoredAccountMaterial::VendorHome
+        {
+            return Err(
+                self.config_read("selected Codex account is not a complete managed OAuth home")
+            );
+        }
+        let data_dir = self
+            .resolved_data_dir()
+            .ok_or_else(|| self.config_read("managed Codex data directory is unavailable"))?;
+        if !data_dir.is_absolute() {
+            return Err(self.config_read("managed Codex data directory must be absolute"));
+        }
+        // A declaration only: the MACO consumer captures auth through its existing
+        // trusted no-follow file reader. Never consult the live/ambient Codex home.
+        let home = managed_account_dir(&data_dir, self.id(), &account.id);
+        let cwd = std::env::current_dir()
+            .map_err(|_| self.config_read("launch working directory is unavailable"))?;
+        Ok(LaunchSpec::new("codex")
+            .current_dir(cwd)
+            .set_plain_env("CODEX_HOME", home.as_os_str()))
+    }
+
     fn descriptor(&self) -> ProviderDescriptor {
         ProviderDescriptor {
             id: self.id().to_string(),
@@ -964,6 +1012,7 @@ impl ProviderAdapter for CodexCliAdapter {
                 ProviderCapability::AddAccount,
                 ProviderCapability::SwitchAccount,
                 ProviderCapability::DeleteAccount,
+                ProviderCapability::LaunchTool,
             ],
         }
     }
@@ -1228,10 +1277,241 @@ impl ProviderAdapter for CodexCliAdapter {
         }
     }
 
+    fn observe_models_for_account(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<
+        crate::account_authority::CategoryObservation<crate::account_authority::ModelsObservation>,
+    > {
+        use crate::account_authority::CategoryObservation;
+        #[cfg(unix)]
+        use crate::account_authority::{ObservationError, ObservationErrorKind};
+        if account.provider_id != self.id()
+            || !account_id_is_safe(&account.id)
+            || account.state != StoredAccountState::Complete
+            || account.auth_kind != AuthKind::OAuth
+            || account.material != StoredAccountMaterial::VendorHome
+        {
+            return Err(self
+                .config_read("model metadata requires the exact complete managed Codex account"));
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(CategoryObservation::unavailable())
+        }
+        #[cfg(unix)]
+        {
+            let path = self.managed_oauth_home(account)?.join("models_cache.json");
+            match read_managed_model_cache(&path) {
+                Ok(None) => Ok(CategoryObservation::unknown()),
+                Ok(Some(bytes)) => match parse_managed_model_cache(&bytes) {
+                    Ok(models) => Ok(CategoryObservation::observed(models)),
+                    Err(()) => Ok(CategoryObservation::failed(ObservationError {
+                        kind: ObservationErrorKind::Other,
+                        message: "managed Codex model cache has invalid model/effort metadata"
+                            .to_string(),
+                    })),
+                },
+                Err(_) => Ok(CategoryObservation::failed(ObservationError {
+                    kind: ObservationErrorKind::Other,
+                    message: "managed Codex model cache failed bounded no-follow read".to_string(),
+                })),
+            }
+        }
+    }
+
     fn quota(&self) -> Result<Vec<crate::model::QuotaSnapshot>> {
         // No local quota file was observed [verified-local], and response
         // headers are only [inferred] (`docs/research/codex-cli.md` section 6).
         Ok(Vec::new())
+    }
+}
+
+#[cfg(any(unix, test))]
+const MAX_MANAGED_MODEL_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(unix, test))]
+const MAX_MANAGED_MODEL_CACHE_MODELS: usize = 512;
+
+/// Cache advertisement is metadata, not proof of entitlement or judgment quality.
+#[cfg(any(unix, test))]
+fn parse_managed_model_cache(
+    bytes: &[u8],
+) -> std::result::Result<crate::account_authority::ModelsObservation, ()> {
+    use crate::account_authority::{validate_observed_models, ModelsObservation, ObservedModel};
+    use std::collections::BTreeSet;
+    if bytes.is_empty() || bytes.len() as u64 > MAX_MANAGED_MODEL_CACHE_BYTES {
+        return Err(());
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| ())?;
+    let rows = value
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or(())?;
+    if rows.is_empty() || rows.len() > MAX_MANAGED_MODEL_CACHE_MODELS {
+        return Err(());
+    }
+    let mut models = Vec::with_capacity(rows.len());
+    for row in rows {
+        let slug = row
+            .get("slug")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(())?;
+        if slug.is_empty()
+            || slug.len() > 256
+            || !slug
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-._/".contains(&byte))
+        {
+            return Err(());
+        }
+        let supported_efforts = match row.get("supported_reasoning_levels") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => {
+                let levels = value.as_array().ok_or(())?;
+                let mut efforts = BTreeSet::new();
+                for level in levels {
+                    let effort = level
+                        .as_str()
+                        .or_else(|| level.get("effort").and_then(serde_json::Value::as_str))
+                        .ok_or(())?;
+                    if !efforts.insert(effort.to_string()) {
+                        return Err(());
+                    }
+                }
+                Some(efforts.into_iter().collect())
+            }
+        };
+        let default_effort = match row.get("default_reasoning_level") {
+            None | Some(serde_json::Value::Null) => None,
+            Some(value) => Some(value.as_str().ok_or(())?.to_string()),
+        };
+        models.push(ObservedModel {
+            access: crate::account_authority::ModelAccessOutcome::UnknownAccess,
+            model_id: slug.to_string(),
+            supported_efforts,
+            default_effort,
+        });
+    }
+    let observed = ModelsObservation {
+        provenance: Some(crate::account_authority::ModelCatalogProvenance {
+            source_kind: crate::account_authority::ModelCatalogSourceKind::ManagedHomeCache,
+            fetched_at: value
+                .get("fetched_at")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string),
+            // Cache freshness and principal semantics are not qualified by this reader.
+            stale: true,
+            principal_binding: None,
+            access_basis: None,
+        }),
+        models,
+    };
+    validate_observed_models(&observed).map_err(|_| ())?;
+    Ok(observed)
+}
+
+#[cfg(unix)]
+fn read_managed_model_cache(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::io::{self, Read};
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(io::Error::from(io::ErrorKind::InvalidInput));
+    }
+    let mut directory = fs::File::open("/")?;
+    let components = path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::Error::from(io::ErrorKind::InvalidInput));
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|_| io::Error::from(io::ErrorKind::InvalidInput))?;
+        let last = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if last {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // Each component is opened relative to the still-held preceding directory.
+        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // Ownership of this fresh descriptor transfers exactly once to File.
+        let mut file = unsafe { fs::File::from_raw_fd(descriptor) };
+        if !last {
+            directory = file;
+            continue;
+        }
+        let before = file.metadata()?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o022 != 0
+            || before.len() > MAX_MANAGED_MODEL_CACHE_BYTES
+        {
+            return Err(io::Error::from(io::ErrorKind::PermissionDenied));
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_MANAGED_MODEL_CACHE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if bytes.len() as u64 != before.len()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(io::Error::from(io::ErrorKind::InvalidData));
+        }
+        return Ok(Some(bytes));
+    }
+    Err(io::Error::from(io::ErrorKind::InvalidInput))
+}
+
+#[cfg(test)]
+mod managed_model_metadata_tests {
+    use super::*;
+    #[test]
+    fn exact_efforts_are_retained_and_unknown_is_not_filled() {
+        let observed = parse_managed_model_cache(br#"{"models":[{"slug":"account-model","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"}],"default_reasoning_level":"high"},{"slug":"unknown-effort-model"}]}"#).unwrap();
+        assert_eq!(
+            observed.models[0].supported_efforts.as_ref().unwrap(),
+            &vec!["high".to_string(), "minimal".to_string()]
+        );
+        assert!(observed.models[1].supported_efforts.is_none());
+        for invalid in [br#"{"models":[]}"#.as_slice(), br#"{"models":[{"slug":"m","supported_reasoning_levels":["high"],"default_reasoning_level":"xhigh"}]}"#.as_slice(), br#"{"models":[{"slug":"m","supported_reasoning_levels":["invented"]}]}"#.as_slice()] {
+            assert!(parse_managed_model_cache(invalid).is_err());
+        }
+    }
+    #[cfg(unix)]
+    #[test]
+    fn bounded_reader_refuses_symlink_and_preserves_missing_unknown() {
+        let root = tempfile::tempdir().unwrap();
+        let root_path = root.path().canonicalize().unwrap();
+        let cache = root_path.join("models_cache.json");
+        assert!(read_managed_model_cache(&cache).unwrap().is_none());
+        let real = root_path.join("real.json");
+        fs::write(&real, br#"{"models":[{"slug":"m"}]}"#).unwrap();
+        std::os::unix::fs::symlink(&real, &cache).unwrap();
+        assert!(read_managed_model_cache(&cache).is_err());
+        assert!(
+            parse_managed_model_cache(&read_managed_model_cache(&real).unwrap().unwrap()).is_ok()
+        );
     }
 }
 
@@ -1306,6 +1586,64 @@ mod tests {
             !text.contains(FAKE_PREFIX),
             "{where_} leaked fixture secret material: {text}"
         );
+    }
+
+    #[test]
+    fn managed_launch_spec_uses_selected_home_and_preserves_ambient_configuration() {
+        use crate::account_authority::StoredAccountRegistry;
+        use crate::paths::stored_accounts_path;
+        use crate::providers::launch_spec_for;
+
+        let ambient = staged_home("home");
+        let data = tempfile::tempdir().expect("managed data");
+        let registry = StoredAccountRegistry::new(stored_accounts_path(data.path()));
+        registry
+            .begin_add(
+                "codex-cli",
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .expect("begin account");
+        registry
+            .complete_add("codex-cli", "work")
+            .expect("complete account");
+        let account = registry.complete("codex-cli", "work").expect("account");
+        let before = digest_codex(ambient.path());
+        let adapter = CodexCliAdapter::with_home(ambient.path()).with_data_dir(data.path());
+        let cwd = std::env::current_dir().expect("current launch working directory");
+        assert!(cwd.is_absolute());
+        let spec = launch_spec_for(&adapter, &account).expect("selected launch declaration");
+        assert_eq!(spec.working_directory.as_deref(), Some(cwd.as_path()));
+        assert_eq!(
+            adapter.activation_mechanism(),
+            ActivationMechanism::LaunchEnvironment
+        );
+        assert_eq!(
+            spec.plain_environment(),
+            vec![(
+                "CODEX_HOME".to_string(),
+                managed_account_dir(data.path(), "codex-cli", "work").into_os_string()
+            )]
+        );
+        assert!(!spec.requires_credential());
+        assert!(spec.environment_removals().is_empty());
+        assert_eq!(digest_codex(ambient.path()), before);
+        assert!(!managed_account_dir(data.path(), "codex-cli", "work").exists());
+
+        for field in ["provider", "state", "material", "auth", "id"] {
+            let mut invalid = account.clone();
+            match field {
+                "provider" => invalid.provider_id = "grok-cli".to_string(),
+                "state" => invalid.state = StoredAccountState::Pending,
+                "material" => invalid.material = StoredAccountMaterial::CredentialStore,
+                "auth" => invalid.auth_kind = AuthKind::ApiKey,
+                _ => invalid.id = "../other".to_string(),
+            }
+            assert!(adapter.launch_spec(&invalid).is_err(), "{field}");
+        }
+        assert_eq!(digest_codex(ambient.path()), before);
     }
 
     #[test]
@@ -1464,6 +1802,7 @@ mod tests {
                 ProviderCapability::AddAccount,
                 ProviderCapability::SwitchAccount,
                 ProviderCapability::DeleteAccount,
+                ProviderCapability::LaunchTool,
             ]
         );
         assert!(

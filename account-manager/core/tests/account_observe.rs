@@ -198,9 +198,14 @@ fn grok_fixture_path(name: &str) -> PathBuf {
 
 fn codex_fixture() -> (common::Fixture, CodexCliAdapter, StoredAccountRegistry) {
     let fixture = common::Fixture::materialise();
-    let data = fixture.temp.path().join("data");
+    let root = fixture
+        .temp
+        .path()
+        .canonicalize()
+        .expect("trusted fixture root");
+    let data = root.join("data");
     fs::create_dir_all(&data).expect("data dir");
-    let adapter = CodexCliAdapter::with_home(&fixture.home)
+    let adapter = CodexCliAdapter::with_home(root.join("home"))
         .with_data_dir(&data)
         .with_tool_running(false);
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
@@ -247,9 +252,10 @@ fn fake_grok_login(home: &Path) -> std::io::Result<i32> {
 
 fn grok_fixture() -> (tempfile::TempDir, GrokCliAdapter, StoredAccountRegistry) {
     let dir = tempfile::tempdir().expect("tempdir");
-    let user_home = dir.path().join("user-home");
-    let data = dir.path().join("data");
-    let cwd = dir.path().join("workspace");
+    let root = dir.path().canonicalize().expect("trusted fixture root");
+    let user_home = root.join("user-home");
+    let data = root.join("data");
+    let cwd = root.join("workspace");
     fs::create_dir_all(user_home.join(".grok")).expect("default grok home");
     copy_tree(&grok_fixture_path("default-home"), &user_home.join(".grok"));
     fs::create_dir_all(&cwd).expect("workspace");
@@ -692,7 +698,10 @@ fn codex_observe_reports_unknown_quota_without_invented_utilization_or_zeros() {
     assert!(quota.content.is_none());
 
     let models = result.models.expect("models category");
+    #[cfg(unix)]
     assert_eq!(models.outcome, ObservationOutcome::Unknown);
+    #[cfg(not(unix))]
+    assert_eq!(models.outcome, ObservationOutcome::Unavailable);
     assert!(models.content.is_none());
 
     let auth = result.auth.expect("auth category");
@@ -933,7 +942,10 @@ fn grok_observe_reports_unknown_quota_and_models_without_numeric_signals() {
     assert!(quota.content.is_none());
 
     let models = result.models.expect("models category");
+    #[cfg(unix)]
     assert_eq!(models.outcome, ObservationOutcome::Unknown);
+    #[cfg(not(unix))]
+    assert_eq!(models.outcome, ObservationOutcome::Unavailable);
     assert!(models.content.is_none());
 
     let auth = result.auth.expect("auth category");
@@ -994,7 +1006,10 @@ fn grok_observe_does_not_treat_auth_json_decoy_fields_as_observed_auth_or_quota(
     assert!(quota.content.is_none());
 
     let models = result.models.expect("models category");
+    #[cfg(unix)]
     assert_eq!(models.outcome, ObservationOutcome::Unknown);
+    #[cfg(not(unix))]
+    assert_eq!(models.outcome, ObservationOutcome::Unavailable);
     assert!(models.content.is_none());
 
     let auth = result.auth.expect("auth category");

@@ -155,6 +155,73 @@ fn wait_for_fixture_thread_finish<T>(
     wait_for_fixture_condition(|| handle.is_finished(), test, run_id, stage, bound);
 }
 
+fn injected_named_terminal_worker_assignment(id: &str, path: &str) -> OrchestratorAssignment {
+    let mut assignment = injected_named_assignment(id, path);
+    assignment.role = AgentRole::Worker;
+    assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    assignment
+}
+
+fn injected_direct_worker_report(assignment: &OrchestratorAssignment) -> WorkerReport {
+    WorkerReport {
+        id: assignment.id.clone(),
+        role: AgentRole::Worker,
+        assignment_kind: AssignmentKind::Ordinary,
+        target_path: None,
+        assigned_paths: assignment.assigned_paths.clone(),
+        semantic_symbols: assignment.semantic_symbols.clone(),
+        semantic_modules: assignment.semantic_modules.clone(),
+        claim_token: None,
+        semantic_intent_token: None,
+        commands_run: Vec::new(),
+        environment_failures: Vec::new(),
+        files_changed: Vec::new(),
+        validation_results: vec![ValidationResult {
+            name: "injected worker validation".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: Vec::new(),
+            message: None,
+        }],
+        findings: Vec::new(),
+        field_guide_entries: Vec::new(),
+        bloated_file_flags: Vec::new(),
+        decomposition_completion: None,
+        no_further_delegation: Some(true),
+        accepted: true,
+        rejected: false,
+        status: ReviewStatus::Succeeded,
+        remaining_risk: "none".to_string(),
+        next_safe_action: "review".to_string(),
+    }
+}
+
+fn write_injected_direct_worker_report(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+) {
+    write_injected_json(
+        &command.output_last_message,
+        &injected_direct_worker_report(assignment),
+    );
+}
+
+fn admission_schedule_metadata(plan: &SupervisorPlan) -> SupervisorPlanMetadata {
+    SupervisorPlanMetadata {
+        assignment_schedule: plan
+            .assignments
+            .iter()
+            .enumerate()
+            .map(|(flattened_index, assignment)| AssignmentScheduleEntry {
+                assignment_id: assignment.id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index,
+            })
+            .collect(),
+        ..SupervisorPlanMetadata::default()
+    }
+}
+
 struct UnwindCleanup<F: FnOnce()> {
     action: Option<F>,
 }
@@ -337,13 +404,18 @@ fn concurrent_disjoint_assignments_make_progress_and_finalize_in_plan_order() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run two disjoint assignments");
 
     assert!(report.success, "unexpected failed report: {report:#?}");
@@ -516,10 +588,11 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
-        injected_named_assignment("child-a", "src"),
-        injected_named_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
     ];
-    let plan = injected_multi_plan(assignments.clone(), 0);
+    let mut plan = injected_multi_plan(assignments.clone(), 0);
+    plan.semantic_coordination = SemanticCoordinationMode::Block;
     let options = injected_options(&repo_path, temp.path(), "serial-overlap-release");
     let invocations = Arc::new(Mutex::new(Vec::new()));
     let runner = {
@@ -527,6 +600,18 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
         let invocations = Arc::clone(&invocations);
         move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             invocations
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -551,7 +636,7 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         }
     };
@@ -562,13 +647,18 @@ fn serial_overlapping_assignments_release_between_slots_with_legacy_scratch_name
                 NonZeroUsize::new(8).expect("test capacity is non-zero"),
             ));
     assert_eq!(serial_bound, 1);
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        serial_bound,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            serial_bound,
+            &runner,
+        )
+    }
     .expect("run serial overlapping assignments");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -616,8 +706,8 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
             .expect("write injected Rust source");
         commit_injected_repository(&repo_path, "add semantic fixture");
         let mut assignments = vec![
-            injected_named_assignment("child-a", "README.md"),
-            injected_named_assignment("child-b", "src/lib.rs"),
+            injected_named_terminal_worker_assignment("child-a", "README.md"),
+            injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
         ];
         for assignment in &mut assignments {
             assignment.semantic_symbols = vec!["Shared".to_string()];
@@ -628,21 +718,38 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
         let options = injected_options(&repo_path, temp.path(), &run_id);
         let runner = move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             let assignment = assignments
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         };
 
-        let report = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            max_concurrent_children,
-            &runner,
-        )
+        let report = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+        }
         .expect("run deterministic semantic warn preview");
         assert!(report.success, "unexpected failed report: {report:#?}");
         let warnings = report
@@ -668,8 +775,8 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
         .claim_paths("external-owner", [PathBuf::from("README.md")])
         .expect("reserve first serial assignment path");
     let mut assignments = vec![
-        injected_named_assignment("child-a", "README.md"),
-        injected_named_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-a", "README.md"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
     ];
     for assignment in &mut assignments {
         assignment.semantic_symbols = vec!["Shared".to_string()];
@@ -683,16 +790,21 @@ fn semantic_warn_previews_are_plan_ordered_once_at_serial_and_concurrent_bounds(
             .iter()
             .find(|assignment| assignment.id == id)
             .unwrap_or_else(|| panic!("missing assignment {id}"));
-        write_injected_assignment_report(command, assignment);
+        write_injected_direct_worker_report(command, assignment);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("serial warn early failure remains reportable");
     sync_store
         .release(external_claim.token)
@@ -747,13 +859,18 @@ fn semantic_resolution_failure_does_not_stop_healthy_assignment_at_any_bound() {
             }
         };
 
-        let report = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            max_concurrent_children,
-            &runner,
-        )
+        let report = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                max_concurrent_children,
+                &runner,
+            )
+        }
         .expect("semantic resolution failure remains assignment-local");
         assert!(!report.success);
         assert_eq!(
@@ -796,9 +913,9 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
     .expect("write injected Rust source");
     commit_injected_repository(&repo_path, "add Block semantic fixture");
     let mut assignments = vec![
-        injected_named_assignment("child-a", "src"),
-        injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md"),
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+        injected_named_terminal_worker_assignment("child-c", "README.md"),
     ];
     assignments[0].semantic_symbols = vec!["Alpha".to_string()];
     assignments[1].semantic_symbols = vec!["Beta".to_string()];
@@ -812,6 +929,18 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
         let state = Arc::clone(&state);
         move |command: &ExternalAgentCommand| {
             let id = injected_command_assignment_id(command);
+            if let Some(assignment) = assignments
+                .iter()
+                .find(|assignment| review_lens_auditor_id(assignment, 0) == id)
+            {
+                let child =
+                    direct_worker_report_envelope(injected_direct_worker_report(assignment));
+                write_injected_json(
+                    &command.output_last_message,
+                    &injected_auditor_report(assignment, &child),
+                );
+                return injected_verified_run(command);
+            }
             let (lock, condvar) = &*state;
             let mut block = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if id == "child-c" {
@@ -829,18 +958,23 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
                 .iter()
                 .find(|assignment| assignment.id == id)
                 .unwrap_or_else(|| panic!("missing assignment {id}"));
-            write_injected_assignment_report(command, assignment);
+            write_injected_direct_worker_report(command, assignment);
             injected_verified_run(command)
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run deterministic semantic Block scheduling");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -890,13 +1024,18 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("claim conflict remains assignment-local");
     sync_store
         .release(external_claim.token)
@@ -934,7 +1073,7 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
     fs::create_dir_all(repo_path.join("src")).expect("create injected source root");
     fs::write(
         repo_path.join("src/lib.rs"),
-        "pub struct Shared;\npub struct Gamma;\n",
+        "pub struct Alpha;\npub struct Shared;\npub struct Gamma;\n",
     )
     .expect("write injected Rust source");
     commit_injected_repository(&repo_path, "add semantic conflict fixture");
@@ -949,6 +1088,25 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
     let mut plan = injected_multi_plan(assignments.clone(), 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
     let options = injected_options(&repo_path, temp.path(), "semantic-block-isolation");
+    let mut metadata = SupervisorPlanMetadata::default();
+    let collision = match bind_assessed_injected_plan(&plan, &repo_path, &mut metadata) {
+        Ok(_) => panic!("intake must reject the authored Shared overlap"),
+        Err(error) => error,
+    };
+    assert!(format!("{collision:#}").contains("overlap semantic symbol 'Shared'"));
+
+    // Runtime isolation needs an admitted plan and a conflict with an active intent.
+    assignments[0].semantic_symbols = vec!["Alpha".to_string()];
+    plan.assignments = assignments.clone();
+    let semantic_store =
+        SemanticIntentStore::open(&repo_path).expect("open semantic fixture store");
+    let mut request = SemanticIntentRequest::new("external-semantic-owner");
+    request.symbols = vec!["Shared".to_string()];
+    let external_intent = semantic_store
+        .claim(request)
+        .expect("retain conflicting Shared intent");
+    assert!(external_intent.persisted);
+    assert!(!external_intent.has_blocking_conflicts);
     let state = Arc::new((Mutex::new(SemanticConflictState::default()), Condvar::new()));
     let runner = {
         let assignments = assignments.clone();
@@ -978,14 +1136,28 @@ fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("semantic Block conflict remains assignment-local");
+    assert_eq!(
+        semantic_store
+            .snapshot()
+            .expect("snapshot retained semantic intent"),
+        vec![external_intent.intent.clone()]
+    );
+    semantic_store
+        .release(external_intent.intent.token)
+        .expect("release external Shared intent");
     assert!(!report.success);
     assert_eq!(
         report
@@ -1014,6 +1186,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
     const HOLDER_REPO_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_REPO";
     const HOLDER_ROOT_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_ROOT";
     const HOLDER_READY_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_READY";
+    const HOLDER_CUSTODY_ENV: &str = "MACO_ISSUE51_SUPERVISE_HOLDER_CUSTODY";
 
     if std::env::var_os(HOLDER_PROCESS_ENV).is_some() {
         let repo_path = PathBuf::from(
@@ -1025,9 +1198,18 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         let ready = PathBuf::from(
             std::env::var_os(HOLDER_READY_ENV).expect("holder subprocess ready marker"),
         );
+        let witness = PathBuf::from(
+            std::env::var_os(HOLDER_CUSTODY_ENV).expect("holder subprocess custody witness"),
+        );
         let assignment = injected_named_assignment("interrupted-scope", "README.md");
         let plan = injected_multi_plan(vec![assignment], 0);
         let options = injected_options(&repo_path, &root, "externally-terminated-run");
+        let mut selected_fixture =
+            selected_concurrent_inherited_fixture(&plan, &options, &root, &ready, &witness)
+                .expect("validate explicit inherited parent fixture custody");
+        let _selected_fixture = selected_fixture
+            .install(&plan, &options)
+            .expect("hold explicit inherited selected concurrent fixture");
         let runner = move |_command: &ExternalAgentCommand| -> ExternalAgentRun {
             fs::write(&ready, b"claim acquired\n").expect("publish holder readiness");
             loop {
@@ -1057,6 +1239,15 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
 
     let (temp, repo_path) = injected_repository();
     let ready = temp.path().join("issue-51-supervise-holder-ready");
+    let holder_plan = injected_multi_plan(
+        vec![injected_named_assignment("interrupted-scope", "README.md")],
+        0,
+    );
+    let holder_options = injected_options(&repo_path, temp.path(), "externally-terminated-run");
+    // Borrow the actual parent owner before KillOnDrop so every unwind reaps first.
+    let holder_custody =
+        selected_concurrent_parent_custody(&holder_plan, &holder_options, &temp, &ready)
+            .expect("hold original parent fixture custody until child reap");
     let holder = std::process::Command::new(
         std::env::current_exe().expect("resolve current supervise test executable"),
     )
@@ -1069,6 +1260,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         .env(HOLDER_REPO_ENV, &repo_path)
         .env(HOLDER_ROOT_ENV, temp.path())
         .env(HOLDER_READY_ENV, &ready)
+        .env(HOLDER_CUSTODY_ENV, holder_custody.witness_path())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .spawn()
@@ -1118,6 +1310,7 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
     holder_process
         .wait()
         .expect("reap supervise holder process");
+    drop(holder_custody);
 
     let leftover = store
         .status_snapshot()
@@ -1140,13 +1333,19 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         write_injected_assignment_report(command, &blocked_assignment);
         injected_verified_run(command)
     };
-    let blocked = run_supervisor_plan_with_concurrent_runner(
-        blocked_plan,
-        SupervisorConsultantPlan::default(),
-        blocked_options,
-        1,
-        &blocked_runner,
-    )
+    let blocked = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&blocked_plan, &blocked_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            blocked_plan,
+            SupervisorConsultantPlan::default(),
+            blocked_options,
+            1,
+            &blocked_runner,
+        )
+    }
     .expect("retained claim produces a reportable typed refusal");
     let conflict = blocked
         .findings
@@ -1182,17 +1381,155 @@ fn external_termination_named_conflict_release_and_reacquisition_form_one_recove
         write_injected_assignment_report(command, &recovered_assignment);
         injected_verified_run(command)
     };
-    let recovered = run_supervisor_plan_with_concurrent_runner(
-        recovered_plan,
-        SupervisorConsultantPlan::default(),
-        recovered_options,
-        1,
-        &recovered_runner,
-    )
+    let recovered = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&recovered_plan, &recovered_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            recovered_plan,
+            SupervisorConsultantPlan::default(),
+            recovered_options,
+            1,
+            &recovered_runner,
+        )
+    }
     .expect("reacquisition after explicit disposition succeeds");
     assert!(recovered.success, "recovered run failed: {recovered:#?}");
     assert_eq!(recovered.released_claims.len(), 1);
     assert_eq!(recovered.released_claims[0].agent_id, "recovered-retry");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn inherited_concurrent_custody_refuses_forged_stale_and_rebound_inputs() {
+    fn require_custody_refusal(
+        result: Result<InheritedSelectedConcurrentFixture>,
+        expected: &'static str,
+    ) -> anyhow::Error {
+        match result {
+            Err(error) => error,
+            Ok(_) => panic!("{expected}"),
+        }
+    }
+
+    let (temp, repo_path) = injected_repository();
+    let ready = temp.path().join("issue-51-supervise-holder-ready");
+    let plan = injected_multi_plan(
+        vec![injected_named_assignment("interrupted-scope", "README.md")],
+        0,
+    );
+    let options = injected_options(&repo_path, temp.path(), "externally-terminated-run");
+    let custody = selected_concurrent_parent_custody(&plan, &options, &temp, &ready)
+        .expect("create actual held custody for validator refusal controls");
+    assert!(
+        !ready.exists(),
+        "custody must not fabricate callback readiness"
+    );
+    let witness = custody.witness_path().to_path_buf();
+    // The creator is this process, not our actual parent: a held lock alone is insufficient.
+    let wrong_parent = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "same-process custody must not impersonate an inherited parent",
+    );
+    assert!(wrong_parent
+        .to_string()
+        .contains("parent incarnation differs"));
+
+    let mut changed_plan = plan.clone();
+    changed_plan.task.push_str(" changed fixture input");
+    let changed = require_custody_refusal(
+        selected_concurrent_inherited_fixture(
+            &changed_plan,
+            &options,
+            temp.path(),
+            &ready,
+            &witness,
+        ),
+        "changed plan must fail before inherited selection",
+    );
+    assert!(changed.to_string().contains("input binding differs"));
+    let changed_run = injected_options(&repo_path, temp.path(), "mismatched-inherited-run");
+    assert!(selected_concurrent_inherited_fixture(
+        &plan,
+        &changed_run,
+        temp.path(),
+        &ready,
+        &witness
+    )
+    .is_err());
+    let foreign_ready = temp.path().join("not-the-holder-ready");
+    assert!(selected_concurrent_inherited_fixture(
+        &plan,
+        &options,
+        temp.path(),
+        &foreign_ready,
+        &witness
+    )
+    .is_err());
+
+    let original_witness = fs::read(&witness).expect("retain public custody witness bytes");
+    let mut forged: serde_json::Value =
+        serde_json::from_slice(&original_witness).expect("parse custody control");
+    // SAFETY: getppid reads only this test process's actual parent PID.
+    forged["parent_pid"] = json!(unsafe { libc::getppid() });
+    forged["parent_incarnation"] = json!("unsupported-fixture-incarnation");
+    fs::write(
+        &witness,
+        serde_json::to_vec(&forged).expect("encode forged incarnation control"),
+    )
+    .expect("write forged incarnation control without replacing inode");
+    let unsupported = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "unsupported parent incarnation must fail",
+    );
+    assert!(unsupported
+        .to_string()
+        .contains("parent incarnation differs"));
+    forged = serde_json::from_slice(&original_witness).expect("restore witness control value");
+    forged["inputs"][1] = json!("not-the-frozen-policy-digest");
+    fs::write(
+        &witness,
+        serde_json::to_vec(&forged).expect("encode policy mismatch control"),
+    )
+    .expect("write policy mismatch control without replacing inode");
+    let wrong_policy = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "different frozen policy binding must fail",
+    );
+    assert!(wrong_policy.to_string().contains("input binding differs"));
+    fs::write(&witness, b"{").expect("write malformed witness control");
+    assert!(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness)
+            .is_err()
+    );
+    fs::write(&witness, &original_witness).expect("restore original witness before path controls");
+
+    let saved_witness = temp.path().join("saved-concurrent-custody.json");
+    fs::rename(&witness, &saved_witness).expect("retain actual witness before symlink control");
+    std::os::unix::fs::symlink(&saved_witness, &witness)
+        .expect("create witness symlink refusal control");
+    assert!(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness)
+            .is_err()
+    );
+    fs::remove_file(&witness).expect("remove only test symlink control");
+    fs::rename(&saved_witness, &witness).expect("restore original held witness identity");
+
+    drop(custody);
+    let stale = require_custody_refusal(
+        selected_concurrent_inherited_fixture(&plan, &options, temp.path(), &ready, &witness),
+        "an unheld stale witness must fail before selection",
+    );
+    assert!(stale.to_string().contains("custody is not held"));
+    assert!(
+        !ready.exists(),
+        "all refusal controls retain absent readiness"
+    );
+    assert!(
+        repo_path.is_dir(),
+        "borrowed custody never deletes the parent repository"
+    );
 }
 
 #[test]
@@ -1270,13 +1607,18 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("run retry slot scheduler");
     assert!(report.success, "unexpected failed report: {report:#?}");
     assert_eq!(
@@ -1334,13 +1676,18 @@ fn concurrent_failure_isolated_and_retry_retains_assignment_slot() {
             injected_verified_run(command)
         }
     };
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("normal child failure remains a finalized report");
     assert!(!report.success);
     assert!(report.breaker_trip.is_none());
@@ -1370,13 +1717,19 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
         injected_verified_run(command)
     };
 
-    let failed_report = run_supervisor_plan_with_concurrent_runner(
-        failed_plan,
-        SupervisorConsultantPlan::default(),
-        failed_options,
-        1,
-        &failed_runner,
-    )
+    let failed_report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&failed_plan, &failed_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            failed_plan,
+            SupervisorConsultantPlan::default(),
+            failed_options,
+            1,
+            &failed_runner,
+        )
+    }
     .expect("nonaccepted run remains reportable");
 
     assert!(!failed_report.success);
@@ -1396,13 +1749,19 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
         write_injected_assignment_report(command, &followup_assignment);
         injected_verified_run(command)
     };
-    let followup_report = run_supervisor_plan_with_concurrent_runner(
-        followup_plan,
-        SupervisorConsultantPlan::default(),
-        followup_options,
-        1,
-        &followup_runner,
-    )
+    let followup_report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture =
+            selected_concurrent_injected_fixture(&followup_plan, &followup_options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            followup_plan,
+            SupervisorConsultantPlan::default(),
+            followup_options,
+            1,
+            &followup_runner,
+        )
+    }
     .expect("followup run reacquires released path");
 
     assert!(
@@ -1420,10 +1779,11 @@ fn nonaccepted_run_releases_claim_and_followup_reacquires_same_path() {
 fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
     let (temp, repo_path) = injected_repository();
     let assignments = vec![
-        injected_named_assignment("serial-terminal-a", "README.md"),
-        injected_named_assignment("serial-terminal-b", "README.md"),
+        injected_named_terminal_worker_assignment("serial-terminal-a", "README.md"),
+        injected_named_terminal_worker_assignment("serial-terminal-b", "README.md"),
     ];
-    let plan = injected_multi_plan(assignments.clone(), 0);
+    let mut plan = injected_multi_plan(assignments.clone(), 0);
+    plan.semantic_coordination = SemanticCoordinationMode::Block;
     let run_id = RunId::new("serial-terminal-before-release").expect("valid serial run id");
     let options = injected_options(&repo_path, temp.path(), run_id.as_str());
     let runner = move |command: &ExternalAgentCommand| {
@@ -1432,18 +1792,23 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
             .iter()
             .find(|assignment| assignment.id == id)
             .expect("serial checkpoint assignment");
-        write_injected_assignment_report(command, assignment);
+        write_injected_direct_worker_report(command, assignment);
         injected_verified_run(command)
     };
     install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
 
-    let _report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let _report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("checkpoint failure remains reportable after terminal finalization");
 
     let (_checkpoint, snapshot) =
@@ -1462,6 +1827,65 @@ fn serial_assignment_terminal_checkpoint_precedes_claim_release() {
 }
 
 #[test]
+fn plan_admission_still_refuses_off_worker_and_enabled_group_overlaps() {
+    let overlapping_workers = vec![
+        injected_named_terminal_worker_assignment("child-a", "src"),
+        injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+    ];
+    let off_plan = injected_multi_plan(overlapping_workers, 0);
+    assert_eq!(
+        off_plan.semantic_coordination,
+        SemanticCoordinationMode::Off
+    );
+    let off_metadata = admission_schedule_metadata(&off_plan);
+    let off_error = validate_supervisor_plan(off_plan, off_metadata)
+        .expect_err("Off controlled-worker overlap must still fail plan admission");
+    let off_message = format!("{off_error:#}");
+    assert!(
+        off_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "Off worker refusal must be the path-collision gate: {off_message}"
+    );
+
+    let mut child_orch_plan = injected_multi_plan(
+        vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_assignment("child-b", "src/lib.rs"),
+        ],
+        0,
+    );
+    child_orch_plan.semantic_coordination = SemanticCoordinationMode::Warn;
+    let child_error = validate_supervisor_plan(
+        child_orch_plan.clone(),
+        admission_schedule_metadata(&child_orch_plan),
+    )
+    .expect_err("Warn ChildOrchestrator overlap must still fail plan admission");
+    let child_message = format!("{child_error:#}");
+    assert!(
+        child_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "enabled ChildOrch refusal must be the path-collision gate: {child_message}"
+    );
+
+    let mut mixed_plan = injected_multi_plan(
+        vec![
+            injected_named_assignment("child-a", "src"),
+            injected_named_terminal_worker_assignment("child-b", "src/lib.rs"),
+        ],
+        0,
+    );
+    mixed_plan.semantic_coordination = SemanticCoordinationMode::Block;
+    let mixed_error =
+        validate_supervisor_plan(mixed_plan.clone(), admission_schedule_metadata(&mixed_plan))
+            .expect_err(
+                "Block mixed ChildOrchestrator/Worker overlap must still fail plan admission",
+            );
+    let mixed_message = format!("{mixed_error:#}");
+    assert!(
+        mixed_message.contains("assignments 'child-a' path 'src' and 'child-b' path 'src/lib.rs' overlap after normalization"),
+        "enabled mixed-group refusal must be the path-collision gate: {mixed_message}"
+    );
+}
+
+#[test]
 fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
@@ -1474,13 +1898,18 @@ fn degraded_manifest_boundary_finalization_still_releases_serial_claims() {
     };
     set_force_degraded_checkpoint_finalization();
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("degraded finalization remains reportable");
 
     assert!(report.success, "degraded finalization report: {report:#?}");
@@ -1538,13 +1967,18 @@ fn assert_scheduler_assignment_runner_cancellation_scopes_isolated(max_concurren
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        max_concurrent_children,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            max_concurrent_children,
+            &runner,
+        )
+    }
     .expect("assignment runner scope isolation fixture remains reportable");
 
     assert!(
@@ -1638,13 +2072,18 @@ fn admission_commit_recv_failure_cancels_and_drains_active_assignments() {
 
     let supervisor_handle = thread::spawn(move || {
         let _injection_cleanup = injection_cleanup;
-        let result = run_supervisor_plan_with_concurrent_cancellable_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_cancellable_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         (temp, result)
     });
     let supervisor_thread = SupervisorThreadGuard::new(
@@ -1726,13 +2165,18 @@ fn serial_scheduler_error_after_completion_collects_outcomes_and_releases_claims
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        1,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            1,
+            &runner,
+        )
+    }
     .expect("serial scheduling error remains reportable after collecting completed work");
 
     assert!(!report.success);
@@ -1786,13 +2230,18 @@ fn concurrent_assignment_terminal_checkpoint_precedes_claim_release() {
     };
     install_checkpoint_failure(run_id.as_str(), "after:assignment_completed");
 
-    let _report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let _report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("concurrent checkpoint failure remains reportable after terminal finalization");
 
     let (_checkpoint, snapshot) = open_supervisor_checkpoint(&repo_path, &run_id)
@@ -1907,13 +2356,18 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
     };
 
     let supervisor_handle = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_cancellable_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+                .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_cancellable_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         (temp, result)
     });
     let mut supervisor_thread = SupervisorThreadGuard::new(
@@ -2090,13 +2544,18 @@ fn contained_nonzero_child_failure_does_not_stop_pending_unrelated_assignment() 
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("contained child failure remains reportable");
     assert!(!report.success);
     assert_eq!(
@@ -2134,7 +2593,7 @@ fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        injected_named_assignment("child-c", "pending-after-fatal.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-join");
@@ -2183,23 +2642,48 @@ fn fatal_scheduler_abort_stops_new_starts_and_joins_active_assignment() {
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut abort = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !abort.child_a_returned {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                abort.release_child_b = true;
+                condvar.notify_all();
+                drop(abort);
+                let _ = supervisor_thread.join();
+                panic!("fatal scheduler fixture supervisor completed before child-a callback");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         abort = condvar
-            .wait(abort)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(abort, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!abort.child_c_started);
     assert!(matches!(
@@ -2240,7 +2724,7 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-fatal"),
+        injected_named_assignment("child-c", "pending-after-fatal.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-fatal-cancels-active");
@@ -2296,13 +2780,18 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
         }
     };
 
-    let report = run_supervisor_plan_with_concurrent_cancellable_runner(
-        plan,
-        SupervisorConsultantPlan::default(),
-        options,
-        2,
-        &runner,
-    )
+    let report = {
+        #[cfg(target_os = "linux")]
+        let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
+            .expect("hold explicit selected concurrent fixture");
+        run_supervisor_plan_with_concurrent_cancellable_runner(
+            plan,
+            SupervisorConsultantPlan::default(),
+            options,
+            2,
+            &runner,
+        )
+    }
     .expect("fatal containment result remains reportable");
 
     assert!(!report.success);
@@ -2319,7 +2808,6 @@ fn fatal_scheduler_abort_cancels_active_sibling_without_manual_release() {
 fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
     #[derive(Default)]
     struct ReleaseState {
-        child_a_returned: bool,
         child_b_started: bool,
         release_child_b: bool,
         child_c_started: bool,
@@ -2329,7 +2817,7 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-release-error"),
+        injected_named_assignment("child-c", "pending-after-release-error.md"),
     ];
     let plan = injected_multi_plan(assignments.clone(), 0);
     let options = injected_options(&repo_path, temp.path(), "concurrent-release-error-abort");
@@ -2378,31 +2866,60 @@ fn concurrent_release_error_stops_new_starts_and_joins_active_assignment() {
                 store
                     .release(claim.token)
                     .expect("inject scheduler release failure");
-                let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                release.child_a_returned = true;
-                condvar.notify_all();
             }
             run
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    let (release_error_sender, release_error_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        crate::supervise::scheduler::set_concurrent_release_error_observer(release_error_sender);
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut release = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-    while !release.child_a_returned {
+    // Removing A's claim in its callback precedes assignment collection and
+    // scheduler cleanup. Hold B until the scheduler observes the release error
+    // and stops scheduling; otherwise B can finish first and admit C.
+    while release_error_receiver.try_recv().is_err() {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                release.release_child_b = true;
+                condvar.notify_all();
+                drop(release);
+                let _ = supervisor_thread.join();
+                panic!(
+                    "claim release fixture supervisor completed before scheduler observed child-a release error"
+                );
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         release = condvar
-            .wait(release)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(release, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!release.child_c_started);
     assert!(matches!(
@@ -2454,7 +2971,7 @@ fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment()
     let assignments = vec![
         injected_named_assignment("child-a", "README.md"),
         injected_named_assignment("child-b", "src/lib.rs"),
-        injected_named_assignment("child-c", "README.md/blocked-after-panic"),
+        injected_named_assignment("child-c", "pending-after-panic.md"),
     ];
     let mut plan = injected_multi_plan(assignments.clone(), 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
@@ -2499,23 +3016,48 @@ fn panic_after_claim_releases_tokens_stops_pending_and_joins_active_assignment()
         }
     };
     let (done_sender, done_receiver) = mpsc::channel();
+    #[cfg(target_os = "linux")]
+    let selected_fixture_owner = Arc::new(temp);
+    #[cfg(target_os = "linux")]
+    let selected_fixture_thread_owner = Arc::clone(&selected_fixture_owner);
     let supervisor_thread = thread::spawn(move || {
-        let result = run_supervisor_plan_with_concurrent_runner(
-            plan,
-            SupervisorConsultantPlan::default(),
-            options,
-            2,
-            &runner,
-        );
+        let result = {
+            #[cfg(target_os = "linux")]
+            let _selected_fixture = selected_concurrent_injected_fixture(
+                &plan,
+                &options,
+                &selected_fixture_thread_owner,
+            )
+            .expect("hold explicit selected concurrent fixture");
+            run_supervisor_plan_with_concurrent_runner(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                2,
+                &runner,
+            )
+        };
         let _ = done_sender.send(result);
     });
 
     let (lock, condvar) = &*state;
     let mut panic_state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     while !panic_state.child_a_panicking {
+        match done_receiver.try_recv() {
+            Ok(_) | Err(mpsc::TryRecvError::Disconnected) => {
+                panic_state.release_child_b = true;
+                condvar.notify_all();
+                drop(panic_state);
+                let _ = supervisor_thread.join();
+                panic!("panic after claim fixture supervisor completed before child-a callback");
+            }
+            Err(mpsc::TryRecvError::Empty) => {}
+        }
+        // Poll completion without adding a fixture execution deadline.
         panic_state = condvar
-            .wait(panic_state)
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .wait_timeout(panic_state, Duration::from_millis(25))
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .0;
     }
     assert!(!panic_state.child_c_started);
     assert!(matches!(
@@ -2612,11 +3154,12 @@ fn supervise_holds_exclusive_worktree_lease_through_child_and_parent_auditor() {
         injected_verified_run(command)
     };
 
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run write-lease regression");
@@ -2652,11 +3195,12 @@ fn injected_runner_path_violation_blocks_retry_and_primary_mutations_fail_integr
         write_injected_json(&command.output_last_message, &child);
         injected_verified_run(command)
     };
-    let report = run_supervisor_plan_with_runner(
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
         plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
         &mut runner,
     )
     .expect("run injected path violation");
@@ -2699,11 +3243,12 @@ fn injected_runner_path_violation_blocks_retry_and_primary_mutations_fail_integr
             }
             injected_verified_run(command)
         };
-        let report = run_supervisor_plan_with_runner(
+        let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
             plan,
             SupervisorConsultantPlan::default(),
             options,
             SupervisorExecutionRuntime::NonpublishableSimulation,
+            &temp,
             &mut runner,
         )
         .expect("run injected primary mutation");

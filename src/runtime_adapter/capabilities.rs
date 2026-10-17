@@ -27,6 +27,36 @@ pub enum AdapterId {
 }
 
 impl AdapterId {
+    /// The configured bridge protocol; this alone grants no launch capability.
+    pub fn managed_parent_control_protocol(
+        self,
+    ) -> crate::selection::routing_policy::ControlTransport {
+        use crate::selection::routing_policy::ControlTransport;
+        if self == Self::Codex {
+            ControlTransport::AdapterDynamicTool
+        } else {
+            ControlTransport::SupervisorCapturedEnvelope
+        }
+    }
+    /// Choose only the protocol this concrete verified adapter can carry.
+    /// Captured envelopes are supervisor parsing, not vendor-native tool support.
+    pub fn managed_parent_control_transport(
+        self,
+        capabilities: RuntimeCapabilities,
+        native_delegation_disabled: bool,
+    ) -> Result<crate::selection::routing_policy::ControlTransport, String> {
+        if !native_delegation_disabled {
+            return Err("managed parent requires verified native delegation disabled".to_string());
+        }
+        if let Some(reason) = capabilities.read_only_inner_contract_refusal() {
+            return Err(format!("managed parent confinement refused: {reason}"));
+        }
+        if self == Self::Fake {
+            return Err("simulation adapter cannot certify a productive parent".to_string());
+        }
+        Ok(self.managed_parent_control_protocol())
+    }
+
     pub const ALL: [Self; 6] = [
         Self::Codex,
         Self::Fake,
@@ -381,19 +411,18 @@ impl RuntimeCapabilities {
         session_resume: SessionResume::Supported,
     };
 
-    /// Capabilities of a launch that has proved the immutable Grok 4.6/xhigh
-    /// adapter contract. This is deliberately separate from [`Self::GROK`]: a
-    /// vendor id or model name alone is not evidence that cwd, output, and
-    /// delegation are bounded.
-    pub(super) const GROK_4_6_XHIGH: Self = Self {
+    /// Capabilities of a launch that has proved the bounded headless protocol.
+    /// This row grants neither account access nor a writable effectful ACP route.
+    pub(super) const GROK_HEADLESS: Self = Self {
         side_effect_confinement: SideEffectConfinement::Verified,
         ..Self::GROK
     };
 
-    /// Capabilities of a launch that has proved the immutable Grok 4.7/xhigh
-    /// adapter contract. Runtime advertisement alone does not grant this row.
-    pub(super) const GROK_4_7_XHIGH: Self = Self {
+    /// Exact contained ACP leaf launches use parent identity/schema evidence.
+    /// This grants no all-tool callback, headless usage parser or session reuse.
+    pub(super) const GROK_ACP: Self = Self {
         side_effect_confinement: SideEffectConfinement::Verified,
+        session_resume: SessionResume::Unsupported,
         ..Self::GROK
     };
 
@@ -404,6 +433,14 @@ impl RuntimeCapabilities {
         model_catalog: ModelCatalogSource::RuntimeAdvertised,
         usage_reporting: UsageReporting::None,
         session_resume: SessionResume::Supported,
+    };
+
+    /// Cursor capabilities after the pinned source bridge, parent ACK protocol,
+    /// selected managed account, and native process confinement are all bound.
+    /// The generic Cursor adapter never receives this row.
+    pub(crate) const CURSOR_MANAGED: Self = Self {
+        side_effect_confinement: SideEffectConfinement::Verified,
+        ..Self::CURSOR
     };
 
     pub const CLAUDE_CODE: Self = Self {

@@ -15,6 +15,11 @@ use crate::providers::{
 };
 
 use super::LoginStatus;
+#[cfg(unix)]
+use super::{run_vendor_oauth_handoff, LoginUrlHandoff, OAuthLoginRunError};
+use super::{
+    vendor_authorization_url, ActiveLoginAuthorization, LoginAuthorization, LoginBrowserMode,
+};
 
 const PROVIDER_ID: &str = "gemini-cli";
 const CODEX_PROVIDER_ID: &str = "codex-cli";
@@ -246,9 +251,27 @@ fn wait_for_state(
         if current.state == target {
             return;
         }
+        assert!(
+            !matches!(
+                current.state,
+                LoginState::Ready
+                    | LoginState::Failed
+                    | LoginState::Cancelled
+                    | LoginState::Unknown
+            ),
+            "expected {target:?}, observed {:?}: {:?}",
+            current.state,
+            current.failure_reason
+        );
         runtime.block_on(async { tokio::time::sleep(Duration::from_millis(10)).await });
     }
-    panic!("timed out waiting for {target:?}");
+    let current = service
+        .status(&status.handle, &status.binding)
+        .expect("status");
+    panic!(
+        "timed out waiting for {target:?}, observed {:?}: {:?}",
+        current.state, current.failure_reason
+    );
 }
 
 fn write_oauth_files(home: &Path) -> crate::error::Result<()> {
@@ -796,6 +819,579 @@ fn stale_incarnation_commit_with_material_is_outcome_unknown() {
         registry
             .account(PROVIDER_ID, "work")
             .expect("replacement row")
+            .state,
+        StoredAccountState::Pending
+    );
+}
+
+#[test]
+fn caller_managed_url_is_bound_to_handle_incarnation_and_live_deadline() {
+    let (_dir, adapter, registry) = cancel_driver_adapter();
+    let (_runtime, service) = service(&registry);
+    let status = service
+        .start_with_browser_mode(
+            start_request("handoff", "handoff-key"),
+            &adapter,
+            LoginBrowserMode::CallerManaged,
+        )
+        .expect("start");
+    let operation = Arc::clone(
+        service
+            .inner
+            .lock()
+            .expect("inner")
+            .operations
+            .get(&status.handle)
+            .expect("operation"),
+    );
+    let handoff = operation.url_handoff();
+    let publish = || ActiveLoginAuthorization {
+        public: LoginAuthorization {
+            authorization_url: "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-handoff"
+                .into(),
+            expires_at_unix_ms: None,
+        },
+        valid_until: std::time::Instant::now() + Duration::from_secs(5),
+    };
+    assert!(handoff.publish(publish()));
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("bound URL")
+        .is_some());
+    let mut wrong = status.binding.clone();
+    wrong.account_incarnation = "fedcba9876543210fedcba9876543210".into();
+    assert!(service.authorization(&status.handle, &wrong).is_err());
+    let unknown = serde_json::from_str("\"unrecognized-handle\"").expect("handle");
+    assert!(service
+        .authorization(&unknown, &status.binding)
+        .expect("unknown")
+        .is_none());
+    assert!(
+        service
+            .start(start_request("handoff", "handoff-key"), &adapter)
+            .is_err(),
+        "idempotent replay may not change browser ownership"
+    );
+    operation
+        .state
+        .lock()
+        .expect("state")
+        .authorization
+        .as_mut()
+        .expect("URL")
+        .valid_until = std::time::Instant::now();
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("expired URL")
+        .is_none());
+    assert!(handoff.publish(publish()));
+    service
+        .cancel(&status.handle, &status.binding)
+        .expect("cancel");
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("cancelled URL")
+        .is_none());
+    assert!(
+        !handoff.publish(publish()),
+        "late publication after cancellation refused"
+    );
+}
+
+#[test]
+fn caller_managed_url_is_removed_for_every_terminal_outcome_and_producer_drop() {
+    for terminal in ["ready", "failed", "cancelled", "unknown", "drop"] {
+        let (_dir, adapter, registry) = cancel_driver_adapter();
+        let (_runtime, service) = service(&registry);
+        let status = service
+            .start_with_browser_mode(
+                start_request("handoff", "handoff-key"),
+                &adapter,
+                LoginBrowserMode::CallerManaged,
+            )
+            .expect("start");
+        let operation = Arc::clone(
+            service
+                .inner
+                .lock()
+                .expect("inner")
+                .operations
+                .get(&status.handle)
+                .expect("operation"),
+        );
+        let handoff = operation.url_handoff();
+        assert!(handoff.publish(ActiveLoginAuthorization {
+            public: LoginAuthorization {
+                authorization_url:
+                    "https://accounts.google.com/o/oauth2/v2/auth?state=FAKE-terminal".into(),
+                expires_at_unix_ms: None
+            },
+            valid_until: std::time::Instant::now() + Duration::from_secs(5),
+        }));
+        assert!(service
+            .authorization(&status.handle, &status.binding)
+            .expect("URL")
+            .is_some());
+        match terminal {
+            "ready" => operation.mark_ready(),
+            "failed" => operation.mark_failed("fixture failure".into()),
+            "cancelled" => operation.mark_cancelled(),
+            "unknown" => operation.mark_commit_outcome_unknown(),
+            "drop" => drop(handoff),
+            _ => unreachable!(),
+        }
+        assert!(service
+            .authorization(&status.handle, &status.binding)
+            .expect("terminal URL")
+            .is_none());
+    }
+}
+
+fn native_authorization_fixture(provider: &str) -> String {
+    let (endpoint, callback) = match provider {
+        "codex-cli" => (
+            "https://auth.openai.com/oauth/authorize",
+            "http://localhost:1455/auth/callback",
+        ),
+        "grok-cli" => (
+            "https://auth.x.ai/oauth2/authorize",
+            "http://127.0.0.1:32123/callback",
+        ),
+        "gemini-cli" => (
+            "https://accounts.google.com/o/oauth2/v2/auth",
+            "http://127.0.0.1:32123/oauth2callback",
+        ),
+        _ => unreachable!(),
+    };
+    let mut url = reqwest::Url::parse(endpoint).expect("fixture endpoint");
+    url.query_pairs_mut().extend_pairs([
+        ("response_type", "code"),
+        ("client_id", "fixture-client"),
+        ("redirect_uri", callback),
+        ("state", "fixture-state"),
+        ("code_challenge_method", "S256"),
+        (
+            "code_challenge",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ),
+    ]);
+    url.to_string()
+}
+
+#[test]
+fn native_handoff_accepts_only_official_pkce_authorization_without_secret_fields() {
+    for provider in ["codex-cli", "grok-cli", "gemini-cli"] {
+        let url = native_authorization_fixture(provider);
+        assert_eq!(
+            vendor_authorization_url(provider, &format!("  {url}")),
+            Some(url.clone())
+        );
+        for field in [
+            "code",
+            "access_token",
+            "refresh_token",
+            "id_token",
+            "client_secret",
+            "code_verifier",
+        ] {
+            assert!(vendor_authorization_url(
+                provider,
+                &format!("{url}&{field}=FAKE-private-material")
+            )
+            .is_none());
+        }
+        assert!(vendor_authorization_url(provider, &url.replace("https://", "http://")).is_none());
+        assert!(
+            vendor_authorization_url(provider, &format!("{url}#FAKE-private-fragment")).is_none()
+        );
+        assert!(vendor_authorization_url(provider, &url.replace("S256", "plain")).is_none());
+        let mut hostile_redirect = reqwest::Url::parse(&url).expect("URL");
+        let pairs: Vec<_> = hostile_redirect
+            .query_pairs()
+            .into_owned()
+            .map(|(key, value)| {
+                let value = if key == "redirect_uri" {
+                    "https://example.invalid/callback".to_string()
+                } else {
+                    value
+                };
+                (key, value)
+            })
+            .collect();
+        hostile_redirect
+            .query_pairs_mut()
+            .clear()
+            .extend_pairs(pairs);
+        assert!(vendor_authorization_url(provider, hostile_redirect.as_str()).is_none());
+        let wrong_provider = if provider == "codex-cli" {
+            "grok-cli"
+        } else {
+            "codex-cli"
+        };
+        assert!(vendor_authorization_url(wrong_provider, &url).is_none());
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn native_handoff_discards_raw_output_and_cancels_only_its_owned_fixture_child() {
+    let url = native_authorization_fixture("codex-cli");
+    let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+    let handoff = LoginUrlHandoff::new(move |authorization| {
+        published_tx
+            .send(authorization.map(|value| value.public.authorization_url))
+            .is_ok()
+    });
+    let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+    let mut command = std::process::Command::new("/bin/sh");
+    command.args([
+        "-c", "test \"$BROWSER\" = /bin/true || exit 7; printf 'FAKE-BEARER-PRIVATE\\n'; printf 'FAKE-CODE-PRIVATE\\n%s\\n' \"$1\" >&2; exec sleep 30",
+        "owned-native-login-fixture", &url,
+    ]);
+    let task = tokio::spawn(run_vendor_oauth_handoff(
+        command,
+        "codex-cli",
+        cancel_rx,
+        handoff,
+    ));
+    let published = tokio::time::timeout(Duration::from_secs(2), published_rx.recv())
+        .await
+        .expect("bounded publication")
+        .expect("publication");
+    assert_eq!(published, Some(url));
+    cancel_tx.send(true).expect("owned cancel");
+    let result = tokio::time::timeout(Duration::from_secs(2), task)
+        .await
+        .expect("bounded owned-child cancellation")
+        .expect("task");
+    assert!(matches!(result, Err(OAuthLoginRunError::Cancelled)));
+    assert_eq!(
+        published_rx.recv().await,
+        Some(None),
+        "producer drop invalidates URL"
+    );
+    assert!(
+        published_rx.recv().await.is_none(),
+        "raw output never entered the handoff"
+    );
+}
+
+fn cursor_authorization_fixture() -> String {
+    format!(
+        "https://cursor.com/loginDeepControl?challenge={}&uuid=01234567-89ab-4cde-8fab-0123456789ab&mode=login&redirectTarget=cli",
+        "A".repeat(43),
+    )
+}
+
+#[test]
+fn cursor_handoff_accepts_only_public_native_cli_challenge_requests() {
+    let url = cursor_authorization_fixture();
+    assert_eq!(vendor_authorization_url("cursor", &url), Some(url.clone()));
+    assert_eq!(
+        vendor_authorization_url(
+            "cursor",
+            &format!("Open a browser and navigate to this link: {url}")
+        ),
+        Some(url.clone()),
+    );
+    for rejected in [
+        url.replace("https://", "http://"),
+        url.replace("cursor.com", "cursor.com.example.invalid"),
+        url.replace("cursor.com", "auth.cursor.com"),
+        url.replace("cursor.com", "owner@cursor.com"),
+        url.replace("cursor.com", "cursor.com:444"),
+        url.replace("/loginDeepControl", "/callback"),
+        url.replace("mode=login", "mode=other"),
+        url.replace("redirectTarget=cli", "redirectTarget=editor"),
+        url.replace("&mode=login", ""),
+        url.replace("01234567-89ab-4cde-8fab-0123456789ab", "not-a-uuid"),
+        url.replace("-4cde-", "-1cde-"),
+        url.replace("-8fab-", "-0fab-"),
+        url.replace(&"A".repeat(43), &"A".repeat(42)),
+        url.replace(&"A".repeat(43), &"!".repeat(43)),
+        format!("{url}#private-fragment"),
+        format!("{url}&uuid=01234567-89ab-4cde-8fab-0123456789ab"),
+        format!("{url}&redirectTarget=https://example.invalid"),
+        format!("{url}&supportsSelectedTeamLogin=true"),
+        format!("unrecognized output {url}"),
+        format!("{url}\x1b[0m"),
+    ] {
+        assert!(vendor_authorization_url("cursor", &rejected).is_none());
+    }
+    for secret in [
+        "verifier",
+        "code",
+        "access_token",
+        "refresh_token",
+        "id_token",
+        "client_secret",
+    ] {
+        assert!(
+            vendor_authorization_url("cursor", &format!("{url}&{secret}=FAKE-private")).is_none()
+        );
+    }
+    assert!(
+        vendor_authorization_url("cursor", &native_authorization_fixture("codex-cli")).is_none()
+    );
+    assert!(vendor_authorization_url("codex-cli", &url).is_none());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_native_handoff_reads_separate_output_channels_and_reaps_on_cancel() {
+    for channel in ["stdout", "stderr"] {
+        let url = cursor_authorization_fixture();
+        let (published_tx, mut published_rx) = tokio::sync::mpsc::unbounded_channel();
+        let handoff = LoginUrlHandoff::new(move |authorization| {
+            published_tx
+                .send(authorization.map(|value| value.public.authorization_url))
+                .is_ok()
+        });
+        let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(false);
+        let mut command = std::process::Command::new("/bin/sh");
+        command.args([
+            "-c",
+            "printf 'FAKE-PRIVATE-STDERR\\n' >&2; printf 'FAKE-PRIVATE-STDOUT\\n'; if test \"$2\" = stderr; then printf 'Open a browser and navigate to this link: %s\\n' \"$1\" >&2; else printf 'Open a browser and navigate to this link: %s\\n' \"$1\"; fi; exec sleep 30",
+            "owned-cursor-login-fixture", &url, channel,
+        ]);
+        let task = tokio::spawn(run_vendor_oauth_handoff(
+            command, "cursor", cancel_rx, handoff,
+        ));
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), published_rx.recv())
+                .await
+                .expect("bounded URL"),
+            Some(Some(url)),
+        );
+        cancel_tx.send(true).expect("cancel owned child");
+        let result = tokio::time::timeout(Duration::from_secs(2), task)
+            .await
+            .expect("bounded kill and reap")
+            .expect("task");
+        assert!(matches!(result, Err(OAuthLoginRunError::Cancelled)));
+        assert_eq!(published_rx.recv().await, Some(None));
+        assert!(
+            published_rx.recv().await.is_none(),
+            "raw output was never published"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cursor_caller_managed_operation_binds_native_url_and_refuses_stale_or_late_actions() {
+    use crate::providers::cursor::CursorAdapter;
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().expect("owned fixture");
+    let root = std::fs::canonicalize(dir.path()).expect("fresh trusted root");
+    let data = root.join("data");
+    let cwd = root.join("workspace");
+    std::fs::create_dir(&cwd).expect("workspace");
+    let program = root.join("inert-cursor-login");
+    let url = cursor_authorization_fixture();
+    std::fs::write(&program, format!(
+        "#!/bin/sh\ntest \"$1\" = login && test \"$NO_OPEN_BROWSER\" = 1 && test \"$BROWSER\" = /bin/true && test \"$AGENT_CLI_CREDENTIAL_STORE\" = file && test \"$CURSOR_CONFIG_DIR\" = \"$HOME/.cursor\" && test -z \"${{CURSOR_API_KEY+x}}\" || exit 7\nprintf 'FAKE-PRIVATE-NOT-A-URL\\n' >&2\nprintf 'Open a browser and navigate to this link: %s\\n' '{url}'\nexec sleep 30\n",
+    )).expect("inert script, no provider or credential writes");
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700))
+        .expect("owned executable");
+    let adapter = CursorAdapter::default()
+        .with_data_dir(&data)
+        .with_working_directory(&cwd)
+        .with_program(program);
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        tokio::runtime::Handle::current(),
+    );
+    let request = LoginStartRequest {
+        provider_id: "cursor".into(),
+        ..start_request("handoff", "cursor-handoff")
+    };
+    let status = service
+        .start_pending_oauth_with_browser_mode(
+            request.clone(),
+            &adapter,
+            LoginBrowserMode::CallerManaged,
+        )
+        .expect("Cursor caller-managed start");
+    let authorization = tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if let Some(value) = service
+                .authorization(&status.handle, &status.binding)
+                .expect("bound action")
+            {
+                break value;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("actual adapter stdout reached operation");
+    assert_eq!(authorization.authorization_url, url);
+    assert!(authorization.expires_at_unix_ms.is_some());
+    let public_status = service
+        .status(&status.handle, &status.binding)
+        .expect("bound live status");
+    assert!(!format!("{public_status:?}").contains("cursor.com"));
+    let replay = service
+        .start_pending_oauth_with_browser_mode(
+            request.clone(),
+            &adapter,
+            LoginBrowserMode::CallerManaged,
+        )
+        .expect("same-mode idempotency");
+    assert_eq!(replay.handle, status.handle);
+    assert!(
+        service.start_pending_oauth(request, &adapter).is_err(),
+        "automatic replay cannot steal browser ownership"
+    );
+    let mut stale = status.binding.clone();
+    stale.account_incarnation = "stale-incarnation".into();
+    assert!(service.authorization(&status.handle, &stale).is_err());
+    assert!(service.cancel(&status.handle, &stale).is_err());
+    let unknown = serde_json::from_str("\"stale-cursor-handle\"").expect("opaque handle");
+    assert!(service
+        .authorization(&unknown, &status.binding)
+        .expect("unknown handle")
+        .is_none());
+    let operation = Arc::clone(
+        service
+            .inner
+            .lock()
+            .expect("inner")
+            .operations
+            .get(&status.handle)
+            .expect("operation"),
+    );
+    operation
+        .state
+        .lock()
+        .expect("state")
+        .authorization
+        .as_mut()
+        .expect("URL")
+        .valid_until = std::time::Instant::now();
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("expired")
+        .is_none());
+    service
+        .cancel(&status.handle, &status.binding)
+        .expect("cancel");
+    assert!(service
+        .authorization(&status.handle, &status.binding)
+        .expect("cancelled")
+        .is_none());
+    let late = operation.url_handoff();
+    assert!(!late.publish(ActiveLoginAuthorization {
+        public: LoginAuthorization {
+            authorization_url: url,
+            expires_at_unix_ms: None
+        },
+        valid_until: std::time::Instant::now() + Duration::from_secs(5),
+    }));
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if service
+                .status(&status.handle, &status.binding)
+                .expect("status")
+                .state
+                == LoginState::Cancelled
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("owned child reaped before terminal cancellation");
+    assert_eq!(
+        registry
+            .account("cursor", "handoff")
+            .expect("pending account")
+            .state,
+        StoredAccountState::Pending
+    );
+    assert!(
+        !data
+            .join("accounts/cursor/handoff/.cursor/auth.json")
+            .exists(),
+        "fixture never manufactures authentication"
+    );
+}
+
+#[tokio::test]
+async fn authority_login_port_carries_cursor_caller_mode_without_starting_a_provider() {
+    use crate::account_authority::{GeminiLoginPort, LoginPort};
+    use crate::providers::cursor::CursorAdapter;
+
+    let dir = tempfile::tempdir().expect("owned fixture");
+    let root = std::fs::canonicalize(dir.path()).expect("fresh trusted root");
+    let data = root.join("data");
+    let registry = StoredAccountRegistry::new(paths::stored_accounts_path(&data));
+    let service = LoginService::new(
+        StoredAccountRegistry::new(registry.metadata_path().to_path_buf()),
+        tokio::runtime::Handle::current(),
+    );
+    let cursor = CursorAdapter::with_home(&root)
+        .with_data_dir(&data)
+        .with_working_directory(&root)
+        .with_test_oauth_watch_cancel_driver();
+    let port = GeminiLoginPort::new(
+        service,
+        GeminiCliAdapter::default(),
+        ClaudeCodeAdapter::default(),
+    )
+    .with_cursor_adapter(cursor);
+    let request = LoginStartRequest {
+        provider_id: "cursor".into(),
+        ..start_request("port-handoff", "cursor-port-handoff")
+    };
+    let status = port
+        .start_with_browser_mode(request.clone(), LoginBrowserMode::CallerManaged)
+        .expect("concrete authority port admits Cursor owner-managed mode");
+    assert_eq!(status.binding.provider_id, "cursor");
+    assert_eq!(status.binding.account_id, "port-handoff");
+    assert_eq!(status.state, LoginState::WaitingForUser);
+    assert!(port
+        .authorization(&status.handle, &status.binding)
+        .expect("no invented URL")
+        .is_none());
+    assert_eq!(
+        port.start_with_browser_mode(request.clone(), LoginBrowserMode::CallerManaged)
+            .expect("same-mode replay")
+            .handle,
+        status.handle,
+    );
+    assert!(
+        port.start(request).is_err(),
+        "automatic replay cannot change browser ownership"
+    );
+    let mut stale = status.binding.clone();
+    stale.account_incarnation = "stale-incarnation".into();
+    assert!(port.cancel(&status.handle, &stale).is_err());
+    port.cancel(&status.handle, &status.binding)
+        .expect("owned cancel");
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if port
+                .status(&status.handle, &status.binding)
+                .expect("bound status")
+                .state
+                == LoginState::Cancelled
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .expect("inert driver honours cancellation");
+    assert_eq!(
+        registry
+            .account("cursor", "port-handoff")
+            .expect("pending row")
             .state,
         StoredAccountState::Pending
     );

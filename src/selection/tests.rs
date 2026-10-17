@@ -55,6 +55,7 @@ fn catalog(
             .map(|(model, efforts, long_context)| CatalogModel {
                 model: (*model).to_string(),
                 available: true,
+                access: None,
                 supported_efforts: efforts.to_vec(),
                 capabilities: capabilities(task_class, authority, *long_context),
             })
@@ -194,6 +195,622 @@ pub(crate) fn base_input() -> SelectionInput {
         },
         debug_override: None,
         operational_observations: None,
+    }
+}
+
+pub(crate) fn loaded_policy_test_receipt() -> anyhow::Result<routing_policy::RoutingPolicyReceipt> {
+    use super::routing_policy::*;
+    let temp = tempfile::tempdir()?;
+    Ok(RoutingPolicyReceipt {
+        frozen: load_routing_policy(temp.path())?,
+        role: "worker".into(),
+        features: TaskRoutingFeatures {
+            scope_paths: 1,
+            scope_modules: 0,
+            complexity: 0,
+            risk: 0,
+            horizon: 0,
+            context_tokens: 0,
+            dependency_edges: 0,
+            independent_groups: 1,
+            evidence: vec!["test scope".into()],
+        },
+    })
+}
+
+fn single_current_prior_input() -> SelectionInput {
+    let mut input = base_input();
+    input.catalogs.truncate(1);
+    input.catalogs[0].models.truncate(1);
+    input.catalogs[0].models[0].supported_efforts = [ReasoningEffort::High].into_iter().collect();
+    let prior = input
+        .priors
+        .models
+        .iter_mut()
+        .find(|prior| {
+            prior.runtime == input.catalogs[0].runtime
+                && prior.model == input.catalogs[0].models[0].model
+        })
+        .expect("current fixture prior");
+    prior.prohibited = false;
+    prior.prohibited_authority_roles.clear();
+    prior.prohibition_reason = Some("current operator evaluation prohibition".into());
+    input
+}
+
+#[test]
+fn loaded_policy_preserves_current_model_wide_prohibition() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for routing in [None, Some(&receipt)] {
+        let mut input = single_current_prior_input();
+        let permitted = select_with_loaded_routing_policy(&input, &[], routing)?;
+        assert!(
+            permitted.choice.is_some(),
+            "permitted control must remain selectable"
+        );
+        let candidate = permitted.choice.as_ref().unwrap().candidate.clone();
+        let prior = input
+            .priors
+            .models
+            .iter_mut()
+            .find(|prior| prior.runtime == candidate.runtime && prior.model == candidate.model)
+            .unwrap();
+        prior.prohibited = true;
+        let prohibited = select_with_loaded_routing_policy(&input, &[], routing)?;
+        assert!(prohibited.choice.is_none());
+        assert!(!prohibited.candidate_set[0].eligible);
+        assert!(prohibited.candidate_set[0].score.is_none());
+        let reasons = &prohibited.candidate_set[0].ineligibility_reasons;
+        assert_eq!(
+            reasons
+                .iter()
+                .filter(|reason| reason.code == IneligibilityCode::PolicyProhibited)
+                .count(),
+            1
+        );
+        assert!(reasons
+            .iter()
+            .any(|reason| reason.code == IneligibilityCode::PolicyProhibited
+                && reason.detail == "current operator evaluation prohibition"));
+    }
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_preserves_current_role_prohibition_and_permitted_role() -> anyhow::Result<()> {
+    let mut receipt = loaded_policy_test_receipt()?;
+    let mut input = single_current_prior_input();
+    input.catalogs[0].models[0]
+        .capabilities
+        .authority_roles
+        .insert(AuthorityRole::ReviewAuditor);
+    input
+        .priors
+        .models
+        .iter_mut()
+        .find(|prior| {
+            prior.runtime == input.catalogs[0].runtime
+                && prior.model == input.catalogs[0].models[0].model
+        })
+        .unwrap()
+        .prohibited_authority_roles
+        .insert(AuthorityRole::ReviewAuditor);
+    let permitted = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(
+        permitted.choice.is_some(),
+        "role-specific prohibition must not exclude a permitted role"
+    );
+    assert!(!permitted.candidate_set[0]
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited));
+    input.task.authority_role = AuthorityRole::ReviewAuditor;
+    receipt.role = "auditor".into();
+    let prohibited = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(prohibited.choice.is_none());
+    assert!(!prohibited.candidate_set[0].eligible);
+    assert!(prohibited.candidate_set[0].score.is_none());
+    assert!(prohibited.candidate_set[0]
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited));
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_unknown_model_none_effort_is_honest_and_exactly_authorized() -> anyhow::Result<()>
+{
+    use super::routing_policy::*;
+    let temp = tempfile::tempdir()?;
+    let frozen = load_routing_policy(temp.path())?;
+    let receipt = RoutingPolicyReceipt {
+        frozen: frozen.clone(),
+        role: "worker".into(),
+        features: TaskRoutingFeatures {
+            scope_paths: 1,
+            scope_modules: 0,
+            complexity: 0,
+            risk: 0,
+            horizon: 0,
+            context_tokens: 0,
+            dependency_edges: 0,
+            independent_groups: 1,
+            evidence: vec!["test scope".into()],
+        },
+    };
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert!(decision.candidate_set.iter().all(|entry| !entry
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::PolicyProhibited)));
+    let chosen = decision
+        .choice
+        .as_ref()
+        .expect("unknown model policy choice");
+    assert_eq!(chosen.candidate.effort, ReasoningEffort::None);
+    let evidence = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == chosen.candidate)
+        .and_then(|entry| entry.loaded_policy_evidence.as_ref())
+        .expect("explicit unknown evidence");
+    assert_eq!(evidence.quality_basis_points, None);
+    assert_eq!(evidence.expected_accepted_cycle_cost_microunits, None);
+    assert_eq!(evidence.samples, 0);
+    assert!(evidence.uncertainty_penalty > 0);
+    let _binding = bind_routing_policy(Some(frozen))?;
+    assert!(validate_selected_launch("worker", "codex", &chosen.candidate.model, "none").is_err());
+    seal_selected_candidate("worker", &decision)?;
+    validate_selected_launch("worker", "codex", &chosen.candidate.model, "none")?;
+    for (role, runtime, model, effort) in [
+        ("auditor", "codex", chosen.candidate.model.as_str(), "none"),
+        ("worker", "grok", chosen.candidate.model.as_str(), "none"),
+        ("worker", "codex", "unselected-model", "none"),
+        ("worker", "codex", chosen.candidate.model.as_str(), "high"),
+    ] {
+        assert!(validate_selected_launch(role, runtime, model, effort).is_err());
+    }
+    input.catalogs[0].models[0].available = false;
+    assert!(
+        select_with_loaded_routing_policy(&input, &[], Some(&receipt))?
+            .choice
+            .is_none()
+    );
+    input.catalogs[0].models[0].available = true;
+    input.pools[0].admission_open = false;
+    assert!(
+        select_with_loaded_routing_policy(&input, &[], Some(&receipt))?
+            .choice
+            .is_none()
+    );
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_score_semantics_v1_remains_deserializable() {
+    let v1 = serde_json::from_value::<RoutingScoreSemantics>(serde_json::json!(
+        "loaded_policy_evidence_penalty_v1"
+    ))
+    .expect("historical loaded-policy v1 token");
+    assert_eq!(v1, RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV1);
+    let v2 = serde_json::from_value::<RoutingScoreSemantics>(serde_json::json!(
+        "loaded_policy_evidence_penalty_v2"
+    ))
+    .expect("loaded-policy v2 token");
+    assert_eq!(v2, RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2);
+
+    let schema = schema::selection_event_schema_value();
+    let score = &schema["properties"]["provenance"]["properties"]["candidate_set"]["items"]
+        ["properties"]["score"];
+    let score_object = score["oneOf"]
+        .as_array()
+        .expect("nullable score schema")
+        .iter()
+        .find(|alt| alt.get("properties").is_some())
+        .expect("candidate_set item score object schema");
+    let tokens = score_object["properties"]["routing_score_semantics"]["enum"]
+        .as_array()
+        .expect("routing_score_semantics enum");
+    let tokens = tokens
+        .iter()
+        .filter_map(serde_json::Value::as_str)
+        .collect::<Vec<_>>();
+    assert!(tokens.contains(&"legacy_baseline_plus_cost_proxy_adjustments_v1"));
+    assert!(tokens.contains(&"loaded_policy_evidence_penalty_v1"));
+    assert!(tokens.contains(&"loaded_policy_evidence_penalty_v2"));
+}
+
+#[test]
+fn loaded_policy_unknown_evidence_skips_quality_normalization() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let candidate = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "account-advertised-unmeasured-model".to_string(),
+        effort: ReasoningEffort::None,
+    };
+    input.signals.previous_choice = Some(candidate.clone());
+    input.signals.retry_count = 3;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-unknown-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let evaluation = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == candidate)
+        .expect("unknown loaded-policy evaluation");
+    let evidence = evaluation
+        .loaded_policy_evidence
+        .as_ref()
+        .expect("unknown loaded-policy evidence");
+    assert_eq!(evidence.quality_basis_points, None);
+    assert_eq!(evidence.expected_accepted_cycle_cost_microunits, None);
+    assert!(evidence.uncertainty_penalty > 0);
+    let score = evaluation
+        .score
+        .as_ref()
+        .expect("unknown loaded-policy score");
+    assert_eq!(
+        score.routing_score_semantics,
+        RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+    );
+    assert_eq!(score.posterior_quality_basis_points, 0);
+    assert_eq!(score.retry_cost_microunits, 0);
+    assert_eq!(score.human_review_cost_proxy_microunits, 0);
+    assert_eq!(score.human_review_adjustment_microunits, 0);
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_observed_ledger_without_class_fit_applies_review_tradeoffs() -> anyhow::Result<()>
+{
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = base_input();
+    input.catalogs = vec![catalog(
+        "codex",
+        "observed-menu",
+        "localized_code_change",
+        AuthorityRole::TerminalLeaf,
+        &[(
+            "account-advertised-unmeasured-model",
+            &[ReasoningEffort::None],
+            true,
+        )],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    let candidate = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "account-advertised-unmeasured-model".to_string(),
+        effort: ReasoningEffort::None,
+    };
+    input.outcomes.push(OutcomeRecord {
+        attempt_id: "attempt-1".to_string(),
+        task: input.task.clone(),
+        candidate: candidate.clone(),
+        result: OutcomeResult::Accepted,
+        failure_class: None,
+        execution_cost_microunits: 10,
+        review_cost_microunits: 25,
+        rework_cost_microunits: 8,
+        rereview_cost_microunits: 0,
+        environment_cost_microunits: 0,
+        environment_failures: Vec::new(),
+        fixed_cause_relaunch: None,
+    });
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-observed-ledger-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let evaluation = decision
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == candidate)
+        .expect("observed-ledger loaded-policy evaluation");
+    assert!(evaluation.prior_source_id.is_none());
+    assert!(evaluation.eligible);
+    let evidence = evaluation
+        .loaded_policy_evidence
+        .as_ref()
+        .expect("observed-ledger loaded-policy evidence");
+    assert!(evidence.quality_basis_points.is_some());
+    assert!(evidence.expected_accepted_cycle_cost_microunits.is_some());
+    assert_eq!(evidence.uncertainty_penalty, 0);
+    let score = evaluation
+        .score
+        .as_ref()
+        .expect("observed-ledger loaded-policy score");
+    assert_eq!(
+        score.routing_score_semantics,
+        RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+    );
+    assert_eq!(score.human_review_cost_proxy_microunits, 25);
+    assert_eq!(score.retry_rework_cost_proxy_microunits, 8);
+    assert_eq!(
+        score.human_review_adjustment_microunits,
+        score.human_review_cost_proxy_microunits * 75 / 25
+    );
+    assert_eq!(
+        score.total_score_microunits,
+        score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+    );
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_known_fit_uses_prior_review_and_previous_choice_retry() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "review-sensitive-known-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 25;
+    profile.tradeoffs.human_review_percent = 75;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let initial = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    for evaluation in initial.candidate_set.iter().filter(|entry| entry.eligible) {
+        let score = evaluation.score.as_ref().expect("known-fit loaded score");
+        assert_eq!(
+            score.routing_score_semantics,
+            RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
+        );
+        assert_eq!(score.retry_cost_microunits, 0);
+        assert_eq!(
+            score.human_review_adjustment_microunits,
+            score.human_review_cost_proxy_microunits * 75 / 25
+        );
+        assert_eq!(
+            score.total_score_microunits,
+            score.legacy_baseline_score_microunits + score.total_adjustment_microunits
+        );
+        assert!(score.human_review_cost_proxy_microunits > 0);
+    }
+    let previous = initial
+        .choice
+        .as_ref()
+        .expect("known-fit loaded choice")
+        .candidate
+        .clone();
+    input.signals.previous_choice = Some(previous.clone());
+    input.signals.retry_count = 3;
+    let retried = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let previous_score = retried
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .and_then(|entry| entry.score.as_ref())
+        .expect("previous loaded-policy retry score");
+    assert!(previous_score.retry_cost_microunits > 0);
+    assert!(retried.candidate_set.iter().all(|entry| {
+        entry.candidate == previous
+            || entry
+                .score
+                .as_ref()
+                .is_none_or(|score| score.retry_cost_microunits == 0)
+    }));
+    Ok(())
+}
+
+#[test]
+fn loaded_policy_nonzero_retry_rework_weight_adds_utility_preference_not_a_second_bill(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut profile = crate::objective_profile::default_objective_profile();
+    profile.id = "retry-rework-utility-loaded-v1".to_string();
+    profile.tradeoffs.monetary_cost_percent = 75;
+    profile.tradeoffs.quota_consumption_percent = 0;
+    profile.tradeoffs.latency_percent = 0;
+    profile.tradeoffs.retry_rework_percent = 25;
+    profile.tradeoffs.human_review_percent = 0;
+    let mut input = base_input();
+    input.resolved_objective_profile = resolved_routing_profile(
+        profile,
+        crate::objective_profile::ObjectiveProfileSource::RepositoryOverride,
+    );
+    let initial = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let previous = initial
+        .choice
+        .as_ref()
+        .expect("initial loaded-policy choice")
+        .candidate
+        .clone();
+    let before = initial
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .and_then(|entry| entry.score.as_ref())
+        .expect("initial previous-candidate score");
+    assert_eq!(before.retry_cost_microunits, 0);
+    assert_eq!(before.switch_cost_microunits, 0);
+    assert_eq!(before.switch_transition, ContextSwitchTransition::Continue);
+    let r = before.retry_rework_cost_proxy_microunits;
+    let before_cycle = before.expected_total_cost_per_accepted_task_microunits;
+    let before_baseline = before.legacy_baseline_score_microunits;
+    let before_total = before.total_score_microunits;
+    input.signals.previous_choice = Some(previous.clone());
+    input.signals.retry_count = 3;
+    let retried = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    let after_eval = retried
+        .candidate_set
+        .iter()
+        .find(|entry| entry.candidate == previous)
+        .expect("retried previous-candidate evaluation");
+    let after = after_eval
+        .score
+        .as_ref()
+        .expect("retried previous-candidate score");
+    let p = after.retry_cost_microunits;
+    assert!(p > 0);
+    assert!(retried.candidate_set.iter().all(|entry| {
+        entry.candidate == previous
+            || entry
+                .score
+                .as_ref()
+                .is_none_or(|score| score.retry_cost_microunits == 0)
+    }));
+    assert_eq!(
+        after.expected_total_cost_per_accepted_task_microunits,
+        before_cycle
+    );
+    assert_eq!(
+        after_eval
+            .loaded_policy_evidence
+            .as_ref()
+            .and_then(|evidence| evidence.expected_accepted_cycle_cost_microunits),
+        Some(before_cycle)
+    );
+    assert_eq!(after.switch_cost_microunits, 0);
+    assert_eq!(after.switch_transition, ContextSwitchTransition::Continue);
+    assert_eq!(after.legacy_baseline_score_microunits, before_baseline + p);
+    assert_eq!(after.retry_rework_cost_proxy_microunits, r + p);
+    assert_eq!(after.human_review_adjustment_microunits, 0);
+    let expected_total_increment = p + ((r + p) * 25 / 75) - (r * 25 / 75);
+    assert_eq!(
+        after.total_score_microunits,
+        before_total + expected_total_increment
+    );
+    Ok(())
+}
+
+#[test]
+fn legacy_catalog_access_absence_preserves_wire_digest_and_replay() {
+    let input = base_input();
+    let legacy_bytes = serde_json::to_vec(&input).unwrap();
+    let legacy: serde_json::Value = serde_json::from_slice(&legacy_bytes).unwrap();
+    for catalog in legacy["catalogs"].as_array().unwrap() {
+        for model in catalog["models"].as_array().unwrap() {
+            assert!(model.get("access").is_none());
+            assert_eq!(model.as_object().unwrap().len(), 4);
+        }
+    }
+    let restored: SelectionInput = serde_json::from_slice(&legacy_bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&restored).unwrap(), legacy_bytes);
+    assert!(restored
+        .catalogs
+        .iter()
+        .all(|catalog| { catalog.models.iter().all(|model| model.access.is_none()) }));
+    let decision = select(&input).unwrap();
+    let replayed = select(&restored).unwrap();
+    assert_eq!(decision, replayed);
+    let catalog_bytes = serde_json::to_vec(&decision.normalized_input.catalogs).unwrap();
+    assert_eq!(
+        decision.input_digests.catalogs.value,
+        crate::artifacts::state_auth::sha256_hex(&catalog_bytes)
+    );
+    assert_eq!(decision.schema_version, 4);
+}
+
+#[test]
+fn typed_catalog_access_survives_normalization_and_changes_digests() {
+    use crate::selection::ModelAccessOutcome;
+    let mut input = base_input();
+    let runtime = input.catalogs[0].runtime.clone();
+    let model = input.catalogs[0].models[0].model.clone();
+    input.catalogs[0].models[0].access = Some(ModelAccessOutcome::UnknownAccess);
+    let unknown = select(&input).unwrap();
+    input.catalogs[0].models[0].access = Some(ModelAccessOutcome::Available);
+    let available = select(&input).unwrap();
+    for (decision, access) in [
+        (&unknown, ModelAccessOutcome::UnknownAccess),
+        (&available, ModelAccessOutcome::Available),
+    ] {
+        let retained = decision
+            .normalized_input
+            .catalogs
+            .iter()
+            .find(|catalog| catalog.runtime == runtime)
+            .unwrap()
+            .models
+            .iter()
+            .find(|entry| entry.model == model)
+            .unwrap();
+        assert_eq!(retained.access, Some(access));
+        assert!(retained.available);
+        let candidates: Vec<_> = decision
+            .candidate_set
+            .iter()
+            .filter(|entry| entry.candidate.runtime == runtime && entry.candidate.model == model)
+            .collect();
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|entry| !entry
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| reason.code == IneligibilityCode::CatalogUnavailable)));
+    }
+    assert_ne!(
+        unknown.input_digests.catalogs,
+        available.input_digests.catalogs
+    );
+    assert_ne!(
+        unknown.input_digests.normalized_input,
+        available.input_digests.normalized_input
+    );
+}
+
+#[test]
+fn explicit_catalog_access_never_overrides_eligibility_refusal() {
+    use crate::selection::ModelAccessOutcome;
+    for (eligible, access) in [
+        (true, ModelAccessOutcome::Unavailable),
+        (false, ModelAccessOutcome::Available),
+    ] {
+        let mut input = base_input();
+        let runtime = input.catalogs[0].runtime.clone();
+        let model = input.catalogs[0].models[0].model.clone();
+        input.catalogs[0].models[0].available = eligible;
+        input.catalogs[0].models[0].access = Some(access);
+        let decision = select(&input).unwrap();
+        let candidates: Vec<_> = decision
+            .candidate_set
+            .iter()
+            .filter(|entry| entry.candidate.runtime == runtime && entry.candidate.model == model)
+            .collect();
+        assert!(!candidates.is_empty());
+        assert!(candidates.iter().all(|entry| !entry.eligible
+            && entry
+                .ineligibility_reasons
+                .iter()
+                .any(|reason| reason.code == IneligibilityCode::CatalogUnavailable)));
+        assert!(decision.choice.as_ref().is_none_or(|choice| {
+            choice.candidate.runtime != runtime || choice.candidate.model != model
+        }));
     }
 }
 
@@ -515,9 +1132,10 @@ fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-08-26.1");
-    assert_eq!(priors.published_on, "2026-08-26");
+    assert_eq!(priors.revision, "2026-10-15.1");
+    assert_eq!(priors.published_on, "2026-10-15");
     assert_eq!(priors.schema_version, 2);
+    assert_eq!(priors.models.len(), 9);
     assert_eq!(priors.objective_profiles[0].version, 3);
     assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-26");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
@@ -529,6 +1147,330 @@ fn built_in_data_is_dated_and_keeps_policy_in_data() {
         base_input().resolved_objective_profile.profile.switch_costs,
         ContextSwitchCosts::default()
     );
+}
+
+const ALL_AUTHORITY_ROLES: [AuthorityRole; 9] = [
+    AuthorityRole::TerminalLeaf,
+    AuthorityRole::Delegating,
+    AuthorityRole::AcceptanceGate,
+    AuthorityRole::ReviewAuditor,
+    AuthorityRole::Audit,
+    AuthorityRole::ConflictResolution,
+    AuthorityRole::FailureClassification,
+    AuthorityRole::GitPublication,
+    AuthorityRole::UnknownJudgment,
+];
+
+fn current_codex_input(authority: AuthorityRole) -> SelectionInput {
+    let mut input = base_input();
+    input.task.authority_role = authority;
+    if authority != AuthorityRole::TerminalLeaf {
+        input.task.task_class = "review_gate".into();
+        input.task.risk = RiskLevel::Critical;
+        input.task.boundedness = Boundedness::CrossCutting;
+        input.task.context = ContextSize::Long;
+        input.task.horizon = TaskHorizon::Long;
+    }
+    input.catalogs = vec![catalog(
+        "codex",
+        "codex-0.162.0",
+        &input.task.task_class,
+        authority,
+        &[
+            (
+                "gpt-6-astra",
+                &[
+                    ReasoningEffort::None,
+                    ReasoningEffort::Minimal,
+                    ReasoningEffort::Low,
+                    ReasoningEffort::Medium,
+                    ReasoningEffort::High,
+                    ReasoningEffort::Xhigh,
+                    ReasoningEffort::Max,
+                    ReasoningEffort::Ultra,
+                ],
+                true,
+            ),
+            (
+                "gpt-6.1-sol",
+                &[ReasoningEffort::High, ReasoningEffort::Xhigh],
+                true,
+            ),
+        ],
+    )];
+    input.pools = vec![pool("codex", 0)];
+    input
+}
+
+#[test]
+fn current_codex_priors_keep_owner_policy_distinct_from_measured_evidence() {
+    let priors = built_in_prior_dataset().expect("built-in priors");
+    validate_prior_dataset(&priors).expect("valid built-in priors");
+    let prior = |model| {
+        priors
+            .models
+            .iter()
+            .find(|prior| prior.runtime == "codex" && prior.model == model)
+            .expect("Codex policy prior")
+    };
+    let sol = prior("gpt-6.1-sol");
+    let previous = prior("gpt-5.6-sol");
+    assert!(sol.source_id.starts_with("owner-policy-"));
+    assert!(sol.limitations.iter().any(|limitation| limitation
+        .contains("owner-policy baseline values")
+        && limitation.contains("not measured local evidence")));
+    assert_eq!(sol.class_fit, previous.class_fit);
+    assert!(sol.strength_rank > previous.strength_rank);
+    assert_eq!(
+        sol.strong_gate_fallback_efforts,
+        previous.strong_gate_fallback_efforts
+    );
+    assert!(sol.authority_evidence.is_empty());
+    let astra = prior("gpt-6-astra");
+    let terra = prior("gpt-5.6-terra");
+    assert!(astra.prohibited && terra.prohibited);
+    assert!(astra
+        .prohibition_reason
+        .as_ref()
+        .unwrap()
+        .contains("owner policy"));
+    assert_eq!(
+        astra.prohibited_authority_roles,
+        terra.prohibited_authority_roles
+    );
+    assert_eq!(
+        astra.prohibited_authority_roles,
+        ALL_AUTHORITY_ROLES.into_iter().collect()
+    );
+    for model in ["gpt-6-sol", "gpt-6-luna"] {
+        assert_eq!(
+            priors.measured_authority_eligibility(model, AuthorityRole::TerminalLeaf),
+            MeasuredAuthorityEligibility::NoDatedEvidence
+        );
+    }
+}
+
+#[test]
+fn current_sol_passes_judgment_admission_while_astra_is_prohibited() -> anyhow::Result<()> {
+    use crate::supervise::{
+        admit_role_category, validate_known_judgment_role_model, AgentRole, RoleCategory,
+    };
+
+    for role in [
+        AgentRole::Supervisor,
+        AgentRole::ChildOrchestrator,
+        AgentRole::Worker,
+        AgentRole::Researcher,
+        AgentRole::GateClassifier,
+        AgentRole::Auditor,
+    ] {
+        validate_known_judgment_role_model(role, Some("gpt-6.1-sol"))?;
+        let denied = validate_known_judgment_role_model(role, Some("gpt-6-astra"))
+            .expect_err("standing owner prohibition must precede static capability fallback");
+        assert!(denied.to_string().contains("standing owner policy"));
+    }
+    for category in [
+        RoleCategory::DelegatingCoordinator,
+        RoleCategory::ReadOnlyReviewAuditor,
+    ] {
+        admit_role_category(category, Some("gpt-6.1-sol"))?;
+        assert!(admit_role_category(category, Some("gpt-6-astra")).is_err());
+    }
+    Ok(())
+}
+
+#[test]
+fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    let mut input = current_codex_input(AuthorityRole::AcceptanceGate);
+    // Reproduce the pre-prohibition dataset with only the unmeasured candidate available.
+    input
+        .priors
+        .models
+        .retain(|prior| prior.model != "gpt-6-astra");
+    input.catalogs[0]
+        .models
+        .retain(|model| model.model == "gpt-6-astra");
+    assert_eq!(
+        input
+            .priors
+            .measured_authority_eligibility("gpt-6-astra", input.task.authority_role),
+        MeasuredAuthorityEligibility::NoDatedEvidence
+    );
+    let legacy = select(&input)?;
+    assert!(legacy.choice.is_none());
+    assert!(legacy.candidate_set.iter().all(|evaluation| evaluation
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| reason.code == IneligibilityCode::MissingDatedPrior)));
+    let loaded = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+    assert_eq!(
+        loaded
+            .choice
+            .as_ref()
+            .expect("unmeasured policy choice")
+            .candidate
+            .model,
+        "gpt-6-astra"
+    );
+    Ok(())
+}
+
+#[test]
+fn current_codex_policy_excludes_astra_for_every_authority_and_catalog_fallback(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for authority in ALL_AUTHORITY_ROLES {
+        let input = current_codex_input(authority);
+        assert!(matches!(
+            input
+                .priors
+                .measured_authority_eligibility("gpt-6-astra", authority),
+            MeasuredAuthorityEligibility::Ineligible { .. }
+        ));
+        assert_eq!(
+            input
+                .priors
+                .measured_authority_eligibility("gpt-6.1-sol", authority),
+            MeasuredAuthorityEligibility::Eligible
+        );
+        for routing in [None, Some(&receipt)] {
+            let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
+            let astra = decision
+                .candidate_set
+                .iter()
+                .filter(|evaluation| evaluation.candidate.model == "gpt-6-astra")
+                .collect::<Vec<_>>();
+            assert_eq!(astra.len(), 8);
+            assert!(astra.iter().all(|evaluation| !evaluation.eligible
+                && evaluation.score.is_none()
+                && evaluation
+                    .ineligibility_reasons
+                    .iter()
+                    .any(|reason| reason.code == IneligibilityCode::PolicyProhibited)));
+            if authority == AuthorityRole::UnknownJudgment {
+                assert!(decision.choice.is_none());
+            } else {
+                let choice = decision.choice.expect("permitted Sol choice");
+                assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+                if routing.is_none() && authority != AuthorityRole::TerminalLeaf {
+                    assert_eq!(
+                        choice.reason,
+                        ChoiceReason::StrongestNoEvidenceJudgmentFallback
+                    );
+                    assert_eq!(choice.candidate.effort, ReasoningEffort::Xhigh);
+                }
+            }
+            let mut withdrawn = input.clone();
+            withdrawn.catalogs[0]
+                .models
+                .retain(|model| model.model != "gpt-6.1-sol");
+            assert!(select_with_loaded_routing_policy(&withdrawn, &[], routing)?
+                .choice
+                .is_none());
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn current_sol_is_the_strongest_approved_no_evidence_judgment_fallback() {
+    for authority in ALL_AUTHORITY_ROLES.into_iter().filter(|authority| {
+        !matches!(
+            authority,
+            AuthorityRole::TerminalLeaf | AuthorityRole::UnknownJudgment
+        )
+    }) {
+        let mut input = current_codex_input(authority);
+        let mut previous = input.catalogs[0].models[1].clone();
+        previous.model = "gpt-5.6-sol".into();
+        input.catalogs[0].models.push(previous);
+        let decision = select(&input).expect("owner-policy default gate fallback");
+        let choice = decision.choice.expect("strong Sol judgment choice");
+        assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+        assert_eq!(
+            choice.reason,
+            ChoiceReason::StrongestNoEvidenceJudgmentFallback
+        );
+    }
+}
+
+#[test]
+fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_override(
+) -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for authority in ALL_AUTHORITY_ROLES {
+        let mut input = current_codex_input(authority);
+        let source = CandidateKey {
+            runtime: "codex".into(),
+            model: "gpt-6.1-sol".into(),
+            effort: ReasoningEffort::Xhigh,
+        };
+        let target = CandidateKey {
+            model: "gpt-6-astra".into(),
+            ..source.clone()
+        };
+        input
+            .priors
+            .models
+            .iter_mut()
+            .find(|prior| prior.model == source.model)
+            .unwrap()
+            .one_shot_environment_fallbacks
+            .push(OneShotEnvironmentFallback {
+                rejection_code: "test_environment_rejection".into(),
+                target_runtime: target.runtime.clone(),
+                target_model: target.model.clone(),
+                target_effort: target.effort,
+            });
+        input.signals.previous_choice = Some(source.clone());
+        input
+            .signals
+            .environment_rejections
+            .push(EnvironmentRejectionState {
+                candidate: source,
+                rejection_code: "test_environment_rejection".into(),
+                evidence_id: "test-rejection-evidence".into(),
+                fallback_transition_used: false,
+            });
+        if authority != AuthorityRole::UnknownJudgment {
+            let mut no_prior = input.clone();
+            no_prior
+                .priors
+                .models
+                .retain(|prior| prior.model != target.model);
+            let control = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
+            assert_eq!(
+                control
+                    .choice
+                    .expect("unmeasured environment fallback")
+                    .reason,
+                ChoiceReason::OneShotEnvironmentFallback
+            );
+            assert_eq!(control.environment_fallback.unwrap().target, target);
+        }
+        for routing in [None, Some(&receipt)] {
+            let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
+            assert!(decision.environment_fallback.is_none());
+            assert!(decision
+                .choice
+                .is_none_or(|choice| choice.candidate.model == "gpt-6.1-sol"));
+            let mut overridden = input.clone();
+            overridden.constraints.allow_debug_override = true;
+            overridden.debug_override = Some(DebugOverride {
+                candidate: target.clone(),
+                requested_by: "test operator".into(),
+                reason: "prove the standing prohibition survives an explicit override".into(),
+            });
+            let decision = select_with_loaded_routing_policy(&overridden, &[], routing)?;
+            assert!(decision.choice.is_none());
+            assert_eq!(
+                decision.debug_override.unwrap().disposition,
+                DebugOverrideDisposition::Rejected
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]
@@ -2040,6 +2982,7 @@ fn prohibited_debug_override_is_rejected_and_fails_closed() {
     input.catalogs[0].models.push(CatalogModel {
         model: "gpt-5.6-terra".to_string(),
         available: true,
+        access: None,
         supported_efforts: vec![ReasoningEffort::High],
         capabilities: capabilities("localized_code_change", AuthorityRole::TerminalLeaf, false),
     });

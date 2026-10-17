@@ -81,7 +81,7 @@ impl NestedWorkerSerialDriver<'_, '_, '_, '_> {
         &self,
         expected: &[ExpectedWorkerRequest],
     ) -> Result<ValidatedParentTurnYield> {
-        Self::verify_parent_quiescence(self.parent, self.preflight)?;
+        Self::verify_parent_quiescence(&self.parent, self.preflight)?;
         self.parent_admission.revalidate(
             &AssignmentAttemptAuthority::from_preflight(
                 self.context,
@@ -89,7 +89,7 @@ impl NestedWorkerSerialDriver<'_, '_, '_, '_> {
                 self.parent_attempt,
             )?,
             &self.preflight.assignment.id,
-            &self.parent._command,
+            self.parent.command,
         )?;
         // These conditions prevent a yielded turn from bypassing existing
         // collection failures which are handled by final-report decision today.

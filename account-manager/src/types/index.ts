@@ -200,6 +200,13 @@ export interface LoginStatus {
   state: LoginState
   /** Present only for terminal failure; never contains secrets or raw vendor output. */
   failureReason?: string
+  /** Public owner action bound to this live login; never a code, token or verifier. */
+  authorization?: LoginAuthorization
+}
+
+export interface LoginAuthorization {
+  authorizationUrl: string
+  expiresAtUnixMs?: number
 }
 
 /** Exact frozen selection binding for `observe_account` (MACO account.observe). */
@@ -254,10 +261,23 @@ export interface ObservedModel {
   modelId: string
   supportedEfforts?: string[]
   defaultEffort?: string
+  /** Older producers omit access; omission means unknown, never available. */
+  access?: 'unknown-access' | 'available' | 'unavailable'
 }
 
 export interface ModelsObservation {
   models: ObservedModel[]
+  provenance?: ModelCatalogProvenance
+}
+
+export interface ModelCatalogProvenance {
+  sourceKind:
+    'managed-home-cache' | 'authenticated-catalog' | 'productive-execution'
+  fetchedAt: string | null
+  stale: boolean
+  principalBinding: SelectedAccountBinding | null
+  accessBasis:
+    'confirmed-model-entitlement' | 'accepted-productive-execution' | null
 }
 
 export interface QuotaObservation {

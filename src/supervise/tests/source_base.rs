@@ -22,10 +22,26 @@ fn authenticated_source_head_binds_real_child_base_at_admission() {
         }
         let assignment = injected_assignment(false);
         let plan = injected_plan(assignment.clone(), 0);
+        let _cam = crate::supervise::scheduler::install_positive_injected_cam_fixture(
+            &temp,
+            &test_runtime_model_catalog(&plan, SupervisorRuntime::Codex)
+                .expect("supplied positive fixture catalog"),
+        )
+        .expect("hold one isolated injected CAM observation for this source scenario");
         let plan_file = temp.path().join("source-base-plan.json");
+        let mut metadata = SupervisorPlanMetadata::default();
+        let _routing_policy = bind_assessed_injected_plan(&plan, &repo, &mut metadata)
+            .expect("bind assessed injected source-base plan");
+        let mut document = serde_json::to_value(&plan).expect("serialize supervisor plan");
+        document["resolved_routing_policy"] =
+            serde_json::to_value(&metadata.resolved_routing_policy)
+                .expect("serialize resolved routing policy");
+        document["task_routing_assessment"] =
+            serde_json::to_value(&metadata.task_routing_assessment)
+                .expect("serialize task routing assessment");
         fs::write(
             &plan_file,
-            serde_json::to_vec_pretty(&plan).expect("serialize supervisor plan"),
+            serde_json::to_vec_pretty(&document).expect("serialize supervisor plan"),
         )
         .expect("write supervisor plan");
         let run_id = RunId::new(format!("source-base-{}", scenario.replace('_', "-")))

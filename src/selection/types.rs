@@ -84,6 +84,8 @@ impl AuthorityRole {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ReasoningEffort {
+    None,
+    Minimal,
     Low,
     Medium,
     High,
@@ -93,14 +95,29 @@ pub enum ReasoningEffort {
 }
 
 impl ReasoningEffort {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Xhigh => "xhigh",
+            Self::Max => "max",
+            Self::Ultra => "ultra",
+        }
+    }
+
     pub(crate) fn rank(self) -> u64 {
         match self {
-            Self::Low => 0,
-            Self::Medium => 1,
-            Self::High => 2,
-            Self::Xhigh => 3,
-            Self::Max => 4,
-            Self::Ultra => 5,
+            Self::None => 0,
+            Self::Minimal => 1,
+            Self::Low => 2,
+            Self::Medium => 3,
+            Self::High => 4,
+            Self::Xhigh => 5,
+            Self::Max => 6,
+            Self::Ultra => 7,
         }
     }
 }
@@ -145,11 +162,30 @@ pub struct CandidateCapabilities {
     pub long_context: bool,
 }
 
+// Keep the Linux observation type identity; other platforms only consume catalog wire data.
+#[cfg(target_os = "linux")]
+pub use coding_agent_manager_lib::account_authority::ModelAccessOutcome;
+
+#[cfg(not(target_os = "linux"))]
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum ModelAccessOutcome {
+    #[default]
+    UnknownAccess,
+    Available,
+    Unavailable,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CatalogModel {
     pub model: String,
+    /// Compatibility eligibility flag; never confirms account access.
     pub available: bool,
+    /// Optional observed access data, not private account or launch authority.
+    /// Legacy, advertised, and prior-only catalogs omit this unconfirmed field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<ModelAccessOutcome>,
     pub supported_efforts: Vec<ReasoningEffort>,
     pub capabilities: CandidateCapabilities,
 }
@@ -655,6 +691,17 @@ pub struct ScoreBreakdown {
 #[serde(rename_all = "snake_case")]
 pub enum RoutingScoreSemantics {
     LegacyBaselinePlusCostProxyAdjustmentsV1,
+    LoadedPolicyEvidencePenaltyV1,
+    LoadedPolicyEvidencePenaltyV2,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct LoadedCandidateEvidence {
+    pub quality_basis_points: Option<u16>,
+    pub expected_accepted_cycle_cost_microunits: Option<u64>,
+    pub samples: u32,
+    pub uncertainty_penalty: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -672,6 +719,8 @@ pub struct CandidateEvaluation {
     pub quota: QuotaCandidateProvenance,
     pub ledger: LedgerSummary,
     pub score: Option<ScoreBreakdown>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loaded_policy_evidence: Option<LoadedCandidateEvidence>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -734,6 +783,7 @@ pub enum SelectionTrigger {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ChoiceReason {
+    LoadedRoutingPolicy,
     LowestExpectedTotalCostPerAcceptedTask,
     LowestLegacyBaselinePlusCostProxyAdjustments,
     StrongestNoEvidenceJudgmentFallback,
@@ -880,6 +930,8 @@ pub enum DecisionStatus {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SelectionProvenance {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub routing_policy: Option<super::routing_policy::RoutingPolicyReceipt>,
     pub schema_version: u32,
     pub status: DecisionStatus,
     pub normalized_input: SelectionInput,

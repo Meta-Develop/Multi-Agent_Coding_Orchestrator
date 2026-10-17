@@ -151,7 +151,10 @@ fn fake_goal_launch_returns_automatic_authority_and_derived_shape() -> Result<()
     let goal = temp.path().join("goal.md");
     fs::write(
         &goal,
-        "Coordinate repository work.\n- Update README.md.\n- Update src/lib.rs.\n",
+        concat!(
+            "- Update README.md to document the API result. design-decision: result: Which return value? = true\n",
+            "- Update src/lib.rs to implement the API result. design-decision: result: Which return value? = true\n",
+        ),
     )?;
     let output = Command::new(BIN)
         .args([

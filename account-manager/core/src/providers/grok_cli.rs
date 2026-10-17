@@ -189,6 +189,7 @@ impl GrokCliAdapter {
         home: &Path,
         plan: PendingOAuthHomePlan,
         mut cancel: tokio::sync::watch::Receiver<bool>,
+        handoff: Option<crate::login::LoginUrlHandoff>,
     ) -> std::result::Result<(), super::OAuthLoginRunError> {
         if *cancel.borrow() {
             return Err(super::OAuthLoginRunError::Cancelled);
@@ -198,6 +199,27 @@ impl GrokCliAdapter {
         }
         if self.test_oauth_watch_cancel_driver {
             return super::gemini_oauth::run_test_oauth_cancelled_by_watch(&mut cancel).await;
+        }
+        if let Some(handoff) = handoff {
+            if self.home.is_some() {
+                return Err(super::OAuthLoginRunError::Failed(config_write(
+                    "refusing a native authorization handoff against an injected home",
+                )));
+            }
+            // Native login continues to own PKCE, loopback and credential writes.
+            // No vendor output is inherited by the authority's journal.
+            let mut command = Command::new(self.program());
+            let cwd = self
+                .resolved_working_directory()
+                .map_err(super::OAuthLoginRunError::Failed)?;
+            command
+                .arg("--no-auto-update")
+                .arg("login")
+                .current_dir(cwd)
+                .env("GROK_HOME", home)
+                .env_remove("GROK_AUTH_PATH");
+            return crate::login::run_vendor_oauth_handoff(command, PROVIDER_ID, cancel, handoff)
+                .await;
         }
         let adapter = self.clone_for_login_task();
         let home = home.to_path_buf();
@@ -341,6 +363,7 @@ impl GrokCliAdapter {
             })?
         } else {
             Command::new(self.program())
+                .arg("--no-auto-update")
                 .arg("login")
                 .current_dir(self.resolved_working_directory()?)
                 .env("GROK_HOME", managed_home)
@@ -1279,9 +1302,11 @@ impl ProviderAdapter for GrokCliAdapter {
         let _operation = HomeOperationGuard::acquire(&home)?;
         gate_managed_home(&home, true)?;
         Ok(LaunchSpec::new(self.program())
+            .arg("--no-auto-update")
             .current_dir(self.resolved_working_directory()?)
             .set_plain_env("GROK_HOME", home.as_os_str())
-            .remove_env("GROK_AUTH_PATH"))
+            .remove_env("GROK_AUTH_PATH")
+            .remove_env("XAI_API_KEY"))
     }
 
     fn managed_account_plan(&self) -> Option<ManagedAccountPlan> {
@@ -1356,10 +1381,513 @@ impl ProviderAdapter for GrokCliAdapter {
         Ok(Vec::new())
     }
 
+    fn observe_models_for_account(
+        &self,
+        account: &StoredAccountMetadata,
+    ) -> Result<
+        crate::account_authority::CategoryObservation<crate::account_authority::ModelsObservation>,
+    > {
+        use crate::account_authority::CategoryObservation;
+        #[cfg(unix)]
+        use crate::account_authority::{ObservationError, ObservationErrorKind};
+        validate_managed_metadata(account)?;
+        if account.state != StoredAccountState::Complete {
+            return Err(config_read(
+                "model metadata requires a complete managed Grok account",
+            ));
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(CategoryObservation::unavailable())
+        }
+        #[cfg(unix)]
+        {
+            // Derive this slot from the adapter's data directory, never ambient GROK_HOME.
+            // No auth file is opened and no vendor process is started by observation.
+            let path = self.managed_home(account)?.join("models_cache.json");
+            match read_grok_model_cache(&path) {
+                Ok(None) => Ok(CategoryObservation::unknown()),
+                Ok(Some(bytes)) => match parse_grok_model_cache(&bytes) {
+                    Ok(Some(models)) => Ok(CategoryObservation::observed(models)),
+                    Ok(None) => Ok(CategoryObservation::unknown()),
+                    Err(()) => Ok(CategoryObservation::failed(ObservationError {
+                        kind: ObservationErrorKind::ConfigRead,
+                        message: "managed Grok model cache has invalid catalog metadata".into(),
+                    })),
+                },
+                Err(_) => Ok(CategoryObservation::failed(ObservationError {
+                    kind: ObservationErrorKind::ConfigRead,
+                    message: "managed Grok model cache failed bounded no-follow read".into(),
+                })),
+            }
+        }
+    }
+
     fn activate_account(&self, _account_id: &str) -> Result<()> {
         // Core owns environment selection; there is intentionally no in-file
         // activation path for this adapter.
         Err(Error::NotImplemented("grok-cli::activate_account"))
+    }
+}
+
+#[cfg(any(unix, test))]
+const MAX_GROK_MODEL_CACHE_BYTES: u64 = 4 * 1024 * 1024;
+#[cfg(any(unix, test))]
+const MAX_GROK_CACHED_MODELS: usize = 512;
+
+// Native cache schema observed in 1.0.41. Unknown fields (including identity)
+// are ignored: the cache's identity semantics and binary/source parity are not
+// established, so they cannot supply a SelectedAccountBinding or entitlement.
+#[derive(Deserialize)]
+#[cfg(any(unix, test))]
+struct GrokModelCache {
+    fetched_at: Option<String>,
+    auth_method: Option<String>,
+    origin: Option<String>,
+    models: std::collections::BTreeMap<String, GrokCachedModel>,
+}
+
+#[derive(Deserialize)]
+#[cfg(any(unix, test))]
+struct GrokCachedModel {
+    info: GrokCachedModelInfo,
+}
+
+#[derive(Deserialize)]
+#[cfg(any(unix, test))]
+struct GrokCachedModelInfo {
+    hidden: bool,
+    reasoning_effort: Option<String>,
+    reasoning_efforts: Option<Vec<GrokCachedEffort>>,
+}
+
+#[derive(Deserialize)]
+#[cfg(any(unix, test))]
+struct GrokCachedEffort {
+    id: String,
+    value: String,
+    #[serde(default)]
+    default: bool,
+}
+
+#[cfg(any(unix, test))]
+fn parse_grok_model_cache(
+    bytes: &[u8],
+) -> std::result::Result<Option<crate::account_authority::ModelsObservation>, ()> {
+    use crate::account_authority::{
+        validate_observed_models, ModelAccessOutcome, ModelCatalogProvenance,
+        ModelCatalogSourceKind, ModelsObservation, ObservedModel,
+    };
+    if bytes.len() as u64 > MAX_GROK_MODEL_CACHE_BYTES {
+        return Err(());
+    }
+    let cache: GrokModelCache = serde_json::from_slice(bytes).map_err(|_| ())?;
+    if cache.auth_method.as_deref() != Some("session")
+        || cache.origin.as_deref() != Some("https://cli-chat-proxy.grok.com/v1/models")
+    {
+        return Ok(None);
+    }
+    if cache.models.len() > MAX_GROK_CACHED_MODELS {
+        return Err(());
+    }
+    // Retain the timestamp without claiming native freshness. The pinned source
+    // also checks its own version/auth/origin before applying a 300-second TTL;
+    // parity with the installed cache writer has not been established.
+    if let Some(timestamp) = cache.fetched_at.as_deref() {
+        time::OffsetDateTime::parse(timestamp, &time::format_description::well_known::Rfc3339)
+            .map_err(|_| ())?;
+    }
+    let mut models = Vec::new();
+    for (model_id, entry) in cache.models {
+        if model_id.is_empty()
+            || model_id.len() > 256
+            || !model_id
+                .bytes()
+                .next()
+                .is_some_and(|byte| byte.is_ascii_alphanumeric())
+            || !model_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || b"-_.:/".contains(&byte))
+        {
+            return Err(());
+        }
+        if entry.info.hidden {
+            continue;
+        }
+        // Picker IDs are map keys, not necessarily the routed info.model slug.
+        // An arbitrary option id (e.g. deep) is not an implicit xhigh mapping.
+        let mut supported_efforts = None;
+        let mut default_effort = None;
+        if let Some(options) = entry
+            .info
+            .reasoning_efforts
+            .filter(|options| !options.is_empty())
+        {
+            let canonical = options.len() <= 7
+                && options.iter().all(|option| {
+                    option.id == option.value
+                        && matches!(
+                            option.value.as_str(),
+                            "none" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"
+                        )
+                });
+            if canonical {
+                let mut values = HashSet::new();
+                if !options
+                    .iter()
+                    .all(|option| values.insert(option.value.as_str()))
+                {
+                    return Err(());
+                }
+                let defaults = options
+                    .iter()
+                    .filter(|option| option.default)
+                    .collect::<Vec<_>>();
+                if defaults.len() > 1 {
+                    return Err(());
+                }
+                default_effort = defaults.first().map(|option| option.value.clone());
+                if let Some(declared) = entry.info.reasoning_effort {
+                    if !values.contains(declared.as_str())
+                        || default_effort
+                            .as_ref()
+                            .is_some_and(|default| default != &declared)
+                    {
+                        return Err(());
+                    }
+                    default_effort = Some(declared);
+                }
+                supported_efforts = Some(options.into_iter().map(|option| option.value).collect());
+            }
+        }
+        models.push(ObservedModel {
+            model_id,
+            supported_efforts,
+            default_effort,
+            access: ModelAccessOutcome::UnknownAccess,
+        });
+    }
+    if models.is_empty() {
+        return Ok(None);
+    }
+    let observed = ModelsObservation {
+        models,
+        provenance: Some(ModelCatalogProvenance {
+            source_kind: ModelCatalogSourceKind::ManagedHomeCache,
+            fetched_at: cache.fetched_at,
+            stale: true,
+            principal_binding: None,
+            access_basis: None,
+        }),
+    };
+    validate_observed_models(&observed).map_err(|_| ())?;
+    Ok(Some(observed))
+}
+
+#[cfg(unix)]
+fn read_grok_model_cache(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+    use std::path::Component;
+    if !path.is_absolute() {
+        return Err(io::ErrorKind::InvalidInput.into());
+    }
+    let mut directory = File::open("/")?;
+    let components = path.components().collect::<Vec<_>>();
+    for (index, component) in components.iter().enumerate() {
+        let Component::Normal(name) = component else {
+            if matches!(component, Component::RootDir) {
+                continue;
+            }
+            return Err(io::ErrorKind::InvalidInput.into());
+        };
+        let name = CString::new(name.as_bytes()).map_err(|_| io::ErrorKind::InvalidInput)?;
+        let last = index + 1 == components.len();
+        let flags = libc::O_RDONLY
+            | libc::O_CLOEXEC
+            | libc::O_NOFOLLOW
+            | if last {
+                libc::O_NONBLOCK
+            } else {
+                libc::O_DIRECTORY
+            };
+        // Hold each directory descriptor while opening its child; never follow symlinks.
+        let descriptor = unsafe { libc::openat(directory.as_raw_fd(), name.as_ptr(), flags) };
+        if descriptor < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() == io::ErrorKind::NotFound {
+                return Ok(None);
+            }
+            return Err(error);
+        }
+        // This fresh descriptor transfers ownership exactly once.
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        if !last {
+            directory = file;
+            continue;
+        }
+        let before = file.metadata()?;
+        if !before.is_file()
+            || before.nlink() != 1
+            || before.uid() != unsafe { libc::geteuid() }
+            || before.mode() & 0o022 != 0
+            || before.len() > MAX_GROK_MODEL_CACHE_BYTES
+        {
+            return Err(io::ErrorKind::PermissionDenied.into());
+        }
+        let mut bytes = Vec::new();
+        (&mut file)
+            .take(MAX_GROK_MODEL_CACHE_BYTES + 1)
+            .read_to_end(&mut bytes)?;
+        let after = file.metadata()?;
+        if bytes.len() as u64 != before.len()
+            || before.len() != after.len()
+            || before.mtime() != after.mtime()
+            || before.mtime_nsec() != after.mtime_nsec()
+            || before.ctime() != after.ctime()
+            || before.ctime_nsec() != after.ctime_nsec()
+        {
+            return Err(io::ErrorKind::InvalidData.into());
+        }
+        return Ok(Some(bytes));
+    }
+    Err(io::ErrorKind::InvalidInput.into())
+}
+
+#[cfg(test)]
+mod grok_model_metadata_tests {
+    use super::*;
+    use crate::account_authority::ModelAccessOutcome;
+    #[cfg(unix)]
+    use crate::account_authority::ObservationOutcome;
+
+    fn cache() -> Value {
+        serde_json::json!({
+            "fetched_at": "2026-09-29T23:27:32.759696216Z",
+            "grok_version": "1.0.41", "auth_method": "session",
+            "origin": "https://cli-chat-proxy.grok.com/v1/models",
+            "identity": "FAKE-private-source-identity",
+            "models": {
+                "grok-4.7": {"info": {"model": "grok-4.7", "hidden": false,
+                    "reasoning_effort": "high", "supports_reasoning_effort": true,
+                    "reasoning_efforts": [
+                        {"id": "xhigh", "value": "xhigh", "default": false},
+                        {"id": "high", "value": "high", "default": true},
+                        {"id": "medium", "value": "medium", "default": false},
+                        {"id": "low", "value": "low", "default": false}
+                    ]}}
+            }
+        })
+    }
+
+    fn parse(
+        value: &Value,
+    ) -> std::result::Result<Option<crate::account_authority::ModelsObservation>, ()> {
+        parse_grok_model_cache(&serde_json::to_vec(value).unwrap())
+    }
+
+    #[cfg(unix)]
+    fn account() -> StoredAccountMetadata {
+        StoredAccountMetadata {
+            id: "work".into(),
+            provider_id: PROVIDER_ID.into(),
+            label: "Work".into(),
+            auth_kind: AuthKind::OAuth,
+            state: StoredAccountState::Complete,
+            material: StoredAccountMaterial::VendorHome,
+            is_selected: true,
+            account_incarnation: "test-incarnation".into(),
+        }
+    }
+
+    #[test]
+    fn cache_advertisement_retains_exact_menu_without_access_or_identity_elevation() {
+        let observed = parse(&cache()).unwrap().unwrap();
+        let model = &observed.models[0];
+        assert_eq!(model.model_id, "grok-4.7");
+        assert_eq!(
+            model.supported_efforts.as_ref().unwrap(),
+            &["xhigh", "high", "medium", "low"]
+        );
+        assert_eq!(model.default_effort.as_deref(), Some("high"));
+        assert_eq!(model.access, ModelAccessOutcome::UnknownAccess);
+        let provenance = observed.provenance.as_ref().unwrap();
+        assert_eq!(
+            provenance.source_kind,
+            crate::account_authority::ModelCatalogSourceKind::ManagedHomeCache
+        );
+        assert_eq!(
+            provenance.fetched_at.as_deref(),
+            Some("2026-09-29T23:27:32.759696216Z")
+        );
+        assert!(provenance.stale);
+        assert!(provenance.principal_binding.is_none());
+        assert!(provenance.access_basis.is_none());
+        assert!(!serde_json::to_string(&observed).unwrap().contains("FAKE-"));
+    }
+
+    #[test]
+    fn picker_aliases_hidden_rows_and_unknown_menus_keep_native_meaning() {
+        let mut value = cache();
+        let models = value["models"].as_object_mut().unwrap();
+        let mut alias = models.remove("grok-4.7").unwrap();
+        alias["info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_efforts");
+        models.insert("picker-alias".into(), alias);
+        models.insert(
+            "hidden-model".into(),
+            serde_json::json!({"info":{"hidden":true}}),
+        );
+        let observed = parse(&value).unwrap().unwrap();
+        assert_eq!(observed.models.len(), 1);
+        assert_eq!(observed.models[0].model_id, "picker-alias");
+        assert!(observed.models[0].supported_efforts.is_none());
+        assert!(observed.models[0].default_effort.is_none());
+        value["models"]["picker-alias"]["info"]["hidden"] = Value::Bool(true);
+        assert!(parse(&value).unwrap().is_none());
+    }
+
+    #[test]
+    fn arbitrary_effort_ids_are_unknown_not_implicit_canonical_aliases() {
+        let mut value = cache();
+        value["models"]["grok-4.7"]["info"]["reasoning_efforts"][0]["id"] =
+            Value::String("deep".into());
+        let observed = parse(&value).unwrap().unwrap();
+        assert!(observed.models[0].supported_efforts.is_none());
+        assert!(observed.models[0].default_effort.is_none());
+    }
+
+    #[test]
+    fn canonical_none_and_explicit_default_are_preserved_without_menu_fallback() {
+        let mut value = cache();
+        let info = &mut value["models"]["grok-4.7"]["info"];
+        info["reasoning_efforts"] =
+            serde_json::json!([{"id":"none","value":"none"},{"id":"high","value":"high"}]);
+        let observed = parse(&value).unwrap().unwrap();
+        assert_eq!(observed.models[0].default_effort.as_deref(), Some("high"));
+        assert_eq!(
+            observed.models[0].supported_efforts.as_ref().unwrap(),
+            &["none", "high"]
+        );
+        value["models"]["grok-4.7"]["info"]
+            .as_object_mut()
+            .unwrap()
+            .remove("reasoning_effort");
+        assert!(parse(&value).unwrap().unwrap().models[0]
+            .default_effort
+            .is_none());
+    }
+
+    #[test]
+    fn unbound_sources_are_unknown_and_inconsistent_metadata_is_rejected() {
+        for field in ["origin", "auth_method"] {
+            let mut value = cache();
+            value.as_object_mut().unwrap().remove(field);
+            assert!(parse(&value).unwrap().is_none());
+        }
+        let mut value = cache();
+        value["origin"] = Value::String("https://unbound.invalid/models".into());
+        assert!(parse(&value).unwrap().is_none());
+        value = cache();
+        value["models"]["grok-4.7"]["info"]["reasoning_effort"] = Value::String("max".into());
+        assert!(parse(&value).is_err());
+        value = cache();
+        value["models"]["grok-4.7"]["info"]["reasoning_efforts"][0]["default"] = Value::Bool(true);
+        assert!(parse(&value).is_err());
+        value = cache();
+        value["fetched_at"] = Value::String("invalid-timestamp".into());
+        assert!(parse(&value).is_err());
+        assert!(
+            parse_grok_model_cache(&vec![b' '; MAX_GROK_MODEL_CACHE_BYTES as usize + 1]).is_err()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn observation_reads_only_derived_slot_without_auth_or_ambient_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let ambient = root.join("ambient");
+        fs::create_dir_all(ambient.join(".grok")).unwrap();
+        fs::write(
+            ambient.join(".grok/models_cache.json"),
+            serde_json::to_vec(&cache()).unwrap(),
+        )
+        .unwrap();
+        let adapter = GrokCliAdapter::with_home(&ambient).with_data_dir(root.join("data"));
+        let account = account();
+        assert_eq!(
+            adapter
+                .observe_models_for_account(&account)
+                .unwrap()
+                .outcome,
+            ObservationOutcome::Unknown
+        );
+        let managed = adapter.managed_home(&account).unwrap();
+        fs::create_dir_all(&managed).unwrap();
+        fs::write(
+            managed.join("models_cache.json"),
+            serde_json::to_vec(&cache()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            adapter
+                .observe_models_for_account(&account)
+                .unwrap()
+                .outcome,
+            ObservationOutcome::Observed
+        );
+        assert!(!managed.join("auth.json").exists());
+        fs::write(
+            managed.join("models_cache.json"),
+            b"FAKE-private-malformed-content",
+        )
+        .unwrap();
+        let failed = adapter.observe_models_for_account(&account).unwrap();
+        assert!(matches!(failed.outcome, ObservationOutcome::Failed { .. }));
+        assert!(!serde_json::to_string(&failed).unwrap().contains("FAKE-"));
+        let mut pending = account.clone();
+        pending.state = StoredAccountState::Pending;
+        assert!(adapter.observe_models_for_account(&pending).is_err());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn bounded_reader_rejects_leaf_ancestor_links_hardlinks_writable_and_oversize_files() {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().canonicalize().unwrap();
+        let real = root.join("real");
+        fs::create_dir(&real).unwrap();
+        let path = real.join("models_cache.json");
+        fs::write(&path, serde_json::to_vec(&cache()).unwrap()).unwrap();
+        assert!(read_grok_model_cache(&path).unwrap().is_some());
+        assert!(read_grok_model_cache(&real.join("missing"))
+            .unwrap()
+            .is_none());
+        let leaf = root.join("leaf");
+        symlink(&path, &leaf).unwrap();
+        assert!(read_grok_model_cache(&leaf).is_err());
+        let ancestor = root.join("ancestor");
+        symlink(&real, &ancestor).unwrap();
+        assert!(read_grok_model_cache(&ancestor.join("models_cache.json")).is_err());
+        let hard = root.join("hard");
+        fs::hard_link(&path, &hard).unwrap();
+        assert!(read_grok_model_cache(&path).is_err());
+        fs::remove_file(hard).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).unwrap();
+        assert!(read_grok_model_cache(&path).is_err());
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(MAX_GROK_MODEL_CACHE_BYTES + 1)
+            .unwrap();
+        assert!(read_grok_model_cache(&path).is_err());
     }
 }
 

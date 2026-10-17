@@ -1366,10 +1366,28 @@ struct TreeBudget {
 struct InventoryBudget {
     remaining_entries: usize,
     total_path_bytes: usize,
+    started_at: Instant,
     deadline: Instant,
+    current_relative_directory: PathBuf,
+    entries_inspected: usize,
 }
 
 impl InventoryBudget {
+    fn new(limits: BoundedTreeWalkLimits) -> Result<Self> {
+        let started_at = Instant::now();
+        let deadline = started_at
+            .checked_add(limits.max_duration)
+            .context("bounded tree walk deadline overflowed")?;
+        Ok(Self {
+            remaining_entries: limits.max_entries,
+            total_path_bytes: 0,
+            started_at,
+            deadline,
+            current_relative_directory: PathBuf::new(),
+            entries_inspected: 0,
+        })
+    }
+
     fn consume_entry(&mut self) -> Result<()> {
         self.remaining_entries = self
             .remaining_entries
@@ -1402,7 +1420,19 @@ impl InventoryBudget {
 
     fn ensure_before_deadline(&self, phase: &str) -> Result<()> {
         if Instant::now() >= self.deadline {
-            bail!("repository inventory exceeded its time limit {phase}");
+            let relative_directory = if self.current_relative_directory.as_os_str().is_empty() {
+                Path::new(".")
+            } else {
+                &self.current_relative_directory
+            };
+            bail!(
+                "repository inventory exceeded its time limit {phase}; \
+                 failure_class=inventory_timeout relative_directory={:?} \
+                 elapsed_ms={} entries_inspected={}",
+                relative_directory,
+                self.started_at.elapsed().as_millis(),
+                self.entries_inspected,
+            );
         }
         Ok(())
     }
@@ -1502,6 +1532,7 @@ where
     F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
 {
     fn walk(&mut self, directory_fd: RawFd, relative_directory: &Path, depth: usize) -> Result<()> {
+        self.budget.current_relative_directory = relative_directory.to_path_buf();
         self.budget
             .ensure_before_deadline("before directory enumeration")?;
         if nested_repository_boundary_enabled(depth, self.options)
@@ -1576,6 +1607,8 @@ where
                 changed_seconds: stat_ctime_seconds(&stat),
                 changed_nanoseconds: stat_ctime_nanoseconds(&stat),
             };
+            // Enumeration already bounds this counter by the global entry limit.
+            self.budget.entries_inspected += 1;
             let decision = (self.action)(&entry)?;
             self.budget
                 .ensure_before_deadline("after repository inventory callback")?;
@@ -1618,6 +1651,7 @@ where
                     }
                 }
                 self.walk(child.as_raw_fd(), &relative, entry_depth)?;
+                self.budget.current_relative_directory = relative_directory.to_path_buf();
             }
             let rebound = fstatat_no_follow(directory_fd, &name_c).with_context(|| {
                 format!(
@@ -2058,8 +2092,22 @@ thread_local! {
 }
 
 #[cfg(test)]
-fn set_scavenge_deadline_hook(hook: impl FnMut(&str) -> bool + 'static) {
+pub(crate) fn set_scavenge_deadline_hook(
+    hook: impl FnMut(&str) -> bool + 'static,
+) -> ScavengeDeadlineHookGuard {
     SCAVENGE_DEADLINE_HOOK.with(|slot| *slot.borrow_mut() = Some(Box::new(hook)));
+    ScavengeDeadlineHookGuard
+}
+
+#[cfg(test)]
+#[must_use]
+pub(crate) struct ScavengeDeadlineHookGuard;
+
+#[cfg(test)]
+impl Drop for ScavengeDeadlineHookGuard {
+    fn drop(&mut self) {
+        SCAVENGE_DEADLINE_HOOK.with(|slot| slot.borrow_mut().take());
+    }
 }
 
 #[cfg(target_os = "linux")]
