@@ -763,8 +763,9 @@ impl RuntimeAdapterConfig {
     ///
     /// Grok capability elevation requires an absolute cwd, the selected
     /// executable, the exact immutable argv for the selected interaction
-    /// protocol (inner profile off behind required outer containment, tool approval, no subagents;
-    /// headless streaming-json or ACP `agent stdio`), stdout capture, and no
+    /// protocol (headless launch uses inner profile `off` only under verified
+    /// `ExternalGrok` outer containment; ACP `agent stdio` keeps
+    /// `--sandbox strict`; tool approval, no subagents), stdout capture, and no
     /// operator environment or stdin alteration. A model/effort string without
     /// these checks remains on the fail-closed adapter-level capability row.
     pub fn typed_runtime_contract(
