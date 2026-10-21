@@ -135,7 +135,7 @@ source "{LIB}"
             check=False,
             capture_output=True,
             text=True,
-            env=env,
+            env={"PATH": os.environ.get("PATH", os.defpath), **env},
         )
 
     def test_lib_refuses_dangling_destination_symlink(self) -> None:
