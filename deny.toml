@@ -36,7 +36,7 @@ exceptions = [
     # exact expression and license-file hashes for every resolved release.
     { allow = ["Zlib"], crate = "libz-sys" },
     # reqwest -> rustls -> rustls-webpki; registry LICENSE (ISC-style, Brian Smith).
-    { allow = ["ISC"], crate = "rustls-webpki@0.103.14" },
+    { allow = ["ISC"], crate = "rustls-webpki@0.103.16" },
     { allow = ["ISC"], crate = "untrusted@0.9.0" },
     # CAM-declared constant-time helper; registry LICENSE is standard BSD-3-Clause.
     { allow = ["BSD-3-Clause"], crate = "subtle@2.6.1" },
@@ -45,7 +45,7 @@ exceptions = [
     # directories -> dirs-sys -> option-ext; registry LICENSE.txt is MPL-2.0 full text.
     { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
     # reqwest -> rustls-platform-verifier -> webpki-root-certs; registry LICENSE is CDLA-P 2.0.
-    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs@1.0.9" },
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs@1.0.10" },
     # reqwest rustls default crypto; registry LICENSE SPDX matches Cargo.toml.
     { allow = ["ISC"], crate = "aws-lc-rs@1.18.0" },
     # Build of aws-lc-rs; bundled upstream licenses (ISC/BSD/MIT/MIT-0) in crate LICENSE.
