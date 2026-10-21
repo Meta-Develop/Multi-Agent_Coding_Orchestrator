@@ -274,6 +274,26 @@ fn worker_journal_native_edit_observes_repeated_edits_and_never_executes_argv() 
 }
 
 #[test]
+fn worker_journal_lock_release_survives_an_inherited_open_description() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let lock =
+        WorkerJournalAppendLock::acquire(open_worker_journal_no_follow(&path, true).unwrap())
+            .unwrap();
+    // A fork in another thread retains the same open description until exec.
+    // A duplicate deterministically models that lifetime without a fork race.
+    let inherited = lock.file.try_clone().unwrap();
+    let record = observed_entry(&worktree, &["true"]);
+    let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
+    assert!(error.to_string().contains("already being appended"));
+    assert!(fs::read(&path).unwrap().is_empty());
+    drop(lock);
+    run_worker_execution_journal_command(&path, &identity, &record, false).unwrap();
+    let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+    assert_eq!(records.len(), 2);
+    verify_worker_journal_identity(&inherited.metadata().unwrap(), &identity).unwrap();
+}
+
+#[test]
 fn worker_journal_observation_detects_create_delete_restore_and_executable_mode() {
     let (_temp, worktree, path, identity) = observed_fixture();
     let mut record = observed_entry(&worktree, &["/bin/sh", "-c", "mv README.md moved.md"]);

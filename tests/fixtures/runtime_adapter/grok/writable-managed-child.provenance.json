@@ -17,11 +17,12 @@
     "--output-format",
     "streaming-json",
     "--sandbox",
-    "strict",
+    "off",
     "--always-approve",
     "--disable-web-search",
     "--no-memory",
-    "--no-subagents"
+    "--no-subagents",
+    "--no-leader"
   ],
   "redactions": "none",
   "scope_note": "Hermetic Grok-compatible streaming-json fixture for a schema-bound managed-child write. Not a live capture. Native end.usage fields are exact Grok spend keys, not Codex turn.completed events."

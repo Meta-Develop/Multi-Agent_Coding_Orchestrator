@@ -335,11 +335,18 @@ fn worker_prompt_includes_execution_journal_contract() {
         Path::new("/tmp/maco-run/schemas/worker-report.schema.json"),
     )
     .expect("render worker prompt");
+    assert_native_edit_journal_reporting_contract(&prompt);
 
     assert!(prompt
         .contains("Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"));
-    assert!(prompt.contains("The wrapper executes the command ONCE"));
+    assert!(prompt.contains("executes the command ONCE"));
+    assert!(prompt.contains("--auto-timestamps"));
+    assert!(prompt.contains("Do not invent timestamps or run date"));
     assert!(prompt.contains("--changed-path is optional"));
+    assert!(prompt.contains(
+        "Read-only validation (for example tail or git diff --check) must omit --changed-path"
+    ));
+    assert!(prompt.contains("cwd is the exact absolute worktree from the journal"));
     assert!(prompt.contains("--observe-changes -- true"));
     assert!(prompt.contains("IMMEDIATELY"));
     assert!(prompt.contains("exact precreated journal"));
@@ -374,6 +381,21 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("Worker model: worker-model"));
     assert!(prompt.contains("Worker reasoning effort: low"));
     assert!(prompt.contains("runtime-side role-tagged usage reporting"));
+}
+
+fn assert_native_edit_journal_reporting_contract(prompt: &str) {
+    for required in [
+        "Both observation records contain [\"true\"]",
+        "omit the native apply_patch/Edit command itself",
+        "Never add a native tool command absent from the journal",
+        "replace ONLY the post-edit observation's -- true",
+        "-- apply_patch '<exact full patch passed to the native tool as ONE argument>'",
+        "Observation never executes argv; do not apply the patch again",
+        "A [\"true\"] observation cannot support it",
+        "never write this JSON yourself or copy this command into commands_run after a -- true observation",
+    ] {
+        assert!(prompt.contains(required), "missing native edit contract: {required}");
+    }
 }
 
 fn injected_direct_worker_assignment() -> OrchestratorAssignment {
@@ -468,6 +490,7 @@ fn admitted_direct_worker_prompt_has_leaf_authority_and_exact_scope() {
         },
     })
     .expect("render admitted direct worker prompt");
+    assert_native_edit_journal_reporting_contract(&prompt);
 
     assert!(prompt.contains("admitted direct terminal worker"));
     assert!(prompt.contains("Do not launch workers, create delegated subtasks"));
@@ -2702,12 +2725,13 @@ fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract(
             &SupervisorFieldGuidePrompt::empty().unwrap(),
         )
         .expect("render generated direct worker prompt");
+        assert_native_edit_journal_reporting_contract(&prompt);
         let expected = incoming_root.join(worker_execution_journal_incoming_relative_for_id(
             &assignment.id,
         ));
         assert!(prompt.contains(&format!("Execution journal path: {}", expected.display())));
         for contract in [
-            "The wrapper executes the command ONCE",
+            "executes the command ONCE",
             "--observe-changes -- true",
             "exact precreated journal",
             "parent is nonwritable",
@@ -2715,7 +2739,7 @@ fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract(
             "Never reconstruct at the end",
             "WorkerExecutionJournalRecordError",
             "each command array element and cwd must be copied byte-for-byte",
-            "Preserve the full apply_patch record when recording native tool argv:",
+            "Only a payload-bearing post-edit observation produces an apply_patch journal record",
         ] {
             assert!(prompt.contains(contract), "{contract}");
         }

@@ -86,6 +86,8 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 pub(crate) mod gemini_bridge;
+mod grok_output;
+mod grok_progress;
 mod grok_steering;
 pub(crate) mod researcher_inputs;
 
@@ -1037,6 +1039,8 @@ mod grok_worker_journal_binding_tests {
         assert_eq!(spec, original);
         assert_eq!(fs::read(&spec.prompt)?, b"original bounded Worker prompt");
         assert_eq!(fs::read(&target.prompt)?, prompt);
+        assert!(String::from_utf8_lossy(&prompt)
+            .contains("Read-only validation must omit --changed-path"));
         assert!(target.prompt.starts_with(staging.root_path()));
         let mut expected = original_argv;
         let position = expected
@@ -1060,7 +1064,9 @@ mod grok_worker_journal_binding_tests {
         }
         assert!(argv
             .windows(2)
-            .any(|args| args[0] == OsStr::new("--sandbox") && args[1] == OsStr::new("strict")));
+            .any(|args| args[0] == OsStr::new("--sandbox")
+                && args[1]
+                    == OsStr::new(crate::runtime_adapter::grok::GROK_INNER_SANDBOX_PROFILE)));
         let prefix = serde_json::to_string(&binding.append.command_prefix()?)?;
         assert!(String::from_utf8(prompt)?.contains(&prefix));
         let SideEffectConfinementProfile::ExternalGrok(grok) = mounted.as_ref().unwrap() else {
@@ -1522,7 +1528,7 @@ fn bind_worker_journal_append_operation(
     }
     let prefix = serde_json::to_string(&binding.command_prefix()?)?;
     let appendix = format!(
-        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd, --start-timestamp, --end-timestamp, then -- and original shell argv. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional and checked against observation.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --start-timestamp <start> --end-timestamp <end> --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again with fresh timestamps. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal. Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal. Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
         binding.helper_sha256,
     );
     if prompt
@@ -1549,7 +1555,7 @@ fn bind_worker_journal_append_operation(
             )
         }
         Some(SideEffectConfinementProfile::ExternalGrok(grok_profile)) if grok => {
-            // Grok's fixed strict native sandbox stays unchanged. Only this exact
+            // Required MACO outer containment stays unchanged. Only this exact
             // running image is exposed; no sibling executable or directory grant.
             SideEffectConfinementProfile::ExternalGrok(
                 grok_profile
@@ -2986,6 +2992,8 @@ pub enum EnvironmentFailureCategory {
     VersionMismatch,
     MissingCredential,
     NetworkForbidden,
+    NetworkUnavailable,
+    ProviderAuthRequired,
     SandboxUnavailable,
     ProbeFailed,
     RuntimeModelCatalogUnavailable,
@@ -4629,7 +4637,19 @@ impl ExternalAgentRun {
         if capture.command != *command {
             return None;
         }
-        let (usage, complete) = capture.observation.allocation();
+        let (mut usage, mut complete) = capture.observation.allocation();
+        for prior in &capture.prior_observations {
+            let (additional, known) = prior.allocation();
+            let sums = (
+                usage.input_tokens.checked_add(additional.input_tokens),
+                usage.output_tokens.checked_add(additional.output_tokens),
+                usage.total_tokens.checked_add(additional.total_tokens),
+            );
+            complete &= known && sums.0.is_some() && sums.1.is_some() && sums.2.is_some();
+            usage.input_tokens = sums.0.unwrap_or(usize::MAX);
+            usage.output_tokens = sums.1.unwrap_or(usize::MAX);
+            usage.total_tokens = sums.2.unwrap_or(usize::MAX);
+        }
         Some((usage, complete && capture.process_completed))
     }
 
@@ -4654,6 +4674,7 @@ impl ExternalAgentRun {
             .map(|observation| GrokNativeUsageCapture {
                 command: command.clone(),
                 observation,
+                prior_observations: Vec::new(),
                 process_completed,
             });
     }
@@ -5351,12 +5372,44 @@ fn retain_held_grok_read_only_completion_facts(
 struct GrokNativeUsageCapture {
     command: ExternalAgentCommand,
     observation: crate::runtime_adapter::grok::GrokNativeUsageObservation,
+    prior_observations: Vec<crate::runtime_adapter::grok::GrokNativeUsageObservation>,
     process_completed: bool,
 }
 
 #[cfg(test)]
 mod grok_native_custody_tests {
     use super::*;
+
+    #[test]
+    fn grok_continuation_usage_sums_native_turns_and_keeps_missing_usage_incomplete() {
+        let command = command();
+        let captured = capture();
+        let mut run = failed_external_run(&command, Instant::now(), vec![], false, String::new());
+        run.retain_grok_native_usage_for_test(&command, &captured, true);
+        let before = run.authenticated_grok_usage(&command).unwrap();
+        let prior =
+            crate::runtime_adapter::grok::observe_grok_native_usage(captured.as_bytes(), false)
+                .unwrap();
+        run.stdout
+            .run_metadata
+            .grok_native_usage
+            .as_mut()
+            .unwrap()
+            .prior_observations
+            .push(prior);
+        let after = run.authenticated_grok_usage(&command).unwrap();
+        assert_eq!(after.0.total_tokens, before.0.total_tokens * 2);
+        assert_eq!(after.0.input_tokens, before.0.input_tokens * 2);
+        assert_eq!(after.0.output_tokens, before.0.output_tokens * 2);
+        assert_eq!(after.1, before.1);
+        run.stdout
+            .run_metadata
+            .grok_native_usage
+            .as_mut()
+            .unwrap()
+            .process_completed = false;
+        assert!(!run.authenticated_grok_usage(&command).unwrap().1);
+    }
 
     fn command() -> ExternalAgentCommand {
         ExternalAgentCommand::codex(
@@ -8683,6 +8736,25 @@ fn run_external_agent_runtime(
         .stdout
         .run_metadata
         .local_source_probe_refusal_quiescent = false;
+    if target_spec.invocation == ExternalAgentInvocation::Grok
+        && runtime == ExternalExecutionRuntime::Verified
+    {
+        tracing::info!(
+            inner_sandbox = crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE,
+            worker = ?target_spec.agent_lifecycle.as_ref().map(|identity| &identity.task_id),
+            "Grok launch uses required MACO outer containment"
+        );
+    }
+    let grok_headless_schema = match grok_output::bind_schema(&target_spec, &argv) {
+        Ok(schema) => schema,
+        Err(error) => {
+            record_external_error(
+                &mut report,
+                format!("Grok launch schema binding failed: {error:#}"),
+            );
+            return report;
+        }
+    };
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
@@ -8694,6 +8766,7 @@ fn run_external_agent_runtime(
         program_identity: &program_identity,
         grok_acp_parent_evidence: None,
         grok_acp_launch_schema_identity: None,
+        grok_headless_schema: grok_headless_schema.as_ref(),
         claude_broker_witness: None,
     };
     let mut retained_gate_denials = Vec::new();
@@ -8974,6 +9047,7 @@ fn run_external_agent_runtime(
                             program_identity: &program_identity,
                             grok_acp_parent_evidence: parent_evidence.as_ref(),
                             grok_acp_launch_schema_identity: launch_schema.as_ref(),
+                            grok_headless_schema: None,
                             claude_broker_witness: None,
                         },
                     ),
@@ -9188,43 +9262,67 @@ fn run_external_agent_runtime(
             unreachable!("managed Cursor was refused before process construction")
         }
     } else {
-        run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref()).map(
-            |(output, filesystem)| {
-                // Bind the original supervisor command, not target_spec's private
-                // staging destination. Retain spend before any fallible materialization.
-                report.retain_grok_native_usage(
-                    spec,
-                    runtime,
-                    &output.stdout,
-                    !output.timed_out
-                        && output.status.is_some_and(|status| status.success())
-                        && output.process_error.is_none()
-                        && output.stdin_error.is_none()
-                        && output.safety_evidence_verified(),
-                );
-                retain_grok_read_only_filesystem(&mut report, spec, runtime, filesystem);
-                match output_staging.completion_handles() {
-                    Ok(staging) => record_completed_target(
-                        &mut report,
-                        output,
-                        staging,
-                        &mut output_reservation,
-                        &mut json_log_reservation,
-                        &credential_redactor,
-                        completed_context,
-                    ),
-                    Err(error) => {
-                        report.error = append_external_error(
-                            report.error.take(),
-                            Some(format!(
+        let batch = if grok_progress::guarded_worker(&target_spec)
+            && runtime == ExternalExecutionRuntime::Verified
+        {
+            grok_progress::run(process_spec, cancellation)
+        } else {
+            run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
+                .map(|(output, filesystem)| (output, filesystem, None))
+        };
+        batch.map(|(output, filesystem, prior)| {
+            // Bind the original supervisor command, not target_spec's private
+            // staging destination. Retain spend before any fallible materialization.
+            report.retain_grok_native_usage(
+                spec,
+                runtime,
+                &output.stdout,
+                !output.timed_out
+                    && output.status.is_some_and(|status| status.success())
+                    && output.process_error.is_none()
+                    && output.stdin_error.is_none()
+                    && output.safety_evidence_verified(),
+            );
+            if let Some(prior) = prior {
+                if let Some(capture) = report.stdout.run_metadata.grok_native_usage.as_mut() {
+                    match crate::runtime_adapter::grok::observe_grok_native_usage(&prior, false) {
+                        Some(observation) => capture.prior_observations.push(observation),
+                        None => capture.process_completed = false,
+                    }
+                } else {
+                    // An interrupted continuation still spent the first turn.
+                    report.retain_grok_native_usage(
+                        spec,
+                        runtime,
+                        &CapturedBytes::from_bounded_protocol(prior),
+                        false,
+                    );
+                }
+                // Public single-stream evidence cannot claim invocation-wide usage
+                // after a continuation. Private accounting retains both native turns.
+            }
+            retain_grok_read_only_filesystem(&mut report, spec, runtime, filesystem);
+            match output_staging.completion_handles() {
+                Ok(staging) => record_completed_target(
+                    &mut report,
+                    output,
+                    staging,
+                    &mut output_reservation,
+                    &mut json_log_reservation,
+                    &credential_redactor,
+                    completed_context,
+                ),
+                Err(error) => {
+                    report.error = append_external_error(
+                        report.error.take(),
+                        Some(format!(
                             "private external-agent output staging became unavailable: {error:#}"
                         )),
-                        );
-                        report.publishable = false;
-                    }
+                    );
+                    report.publishable = false;
                 }
-            },
-        )
+            }
+        })
     };
     match process_result {
         Ok(()) => {}
@@ -9249,6 +9347,12 @@ fn run_external_agent_runtime(
             }
             if let Some(evidence) = error.cancellation_evidence() {
                 report.retain_grok_native_usage(spec, runtime, &evidence.stdout, false);
+                retain_grok_stream_auth_failure(
+                    &mut report,
+                    spec.invocation,
+                    evidence.stdout.as_bytes(),
+                    evidence.stderr.as_bytes(),
+                );
                 sandbox_denials.extend(sandbox_denials_from_codex_jsonl(
                     &protected_controls,
                     evidence.stdout.as_bytes(),
@@ -9271,6 +9375,15 @@ fn run_external_agent_runtime(
                     &mut report,
                     summarize_redacted_output(&evidence.stdout, &credential_redactor),
                 );
+                if target_spec.invocation == ExternalAgentInvocation::Grok
+                    && runtime == ExternalExecutionRuntime::Verified
+                {
+                    tracing::info!(
+                        inner_sandbox = crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE,
+                        worker = ?target_spec.agent_lifecycle.as_ref().map(|identity| &identity.task_id),
+                        "Grok launch uses required MACO outer containment"
+                    );
+                }
                 report.stdout.target_launch_attempted = true;
                 if target_spec.invocation == ExternalAgentInvocation::ClaudeCode {
                     let mut claude = crate::runtime_adapter::claude::collect_native_stream(
@@ -9311,6 +9424,7 @@ fn run_external_agent_runtime(
             }
         }
     }
+    retain_grok_native_failure(&mut report, spec.invocation);
     #[cfg(target_os = "linux")]
     if let Some(binding) = &grok_worker_journal {
         let checked = binding
@@ -9422,6 +9536,7 @@ fn run_external_agent_runtime(
             }
         }
     }
+    grok_progress::record_launch_policy(&mut report, spec, runtime);
     report
 }
 
@@ -10406,6 +10521,7 @@ struct CompletedTargetContext<'a> {
     program_identity: &'a ExternalProgramIdentity,
     grok_acp_parent_evidence: Option<&'a GrokAcpParentEvidence>,
     grok_acp_launch_schema_identity: Option<&'a GrokAcpBoundOutputSchema>,
+    grok_headless_schema: Option<&'a serde_json::Value>,
     claude_broker_witness: Option<(&'a ClaudeWholeCallWitness, &'a ClaudeBrokerBinding)>,
 }
 
@@ -10621,6 +10737,7 @@ fn runtime_adapter_captured_output(
         stderr,
         target_completed_successfully,
         None,
+        None,
     )
 }
 
@@ -10630,6 +10747,7 @@ fn runtime_adapter_captured_output_with_claude_evidence(
     stderr: &[u8],
     target_completed_successfully: bool,
     claude_evidence: Option<&ClaudeNativeEvidence>,
+    grok_headless_schema: Option<&serde_json::Value>,
 ) -> Result<RuntimeAdapterCapturedOutput> {
     if spec.invocation == ExternalAgentInvocation::Grok {
         if grok_acp_stdio_protocol_selected(spec) {
@@ -10638,34 +10756,11 @@ fn runtime_adapter_captured_output_with_claude_evidence(
         if !target_completed_successfully {
             return Ok(RuntimeAdapterCapturedOutput::Unavailable);
         }
-        let stream = crate::runtime_adapter::grok::parse_grok_event_stream(stdout)
-            .context("Grok runtime output failed bounded streaming-json validation")?;
-        if !stream.successful_completion() {
-            // Retain raw terminal and usage evidence without reflecting child-controlled data.
-            if stream.completed() {
-                bail!("Grok runtime returned a non-success terminal streaming-json end event");
-            }
-            bail!("Grok runtime returned a terminal streaming-json error event");
-        }
-        if spec.output_schema.is_some() {
-            let crate::runtime_adapter::grok::GrokStreamOutcome::Completed(end) = stream.outcome()
-            else {
-                bail!("Grok runtime did not return a completed terminal end event");
-            };
-            if end.structured_output_error().is_some() {
-                // Never reflect the provider-controlled validation diagnostic: it may contain
-                // report content or other sensitive data from the child session.
-                bail!("Grok runtime returned a terminal structuredOutputError");
-            }
-            let structured = end
-                .structured_output()
-                .context("Grok runtime terminal end event is missing structuredOutput")?;
-            return Ok(RuntimeAdapterCapturedOutput::Captured(
-                crate::runtime_adapter::grok::canonical_grok_structured_output(structured)?,
-            ));
+        if grok_progress::worker_no_progress(stdout) {
+            bail!("worker_no_progress");
         }
         return Ok(RuntimeAdapterCapturedOutput::Captured(
-            stream.response_text().as_bytes().to_vec(),
+            grok_output::capture(spec, stdout, grok_headless_schema)?,
         ));
     }
 
@@ -10827,6 +10922,84 @@ fn record_completed_app_server_target(
     }
 }
 
+fn retain_grok_native_failure(report: &mut ExternalAgentRun, invocation: ExternalAgentInvocation) {
+    if invocation != ExternalAgentInvocation::Grok {
+        return;
+    }
+    let Some(error) = report.error.as_deref() else {
+        return;
+    };
+    // These markers are emitted only by the runner's bounded native-log
+    // projection; command availability and a timeout alone remain unknown.
+    if !error.contains("Grok native inference failure tail (") {
+        return;
+    }
+    let auth_failure = error.contains(crate::runtime_adapter::grok::GROK_NATIVE_AUTH_FAILURE);
+    let network_failure = error.contains(crate::runtime_adapter::grok::GROK_NATIVE_DNS_FAILURE)
+        || error.contains(crate::runtime_adapter::grok::GROK_NATIVE_CONNECT_FAILURE);
+    if auth_failure {
+        retain_grok_provider_auth_failure(report);
+    }
+    if network_failure {
+        report
+            .stdout
+            .run_metadata
+            .environment_failures
+            .push(environment_failure(
+            EnvironmentFailureCategory::NetworkUnavailable,
+            Some(EnvironmentRequirement::network(
+                EnvironmentNetworkAccess::Enabled,
+            )),
+            "Grok native inference log reports a DNS/connect failure; transport did not complete"
+                .to_string(),
+        ));
+    }
+}
+
+fn retain_grok_provider_auth_failure(report: &mut ExternalAgentRun) {
+    if !report
+        .environment_failures()
+        .iter()
+        .any(|failure| failure.category == EnvironmentFailureCategory::ProviderAuthRequired)
+    {
+        report
+            .stdout
+            .run_metadata
+            .environment_failures
+            .push(environment_failure(
+                EnvironmentFailureCategory::ProviderAuthRequired,
+                None,
+                "Grok worker inference reported an authentication/authorization failure"
+                    .to_string(),
+            ));
+    }
+    if !report
+        .error
+        .as_deref()
+        .is_some_and(|error| error.contains(crate::runtime_adapter::grok::GROK_NATIVE_AUTH_FAILURE))
+    {
+        report.error = append_external_error(
+            report.error.take(),
+            Some(crate::runtime_adapter::grok::GROK_NATIVE_AUTH_FAILURE.to_string()),
+        );
+    }
+    report.publishable = false;
+}
+
+fn retain_grok_stream_auth_failure(
+    report: &mut ExternalAgentRun,
+    invocation: ExternalAgentInvocation,
+    stdout: &[u8],
+    stderr: &[u8],
+) {
+    if invocation == ExternalAgentInvocation::Grok
+        && (crate::runtime_adapter::grok::inference_stream_authentication_failed(stdout)
+            || crate::runtime_adapter::grok::inference_stream_authentication_failed(stderr))
+    {
+        retain_grok_provider_auth_failure(report);
+    }
+}
+
 fn record_completed_target(
     report: &mut ExternalAgentRun,
     output: ProcessOutput,
@@ -10841,6 +11014,12 @@ fn record_completed_target(
         codex_home,
     } = staging;
     let safety_verified = output.safety_evidence_verified();
+    retain_grok_stream_auth_failure(
+        report,
+        context.spec.invocation,
+        output.stdout.as_bytes(),
+        output.stderr.as_bytes(),
+    );
     let target_completed_successfully = !output.timed_out
         && output.status.is_some_and(|status| status.success())
         && output.process_error.is_none()
@@ -10966,6 +11145,7 @@ fn record_completed_target(
         output.stderr.as_bytes(),
         target_completed_successfully,
         claude_native_evidence.as_ref(),
+        context.grok_headless_schema,
     )
     .and_then(|captured| qualify_grok_read_only_capture(context.original_spec, report, captured))
     {
@@ -11299,6 +11479,12 @@ impl ExternalOutputStaging {
     ) -> Result<Self> {
         let store = MachineGlobalStore::open_config(&binding.config)
             .context("failed to open machine-global config before output staging")?;
+        // Opening validates the config and roots, but durable state is checked only
+        // under the store lock. Refuse an incompatible domain before allocating
+        // staging or launching a provider whose cleanup could never be authorized.
+        store
+            .status()
+            .context("machine-global durable state refused before output staging")?;
         let root_reservation = store
             .reserve_random_direct_child_directory(
                 &binding.root_id,

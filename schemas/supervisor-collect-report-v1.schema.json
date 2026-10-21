@@ -1739,6 +1739,8 @@
                     "version_mismatch",
                     "missing_credential",
                     "network_forbidden",
+                    "network_unavailable",
+                    "provider_auth_required",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"
@@ -2988,6 +2990,8 @@
               "version_mismatch",
               "missing_credential",
               "network_forbidden",
+              "network_unavailable",
+              "provider_auth_required",
               "sandbox_unavailable",
               "probe_failed",
               "runtime_model_catalog_unavailable"
@@ -6877,6 +6881,8 @@
                                 "version_mismatch",
                                 "missing_credential",
                                 "network_forbidden",
+                                "network_unavailable",
+                                "provider_auth_required",
                                 "sandbox_unavailable",
                                 "probe_failed",
                                 "runtime_model_catalog_unavailable"
@@ -8019,6 +8025,8 @@
                           "version_mismatch",
                           "missing_credential",
                           "network_forbidden",
+                          "network_unavailable",
+                          "provider_auth_required",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"
@@ -8671,6 +8679,8 @@
                           "version_mismatch",
                           "missing_credential",
                           "network_forbidden",
+                          "network_unavailable",
+                          "provider_auth_required",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"
@@ -9886,6 +9896,8 @@
                     "version_mismatch",
                     "missing_credential",
                     "network_forbidden",
+                    "network_unavailable",
+                    "provider_auth_required",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"
@@ -14034,6 +14046,8 @@
                                 "version_mismatch",
                                 "missing_credential",
                                 "network_forbidden",
+                                "network_unavailable",
+                                "provider_auth_required",
                                 "sandbox_unavailable",
                                 "probe_failed",
                                 "runtime_model_catalog_unavailable"
@@ -15248,6 +15262,8 @@
                           "version_mismatch",
                           "missing_credential",
                           "network_forbidden",
+                          "network_unavailable",
+                          "provider_auth_required",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"

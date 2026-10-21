@@ -63,6 +63,7 @@ pub(super) fn canonicalize_command(
     let mut flags = BTreeMap::new();
     let mut declared_paths = Vec::new();
     let mut observe = false;
+    let mut auto_timestamps = false;
     let mut cursor = 3;
     while cursor < separator {
         let flag = words[cursor].literal()?;
@@ -72,6 +73,13 @@ pub(super) fn canonicalize_command(
                 return None;
             }
             observe = true;
+            continue;
+        }
+        if flag == "--auto-timestamps" {
+            if auto_timestamps {
+                return None;
+            }
+            auto_timestamps = true;
             continue;
         }
         let (name, value) = if let Some((name, value)) = flag.split_once('=') {
@@ -124,8 +132,18 @@ pub(super) fn canonicalize_command(
     if command.is_empty() {
         return None;
     }
-    let start = flags.get("--start-timestamp")?;
-    let end = flags.get("--end-timestamp")?;
+    let automatic = Word::Timestamp;
+    let (start, end) = if auto_timestamps {
+        if flags.contains_key("--start-timestamp") || flags.contains_key("--end-timestamp") {
+            return None;
+        }
+        (&automatic, &automatic)
+    } else {
+        (
+            flags.get("--start-timestamp")?,
+            flags.get("--end-timestamp")?,
+        )
+    };
     let declared_paths = normalize_paths(declared_paths).ok()?;
     let candidates = entries
         .iter()

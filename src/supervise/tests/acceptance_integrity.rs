@@ -1573,6 +1573,23 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
     );
     assert!(!finding_messages(&exact).contains("not supported by execution journal"));
 
+    // A private launch schema accepts the absolute spelling, but only the
+    // exact journal-bound cwd may survive reconciliation (including whitespace).
+    for wrong_cwd in [
+        ".",
+        "/private/other-worker",
+        " /native/local/tmp/c6/a1/.maco/worktrees/r/assignment-001",
+    ] {
+        let mut wrong = injected_child_report(&assignment);
+        wrong.worker_reports[0].commands_run = exact.worker_reports[0].commands_run.clone();
+        wrong.worker_reports[0].commands_run[0].cwd = PathBuf::from(wrong_cwd);
+        validate_worker_execution_journal_evidence(&assignment, report_path, &journals, &mut wrong);
+        assert!(!wrong.accepted);
+        assert_eq!(wrong.status, ReviewStatus::Failed);
+        assert!(finding_messages(&wrong)
+            .contains("commands_run entries are not supported by execution journal"));
+    }
+
     let mut paraphrased = injected_child_report(&assignment);
     paraphrased.worker_reports[0].commands_run = exact.worker_reports[0].commands_run.clone();
     paraphrased.worker_reports[0].commands_run[0].command[2] =
@@ -1589,6 +1606,147 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
     assert!(paraphrased.rejected);
     assert!(finding_messages(&paraphrased)
         .contains("commands_run entries are not supported by execution journal"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_native_and_wrapped_edit_reports_require_exact_observed_command() {
+    use std::os::unix::fs::MetadataExt;
+
+    // R39x1b captured a native Codex edit between two --observe-changes -- true
+    // calls, then reported an unjournaled apply_patch. Exercise both documented
+    // native reporting choices and the productive Grok wrapped-shell path.
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    for mode in ["native_true", "native_payload", "wrapped_shell"] {
+        let (temp, worktree, base, _) = observed_parent_journal("true");
+        let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+        let metadata = fs::metadata(&journal).unwrap();
+        let identity = crate::safe_state::FileIdentity {
+            device: metadata.dev(),
+            file: metadata.ino(),
+        };
+        let automatic_entry = |command: Vec<String>| WorkerExecutionJournalEntry {
+            command,
+            cwd: worktree.clone(),
+            start_timestamp: String::new(),
+            end_timestamp: String::new(),
+            changed_paths: Vec::new(),
+            observation: None,
+        };
+        let patch = format!(
+            "*** Begin Patch\n*** Update File: {}/README.md\n@@\n original\n+Hello from MACO\n*** End Patch",
+            worktree.display()
+        );
+        let native_argv = vec!["apply_patch".to_string(), patch];
+        let edit_argv = match mode {
+            "wrapped_shell" => vec![
+                "/bin/sh".into(),
+                "-c".into(),
+                "printf 'Hello from MACO\\n' >> README.md".into(),
+            ],
+            "native_payload" => native_argv.clone(),
+            _ => vec!["true".into()],
+        };
+        if mode != "wrapped_shell" {
+            run_worker_execution_journal_command_with_clock(
+                &journal,
+                &identity,
+                &automatic_entry(vec!["true".into()]),
+                true,
+                true,
+            )
+            .unwrap();
+            // Stand in for the runtime's native edit; observation must not
+            // launch apply_patch or apply its payload a second time.
+            fs::write(worktree.join("README.md"), "original\nHello from MACO\n").unwrap();
+        }
+        run_worker_execution_journal_command_with_clock(
+            &journal,
+            &identity,
+            &automatic_entry(edit_argv.clone()),
+            mode != "wrapped_shell",
+            true,
+        )
+        .unwrap();
+        let verify_argv = vec![
+            "/bin/sh".into(),
+            "-c".into(),
+            "test \"$(cat README.md)\" = \"$(printf 'original\\nHello from MACO')\"".into(),
+        ];
+        run_worker_execution_journal_command_with_clock(
+            &journal,
+            &identity,
+            &automatic_entry(verify_argv.clone()),
+            false,
+            true,
+        )
+        .unwrap();
+        let entries =
+            parse_worker_execution_journal(&fs::read(&journal).unwrap(), &journal).unwrap();
+        assert!(entries.iter().any(|entry| {
+            entry.command == edit_argv && entry.changed_paths == vec![PathBuf::from("README.md")]
+        }));
+        let journals =
+            injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(entries));
+        let mut assignment = injected_assignment(true);
+        let mut report = injected_child_report(&assignment);
+        assignment.id = "worker-a".into();
+        assignment.role = AgentRole::Worker;
+        assignment.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        assignment.worker_assignments.clear();
+        report.id = assignment.id.clone();
+        report.files_changed = vec![PathBuf::from("README.md")];
+        let worker = &mut report.worker_reports[0];
+        worker.files_changed = report.files_changed.clone();
+        worker.commands_run = [edit_argv, verify_argv.clone()]
+            .into_iter()
+            .map(|command| CommandRunRecord {
+                command,
+                cwd: worktree.clone(),
+                ..injected_command_record()
+            })
+            .collect();
+        worker.validation_results[0].command = verify_argv;
+        report.commands_run = worker.commands_run.clone();
+        report.validation_results = worker.validation_results.clone();
+        let report_path = Path::new("native-edit-report.json");
+        validate_worker_journal_worktree_binding(&journals, &worktree, &base, &mut report);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &journals,
+            &mut report,
+        );
+        assert!(report.accepted, "{mode}: {}", finding_messages(&report));
+        let finalized = finalized_direct_worker_report(&assignment, &report, report_path);
+        assert!(finalized.accepted);
+        assert_eq!(finalized.status, ReviewStatus::Succeeded);
+        assert_eq!(
+            fs::read_to_string(worktree.join("README.md")).unwrap(),
+            "original\nHello from MACO\n"
+        );
+
+        // Neither a true observation nor an observed content digest is a
+        // license to infer a native command identity. A modified payload is
+        // equally unsupported even when its filename and cwd are unchanged.
+        let mut unsupported = report;
+        let mut unjournaled_native = native_argv;
+        if mode == "native_payload" {
+            unjournaled_native[1].push('\n');
+        }
+        unsupported.worker_reports[0].commands_run[0].command = unjournaled_native;
+        unsupported.commands_run = unsupported.worker_reports[0].commands_run.clone();
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            report_path,
+            &journals,
+            &mut unsupported,
+        );
+        assert!(!unsupported.accepted, "{mode}");
+        assert!(finding_messages(&unsupported)
+            .contains("commands_run entries are not supported by execution journal"));
+        assert!(!finalized_direct_worker_report(&assignment, &unsupported, report_path).accepted);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1952,6 +2110,25 @@ fn worker_journal_repeated_wrappers_require_literal_timestamps_and_exact_paths()
     candidates.push(candidates[1].clone());
     record.command[4] = "README.md".into();
     assert!(journal_command::canonicalize_wrapper(&record, journal, &candidates).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_journal_auto_timestamp_wrapper_requires_unique_finished_command() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, mut journals, mut wrapper) = wrapper_journal_fixture(false);
+    wrapper.splice(11..15, ["--auto-timestamps".to_string()]);
+    assert!(reconcile_wrapper(&journals, wrapper.clone()).accepted);
+    let WorkerExecutionJournalStatus::Loaded(entries) =
+        &mut journals.get_mut("worker-a").unwrap().status
+    else {
+        panic!("loaded")
+    };
+    entries.extend(entries.clone());
+    // Automatic timestamps do not resolve ambiguous repeated wrapper identities.
+    assert!(!reconcile_wrapper(&journals, wrapper.clone()).accepted);
+    wrapper.splice(3..3, ["--start-timestamp".into(), "invented".into()]);
+    assert!(!reconcile_wrapper(&journals, wrapper).accepted);
 }
 
 #[cfg(target_os = "linux")]
@@ -3024,6 +3201,95 @@ fn missing_child_report_preserves_original_and_adds_actionable_contract_finding(
         .contains("missing field `id` at line 3 column 1"));
     assert!(report.findings[1].message.contains("Corrective action"));
     assert_eq!(report.findings[1].paths, vec![report_path.to_path_buf()]);
+    assert!(report.findings[1]
+        .message
+        .contains("one OrchestratorReviewReport"));
+
+    let mut direct_worker = assignment;
+    direct_worker.role = AgentRole::Worker;
+    direct_worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+    let report = missing_child_report(
+        &direct_worker,
+        report_path,
+        &external_run,
+        &command,
+        SupervisorRuntime::Grok,
+        "external run did not capture a descriptor-held direct worker report".to_string(),
+    );
+    assert!(report.findings[1]
+        .message
+        .contains("one non-delegating WorkerReport"));
+    assert!(report.findings[1]
+        .message
+        .contains("supervisor runs the independent auditor"));
+    assert!(!report.findings[1]
+        .message
+        .contains("OrchestratorReviewReport"));
+    assert!(!report.accepted);
+    assert_eq!(report.status, ReviewStatus::Missing);
+}
+
+#[test]
+fn contained_adapter_timeout_is_not_completion_or_acceptance_evidence() {
+    let temp = tempfile::tempdir().unwrap();
+    let command = control_test_command(temp.path(), temp.path());
+    for (runtime, profile) in [
+        (
+            SupervisorRuntime::Grok,
+            SideEffectConfinementProfileKind::ExternalGrok,
+        ),
+        (
+            SupervisorRuntime::Cursor,
+            SideEffectConfinementProfileKind::ExternalCursor,
+        ),
+        (
+            SupervisorRuntime::ClaudeCode,
+            SideEffectConfinementProfileKind::ExternalClaude,
+        ),
+        (
+            SupervisorRuntime::GeminiCli,
+            SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        ),
+    ] {
+        let mut run = injected_verified_run_without_journals(&command);
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(profile));
+        run.program_trust = ExternalProgramTrust::ExplicitCustom;
+        run.codex_permissions = None;
+        run.exit_code = Some(255);
+        run.timed_out = true;
+        run.publishable = false;
+        run.error = Some("external agent timed out after 1200 seconds".into());
+        assert!(external_containment_verified(&run, runtime), "{runtime:?}");
+        assert!(!external_process_completed(&run, runtime), "{runtime:?}");
+        assert!(!external_safety_verified(&run, runtime), "{runtime:?}");
+        // The identical evidence cannot satisfy the trusted Codex boundary.
+        assert!(!external_containment_verified(
+            &run,
+            SupervisorRuntime::Codex
+        ));
+        for process_tree in [
+            None,
+            Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService,
+            )),
+            Some(ProcessTreeEvidence::TrustedBestEffort(
+                ContainmentBackend::SystemdUserService,
+            )),
+        ] {
+            let mut unknown = run.clone();
+            unknown.process_tree = process_tree;
+            assert!(!external_containment_verified(&unknown, runtime));
+        }
+        for side_effects in [
+            None,
+            Some(SideEffectConfinementEvidence::Unverified(profile)),
+            Some(SideEffectConfinementEvidence::TrustedBestEffort(profile)),
+        ] {
+            let mut unknown = run.clone();
+            unknown.side_effects = side_effects;
+            assert!(!external_containment_verified(&unknown, runtime));
+        }
+    }
 }
 
 #[test]

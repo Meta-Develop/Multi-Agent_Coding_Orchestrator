@@ -216,8 +216,8 @@ fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutat
         .expect("write authoritative worker report schema");
     write_codex_worker_schema(&mut writer, Path::new(CODEX_OUTPUT))
         .expect("write Codex worker output schema");
-    let expected_codex =
-        codex_response_format_schema(worker_report_schema_value()).expect("derive worker schema");
+    let expected_codex = codex_response_format_schema(terminal_worker_output_schema_value())
+        .expect("derive worker schema");
     let before_resume = fs::read(writer.run_dir().join(CODEX_OUTPUT))
         .expect("read worker Codex schema before resume");
     assert_eq!(
@@ -1559,8 +1559,8 @@ fn scheduler_materializes_and_binds_worker_codex_schema_for_direct_worker() {
         "direct-worker-codex-schema-dispatch",
     );
     let run_id = options.run_id.clone();
-    let expected_codex =
-        codex_response_format_schema(worker_report_schema_value()).expect("derive worker schema");
+    let expected_codex = codex_response_format_schema(terminal_worker_output_schema_value())
+        .expect("derive worker schema");
     let mut worker_invocations = 0usize;
     let mut auditor_invocations = 0usize;
     let mut runner = |command: &ExternalAgentCommand| {

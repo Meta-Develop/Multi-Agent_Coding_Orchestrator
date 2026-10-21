@@ -235,16 +235,17 @@ Safety requirements:
 fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
     Ok(format!(
-        r#"- Bound journal-append prefix/device/inode + --cwd <exact worktree> + nonempty --start-timestamp/--end-timestamp + -- <argv>. The wrapper executes the command ONCE, journaling start/completion/digests. Never execute separately. Never reconstruct at the end.
-- --changed-path is optional; repeat per path, matching observation. Parent checks all paths, including out-of-scope paths.
-- Native apply_patch/Edit: baseline before editing with bound prefix + cwd/timestamps + --observe-changes -- true; edit, then IMMEDIATELY observe with fresh timestamps before any other action. Observation never executes argv: record ["true"] or apply_patch + full patch as ONE argument.
+        r#"- Bound journal-append prefix/device/inode + --cwd <exact worktree> + --auto-timestamps + -- <argv>. The wrapper obtains real UTC start/end timestamps itself and executes the command ONCE, journaling start/completion/digests. Do not invent timestamps or run date. Never execute separately. Never reconstruct at the end. Explicit nonempty --start-timestamp/--end-timestamp remain a legacy alternative; never combine them with --auto-timestamps.
+- --changed-path is optional; omit it and let the wrapper derive changed paths. If supplied, it describes only changes made by THIS command/observation, not files already dirty from an earlier edit. Read-only validation (for example tail or git diff --check) must omit --changed-path. Parent checks all paths, including out-of-scope paths.
+- Native apply_patch/Edit: baseline before editing with bound prefix + --cwd <exact worktree> --auto-timestamps --observe-changes -- true; use the native edit tool ONCE, then IMMEDIATELY invoke that observation prefix again before any other action. Both observation records contain ["true"]. In WorkerReport.commands_run report only the journaled ["true"] observations and wrapped verification commands; omit the native apply_patch/Edit command itself and describe the edit in findings. Never add a native tool command absent from the journal, even when the tool succeeded and its changed bytes were observed.
+- If reporting native apply_patch argv is necessary, replace ONLY the post-edit observation's -- true with -- apply_patch '<exact full patch passed to the native tool as ONE argument>'. Observation never executes argv; do not apply the patch again. Only this payload-bearing observation supports ["apply_patch", "<exact full patch>"] in commands_run. A ["true"] observation cannot support it. The timestamps describe observation time, not an unobserved native edit's execution time.
 - Do not pre-journal apply_patch as shell argv.
 - Append/observation error: stop; no repair/retry, hand JSON, identity discovery, PATH change or recursive journaling. For environment errors include the observed error in environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true. Never rerun outside the wrapper.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Empty command/payload/cwd/timestamps or invalid paths: WorkerExecutionJournalRecordError; stop.
-- WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
+- WorkerReport.commands_run cwd is the exact absolute worktree from the journal, not a repository-relative path or a redacted placeholder. WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
 - Report the inner argv after --: direct prefix ... -- bash -lc 'true' or /bin/bash -lc 'prefix ...' reports ["bash","-lc","true"]; the inner bash -lc array stays intact, with a matching finished journal record.
 - Replace /worktree with your assigned worktree.
-- Never write this JSON yourself. Preserve the full apply_patch record when recording native tool argv:
+- Only a payload-bearing post-edit observation produces an apply_patch journal record with the following command shape. The wrapper generates JSON and timestamps; never write this JSON yourself or copy this command into commands_run after a -- true observation:
 {apply_patch_journal_example}"#
     ))
 }
@@ -342,6 +343,7 @@ Rules:
 - Do not stage, commit, push, merge, or otherwise publish changes.
 {journal_contract}
 - Validate the bounded change, or report exactly why validation could not run.
+- Use tools to execute the assignment before returning the final WorkerReport. The JSON output contract applies to the final response; it does not replace tool execution. Return status=succeeded only after completing and verifying the work, or status=failed/rejected with observed evidence if blocked. Never end with a pending or not-started report.
 - Return exactly one WorkerReport JSON object matching the declared worker schema. Do not return an OrchestratorReviewReport, prose, Markdown, or a code fence.
 - Set assignment_kind to ordinary, target_path to null, and decomposition_completion to null.
 - Copy assigned_paths, semantic_symbols, and semantic_modules byte-for-byte from the assignment JSON; do not widen or reinterpret scope.

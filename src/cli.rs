@@ -1074,7 +1074,7 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
         SuperviseSubcommand::JournalAppend(args) => {
-            supervise::run_worker_execution_journal_command(
+            supervise::run_worker_execution_journal_command_with_clock(
                 &args.journal,
                 &crate::safe_state::FileIdentity {
                     device: args.device,
@@ -1083,12 +1083,13 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 &supervise::WorkerExecutionJournalEntry {
                     command: args.command,
                     cwd: args.cwd,
-                    start_timestamp: args.start_timestamp,
-                    end_timestamp: args.end_timestamp,
+                    start_timestamp: args.start_timestamp.unwrap_or_default(),
+                    end_timestamp: args.end_timestamp.unwrap_or_default(),
                     changed_paths: args.changed_paths,
                     observation: None,
                 },
                 args.observe_changes,
+                args.auto_timestamps,
             )
         }
         SuperviseSubcommand::Plan(args) => {
@@ -1128,6 +1129,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            validate_supervise_only_runtime(args.runtime, args.only_runtime)?;
             pin_cam_authority_socket(args.cam_authority_socket.as_deref())?;
             let routed_literal = args.literal_goal.is_some();
             let (machine_global_config, machine_global_runtime_root_id) =
@@ -1351,7 +1353,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     options.codex_bin = primary;
                     guard
                 })
-            } else if additional_runtime_bins.is_empty() {
+            } else if additional_runtime_bins.is_empty() && args.only_runtime.is_none() {
                 None
             } else {
                 let primary = supplied_runtime_bin
@@ -1365,6 +1367,9 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     &additional_runtime_bins,
                 )?)
             };
+            if let Some(runtime) = args.only_runtime {
+                supervise::require_only_runtime_binding(runtime)?;
+            }
             let outcome = (|| {
                 let report = if let Some(document) = normal_document {
                     supervise::run_supervisor_normal_document_cascade(
@@ -1521,10 +1526,13 @@ struct WorkerJournalAppendArgs {
     inode: u64,
     #[arg(long)]
     cwd: PathBuf,
-    #[arg(long)]
-    start_timestamp: String,
-    #[arg(long)]
-    end_timestamp: String,
+    /// Record start/end UTC times inside the wrapper; no separate date command.
+    #[arg(long, conflicts_with_all = ["start_timestamp", "end_timestamp"])]
+    auto_timestamps: bool,
+    #[arg(long, required_unless_present = "auto_timestamps")]
+    start_timestamp: Option<String>,
+    #[arg(long, required_unless_present = "auto_timestamps")]
+    end_timestamp: Option<String>,
     /// Optional assertion of observed paths; a mismatch is journaled and rejected.
     #[arg(long = "changed-path")]
     changed_paths: Vec<PathBuf>,
@@ -1811,6 +1819,21 @@ fn materialize_launch_plan_for_operator_role_category(
     Ok((stamped, None))
 }
 
+fn validate_supervise_only_runtime(
+    runtime: Option<supervise::SupervisorRuntime>,
+    only_runtime: Option<supervise::SupervisorRuntime>,
+) -> Result<()> {
+    if let Some(only) = only_runtime {
+        if runtime != Some(only) {
+            bail!("--only-runtime must match --runtime");
+        }
+        if only == supervise::SupervisorRuntime::Fake {
+            bail!("--only-runtime requires a real runtime and an absolute --runtime-bin");
+        }
+    }
+    Ok(())
+}
+
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
     /// JSON supervisor plan file to run.
@@ -1862,6 +1885,14 @@ struct RunSuperviseArgs {
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
+    /// Restrict selection and dispatch to this runtime; requires matching --runtime and an absolute --runtime-bin.
+    #[arg(
+        long,
+        value_enum,
+        requires_all = ["runtime", "runtime_bin"],
+        conflicts_with = "additional_runtime_bin"
+    )]
+    only_runtime: Option<supervise::SupervisorRuntime>,
     /// Named objective profile. Overrides the authored plan selection.
     #[arg(long, value_name = "NAME")]
     objective_profile: Option<String>,
@@ -5228,6 +5259,65 @@ mod cli_integration_tests {
             fs::read_to_string(cwd.join("hello.txt")).unwrap(),
             "Hello from MACO\n"
         );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_auto_timestamps_bracket_execution_and_observe_native_edits() -> Result<()> {
+        // Exercise the Linux syscall fallback used on this worker host too.
+        let _fallback =
+            crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let device = identity.device.to_string();
+        let inode = identity.file.to_string();
+        let cwd = root.join("worktree");
+        let prefix = vec![
+            "maco",
+            "supervise",
+            "journal-append",
+            "--journal",
+            path.to_str().unwrap(),
+            "--device",
+            &device,
+            "--inode",
+            &inode,
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--auto-timestamps",
+        ];
+        let before = crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())?;
+        let mut args = prefix.clone();
+        args.extend([
+            "--",
+            "/bin/sh",
+            "-c",
+            "printf 'Hello from MACO\\n' > README.md",
+        ]);
+        Cli::try_parse_from(args)?.run()?;
+        let after = crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())?;
+        let entries = supervise::parse_worker_execution_journal(&fs::read(&path)?, &path)?;
+        assert_eq!(entries.len(), 2);
+        assert!(before <= entries[0].start_timestamp);
+        assert_eq!(entries[0].start_timestamp, entries[0].end_timestamp);
+        assert_eq!(entries[0].start_timestamp, entries[1].start_timestamp);
+        assert!(entries[1].start_timestamp <= entries[1].end_timestamp);
+        assert!(entries[1].end_timestamp <= after);
+        assert_eq!(entries[1].changed_paths, [PathBuf::from("README.md")]);
+        fs::write(cwd.join("README.md"), "Hello from MACO\nobserved edit\n")?;
+        let mut args = prefix.clone();
+        args.extend(["--observe-changes", "--", "true"]);
+        Cli::try_parse_from(args)?.run()?;
+        let entries = supervise::parse_worker_execution_journal(&fs::read(&path)?, &path)?;
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].changed_paths, [PathBuf::from("README.md")]);
+        assert!(!entries[2].start_timestamp.is_empty());
+        let mut conflicting = prefix;
+        conflicting.extend(["--start-timestamp", "invented", "--", "true"]);
+        assert!(Cli::try_parse_from(conflicting).is_err());
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

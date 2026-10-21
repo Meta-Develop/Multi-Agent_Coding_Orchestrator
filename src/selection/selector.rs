@@ -1294,6 +1294,22 @@ fn evaluate_loaded_policy_candidate(
 ) -> Result<CandidateEvaluation, SelectionError> {
     let policy = &receipt.frozen.policy;
     let role = policy.role(&receipt.role);
+    // An uncertainty penalty may price an exploratory terminal attempt, but
+    // cannot qualify an unknown model to judge or delegate other work. Preserve
+    // the exact, unused environment fallback declared by the source's prior;
+    // all other gates (including a target's prohibition) still apply.
+    if prior.is_none()
+        && input.task.authority_role.requires_exact_judgment_evidence()
+        && (input.debug_override.is_some()
+            || environment_fallback_transition(input)
+                .is_none_or(|transition| transition.target != candidate))
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::MissingDatedPrior,
+            "judgment authority requires a dated model prior; loaded routing preferences cannot qualify an unknown model",
+        );
+    }
     if input.task.authority_role == AuthorityRole::UnknownJudgment {
         reject(
             &mut reasons,
@@ -2127,52 +2143,55 @@ fn environment_fallback_choice(
     input: &SelectionInput,
     candidates: &[CandidateEvaluation],
 ) -> Result<Option<(SelectedChoice, EnvironmentFallbackTransition)>, SelectionError> {
-    let Some(previous) = input.signals.previous_choice.as_ref() else {
+    let Some(transition) = environment_fallback_transition(input) else {
         return Ok(None);
-    };
-    let rejection = input
-        .signals
-        .environment_rejections
-        .iter()
-        .find(|rejection| rejection.candidate == *previous && !rejection.fallback_transition_used);
-    let Some(rejection) = rejection else {
-        return Ok(None);
-    };
-    let prior = input
-        .priors
-        .models
-        .iter()
-        .find(|prior| prior.runtime == previous.runtime && prior.model == previous.model);
-    let Some(fallback) = prior.and_then(|prior| {
-        prior
-            .one_shot_environment_fallbacks
-            .iter()
-            .find(|fallback| fallback.rejection_code == rejection.rejection_code)
-    }) else {
-        return Ok(None);
-    };
-    let target = CandidateKey {
-        runtime: fallback.target_runtime.clone(),
-        model: fallback.target_model.clone(),
-        effort: fallback.target_effort,
     };
     let Some(evaluation) = candidates
         .iter()
-        .find(|evaluation| evaluation.candidate == target && evaluation.eligible)
+        .find(|evaluation| evaluation.candidate == transition.target && evaluation.eligible)
     else {
         return Ok(None);
     };
     Ok(Some((
         selected_choice(evaluation, ChoiceReason::OneShotEnvironmentFallback)?,
-        EnvironmentFallbackTransition {
-            source: previous.clone(),
-            target,
-            rejection_code: rejection.rejection_code.clone(),
-            evidence_id: rejection.evidence_id.clone(),
-            transition_ordinal: 1,
-            maximum_transitions: 1,
-        },
+        transition,
     )))
+}
+
+fn environment_fallback_transition(
+    input: &SelectionInput,
+) -> Option<EnvironmentFallbackTransition> {
+    let previous = input.signals.previous_choice.as_ref()?;
+    let rejection = input
+        .signals
+        .environment_rejections
+        .iter()
+        .find(|rejection| rejection.candidate == *previous && !rejection.fallback_transition_used);
+    let rejection = rejection?;
+    let prior = input
+        .priors
+        .models
+        .iter()
+        .find(|prior| prior.runtime == previous.runtime && prior.model == previous.model);
+    let fallback = prior.and_then(|prior| {
+        prior
+            .one_shot_environment_fallbacks
+            .iter()
+            .find(|fallback| fallback.rejection_code == rejection.rejection_code)
+    })?;
+    let target = CandidateKey {
+        runtime: fallback.target_runtime.clone(),
+        model: fallback.target_model.clone(),
+        effort: fallback.target_effort,
+    };
+    Some(EnvironmentFallbackTransition {
+        source: previous.clone(),
+        target,
+        rejection_code: rejection.rejection_code.clone(),
+        evidence_id: rejection.evidence_id.clone(),
+        transition_ordinal: 1,
+        maximum_transitions: 1,
+    })
 }
 
 fn selected_choice(

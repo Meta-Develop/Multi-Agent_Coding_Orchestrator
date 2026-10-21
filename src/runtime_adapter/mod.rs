@@ -763,7 +763,7 @@ impl RuntimeAdapterConfig {
     ///
     /// Grok capability elevation requires an absolute cwd, the selected
     /// executable, the exact immutable argv for the selected interaction
-    /// protocol (strict sandboxing, headless tool approval, no subagents;
+    /// protocol (inner profile off behind required outer containment, tool approval, no subagents;
     /// headless streaming-json or ACP `agent stdio`), stdout capture, and no
     /// operator environment or stdin alteration. A model/effort string without
     /// these checks remains on the fail-closed adapter-level capability row.
@@ -1061,7 +1061,34 @@ impl RuntimeAdapterConfig {
     pub fn execute(&self, context: &LaunchContext<'_>) -> Result<AdapterRun> {
         let launch = self.render(context)?;
         let resolved = resolve_binary(&launch.program)?;
-        let mut command = Command::new(&resolved);
+        if launch
+            .argv
+            .windows(2)
+            .any(|args| args == ["--sandbox", "off"])
+        {
+            bail!("Grok inner sandbox off requires the verified ExternalGrok runner; uncontained adapter execution refused");
+        }
+        self.execute_rendered(context, launch, &resolved)
+    }
+
+    /// Explicit synthetic transport seam; absent from production builds.
+    #[cfg(test)]
+    pub(crate) fn execute_scripted_fixture(
+        &self,
+        context: &LaunchContext<'_>,
+    ) -> Result<AdapterRun> {
+        let launch = self.render(context)?;
+        let resolved = resolve_binary(&launch.program)?;
+        self.execute_rendered(context, launch, &resolved)
+    }
+
+    fn execute_rendered(
+        &self,
+        context: &LaunchContext<'_>,
+        launch: LaunchSpec,
+        resolved: &Path,
+    ) -> Result<AdapterRun> {
+        let mut command = Command::new(resolved);
         command
             .args(&launch.argv)
             .current_dir(&launch.cwd)
@@ -1540,11 +1567,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
 
@@ -1570,11 +1598,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
@@ -1622,11 +1651,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
         assert_eq!(
@@ -1676,11 +1706,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
         Ok(())
@@ -1706,11 +1737,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
         Ok(())
@@ -1818,11 +1850,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
@@ -1842,7 +1875,7 @@ mod tests {
         );
         assert_eq!(
             config.argument_template.last().map(String::as_str),
-            Some(GROK_NO_SUBAGENTS_ARG)
+            Some("--no-leader")
         );
 
         let mut cursor = RuntimeAdapterConfig::defaults(RuntimeId::Cursor);
@@ -1924,10 +1957,12 @@ mod tests {
 
     #[test]
     fn grok_from_environment_keeps_defaults_without_overrides() {
-        assert_eq!(
-            RuntimeAdapterConfig::from_environment(RuntimeId::Grok),
-            RuntimeAdapterConfig::defaults(RuntimeId::Grok)
-        );
+        // The real operator may export MACO_GROK_BIN while running tests.
+        // Exercise an absent-override lookup without mutating process globals.
+        let config = RuntimeAdapterConfig::load_adapter_environment(AdapterId::Grok, |_| {
+            Err(env::VarError::NotPresent)
+        });
+        assert_eq!(config, RuntimeAdapterConfig::defaults(RuntimeId::Grok));
     }
 
     #[test]
@@ -2004,7 +2039,7 @@ mod tests {
             [
                 "--no-auto-update",
                 "--sandbox",
-                "strict",
+                grok::GROK_INNER_SANDBOX_PROFILE,
                 "--disable-web-search",
                 "agent",
                 "--always-approve",
@@ -2444,14 +2479,36 @@ mod tests {
                 OsString::from("--output-format"),
                 OsString::from("streaming-json"),
                 OsString::from("--sandbox"),
-                OsString::from("strict"),
+                OsString::from(grok::GROK_INNER_SANDBOX_PROFILE),
                 OsString::from("--always-approve"),
                 OsString::from("--disable-web-search"),
                 OsString::from("--no-memory"),
                 OsString::from("--no-subagents"),
+                OsString::from("--no-leader"),
             ]
         );
         Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn grok_inner_sandbox_off_cannot_use_uncontained_transport() {
+        let config = RuntimeAdapterConfig {
+            binary: Some(PathBuf::from("/bin/true")),
+            ..RuntimeAdapterConfig::defaults(RuntimeId::Grok)
+        };
+        let error = config
+            .execute(&LaunchContext {
+                prompt: Path::new("prompt"),
+                model: Some("grok-4.6"),
+                effort: Some("xhigh"),
+                cwd: Path::new("/tmp"),
+                output: Path::new("output"),
+            })
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("uncontained adapter execution refused"));
     }
 
     #[cfg(unix)]
@@ -2718,6 +2775,9 @@ mod tests {
     }
 
     fn assert_grok_help_contract(help: &str, label: &str) {
+        // --no-leader is a hidden, supported flag (already pinned for ACP).
+        // Its parseability was checked against installed 1.0.60; public help
+        // deliberately omits it. Descriptor tests pin it for headless too.
         assert_help_contains(
             help,
             &[

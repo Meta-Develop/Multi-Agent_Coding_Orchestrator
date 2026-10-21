@@ -40,6 +40,7 @@ harness = false
 
 [dependencies]
 anyhow = "1.0.103"
+boon = { version = "=0.6.1", default-features = false }
 clap = { version = "4", features = ["derive", "env"] }
 dashmap = "6"
 git2 = { version = "0.21", default-features = false, features = ["vendored-libgit2"] }
@@ -72,7 +73,6 @@ windows-sys = { version = "0.61", features = [
 ] }
 
 [dev-dependencies]
-boon = { version = "=0.6.1", default-features = false }
 criterion = "0.8.2"
 
 [profile.dev]

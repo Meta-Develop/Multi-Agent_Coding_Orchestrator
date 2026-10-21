@@ -3579,6 +3579,75 @@ mod tests {
     }
 
     #[test]
+    fn documented_mixed_plan_has_bound_existing_file_verification_without_overrides() {
+        let (_temp, repo_map) = repository_map_with_test_inventory_for_file(
+            "README.md",
+            "# MACO E2E scratch\n\nScratch repository for one supervised task.\n",
+            true,
+        );
+        let loaded = super::super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
+            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-plan.json")),
+            Some(&repo_map.root),
+        )
+        .expect("load the actual documented mixed plan");
+        let [assignment] = loaded.plan.assignments.as_slice() else {
+            panic!("the documented plan must have exactly one worker");
+        };
+        assert_eq!(assignment.task.as_deref(), Some(loaded.plan.task.as_str()));
+        assert_eq!(assignment.runtime, Some(SupervisorRuntime::Grok));
+        let directive: RequestedPreclaimDirective = serde_json::from_str(
+            assignment
+                .notes
+                .as_deref()
+                .unwrap()
+                .strip_prefix(PRECLAIM_DIRECTIVE_PREFIX)
+                .unwrap(),
+        )
+        .unwrap();
+        assert!(directive.operator_override.is_none());
+        let risk = risk_for_path("README.md");
+        let assess = |assignment: &OrchestratorAssignment| {
+            evaluate_preclaim_viability(
+                assignment,
+                std::slice::from_ref(assignment),
+                Some(&repo_map),
+                Some(&risk),
+                Some(SupervisorRuntime::Grok),
+                SupervisorExecutionRuntime::Verified,
+            )
+        };
+        let decision = assess(assignment);
+        assert_eq!(
+            decision.disposition,
+            PreclaimDisposition::Claim,
+            "{}",
+            decision.reason
+        );
+        assert!(decision.dimensions.all_positive());
+        for task in [
+            None,
+            Some("Update README.md.".to_string()),
+            Some(
+                assignment
+                    .task
+                    .as_ref()
+                    .unwrap()
+                    .replace("Hello from MACO", "Different line"),
+            ),
+        ] {
+            let mut changed = assignment.clone();
+            changed.task = task;
+            assert_eq!(assess(&changed).disposition, PreclaimDisposition::Park);
+        }
+        let mut missing_contract = assignment.clone();
+        missing_contract.notes = None;
+        assert_eq!(
+            assess(&missing_contract).disposition,
+            PreclaimDisposition::Park
+        );
+    }
+
+    #[test]
     fn literal_existing_file_contracts_pass_preclaim_for_direct_and_paired_routes() {
         for (path, task) in [
             ("README.md", "Update README.md: append one final line that reads exactly\n`Hello from MACO`\nDo not change any other file."),
@@ -3746,7 +3815,8 @@ mod tests {
     fn existing_file_contract_rejects_forged_mismatched_missing_and_ambiguous_evidence() {
         let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
         let assignments = existing_file_edit_assignments("README.md", task);
-        let (_temp, repo_map) = repository_map_for_file("README.md", "scheduler fixture\n", true);
+        let (_temp, repo_map) =
+            repository_map_with_test_inventory_for_file("README.md", "scheduler fixture\n", true);
         let risk = risk_for_path("README.md");
 
         let mut task_only = assignment();
@@ -3823,7 +3893,7 @@ mod tests {
         }
 
         let (_untracked_temp, untracked_map) =
-            repository_map_for_file("README.md", "scheduler fixture\n", false);
+            repository_map_with_test_inventory_for_file("README.md", "scheduler fixture\n", false);
         let untracked_decision = evaluate_preclaim_viability(
             &assignments[1],
             &assignments,
@@ -3870,7 +3940,8 @@ mod tests {
 
         let task = "In README.md, replace scheduler fixture with exactly: verified replacement. Verify the result with git diff --check and confirm README.md contains exactly that line.";
         let assignments = existing_file_edit_assignments("README.md", task);
-        let (_temp, repo_map) = repository_map_for_file("README.md", "scheduler fixture\n", true);
+        let (_temp, repo_map) =
+            repository_map_with_test_inventory_for_file("README.md", "scheduler fixture\n", true);
         let readme = repo_map.root.join("README.md");
         std::fs::set_permissions(&readme, std::fs::Permissions::from_mode(0o000))
             .expect("make README unreadable");

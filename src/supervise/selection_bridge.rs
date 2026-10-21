@@ -427,7 +427,6 @@ fn grok_catalog_is_omittable_implicit_unavailability(error: &anyhow::Error) -> b
         message == "Grok authentication source auth.json is missing"
             || message == "Grok authentication source auth.json is unavailable"
             || message == "Grok runtime model catalog has an invalid header"
-            || message == crate::runtime_adapter::grok::GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED
             || ((message.starts_with("Grok catalog executable '")
                 || message.starts_with("Grok executable '"))
                 && message.ends_with("' is missing"))
@@ -2079,6 +2078,14 @@ fn select_with_live_switch_cost_for_policy(
     input: &SelectionInput,
     routing_policy: Option<&crate::selection::routing_policy::RoutingPolicyReceipt>,
 ) -> Result<SelectionProvenance, selection::SelectionError> {
+    let mut constrained;
+    let input = if super::runtime_executables::captured_binding().is_some() {
+        constrained = input.clone();
+        super::runtime_executables::constrain_selection(&mut constrained);
+        &constrained
+    } else {
+        input
+    };
     let evidence = live_switch_cost_evidence(input);
     let provenance =
         selection::select_with_loaded_routing_policy(input, &evidence, routing_policy)?;
@@ -2951,7 +2958,11 @@ fn constructed_selection_catalogs(
             runtime_catalog_from_advertised_slugs(
                 "grok",
                 observation.catalog().slugs(),
-                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                format!(
+                    "grok-advertised-sha256:{};auth={}",
+                    observation.source_sha256(),
+                    observation.authentication_evidence()
+                ),
                 observation.observed_at_unix_millis().to_string(),
                 task,
                 priors,
@@ -2984,7 +2995,11 @@ fn constructed_selection_catalogs(
             catalogs.push(runtime_catalog_from_advertised_slugs(
                 "grok",
                 observation.catalog().slugs(),
-                format!("grok-advertised-sha256:{}", observation.source_sha256()),
+                format!(
+                    "grok-advertised-sha256:{};auth={}",
+                    observation.source_sha256(),
+                    observation.authentication_evidence()
+                ),
                 observation.observed_at_unix_millis().to_string(),
                 task,
                 priors,
@@ -3630,6 +3645,55 @@ enum ExecutableChoiceResolution<'a> {
     PreflightFailure(SupervisorSelectionPreflightFailure),
 }
 
+fn selection_refusal_message(decision: &SelectionProvenance, role: AgentRole) -> String {
+    let mut message = format!(
+        "selector failed closed for role '{}': {}",
+        role.as_str(),
+        decision.decision_reason
+    );
+    let input = &decision.normalized_input;
+    for catalog in &input.catalogs {
+        if catalog.models.is_empty()
+            && catalog
+                .revision
+                .starts_with("account-observe-models-unobserved-sha256:")
+        {
+            message.push_str(&format!(
+                "; CAM model/effort metadata is unobserved or unusable for runtime '{}', so no catalog candidates were admitted; completing account login alone does not supply model metadata",
+                catalog.runtime
+            ));
+        }
+    }
+    let grok_priors = input
+        .priors
+        .models
+        .iter()
+        .filter(|prior| prior.runtime == "grok")
+        .collect::<Vec<_>>();
+    if input
+        .catalogs
+        .iter()
+        .any(|catalog| catalog.runtime == "grok")
+        && input.task.authority_role != AuthorityRole::TerminalLeaf
+        && !decision
+            .candidate_set
+            .iter()
+            .any(|candidate| candidate.candidate.runtime != "grok")
+        && !grok_priors.is_empty()
+        && grok_priors.iter().all(|prior| {
+            prior.prohibited
+                || prior
+                    .prohibited_authority_roles
+                    .contains(&input.task.authority_role)
+        })
+    {
+        message.push_str(
+            "; the loaded Grok priors explicitly prohibit this judgment authority; use --runtime codex for supervision and control roles, with Grok only for qualified direct Worker assignments (see docs/OPERATOR_QUICKSTART.md, Grok runtime)",
+        );
+    }
+    message
+}
+
 fn executable_choice<'a>(
     decision: &'a SelectionProvenance,
     runtime: SupervisorRuntime,
@@ -3640,11 +3704,7 @@ fn executable_choice<'a>(
             SupervisorSelectionPreflightFailure {
                 role,
                 kind: SupervisorSelectionPreflightFailureKind::FailClosed,
-                message: format!(
-                    "selector failed closed for role '{}': {}",
-                    role.as_str(),
-                    decision.decision_reason
-                ),
+                message: selection_refusal_message(decision, role),
             },
         ));
     }
@@ -8149,7 +8209,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_grok_uses_one_authenticated_advertised_primary_catalog() -> Result<()> {
+    fn selected_grok_uses_one_availability_only_advertised_primary_catalog() -> Result<()> {
         let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
         let priors = selector_priors_with_terminal_worker_economics()?;
         let catalogs = constructed_selection_catalogs(
@@ -8163,7 +8223,14 @@ mod tests {
 
         assert_eq!(catalogs.len(), 1);
         assert_eq!(catalogs[0].runtime, "grok");
+        assert!(catalogs[0]
+            .models
+            .iter()
+            .all(|model| model.access.is_none()));
         assert!(catalogs[0].revision.starts_with("grok-advertised-sha256:"));
+        assert!(catalogs[0]
+            .revision
+            .ends_with(";auth=not_asserted_by_catalog"));
         assert!(catalogs[0]
             .models
             .iter()
@@ -8563,43 +8630,26 @@ mod tests {
     }
 
     #[test]
-    fn live_grok_catalog_bridge_omits_implicit_owner_authentication_required() -> Result<()> {
-        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
-        let runner = FakeGrokRunner::successful(UNAUTHENTICATED_PUBLIC_PAYLOAD);
-        assert_eq!(
-            observe_optional_live_grok_catalog(
+    fn live_grok_catalog_bridge_accepts_misleading_banner_without_authentication_gate() -> Result<()>
+    {
+        const PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+        for program in [None, Some(std::ffi::OsStr::new("/configured/grok"))] {
+            let runner = FakeGrokRunner::successful(PAYLOAD);
+            let observed = observe_optional_live_grok_catalog(
                 &runner,
                 Path::new("/workspace"),
                 CAPTURED_CURSOR_AT_UNIX_MILLIS,
-                None,
-            )?,
-            None
-        );
-        assert_eq!(runner.observed_specs.borrow().len(), 1);
+                program,
+            )?
+            .context("observed model availability")?;
+            assert!(observed.catalog().contains("grok-4.6"));
+            assert_eq!(
+                observed.authentication_evidence(),
+                "not_asserted_by_catalog"
+            );
+            assert_eq!(runner.observed_specs.borrow().len(), 1);
+        }
         Ok(())
-    }
-
-    #[test]
-    fn live_grok_catalog_bridge_fails_closed_for_explicit_owner_authentication_required() {
-        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
-        let error = observe_optional_live_grok_catalog(
-            &FakeGrokRunner::successful(UNAUTHENTICATED_PUBLIC_PAYLOAD),
-            Path::new("/workspace"),
-            CAPTURED_CURSOR_AT_UNIX_MILLIS,
-            Some(std::ffi::OsStr::new("/configured/grok")),
-        )
-        .expect_err("an explicit unauthenticated Grok listing must fail closed");
-
-        let message = format!("{error:#}");
-        assert!(
-            message.contains("live Grok catalog observation failed closed"),
-            "{message}"
-        );
-        assert!(
-            message
-                .contains(crate::runtime_adapter::grok::GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED),
-            "{message}"
-        );
     }
 
     #[test]
@@ -9022,6 +9072,224 @@ mod tests {
             .candidate_set
             .iter()
             .all(|evaluation| evaluation.candidate.model != grok_prior.model));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_only_goal_selection_and_retry_reject_advertised_grok_without_weakening_policy(
+    ) -> Result<()> {
+        let _policy = bind_fixture_routing_policy()?;
+        let (_temporary, repo) = super::super::tests::injected_repository();
+        let primary = repo.join("codex-bin");
+        std::fs::write(&primary, b"fixture executable")?;
+        let catalog = codex_catalog()?;
+        let advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
+            "grok-4.6",
+            &["  * grok-4.6 (default)"],
+        ))?);
+        let goal = "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file.";
+        let session = crate::planning::task_planning_session_with_test_inventory(
+            &repo,
+            "",
+            goal,
+            vec![PathBuf::from("README.md")],
+        )?;
+        let original = super::super::plan_api::supervisor_plan_from_task_planning_session_in_repo(
+            &repo, goal, "", &session,
+        )?;
+        let mut automatic = original.clone();
+        let unrestricted = initialize_supervisor_selection(
+            &mut automatic,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+        )?;
+        assert!(unrestricted
+            .decisions
+            .iter()
+            .filter(|decision| decision.role == AgentRole::Worker)
+            .any(|decision| decision
+                .provenance
+                .candidate_set
+                .iter()
+                .any(|candidate| candidate.candidate.runtime == "grok" && candidate.eligible)));
+        let _binding = super::super::runtime_executables::bind_new(
+            &repo,
+            &RunId::new("codex-only-selection")?,
+            SupervisorRuntime::Codex,
+            &primary,
+            &[],
+        )?;
+        let mut constrained = original;
+        let resolution = initialize_supervisor_selection(
+            &mut constrained,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        for decision in &resolution.decisions {
+            assert_eq!(
+                decision
+                    .provenance
+                    .choice
+                    .as_ref()
+                    .context("selected Codex role")?
+                    .candidate
+                    .runtime,
+                "codex"
+            );
+            assert!(decision
+                .provenance
+                .candidate_set
+                .iter()
+                .filter(|candidate| candidate.candidate.runtime == "grok")
+                .all(|candidate| !candidate.eligible));
+        }
+        let mut state = resolution
+            .automatic_state
+            .context("automatic replay state")?;
+        let retry = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            1,
+            BudgetSignal::Continue,
+            &[],
+        )?;
+        assert_eq!(
+            retry.runtime_overrides.get(&AgentRole::Worker),
+            Some(&SupervisorRuntime::Codex)
+        );
+        assert!(retry.decisions.iter().all(|(_, decision)| decision
+            .choice
+            .as_ref()
+            .is_some_and(|choice| choice.candidate.runtime == "codex")));
+        Ok(())
+    }
+
+    #[test]
+    fn documented_mixed_plan_selects_with_its_own_replayable_assessment() -> Result<()> {
+        let (_temporary, repo) = super::super::tests::injected_repository();
+        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-plan.json"));
+        let mut loaded = super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
+            source,
+            Some(&repo),
+        )?;
+        let frozen = loaded
+            .plan_metadata
+            .resolved_routing_policy
+            .clone()
+            .context("documented policy")?;
+        assert_eq!(
+            frozen,
+            crate::selection::routing_policy::load_routing_policy(&repo)?
+        );
+        let assessment = loaded
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .context("documented assessment")?;
+        let assignment = &loaded.plan.assignments[0];
+        let proposal = serde_json::from_value(json!({
+            "fragments": [{"id": "readme-append", "text": loaded.plan.task}],
+            "assignments": [{"id": assignment.id, "task": assignment.task,
+                "fragment_ids": ["readme-append"], "assigned_paths": assignment.assigned_paths,
+                "semantic_symbols": [], "semantic_modules": [], "decision_dependencies": []}],
+            "diagnostics": {"degraded": false, "notes": []},
+            "disjointness": {"disjoint": true, "conflicts": []}
+        }))?;
+        assert_eq!(
+            *assessment,
+            super::super::assess_task_routing(&loaded.plan.task, &proposal, &frozen)?
+        );
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen.clone()))?;
+        let catalog = codex_catalog()?;
+        let advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
+            "grok-4.6",
+            &["  * grok-4.6 (default)"],
+        ))?);
+        // Use the production entry point and the shipped metadata, never the
+        // fixture wrapper that synthesizes an assessment for selector unit tests.
+        let resolution = super::initialize_supervisor_selection_with_assessment(
+            &mut loaded.plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            Some(assessment),
+        )?;
+        assert!(resolution.selection_preflight_failure.is_none());
+        assert!(resolution
+            .decisions
+            .iter()
+            .any(|event| event.role == AgentRole::Supervisor));
+        for event in &resolution.decisions {
+            let candidate = &event
+                .provenance
+                .choice
+                .as_ref()
+                .context("selected documented role")?
+                .candidate;
+            if event.role == AgentRole::Worker {
+                assert_eq!(candidate.runtime, "grok");
+                assert_eq!(candidate.model, "grok-4.6");
+                assert_eq!(candidate.effort, selector_effort_from_str("xhigh").unwrap());
+            } else {
+                assert_eq!(candidate.runtime, "codex");
+            }
+            assert_eq!(event.provenance.normalized_task.risk, RiskLevel::Low);
+            assert_eq!(
+                event
+                    .provenance
+                    .routing_policy
+                    .as_ref()
+                    .context("policy receipt")?
+                    .frozen,
+                frozen
+            );
+        }
+        let mut missing: serde_json::Value = serde_json::from_str(source)?;
+        missing
+            .as_object_mut()
+            .unwrap()
+            .remove("task_routing_assessment");
+        let mut unassessed = super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
+            &serde_json::to_string(&missing)?,
+            Some(&repo),
+        )?;
+        let error = super::initialize_supervisor_selection_with_assessment(
+            &mut unassessed.plan,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &test_admission(),
+            &advertised,
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            &[],
+            unassessed.plan_metadata.task_routing_assessment.as_ref(),
+        )
+        .expect_err("missing documented assessment must still fail closed");
+        assert!(error.to_string().contains("task.risk must be known"));
+        for pointer in ["/task", "/task_routing_assessment/declared_input_sha256"] {
+            let mut stale: serde_json::Value = serde_json::from_str(source)?;
+            *stale.pointer_mut(pointer).unwrap() = json!("changed");
+            assert!(
+                super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
+                    &serde_json::to_string(&stale)?,
+                    Some(&repo),
+                )
+                .is_err()
+            );
+        }
         Ok(())
     }
 
@@ -11221,6 +11489,127 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn grok_supervisor_unobserved_models_refusal_explains_catalog_and_authority() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
+        let mut observation = account_observe_result(
+            "grok-cli",
+            CategoryObservation::unknown(),
+            Some(CategoryObservation::unknown()),
+        );
+        observation.binding.account_id = "work2".to_string();
+        observation.observed_at = "2026-10-17T05:39:11.151129602Z".to_string();
+        // A separate CLI listing must not replace missing CAM-bound metadata.
+        let advertised = advertised_with_grok(discover_grok_observation(CAPTURED_GROK_CATALOG)?);
+        let mut plan = test_plan();
+        plan.assignments = vec![worker_assignment()];
+        let resolution = initialize_supervisor_selection_with_history(
+            &mut plan,
+            SupervisorRuntime::Grok,
+            &RuntimeModelCatalog::OperatorDeclared,
+            &test_admission(),
+            &advertised,
+            Some(&default_resolved_profile()),
+            SupervisorQuotaSelectionInput::default(),
+            None,
+            Some(&observation),
+        )?;
+        let failure = resolution
+            .selection_preflight_failure
+            .context("Grok refusal")?;
+        assert_eq!(failure.role, AgentRole::Supervisor);
+        assert_eq!(
+            failure.kind,
+            SupervisorSelectionPreflightFailureKind::FailClosed
+        );
+        assert!(failure
+            .message
+            .contains("CAM model/effort metadata is unobserved or unusable"));
+        assert!(failure
+            .message
+            .contains("loaded Grok priors explicitly prohibit"));
+        assert!(failure.message.contains("--runtime codex"));
+        assert!(failure.message.contains("docs/OPERATOR_QUICKSTART.md"));
+        assert!(plan.role_models.is_empty());
+        assert_eq!(resolution.decisions.len(), 1);
+        let decision = &resolution.decisions[0].provenance;
+        assert_eq!(decision.status, DecisionStatus::FailClosed);
+        assert_eq!(
+            decision.normalized_task.authority_role,
+            AuthorityRole::AcceptanceGate
+        );
+        assert_eq!(decision.normalized_task.task_class, "review_gate");
+        assert_eq!(decision.normalized_input.catalogs.len(), 1);
+        let catalog = &decision.normalized_input.catalogs[0];
+        assert_eq!(catalog.runtime, "grok");
+        assert!(catalog
+            .revision
+            .starts_with("account-observe-models-unobserved-sha256:"));
+        assert!(catalog.models.is_empty());
+        assert!(decision.candidate_set.is_empty());
+        assert!(decision.choice.is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_supervisor_observed_known_and_unknown_models_still_fail_closed() -> Result<()> {
+        let _fixture_policy = bind_fixture_routing_policy()?;
+        for (model, expected_code) in [
+            ("grok-4.6", selection::IneligibilityCode::PolicyProhibited),
+            (
+                "unknown-grok-model",
+                selection::IneligibilityCode::MissingDatedPrior,
+            ),
+        ] {
+            let observation = qualified_account_fixture("grok-cli", model, "xhigh");
+            let mut plan = test_plan();
+            plan.assignments = vec![worker_assignment()];
+            let resolution = initialize_supervisor_selection_with_history(
+                &mut plan,
+                SupervisorRuntime::Grok,
+                &RuntimeModelCatalog::OperatorDeclared,
+                &test_admission(),
+                &AdvertisedCatalogSet::empty(),
+                Some(&default_resolved_profile()),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                Some(&observation),
+            )?;
+            let failure = resolution
+                .selection_preflight_failure
+                .context("Grok refusal")?;
+            assert_eq!(failure.role, AgentRole::Supervisor);
+            assert_eq!(
+                failure.kind,
+                SupervisorSelectionPreflightFailureKind::FailClosed
+            );
+            assert!(!failure.message.contains("metadata is unobserved"));
+            assert!(failure.message.contains("--runtime codex"));
+            let decision = &resolution.decisions[0].provenance;
+            assert!(decision.choice.is_none());
+            assert_eq!(decision.candidate_set.len(), 1);
+            let candidate = &decision.candidate_set[0];
+            assert_eq!(candidate.candidate.model, model);
+            assert!(!candidate.eligible);
+            assert!(candidate
+                .ineligibility_reasons
+                .iter()
+                .any(|reason| reason.code == expected_code));
+            // A remaining control candidate on another runtime makes
+            // the Grok-only remediation misleading, even on a refused decision.
+            let mut mixed = decision.clone();
+            let mut remaining = candidate.clone();
+            remaining.candidate.runtime = "codex".into();
+            mixed.candidate_set.push(remaining);
+            assert!(!selection_refusal_message(&mixed, AgentRole::Supervisor)
+                .contains("loaded Grok priors explicitly prohibit"));
+            assert!(plan.role_models.is_empty());
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn account_observe_does_not_fill_efforts_from_priors() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
         let observation = account_observe_result(
@@ -11421,6 +11810,9 @@ mod tests {
         )?;
         assert_eq!(catalogs.len(), 1);
         assert!(catalogs[0].revision.starts_with("grok-advertised-sha256:"));
+        assert!(catalogs[0]
+            .revision
+            .ends_with(";auth=not_asserted_by_catalog"));
         let catalog = RuntimeModelCatalog::OperatorDeclared;
         let admission = test_admission();
         let resolved = default_resolved_profile();

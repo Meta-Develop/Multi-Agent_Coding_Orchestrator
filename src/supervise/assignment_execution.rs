@@ -7288,7 +7288,7 @@ fn persist_parent_terminal_assignment_outcome(
     }
     if report.rejected
         && !report.accepted
-        && parent_terminal_reject_is_model_quality(
+        && parent_terminal_reject_is_attributable(
             report,
             child_gate_terminal,
             auditor_environment_blocked,
@@ -7300,13 +7300,13 @@ fn persist_parent_terminal_assignment_outcome(
             artifacts,
             attempt,
             crate::selection::OutcomeResult::Rejected,
-            Some(crate::selection::FailureClass::ModelQuality),
+            Some(parent_terminal_rejection_class(report)),
         )?;
     }
     Ok(())
 }
 
-fn parent_terminal_reject_is_model_quality(
+fn parent_terminal_reject_is_attributable(
     report: &OrchestratorReviewReport,
     child_gate_terminal: bool,
     auditor_environment_blocked: bool,
@@ -7333,6 +7333,25 @@ fn parent_terminal_reject_is_model_quality(
         return false;
     }
     true
+}
+
+fn parent_terminal_rejection_class(
+    report: &OrchestratorReviewReport,
+) -> crate::selection::FailureClass {
+    // A timeout proves that the bounded invocation did not finish. Even when
+    // its empty report/diff correctly fails review, it does not identify why
+    // the native runtime stalled or establish a model-quality failure.
+    if report.commands_run.iter().any(|command| {
+        command.timed_out
+            || command
+                .error
+                .as_deref()
+                .is_some_and(|error| error.contains("Grok native inference failure tail ("))
+    }) {
+        crate::selection::FailureClass::Unknown
+    } else {
+        crate::selection::FailureClass::ModelQuality
+    }
 }
 
 fn gate_denial_is_non_quality_failure(denial: &GateDenial) -> bool {
@@ -13126,24 +13145,75 @@ done
     #[test]
     fn parent_terminal_reject_classifies_acceptance_failure_as_model_quality() {
         let report = rejected_assignment_report();
-        assert!(parent_terminal_reject_is_model_quality(
+        assert!(parent_terminal_reject_is_attributable(
             &report, false, false, false, false
         ));
+        assert_eq!(
+            parent_terminal_rejection_class(&report),
+            crate::selection::FailureClass::ModelQuality
+        );
+    }
+
+    #[test]
+    fn parent_terminal_reject_preserves_unknown_cause_after_native_timeout() {
+        let mut report = rejected_assignment_report();
+        // Replay the R37 worker timeout followed by successful auditor commands.
+        let mut command: CommandRunRecord = serde_json::from_value(serde_json::json!({
+            "command": ["grok", "--prompt-file", "worker.prompt.md"],
+            "cwd": "worker", "exit_code": 255, "status": "failed",
+            "timeout_seconds": 1200, "duration_ms": 1202436,
+            "timed_out": true,
+            "error": "external agent timed out after 1200 seconds"
+        }))
+        .unwrap();
+        report.commands_run.push(command.clone());
+        command.timed_out = false;
+        command.exit_code = Some(0);
+        command.status = ReviewStatus::Succeeded;
+        command.error = None;
+        report.commands_run.push(command);
+        assert!(parent_terminal_reject_is_attributable(
+            &report, false, false, false, false
+        ));
+        assert_eq!(
+            parent_terminal_rejection_class(&report),
+            crate::selection::FailureClass::Unknown
+        );
+        assert!(!report.accepted);
+        assert!(report.rejected);
+    }
+
+    #[test]
+    fn parent_terminal_reject_preserves_unknown_native_inference_failure_cause() {
+        let mut report = rejected_assignment_report();
+        let command: CommandRunRecord = serde_json::from_value(serde_json::json!({
+            "command": ["grok", "--prompt-file", "worker.prompt.md"],
+            "cwd": "worker", "exit_code": 1, "status": "failed",
+            "timeout_seconds": 1200, "duration_ms": 1000, "timed_out": false,
+            "error": "Grok native inference failure tail (last <=8 events): shell.turn.inference_failed: inference failure (detail redacted; cause unknown)"
+        })).unwrap();
+        report.commands_run.push(command);
+        assert_eq!(
+            parent_terminal_rejection_class(&report),
+            crate::selection::FailureClass::Unknown
+        );
+        assert!(!report.accepted);
+        assert!(report.rejected);
     }
 
     #[test]
     fn parent_terminal_reject_keeps_environment_and_authority_non_quality() {
         let report = rejected_assignment_report();
-        assert!(!parent_terminal_reject_is_model_quality(
+        assert!(!parent_terminal_reject_is_attributable(
             &report, true, false, false, false
         ));
-        assert!(!parent_terminal_reject_is_model_quality(
+        assert!(!parent_terminal_reject_is_attributable(
             &report, false, true, false, false
         ));
-        assert!(!parent_terminal_reject_is_model_quality(
+        assert!(!parent_terminal_reject_is_attributable(
             &report, false, false, true, false
         ));
-        assert!(!parent_terminal_reject_is_model_quality(
+        assert!(!parent_terminal_reject_is_attributable(
             &report, false, false, false, true
         ));
     }
@@ -14216,11 +14286,12 @@ done
                 "--output-format".to_string(),
                 "streaming-json".to_string(),
                 "--sandbox".to_string(),
-                "strict".to_string(),
+                "off".to_string(),
                 "--always-approve".to_string(),
                 "--disable-web-search".to_string(),
                 "--no-memory".to_string(),
                 "--no-subagents".to_string(),
+                "--no-leader".to_string(),
             ]
         );
         assert_eq!(
@@ -14389,9 +14460,7 @@ done
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
         assert!(argv.iter().any(|argument| argument == "--no-auto-update"));
-        assert!(argv
-            .windows(2)
-            .any(|window| window == ["--sandbox", "strict"]));
+        assert!(argv.windows(2).any(|window| window == ["--sandbox", "off"]));
         assert!(argv
             .iter()
             .any(|argument| argument == "--disable-web-search"));

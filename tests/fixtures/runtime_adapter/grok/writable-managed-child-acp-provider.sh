@@ -19,7 +19,7 @@ if [ "$#" -ne "$expected_count" ]; then
 	exit 2
 fi
 if [ "$1" != "--sandbox" ] \
-	|| [ "$2" != "strict" ] \
+	|| [ "$2" != "off" ] \
 	|| [ "$3" != "--disable-web-search" ] \
 	|| [ "$4" != "agent" ] \
 	|| [ "$5" != "--always-approve" ] \
@@ -51,7 +51,7 @@ if [ -e "$GROK_HOME/ambient-secret" ]; then
 	exit 3
 fi
 
-printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
+printf '%s\n' 'approval-contract:inner-sandbox=off;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 
 send() {
 	printf '%s\n' "$1"

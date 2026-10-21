@@ -1,0 +1,124 @@
+{
+  "assignment_schedule": [
+    {
+      "assignment_id": "assignment-001-planning",
+      "depth": 2,
+      "flattened_index": 0
+    },
+    {
+      "assignment_id": "assignment-001",
+      "depth": 3,
+      "flattened_index": 1,
+      "parent_assignment_id": "assignment-001-planning"
+    }
+  ],
+  "assignments": [
+    {
+      "assigned_paths": [
+        "README.md"
+      ],
+      "environment_requirements": [],
+      "id": "assignment-001-planning",
+      "notes": "MACO-visible read-only planning root; its execution child is parent-gated",
+      "phase": "planning",
+      "role": "child_orchestrator",
+      "role_category": "delegating_coordinator",
+      "semantic_modules": [],
+      "semantic_symbols": [],
+      "task": "Read-only planning gate for workstream 'assignment-001'. Review the proposed scope and implementation task without editing files or delegating implementation. Confirm whether the execution child can proceed safely.\n\nExecution task:\nUpdate `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file. Use tools to perform the edit now, before returning the final report. Read the original bytes through the bound execution journal. Preserve those bytes, add a newline separator if needed, and append the requested line with a terminating newline. Verify the unchanged original prefix and exact appended bytes, run git diff --check, and confirm that only the assigned file changed. Journal every command and edit using the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Read-only verification must not declare earlier edits as changed paths. Return a terminal WorkerReport after execution and verification; if blocked, report failed with the observed evidence.",
+      "worker_assignments": []
+    },
+    {
+      "assigned_paths": [
+        "README.md"
+      ],
+      "environment_requirements": [],
+      "id": "assignment-001",
+      "notes": "Execution child admitted only after read-only planning root 'assignment-001-planning' succeeds",
+      "phase": "execution",
+      "role": "child_orchestrator",
+      "role_category": "delegating_coordinator",
+      "semantic_modules": [],
+      "semantic_symbols": [],
+      "spec_fragment_ids": [
+        "fragment-001"
+      ],
+      "task": "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file. Use tools to perform the edit now, before returning the final report. Read the original bytes through the bound execution journal. Preserve those bytes, add a newline separator if needed, and append the requested line with a terminating newline. Verify the unchanged original prefix and exact appended bytes, run git diff --check, and confirm that only the assigned file changed. Journal every command and edit using the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Read-only verification must not declare earlier edits as changed paths. Return a terminal WorkerReport after execution and verification; if blocked, report failed with the observed evidence.",
+      "worker_assignments": [
+        {
+          "assigned_paths": [
+            "README.md"
+          ],
+          "environment_requirements": [],
+          "id": "assignment-001-worker",
+          "kind": "ordinary",
+          "role": "worker",
+          "role_category": "non_delegating_terminal_worker",
+          "semantic_modules": [],
+          "semantic_symbols": [],
+          "task": "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file. Use tools to perform the edit now, before returning the final report. Read the original bytes through the bound execution journal. Preserve those bytes, add a newline separator if needed, and append the requested line with a terminating newline. Verify the unchanged original prefix and exact appended bytes, run git diff --check, and confirm that only the assigned file changed. Journal every command and edit using the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Read-only verification must not declare earlier edits as changed paths. Return a terminal WorkerReport after execution and verification; if blocked, report failed with the observed evidence."
+        }
+      ]
+    }
+  ],
+  "child_timeout_seconds": 1200,
+  "coordination_topology": {
+    "caller_selected_coordination_depth": false,
+    "derived_coordination_depth": 2,
+    "planned_max_depth": 3
+  },
+  "max_child_assignments": 4,
+  "max_child_retries": 0,
+  "max_depth": 3,
+  "max_gate_corrections": 0,
+  "review_aggregation_policy": {
+    "kind": "all_must_accept"
+  },
+  "review_lens_correlation": "distinct_scopes",
+  "review_lenses": [
+    {
+      "backend": {
+        "backend_id": "openai",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "xhigh"
+      },
+      "id": "parent-acceptance",
+      "information_scope": "full_child_transcript"
+    },
+    {
+      "backend": {
+        "backend_id": "openai",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high"
+      },
+      "id": "output-only",
+      "information_scope": "output_report_only"
+    },
+    {
+      "backend": {
+        "backend_id": "openai",
+        "kind": "model",
+        "model": "gpt-5.6-sol",
+        "reasoning_effort": "high"
+      },
+      "id": "diff-only",
+      "information_scope": "diff_only"
+    }
+  ],
+  "run_budget": {
+    "role_token_reservations": {
+      "auditor": 1024,
+      "child_orchestrator": 1024,
+      "gate_classifier": 1024,
+      "worker": 1024
+    }
+  },
+  "semantic_coordination": "off",
+  "spec_fragment_ids": [
+    "fragment-001"
+  ],
+  "task": "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file. Use tools to perform the edit now, before returning the final report. Read the original bytes through the bound execution journal. Preserve those bytes, add a newline separator if needed, and append the requested line with a terminating newline. Verify the unchanged original prefix and exact appended bytes, run git diff --check, and confirm that only the assigned file changed. Journal every command and edit using the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Read-only verification must not declare earlier edits as changed paths. Return a terminal WorkerReport after execution and verification; if blocked, report failed with the observed evidence.",
+  "version": 1
+}
