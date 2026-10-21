@@ -11,8 +11,9 @@ no-default-features = false
 exclude-dev = false
 
 [advisories]
-# These three exceptions are intentionally absent from cargo-deny's compiled
-# graph. cargo-audit still scans their lockfile records; CI verifies inactivity.
+# CI must prove these packages inactive in both workspace graphs before
+# accepting the lockfile-only exceptions. Standalone audit/deny output does
+# not prove inactivity. Allow unused IDs only for the guard-verified graph.
 unused-ignored-advisory = "allow"
 ignore = [
     # Allowed only for the inactive, lockfile-only async secret-service path (zvariant).
