@@ -11,6 +11,8 @@ import sys
 def check_tree(tree: str) -> None:
     packages: dict[tuple[str, str], set[str]] = {}
     for line in tree.splitlines():
+        if not line.strip():
+            continue
         package, features = line.removesuffix(" (*)").split("|", 1)
         name, version, *_ = package.split()
         packages.setdefault((name, version), set()).update(features.split(","))
@@ -36,35 +38,50 @@ def check_tree(tree: str) -> None:
         raise ValueError("dbus-secret-service must enable crypto-rust")
     # Cargo metadata includes weak-optional lockfile nodes that cargo tree
     # correctly omits from the compilation graph, even with --target all.
-    inactive = {
-        ("secret-service", "v4.0.0"),
-        ("zvariant", "v4.2.0"),
-        ("zvariant_derive", "v4.2.0"),
-        ("zbus_names", "v3.0.0"),
-    }
-    if "async-secret-service" in features or inactive.intersection(packages):
+    # RUSTSEC-2026-0370/0371/0372 have no patched versions. Checking
+    # only keyring's old exact versions would let the shared exceptions hide
+    # active desktop zvariant 5 / zbus_names 4 (or a future affected version).
+    excepted = {"zvariant", "zvariant_derive", "zbus_names"}
+    active = sorted(f"{name} {version}" for name, version in packages
+                    if name in excepted)
+    if active:
+        raise ValueError("advisory-excepted packages must never be compiled: "
+                         + ", ".join(active))
+    if "async-secret-service" in features or any(
+        name == "secret-service" for name, _ in packages
+    ):
         raise ValueError("the excepted async Secret Service path must never be compiled")
+
+
+def check_workspace(root: Path, manifest: Path) -> None:
+    result = subprocess.run(
+        [
+            "cargo", "tree", "--locked", "--workspace", "--target", "all",
+            "--edges", "normal,build,dev", "--prefix", "none",
+            "--format", "{p}|{f}", "--manifest-path", str(manifest),
+        ],
+        cwd=root,
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    check_tree(result.stdout)
 
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    try:
-        result = subprocess.run(
-            [
-                "cargo", "tree", "--locked", "--target", "all",
-                "--edges", "normal,build,dev", "--prefix", "none",
-                "--format", "{p}|{f}", *sys.argv[1:],
-            ],
-            cwd=root,
-            check=True,
-            stdout=subprocess.PIPE,
-            text=True,
-        )
-        check_tree(result.stdout)
-    except (ValueError, subprocess.CalledProcessError) as error:
-        print(f"keyring crypto check failed: {error}", file=sys.stderr)
+    # Audit/deny policy is shared, so every normal invocation must validate
+    # both consumers before any lockfile-wide advisory exceptions are used.
+    failed = False
+    for manifest in (Path("Cargo.toml"), Path("account-manager/src-tauri/Cargo.toml")):
+        try:
+            check_workspace(root, manifest)
+        except (ValueError, subprocess.CalledProcessError) as error:
+            print(f"keyring crypto check failed ({manifest}): {error}", file=sys.stderr)
+            failed = True
+    if failed:
         return 1
-    print("keyring DH features enabled; excepted async path is not compiled")
+    print("both workspaces enable keyring DH; advisory-excepted packages are inactive")
     return 0
 
 
