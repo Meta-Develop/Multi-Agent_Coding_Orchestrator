@@ -1319,10 +1319,10 @@ fn current_sol_passes_judgment_admission_while_astra_is_prohibited() -> anyhow::
 }
 
 #[test]
-fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> anyhow::Result<()> {
+fn no_prior_astra_is_refused_by_loaded_policy_and_legacy_selector() -> anyhow::Result<()> {
     let receipt = loaded_policy_test_receipt()?;
     let mut input = current_codex_input(AuthorityRole::AcceptanceGate);
-    // Reproduce the pre-prohibition dataset with only the unmeasured candidate available.
+    // Removing the dated prohibition cannot grant an unknown model judgment authority.
     input
         .priors
         .models
@@ -1343,15 +1343,18 @@ fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> an
         .iter()
         .any(|reason| reason.code == IneligibilityCode::MissingDatedPrior)));
     let loaded = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
-    assert_eq!(
-        loaded
-            .choice
-            .as_ref()
-            .expect("unmeasured policy choice")
-            .candidate
-            .model,
-        "gpt-6-astra"
-    );
+    assert!(loaded.choice.is_none());
+    assert!(!loaded.candidate_set.is_empty());
+    assert!(loaded.candidate_set.iter().all(|evaluation| {
+        !evaluation.eligible
+            && evaluation.score.is_none()
+            && evaluation.ineligibility_reasons.iter().any(|reason| {
+                reason.code == IneligibilityCode::MissingDatedPrior
+                    && reason
+                        .detail
+                        .contains("judgment authority requires a dated model prior")
+            })
+    }));
     Ok(())
 }
 

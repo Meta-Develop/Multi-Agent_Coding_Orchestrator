@@ -173,13 +173,15 @@ Prerequisites:
   `test -f "$MACO_GROK_BIN" && test ! -L "$MACO_GROK_BIN"`.
   `$HOME/.grok/bin/grok` is an example install location. Use `readlink -f` on
   that path when `grok` is not on `PATH`.
-- Bubblewrap is installed. Run `bwrap --version`. Headless and ACP launches
-  pass the installed Grok 1.0.60 profile `--sandbox off` and force `--no-leader`.
+- Bubblewrap is installed. Run `bwrap --version`. Headless launches pass the
+  installed Grok 1.0.60 profile `--sandbox off`; ACP (`agent ... stdio`)
+  retains `--sandbox strict`. Both force `--no-leader`.
   MACO requires its verified systemd containment, worktree-scoped writable
   binds, private home, credential isolation and current network policy before
   launch. The command report's `stderr` records
-  `inner_sandbox=disabled_outer_containment_enforced`. No uncontained fallback
-  is provided. MACO does not ship `bwrap`; install it with
+  `inner_sandbox=disabled_outer_containment_enforced` for headless launches
+  and `inner_sandbox=strict_outer_containment_enforced` for ACP. No uncontained
+  fallback is provided. MACO does not ship `bwrap`; install it with
   `sudo apt-get install -y bubblewrap`.
 - A complete CAM `grok-cli` account must be selected. Grok has no local-auth
   fallback. `~/.grok` and `XAI_API_KEY` are not the launch path. With
@@ -547,20 +549,23 @@ Those probes supported disabling the inner profile. The subsequent
 10 `tool_call` events and the diff appends the requested line. This supersedes
 the earlier claim that the inner profile was the only remaining cause.
 
-Headless Workers and reviewers, and ACP launches, now explicitly select
-`--sandbox off`. The installed binary's embedded documentation lists
+Headless Workers and reviewers explicitly select `--sandbox off`.
+ACP launches retain `--sandbox strict`: their MACO systemd profile does not
+prove an outer bubblewrap wrapper, so disabling the inner profile is not
+authorized for that path. The installed binary's embedded documentation lists
 `off, workspace, devbox, read-only, strict` and says
 `Sandbox disabled (profile: off)`; `--no-leader --sandbox off --help` parses
 successfully. `--no-leader` keeps tools in the contained process rather than
 attaching to a shared leader. The unused `maco-strict-resolver` profile and
-its private-file generation are removed; regression tests assert both launch
-templates select `off` and need no resolver profile. This removes the inner
-restriction on WSL's resolved resolver target. The selected CAM
-credentials/config/cache, systemd `ProtectSystem=strict`, `ProtectHome=tmpfs`,
+its private-file generation are removed; regression tests assert headless
+selects `off` and ACP selects `strict`, with no custom resolver profile.
+Headless launches avoid the inner restriction on WSL's resolved resolver target.
+The selected CAM credentials/config/cache, systemd `ProtectSystem=strict`, `ProtectHome=tmpfs`,
 `PrivateUsers`, exact writable binds, inaccessible credential roots and
 existing bwrap/network policy remain required. Astra and the bundled Grok
 authority limits remain enforced. The command report's `stderr` records
-`inner_sandbox=disabled_outer_containment_enforced`; containment failure
+`inner_sandbox=disabled_outer_containment_enforced` for headless launches and
+`inner_sandbox=strict_outer_containment_enforced` for ACP; containment failure
 refuses release. The R34 plan and wrapper's `maco repo base run_id OUT`
 interface and byte-for-byte shared machine-global config remain unchanged.
 
@@ -728,7 +733,6 @@ failure. DNS/connect failures remain `network_unavailable`; timeout alone and
 missing evidence remain unknown. These environment failures cannot produce
 acceptance or model-quality evidence. Selected CAM binding, credential
 isolation and all MACO gates remain in force. The subsequent
-`e2e-mixed-r39z1` and `e2e-codex-r39z1` reports both recorded `success=true`
-and `accepted=true` with the worker-guidance correction (integrated as
-`cd794fec`). Those results precede the script relocation and stricter routing
-comparison documented here; both live paths still need rerunning for this revision.
+`e2e-mixed-r40s1` and `e2e-codex-r40s1` reports both recorded `success=true`
+and `accepted=true` on `91f416b7`, including the script relocation and
+stricter routing comparison documented here.

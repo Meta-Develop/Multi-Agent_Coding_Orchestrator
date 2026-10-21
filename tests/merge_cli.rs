@@ -3228,6 +3228,7 @@ fn process_start_ticks(pid: u32) -> Result<u64> {
         .context("parse process starttime")
 }
 
+#[cfg(target_os = "linux")]
 fn path_with_prefix(prefix: &Path) -> Result<std::ffi::OsString> {
     let original_path = env::var_os("PATH").unwrap_or_default();
     let mut entries = vec![prefix.to_path_buf()];

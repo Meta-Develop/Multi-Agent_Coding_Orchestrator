@@ -14459,15 +14459,25 @@ done
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
-        assert!(argv.iter().any(|argument| argument == "--no-auto-update"));
-        assert!(argv.windows(2).any(|window| window == ["--sandbox", "off"]));
-        assert!(argv
-            .iter()
-            .any(|argument| argument == "--disable-web-search"));
-        assert!(argv
-            .windows(3)
-            .any(|window| { window == ["agent", "--always-approve", "--no-leader"] }));
-        assert_eq!(argv.last().map(String::as_str), Some("stdio"));
+        // ACP has no verified outer bwrap wrapper, so selection must preserve
+        // the strict inner sandbox and cannot append operator overrides.
+        assert_eq!(
+            argv,
+            [
+                "--no-auto-update",
+                "--sandbox",
+                "strict",
+                "--disable-web-search",
+                "agent",
+                "--always-approve",
+                "--no-leader",
+                "-m",
+                "grok-4.6",
+                "--reasoning-effort",
+                "xhigh",
+                "stdio",
+            ]
+        );
         assert!(!argv.iter().any(|argument| argument == "streaming-json"));
         assert!(!argv.iter().any(|argument| argument == "--prompt-file"));
         assert!(!argv.iter().any(|argument| argument == "--permission-mode"));

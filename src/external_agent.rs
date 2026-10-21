@@ -8740,7 +8740,7 @@ fn run_external_agent_runtime(
         && runtime == ExternalExecutionRuntime::Verified
     {
         tracing::info!(
-            inner_sandbox = crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE,
+            inner_sandbox = grok_progress::launch_policy_evidence(&target_spec),
             worker = ?target_spec.agent_lifecycle.as_ref().map(|identity| &identity.task_id),
             "Grok launch uses required MACO outer containment"
         );
@@ -9379,7 +9379,7 @@ fn run_external_agent_runtime(
                     && runtime == ExternalExecutionRuntime::Verified
                 {
                     tracing::info!(
-                        inner_sandbox = crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE,
+                        inner_sandbox = grok_progress::launch_policy_evidence(&target_spec),
                         worker = ?target_spec.agent_lifecycle.as_ref().map(|identity| &identity.task_id),
                         "Grok launch uses required MACO outer containment"
                     );

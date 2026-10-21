@@ -126,10 +126,13 @@ fn resolve_grok_executable_candidate(
     Ok(canonical)
 }
 
-/// Grok 1.0.60 documents `off` as disabling its inner profile. Production
+/// Grok 1.0.60 documents `off` as disabling its headless inner profile. Production
 /// launches still require MACO's verified ExternalGrok outer containment.
 pub const GROK_INNER_SANDBOX_PROFILE: &str = "off";
 pub const GROK_INNER_SANDBOX_EVIDENCE: &str = "inner_sandbox=disabled_outer_containment_enforced";
+/// ACP has no verified outer bubblewrap wrapper; retain its native strict profile.
+pub const GROK_ACP_INNER_SANDBOX_PROFILE: &str = "strict";
+pub const GROK_ACP_INNER_SANDBOX_EVIDENCE: &str = "inner_sandbox=strict_outer_containment_enforced";
 
 /// Constant markers contain no provider-controlled text or credentials.
 pub(crate) const GROK_NATIVE_DNS_FAILURE: &str = "dns error: failed to lookup address information";
@@ -342,7 +345,7 @@ pub const GROK_RUNTIME_DESCRIPTOR: GrokRuntimeDescriptor = GrokRuntimeDescriptor
 
 /// Pinned Grok `agent stdio` launch contract (ACP parent path).
 ///
-/// Global hardening flags match headless posture; the prompt is sent only over
+/// ACP retains its strict inner sandbox; the prompt is sent only over
 /// the ACP `session/prompt` channel, not via `--prompt-file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrokAcpRuntimeDescriptor {
@@ -394,7 +397,7 @@ impl GrokAcpRuntimeDescriptor {
 
 pub const GROK_ACP_RUNTIME_DESCRIPTOR: GrokAcpRuntimeDescriptor = GrokAcpRuntimeDescriptor {
     executable: "grok",
-    sandbox_profile: GROK_INNER_SANDBOX_PROFILE,
+    sandbox_profile: GROK_ACP_INNER_SANDBOX_PROFILE,
     headless_approval_flag: "--always-approve",
 };
 
@@ -2330,21 +2333,22 @@ mod tests {
     use std::{cell::RefCell, fs};
 
     #[test]
-    fn grok_launches_disable_inner_profile_and_do_not_reference_resolver_profile() {
-        for template in [
-            GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(),
-            GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+    fn grok_launches_pin_protocol_specific_inner_profiles_without_custom_resolver() {
+        for (template, expected) in [
+            (GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(), "off"),
+            (
+                GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+                "strict",
+            ),
         ] {
             assert_eq!(
                 template
                     .windows(2)
-                    .filter(|args| args[0] == "--sandbox" && args[1] == "off")
+                    .filter(|args| args[0] == "--sandbox" && args[1] == expected)
                     .count(),
                 1
             );
-            assert!(!template
-                .iter()
-                .any(|arg| arg == "strict" || arg == "maco-strict-resolver"));
+            assert!(!template.iter().any(|arg| arg == "maco-strict-resolver"));
         }
     }
 
@@ -2571,7 +2575,7 @@ mod tests {
             [
                 "--no-auto-update",
                 "--sandbox",
-                GROK_INNER_SANDBOX_PROFILE,
+                GROK_ACP_INNER_SANDBOX_PROFILE,
                 "--disable-web-search",
                 "agent",
                 "--always-approve",

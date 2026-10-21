@@ -412,7 +412,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
         .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
-        .map(|frozen| super::task_routing::assess_task_routing(&task, &proposal, frozen))
+        .map(|frozen| super::assess_task_routing(&task, &proposal, frozen))
         .transpose()?;
     let has_declared_dependencies = proposal
         .assignments
@@ -2700,7 +2700,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
     let task_routing_assessment = resolved_routing_policy
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
-        .map(|frozen| super::task_routing::assess_task_routing(&task, &remaining_proposal, frozen))
+        .map(|frozen| super::assess_task_routing(&task, &remaining_proposal, frozen))
         .transpose()?;
     let roots = session.provider_assignment_tree();
     if roots.is_empty() {

@@ -301,7 +301,6 @@ pub(crate) use selection_bridge::{
 
 mod parent_broker;
 mod task_routing;
-#[cfg(target_os = "linux")]
 pub(crate) use task_routing::assess_task_routing;
 pub use task_routing::TaskRoutingAssessment;
 

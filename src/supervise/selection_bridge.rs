@@ -10246,7 +10246,7 @@ mod tests {
         use crate::selection::routing_policy::*;
         let temp = tempfile::tempdir()?;
         let mut frozen = load_routing_policy(temp.path())?;
-        frozen.policy.default_role.preferred_effort = Some(SelectorEffort::High);
+        frozen.policy.default_role.preferred_effort = Some(SelectorEffort::Medium);
         let mut worker = frozen.policy.default_role.clone();
         worker.preferred_effort = Some(SelectorEffort::None);
         frozen
@@ -10256,10 +10256,12 @@ mod tests {
         frozen.sha256 =
             crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
         let _policy = bind_routing_policy(Some(frozen))?;
+        // Use a dated permitted control model. Medium has no measured worker fit,
+        // so this fixture continues to exercise effort-driven mixed-account routing.
         let accounts = vec![
             (
                 SupervisorRuntime::Codex,
-                qualified_account_fixture("codex-cli", "account-parent-fixture", "high"),
+                qualified_account_fixture("codex-cli", "gpt-6.1-sol", "medium"),
             ),
             (
                 SupervisorRuntime::Grok,
@@ -10279,7 +10281,11 @@ mod tests {
             None,
             &accounts,
         )?;
-        assert!(resolution.selection_preflight_failure.is_none());
+        assert!(
+            resolution.selection_preflight_failure.is_none(),
+            "{:?}",
+            resolution.selection_preflight_failure
+        );
         for event in &resolution.decisions {
             assert_eq!(event.provenance.normalized_input.catalogs.len(), 2);
             assert_eq!(event.provenance.normalized_input.pools.len(), 2);
@@ -10387,9 +10393,10 @@ mod tests {
         frozen.sha256 =
             crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
         let _policy = bind_routing_policy(Some(frozen.clone()))?;
+        // Judgment roles require a dated permitted model, even with loaded policy.
         let accounts = vec![(
             SupervisorRuntime::Codex,
-            qualified_account_fixture("codex-cli", "bounded-direct-fixture", "none"),
+            qualified_account_fixture("codex-cli", "gpt-6.1-sol", "none"),
         )];
         let mut plan = test_plan();
         plan.assignments = vec![serde_json::from_value(json!({
@@ -10408,7 +10415,11 @@ mod tests {
             None,
             &accounts,
         )?;
-        assert!(resolution.selection_preflight_failure.is_none());
+        assert!(
+            resolution.selection_preflight_failure.is_none(),
+            "{:?}",
+            resolution.selection_preflight_failure
+        );
         assert_eq!(resolution.decisions.len(), required.len());
         assert!(!plan.role_models.contains_key(&AgentRole::ChildOrchestrator));
         for gate in [

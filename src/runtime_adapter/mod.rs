@@ -2039,7 +2039,7 @@ mod tests {
             [
                 "--no-auto-update",
                 "--sandbox",
-                grok::GROK_INNER_SANDBOX_PROFILE,
+                grok::GROK_ACP_INNER_SANDBOX_PROFILE,
                 "--disable-web-search",
                 "agent",
                 "--always-approve",

@@ -7017,7 +7017,7 @@ fn grok_acp_runtime_adapter_argv_uses_contained_agent_stdio() {
         [
             "--no-auto-update",
             "--sandbox",
-            "off",
+            "strict",
             "--disable-web-search",
             "agent",
             "--always-approve",
@@ -8880,7 +8880,7 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
         [
             "--no-auto-update",
             "--sandbox",
-            "off",
+            "strict",
             "--disable-web-search",
             "agent",
             "--always-approve",

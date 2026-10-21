@@ -22,10 +22,15 @@ pub(super) fn record_launch_policy(
             )
     {
         report.stderr.text.push_str("\nMACO launch policy: ");
-        report
-            .stderr
-            .text
-            .push_str(crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE);
+        report.stderr.text.push_str(launch_policy_evidence(spec));
+    }
+}
+
+pub(super) fn launch_policy_evidence(spec: &ExternalAgentCommand) -> &'static str {
+    if grok_acp_stdio_protocol_selected(spec) {
+        crate::runtime_adapter::grok::GROK_ACP_INNER_SANDBOX_EVIDENCE
+    } else {
+        crate::runtime_adapter::grok::GROK_INNER_SANDBOX_EVIDENCE
     }
 }
 
@@ -352,6 +357,19 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("MACO launch policy:"));
+        let mut acp_config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+        acp_config.grok_interaction_protocol =
+            crate::runtime_adapter::GrokInteractionProtocol::AcpStdio;
+        acp_config.argument_template =
+            crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template();
+        let acp = spec.with_runtime_adapter(RuntimeId::Grok, acp_config);
+        report.stderr.text.clear();
+        record_launch_policy(&mut report, &acp, ExternalExecutionRuntime::Verified);
+        assert!(report
+            .stderr
+            .text
+            .contains("inner_sandbox=strict_outer_containment_enforced"));
+        assert!(!report.stderr.text.contains("inner_sandbox=disabled"));
     }
 
     #[cfg(unix)]
