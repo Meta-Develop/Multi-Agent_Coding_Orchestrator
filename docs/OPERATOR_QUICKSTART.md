@@ -244,14 +244,14 @@ operator-reported native catalog on 2026-10-17 lists `grok-4.7` (default),
 The run must still admit the selected model and effort from CAM-bound metadata.
 
 Set: `repo=/path/to/target-repo`, `base=$XDG_RUNTIME_DIR/maco-e2e`, `run_id=example-1`, `maco=/path/to/target/release/maco`.
-Copy the complete checkout-root plan for the exact README append task:
+Copy the complete example plan for the exact README append task:
 
 ```bash
-install -m 0600 R34-mixed-plan.json "$base/plan.json"
+install -m 0600 examples/supervise/mixed-codex-grok-plan.json "$base/plan.json"
 "$maco" supervise plan "$base/plan.json" --repo "$repo" --json
 ```
 
-[R34-mixed-plan.json](../R34-mixed-plan.json) assigns one direct, non-delegating
+[examples/supervise/mixed-codex-grok-plan.json](../examples/supervise/mixed-codex-grok-plan.json) assigns one direct, non-delegating
 Grok Worker to `README.md`, with `grok-4.6` / `xhigh` and fail-closed model
 fallback. It also includes `resolved_routing_policy` and
 `task_routing_assessment`. The assessment replays the exact declared task,
@@ -410,18 +410,23 @@ timeout --signal=TERM 3600 systemd-run --user --scope --quiet -p Delegate=yes \
 The report path is the same
 `<repo>/.maco/o2/runs/<run-id>/reports/supervisor-final.json` path as Codex.
 
-The checkout-root `R34-mixed-plan.json` and executable `R34-mixed-run.sh` use
-this contract for the exact README append task. Export `maco`, `repo`, `base`,
+The example [`examples/supervise/mixed-codex-grok-plan.json`](../examples/supervise/mixed-codex-grok-plan.json)
+and executable [`scripts/run-mixed-codex-grok.sh`](../scripts/run-mixed-codex-grok.sh)
+use this contract for the exact README append task. Export `maco`, `repo`, `base`,
 `run_id`, and `OUT` together with the session and Grok variables above, then
-run `./R34-mixed-run.sh` (Python 3 is required). The script first saves the non-spawning shared-state
+run `./scripts/run-mixed-codex-grok.sh` from the checkout root (Python 3 is required).
+The script first saves the non-spawning shared-state
 check to `$OUT/machine-global-status.json` and `$OUT/machine-global-status.stderr`,
 then copies the plan into a fresh directory under `$base`. It records the
 executable identity in `$OUT/maco-version.txt` and `$OUT/maco-sha256.txt`, validates the plan into
 `$OUT/checked-plan.json`, and lowers its exact task via non-spawning
 `supervise plan --from-goal` into `$OUT/generated-plan.json`. The generated plan
 and normalized checked plan must retain the same direct-worker verification
-contract, task, scope, and replayable routing assessment (generated assignment
-ids can differ). Exactly one direct non-delegating execution Worker is required;
+contract, task, scope, resolved policy SHA-256 and source, assessment policy
+SHA-256 and provenance, and every routing feature value (including risk,
+complexity, horizon, and context tokens). Generated assignment ids and their
+declaration digests can differ. Exactly one direct non-delegating execution
+Worker is required;
 paired planning/execution coordinators and extra workers are incompatible with
 this example. A mismatch fails before runtime launch with the failing plan and
 contract check named; rebuild using the explicit manifest path above.
@@ -504,7 +509,8 @@ All parent review lenses rejected the missing execution evidence. No shared
 config cleanup error appears in this capture. The older executable mismatch
 and config reserialization therefore do not explain this later timeout.
 
-The R38 standalone diagnostic initially failed even `--help` with
+The standalone diagnostic is [`scripts/diagnose-grok-launch.sh`](../scripts/diagnose-grok-launch.sh).
+Its R38 capture initially failed even `--help` with
 `No such file or directory`: `ProtectHome=tmpfs` hid its home-installed Grok
 executable. The existing diagnostic's exact executable bind fixes that separate
 harness defect. Later H (AF_NETLINK allowed) and I (no SystemCallFilter) still
@@ -609,6 +615,12 @@ The bound `journal-append` operation now accepts `--auto-timestamps` instead of
 explicit start/end arguments. Use the exact provided prefix followed by
 `--cwd <exact assigned worktree> --auto-timestamps -- <original argv>`; the wrapper
 gets real UTC timestamps itself and records the end after command execution.
+Codex and Grok workers must run `journal-append` commands one at a time, never
+in parallel tool calls, including read-only validations. Wait for completion
+before starting the next invocation. Accidental concurrent appends wait for the
+exclusive journal lock for up to 30 seconds; a timeout fails closed without
+executing the waiting command or replacing or repairing the journal. Each lock
+covers the complete observation, command execution and durable append sequence.
 Do not run `date`, invent timestamps, or execute the command separately. For
 native edits, call the prefix with
 `--cwd <exact assigned worktree> --auto-timestamps --observe-changes -- true`
@@ -624,8 +636,8 @@ do not apply the patch again. Only that payload-bearing record supports the exac
 `["apply_patch", "<exact full native patch>"]` command in the report. A `true`
 observation and observed content digests do not establish a native tool's argv.
 Legacy explicit timestamp pairs remain
-supported and cannot be combined with `--auto-timestamps`. This changes neither
-the journal identity, locking, observed content chain nor failure behavior.
+supported and cannot be combined with `--auto-timestamps`. Journal identity,
+observed content continuity and terminal failure checks still apply.
 `WorkerReport.commands_run` copies the inner command array and exact absolute
 cwd from the journal. Avoid reporting wrapper argv; repeated automatic-timestamp
 wrappers remain ambiguous and cannot be matched to a particular journal row.
@@ -715,6 +727,8 @@ Successful response text mentioning those strings does not establish an auth
 failure. DNS/connect failures remain `network_unavailable`; timeout alone and
 missing evidence remain unknown. These environment failures cannot produce
 acceptance or model-quality evidence. Selected CAM binding, credential
-isolation and all MACO gates remain in force. The later mixed run verified
-contained inference and acceptance as recorded above. Both live paths must be
-rerun after the latest worker-guidance correction.
+isolation and all MACO gates remain in force. The subsequent
+`e2e-mixed-r39z1` and `e2e-codex-r39z1` reports both recorded `success=true`
+and `accepted=true` with the worker-guidance correction (integrated as
+`cd794fec`). Those results precede the script relocation and stricter routing
+comparison documented here; both live paths still need rerunning for this revision.

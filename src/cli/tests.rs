@@ -16,7 +16,7 @@ fn documented_grok_diagnostic_preserves_confinement_and_reports_observed_startup
     let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
     let output = std::process::Command::new("python3")
         .arg(root.join("tests/fixtures/runtime_adapter/r38_diagnostic.py"))
-        .arg(root.join("R38-diag.sh"))
+        .arg(root.join("scripts/diagnose-grok-launch.sh"))
         .output()
         .expect("Python diagnostic regression harness");
     assert!(
@@ -37,17 +37,27 @@ fn documented_mixed_script_checks_binary_compatibility_before_launch_and_preserv
         .tempdir()
         .unwrap();
     let root = owner.path();
-    for directory in ["bin", "base", "repo"] {
-        fs::create_dir(root.join(directory)).unwrap();
+    for directory in ["bin", "base", "repo", "scripts", "examples/supervise"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
     }
     fs::write(root.join("base/machine-global.json"), "{}").unwrap();
     fs::write(
-        root.join("R34-mixed-run.sh"),
-        include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-run.sh")),
+        root.join("scripts/run-mixed-codex-grok.sh"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/run-mixed-codex-grok.sh"
+        )),
     )
     .unwrap();
-    let plan = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-plan.json"));
-    fs::write(root.join("R34-mixed-plan.json"), plan).unwrap();
+    let plan = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/supervise/mixed-codex-grok-plan.json"
+    ));
+    fs::write(
+        root.join("examples/supervise/mixed-codex-grok-plan.json"),
+        plan,
+    )
+    .unwrap();
     // Generated ids may differ; compatibility must follow the bound contract.
     let mut generated: serde_json::Value = serde_json::from_str(plan).unwrap();
     let worker = &mut generated["assignments"][0];
@@ -56,6 +66,8 @@ fn documented_mixed_script_checks_binary_compatibility_before_launch_and_preserv
         .as_str()
         .unwrap()
         .replace("readme-worker", "generated-worker"));
+    generated["task_routing_assessment"]["declaration"]["assignments"][0]["id"] =
+        serde_json::json!("generated-worker");
     fs::write(
         root.join("generated.json"),
         serde_json::to_vec(&generated).unwrap(),
@@ -81,6 +93,20 @@ args = sys.argv[1:]
 with open(os.environ['CALLS'], 'a') as calls:
     calls.write(json.dumps(args) + '\n')
 mode = os.environ['MODE']
+def change_routing(plan, mismatch):
+    policy = plan['resolved_routing_policy']
+    assessment = plan['task_routing_assessment']
+    if mismatch == 'policy':
+        policy['sha256'] = assessment['policy_sha256'] = '0' * 64
+    elif mismatch == 'policy-binding':
+        assessment['policy_sha256'] = '0' * 64
+    elif mismatch == 'source':
+        policy['source'] = 'different-policy-source'
+    elif mismatch == 'provenance':
+        assessment['provenance'] = 'different-provenance'
+    elif mismatch.startswith('feature-'):
+        field = mismatch.removeprefix('feature-')
+        assessment['features'][field] += 1
 if args[:2] == ['machine-global', 'status']:
     sys.exit(9 if mode == 'bad-config' else 0)
 if args == ['--version']:
@@ -104,11 +130,15 @@ if '--from-goal' in args:
         worker['notes'] = 'maco-preclaim-v1:' + json.dumps(directive)
     if mode == 'extra-worker':
         plan['assignments'].append(plan['assignments'][0].copy())
+    if mode.startswith('generated-'):
+        change_routing(plan, mode.removeprefix('generated-'))
     print(json.dumps(plan))
 else:
     if mode == 'bad-plan': sys.exit(11)
     plan = json.loads(pathlib.Path(args[2]).read_text())
     if mode == 'lossy-check': plan.pop('task_routing_assessment')
+    if mode.startswith('checked-'):
+        change_routing(plan, mode.removeprefix('checked-'))
     print(json.dumps(plan))
 "#,
         ),
@@ -138,6 +168,22 @@ sys.exit(7)
         ("override", 1, false),
         ("extra-worker", 1, false),
         ("lossy-check", 1, false),
+        ("generated-policy", 1, false),
+        ("generated-policy-binding", 1, false),
+        ("generated-source", 1, false),
+        ("generated-provenance", 1, false),
+        ("generated-feature-risk", 1, false),
+        ("generated-feature-complexity", 1, false),
+        ("generated-feature-horizon", 1, false),
+        ("generated-feature-context_tokens", 1, false),
+        ("checked-policy", 1, false),
+        ("checked-policy-binding", 1, false),
+        ("checked-source", 1, false),
+        ("checked-provenance", 1, false),
+        ("checked-feature-risk", 1, false),
+        ("checked-feature-complexity", 1, false),
+        ("checked-feature-horizon", 1, false),
+        ("checked-feature-context_tokens", 1, false),
         ("bad-config", 1, false),
         ("bad-plan", 11, false),
         ("bad-goal", 10, false),
@@ -145,7 +191,7 @@ sys.exit(7)
         let out = root.join(mode);
         let launch = out.join("launch.json");
         let output = std::process::Command::new("bash")
-            .arg(root.join("R34-mixed-run.sh"))
+            .arg(root.join("scripts/run-mixed-codex-grok.sh"))
             .env("PATH", &path)
             .env("MODE", mode)
             .env("CALLS", root.join(format!("{mode}-calls.jsonl")))
@@ -188,6 +234,15 @@ sys.exit(7)
         }
         if mode == "lossy-check" {
             assert!(stderr.contains("checked plan:"), "{stderr}");
+        }
+        if mode.starts_with("checked-") || mode.starts_with("generated-") {
+            let label = if mode.starts_with("checked-") {
+                "checked plan:"
+            } else {
+                "goal lowering:"
+            };
+            assert!(stderr.contains(label), "{mode}: {stderr}");
+            assert!(stderr.contains("routing"), "{mode}: {stderr}");
         }
         if launches {
             let args: Vec<String> = serde_json::from_slice(&fs::read(&launch).unwrap()).unwrap();

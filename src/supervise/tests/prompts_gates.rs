@@ -340,6 +340,9 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt
         .contains("Execution journal path: /tmp/maco-run/incoming/worker-journals/worker-a.jsonl"));
     assert!(prompt.contains("executes the command ONCE"));
+    assert!(
+        prompt.contains("Run journal-append commands one at a time; never in parallel tool calls")
+    );
     assert!(prompt.contains("--auto-timestamps"));
     assert!(prompt.contains("Do not invent timestamps or run date"));
     assert!(prompt.contains("--changed-path is optional"));
@@ -385,6 +388,7 @@ fn worker_prompt_includes_execution_journal_contract() {
 
 fn assert_native_edit_journal_reporting_contract(prompt: &str) {
     for required in [
+        "Run journal-append commands one at a time; never in parallel tool calls",
         "Both observation records contain [\"true\"]",
         "omit the native apply_patch/Edit command itself",
         "Never add a native tool command absent from the journal",
@@ -2732,6 +2736,7 @@ fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract(
         assert!(prompt.contains(&format!("Execution journal path: {}", expected.display())));
         for contract in [
             "executes the command ONCE",
+            "Run journal-append commands one at a time; never in parallel tool calls",
             "--observe-changes -- true",
             "exact precreated journal",
             "parent is nonwritable",

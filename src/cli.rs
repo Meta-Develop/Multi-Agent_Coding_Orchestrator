@@ -5490,7 +5490,17 @@ mod cli_integration_tests {
             unsafe { libc::flock(locked.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
             0
         );
-        assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
+        let error = invoke_worker_journal_append(&path, &identity, "patch", "p").unwrap_err();
+        assert!(
+            error.to_string().contains(
+                "timed out after 30000 ms waiting for exclusive worker journal append lock"
+            ),
+            "{error:#}"
+        );
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::TimedOut
+        );
         assert!(fs::read(&path).unwrap().is_empty());
         drop(locked);
         let original = vec![b' '; 1024 * 1024];

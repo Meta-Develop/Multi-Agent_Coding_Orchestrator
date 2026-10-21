@@ -3586,7 +3586,10 @@ mod tests {
             true,
         );
         let loaded = super::super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
-            include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-plan.json")),
+            include_str!(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/examples/supervise/mixed-codex-grok-plan.json"
+            )),
             Some(&repo_map.root),
         )
         .expect("load the actual documented mixed plan");

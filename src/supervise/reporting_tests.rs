@@ -283,14 +283,122 @@ fn worker_journal_lock_release_survives_an_inherited_open_description() {
     // A duplicate deterministically models that lifetime without a fork race.
     let inherited = lock.file.try_clone().unwrap();
     let record = observed_entry(&worktree, &["true"]);
-    let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
-    assert!(error.to_string().contains("already being appended"));
+    let error = WorkerJournalAppendLock::acquire_with_timeout(
+        open_worker_journal_no_follow(&path, true).unwrap(),
+        std::time::Duration::from_millis(20),
+    )
+    .err()
+    .expect("the active holder must not be bypassed");
+    assert_eq!(
+        error.downcast_ref::<std::io::Error>().unwrap().kind(),
+        std::io::ErrorKind::TimedOut
+    );
+    assert!(error
+        .to_string()
+        .contains("exclusive worker journal append lock"));
     assert!(fs::read(&path).unwrap().is_empty());
     drop(lock);
     run_worker_execution_journal_command(&path, &identity, &record, false).unwrap();
     let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
     assert_eq!(records.len(), 2);
     verify_worker_journal_identity(&inherited.metadata().unwrap(), &identity).unwrap();
+}
+
+#[test]
+fn worker_journal_concurrent_cli_appends_wait_and_preserve_ordered_observations() {
+    use clap::Parser;
+    use std::sync::{mpsc, Barrier};
+    use std::time::Duration;
+
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let holder =
+        WorkerJournalAppendLock::acquire(open_worker_journal_no_follow(&path, true).unwrap())
+            .unwrap();
+    let barrier = Barrier::new(3);
+    let (finished, received) = mpsc::channel();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = [
+            "printf 'first\\n' >> README.md",
+            "printf 'second\\n' >> README.md",
+        ]
+        .into_iter()
+        .map(|command| {
+            let finished = finished.clone();
+            let barrier = &barrier;
+            let path = &path;
+            let identity = &identity;
+            let worktree = &worktree;
+            scope.spawn(move || {
+                let args = vec![
+                    "maco".to_string(),
+                    "supervise".into(),
+                    "journal-append".into(),
+                    "--journal".into(),
+                    path.to_str().unwrap().into(),
+                    "--device".into(),
+                    identity.device.to_string(),
+                    "--inode".into(),
+                    identity.file.to_string(),
+                    "--cwd".into(),
+                    worktree.to_str().unwrap().into(),
+                    "--auto-timestamps".into(),
+                    "--".into(),
+                    "/bin/sh".into(),
+                    "-c".into(),
+                    command.into(),
+                ];
+                let cli = crate::cli::Cli::try_parse_from(args).unwrap();
+                barrier.wait();
+                let result = cli.run();
+                finished.send(()).unwrap();
+                result
+            })
+        })
+        .collect();
+        barrier.wait();
+        // Both invocations overlap a held lock. Neither may fail immediately,
+        // append an intent record, or execute its source mutation while waiting.
+        let early = received.recv_timeout(Duration::from_millis(150));
+        let waiting_bytes = fs::read(&path).unwrap();
+        let waiting_source = fs::read_to_string(worktree.join("README.md")).unwrap();
+        drop(holder);
+        for handle in handles {
+            handle.join().unwrap().unwrap();
+        }
+        assert_eq!(early, Err(mpsc::RecvTimeoutError::Timeout));
+        assert!(waiting_bytes.is_empty());
+        assert_eq!(waiting_source, "original\n");
+    });
+    let bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes.last(), Some(&b'\n'));
+    // Two invocations each produce an adjacent started/completed pair; parsing
+    // also checks digest continuity and rejects interleaved command records.
+    let records = parse_worker_execution_journal(&bytes, &path).unwrap();
+    assert_eq!(records.len(), 4);
+    assert_ne!(records[0].command, records[2].command);
+    for pair in records.chunks_exact(2) {
+        assert_eq!(pair[0].command, pair[1].command);
+        assert_eq!(pair[0].cwd, worktree);
+        assert_eq!(pair[1].changed_paths, [PathBuf::from("README.md")]);
+        assert_eq!(
+            pair[0].observation.as_ref().unwrap().phase,
+            WorkerJournalObservationPhase::Started
+        );
+        assert_eq!(
+            pair[1].observation.as_ref().unwrap().phase,
+            WorkerJournalObservationPhase::Completed
+        );
+    }
+    let expected = if records[0].command[2].contains("first") {
+        "original\nfirst\nsecond\n"
+    } else {
+        "original\nsecond\nfirst\n"
+    };
+    assert_eq!(
+        fs::read_to_string(worktree.join("README.md")).unwrap(),
+        expected
+    );
+    verify_worker_journal_identity(&fs::metadata(&path).unwrap(), &identity).unwrap();
 }
 
 #[test]

@@ -615,7 +615,8 @@ pub(crate) fn append_precreated_worker_execution_journal(
 /// Release the lock explicitly before closing the descriptor. Another thread's
 /// concurrent fork can temporarily retain this open file description, including
 /// CLOEXEC descriptors until exec, so close alone can leave a completed append
-/// locked. Active append operations still fail immediately on contention.
+/// locked. Contending append operations wait for a bounded time and never steal
+/// or replace a lock, including a stale or foreign holder's lock.
 #[cfg(target_os = "linux")]
 struct WorkerJournalAppendLock {
     file: fs::File,
@@ -624,13 +625,39 @@ struct WorkerJournalAppendLock {
 #[cfg(target_os = "linux")]
 impl WorkerJournalAppendLock {
     fn acquire(file: fs::File) -> Result<Self> {
+        Self::acquire_with_timeout(file, std::time::Duration::from_secs(30))
+    }
+
+    fn acquire_with_timeout(file: fs::File, timeout: std::time::Duration) -> Result<Self> {
         use std::os::fd::AsRawFd;
-        // SAFETY: flock acts on a live owned descriptor without pointers.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("worker journal is already being appended");
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        loop {
+            // SAFETY: flock acts on a live owned descriptor without pointers.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                return Err(error).context("cannot acquire exclusive worker journal append lock");
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {} ms waiting for exclusive worker journal append lock; stop without replacing or repairing the journal",
+                        timeout.as_millis()
+                    ),
+                )
+                .into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
         }
-        Ok(Self { file })
     }
 }
 

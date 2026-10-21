@@ -116,7 +116,7 @@ for help_exit in (0, 127):
                 mock.patch.object(Path, 'open', guarded_path_open), \
                 mock.patch('os.open', side_effect=guarded_open):
             try:
-                exec(compile(source, 'R38-diag embedded Python', 'exec'), namespace)
+                exec(compile(source, 'diagnose-grok-launch embedded Python', 'exec'), namespace)
             except SystemExit as error:
                 assert help_exit != 0 and error.code == 1
             else:

@@ -9174,7 +9174,10 @@ mod tests {
     #[test]
     fn documented_mixed_plan_selects_with_its_own_replayable_assessment() -> Result<()> {
         let (_temporary, repo) = super::super::tests::injected_repository();
-        let source = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/R34-mixed-plan.json"));
+        let source = include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/examples/supervise/mixed-codex-grok-plan.json"
+        ));
         let mut loaded = super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
             source,
             Some(&repo),

@@ -236,6 +236,7 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
     let apply_patch_journal_example = worker_execution_journal_apply_patch_example()?;
     Ok(format!(
         r#"- Bound journal-append prefix/device/inode + --cwd <exact worktree> + --auto-timestamps + -- <argv>. The wrapper obtains real UTC start/end timestamps itself and executes the command ONCE, journaling start/completion/digests. Do not invent timestamps or run date. Never execute separately. Never reconstruct at the end. Explicit nonempty --start-timestamp/--end-timestamp remain a legacy alternative; never combine them with --auto-timestamps.
+- Run journal-append commands one at a time; never in parallel tool calls, including read-only validations. Wait for each invocation to finish before starting the next.
 - --changed-path is optional; omit it and let the wrapper derive changed paths. If supplied, it describes only changes made by THIS command/observation, not files already dirty from an earlier edit. Read-only validation (for example tail or git diff --check) must omit --changed-path. Parent checks all paths, including out-of-scope paths.
 - Native apply_patch/Edit: baseline before editing with bound prefix + --cwd <exact worktree> --auto-timestamps --observe-changes -- true; use the native edit tool ONCE, then IMMEDIATELY invoke that observation prefix again before any other action. Both observation records contain ["true"]. In WorkerReport.commands_run report only the journaled ["true"] observations and wrapped verification commands; omit the native apply_patch/Edit command itself and describe the edit in findings. Never add a native tool command absent from the journal, even when the tool succeeded and its changed bytes were observed.
 - If reporting native apply_patch argv is necessary, replace ONLY the post-edit observation's -- true with -- apply_patch '<exact full patch passed to the native tool as ONE argument>'. Observation never executes argv; do not apply the patch again. Only this payload-bearing observation supports ["apply_patch", "<exact full patch>"] in commands_run. A ["true"] observation cannot support it. The timestamps describe observation time, not an unobserved native edit's execution time.
@@ -2088,6 +2089,14 @@ pub(super) fn apply_canonical_environment_requirements(
 mod regression_tests {
     use super::*;
 
+    // Cost decision: allow at most 2 KiB per worker template for the integrated
+    // native-edit identity, automatic timestamp and serial journal contracts.
+    // The fixed worker is 8,273 bytes (8,104 before the 169-byte serial rule),
+    // already above the older 6,656-byte baseline. The child fixture embeds the
+    // worker contract once and gets the same allowance. This is test-only: production
+    // measurement fields and trusted launch/acceptance limits remain unchanged.
+    const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 2 * 1024;
+
     fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
     }
@@ -2848,12 +2857,13 @@ mod regression_tests {
             (
                 "terminal worker",
                 worker.as_str(),
-                WORKER_PROMPT_FIXTURE_CEILING_BYTES,
+                WORKER_PROMPT_FIXTURE_CEILING_BYTES + JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES,
             ),
             (
                 "child orchestrator",
                 child.as_str(),
-                CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES,
+                CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES
+                    + JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES,
             ),
             (
                 "review auditor",
@@ -2879,18 +2889,18 @@ mod regression_tests {
 
     #[test]
     fn rendered_role_prompt_ceiling_guard_rejects_growth() {
-        let oversized = "x".repeat(WORKER_PROMPT_FIXTURE_CEILING_BYTES.saturating_add(1));
-        let error = enforce_rendered_prompt_ceiling(
-            "terminal worker",
-            &oversized,
+        for ceiling in [
             WORKER_PROMPT_FIXTURE_CEILING_BYTES,
-        )
-        .expect_err("one byte beyond the declared ceiling must fail");
-
-        assert!(error.to_string().contains("above its declared"));
-        assert!(error
-            .to_string()
-            .contains(&WORKER_PROMPT_FIXTURE_CEILING_BYTES.to_string()));
+            WORKER_PROMPT_FIXTURE_CEILING_BYTES + JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES,
+            CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES
+                + JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES,
+        ] {
+            let oversized = "x".repeat(ceiling.saturating_add(1));
+            let error = enforce_rendered_prompt_ceiling("fixture", &oversized, ceiling)
+                .expect_err("one byte beyond the declared ceiling must fail");
+            assert!(error.to_string().contains("above its declared"));
+            assert!(error.to_string().contains(&ceiling.to_string()));
+        }
     }
 
     #[test]
