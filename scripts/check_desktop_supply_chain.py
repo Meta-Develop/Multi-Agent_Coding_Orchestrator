@@ -90,7 +90,8 @@ def main() -> int:
             ], cwd=root, stdout=subprocess.PIPE, text=True)
             if raw.returncode not in {0, 1}:
                 raise ValueError(f"cargo-audit failed with exit {raw.returncode}")
-            check_report(json.loads(raw.stdout), manifest["package"]["metadata"]["desktop-advisories"])
+            exceptions = manifest.get("package", {}).get("metadata", {}).get("desktop-advisories", [])
+            check_report(json.loads(raw.stdout), exceptions)
             # cargo-audit accepts IDs, not package versions. Validate the exact
             # report first, then pass only the reviewed IDs for this invocation.
             command = ["cargo", "audit", "--no-fetch", "--file", str(desktop / "Cargo.lock"), "--deny", "warnings"]

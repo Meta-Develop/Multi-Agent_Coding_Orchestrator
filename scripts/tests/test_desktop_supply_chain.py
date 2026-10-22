@@ -88,6 +88,12 @@ class DesktopSupplyChainTests(unittest.TestCase):
             with self.subTest(report=report), self.assertRaises(ValueError):
                 MODULE.check_report(report, [self.entry])
 
+    def test_last_exception_can_be_removed_after_upstream_fix(self):
+        self.manifest["package"].pop("metadata")
+        self.policy["advisories"]["ignore"] = []
+        self.assertEqual(self.check(), [])
+        MODULE.check_report({"vulnerabilities": {"found": False, "list": []}, "warnings": {}}, [])
+
 
 if __name__ == "__main__":
     unittest.main()
