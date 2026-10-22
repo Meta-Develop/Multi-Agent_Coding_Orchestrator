@@ -1,15 +1,3 @@
+# No advisory exceptions: audit every package represented in Cargo.lock.
 [advisories]
-ignore = [
-    # Allowed only for the inactive, lockfile-only async secret-service path (zvariant).
-    # Remove when keyring drops the optional path. The required CI guard rejects
-    # every active version in both workspaces, including desktop zvariant 5 / zbus_names 4.
-    "RUSTSEC-2026-0370",
-    # Allowed only for the inactive, lockfile-only async secret-service path (zbus_names).
-    # Remove when keyring drops the optional path. The required CI guard rejects
-    # every active version in both workspaces, including desktop zvariant 5 / zbus_names 4.
-    "RUSTSEC-2026-0371",
-    # Allowed only for the inactive, lockfile-only async secret-service path (zvariant_derive).
-    # Remove when keyring drops the optional path. The required CI guard rejects
-    # every active version in both workspaces, including desktop zvariant 5 / zbus_names 4.
-    "RUSTSEC-2026-0372",
-]
+ignore = []

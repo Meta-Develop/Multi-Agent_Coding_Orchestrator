@@ -6,6 +6,7 @@ from __future__ import annotations
 from pathlib import Path
 import subprocess
 import sys
+import tomllib
 
 
 def check_tree(tree: str) -> None:
@@ -16,41 +17,37 @@ def check_tree(tree: str) -> None:
         package, features = line.removesuffix(" (*)").split("|", 1)
         name, version, *_ = package.split()
         packages.setdefault((name, version), set()).update(features.split(","))
-    keyrings = [
-        (version, features)
-        for (name, version), features in packages.items()
-        if name == "keyring"
-    ]
-    if len(keyrings) != 1:
-        raise ValueError("expected exactly one resolved keyring")
-    version, features = keyrings[0]
-    # In keyring 3 the wrapper's feature selects Dh instead of Plain. Enabling
-    # crypto only on dbus-secret-service does not select encrypted sessions.
-    if not version.startswith("v3."):
-        raise ValueError("review the DH feature contract when upgrading keyring")
-    if not {"sync-secret-service", "crypto-rust"} <= features:
-        raise ValueError("keyring must enable sync-secret-service and crypto-rust for DH")
-    backends = [
-        enabled for (name, _), enabled in packages.items()
-        if name == "dbus-secret-service"
-    ]
-    if len(backends) != 1 or "crypto-rust" not in backends[0]:
-        raise ValueError("dbus-secret-service must enable crypto-rust")
-    # Cargo metadata includes weak-optional lockfile nodes that cargo tree
-    # correctly omits from the compilation graph, even with --target all.
-    # RUSTSEC-2026-0370/0371/0372 have no patched versions. Checking
-    # only keyring's old exact versions would let the shared exceptions hide
-    # active desktop zvariant 5 / zbus_names 4 (or a future affected version).
-    excepted = {"zvariant", "zvariant_derive", "zbus_names"}
-    active = sorted(f"{name} {version}" for name, version in packages
-                    if name in excepted)
-    if active:
-        raise ValueError("advisory-excepted packages must never be compiled: "
-                         + ", ".join(active))
-    if "async-secret-service" in features or any(
-        name == "secret-service" for name, _ in packages
-    ):
-        raise ValueError("the excepted async Secret Service path must never be compiled")
+    # These are the reviewed keyring 4 store API and DH implementation versions.
+    # The dbus store always selects EncryptionType::Dh and refuses to compile
+    # without crypto. It has no optional async Secret Service dependency.
+    required = {
+        "keyring-core": ("v1.0.1", set()),
+        "dbus-secret-service-keyring-store": ("v1.0.1", {"crypto-rust"}),
+        "dbus-secret-service": ("v4.1.0", {"crypto-rust"}),
+        "apple-native-keyring-store": ("v1.0.2", {"keychain"}),
+        "windows-native-keyring-store": ("v1.1.0", set()),
+    }
+    for name, (version, features) in required.items():
+        resolved = [(v, f) for (n, v), f in packages.items() if n == name]
+        if len(resolved) != 1 or resolved[0][0] != version:
+            raise ValueError(f"review the native store contract for {name}: expected {version}")
+        if not features <= resolved[0][1]:
+            raise ValueError(f"{name} must enable {', '.join(sorted(features))}")
+    if any(name in {"keyring", "secret-service", "zbus-secret-service-keyring-store"}
+           for name, _ in packages):
+        raise ValueError("use explicit native stores, without the legacy or async keyring path")
+
+
+def check_policies(root: Path) -> None:
+    # No global exception may mask the desktop's independent Tauri dependencies.
+    # Inactivity checks are unnecessary only because there are NO advisory ignores.
+    for name in (".cargo/audit.toml", "deny.toml"):
+        policy = tomllib.loads((root / name).read_text())
+        advisories = policy.get("advisories", {})
+        if advisories.get("ignore") != []:
+            raise ValueError(f"{name} must have no advisory exceptions")
+        if "unused-ignored-advisory" in advisories:
+            raise ValueError(f"{name} must not allow unused advisory exceptions")
 
 
 def check_workspace(root: Path, manifest: Path) -> None:
@@ -70,8 +67,12 @@ def check_workspace(root: Path, manifest: Path) -> None:
 
 def main() -> int:
     root = Path(__file__).resolve().parents[1]
-    # Audit/deny policy is shared, so every normal invocation must validate
-    # both consumers before any lockfile-wide advisory exceptions are used.
+    try:
+        check_policies(root)
+    except ValueError as error:
+        print(f"keyring crypto check failed: {error}", file=sys.stderr)
+        return 1
+    # Keep desktop defaults and every target enabled when validating stores.
     failed = False
     for manifest in (Path("Cargo.toml"), Path("account-manager/src-tauri/Cargo.toml")):
         try:
@@ -81,7 +82,7 @@ def main() -> int:
             failed = True
     if failed:
         return 1
-    print("both workspaces enable keyring DH; advisory-excepted packages are inactive")
+    print("both workspaces use explicit DH stores; no advisory exceptions")
     return 0
 
 
