@@ -3001,7 +3001,7 @@ fn gate_correction_outcome_schema_value() -> serde_json::Value {
 }
 
 pub(super) fn write_worker_schema(writer: &mut ArtifactRunWriter, relative: &Path) -> Result<()> {
-    write_schema(writer, relative, worker_report_schema_value())
+    write_schema(writer, relative, terminal_worker_output_schema_value())
 }
 
 pub(super) fn write_codex_worker_schema(
@@ -3011,7 +3011,7 @@ pub(super) fn write_codex_worker_schema(
     write_schema(
         writer,
         relative,
-        codex_response_format_schema(worker_report_schema_value())?,
+        codex_response_format_schema(terminal_worker_output_schema_value())?,
     )
 }
 
@@ -3590,6 +3590,19 @@ pub(super) fn auditor_report_schema_value() -> serde_json::Value {
 
 pub(super) fn worker_report_schema_value() -> serde_json::Value {
     worker_report_schema_value_with_decomposition(decomposition_completion_schema_value())
+}
+
+/// A worker returns a terminal result. Internal snapshots and final supervisor
+/// projections still use the full lifecycle schema (including pending/missing).
+pub(super) fn terminal_worker_output_schema_value() -> serde_json::Value {
+    let mut schema = worker_report_schema_value();
+    schema["properties"]["status"]["enum"] = json!(["succeeded", "failed", "rejected"]);
+    // Private worker input carries exact journal identities, including absolute
+    // cwd. The parent reconciles them against held journal records before review.
+    // Public aggregate schemas retain their safe published-path constraint.
+    schema["properties"]["commands_run"]["items"]["properties"]["cwd"] =
+        json!({"type": "string", "minLength": 1});
+    schema
 }
 
 fn supervisor_final_worker_report_schema_value() -> serde_json::Value {
@@ -4289,6 +4302,8 @@ fn environment_failure_schema_value() -> serde_json::Value {
                     "version_mismatch",
                     "missing_credential",
                     "network_forbidden",
+                    "network_unavailable",
+                    "provider_auth_required",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"
@@ -5813,6 +5828,70 @@ mod selection_schema_tests {
         assert!(child_schema["properties"]
             .get("codex_parent_evidence")
             .is_none());
+    }
+
+    #[test]
+    fn terminal_worker_schema_preserves_absolute_journal_cwd_without_relaxing_public_paths(
+    ) -> Result<()> {
+        let instance = json!({
+            "id": "readme-worker", "role": "worker", "assignment_kind": "ordinary",
+            "target_path": null, "assigned_paths": ["README.md"],
+            "semantic_symbols": [], "semantic_modules": [], "files_changed": ["README.md"],
+            "commands_run": [{"command": ["git", "diff", "--check"],
+                "cwd": "/private/run/.maco/worktrees/repo/readme-worker",
+                "status": "succeeded", "exit_code": 0, "timeout_seconds": 30,
+                "duration_ms": 1, "timed_out": false, "stdout": "", "stderr": "",
+                "environment_preflight_results": [], "environment_failures": []}],
+            "environment_failures": [], "validation_results": [], "findings": [],
+            "field_guide_entries": [], "bloated_file_flags": [], "decomposition_completion": null,
+            "no_further_delegation": true, "accepted": true, "rejected": false,
+            "status": "succeeded", "remaining_risk": "none", "next_safe_action": "parent review"
+        });
+        let instance = serde_json::to_value(serde_json::from_value::<WorkerReport>(instance)?)?;
+        let private = terminal_worker_output_schema_value();
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        let mut schemas = boon::Schemas::new();
+        for (name, schema, absolute_allowed) in [
+            ("private", private.clone(), true),
+            ("codex", codex_response_format_schema(private)?, true),
+            ("public", worker_report_schema_value(), false),
+        ] {
+            let id = format!("https://example.invalid/{name}-worker");
+            compiler
+                .add_resource(&id, schema)
+                .expect("register worker schema");
+            let index = compiler
+                .compile(&id, &mut schemas)
+                .expect("compile worker schema");
+            let mut candidate = instance.clone();
+            if name == "codex" {
+                candidate["claim_token"] = json!(null);
+                candidate["semantic_intent_token"] = json!(null);
+                candidate["commands_run"][0]["error"] = json!(null);
+            }
+            assert_eq!(
+                schemas.validate(&candidate, index).is_ok(),
+                absolute_allowed,
+                "{name}"
+            );
+            if absolute_allowed {
+                let mut empty_cwd = candidate.clone();
+                empty_cwd["commands_run"][0]["cwd"] = json!("");
+                // Codex removes unsupported string constraints, so the parent
+                // journal reconciliation remains mandatory for all runtimes.
+                if name == "private" {
+                    assert!(schemas.validate(&empty_cwd, index).is_err());
+                }
+                let mut pending = candidate.clone();
+                pending["status"] = json!("pending");
+                assert!(schemas.validate(&pending, index).is_err());
+                let mut delegated = candidate.clone();
+                delegated["no_further_delegation"] = json!(false);
+                assert!(schemas.validate(&delegated, index).is_err());
+            }
+        }
+        Ok(())
     }
 
     #[test]

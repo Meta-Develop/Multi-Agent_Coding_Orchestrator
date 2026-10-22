@@ -6156,6 +6156,9 @@ pub(crate) fn account_observations_for_selection(
             else {
                 continue;
             };
+            if !super::runtime_executables::runtime_allowed(runtime) {
+                continue;
+            }
             if let Some(observation) = account_observation_for_launch_runtime(runtime, run_id)? {
                 observations.push((runtime, observation));
             }
@@ -7401,7 +7404,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     if collected.usage_incomplete {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
-            message: "process usage is incomplete because at least one external Codex JSONL capture was missing, truncated, or malformed, or conservatively reconciled because usage was observed but unreliable after its run failed, timed out, or lacked verified completion or containment"
+            message: "process usage is incomplete because at least one runtime's native usage evidence was missing, truncated, or malformed, or conservatively reconciled because usage was observed but unreliable after its run failed, timed out, or lacked verified completion or containment"
                 .to_string(),
             paths: Vec::new(),
         });

@@ -51,7 +51,7 @@ if [ -e "$GROK_HOME/ambient-secret" ]; then
 	exit 3
 fi
 
-printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
+printf '%s\n' 'approval-contract:inner-sandbox=strict;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 
 send() {
 	printf '%s\n' "$1"

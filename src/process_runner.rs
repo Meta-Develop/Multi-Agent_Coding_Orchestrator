@@ -2295,6 +2295,8 @@ pub struct ProcessSpec {
     /// Point GROK_HOME at the same owner-private RuntimeDirectory. Admitted host auth/config
     /// capabilities may be projected as read-only leaves below this otherwise writable home.
     pub private_runtime_grok_home: bool,
+    /// One host-directed headless continuation inside the same contained unit/home.
+    pub(crate) grok_worker_continuation: bool,
     /// Point HOME at the owner-private RuntimeDirectory, force Cursor's documented file credential
     /// store, and expose the unit-owned parent socket path. `ExternalCursor` may project its exact
     /// auth leaf read-only; the providerless offline-UDS profile leaves the private home empty.
@@ -2392,6 +2394,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            grok_worker_continuation: false,
             private_runtime_cursor_home: false,
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
@@ -2432,6 +2435,7 @@ impl ProcessSpec {
             private_runtime_home: false,
             private_runtime_codex_home: false,
             private_runtime_grok_home: false,
+            grok_worker_continuation: false,
             private_runtime_cursor_home: false,
             staged_codex_home: None,
             #[cfg(target_os = "linux")]
@@ -2640,6 +2644,14 @@ pub struct CapturedBytes {
 }
 
 impl CapturedBytes {
+    /// Bounded bytes already validated/captured by a parent-owned protocol.
+    pub(crate) fn from_bounded_protocol(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            truncated: false,
+        }
+    }
+
     pub fn as_bytes(&self) -> &[u8] {
         &self.bytes
     }
@@ -3951,6 +3963,19 @@ fn cancel_attached_process(
 }
 
 fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
+    if spec.grok_worker_continuation
+        && (spec.containment != ContainmentPolicy::Required
+            || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalGrok
+            || !spec.private_runtime_home
+            || !spec.private_runtime_grok_home
+            || !matches!(spec.stdin, StdinMode::Interactive)
+            || !matches!(spec.command, ProcessCommand::Direct { .. })
+            || spec.pinned_direct.is_some())
+    {
+        return Err(io::Error::other(
+            "Grok continuation requires verified outer containment and the same private home",
+        ));
+    }
     if !spec.read_only_input_snapshots.is_empty()
         && (spec.containment != ContainmentPolicy::Required
             || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalCodex)

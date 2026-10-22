@@ -126,27 +126,43 @@ pub(crate) fn validate_worker_journal_observations(
 
 /// Execute shell argv under the existing confinement, or observe an immediately
 /// preceding native edit. The journal lock is held across observation and action.
+#[cfg(test)]
 pub(crate) fn run_worker_execution_journal_command(
     path: &Path,
     expected: &crate::safe_state::FileIdentity,
     entry: &WorkerExecutionJournalEntry,
     observe_changes: bool,
 ) -> Result<()> {
+    run_worker_execution_journal_command_with_clock(path, expected, entry, observe_changes, false)
+}
+
+pub(crate) fn run_worker_execution_journal_command_with_clock(
+    path: &Path,
+    expected: &crate::safe_state::FileIdentity,
+    entry: &WorkerExecutionJournalEntry,
+    observe_changes: bool,
+    auto_timestamps: bool,
+) -> Result<()> {
+    let mut timed_entry = entry.clone();
+    if auto_timestamps {
+        if !entry.start_timestamp.is_empty() || !entry.end_timestamp.is_empty() {
+            bail!("automatic journal timestamps cannot be combined with supplied timestamps");
+        }
+        timed_entry.start_timestamp = journal_timestamp()?;
+        timed_entry.end_timestamp = timed_entry.start_timestamp.clone();
+    }
+    let entry = &timed_entry;
     // Keep semantic validation before opening any append descriptor or running argv.
     let mut encoded = Vec::new();
     append_worker_execution_journal_record(&mut encoded, entry)?;
     #[cfg(target_os = "linux")]
     {
         use std::io::Read;
-        use std::os::fd::AsRawFd;
 
-        let mut file = open_worker_journal_no_follow(path, true)?;
+        let file = open_worker_journal_no_follow(path, true)?;
         verify_worker_journal_identity(&file.metadata()?, expected)?;
-        // SAFETY: flock operates on the live journal descriptor without pointers.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("worker journal is already being appended");
-        }
+        let mut locked = WorkerJournalAppendLock::acquire(file)?;
+        let file = &mut locked.file;
         let mut reader = open_worker_journal_no_follow(path, false)?;
         verify_worker_journal_identity(&reader.metadata()?, expected)?;
         let original_len = file.metadata()?.len();
@@ -222,7 +238,7 @@ pub(crate) fn run_worker_execution_journal_command(
             {
                 bail!("worker journal has no room for command start and terminal failure");
             }
-            append_locked_worker_journal(path, expected, &mut file, &encoded)?;
+            append_locked_worker_journal(path, expected, file, &encoded)?;
             Some(
                 std::process::Command::new(&entry.command[0])
                     .args(&entry.command[1..])
@@ -230,7 +246,12 @@ pub(crate) fn run_worker_execution_journal_command(
                     .status(),
             )
         };
+        // Capture the end after execution (or at observation time for a native
+        // edit). A failed clock read is a terminal observation failure too.
         let completion = (|| -> Result<_> {
+            if auto_timestamps {
+                record.end_timestamp = journal_timestamp()?;
+            }
             let after = if observe_changes {
                 before
             } else {
@@ -266,13 +287,13 @@ pub(crate) fn run_worker_execution_journal_command(
             Err(error) => {
                 let failure = format!("{error:#}").chars().take(1024).collect();
                 let terminal = encode_observation_failure(&record, failure)?;
-                append_locked_worker_journal(path, expected, &mut file, &terminal)
+                append_locked_worker_journal(path, expected, file, &terminal)
                     .context("observation failed and terminal failure could not be appended")?;
                 return Err(error)
                     .context("journal observation failed; terminal failure preserved; stop");
             }
         };
-        append_locked_worker_journal(path, expected, &mut file, &encoded)?;
+        append_locked_worker_journal(path, expected, file, &encoded)?;
         if mismatch {
             bail!("declared --changed-path values do not match observed changed paths; mismatch preserved in journal; stop");
         }
@@ -289,6 +310,11 @@ pub(crate) fn run_worker_execution_journal_command(
         let _ = (path, expected, observe_changes);
         bail!("observed worker journal append requires the qualified Linux file contract")
     }
+}
+
+fn journal_timestamp() -> Result<String> {
+    crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())
+        .context("worker journal UTC clock is unavailable")
 }
 
 #[cfg(target_os = "linux")]

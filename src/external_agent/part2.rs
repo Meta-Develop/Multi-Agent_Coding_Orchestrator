@@ -472,6 +472,9 @@ fn sanitized_grok_credential_validation_summary(error: &anyhow::Error) -> &'stat
         "Grok configuration source config.toml is unavailable",
         "Grok configuration source config.toml is not a regular file",
         "Grok configuration source config.toml identity changed",
+        "Grok model cache source models_cache.json is unavailable",
+        "Grok model cache source models_cache.json is not a regular file",
+        "Grok model cache source models_cache.json identity changed",
         "no complete account is selected for Coding Agent Manager provider",
         "Coding Agent Manager selection for",
         "Coding Agent Manager account",
@@ -664,7 +667,7 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
                     .to_string(),
             },
         ],
-        EnvironmentFailureCategory::MissingCredential => vec![EnvironmentRemediation {
+        EnvironmentFailureCategory::MissingCredential | EnvironmentFailureCategory::ProviderAuthRequired => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::CredentialConfiguration,
             guidance: "Configure the named credential or configuration source for the supervised runner without committing or copying secret material into the repository."
                 .to_string(),
@@ -673,6 +676,10 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
             scope: EnvironmentRemediationScope::CapabilityPolicy,
             guidance: "Use an offline workflow or an approved host-side integration; this preflight will not enable network access or broaden confinement."
                 .to_string(),
+        }],
+        EnvironmentFailureCategory::NetworkUnavailable => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance: "Repair resolver/transport access for the existing contained runtime; retain the native failure evidence and retry without changing selection or acceptance policy.".to_string(),
         }],
         EnvironmentFailureCategory::SandboxUnavailable => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::PersistentNixosHostSoftware,

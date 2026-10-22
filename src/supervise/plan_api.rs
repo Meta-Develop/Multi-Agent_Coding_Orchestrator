@@ -412,7 +412,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
         .filter(|_| goal_spec_proposal_admits_task_routing_assessment(&proposal))
-        .map(|frozen| super::task_routing::assess_task_routing(&task, &proposal, frozen))
+        .map(|frozen| super::assess_task_routing(&task, &proposal, frozen))
         .transpose()?;
     let has_declared_dependencies = proposal
         .assignments
@@ -893,6 +893,90 @@ mod task_routing_lowering_tests {
             Some(repo),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn readme_goal_lowering_carries_replayable_assessment_through_the_file_entry() {
+        let (_owner, repo) = super::super::tests::injected_repository();
+        let goal = "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file.";
+        let documented_goal = format!("{goal} {}", planning::LITERAL_FILE_EDIT_EXECUTION_WORKFLOW);
+        for goal in [goal, documented_goal.as_str()] {
+            let session = planning::task_planning_session_with_test_inventory(
+                &repo,
+                "",
+                goal,
+                vec![PathBuf::from("README.md")],
+            )
+            .unwrap();
+            // Only inventory is injected; assessment, lowering, serialization and
+            // the file-entry replay are the production goal path.
+            let loaded = supervisor_plan_and_consultant_from_task_planning_session(
+                "",
+                goal,
+                None,
+                &session,
+                Some(&repo),
+            )
+            .unwrap();
+            let document = supervisor_plan_value(
+                &loaded.plan,
+                &loaded.consultant,
+                &loaded.assignment_metadata,
+                &loaded.plan_metadata,
+            )
+            .unwrap();
+            let parsed = parse_supervisor_plan_with_consultant_in_repo(
+                &serde_json::to_string(&document).unwrap(),
+                Some(&repo),
+            )
+            .unwrap();
+            let frozen = parsed
+                .plan_metadata
+                .resolved_routing_policy
+                .as_ref()
+                .unwrap();
+            let assessment = parsed
+                .plan_metadata
+                .task_routing_assessment
+                .as_ref()
+                .unwrap();
+            assert_eq!(
+                *assessment,
+                super::super::assess_task_routing(&parsed.plan.task, session.proposal(), frozen)
+                    .unwrap()
+            );
+            assert_eq!(
+                loaded.plan_metadata.task_routing_assessment,
+                parsed.plan_metadata.task_routing_assessment
+            );
+            let [worker] = parsed.plan.assignments.as_slice() else {
+                panic!("one direct Worker")
+            };
+            assert_eq!(worker.role, AgentRole::Worker);
+            assert_eq!(worker.task.as_deref(), Some(goal));
+            assert!(worker
+                .notes
+                .as_deref()
+                .unwrap()
+                .starts_with(GENERATED_PRECLAIM_DIRECTIVE_PREFIX));
+            let features = super::super::selection_bridge::routing_features_with_assessment(
+                &parsed.plan,
+                Some(assessment),
+                Some(frozen),
+            )
+            .unwrap();
+            for role in [AgentRole::Worker, AgentRole::Supervisor, AgentRole::Auditor] {
+                let profile = super::super::selection_bridge::task_profile_with_assessment(
+                    role,
+                    Some(assessment),
+                    Some(&features),
+                    Some(frozen),
+                )
+                .unwrap();
+                assert_eq!(profile.risk, crate::selection::RiskLevel::Low);
+                assert_ne!(profile.context, crate::selection::ContextSize::Unknown);
+            }
+        }
     }
 
     #[test]
@@ -2616,7 +2700,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
     let task_routing_assessment = resolved_routing_policy
         .as_ref()
         .filter(|frozen| frozen.policy.task_estimation.is_some())
-        .map(|frozen| super::task_routing::assess_task_routing(&task, &remaining_proposal, frozen))
+        .map(|frozen| super::assess_task_routing(&task, &remaining_proposal, frozen))
         .transpose()?;
     let roots = session.provider_assignment_tree();
     if roots.is_empty() {

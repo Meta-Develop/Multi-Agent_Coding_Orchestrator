@@ -976,8 +976,16 @@ fn is_single_file_only_directive(line: &str) -> bool {
 /// The quoted line supplies a deterministic verification target. Contract lowering
 /// and pre-claim validation share this parser; Git/readability/risk checks remain
 /// the scheduler's responsibility.
+pub(crate) const LITERAL_FILE_EDIT_EXECUTION_WORKFLOW: &str = "Use tools to perform the edit now, before returning the final report. Read the original bytes through the bound execution journal. Preserve those bytes, add a newline separator if needed, and append the requested line with a terminating newline. Verify the unchanged original prefix and exact appended bytes, run git diff --check, and confirm that only the assigned file changed. Journal every command and edit using the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Read-only verification must not declare earlier edits as changed paths. Return a terminal WorkerReport after execution and verification; if blocked, report failed with the observed evidence.";
+
 pub(crate) fn explicit_existing_file_line_edit_target(text: &str) -> Option<PathBuf> {
+    // Only this exact execution/verification suffix is accepted. Arbitrary extra
+    // instructions must still fail the literal-only scope recognizer.
     let text = text.trim();
+    let text = text
+        .strip_suffix(LITERAL_FILE_EDIT_EXECUTION_WORKFLOW)
+        .map(str::trim_end)
+        .unwrap_or(text);
     let (target, trailing) = if let Some(rest) = strip_ascii_word_prefix(text, "update") {
         let (target, rest) = literal_line_edit_path(rest)?;
         let rest = rest.trim_start();
@@ -4591,6 +4599,24 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             fs::read_to_string(repo.join("README.md")).unwrap(),
             "# Scratch repository\n"
         );
+    }
+
+    #[test]
+    fn literal_existing_file_edit_parser_accepts_only_the_exact_verification_workflow() {
+        let goal = "Update `README.md`: append one final line that reads exactly `Hello from MACO`. Do not change any other file.";
+        let task = format!("{goal} {LITERAL_FILE_EDIT_EXECUTION_WORKFLOW}");
+        assert_eq!(
+            explicit_existing_file_line_edit_target(&task),
+            Some(PathBuf::from("README.md"))
+        );
+        for extra in [" Skip verification.", " Edit OTHER.md."] {
+            assert!(explicit_existing_file_line_edit_target(&format!("{task}{extra}")).is_none());
+        }
+        assert!(explicit_existing_file_line_edit_target(&task.replace(
+            "must not declare earlier edits",
+            "may declare earlier edits"
+        ))
+        .is_none());
     }
 
     #[test]

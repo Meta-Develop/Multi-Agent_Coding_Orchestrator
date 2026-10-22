@@ -712,7 +712,7 @@ set -eu
 no_auto_update="${1:-}"
 [ "$no_auto_update" = "--no-auto-update" ]
 shift
-[ "$#" -eq 18 ]
+[ "$#" -eq 19 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
 [ "$4" = "grok-4.6" ]
@@ -723,11 +723,12 @@ shift
 [ "${11}" = "--output-format" ]
 [ "${12}" = "streaming-json" ]
 [ "${13}" = "--sandbox" ]
-[ "${14}" = "strict" ]
+[ "${14}" = "off" ]
 [ "${15}" = "--always-approve" ]
 [ "${16}" = "--disable-web-search" ]
 [ "${17}" = "--no-memory" ]
 [ "${18}" = "--no-subagents" ]
+[ "${19}" = "--no-leader" ]
 [ "$HOME" = "$GROK_HOME" ]
 [ -r "$GROK_HOME/auth.json" ]
 printf '%s\n' 'verified-grok-cam-launch-blocked' >&2
@@ -1508,6 +1509,7 @@ send({"method":"turn/completed", "params":{"threadId":"research-thread", "turn":
             program_identity: &identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            grok_headless_schema: None,
             claude_broker_witness: None,
         },
     );
@@ -4884,6 +4886,14 @@ fn environment_failure_category_spellings_are_stable() -> Result<()> {
             EnvironmentFailureCategory::SandboxUnavailable,
             "sandbox_unavailable",
         ),
+        (
+            EnvironmentFailureCategory::NetworkUnavailable,
+            "network_unavailable",
+        ),
+        (
+            EnvironmentFailureCategory::ProviderAuthRequired,
+            "provider_auth_required",
+        ),
         (EnvironmentFailureCategory::ProbeFailed, "probe_failed"),
         (
             EnvironmentFailureCategory::RuntimeModelCatalogUnavailable,
@@ -5947,6 +5957,71 @@ fn bound_output_staging_is_created_under_the_reviewed_root() -> Result<()> {
     };
     assert!(error.to_string().contains("reviewed machine-global root"));
     assert_eq!(fs::read_dir(&runtime_root)?.count(), before);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bound_output_staging_refuses_reserialized_shared_config_before_allocation() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("runtime");
+    let state_root = temp.path().join("state");
+    for path in [&workspace, &runtime_root, &state_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let value = serde_json::json!({
+        "version": 1, "state_root": state_root,
+        "roots": [{"id": "runtime", "path": runtime_root,
+                   "protected_paths": [], "quarantine_grace_seconds": 60}]
+    });
+    let config = temp.path().join("shared.json");
+    fs::write(&config, serde_json::to_vec_pretty(&value)?)?;
+    fs::set_permissions(&config, fs::Permissions::from_mode(0o600))?;
+    let binding = ExternalMachineGlobalRetentionBinding {
+        config: config.clone(),
+        root_id: "runtime".into(),
+        owner: "cleanup-agent".into(),
+        correction_correlation_id: "cleanup-correlation".into(),
+    };
+    let mut first = ExternalOutputStaging::create(&workspace, Some(binding.clone()))?;
+    assert!(matches!(
+        first.cleanup()?,
+        ExternalOutputCleanup::Quarantined(_)
+    ));
+    let before = fs::read_dir(&runtime_root)?.count();
+    let state_before = fs::read(state_root.join("machine-global-state-v1.json"))?;
+    let original_bytes = fs::read(&config)?;
+    fs::write(&config, serde_json::to_vec(&value)?)?;
+    let error = match ExternalOutputStaging::create(&workspace, Some(binding.clone())) {
+        Ok(_) => bail!("reserialized config allocated provider staging"),
+        Err(error) => error,
+    };
+    assert!(format!("{error:#}")
+        .contains("machine-global config changed; refusing to reinterpret durable state"));
+    assert_eq!(fs::read_dir(&runtime_root)?.count(), before);
+    assert_eq!(
+        fs::read(state_root.join("machine-global-state-v1.json"))?,
+        state_before
+    );
+    // A byte-for-byte copy of the established config can use the same domain.
+    let copied_config = temp.path().join("copied.json");
+    fs::write(&copied_config, original_bytes)?;
+    fs::set_permissions(&copied_config, fs::Permissions::from_mode(0o600))?;
+    let mut copied = ExternalOutputStaging::create(
+        &workspace,
+        Some(ExternalMachineGlobalRetentionBinding {
+            config: copied_config,
+            ..binding
+        }),
+    )?;
+    assert!(matches!(
+        copied.cleanup()?,
+        ExternalOutputCleanup::Quarantined(_)
+    ));
     Ok(())
 }
 
@@ -7508,6 +7583,7 @@ fn record_verified_acp_publication(
             program_identity: &program_identity,
             grok_acp_parent_evidence: Some(evidence),
             grok_acp_launch_schema_identity: None,
+            grok_headless_schema: None,
             claude_broker_witness: None,
         },
     );
@@ -8068,11 +8144,12 @@ fn grok_runtime_adapter_argv_immutably_disables_subagents() {
             "--output-format",
             "streaming-json",
             "--sandbox",
-            "strict",
+            "off",
             "--always-approve",
             "--disable-web-search",
             "--no-memory",
             "--no-subagents",
+            "--no-leader",
         ]
     );
     assert_eq!(
@@ -8151,11 +8228,12 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
             "--output-format",
             "streaming-json",
             "--sandbox",
-            "strict",
+            "off",
             "--always-approve",
             "--disable-web-search",
             "--no-memory",
             "--no-subagents",
+            "--no-leader",
         ]
     );
     for fixed in [
@@ -8163,11 +8241,12 @@ fn grok_runtime_adapter_argv_binds_schema_json_without_weakening_operators() -> 
         "--output-format",
         "streaming-json",
         "--sandbox",
-        "strict",
+        "off",
         "--always-approve",
         "--disable-web-search",
         "--no-memory",
         "--no-subagents",
+        "--no-leader",
     ] {
         assert_eq!(argv.iter().filter(|argument| *argument == fixed).count(), 1);
     }
@@ -8922,7 +9001,7 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         .contains(&canonical_incoming));
 
     let config = command.runtime_adapter.as_ref().context("Grok adapter")?;
-    let run = config.execute(&LaunchContext {
+    let run = config.execute_scripted_fixture(&LaunchContext {
         prompt: &command.prompt,
         model: command.model.as_deref(),
         effort: command.reasoning_effort.as_deref(),
@@ -9079,7 +9158,7 @@ fn writable_grok_run_external_agent_helper() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     const STRUCTURED_OUTPUT_SCHEMA: &str = r#"{"properties":{"accepted":{"type":"boolean"},"path":{"type":"string"}},"required":["accepted","path"],"type":"object"}"#;
-    const APPROVAL_RECORD: &str = "approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled";
+    const APPROVAL_RECORD: &str = "approval-contract:inner-sandbox=off;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled";
 
     let _no_socket = CamSocketEnvGuard::unset();
     let (cam_harness, grok_home, expected_cam_binding) = build_cam_grok_test_harness("account-a")?;
@@ -9126,7 +9205,7 @@ set -eu
 no_auto_update="${1:-}"
 [ "$no_auto_update" = "--no-auto-update" ]
 shift
-[ "$#" -eq 18 ]
+[ "$#" -eq 19 ]
 [ "$1" = "--prompt-file" ]
 [ "$3" = "--model" ]
 [ "$4" = "grok-4.6" ]
@@ -9137,16 +9216,17 @@ shift
 [ "${11}" = "--output-format" ]
 [ "${12}" = "streaming-json" ]
 [ "${13}" = "--sandbox" ]
-[ "${14}" = "strict" ]
+[ "${14}" = "off" ]
 [ "${15}" = "--always-approve" ]
 [ "${16}" = "--disable-web-search" ]
 [ "${17}" = "--no-memory" ]
 [ "${18}" = "--no-subagents" ]
+[ "${19}" = "--no-leader" ]
 [ "$HOME" = "$GROK_HOME" ]
 [ -r "$GROK_HOME/auth.json" ]
 [ ! -e "$GROK_HOME/ambient-secret" ]
 printf '%s\n' 'request-begin' "$no_auto_update" "$@" 'request-end' >&2
-printf '%s\n' 'approval-contract:sandbox=strict;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
+printf '%s\n' 'approval-contract:inner-sandbox=off;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
 printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
@@ -9272,11 +9352,12 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
         "--output-format".to_string(),
         "streaming-json".to_string(),
         "--sandbox".to_string(),
-        "strict".to_string(),
+        "off".to_string(),
         "--always-approve".to_string(),
         "--disable-web-search".to_string(),
         "--no-memory".to_string(),
         "--no-subagents".to_string(),
+        "--no-leader".to_string(),
     ];
     let mut expected_stderr = vec!["request-begin".to_string()];
     expected_stderr.extend(expected_request);
@@ -9483,6 +9564,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
                 program_identity: &program_identity,
                 grok_acp_parent_evidence: None,
                 grok_acp_launch_schema_identity: None,
+                grok_headless_schema: None,
                 claude_broker_witness: None,
             },
         );
@@ -9517,6 +9599,78 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     let native_stdout = concat!(
         "{\"type\":\"end\",\"stopReason\":\"end_turn\",\"sessionId\":\"s\",\"requestId\":\"r\",",
         "\"usage\":{\"input_tokens\":9,\"output_tokens\":3,\"total_tokens\":12}}\n",
+    );
+    // Exercise inference-time authentication through the production completion
+    // path even when Grok exits zero. No catalog/session auth assertion is used.
+    for (index, error) in ["HTTP 401", "HTTP 403", "Unauthenticated"]
+        .iter()
+        .enumerate()
+    {
+        let id = format!("auth-{index}");
+        let stream = serde_json::json!({"type": "error", "message": error}).to_string() + "\n";
+        let report = finish(
+            &id,
+            &grok_command(&id),
+            CapturedBytes::from_bytes_for_test(stream.into_bytes()),
+        )?;
+        assert_eq!(report.exit_code, Some(0));
+        assert_eq!(
+            report.environment_failures()[0].category,
+            EnvironmentFailureCategory::ProviderAuthRequired
+        );
+        assert!(report.environment_blocked());
+        assert!(!report.succeeded());
+        assert!(!report.publishable);
+        assert!(report
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("provider_auth_required"));
+        let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+        assert_eq!(
+            restored.environment_failures()[0].category,
+            EnvironmentFailureCategory::ProviderAuthRequired
+        );
+    }
+    // Reproduce the native premature-text/tool/end shape through the production
+    // descriptor-held staging path, not merely the adapter's JSON parser.
+    let mut worker_command = grok_command("worker-final")
+        .with_workspace_access(WorkspaceAccess::ReadWrite)
+        .with_agent_lifecycle(temp.path(), "worker", "run", "readme-worker");
+    worker_command.output_schema = Some(temp.path().join("worker.schema.json"));
+    let worker = serde_json::json!({
+        "id":"readme-worker", "role":"worker", "assigned_paths":["README.md"],
+        "files_changed":["README.md"], "commands_run":[], "no_further_delegation":true,
+        "accepted":true, "rejected":false, "status":"succeeded"
+    });
+    let stream = [
+        serde_json::json!({"type":"text", "data":"{\"id\":\"readme-worker\",\"files_changed\":[]}"}),
+        serde_json::json!({"type":"tool_call", "toolName":"search_replace"}),
+        serde_json::json!({"type":"tool_call_update", "status":"completed"}),
+        serde_json::json!({"type":"end", "stopReason":"end_turn", "sessionId":"s", "requestId":"r",
+            "structuredOutput":worker}),
+    ].iter().map(|event| event.to_string() + "\n").collect::<String>();
+    let held = finish(
+        "worker-final",
+        &worker_command,
+        CapturedBytes::from_bytes_for_test(stream.into_bytes()),
+    )?;
+    let decoded: crate::supervise::WorkerReport = serde_json::from_slice(
+        held.output_last_message()
+            .expect("descriptor-held worker report"),
+    )?;
+    assert_eq!(decoded.id, "readme-worker");
+    assert_eq!(decoded.files_changed, [PathBuf::from("README.md")]);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&fs::read(
+            &worker_command.output_last_message
+        )?)?,
+        worker
+    );
+    let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&held)?)?;
+    assert!(
+        restored.output_last_message().is_none(),
+        "wire output cannot mint held custody"
     );
     let native_report = finish(
         "native",
@@ -10788,6 +10942,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
             program_identity: &program_identity,
             grok_acp_parent_evidence: None,
             grok_acp_launch_schema_identity: None,
+            grok_headless_schema: None,
             claude_broker_witness: None,
         },
     );
@@ -15062,5 +15217,121 @@ fn selected_merge_wire_flags_cannot_restore_private_completion() -> Result<()> {
         .selected_merge_completion
         .is_none());
     assert!(restored.qualified_merge_arbiter_output(&command).is_err());
+    Ok(())
+}
+
+#[test]
+fn grok_native_transport_failure_is_environment_and_timeout_alone_stays_unknown() -> Result<()> {
+    let spec = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "prompt",
+        "log",
+        "output",
+        Duration::from_secs(1),
+    );
+    for (invocation, detail, expected) in [
+        (ExternalAgentInvocation::Grok, "external agent timed out after 1200 seconds", false),
+        (ExternalAgentInvocation::Grok, "Grok native inference failure tail (last <=8 events): shell.turn.inference_retry: dns error: failed to lookup address information", true),
+        (ExternalAgentInvocation::Grok, "Grok native inference failure tail (last <=8 events): shell.turn.inference_failed: client error (Connect)", true),
+        (ExternalAgentInvocation::Grok, "Grok native inference failure tail (last <=8 events): inference failure (detail redacted; cause unknown)", false),
+        (ExternalAgentInvocation::CodexSupervisor, "Grok native inference failure tail (last <=8 events): client error (Connect)", false),
+    ] {
+        let mut report = failed_external_run(&spec, Instant::now(), vec![], true, detail.to_string());
+        retain_grok_native_failure(&mut report, invocation);
+        assert_eq!(!report.environment_failures().is_empty(), expected);
+        if expected {
+            assert_eq!(report.environment_failures()[0].category, EnvironmentFailureCategory::NetworkUnavailable);
+            assert_eq!(serde_json::to_value(report.environment_failures()[0].category)?, "network_unavailable");
+        }
+        assert_eq!(report.error.as_deref(), Some(detail));
+        assert!(!report.succeeded());
+        assert!(report.grok_stream_usage_evidence.is_none());
+        assert!(report.process_tree.is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn grok_native_auth_failure_is_environment_and_fails_closed() -> Result<()> {
+    let spec = ExternalAgentCommand::codex(
+        "grok",
+        "/workspace",
+        "prompt",
+        "log",
+        "output",
+        Duration::from_secs(1),
+    );
+    let detail = "Grok native inference failure tail (last <=8 events): shell.turn.inference_failed: provider_auth_required";
+    let mut mixed = failed_external_run(
+        &spec,
+        Instant::now(),
+        vec![],
+        true,
+        format!("{detail}; shell.turn.inference_retry: client error (Connect)"),
+    );
+    retain_grok_native_failure(&mut mixed, ExternalAgentInvocation::Grok);
+    assert!(mixed
+        .environment_failures()
+        .iter()
+        .any(|failure| failure.category == EnvironmentFailureCategory::ProviderAuthRequired));
+    assert!(mixed
+        .environment_failures()
+        .iter()
+        .any(|failure| failure.category == EnvironmentFailureCategory::NetworkUnavailable));
+    assert!(!mixed.succeeded());
+    for invocation in [
+        ExternalAgentInvocation::Grok,
+        ExternalAgentInvocation::CodexSupervisor,
+    ] {
+        let mut report =
+            failed_external_run(&spec, Instant::now(), vec![], true, detail.to_string());
+        retain_grok_native_failure(&mut report, invocation);
+        if invocation == ExternalAgentInvocation::Grok {
+            assert_eq!(report.environment_failures().len(), 1);
+            assert_eq!(
+                report.environment_failures()[0].category,
+                EnvironmentFailureCategory::ProviderAuthRequired
+            );
+            assert_eq!(
+                serde_json::to_value(report.environment_failures()[0].category)?,
+                "provider_auth_required"
+            );
+            assert!(report.environment_blocked());
+        } else {
+            assert!(report.environment_failures().is_empty());
+        }
+        assert!(!report.succeeded());
+        assert!(!report.publishable);
+        assert!(report.grok_stream_usage_evidence.is_none());
+    }
+    // The same projection is used for held error/cancellation captures, before
+    // summarized stdout can discard the error event.
+    for (stdout, stderr) in [
+        (
+            b"{\"type\":\"error\",\"message\":\"HTTP 401\"}\n".as_slice(),
+            b"".as_slice(),
+        ),
+        (
+            b"".as_slice(),
+            b"{\"type\":\"error\",\"message\":\"Unauthenticated\"}\n".as_slice(),
+        ),
+    ] {
+        let mut report = failed_external_run(
+            &spec,
+            Instant::now(),
+            vec![],
+            true,
+            "interrupted".to_string(),
+        );
+        retain_grok_stream_auth_failure(&mut report, ExternalAgentInvocation::Grok, stdout, stderr);
+        assert_eq!(
+            report.environment_failures()[0].category,
+            EnvironmentFailureCategory::ProviderAuthRequired
+        );
+        retain_grok_stream_auth_failure(&mut report, ExternalAgentInvocation::Grok, stdout, stderr);
+        assert_eq!(report.environment_failures().len(), 1);
+        assert!(!report.succeeded());
+    }
     Ok(())
 }

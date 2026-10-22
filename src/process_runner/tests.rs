@@ -6739,3 +6739,42 @@ mod process_cancellation_child_scope {
 }
 
 include!("tests_part2.rs");
+
+#[cfg(target_os = "linux")]
+#[test]
+fn grok_private_runtime_needs_no_inner_sandbox_profile() {
+    let spec = ProcessSpec::direct("profile test", "/bin/true", [] as [&str; 0], "/tmp", 1024);
+    assert!(private_runtime_files_for_spec(&spec).unwrap().is_empty());
+    let grok = spec.with_private_runtime_grok_home(true);
+    assert!(private_runtime_files_for_spec(&grok).unwrap().is_empty());
+}
+
+#[test]
+fn grok_continuation_refuses_uncontained_or_substituted_process_specs() {
+    let mut spec = ProcessSpec::direct(
+        "continuation",
+        "/bin/true",
+        ["--prompt-file", "p"],
+        "/tmp",
+        1024,
+    )
+    .with_private_runtime_home(true)
+    .with_private_runtime_grok_home(true)
+    .with_stdin(StdinMode::Interactive)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalGrok(
+        ExternalGrokProfile::read_write("/tmp"),
+    ));
+    spec.grok_worker_continuation = true;
+    assert!(validate_process_spec_bounds(&spec).is_ok());
+    let mut changed = spec.clone();
+    changed.containment = ContainmentPolicy::TrustedBestEffort;
+    assert!(validate_process_spec_bounds(&changed).is_err());
+    let mut changed = spec.clone();
+    changed.private_runtime_grok_home = false;
+    assert!(validate_process_spec_bounds(&changed).is_err());
+    let mut changed = spec.clone();
+    changed.side_effects = SideEffectConfinementProfile::TrustedCompatibility;
+    assert!(validate_process_spec_bounds(&changed).is_err());
+    spec.stdin = StdinMode::Null;
+    assert!(validate_process_spec_bounds(&spec).is_err());
+}

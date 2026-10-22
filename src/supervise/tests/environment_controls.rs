@@ -798,3 +798,42 @@ fn external_containment_gate_accepts_only_verified_empty_evidence() {
         !ProcessTreeEvidence::Unverified(ContainmentBackend::WindowsJobObject).is_verified_empty()
     );
 }
+
+#[test]
+fn native_network_failure_category_is_schema_valid_and_keeps_acceptance_failed() {
+    for (category, name) in [
+        (
+            EnvironmentFailureCategory::NetworkUnavailable,
+            "network_unavailable",
+        ),
+        (
+            EnvironmentFailureCategory::ProviderAuthRequired,
+            "provider_auth_required",
+        ),
+    ] {
+        let failure = EnvironmentFailure {
+            category,
+            requirement: (category == EnvironmentFailureCategory::NetworkUnavailable)
+                .then(|| EnvironmentRequirement::network(EnvironmentNetworkAccess::Enabled)),
+            summary: "untrusted detail must be sanitized".to_string(),
+            remediation: Vec::new(),
+        };
+        let schema =
+            worker_report_schema_value()["properties"]["environment_failures"]["items"].clone();
+        assert!(schema["properties"]["category"]["enum"]
+            .as_array()
+            .unwrap()
+            .contains(&json!(name)));
+        let mut report = injected_child_report(&injected_assignment(false));
+        report.environment_failures.push(failure);
+        enforce_orchestrator_environment_failure_outcome(&mut report);
+        assert!(!report.accepted);
+        assert!(report.rejected);
+        assert_eq!(report.status, ReviewStatus::Failed);
+        assert_eq!(report.environment_failures[0].category, category);
+        assert_eq!(
+            report.environment_failures[0].summary,
+            format!("environment preflight reported {name}")
+        );
+    }
+}

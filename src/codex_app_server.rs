@@ -5680,7 +5680,7 @@ mod tests {
     }
 
     #[test]
-    fn cancellation_is_polled_while_approval_callback_is_running() {
+    fn cancellation_is_checked_after_approval_callback_returns() {
         let mut messages = base_messages();
         messages.extend([
             json!({
@@ -5704,22 +5704,24 @@ mod tests {
             }),
         ]);
         let mut transport = FakeTransport::from_values(messages);
-        let started = Instant::now();
-        let cancellation_started = started;
+        let cancelled = std::cell::Cell::new(false);
+        let callback_finished = std::cell::Cell::new(false);
         let error = run_app_server_turn(
             &mut transport,
             &test_turn(),
             AppServerLimits::default(),
             &mut |_: ApprovalRequest| {
-                thread::sleep(Duration::from_millis(20));
+                // Cancellation begins during review, never during turn setup.
+                cancelled.set(true);
+                callback_finished.set(true);
                 Ok(ApprovalReview::accept())
             },
-            move || cancellation_started.elapsed() >= Duration::from_millis(10),
+            || cancelled.get(),
         )
         .expect_err("approval cancellation");
         assert_eq!(error, AppServerError::Cancelled { phase: "approval" });
-        assert!(started.elapsed() >= Duration::from_millis(20));
-        assert!(started.elapsed() < Duration::from_secs(1));
+        // The synchronous reviewer must finish before cancellation returns.
+        assert!(callback_finished.get());
         assert_eq!(
             approval_response(&transport, 47).and_then(|value| value.pointer("/result/decision")),
             Some(&json!("cancel"))

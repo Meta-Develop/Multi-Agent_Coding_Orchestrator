@@ -2,16 +2,22 @@ mod support;
 
 use anyhow::{Context, Result};
 use git2::{Oid, Repository, Signature};
+#[cfg(target_os = "linux")]
 use multi_agent_coding_orchestrator::{orchestrator::RunId, sync_store::SyncStore};
 use serde_json::Value;
 #[cfg(unix)]
-use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+use std::os::unix::fs::PermissionsExt;
 #[cfg(unix)]
 use std::{collections::BTreeMap, path::PathBuf};
 use std::{
     fs::{self, File},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Command, Output},
+};
+#[cfg(target_os = "linux")]
+use std::{
+    os::unix::fs::{symlink, MetadataExt},
+    process::Stdio,
 };
 use tempfile::TempDir;
 

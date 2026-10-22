@@ -2,7 +2,9 @@ use super::*;
 
 #[path = "journal_observation.rs"]
 mod journal_observation;
+#[cfg(test)]
 pub(crate) use journal_observation::run_worker_execution_journal_command;
+pub(crate) use journal_observation::run_worker_execution_journal_command_with_clock;
 pub(super) use journal_observation::validate_worker_journal_observations;
 
 pub(super) const MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS: usize = 1024;
@@ -594,27 +596,78 @@ pub(crate) fn append_precreated_worker_execution_journal(
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
     {
-        use std::os::unix::io::AsRawFd;
-
         // Validate and encode before opening the append descriptor. Never expose a
         // partial hand-escaped JSON record to the journal.
         let mut record = Vec::new();
         append_worker_execution_journal_record(&mut record, entry)?;
-        let mut file = open_worker_journal_no_follow(path, true)?;
+        let file = open_worker_journal_no_follow(path, true)?;
         verify_worker_journal_identity(&file.metadata()?, expected)?;
-        // No waiting or interleaving with another append operation. A failed write
-        // may leave partial evidence; callers must stop, never truncate or repair it.
-        // SAFETY: flock acts on a live file descriptor and has no pointer arguments.
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(std::io::Error::last_os_error())
-                .context("worker journal is already being appended");
-        }
-        append_locked_worker_journal(path, expected, &mut file, &record)
+        let mut locked = WorkerJournalAppendLock::acquire(file)?;
+        append_locked_worker_journal(path, expected, &mut locked.file, &record)
     }
     #[cfg(not(target_os = "linux"))]
     {
         let _ = (path, expected, entry);
         bail!("precreated worker journal append requires the qualified Linux file contract")
+    }
+}
+
+/// Release the lock explicitly before closing the descriptor. Another thread's
+/// concurrent fork can temporarily retain this open file description, including
+/// CLOEXEC descriptors until exec, so close alone can leave a completed append
+/// locked. Contending append operations wait for a bounded time and never steal
+/// or replace a lock, including a stale or foreign holder's lock.
+#[cfg(target_os = "linux")]
+struct WorkerJournalAppendLock {
+    file: fs::File,
+}
+
+#[cfg(target_os = "linux")]
+impl WorkerJournalAppendLock {
+    fn acquire(file: fs::File) -> Result<Self> {
+        Self::acquire_with_timeout(file, std::time::Duration::from_secs(30))
+    }
+
+    fn acquire_with_timeout(file: fs::File, timeout: std::time::Duration) -> Result<Self> {
+        use std::os::fd::AsRawFd;
+        use std::time::{Duration, Instant};
+
+        let started = Instant::now();
+        loop {
+            // SAFETY: flock acts on a live owned descriptor without pointers.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(Self { file });
+            }
+            let error = std::io::Error::last_os_error();
+            if !matches!(
+                error.kind(),
+                std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+            ) {
+                return Err(error).context("cannot acquire exclusive worker journal append lock");
+            }
+            let remaining = timeout.saturating_sub(started.elapsed());
+            if remaining.is_zero() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out after {} ms waiting for exclusive worker journal append lock; stop without replacing or repairing the journal",
+                        timeout.as_millis()
+                    ),
+                )
+                .into());
+            }
+            std::thread::sleep(remaining.min(Duration::from_millis(10)));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+impl Drop for WorkerJournalAppendLock {
+    fn drop(&mut self) {
+        use std::os::fd::AsRawFd;
+        // SAFETY: self owns the live descriptor throughout this explicit unlock.
+        // flock LOCK_UN has no contention failure; closing follows on all paths.
+        unsafe { libc::flock(self.file.as_raw_fd(), libc::LOCK_UN) };
     }
 }
 
@@ -1084,6 +1137,8 @@ fn environment_failure_category_name(category: EnvironmentFailureCategory) -> &'
         EnvironmentFailureCategory::VersionMismatch => "version_mismatch",
         EnvironmentFailureCategory::MissingCredential => "missing_credential",
         EnvironmentFailureCategory::NetworkForbidden => "network_forbidden",
+        EnvironmentFailureCategory::NetworkUnavailable => "network_unavailable",
+        EnvironmentFailureCategory::ProviderAuthRequired => "provider_auth_required",
         EnvironmentFailureCategory::SandboxUnavailable => "sandbox_unavailable",
         EnvironmentFailureCategory::ProbeFailed => "probe_failed",
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => {
@@ -1180,7 +1235,7 @@ fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentF
                         .to_string(),
             },
         ],
-        EnvironmentFailureCategory::MissingCredential => vec![EnvironmentRemediation {
+        EnvironmentFailureCategory::MissingCredential | EnvironmentFailureCategory::ProviderAuthRequired => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::CredentialConfiguration,
             guidance:
                 "configure the named credential or configuration through an approved secret source; do not put secret values in the plan"
@@ -1191,6 +1246,10 @@ fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentF
             guidance:
                 "revise the assignment for offline execution or request an explicit policy change; do not enable networking automatically"
                     .to_string(),
+        }],
+        EnvironmentFailureCategory::NetworkUnavailable => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance: "repair resolver/transport access for the existing contained runtime and retry; retain the native inference failure evidence".to_string(),
         }],
         EnvironmentFailureCategory::SandboxUnavailable => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::CapabilityPolicy,
@@ -1442,6 +1501,11 @@ pub(super) fn missing_child_report(
     runtime: SupervisorRuntime,
     error: String,
 ) -> OrchestratorReviewReport {
+    let corrective_action = if assignment.role == AgentRole::Worker {
+        "return exactly one non-delegating WorkerReport JSON object bound to this assignment id and matching the supplied output schema; the supervisor runs the independent auditor"
+    } else {
+        "return exactly one OrchestratorReviewReport JSON object matching the supplied output schema, with every accepted terminal WorkerReport embedded and at least one read-only AuditorReport covering every worker id"
+    };
     OrchestratorReviewReport {
         id: assignment.id.clone(),
         role: AgentRole::ChildOrchestrator,
@@ -1469,7 +1533,7 @@ pub(super) fn missing_child_report(
             Finding {
                 severity: FindingSeverity::Error,
                 message: format!(
-                    "child report contract failure at '{}': {error}. Corrective action: return exactly one OrchestratorReviewReport JSON object matching the supplied output schema, with every accepted terminal WorkerReport embedded and at least one read-only AuditorReport covering every worker id; do not add a prose or Markdown wrapper",
+                    "child report contract failure at '{}': {error}. Corrective action: {corrective_action}; do not add a prose or Markdown wrapper",
                     report_path.display()
                 ),
                 paths: vec![report_path.to_path_buf()],
@@ -2068,6 +2132,15 @@ pub(super) fn external_containment_verified(
 ) -> bool {
     if run.environment_blocked() {
         run.environment_preflight_quiescence_verified()
+    } else if runtime.is_adapter_subprocess() {
+        // A failed or timed-out target can still have a verified-empty process
+        // tree. Completion and publication are checked separately; conflating
+        // them here falsely quarantines contained failures and prevents recovery.
+        run.process_tree
+            .is_some_and(ProcessTreeEvidence::is_verified_empty)
+            && run
+                .side_effects
+                .is_some_and(SideEffectConfinementEvidence::is_verified)
     } else {
         external_safety_verified(run, runtime)
     }

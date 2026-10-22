@@ -1,4 +1,4 @@
-//! Run-scoped explicit executable bindings for ordinary mixed-runtime supervise.
+//! Run-scoped explicit executable bindings for ordinary supervise.
 //! A binding is frozen before reservation, archived as private authenticated
 //! evidence, and copied into assignment threads. Without an opt-in binding,
 //! single-runtime dispatch retains its existing behavior.
@@ -119,9 +119,6 @@ pub(crate) fn bind_new(
     additional: &[(SupervisorRuntime, PathBuf)],
 ) -> Result<RuntimeExecutableGuard> {
     require_linux()?;
-    if additional.is_empty() {
-        bail!("explicit mixed-runtime binding requires an additional runtime");
-    }
     let repo = crate::artifacts::discover_repo_root(repo)?;
     let allowlist = plan_api::freeze_supervise_runtime_allowlist(
         primary_runtime,
@@ -190,9 +187,6 @@ pub(crate) fn bind_resume(
         .iter()
         .map(|entry| (entry.runtime, entry.executable.clone()))
         .collect::<Vec<_>>();
-    if additional.is_empty() {
-        bail!("archived mixed-runtime allowlist has no additional runtime");
-    }
     let allowlist = plan_api::freeze_supervise_runtime_allowlist(
         first.runtime,
         &first.executable,
@@ -257,6 +251,37 @@ pub(crate) fn selected_program(
         )
     })?;
     Ok(Some(executable.to_path_buf()))
+}
+
+pub(crate) fn require_only_runtime_binding(runtime: SupervisorRuntime) -> Result<()> {
+    let binding = captured_binding().context("--only-runtime requires a frozen executable binding; an existing run without one cannot acquire it on resume")?;
+    let bindings = binding.allowlist.bindings();
+    if bindings.len() != 1 || bindings[0].runtime != runtime {
+        bail!("--only-runtime differs from the frozen supervise runtime allowlist");
+    }
+    Ok(())
+}
+
+pub(super) fn runtime_allowed(runtime: SupervisorRuntime) -> bool {
+    captured_binding().is_none_or(|binding| binding.allowlist.executable_for(runtime).is_some())
+}
+
+pub(super) fn constrain_selection(input: &mut crate::selection::SelectionInput) {
+    if let Some(binding) = captured_binding() {
+        for catalog in &input.catalogs {
+            if !binding
+                .allowlist
+                .bindings()
+                .iter()
+                .any(|entry| entry.runtime.as_str() == catalog.runtime)
+            {
+                input
+                    .constraints
+                    .forbidden_runtimes
+                    .insert(catalog.runtime.clone());
+            }
+        }
+    }
 }
 
 /// Outer `None` means no explicit run binding; inner `None` means this runtime
@@ -442,6 +467,58 @@ mod tests {
             ]
         )
         .is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_runtime_binding_is_archived_restored_and_enforced_on_dispatch() -> Result<()> {
+        let (_temporary, repo) = super::super::tests::injected_repository();
+        let primary = repo.join("codex-bin");
+        std::fs::write(&primary, b"fixture executable")?;
+        let run_id = RunId::new("codex-only-runtime")?;
+        {
+            let _guard = bind_new(&repo, &run_id, SupervisorRuntime::Codex, &primary, &[])?;
+            require_only_runtime_binding(SupervisorRuntime::Codex)?;
+            assert!(require_only_runtime_binding(SupervisorRuntime::Grok).is_err());
+            assert!(runtime_allowed(SupervisorRuntime::Codex));
+            assert!(!runtime_allowed(SupervisorRuntime::Grok));
+            assert_eq!(catalog_program(&repo, SupervisorRuntime::Grok)?, Some(None));
+            let mut command = ExternalAgentCommand::codex(
+                &primary,
+                &repo,
+                repo.join("prompt"),
+                repo.join("log"),
+                repo.join("output"),
+                std::time::Duration::from_secs(1),
+            );
+            validate_launch(&command)?;
+            command = command.with_runtime_adapter(
+                SupervisorRuntime::Grok,
+                crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+            );
+            assert!(validate_launch(&command).is_err());
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                run_id.clone(),
+                "single-runtime-test",
+            )?;
+            archive_current(&mut writer, &repo, &run_id)?;
+            let final_path = RunArtifactFamily::Supervise.final_report_relative_path();
+            writer.write_json(
+                &final_path,
+                &serde_json::json!({"run_id": run_id.as_str()}),
+                ArtifactFileDisposition::Publishable,
+            )?;
+            writer.finalize(&final_path, false)?;
+        }
+        assert!(require_only_runtime_binding(SupervisorRuntime::Codex).is_err());
+        let (_guard, restored) = bind_resume(&repo, &run_id, SupervisorRuntime::Codex, None, &[])?
+            .context("restore a single runtime")?;
+        assert_eq!(restored, primary);
+        require_only_runtime_binding(SupervisorRuntime::Codex)?;
+        assert!(!runtime_allowed(SupervisorRuntime::Grok));
         Ok(())
     }
 

@@ -619,7 +619,7 @@ impl SystemdUnit {
         } else {
             spec.environment.clone()
         };
-        let mut private_runtime_files = spec.private_runtime_files.clone();
+        let mut private_runtime_files = private_runtime_files_for_spec(spec)?;
         if spec.staged_codex_home.is_none()
             && private_runtime_files
                 .iter()
@@ -868,6 +868,20 @@ impl SystemdUnit {
                 .arg(self.runtime_dir.join(PINNED_EXEC_DESCRIPTOR_NAME))
                 .arg(digest);
         } else {
+            if spec.grok_worker_continuation {
+                if spec.containment != ContainmentPolicy::Required
+                    || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalGrok
+                    || !spec.private_runtime_grok_home
+                    || !matches!(spec.stdin, StdinMode::Interactive)
+                {
+                    return Err(io::Error::other("Grok continuation requires its verified outer containment and private home"));
+                }
+                command
+                    .arg(&self.shell)
+                    .arg("-c")
+                    .arg(crate::runtime_adapter::grok::GROK_WORKER_CONTINUATION_SCRIPT)
+                    .arg("maco-grok-bounded-continuation");
+            }
             match &spec.command {
                 ProcessCommand::Shell {
                     shell,
@@ -1423,6 +1437,22 @@ impl SystemdUnit {
                 ),
             };
         }
+        // Snapshot before stopping the unit removes its private GROK_HOME. The
+        // tail is failure context only and must never alter containment evidence.
+        let native_failure =
+            if self.sandbox.as_ref().is_some_and(|sandbox| {
+                sandbox.kind == SideEffectConfinementProfileKind::ExternalGrok
+            }) && (context != "normal process-tree finalization"
+                || _child
+                    .try_wait()
+                    .ok()
+                    .flatten()
+                    .is_some_and(|status| !status.success()))
+            {
+                crate::runtime_adapter::grok::native_inference_failure_tail(&self.runtime_dir)
+            } else {
+                None
+            };
         let mut error = self.kill_and_verify(label, context).err().map(|error| {
             format!(
                 "{label} {context} could not verify empty systemd containment unit {}: {error}",
@@ -1459,7 +1489,7 @@ impl SystemdUnit {
             side_effects: SideEffectConfinementEvidence::Unverified(
                 SideEffectConfinementProfileKind::TrustedCompatibility,
             ),
-            error,
+            error: append_error(error, native_failure),
         }
     }
 
@@ -2005,6 +2035,13 @@ pub(crate) fn trusted_system_executable(
             "fixed trusted executable resolution is not implemented on this platform",
         ))
     }
+}
+
+#[cfg(target_os = "linux")]
+fn private_runtime_files_for_spec(spec: &ProcessSpec) -> std::io::Result<Vec<PrivateRuntimeFile>> {
+    let private_runtime_files = spec.private_runtime_files.clone();
+    validate_private_runtime_files(&private_runtime_files)?;
+    Ok(private_runtime_files)
 }
 
 #[cfg(target_os = "linux")]

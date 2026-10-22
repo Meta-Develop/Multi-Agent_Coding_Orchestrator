@@ -10,6 +10,255 @@ use super::*;
 
 static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
+#[test]
+fn documented_grok_diagnostic_preserves_confinement_and_reports_observed_startup_stages() {
+    let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new("python3")
+        .arg(root.join("tests/fixtures/runtime_adapter/r38_diagnostic.py"))
+        .arg(root.join("scripts/diagnose-grok-launch.sh"))
+        .output()
+        .expect("Python diagnostic regression harness");
+    assert!(
+        output.status.success(),
+        "stdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn documented_mixed_script_checks_binary_compatibility_before_launch_and_preserves_status() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let owner = tempfile::Builder::new()
+        .prefix("mixed script regression ")
+        .tempdir()
+        .unwrap();
+    let root = owner.path();
+    for directory in ["bin", "base", "repo", "scripts", "examples/supervise"] {
+        fs::create_dir_all(root.join(directory)).unwrap();
+    }
+    fs::write(root.join("base/machine-global.json"), "{}").unwrap();
+    fs::write(
+        root.join("scripts/run-mixed-codex-grok.sh"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/scripts/run-mixed-codex-grok.sh"
+        )),
+    )
+    .unwrap();
+    let plan = include_str!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/examples/supervise/mixed-codex-grok-plan.json"
+    ));
+    fs::write(
+        root.join("examples/supervise/mixed-codex-grok-plan.json"),
+        plan,
+    )
+    .unwrap();
+    // Generated ids may differ; compatibility must follow the bound contract.
+    let mut generated: serde_json::Value = serde_json::from_str(plan).unwrap();
+    let worker = &mut generated["assignments"][0];
+    worker["id"] = serde_json::json!("generated-worker");
+    worker["notes"] = serde_json::json!(worker["notes"]
+        .as_str()
+        .unwrap()
+        .replace("readme-worker", "generated-worker"));
+    generated["task_routing_assessment"]["declaration"]["assignments"][0]["id"] =
+        serde_json::json!("generated-worker");
+    fs::write(
+        root.join("generated.json"),
+        serde_json::to_vec(&generated).unwrap(),
+    )
+    .unwrap();
+    // Captured R39v1b goal lowering is incompatible: two coordinators, one
+    // nested worker, no typed verification contract or replayable assessment.
+    // Finding that nested worker must not make the wrapper launch it.
+    fs::write(
+        root.join("paired-generated.json"),
+        include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/mixed_plan/r39v1b-paired-generated-plan.json"
+        )),
+    )
+    .unwrap();
+    for (name, script) in [
+        (
+            "maco",
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+args = sys.argv[1:]
+with open(os.environ['CALLS'], 'a') as calls:
+    calls.write(json.dumps(args) + '\n')
+mode = os.environ['MODE']
+def change_routing(plan, mismatch):
+    policy = plan['resolved_routing_policy']
+    assessment = plan['task_routing_assessment']
+    if mismatch == 'policy':
+        policy['sha256'] = assessment['policy_sha256'] = '0' * 64
+    elif mismatch == 'policy-binding':
+        assessment['policy_sha256'] = '0' * 64
+    elif mismatch == 'source':
+        policy['source'] = 'different-policy-source'
+    elif mismatch == 'provenance':
+        assessment['provenance'] = 'different-provenance'
+    elif mismatch.startswith('feature-'):
+        field = mismatch.removeprefix('feature-')
+        assessment['features'][field] += 1
+if args[:2] == ['machine-global', 'status']:
+    sys.exit(9 if mode == 'bad-config' else 0)
+if args == ['--version']:
+    print('source_revision=fixture')
+    sys.exit(0)
+assert args[:2] == ['supervise', 'plan'], args
+if '--from-goal' in args:
+    if mode == 'bad-goal': sys.exit(10)
+    plan = json.loads(pathlib.Path(os.environ['GENERATED']).read_text())
+    if mode == 'old-binary':
+        plan.pop('task_routing_assessment')
+        plan['assignments'][0]['notes'] = 'old paired goal lowering'
+    if mode == 'bad-binding':
+        plan['assignments'][0]['task'] = 'unbound task'
+    if mode == 'captured-paired':
+        plan = json.loads(pathlib.Path(os.environ['PAIRED_GENERATED']).read_text())
+    if mode == 'override':
+        worker = plan['assignments'][0]
+        directive = json.loads(worker['notes'].removeprefix('maco-preclaim-v1:'))
+        directive['operator_override'] = {'reason': 'must not bypass the contract'}
+        worker['notes'] = 'maco-preclaim-v1:' + json.dumps(directive)
+    if mode == 'extra-worker':
+        plan['assignments'].append(plan['assignments'][0].copy())
+    if mode.startswith('generated-'):
+        change_routing(plan, mode.removeprefix('generated-'))
+    print(json.dumps(plan))
+else:
+    if mode == 'bad-plan': sys.exit(11)
+    plan = json.loads(pathlib.Path(args[2]).read_text())
+    if mode == 'lossy-check': plan.pop('task_routing_assessment')
+    if mode.startswith('checked-'):
+        change_routing(plan, mode.removeprefix('checked-'))
+    print(json.dumps(plan))
+"#,
+        ),
+        (
+            "systemd-run",
+            r#"#!/usr/bin/env python3
+import json, os, pathlib, sys
+pathlib.Path(os.environ['LAUNCH']).write_text(json.dumps(sys.argv[1:]))
+sys.exit(7)
+"#,
+        ),
+    ] {
+        let path = root.join("bin").join(name);
+        fs::write(&path, script).unwrap();
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    let path = std::env::join_paths(
+        std::iter::once(root.join("bin"))
+            .chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    for (mode, code, launches) in [
+        ("compatible", 7, true),
+        ("old-binary", 1, false),
+        ("bad-binding", 1, false),
+        ("captured-paired", 1, false),
+        ("override", 1, false),
+        ("extra-worker", 1, false),
+        ("lossy-check", 1, false),
+        ("generated-policy", 1, false),
+        ("generated-policy-binding", 1, false),
+        ("generated-source", 1, false),
+        ("generated-provenance", 1, false),
+        ("generated-feature-risk", 1, false),
+        ("generated-feature-complexity", 1, false),
+        ("generated-feature-horizon", 1, false),
+        ("generated-feature-context_tokens", 1, false),
+        ("checked-policy", 1, false),
+        ("checked-policy-binding", 1, false),
+        ("checked-source", 1, false),
+        ("checked-provenance", 1, false),
+        ("checked-feature-risk", 1, false),
+        ("checked-feature-complexity", 1, false),
+        ("checked-feature-horizon", 1, false),
+        ("checked-feature-context_tokens", 1, false),
+        ("bad-config", 1, false),
+        ("bad-plan", 11, false),
+        ("bad-goal", 10, false),
+    ] {
+        let out = root.join(mode);
+        let launch = out.join("launch.json");
+        let output = std::process::Command::new("bash")
+            .arg(root.join("scripts/run-mixed-codex-grok.sh"))
+            .env("PATH", &path)
+            .env("MODE", mode)
+            .env("CALLS", root.join(format!("{mode}-calls.jsonl")))
+            .env("GENERATED", root.join("generated.json"))
+            .env("PAIRED_GENERATED", root.join("paired-generated.json"))
+            .env("LAUNCH", &launch)
+            .env("maco", root.join("bin/maco"))
+            .env("repo", root.join("repo"))
+            .env("base", root.join("base"))
+            .env("run_id", "mixed-regression")
+            .env("OUT", &out)
+            .env("XDG_RUNTIME_DIR", root)
+            .env("DBUS_SESSION_BUS_ADDRESS", "fixture")
+            .env("MACO_GROK_BIN", "/fixture/grok")
+            .output()
+            .unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(code),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert_eq!(launch.exists(), launches, "{mode}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            !stderr.contains("too many values to unpack"),
+            "{mode}: {stderr}"
+        );
+        if mode == "captured-paired" || mode == "extra-worker" {
+            assert!(
+                stderr.contains("expected exactly one direct execution worker; got 2 assignments"),
+                "{stderr}"
+            );
+        }
+        if mode == "override" {
+            assert!(
+                stderr.contains("verification contract without overrides"),
+                "{stderr}"
+            );
+        }
+        if mode == "lossy-check" {
+            assert!(stderr.contains("checked plan:"), "{stderr}");
+        }
+        if mode.starts_with("checked-") || mode.starts_with("generated-") {
+            let label = if mode.starts_with("checked-") {
+                "checked plan:"
+            } else {
+                "goal lowering:"
+            };
+            assert!(stderr.contains(label), "{mode}: {stderr}");
+            assert!(stderr.contains("routing"), "{mode}: {stderr}");
+        }
+        if launches {
+            let args: Vec<String> = serde_json::from_slice(&fs::read(&launch).unwrap()).unwrap();
+            assert!(args.contains(&"--scope".to_string()));
+            let executable = args.iter().position(|arg| arg == "--").unwrap() + 1;
+            assert_eq!(args[executable], root.join("bin/maco").to_str().unwrap());
+            assert_eq!(&args[executable + 1..executable + 3], ["supervise", "run"]);
+            assert_eq!(fs::read_to_string(&args[executable + 3]).unwrap(), plan);
+            assert!(args.windows(2).any(|pair| pair == ["--runtime", "codex"]));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--run-id", "mixed-regression"]));
+        }
+    }
+}
+
 struct CamAuthoritySocketEnvironmentGuard {
     _inner: crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard,
 }
@@ -1809,6 +2058,57 @@ fn supervise_plan_requires_exactly_one_positional_or_goal_source() {
 }
 
 #[test]
+fn supervise_only_runtime_requires_matching_explicit_executable_and_rejects_mixed_bindings() {
+    let base = [
+        "maco",
+        "supervise",
+        "run",
+        "--from-goal",
+        "goal.md",
+        "--machine-global-config",
+        "/tmp/maco-machine-global.json",
+        "--machine-global-runtime-root-id",
+        "runtime",
+    ];
+    let flags = [
+        "--only-runtime",
+        "codex",
+        "--runtime",
+        "codex",
+        "--runtime-bin",
+        "/tmp/codex",
+    ];
+    let parsed = Cli::try_parse_from(base.into_iter().chain(flags)).unwrap();
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(parsed.command).command else {
+        panic!("expected supervise run");
+    };
+    validate_supervise_only_runtime(args.runtime, args.only_runtime).unwrap();
+    assert_eq!(args.only_runtime, Some(supervise::SupervisorRuntime::Codex));
+    assert_eq!(args.from_goal, Some(PathBuf::from("goal.md")));
+    for invalid in [
+        vec!["--only-runtime", "codex"],
+        vec!["--only-runtime", "codex", "--runtime", "codex"],
+        vec!["--only-runtime", "codex", "--runtime-bin", "/tmp/codex"],
+        flags
+            .into_iter()
+            .chain(["--additional-runtime-bin", "grok=/tmp/grok"])
+            .collect(),
+    ] {
+        assert!(Cli::try_parse_from(base.into_iter().chain(invalid)).is_err());
+    }
+    assert!(validate_supervise_only_runtime(
+        Some(supervise::SupervisorRuntime::Grok),
+        Some(supervise::SupervisorRuntime::Codex),
+    )
+    .is_err());
+    assert!(validate_supervise_only_runtime(
+        Some(supervise::SupervisorRuntime::Fake),
+        Some(supervise::SupervisorRuntime::Fake),
+    )
+    .is_err());
+}
+
+#[test]
 fn supervise_run_requires_exactly_one_plan_or_goal_source() {
     let retention = [
         "--machine-global-config",
@@ -1825,6 +2125,29 @@ fn supervise_run_requires_exactly_one_plan_or_goal_source() {
     };
     assert_eq!(args.supervisor_plan, Some(PathBuf::from("plan.json")));
     assert_eq!(args.from_goal, None);
+    assert_eq!(
+        args.prior_data, None,
+        "a plan does not require --prior-data"
+    );
+
+    let mut with_prior = vec![
+        "maco",
+        "supervise",
+        "run",
+        "plan.json",
+        "--prior-data",
+        "evidence/prior.json",
+    ];
+    with_prior.extend(retention);
+    let parsed = Cli::try_parse_from(with_prior).expect("optional prior snapshot should parse");
+    let SuperviseSubcommand::Run(args) = expect_supervise_command(parsed.command).command else {
+        panic!("expected supervise run command");
+    };
+    assert_eq!(args.prior_data, Some(PathBuf::from("evidence/prior.json")));
+
+    let mut named_plan = vec!["maco", "supervise", "run", "--supervisor-plan", "plan.json"];
+    named_plan.extend(retention);
+    assert!(Cli::try_parse_from(named_plan).is_err());
 
     let mut from_goal = vec!["maco", "supervise", "run", "--from-goal", "goal.md"];
     from_goal.extend(retention);

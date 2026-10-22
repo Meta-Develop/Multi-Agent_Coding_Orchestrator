@@ -3465,14 +3465,16 @@ fn apply_systemd_sandbox_properties(
             | SideEffectConfinementProfileKind::ExternalGrok
     ) {
         command.arg("--property=PrivateNetwork=no");
-        command.arg(if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
-            // Codex initializes local Unix streams before its inner bubblewrap sandbox uses
-            // AF_NETLINK to construct the network namespace and configure loopback. Known
-            // same-user sockets remain masked by the exact path policy below.
-            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
-        } else {
-            "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
-        });
+        command.arg(
+            if sandbox.kind == SideEffectConfinementProfileKind::ExternalCodex {
+                // Codex initializes local Unix streams before its inner bubblewrap sandbox uses
+                // AF_NETLINK to construct the network namespace and configure loopback. Known
+                // same-user sockets remain masked by the exact path policy below.
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK"
+            } else {
+                "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
+            },
+        );
         // Both runtimes need bubblewrap to construct the inner mount tree, including Grok's
         // denied-path protection. Keep the rest of their networked deny lists intact.
         command.arg(

@@ -2349,60 +2349,90 @@ fn runtime_aware_external_completion_preserves_fake_simulation_contract() {
 #[test]
 fn budget_reliability_uses_bound_adapter_runtime_completion() {
     let _capability = install_budget_fixture_models();
-    let assignment = injected_assignment(false);
-    let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
-    let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
-    let temp = tempfile::tempdir().expect("adapter budget command root");
-    let mut command = ExternalAgentCommand::codex(
-        "grok",
-        temp.path(),
-        temp.path().join("prompt.md"),
-        temp.path().join("capture.jsonl"),
-        temp.path().join("report.json"),
-        Duration::from_secs(1),
-    )
-    .with_runtime_adapter(
-        SupervisorRuntime::Grok,
-        crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
-    );
-    command.model = Some("priced-model".to_string());
-    let mut reservation = match reserve_dispatch_budget(
-        &plan,
-        &budget,
-        &ledger,
-        (AgentRole::ChildOrchestrator, SupervisorRuntime::Grok),
-        &command,
-    )
-    .expect("reserve adapter dispatch")
-    {
-        DispatchBudgetAdmission::Admitted(reservation) => reservation,
-        DispatchBudgetAdmission::Refused(refusal) => {
-            panic!("unexpected budget refusal: {refusal:?}")
+    for timed_out in [false, true] {
+        let assignment = injected_assignment(false);
+        let mut plan = injected_plan(assignment, 0);
+        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let temp = tempfile::tempdir().expect("adapter budget command root");
+        let mut command = ExternalAgentCommand::codex(
+            "grok",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("capture.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            SupervisorRuntime::Grok,
+            crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+        );
+        command.model = Some("priced-model".to_string());
+        let mut reservation = match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Grok),
+            &command,
+        )
+        .expect("reserve adapter dispatch")
+        {
+            DispatchBudgetAdmission::Admitted(reservation) => reservation,
+            DispatchBudgetAdmission::Refused(refusal) => {
+                panic!("unexpected budget refusal: {refusal:?}")
+            }
+        };
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Grok)
+            .expect("retain adapter launch runtime");
+        write_injected_usage(&command, 7, 3);
+        let mut run = injected_verified_run_without_journals(&command);
+        run.program_trust = ExternalProgramTrust::ExplicitCustom;
+        run.codex_permissions = None;
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalGrok,
+        ));
+        if timed_out {
+            run.exit_code = Some(255);
+            run.timed_out = true;
+            run.publishable = false;
+            run.error = Some("external agent timed out after partial usage".to_string());
         }
-    };
-    reservation
-        .mark_invoked_for_runtime(SupervisorRuntime::Grok)
-        .expect("retain adapter launch runtime");
-    write_injected_usage(&command, 7, 3);
-    let mut run = injected_verified_run_without_journals(&command);
-    run.program_trust = ExternalProgramTrust::ExplicitCustom;
-    run.codex_permissions = None;
-    let native_capture = crate::process_runner::CapturedBytes::from_bytes_for_test(
+        assert!(external_containment_verified(&run, SupervisorRuntime::Grok));
+        assert_eq!(
+            external_process_completed(&run, SupervisorRuntime::Grok),
+            !timed_out
+        );
+        let native_capture = crate::process_runner::CapturedBytes::from_bytes_for_test(
         b"{\"type\":\"end\",\"stopReason\":\"stop\",\"sessionId\":\"s\",\"requestId\":\"r\",\"usage\":{\"input_tokens\":7,\"output_tokens\":3,\"cache_read_input_tokens\":0,\"cache_creation_input_tokens\":0,\"reasoning_tokens\":0,\"total_tokens\":10}}\n"
             .to_vec(),
     );
-    run.retain_grok_native_usage_for_test(&command, &native_capture, true);
+        run.retain_grok_native_usage_for_test(&command, &native_capture, !timed_out);
 
-    let settlement = reservation
-        .settle(&run, SupervisorRuntime::Grok, &command)
-        .expect("settle verified adapter usage");
-    assert_eq!(
-        settlement.observed_usage.map(|usage| usage.total_tokens),
-        Some(10)
-    );
-    assert_eq!(settlement.reliability, DispatchUsageReliability::Reliable);
+        let settlement = reservation
+            .settle(&run, SupervisorRuntime::Grok, &command)
+            .expect("settle verified adapter usage");
+        assert_eq!(
+            settlement.observed_usage.map(|usage| usage.total_tokens),
+            Some(10)
+        );
+        assert_eq!(
+            settlement.reliability,
+            if timed_out {
+                DispatchUsageReliability::Estimated
+            } else {
+                DispatchUsageReliability::Reliable
+            }
+        );
+        assert_eq!(
+            ledger
+                .report()
+                .expect("settled native usage")
+                .usage_complete,
+            !timed_out
+        );
+    }
 }
 
 #[test]

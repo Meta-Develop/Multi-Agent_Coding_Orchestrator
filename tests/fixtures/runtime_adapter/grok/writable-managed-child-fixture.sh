@@ -68,8 +68,8 @@ while [ "$#" -gt 0 ]; do
             ;;
         --sandbox)
             [ "$#" -ge 2 ] || exit 1
-            [ "$2" = "strict" ] || {
-                printf '%s\n' "sandbox must stay strict" >&2
+            [ "$2" = "off" ] || {
+                printf '%s\n' "inner sandbox must be off under MACO containment" >&2
                 exit 1
             }
             sandbox=$((sandbox + 1))
@@ -85,6 +85,9 @@ while [ "$#" -gt 0 ]; do
             ;;
         --no-memory)
             no_memory=$((no_memory + 1))
+            shift
+            ;;
+        --no-leader)
             shift
             ;;
         --no-subagents)

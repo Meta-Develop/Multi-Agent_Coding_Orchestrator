@@ -301,7 +301,6 @@ pub(crate) use selection_bridge::{
 
 mod parent_broker;
 mod task_routing;
-#[cfg(target_os = "linux")]
 pub(crate) use task_routing::assess_task_routing;
 pub use task_routing::TaskRoutingAssessment;
 
@@ -315,7 +314,7 @@ use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
 pub(crate) use runtime_executables::{
     bind_new as bind_explicit_runtime_executables,
-    bind_resume as bind_frozen_runtime_executables_for_run,
+    bind_resume as bind_frozen_runtime_executables_for_run, require_only_runtime_binding,
 };
 
 mod messaging_bridge;
@@ -441,7 +440,9 @@ pub(crate) use reporting::append_worker_execution_journal_record;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use reporting::import_worker_execution_journals_at;
 pub(crate) use reporting::parse_worker_execution_journal;
+#[cfg(test)]
 pub(crate) use reporting::run_worker_execution_journal_command;
+pub(crate) use reporting::run_worker_execution_journal_command_with_clock;
 use reporting::*;
 
 #[cfg(test)]

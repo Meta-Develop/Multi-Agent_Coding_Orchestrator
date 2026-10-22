@@ -50,13 +50,11 @@ const GROK_CATALOG_MAX_BYTES: usize = 256 * 1024;
 const GROK_CATALOG_MAX_MODELS: usize = 512;
 const GROK_MODEL_SLUG_MAX_BYTES: usize = 256;
 const GROK_MODEL_DISPLAY_NAME_MAX_BYTES: usize = 768;
-const GROK_LOGIN_PROVIDER_MAX_BYTES: usize = 253;
-pub(crate) const GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED: &str =
-    "Grok runtime model catalog requires owner authentication";
 const GROK_CATALOG_TIMEOUT: Duration = Duration::from_secs(30);
 const GROK_DIGEST_FRAMING_VERSION: &[u8] = b"maco.grok.advertised-catalog.v1\n";
 const GROK_AUTH_FILE: &str = "auth.json";
 const GROK_CONFIG_FILE: &str = "config.toml";
+const GROK_MODEL_CACHE_FILE: &str = "models_cache.json";
 
 /// Fixed host entry point used when the operator does not set `MACO_GROK_BIN`.
 ///
@@ -128,6 +126,146 @@ fn resolve_grok_executable_candidate(
     Ok(canonical)
 }
 
+/// Grok 1.0.60 documents `off` as disabling its headless inner profile. Production
+/// launches still require MACO's verified ExternalGrok outer containment.
+pub const GROK_INNER_SANDBOX_PROFILE: &str = "off";
+pub const GROK_INNER_SANDBOX_EVIDENCE: &str = "inner_sandbox=disabled_outer_containment_enforced";
+/// ACP has no verified outer bubblewrap wrapper; retain its native strict profile.
+pub const GROK_ACP_INNER_SANDBOX_PROFILE: &str = "strict";
+pub const GROK_ACP_INNER_SANDBOX_EVIDENCE: &str = "inner_sandbox=strict_outer_containment_enforced";
+
+/// Constant markers contain no provider-controlled text or credentials.
+pub(crate) const GROK_NATIVE_DNS_FAILURE: &str = "dns error: failed to lookup address information";
+pub(crate) const GROK_NATIVE_CONNECT_FAILURE: &str = "client error (Connect)";
+pub(crate) const GROK_NATIVE_AUTH_FAILURE: &str = "provider_auth_required";
+
+fn is_inference_authentication_error(error: &str) -> bool {
+    let lower = error.to_ascii_lowercase();
+    lower.contains("unauthenticated")
+        || lower.contains("not authenticated")
+        || lower.contains("unauthorized")
+        || lower.contains("authentication required")
+        || lower.contains("invalid api key")
+        || lower
+            .split(|c: char| !c.is_ascii_alphanumeric())
+            .any(|word| matches!(word, "401" | "403"))
+}
+
+/// Inspect bounded error events, including ACP JSON-RPC errors, from the worker
+/// invocation. Successful text/tool output mentioning auth is not an auth error.
+pub(crate) fn inference_stream_authentication_failed(bytes: &[u8]) -> bool {
+    bytes[..bytes.len().min(GROK_EVENT_STREAM_MAX_BYTES)]
+        .split(|byte| *byte == b'\n')
+        .filter(|line| line.len() <= GROK_EVENT_LINE_MAX_BYTES)
+        .filter_map(|line| serde_json::from_slice::<Value>(line).ok())
+        .any(|event| {
+            let error = if event.get("type").and_then(Value::as_str) == Some("error") {
+                event.get("message").or_else(|| event.get("error"))
+            } else if event.get("jsonrpc").and_then(Value::as_str) == Some("2.0") {
+                event.get("error")
+            } else {
+                None
+            };
+            error.is_some_and(|error| is_inference_authentication_error(&error.to_string()))
+        })
+}
+
+/// Read only a bounded tail of the run-private native log before teardown.
+/// Callers project typed/allowlisted evidence; raw bytes never leave the adapter.
+#[cfg(target_os = "linux")]
+fn native_log_tail(home: &Path) -> Option<Vec<u8>> {
+    use std::io::{Read, Seek, SeekFrom};
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::fs::{MetadataExt, OpenOptionsExt},
+    };
+    const MAX_BYTES: u64 = 64 * 1024;
+    fn open_child(parent: &File, name: &std::ffi::CStr, directory: bool) -> Option<File> {
+        // SAFETY: the parent descriptor and NUL-terminated name are live. Each
+        // component refuses symlinks; O_NONBLOCK prevents a tainted FIFO stall.
+        let fd = unsafe {
+            libc::openat(
+                parent.as_raw_fd(),
+                name.as_ptr(),
+                libc::O_RDONLY
+                    | libc::O_CLOEXEC
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | if directory { libc::O_DIRECTORY } else { 0 },
+            )
+        };
+        (fd >= 0).then(|| unsafe { File::from_raw_fd(fd) })
+    }
+    let root = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_CLOEXEC | libc::O_NOFOLLOW | libc::O_DIRECTORY)
+        .open(home)
+        .ok()?;
+    let logs = open_child(&root, c"logs", true)?;
+    let mut log = open_child(&logs, c"unified.jsonl", false)?;
+    let metadata = log.metadata().ok()?;
+    if !metadata.is_file() || metadata.nlink() != 1 {
+        return None;
+    }
+    let offset = metadata.len().saturating_sub(MAX_BYTES);
+    log.seek(SeekFrom::Start(offset)).ok()?;
+    let mut bytes = Vec::new();
+    log.take(MAX_BYTES).read_to_end(&mut bytes).ok()?;
+    let bytes = if offset > 0 {
+        bytes.get(bytes.iter().position(|byte| *byte == b'\n')? + 1..)?
+    } else {
+        &bytes
+    };
+    Some(bytes.to_vec())
+}
+
+/// Project only allowlisted event/error labels, never messages, URLs, prompts,
+/// headers, or credential-bearing context.
+#[cfg(target_os = "linux")]
+pub(crate) fn native_inference_failure_tail(home: &Path) -> Option<String> {
+    let bytes = native_log_tail(home)?;
+    let mut entries = std::collections::VecDeque::new();
+    for line in bytes.split(|byte| *byte == b'\n') {
+        let Ok(event) = serde_json::from_slice::<Value>(line) else {
+            continue;
+        };
+        let Some(message) = event.get("msg").and_then(Value::as_str) else {
+            continue;
+        };
+        if !matches!(
+            message,
+            "shell.turn.inference_retry"
+                | "shell.turn.inference_failed"
+                | "shell.turn.inference_error"
+        ) {
+            continue;
+        }
+        let Some(error) = event.pointer("/ctx/error").and_then(Value::as_str) else {
+            continue;
+        };
+        let lower = error.to_ascii_lowercase();
+        let label = if is_inference_authentication_error(error) {
+            GROK_NATIVE_AUTH_FAILURE
+        } else if lower.contains("dns error")
+            || lower.contains("failed to lookup address information")
+        {
+            GROK_NATIVE_DNS_FAILURE
+        } else if lower.contains("client error (connect)")
+            || lower.contains("tcp connect error")
+            || lower.contains("connection refused")
+        {
+            GROK_NATIVE_CONNECT_FAILURE
+        } else {
+            "inference failure (detail redacted; cause unknown)"
+        };
+        if entries.len() == 8 {
+            entries.pop_front();
+        }
+        entries.push_back(format!("{message}: {label}"));
+    }
+    (!entries.is_empty()).then(|| format!("Grok native inference failure tail (last <=8 events, <=65536 source bytes; free-form fields redacted): {}", entries.into_iter().collect::<Vec<_>>().join("; ")))
+}
+
 /// Immutable Grok headless protocol supported by this adapter.
 ///
 /// Model and reasoning effort remain selector inputs. Every protocol, approval,
@@ -190,6 +328,7 @@ impl GrokRuntimeDescriptor {
             "--disable-web-search",
             "--no-memory",
             "--no-subagents",
+            "--no-leader",
         ]
         .into_iter()
         .map(str::to_string)
@@ -200,13 +339,13 @@ impl GrokRuntimeDescriptor {
 pub const GROK_RUNTIME_DESCRIPTOR: GrokRuntimeDescriptor = GrokRuntimeDescriptor {
     executable: "grok",
     output_format: "streaming-json",
-    sandbox_profile: "strict",
+    sandbox_profile: GROK_INNER_SANDBOX_PROFILE,
     headless_approval_flag: "--always-approve",
 };
 
 /// Pinned Grok `agent stdio` launch contract (ACP parent path).
 ///
-/// Global hardening flags match headless posture; the prompt is sent only over
+/// ACP retains its strict inner sandbox; the prompt is sent only over
 /// the ACP `session/prompt` channel, not via `--prompt-file`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GrokAcpRuntimeDescriptor {
@@ -258,7 +397,7 @@ impl GrokAcpRuntimeDescriptor {
 
 pub const GROK_ACP_RUNTIME_DESCRIPTOR: GrokAcpRuntimeDescriptor = GrokAcpRuntimeDescriptor {
     executable: "grok",
-    sandbox_profile: "strict",
+    sandbox_profile: GROK_ACP_INNER_SANDBOX_PROFILE,
     headless_approval_flag: "--always-approve",
 };
 
@@ -1476,6 +1615,11 @@ pub struct GrokAdvertisedCatalogObservation {
 }
 
 impl GrokAdvertisedCatalogObservation {
+    /// Model listing is availability evidence only; inference must establish auth.
+    pub const fn authentication_evidence(&self) -> &'static str {
+        "not_asserted_by_catalog"
+    }
+
     pub fn catalog(&self) -> &GrokModelCatalog {
         &self.catalog
     }
@@ -1530,21 +1674,29 @@ pub fn discover_grok_model_catalog(
         .filter(|observed_at| *observed_at != 0)
         .context("Grok runtime model catalog observation time is missing or zero")?;
     let output = runner.run(spec)?;
+    validate_grok_catalog_process(&output, spec.capture_limit_bytes())?;
+    let catalog = parse_grok_model_catalog(&output.stdout)?;
+    inject_grok_advertised_catalog(catalog, Some(observed_at_unix_millis), &output.stdout)
+}
+
+/// Catalog availability requires successful contained completion, without asserting authentication.
+fn validate_grok_catalog_process(
+    output: &GrokCatalogCommandOutput,
+    capture_limit: usize,
+) -> Result<()> {
     if output.timed_out {
         bail!("Grok runtime model catalog command timed out");
     }
     if output.stdout_truncated || output.stderr_truncated {
         bail!(
             "Grok runtime model catalog command output exceeded the {} byte stream limit",
-            spec.capture_limit_bytes()
+            capture_limit
         );
     }
-    if output.stdout.len() > spec.capture_limit_bytes()
-        || output.stderr.len() > spec.capture_limit_bytes()
-    {
+    if output.stdout.len() > capture_limit || output.stderr.len() > capture_limit {
         bail!(
             "Grok runtime model catalog command returned output larger than the {} byte stream limit",
-            spec.capture_limit_bytes()
+            capture_limit
         );
     }
     if output.status != Some(0) {
@@ -1571,8 +1723,7 @@ pub fn discover_grok_model_catalog(
     if !output.stderr.is_empty() {
         bail!("Grok runtime model catalog command emitted unexpected stderr");
     }
-    let catalog = parse_grok_model_catalog(&output.stdout)?;
-    inject_grok_advertised_catalog(catalog, Some(observed_at_unix_millis), &output.stdout)
+    Ok(())
 }
 
 /// Parse the strict plain-text grammar emitted by `grok models`.
@@ -1599,22 +1750,25 @@ pub fn parse_grok_model_catalog(bytes: &[u8]) -> Result<GrokModelCatalog> {
         .unwrap_or(&normalized)
         .split('\n')
         .collect::<Vec<_>>();
-    if lines.len() < 6 {
+    // Display banners and flags convey no authentication evidence. Locate only
+    // the model grammar; a banner alone still cannot establish availability.
+    let start = lines
+        .iter()
+        .position(|line| line.starts_with("Default model: "))
+        .context("Grok runtime model catalog has an invalid header")?;
+    let lines = &lines[start..];
+    if lines.len() < 4 {
         bail!("Grok runtime model catalog has an invalid header");
     }
-    validate_grok_login_line(lines[0])?;
-    if !lines[1].is_empty() {
-        bail!("Grok runtime model catalog has an invalid header");
-    }
-    let default_slug = lines[2]
+    let default_slug = lines[0]
         .strip_prefix("Default model: ")
         .context("Grok runtime model catalog has an invalid header")?;
     validate_grok_model_slug(default_slug).context("Grok runtime model catalog default model")?;
-    if !lines[3].is_empty() || lines[4] != "Available models:" {
+    if !lines[1].is_empty() || lines[2] != "Available models:" {
         bail!("Grok runtime model catalog has an invalid header");
     }
 
-    let model_lines = &lines[5..];
+    let model_lines = &lines[3..];
     if model_lines.is_empty() {
         bail!("Grok runtime model catalog contains no models");
     }
@@ -1675,28 +1829,6 @@ fn parse_grok_model_line(line: &str) -> Result<(&str, bool)> {
         return Ok((slug, false));
     }
     bail!("line does not match a Grok model marker");
-}
-
-fn validate_grok_login_line(line: &str) -> Result<()> {
-    if line == "You are not authenticated." {
-        bail!(GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
-    }
-    let provider = line
-        .strip_prefix("You are logged in with ")
-        .and_then(|rest| rest.strip_suffix('.'))
-        .context("Grok runtime model catalog has an invalid header")?;
-    if provider.is_empty() || provider.len() > GROK_LOGIN_PROVIDER_MAX_BYTES {
-        bail!("Grok runtime model catalog has an invalid login provider");
-    }
-    let mut bytes = provider.bytes();
-    if !bytes
-        .next()
-        .is_some_and(|byte| byte.is_ascii_alphanumeric())
-        || !bytes.all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.'))
-    {
-        bail!("Grok runtime model catalog has an invalid login provider");
-    }
-    Ok(())
 }
 
 fn grok_catalog_source_digest(catalog: &GrokModelCatalog, source_bytes: &[u8]) -> String {
@@ -1786,7 +1918,7 @@ fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<P
     #[cfg(not(target_os = "linux"))]
     {
         let _ = program;
-        bail!("Grok catalog authentication confinement requires Linux");
+        bail!("Grok catalog confinement requires Linux");
     }
     #[cfg(target_os = "linux")]
     {
@@ -1809,6 +1941,7 @@ pub(crate) struct GrokCredentialSource {
     grok_home_environment: String,
     auth: GrokCredentialFile,
     config: Option<GrokCredentialFile>,
+    model_cache: Option<GrokCredentialFile>,
 }
 
 #[cfg(target_os = "linux")]
@@ -1822,8 +1955,10 @@ impl GrokCredentialSource {
 
     /// Derive and admit an absolute, lexically normalized `GROK_HOME`.
     ///
-    /// `auth.json` is mandatory. `config.toml` is admitted only when present.
-    /// Neither file is read; successful admission retains its descriptor and
+    /// `auth.json` is mandatory. `config.toml` and the native `models_cache.json`
+    /// are admitted only when present. The cache is runtime input, never authority
+    /// or proof of model resolution, usage, or completion.
+    /// No file is read; successful admission retains its descriptor and
     /// the device/inode identity observed through both descriptor and path.
     pub(crate) fn from_environment(
         ambient_home: Option<&OsStr>,
@@ -1858,10 +1993,15 @@ impl GrokCredentialSource {
             grok_home.join(GROK_CONFIG_FILE),
             GrokCredentialFileKind::Configuration,
         )?;
+        let model_cache = GrokCredentialFile::open(
+            grok_home.join(GROK_MODEL_CACHE_FILE),
+            GrokCredentialFileKind::ModelCache,
+        )?;
         Ok(Self {
             grok_home_environment,
             auth,
             config,
+            model_cache,
         })
     }
 
@@ -1880,8 +2020,12 @@ impl GrokCredentialSource {
         // are projected into the run-private GROK_HOME below.
         let profile = profile.with_hidden_root(PathBuf::from(self.grok_home_environment.as_str()));
         let profile = self.auth.bind_to_profile(profile)?;
-        match &self.config {
-            Some(config) => config.bind_to_profile(profile),
+        let profile = match &self.config {
+            Some(config) => config.bind_to_profile(profile)?,
+            None => profile,
+        };
+        match &self.model_cache {
+            Some(cache) => cache.bind_to_profile(profile),
             None => Ok(profile),
         }
     }
@@ -1894,6 +2038,7 @@ impl fmt::Debug for GrokCredentialSource {
             .debug_struct("GrokCredentialSource")
             .field("authentication", &"held read-only source")
             .field("configuration_present", &self.config.is_some())
+            .field("model_cache_present", &self.model_cache.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -1919,7 +2064,7 @@ impl GrokCredentialFile {
         {
             Ok(file) => file,
             Err(error)
-                if kind == GrokCredentialFileKind::Configuration
+                if kind != GrokCredentialFileKind::Authentication
                     && error.kind() == std::io::ErrorKind::NotFound =>
             {
                 return Ok(None);
@@ -2009,6 +2154,7 @@ impl GrokCredentialFileIdentity {
 enum GrokCredentialFileKind {
     Authentication,
     Configuration,
+    ModelCache,
 }
 
 #[cfg(target_os = "linux")]
@@ -2017,6 +2163,7 @@ impl GrokCredentialFileKind {
         match self {
             Self::Authentication => GROK_AUTH_FILE,
             Self::Configuration => GROK_CONFIG_FILE,
+            Self::ModelCache => GROK_MODEL_CACHE_FILE,
         }
     }
 
@@ -2024,6 +2171,7 @@ impl GrokCredentialFileKind {
         match self {
             Self::Authentication => GrokCredentialSourceFailure::AuthenticationUnavailable,
             Self::Configuration => GrokCredentialSourceFailure::ConfigurationUnavailable,
+            Self::ModelCache => GrokCredentialSourceFailure::ModelCacheUnavailable,
         }
     }
 
@@ -2031,6 +2179,7 @@ impl GrokCredentialFileKind {
         match self {
             Self::Authentication => GrokCredentialSourceFailure::AuthenticationNotRegular,
             Self::Configuration => GrokCredentialSourceFailure::ConfigurationNotRegular,
+            Self::ModelCache => GrokCredentialSourceFailure::ModelCacheNotRegular,
         }
     }
 
@@ -2038,6 +2187,7 @@ impl GrokCredentialFileKind {
         match self {
             Self::Authentication => GrokCredentialSourceFailure::AuthenticationIdentityChanged,
             Self::Configuration => GrokCredentialSourceFailure::ConfigurationIdentityChanged,
+            Self::ModelCache => GrokCredentialSourceFailure::ModelCacheIdentityChanged,
         }
     }
 }
@@ -2055,6 +2205,9 @@ enum GrokCredentialSourceFailure {
     ConfigurationUnavailable,
     ConfigurationNotRegular,
     ConfigurationIdentityChanged,
+    ModelCacheUnavailable,
+    ModelCacheNotRegular,
+    ModelCacheIdentityChanged,
 }
 
 #[cfg(target_os = "linux")]
@@ -2084,6 +2237,15 @@ impl fmt::Display for GrokCredentialSourceFailure {
             }
             Self::ConfigurationIdentityChanged => {
                 "Grok configuration source config.toml identity changed"
+            }
+            Self::ModelCacheUnavailable => {
+                "Grok model cache source models_cache.json is unavailable"
+            }
+            Self::ModelCacheNotRegular => {
+                "Grok model cache source models_cache.json is not a regular file"
+            }
+            Self::ModelCacheIdentityChanged => {
+                "Grok model cache source models_cache.json identity changed"
             }
         })
     }
@@ -2143,11 +2305,136 @@ fn resolve_catalog_program(program: &Path) -> Result<PathBuf> {
     })
 }
 
+/// Runs only behind the systemd start gate, in the same outer filesystem/network
+/// containment as the admitted command. stdin is a host-only control channel;
+/// the provider gets /dev/null. No eval, ambient executable or new authority.
+pub(crate) const GROK_WORKER_CONTINUATION_SCRIPT: &str = r#"
+[ "$2" = --no-auto-update ] && [ "$3" = --prompt-file ] || exit 125
+"$@" </dev/null
+code=$?
+printf '{"type":"maco_grok_turn_exit","code":%s}\n' "$code"
+IFS= read -r resume || exit "$code"
+[ -n "$resume" ] || exit "$code"
+[ "$code" = 0 ] || exit "$code"
+case "$resume" in *[!a-zA-Z0-9-]*|-*) exit 125;; esac
+program=$1
+shift 4
+"$program" --no-auto-update --single 'Perform the assignment now using your tools, then return the final report.' --resume "$resume" "$@" </dev/null
+code=$?
+printf '{"type":"maco_grok_turn_exit","code":%s}\n' "$code"
+IFS= read -r done_token || :
+exit "$code"
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::process_runner::{ContainmentBackend, ProcessCommand};
     use std::{cell::RefCell, fs};
+
+    #[test]
+    fn grok_launches_pin_protocol_specific_inner_profiles_without_custom_resolver() {
+        for (template, expected) in [
+            (GROK_RUNTIME_DESCRIPTOR.immutable_argument_template(), "off"),
+            (
+                GROK_ACP_RUNTIME_DESCRIPTOR.immutable_argument_template(),
+                "strict",
+            ),
+        ] {
+            assert_eq!(
+                template
+                    .windows(2)
+                    .filter(|args| args[0] == "--sandbox" && args[1] == expected)
+                    .count(),
+                1
+            );
+            assert!(!template.iter().any(|arg| arg == "maco-strict-resolver"));
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn native_inference_failure_tail_is_bounded_redacted_and_refuses_unsafe_paths() -> Result<()> {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir()?;
+        let logs = dir.path().join("logs");
+        fs::create_dir(&logs)?;
+        let log = logs.join("unified.jsonl");
+        assert!(native_inference_failure_tail(dir.path()).is_none());
+        let mut contents = "x".repeat(100_000);
+        contents.push('\n');
+        for i in 0..12 {
+            let error = if i % 2 == 0 {
+                "dns error: failed to lookup address information: Bearer secret-fixture"
+            } else {
+                "client error (Connect): https://user:secret-fixture@host/?token=secret-fixture"
+            };
+            contents.push_str(&serde_json::to_string(&serde_json::json!({
+                "msg": "shell.turn.inference_retry", "ctx": {"error": error, "token": "secret-fixture"}
+            }))?);
+            contents.push('\n');
+        }
+        contents
+            .push_str("malformed\n{\"msg\":\"startup\",\"ctx\":{\"error\":\"secret-fixture\"}}\n");
+        fs::write(&log, contents)?;
+        let tail = native_inference_failure_tail(dir.path()).expect("observed failure tail");
+        assert_eq!(tail.matches("shell.turn.inference_retry:").count(), 8);
+        assert_eq!(tail.matches(GROK_NATIVE_DNS_FAILURE).count(), 4);
+        assert_eq!(tail.matches(GROK_NATIVE_CONNECT_FAILURE).count(), 4);
+        assert!(!tail.contains("secret-fixture"));
+        assert!(tail.len() < 1500);
+        let outside = dir.path().join("external-log");
+        fs::rename(&log, &outside)?;
+        symlink(&outside, &log)?;
+        assert!(native_inference_failure_tail(dir.path()).is_none());
+        fs::remove_file(&log)?;
+        fs::hard_link(&outside, &log)?;
+        assert!(native_inference_failure_tail(dir.path()).is_none());
+        fs::remove_file(&log)?;
+        fs::remove_dir(&logs)?;
+        symlink(dir.path(), &logs)?;
+        assert!(native_inference_failure_tail(dir.path()).is_none());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn inference_auth_failures_are_observed_only_in_worker_errors_and_redacted_native_failures(
+    ) -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        fs::create_dir(dir.path().join("logs"))?;
+        for error in [
+            "HTTP 401: secret-fixture",
+            "HTTP status 403 Forbidden: secret-fixture",
+            "Unauthenticated: secret-fixture",
+        ] {
+            let event = serde_json::json!({"type": "error", "message": error}).to_string();
+            assert!(inference_stream_authentication_failed(event.as_bytes()));
+            let rpc = serde_json::json!({"jsonrpc": "2.0", "id": 2, "error": {"code": 401, "message": error}}).to_string();
+            assert!(inference_stream_authentication_failed(rpc.as_bytes()));
+            let success = serde_json::json!({"type": "text", "data": error}).to_string();
+            assert!(!inference_stream_authentication_failed(success.as_bytes()));
+            let log =
+                serde_json::json!({"msg": "shell.turn.inference_failed", "ctx": {"error": error}})
+                    .to_string()
+                    + "\n";
+            fs::write(dir.path().join("logs/unified.jsonl"), log)?;
+            let tail = native_inference_failure_tail(dir.path()).context("native auth failure")?;
+            assert!(tail.contains(GROK_NATIVE_AUTH_FAILURE));
+            assert!(!tail.contains("secret-fixture"));
+        }
+        for error in ["HTTP 500", "dns error", "request id 1401", "4030 tokens"] {
+            let event = serde_json::json!({"type": "error", "message": error}).to_string();
+            assert!(!inference_stream_authentication_failed(event.as_bytes()));
+        }
+        assert!(!inference_stream_authentication_failed(
+            b"You are not authenticated.\n"
+        ));
+        assert!(!inference_stream_authentication_failed(
+            b"{\"type\":\"available_commands\"}\n"
+        ));
+        Ok(())
+    }
 
     const CAPTURED_CATALOG: &[u8] = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
@@ -2245,7 +2532,10 @@ mod tests {
     fn grok_headless_command_template_contract_is_exact() {
         assert_eq!(GROK_RUNTIME_DESCRIPTOR.executable(), "grok");
         assert_eq!(GROK_RUNTIME_DESCRIPTOR.output_format(), "streaming-json");
-        assert_eq!(GROK_RUNTIME_DESCRIPTOR.sandbox_profile(), "strict");
+        assert_eq!(
+            GROK_RUNTIME_DESCRIPTOR.sandbox_profile(),
+            GROK_INNER_SANDBOX_PROFILE
+        );
         assert_eq!(
             GROK_RUNTIME_DESCRIPTOR.headless_approval_flag(),
             "--always-approve"
@@ -2268,11 +2558,12 @@ mod tests {
                 "--output-format",
                 "streaming-json",
                 "--sandbox",
-                "strict",
+                GROK_INNER_SANDBOX_PROFILE,
                 "--always-approve",
                 "--disable-web-search",
                 "--no-memory",
                 "--no-subagents",
+                "--no-leader",
             ]
         );
     }
@@ -2284,7 +2575,7 @@ mod tests {
             [
                 "--no-auto-update",
                 "--sandbox",
-                "strict",
+                GROK_ACP_INNER_SANDBOX_PROFILE,
                 "--disable-web-search",
                 "agent",
                 "--always-approve",
@@ -2912,23 +3203,62 @@ mod tests {
     }
 
     #[test]
-    fn unauthenticated_public_models_catalog_fails_closed_before_advertising() {
-        const UNAUTHENTICATED_PUBLIC_PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
+    fn catalog_accepts_exact_misleading_banner_without_asserting_authentication() -> Result<()> {
+        // Parent capture: Grok 1.0.60, CAM work2, models exit 0. Neither banner
+        // nor any auth flag is a session-validity signal from this command.
+        const PAYLOAD: &[u8] = b"You are not authenticated.\n\nDefault model: grok-4.7\n\nAvailable models:\n  * grok-4.7 (default)\n  - grok-4.7-build-fast\n  - grok-4.6\n  - grok-4.5\n";
         assert_eq!(
-            sha256_hex(UNAUTHENTICATED_PUBLIC_PAYLOAD),
+            sha256_hex(PAYLOAD),
             "028d0f4e90faa109b2a8c061728829287302687df51a521b8d0226ef7856cf34"
         );
-        let error = parse_grok_model_catalog(UNAUTHENTICATED_PUBLIC_PAYLOAD)
-            .expect_err("unauthenticated public models listing must fail closed")
-            .to_string();
-        assert_eq!(error, GROK_CATALOG_OWNER_AUTHENTICATION_REQUIRED);
-        assert!(
-            !error.contains("grok-4.7")
-                && !error.contains("grok-4.6")
-                && !error.contains("grok-4.5")
-                && !error.contains("grok-4.7-build-fast"),
-            "{error}"
+        let spec = GrokCatalogCommandSpec::new("/workspace");
+        let runner = FakeRunner::successful(PAYLOAD);
+        let observation =
+            discover_grok_model_catalog(&runner, &spec, Some(CAPTURED_AT_UNIX_MILLIS))?;
+        assert_eq!(
+            observation.catalog().slugs().collect::<Vec<_>>(),
+            ["grok-4.7", "grok-4.7-build-fast", "grok-4.6", "grok-4.5"]
         );
+        assert_eq!(
+            observation.authentication_evidence(),
+            "not_asserted_by_catalog"
+        );
+        assert_eq!(
+            runner.observed_specs.borrow().as_slice(),
+            std::slice::from_ref(&spec)
+        );
+        let models = &PAYLOAD[PAYLOAD
+            .windows(b"Default model:".len())
+            .position(|w| w == b"Default model:")
+            .unwrap()..];
+        for banner in [
+            "",
+            "You are logged in with not a host.\n\n",
+            "has_cached_token=false\n",
+            "has_cached_token=true\n",
+            "You are not logged in.\n\n",
+        ] {
+            let bytes = [banner.as_bytes(), models].concat();
+            assert!(discover_grok_model_catalog(
+                &FakeRunner::successful(&bytes),
+                &spec,
+                Some(CAPTURED_AT_UNIX_MILLIS)
+            )?
+            .catalog()
+            .contains("grok-4.6"));
+        }
+        for payload in [
+            b"You are not authenticated.\n".as_slice(),
+            &PAYLOAD[..PAYLOAD.len() - 1],
+        ] {
+            assert!(discover_grok_model_catalog(
+                &FakeRunner::successful(payload),
+                &spec,
+                Some(CAPTURED_AT_UNIX_MILLIS)
+            )
+            .is_err());
+        }
+        Ok(())
     }
 
     #[test]
@@ -3008,11 +3338,6 @@ mod tests {
                     ],
                 ),
                 "more than one default marker",
-            ),
-            (
-                "invalid login provider",
-                b"You are logged in with not a host.\n\nDefault model: worker-stable\n\nAvailable models:\n  * worker-stable (default)\n".to_vec(),
-                "invalid login provider",
             ),
         ];
 
@@ -3446,6 +3771,106 @@ mod tests {
 
         let profile = source.bind_to_profile(ExternalGrokProfile::read_only(dir.path()))?;
         assert_eq!(profile.visible_read_only_files(), &[auth, config]);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_native_model_cache_is_projected_read_only_without_ambient_home() -> Result<()> {
+        use std::os::fd::AsRawFd;
+
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("selected-cam-home");
+        let workspace = dir.path().join("workspace");
+        fs::create_dir(&home)?;
+        fs::create_dir(&workspace)?;
+        let program = dir.path().join("grok-standin");
+        fs::write(&program, "")?;
+        let auth = home.join(GROK_AUTH_FILE);
+        let cache = home.join(GROK_MODEL_CACHE_FILE);
+        fs::write(&auth, "synthetic-auth")?;
+        let native_bytes = br#"{"models":{"grok-4.6":{"info":{"hidden":false}}},"native_identity":"preserve-verbatim"}"#;
+        fs::write(&cache, native_bytes)?;
+        fs::write(home.join("ambient-secret"), "must stay hidden")?;
+        let source = GrokCredentialSource::from_environment(None, Some(home.as_os_str()))?;
+        let held = source.model_cache.as_ref().expect("native cache admitted");
+        // SAFETY: these calls inspect flags on the live descriptor only.
+        let (flags, mode) = unsafe {
+            (
+                libc::fcntl(held.held_file.as_raw_fd(), libc::F_GETFD),
+                libc::fcntl(held.held_file.as_raw_fd(), libc::F_GETFL),
+            )
+        };
+        assert_ne!(flags & libc::FD_CLOEXEC, 0);
+        assert_eq!(mode & libc::O_ACCMODE, libc::O_RDONLY);
+        let profile = source.bind_to_profile(ExternalGrokProfile::read_only(&workspace))?;
+        assert_eq!(profile.visible_read_only_files(), &[auth, cache.clone()]);
+        assert!(profile.visible_read_only_roots().is_empty());
+        assert!(profile.visible_read_write_files().is_empty());
+        assert!(profile.visible_read_write_roots().is_empty());
+        let properties = crate::process_runner::external_grok_systemd_properties_for_test(
+            profile.with_visible_read_only_file(&program),
+            &program,
+            &workspace,
+        )?;
+        assert!(properties.contains(&format!("--property=InaccessiblePaths=-{}", home.display())));
+        let private_home = Path::new("/run/user/1000/maco-test-runtime");
+        let target = private_home.join(GROK_MODEL_CACHE_FILE);
+        assert!(properties.contains(&format!(
+            "--property=BindReadOnlyPaths={}:{}",
+            cache.display(),
+            target.display()
+        )));
+        assert!(properties.contains(&format!("--property=ReadOnlyPaths={}", target.display())));
+        assert!(!properties.contains(&format!("--property=BindReadOnlyPaths={}", home.display())));
+        assert_eq!(fs::read(cache)?, native_bytes);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn grok_native_model_cache_absence_and_unsafe_sources_fail_honestly() -> Result<()> {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir()?;
+        let home = dir.path().join("selected-cam-home");
+        fs::create_dir(&home)?;
+        fs::write(home.join(GROK_AUTH_FILE), "synthetic-auth")?;
+        let source = GrokCredentialSource::from_environment(None, Some(home.as_os_str()))?;
+        assert!(
+            source.model_cache.is_none(),
+            "absence must not invent a cache"
+        );
+        let cache = home.join(GROK_MODEL_CACHE_FILE);
+        let external = dir.path().join("external-cache");
+        fs::write(&external, "cache-fixture")?;
+        symlink(&external, &cache)?;
+        let error =
+            GrokCredentialSource::from_environment(None, Some(home.as_os_str())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok model cache source models_cache.json is unavailable"
+        );
+        fs::remove_file(&cache)?;
+        fs::create_dir(&cache)?;
+        let error =
+            GrokCredentialSource::from_environment(None, Some(home.as_os_str())).unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok model cache source models_cache.json is not a regular file"
+        );
+        fs::remove_dir(&cache)?;
+        fs::write(&cache, "original-cache")?;
+        let source = GrokCredentialSource::from_environment(None, Some(home.as_os_str()))?;
+        fs::rename(&external, &cache)?;
+        let error = source
+            .bind_to_profile(ExternalGrokProfile::read_only(dir.path()))
+            .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "Grok model cache source models_cache.json identity changed"
+        );
+        assert!(!format!("{error:#?}").contains(home.to_str().unwrap()));
         Ok(())
     }
 

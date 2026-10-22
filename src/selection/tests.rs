@@ -318,6 +318,45 @@ fn loaded_policy_preserves_current_role_prohibition_and_permitted_role() -> anyh
 }
 
 #[test]
+fn loaded_policy_unknown_models_fail_closed_for_judgment_roles() -> anyhow::Result<()> {
+    let mut receipt = loaded_policy_test_receipt()?;
+    for (role, authority) in [
+        ("supervisor", AuthorityRole::AcceptanceGate),
+        ("child_orchestrator", AuthorityRole::Delegating),
+        ("auditor", AuthorityRole::ReviewAuditor),
+        ("auditor", AuthorityRole::Audit),
+        ("supervisor", AuthorityRole::ConflictResolution),
+        ("gate_classifier", AuthorityRole::FailureClassification),
+        ("supervisor", AuthorityRole::GitPublication),
+        ("supervisor", AuthorityRole::UnknownJudgment),
+    ] {
+        receipt.role = role.into();
+        let mut input = base_input();
+        input.task.authority_role = authority;
+        input.catalogs = vec![catalog(
+            "grok",
+            "observed-menu",
+            &input.task.task_class,
+            authority,
+            &[("unknown-grok-model", &[ReasoningEffort::Xhigh], true)],
+        )];
+        input.pools = vec![pool("grok", 0)];
+        let decision = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        assert_eq!(decision.status, DecisionStatus::FailClosed, "{role}");
+        assert!(decision.choice.is_none());
+        assert_eq!(decision.candidate_set.len(), 1);
+        let candidate = &decision.candidate_set[0];
+        assert!(!candidate.eligible);
+        assert!(candidate.score.is_none());
+        assert!(candidate
+            .ineligibility_reasons
+            .iter()
+            .any(|reason| reason.code == IneligibilityCode::MissingDatedPrior));
+    }
+    Ok(())
+}
+
+#[test]
 fn loaded_policy_unknown_model_none_effort_is_honest_and_exactly_authorized() -> anyhow::Result<()>
 {
     use super::routing_policy::*;
@@ -1280,10 +1319,10 @@ fn current_sol_passes_judgment_admission_while_astra_is_prohibited() -> anyhow::
 }
 
 #[test]
-fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> anyhow::Result<()> {
+fn no_prior_astra_is_refused_by_loaded_policy_and_legacy_selector() -> anyhow::Result<()> {
     let receipt = loaded_policy_test_receipt()?;
     let mut input = current_codex_input(AuthorityRole::AcceptanceGate);
-    // Reproduce the pre-prohibition dataset with only the unmeasured candidate available.
+    // Removing the dated prohibition cannot grant an unknown model judgment authority.
     input
         .priors
         .models
@@ -1304,15 +1343,18 @@ fn no_prior_astra_is_selectable_by_loaded_policy_but_not_legacy_selector() -> an
         .iter()
         .any(|reason| reason.code == IneligibilityCode::MissingDatedPrior)));
     let loaded = select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
-    assert_eq!(
-        loaded
-            .choice
-            .as_ref()
-            .expect("unmeasured policy choice")
-            .candidate
-            .model,
-        "gpt-6-astra"
-    );
+    assert!(loaded.choice.is_none());
+    assert!(!loaded.candidate_set.is_empty());
+    assert!(loaded.candidate_set.iter().all(|evaluation| {
+        !evaluation.eligible
+            && evaluation.score.is_none()
+            && evaluation.ineligibility_reasons.iter().any(|reason| {
+                reason.code == IneligibilityCode::MissingDatedPrior
+                    && reason
+                        .detail
+                        .contains("judgment authority requires a dated model prior")
+            })
+    }));
     Ok(())
 }
 
@@ -1448,6 +1490,62 @@ fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_overrid
                 ChoiceReason::OneShotEnvironmentFallback
             );
             assert_eq!(control.environment_fallback.unwrap().target, target);
+            if authority != AuthorityRole::TerminalLeaf {
+                // The source declaration authorizes only this unused transition,
+                // never ordinary unknown-model judgment or a debug override.
+                for invalidation in 0..5 {
+                    let mut invalid = no_prior.clone();
+                    match invalidation {
+                        0 => {
+                            invalid.signals.environment_rejections[0].fallback_transition_used =
+                                true
+                        }
+                        1 => {
+                            invalid.signals.environment_rejections[0].rejection_code =
+                                "different_rejection".into()
+                        }
+                        2 => invalid.signals.previous_choice = None,
+                        3 => invalid
+                            .priors
+                            .models
+                            .iter_mut()
+                            .find(|prior| prior.model == "gpt-6.1-sol")
+                            .unwrap()
+                            .one_shot_environment_fallbacks
+                            .clear(),
+                        4 => {
+                            invalid.constraints.allow_debug_override = true;
+                            invalid.debug_override = Some(DebugOverride {
+                                candidate: target.clone(),
+                                requested_by: "test operator".into(),
+                                reason: "fallback is not debug judgment authority".into(),
+                            });
+                        }
+                        _ => unreachable!(),
+                    }
+                    let denied = select_with_loaded_routing_policy(&invalid, &[], Some(&receipt))?;
+                    assert!(
+                        denied
+                            .choice
+                            .as_ref()
+                            .is_none_or(|choice| choice.candidate.model != target.model),
+                        "{authority:?}, case {invalidation}"
+                    );
+                    assert!(denied.environment_fallback.is_none());
+                    assert!(
+                        denied
+                            .candidate_set
+                            .iter()
+                            .filter(|evaluation| { evaluation.candidate.model == target.model })
+                            .all(|evaluation| !evaluation.eligible
+                                && evaluation.score.is_none()
+                                && evaluation.ineligibility_reasons.iter().any(|reason| {
+                                    reason.code == IneligibilityCode::MissingDatedPrior
+                                })),
+                        "{authority:?}, case {invalidation}"
+                    );
+                }
+            }
         }
         for routing in [None, Some(&receipt)] {
             let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
