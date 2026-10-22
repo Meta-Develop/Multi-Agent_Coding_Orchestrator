@@ -2,8 +2,12 @@
 
 import copy
 import importlib.util
+import json
 from pathlib import Path
+import subprocess
+import tempfile
 import unittest
+from unittest.mock import patch
 
 SPEC = importlib.util.spec_from_file_location(
     "desktop_supply_chain", Path(__file__).resolve().parents[1] / "check_desktop_supply_chain.py"
@@ -89,10 +93,29 @@ class DesktopSupplyChainTests(unittest.TestCase):
                 MODULE.check_report(report, [self.entry])
 
     def test_last_exception_can_be_removed_after_upstream_fix(self):
-        self.manifest["package"].pop("metadata")
-        self.policy["advisories"]["ignore"] = []
-        self.assertEqual(self.check(), [])
-        MODULE.check_report({"vulnerabilities": {"found": False, "list": []}, "warnings": {}}, [])
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            desktop = root / "account-manager/src-tauri"
+            desktop.mkdir(parents=True)
+            (root / ".cargo").mkdir()
+            (desktop / "Cargo.toml").write_text('[package]\nname = "desktop"\n')
+            (desktop / "Cargo.lock").write_text('package = []\n')
+            (desktop / "deny.toml").write_text(
+                '[advisories]\nignore = []\nunused-ignored-advisory = "deny"\nunsound = "all"\n'
+            )
+            for file in (root / ".cargo/audit.toml", root / "deny.toml"):
+                file.write_text('[advisories]\nignore = []\n')
+            report = {"vulnerabilities": {"found": False, "list": []}, "warnings": {}}
+            results = [subprocess.CompletedProcess([], 0, json.dumps(report))]
+            results += [subprocess.CompletedProcess([], 0)] * 2
+            with (
+                patch.object(MODULE, "__file__", str(root / "scripts/check_desktop_supply_chain.py")),
+                patch.object(MODULE.sys, "argv", ["check_desktop_supply_chain.py"]),
+                patch.object(MODULE.subprocess, "run", side_effect=results) as run,
+            ):
+                self.assertEqual(MODULE.main(), 0)
+                self.assertEqual(run.call_count, 3)
+                self.assertNotIn("--ignore", run.call_args_list[1].args[0])
 
 
 if __name__ == "__main__":
