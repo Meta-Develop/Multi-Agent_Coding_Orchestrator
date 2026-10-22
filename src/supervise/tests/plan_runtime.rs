@@ -5239,6 +5239,32 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     assert!(report.review_lens_usage.iter().all(|usage| {
         usage.observation == RoleUsageObservation::ProcessObserved && usage.usage.is_some()
     }));
+    let lens_usage = report
+        .review_lens_usage
+        .iter()
+        .map(|row| (row.lens_id.as_str(), row.usage))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(
+        lens_usage,
+        BTreeMap::from([
+            (
+                "diff-security",
+                Some(Usage {
+                    input_tokens: 100,
+                    output_tokens: 20,
+                    total_tokens: 120,
+                }),
+            ),
+            (
+                "report-consistency",
+                Some(Usage {
+                    input_tokens: 200,
+                    output_tokens: 40,
+                    total_tokens: 240,
+                }),
+            ),
+        ])
+    );
     assert_eq!(
         report.review_lens_total_usage,
         Some(Usage {

@@ -901,7 +901,9 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
     skip_without_containment!();
     #[derive(Default)]
     struct BlockState {
+        child_a_started: bool,
         child_c_started: bool,
+        child_c_parent_review_started: bool,
     }
 
     let (temp, repo_path) = injected_repository();
@@ -927,7 +929,9 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
     let runner = {
         let assignments = assignments.clone();
         let state = Arc::clone(&state);
-        move |command: &ExternalAgentCommand| {
+        move |command: &ExternalAgentCommand,
+              cancellation: &ProcessCancellation,
+              _review_runtime: Option<ExternalPreActionReviewRuntime<'_>>| {
             let id = injected_command_assignment_id(command);
             if let Some(assignment) = assignments
                 .iter()
@@ -939,6 +943,16 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
                     &command.output_last_message,
                     &injected_auditor_report(assignment, &child),
                 );
+                if assignment.id == "child-c" {
+                    let (lock, condvar) = &*state;
+                    let mut block = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    assert!(
+                        block.child_a_started,
+                        "sibling invocation scratch must be live"
+                    );
+                    block.child_c_parent_review_started = true;
+                    condvar.notify_all();
+                }
                 return injected_verified_run(command);
             }
             let (lock, condvar) = &*state;
@@ -946,12 +960,37 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
             if id == "child-c" {
                 block.child_c_started = true;
                 condvar.notify_all();
+                // C may reach its runner before A's thread is scheduled. Do
+                // not let it complete until A owns live invocation scratches.
+                block = wait_for_fixture_state(
+                    condvar,
+                    block,
+                    |block| block.child_a_started,
+                    "semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead",
+                    "semantic-block-dispatch-order",
+                    "child-a holds invocation scratch",
+                    Duration::from_secs(120),
+                );
             } else if id == "child-a" {
-                while !block.child_c_started {
-                    block = condvar
-                        .wait(block)
+                block.child_a_started = true;
+                condvar.notify_all();
+                // Keep A's invocation scratch live until C has authenticated its
+                // completed transcript and entered parent review. Cancellation
+                // also releases A if authentication fails, so the old behavior
+                // produces a failed report rather than a deadlocked fixture.
+                let deadline = Instant::now() + Duration::from_secs(120);
+                while !block.child_c_parent_review_started && !cancellation.is_cancelled() {
+                    if Instant::now() >= deadline {
+                        if !block.child_c_started {
+                            panic!("child-c runner did not start");
+                        }
+                        panic!("child-c parent review did not start");
+                    }
+                    (block, _) = condvar
+                        .wait_timeout(block, Duration::from_millis(25))
                         .unwrap_or_else(|poisoned| poisoned.into_inner());
                 }
+                assert!(block.child_c_started || cancellation.is_cancelled());
             }
             drop(block);
             let assignment = assignments
@@ -967,7 +1006,7 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
         #[cfg(target_os = "linux")]
         let _selected_fixture = selected_concurrent_injected_fixture(&plan, &options, &temp)
             .expect("hold explicit selected concurrent fixture");
-        run_supervisor_plan_with_concurrent_runner(
+        run_supervisor_plan_with_concurrent_cancellable_runner(
             plan,
             SupervisorConsultantPlan::default(),
             options,
@@ -977,6 +1016,7 @@ fn semantic_block_claims_follow_actual_dispatch_order_with_overlap_scan_ahead() 
     }
     .expect("run deterministic semantic Block scheduling");
     assert!(report.success, "unexpected failed report: {report:#?}");
+    assert!(state.0.lock().unwrap().child_c_parent_review_started);
     assert_eq!(
         report
             .released_semantic_intents

@@ -5143,6 +5143,58 @@ fn retained_review_transcript_refuses_input_above_supervisor_report_limit() {
 }
 
 #[test]
+fn retained_review_transcript_authenticates_while_sibling_invocation_scratch_is_open() {
+    let (_temp, repo_path) = injected_repository();
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        RunId::new("review-transcript-live-sibling").unwrap(),
+        "supervise-test",
+    )
+    .expect("reserve shared artifact writer");
+    let transcript_relative = Path::new("logs/child-c.jsonl");
+    let transcript = "completed child-c transcript\n";
+    writer
+        .write_bytes(
+            transcript_relative,
+            transcript.as_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .expect("retain child-c transcript");
+    let mut journal = None;
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
+    let artifacts = Mutex::new(SharedSupervisorArtifacts {
+        writer: &mut writer,
+        journal: &mut journal,
+        autonomy_kpis: &mut autonomy_kpis,
+        checkpoint: None,
+    });
+    let sibling_scratch = with_supervisor_artifacts(&artifacts, |writer, _| {
+        writer.create_supervisor_invocation_scratch_dir("capture-assignment-0000-attempt-01")
+    })
+    .expect("hold child-a invocation scratch open");
+    fs::write(sibling_scratch.path().join("stdout.jsonl"), b"in flight")
+        .expect("sibling is still producing evidence");
+    let authenticated = with_supervisor_artifacts(&artifacts, |writer, _| {
+        assert!(
+            writer.resume_binding().is_err(),
+            "checkpoint must still refuse live scratch"
+        );
+        read_authenticated_review_transcript(writer, transcript_relative)
+    });
+    with_supervisor_artifacts(&artifacts, |writer, _| {
+        writer.discard_scratch(&sibling_scratch)?;
+        writer.resume_binding()?;
+        Ok(())
+    })
+    .expect("quiescent writer becomes resumable");
+    assert_eq!(
+        authenticated.expect("parent review authenticates child-c independently"),
+        transcript
+    );
+}
+
+#[test]
 fn retained_review_transcript_manifest_authentication_refuses_tampering() {
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("review-transcript-tamper").expect("valid run id");
@@ -5168,14 +5220,35 @@ fn retained_review_transcript_manifest_authentication_refuses_tampering() {
         transcript
     );
 
+    for tampered in [b"truncated".to_vec(), vec![b'f'; transcript.len()]] {
+        fs::write(writer.run_dir().join(transcript_relative), tampered)
+            .expect("tamper transcript fixture");
+        let error = read_authenticated_review_transcript(&mut writer, transcript_relative)
+            .expect_err("length or hash mismatch must be refused before review reads it");
+        assert!(error
+            .to_string()
+            .contains("failed to authenticate retained transcript artifact manifest before read"));
+        assert!(format!("{error:#}").contains("digest/length does not match its manifest"));
+    }
+
+    let unregistered = Path::new("logs/forged.jsonl");
+    fs::write(writer.run_dir().join(unregistered), b"forged transcript")
+        .expect("write unregistered transcript");
+    let error = read_authenticated_review_transcript(&mut writer, unregistered)
+        .expect_err("unregistered transcript must be refused before read");
+    assert!(error.to_string().contains("before read"));
+    assert!(format!("{error:#}").contains("not registered"));
+
+    let scratch = writer.create_scratch_dir("still-writing").unwrap();
     fs::write(
-        writer.run_dir().join(transcript_relative),
-        b"tampered transcript",
+        scratch.path().join("stdout.jsonl"),
+        b"unfinished transcript",
     )
-    .expect("tamper transcript fixture");
-    let error = read_authenticated_review_transcript(&mut writer, transcript_relative)
-        .expect_err("tampered transcript must be refused");
-    assert!(error
-        .to_string()
-        .contains("failed to authenticate retained transcript artifact manifest before read"));
+    .unwrap();
+    let error =
+        read_authenticated_review_transcript(&mut writer, Path::new("still-writing/stdout.jsonl"))
+            .expect_err("live scratch transcript must be refused before read");
+    assert!(error.to_string().contains("before read"));
+    assert!(format!("{error:#}").contains("outstanding scratch"));
+    writer.discard_scratch(&scratch).unwrap();
 }

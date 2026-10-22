@@ -12,6 +12,101 @@ fn sha256_matches_standard_vector() {
 }
 
 #[test]
+fn authenticated_file_read_refuses_its_own_poisoned_append_without_requiring_run_quiescence() {
+    let (_temp, repo) = committed_repo();
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        RunId::new("authenticated-read-poison").unwrap(),
+        "supervise",
+    )
+    .unwrap();
+    let transcript = Path::new("logs/child-c.jsonl");
+    let sibling = Path::new("logs/child-a.jsonl");
+    for path in [transcript, sibling] {
+        writer
+            .write_bytes(
+                path,
+                b"completed\n",
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+    }
+    // Even if disk bytes happen to match the old manifest, an unrecovered
+    // append must not be treated as durable, authenticated evidence.
+    writer.poisoned_appends.insert(transcript.to_path_buf());
+    let error = writer.read_authenticated(transcript, 1024).unwrap_err();
+    assert!(error.to_string().contains("poisoned"));
+    assert!(writer.resume_binding().is_err());
+
+    writer.poisoned_appends.remove(transcript);
+    writer.poisoned_appends.insert(sibling.to_path_buf());
+    assert_eq!(
+        writer.read_authenticated(transcript, 1024).unwrap(),
+        b"completed\n"
+    );
+    assert!(writer.resume_binding().is_err());
+    let run = writer.run_dir().to_path_buf();
+    let error = writer.finalize(transcript, false).unwrap_err();
+    assert!(error.to_string().contains("poisoned append"));
+    assert!(!run.join(FINALIZATION_MARKER).exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn authenticated_file_read_preserves_private_path_and_writer_lock_custody() {
+    use std::os::unix::fs::symlink;
+
+    let (_temp, repo) = committed_repo();
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        RunId::new("authenticated-read-custody").unwrap(),
+        "supervise",
+    )
+    .unwrap();
+    let relative = Path::new("logs/child-c.jsonl");
+    writer
+        .write_bytes(
+            relative,
+            b"completed\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .unwrap();
+    let path = writer.run_dir().join(relative);
+    let parent = path.parent().unwrap();
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(writer
+        .read_authenticated(relative, 1024)
+        .unwrap_err()
+        .to_string()
+        .contains("owner-private"));
+    fs::set_permissions(parent, fs::Permissions::from_mode(0o700)).unwrap();
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o644)).unwrap();
+    assert!(writer
+        .read_authenticated(relative, 1024)
+        .unwrap_err()
+        .to_string()
+        .contains("owner-private"));
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+    let saved = parent.join("saved.jsonl");
+    fs::rename(&path, &saved).unwrap();
+    symlink(&saved, &path).unwrap();
+    assert!(writer.read_authenticated(relative, 1024).is_err());
+    fs::remove_file(&path).unwrap();
+    fs::rename(saved, &path).unwrap();
+    assert_eq!(
+        writer.read_authenticated(relative, 1024).unwrap(),
+        b"completed\n"
+    );
+
+    let lock_path = writer.run_dir().join(RUN_LOCK_FILE);
+    fs::rename(&lock_path, writer.run_dir().join("saved.lock")).unwrap();
+    fs::write(lock_path, b"replacement").unwrap();
+    assert!(writer.read_authenticated(relative, 1024).is_err());
+}
+
+#[test]
 fn supervisor_invocation_scratch_names_require_the_full_canonical_grammar() {
     let valid = [
         "incoming",
