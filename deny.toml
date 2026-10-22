@@ -80,8 +80,8 @@ allow-workspace = true
 deny = []
 skip = [
     # digest 0.10 / dbus-secret-service (keyring crypto-rust) vs RustCrypto 0.2 (chacha20poly1305).
-    { name = "block-buffer", version = "=0.10.4", reason = "Pinned by digest 0.10.7 for argon2, sha2, and dbus-secret-service via keyring@3.6.3; chacha20poly1305@0.11 requires block-buffer 0.12." },
-    { name = "cipher", version = "=0.4.4", reason = "dbus-secret-service aes/cbc via keyring@3.6.3; CAM encrypted store uses cipher 0.5 through chacha20poly1305@0.11." },
+    { name = "block-buffer", version = "=0.10.4", reason = "Pinned by digest 0.10.7 for argon2, sha2, and dbus-secret-service via the explicit dbus keyring store; chacha20poly1305@0.11 requires block-buffer 0.12." },
+    { name = "cipher", version = "=0.4.4", reason = "dbus-secret-service aes/cbc via the explicit dbus keyring store; CAM encrypted store uses cipher 0.5 through chacha20poly1305@0.11." },
     { name = "crypto-common", version = "=0.1.7", reason = "digest 0.10 stack for keyring/argon2; chacha20poly1305 pulls crypto-common 0.2.2." },
     { name = "cpufeatures", version = "=0.2.17", reason = "sha2/argon2/dbus-secret-service on digest 0.10; poly1305/chacha20 on cpufeatures 0.3." },
     { name = "inout", version = "=0.1.4", reason = "cipher 0.4 inout for dbus-secret-service; cipher 0.5 inout 0.2 for chacha20poly1305." },
@@ -91,10 +91,6 @@ skip = [
     { name = "getrandom", version = "=0.4.3", reason = "crypto-common 0.2 for chacha20poly1305 and tempfile 3.27 dev/runtime paths." },
     { name = "r-efi", version = "=5.3.0", reason = "Target getrandom 0.3.4 in libgit2-sys/cc/aws-lc-sys build graph." },
     { name = "r-efi", version = "=6.0.0", reason = "Target getrandom 0.4.3 for crypto-common 0.2 and tempfile." },
-    # keyring@3.6.3 platform deps vs reqwest rustls-platform-verifier stack.
-    { name = "core-foundation", version = "=0.9.4", reason = "keyring apple-native; rustls-platform-verifier uses core-foundation 0.10." },
-    { name = "security-framework", version = "=2.11.1", reason = "keyring apple-native; rustls-native-certs uses security-framework 3.7." },
-    { name = "windows-sys", version = "=0.60.2", reason = "keyring windows-native; workspace root and tokio/clap use windows-sys 0.61.2." },
 ]
 skip-tree = [
     { crate = "syn:>=2,<3", depth = 0, reason = "Newer serde_derive and clap_derive require syn 3 while the workspace and remaining proc-macro graph still require syn 2." },

@@ -48,6 +48,9 @@ jobs:
       - name: Verify Cargo.lock is current
         run: cargo metadata --locked --format-version 1 > /dev/null
 
+      - name: Require encrypted keyring sessions and no advisory exceptions in both workspaces
+        run: python3 scripts/check_keyring_crypto.py
+
       - name: Verify the locked release package
         run: cargo package --locked --workspace --no-default-features
 

@@ -5,14 +5,22 @@
 //! preferred store; the encrypted-file store exists only for hosts where no
 //! Secret Service is running — headless Linux, for example.
 //!
-//! The `keyring` crate supplies the three platform integrations. Its errors are
+//! The keyring-core API uses explicitly selected native stores. Its errors are
 //! never forwarded verbatim: `keyring::Error::BadEncoding` carries the stored
 //! bytes and `Ambiguous` carries whole credential records, so forwarding
 //! `Display` output would put secret material into a message the user sees
 //! (`NFR-1`, threat T2). [`store_error`] maps each variant to wording of our
 //! own and drops every payload.
 
-use keyring::Entry;
+use keyring::{api::CredentialStoreApi, Entry};
+use keyring_core as keyring;
+
+#[cfg(target_os = "macos")]
+use apple_native_keyring_store::keychain::Store as NativeStore;
+#[cfg(any(target_os = "linux", target_os = "freebsd", target_os = "openbsd"))]
+use dbus_secret_service_keyring_store::Store as NativeStore;
+#[cfg(target_os = "windows")]
+use windows_native_keyring_store::Store as NativeStore;
 
 use super::{CredentialStore, Secret, SecretRef};
 use crate::error::{Error, Result};
@@ -32,12 +40,44 @@ const SERVICE: &str = "coding-agent-manager";
 /// `NoEntry` answer instead of requiring a write.
 const AVAILABILITY_PROBE_ENTRY: &str = "availability-probe (never stored)";
 
+// Build through an explicit store, never the process-global default (which
+// another library can replace). Keep the legacy service/user naming and each
+// platform store's default configuration so existing credentials remain visible.
+#[cfg(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "windows"
+))]
+fn native_entry(user: &str) -> keyring::Result<Entry> {
+    let store = NativeStore::new()?;
+    entry_in_store(store.as_ref(), user)
+}
+
+#[cfg(not(any(
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+    target_os = "macos",
+    target_os = "windows"
+)))]
+fn native_entry(_: &str) -> keyring::Result<Entry> {
+    Err(keyring::Error::NotSupportedByStore(
+        "no native credential store for this platform".to_owned(),
+    ))
+}
+
+fn entry_in_store(store: &dyn CredentialStoreApi, user: &str) -> keyring::Result<Entry> {
+    store.build(SERVICE, user, None)
+}
+
 #[derive(Debug, Default)]
 pub struct KeychainStore;
 
 impl KeychainStore {
     fn entry(&self, key: &SecretRef) -> Result<Entry> {
-        Entry::new(SERVICE, &key.0).map_err(|error| store_error("open", error))
+        native_entry(&key.0).map_err(|error| store_error("open", error))
     }
 }
 
@@ -47,7 +87,7 @@ impl CredentialStore for KeychainStore {
     }
 
     fn is_available(&self) -> bool {
-        let Ok(entry) = Entry::new(SERVICE, AVAILABILITY_PROBE_ENTRY) else {
+        let Ok(entry) = native_entry(AVAILABILITY_PROBE_ENTRY) else {
             return false;
         };
         // A read of a name that was never stored. A backend that answers "no
@@ -115,6 +155,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn explicit_store_preserves_entry_names_and_secret_operations() {
+        let store = keyring::mock::Store::new().expect("isolated in-memory store");
+        let user = "migration-fixture";
+        let entry = entry_in_store(store.as_ref(), user).expect("entry");
+        assert_eq!(
+            entry.get_specifiers(),
+            Some((SERVICE.to_owned(), user.to_owned()))
+        );
+        entry.set_secret(b"FAKE-migration-secret").expect("write");
+        assert_eq!(entry.get_secret().expect("read"), b"FAKE-migration-secret");
+        entry.delete_credential().expect("delete");
+        assert!(matches!(entry.get_secret(), Err(keyring::Error::NoEntry)));
+    }
+
+    #[test]
+    fn new_error_payloads_are_not_forwarded() {
+        let error = keyring::Error::BadDataFormat(
+            b"FAKE-secret".to_vec(),
+            Box::new(std::io::Error::other("FAKE-platform-payload")),
+        );
+        let message = store_error("read", error).to_string();
+        assert!(!message.contains("FAKE"), "{message}");
+    }
+
+    #[test]
     fn errors_describe_the_kind_of_failure_and_the_operation() {
         let error = store_error("read", keyring::Error::NoEntry);
         let message = error.to_string();
@@ -124,9 +189,8 @@ mod tests {
 
     #[test]
     fn error_mapping_never_forwards_stored_bytes() {
-        // `BadEncoding` is the variant that carries the secret itself, so it is
-        // the one worth pinning: `keyring`'s own `Display` would print the byte
-        // vector, and this test fails the moment anyone forwards it.
+        // Error payloads can carry the stored secret. Keep them private even
+        // when a library changes how it formats those payloads.
         let stored = b"FAKE-access-token-0001".to_vec();
         let message = store_error("read", keyring::Error::BadEncoding(stored)).to_string();
         assert!(!message.contains("FAKE"), "{message}");
