@@ -180,10 +180,37 @@ fn verify_manifest_contents<'a>(
 }
 
 fn read_and_verify_record(run: &SafeRoot, record: &ArtifactFileRecord) -> Result<Vec<u8>> {
+    read_and_verify_record_with_limit(run, record, MAX_ARTIFACT_FILE_BYTES)
+}
+
+fn verify_private_artifact_read_path(run: &SafeRoot, relative: &Path) -> Result<FileIdentity> {
+    ensure_private_directory(run.path())?;
+    let mut directory = run.path().to_path_buf();
+    if let Some(parent) = relative.parent() {
+        for component in parent.components() {
+            directory.push(component);
+            ensure_private_directory(&directory)?;
+            ensure_same_device(
+                &fs::symlink_metadata(&directory)?,
+                run.identity().device,
+                &directory,
+            )?;
+        }
+    }
+    let path = run.path().join(relative);
+    let identity = ensure_private_regular_file(&path)?;
+    ensure_same_device(&fs::symlink_metadata(&path)?, run.identity().device, &path)?;
+    Ok(identity)
+}
+
+fn read_and_verify_record_with_limit(
+    run: &SafeRoot,
+    record: &ArtifactFileRecord,
+    max_bytes: u64,
+) -> Result<Vec<u8>> {
     let (_parent, _file_name) = artifact_parent_and_name(run, &record.path, false)?;
     ensure_private_regular_file(&run.path().join(&record.path))?;
-    let contents =
-        BoundedRegularReader::read_relative(run.path(), &record.path, MAX_ARTIFACT_FILE_BYTES)?;
+    let contents = BoundedRegularReader::read_relative(run.path(), &record.path, max_bytes)?;
     if u64::try_from(contents.len()).unwrap_or(u64::MAX) != record.bytes
         || sha256_hex(&contents) != record.sha256
     {

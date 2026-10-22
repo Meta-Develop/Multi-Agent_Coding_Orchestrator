@@ -887,6 +887,48 @@ impl ArtifactRunWriter {
         self.run.path()
     }
 
+    /// Reads one manifested artifact while sibling invocations may still own
+    /// scratch directories. The caller must retain exclusive access to this
+    /// writer throughout the read; no manifest update or append can interleave.
+    /// Run-wide checkpoint/resume/finalization boundaries still use their full
+    /// tree audits and require every scratch and poisoned append to be resolved.
+    pub(crate) fn read_authenticated(&self, relative: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+        self.run_lock.verify(&self.run)?;
+        let result = (|| -> Result<Vec<u8>> {
+            let relative = validate_artifact_relative_path(relative)?;
+            if self
+                .outstanding_scratches
+                .keys()
+                .any(|scratch| artifact_path_starts_with(&relative, scratch))
+            {
+                bail!("artifact read path overlaps an outstanding scratch directory");
+            }
+            if self.poisoned_appends.contains(&relative) {
+                bail!("artifact read path is poisoned by an unrecovered prior append");
+            }
+            let record = self
+                .files
+                .get(&relative)
+                .context("artifact read path is not registered in the writer manifest")?;
+            let max_bytes = u64::try_from(max_bytes).context("artifact read limit overflow")?;
+            if record.bytes > max_bytes {
+                bail!("artifact file exceeds its configured {max_bytes} byte limit");
+            }
+
+            // Preserve the selected path's privacy and directory/lock identity
+            // checks without auditing unrelated, actively written scratch trees.
+            verify_writer_evidence(&self.writer_evidence, &self.run_root, &self.run)?;
+            let before = verify_private_artifact_read_path(&self.run, &relative)?;
+            let contents = read_and_verify_record_with_limit(&self.run, record, max_bytes)?;
+            if verify_private_artifact_read_path(&self.run, &relative)? != before {
+                bail!("artifact file identity changed during authenticated read");
+            }
+            verify_writer_evidence(&self.writer_evidence, &self.run_root, &self.run)?;
+            Ok(contents)
+        })();
+        finish_with_artifact_lock_verification(result, self.run_lock.verify(&self.run))
+    }
+
     /// Reserves one owner-private, child-writable scratch directory directly
     /// beneath this run. Only a canonical single-component name is accepted so
     /// cleanup can remain handle-relative and identity-bound. A launcher must

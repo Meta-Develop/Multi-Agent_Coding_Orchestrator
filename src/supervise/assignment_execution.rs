@@ -269,25 +269,13 @@ pub(super) fn read_authenticated_review_transcript(
     {
         bail!("review transcript artifact path is not canonical relative form");
     }
-    let before = writer
-        .resume_binding()
-        .context("failed to authenticate retained transcript artifact manifest before read")?;
-    let transcript_path = writer.run_dir().join(transcript_relative);
     // Authenticate and decode the complete retained evidence under the supervisor-report cap.
     // Only the later review-lens request is excerpted to its smaller, independent request limit.
-    let bytes = read_bounded_regular_file_nofollow(&transcript_path, MAX_SUPERVISOR_REPORT_BYTES)
-        .with_context(|| {
-        format!(
-            "failed to read retained child transcript {}",
-            transcript_path.display()
-        )
-    })?;
-    let after = writer
-        .resume_binding()
-        .context("failed to authenticate retained transcript artifact manifest after read")?;
-    if before != after {
-        bail!("retained transcript artifact manifest changed while it was read");
-    }
+    // The shared writer remains locked by the caller. Authenticate the exact bytes
+    // before allowing review to read them, independently of sibling scratch state.
+    let bytes = writer
+        .read_authenticated(transcript_relative, MAX_SUPERVISOR_REPORT_BYTES)
+        .context("failed to authenticate retained transcript artifact manifest before read")?;
     String::from_utf8(bytes).context("child transcript evidence is not valid UTF-8")
 }
 
