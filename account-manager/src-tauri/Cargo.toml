@@ -24,12 +24,12 @@ path = "src/main.rs"
 required-features = ["desktop"]
 
 [build-dependencies]
-tauri-build = { version = "2", features = [], optional = true }
+tauri-build = { version = "2.7.4", features = [], optional = true }
 
 [dependencies]
 coding_agent_manager_core = { package = "coding-agent-manager", path = "../core", version = "0.1.0", default-features = false }
-tauri = { version = "2", features = [], optional = true }
-tauri-plugin-opener = { version = "2", optional = true }
+tauri = { version = "2.12.5", features = [], optional = true }
+tauri-plugin-opener = { version = "2.7.2", optional = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 thiserror = "2"
@@ -50,3 +50,41 @@ lto = true
 opt-level = "s"
 panic = "abort"
 strip = true
+
+# Desktop-only, version-exact dispositions checked before either audit tool runs.
+# Root audit/deny remain exception-free. See ../docs/DEPENDENCY_AUDIT.md.
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2024-0370"
+package = "proc-macro-error"
+version = "1.0.4"
+reason = "GTK3 glib-macros/gtk3-macros build dependency; no patched 1.x release."
+removal = "Remove when Tauri no longer needs the GTK3 0.18 macro stack."
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2024-0429"
+package = "glib"
+version = "0.18.5"
+reason = "Tauri 2.12 uses GTK3 0.18; patched glib >=0.20 is incompatible. No application call to VariantStrIter/array_iter_str was found; this is not proof of unreachability."
+removal = "Remove when Tauri supports a patched GLib binding without replacing the desktop runtime."
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2026-0371"
+package = "zbus_names"
+version = "4.3.4"
+reason = "opener 2.7.2 requires zbus 5; these types are used by its Linux file-manager D-Bus integration. No patched standalone crate exists."
+removal = "Remove when a released opener uses zbus 6 or removes this dependency."
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2026-0370"
+package = "zvariant"
+version = "5.15.0"
+reason = "opener 2.7.2 requires zbus 5 and its D-Bus serialization; no patched standalone crate exists."
+removal = "Remove when a released opener uses zbus 6 or removes this dependency."
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2026-0372"
+package = "zvariant_derive"
+version = "5.15.0"
+reason = "Build-time derives for the opener zbus 5 serialization stack; no patched standalone crate exists."
+removal = "Remove when a released opener uses zbus 6 or removes this dependency."
