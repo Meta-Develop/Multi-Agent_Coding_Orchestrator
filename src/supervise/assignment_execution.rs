@@ -2146,6 +2146,7 @@ pub(super) fn bind_worker_journal_artifacts(
     journal_paths: Vec<PathBuf>,
 ) -> Result<ExternalAgentCommand> {
     let worker_journal_subject_ids = assignment_worker_journal_subject_ids(assignment)?;
+    command.worker_change_required = scheduler::assignment_requires_file_change(assignment);
     if !command.worker_journal_artifacts.is_empty() {
         bail!("worker journal artifacts were already bound before assignment preparation");
     }
@@ -8761,7 +8762,7 @@ mod decomposition_tests {
             "max_gate_corrections": 0, "child_timeout_seconds": 10,
             "semantic_coordination": "off",
             "role_models": {
-                "researcher": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+                "researcher": {"model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}
             },
             "assignments": [{
                 "id": "researcher-prompt-order", "phase": "execution", "runtime": "codex",
@@ -8864,7 +8865,7 @@ mod decomposition_tests {
         let runtime_model_catalog = if runtime == SupervisorRuntime::GeminiCli {
             RuntimeModelCatalog::OperatorDeclared
         } else {
-            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?)
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])?)
         };
         let mut journal = initialize_orchestration_event_journal(&repo, &options.run_id, None);
         assert!(
@@ -10969,7 +10970,7 @@ mod decomposition_tests {
         plan.role_models.insert(
             AgentRole::ChildOrchestrator,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-6.1-sol".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -10977,7 +10978,7 @@ mod decomposition_tests {
         plan.role_models.insert(
             AgentRole::Auditor,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-6.1-sol".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -10989,7 +10990,7 @@ mod decomposition_tests {
                     reasoning_effort,
                     ..
                 } => {
-                    *model = "gpt-5.6-sol".to_string();
+                    *model = "gpt-6.1-sol".to_string();
                     *reasoning_effort = Some("xhigh".to_string());
                 }
                 crate::review::ReviewLensBackendConfig::Precomputed { .. } => {
@@ -11047,7 +11048,7 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let budget_policy = AssignmentBudgetPolicy::default();
-        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])
             .expect("fixture codex runtime model catalog");
         #[cfg(target_os = "linux")]
         let (_selected_concurrent_fixture, budget_policy) = {
@@ -11339,7 +11340,7 @@ mod decomposition_tests {
         plan.role_models.insert(
             AgentRole::ChildOrchestrator,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-6.1-sol".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -11347,7 +11348,7 @@ mod decomposition_tests {
         plan.role_models.insert(
             AgentRole::Auditor,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-6.1-sol".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -11359,7 +11360,7 @@ mod decomposition_tests {
                     reasoning_effort,
                     ..
                 } => {
-                    *model = "gpt-5.6-sol".to_string();
+                    *model = "gpt-6.1-sol".to_string();
                     *reasoning_effort = Some("xhigh".to_string());
                 }
                 crate::review::ReviewLensBackendConfig::Precomputed { .. } => {
@@ -11417,7 +11418,7 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let budget_policy = AssignmentBudgetPolicy::default();
-        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])
+        let runtime_model_catalog_inner = CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])
             .expect("fixture codex runtime model catalog");
         #[cfg(target_os = "linux")]
         let (_selected_concurrent_fixture, budget_policy) = {
@@ -11681,7 +11682,7 @@ mod decomposition_tests {
             &assignment.id,
             1,
             Path::new("codex"),
-            Some("gpt-5.6-sol"),
+            Some("gpt-6.1-sol"),
             ASSIGNMENT_CHILD_PROCESS_DUTY,
         )?;
         let command = ExternalAgentCommand::codex(
@@ -11693,7 +11694,7 @@ mod decomposition_tests {
             Duration::from_secs(3),
         )
         .with_agent_lifecycle("/registry", "worker", run, &assignment.id)
-        .with_model_selection(Some("gpt-5.6-sol".into()), Some("high".into()))
+        .with_model_selection(Some("gpt-6.1-sol".into()), Some("high".into()))
         .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
         let incoming = Path::new("/private");
         let command = bind_worker_journal_artifacts(
@@ -11738,6 +11739,39 @@ mod decomposition_tests {
     #[test]
     fn prepare_child_and_parent_auditor_issuers_reach_production_sink() -> Result<()> {
         exercise_child_and_parent_auditor_issuers(false)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mixed_worker_journal_binding_retains_parent_required_change_contract() -> Result<()> {
+        let plan: SupervisorPlan = serde_json::from_str(include_str!(
+            "../../examples/supervise/mixed-codex-grok-plan.json"
+        ))?;
+        let assignment = &plan.assignments[0];
+        let incoming = Path::new("/private");
+        let command = ExternalAgentCommand::codex(
+            "grok",
+            "/workspace",
+            "/private/prompt",
+            "/private/log",
+            "/private/report",
+            Duration::from_secs(3),
+        );
+        assert!(!command.worker_change_required);
+        let paths = vec![
+            incoming.join(worker_execution_journal_incoming_relative_for_id(
+                &assignment.id,
+            )),
+        ];
+        let bound =
+            bind_worker_journal_artifacts(command.clone(), assignment, incoming, paths.clone())?;
+        assert!(bound.worker_change_required);
+        assert_eq!(bound.worker_journal_artifacts.len(), 1);
+        let mut read_only = assignment.clone();
+        read_only.notes = None;
+        let bound = bind_worker_journal_artifacts(command, &read_only, incoming, paths)?;
+        assert!(!bound.worker_change_required);
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]
@@ -11868,7 +11902,7 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let runtime_model_catalog = if local_auth {
-            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?)
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])?)
         } else {
             RuntimeModelCatalog::LocalDeterministicFake
         };
@@ -12420,7 +12454,7 @@ mod decomposition_tests {
     fn real_runtime_default_launch_provenance_cannot_recover_coordinator_authority() {
         let provenance = CompletedLaunchModelProvenance {
             launch_runtime: SupervisorRuntime::Codex,
-            configured_model: Some("gpt-5.6-sol".to_string()),
+            configured_model: Some("gpt-6.1-sol".to_string()),
             launched_model: None,
             resolution_observation: ModelResolutionObservation::RuntimeDefault,
         };
@@ -12460,18 +12494,18 @@ mod decomposition_tests {
         ] {
             let provenance = CompletedLaunchModelProvenance {
                 launch_runtime: SupervisorRuntime::Fake,
-                configured_model: Some("gpt-5.6-sol".to_string()),
+                configured_model: Some("gpt-6.1-sol".to_string()),
                 launched_model: None,
                 resolution_observation,
             };
             let subject = model_capability_or_weak(provenance.transition_subject_model());
-            assert_eq!(subject.model, Some("gpt-5.6-sol"));
+            assert_eq!(subject.model, Some("gpt-6.1-sol"));
             assert_ne!(subject.capability, ModelCapabilityClass::WeakMechanical);
         }
 
         let unresolved = CompletedLaunchModelProvenance {
             launch_runtime: SupervisorRuntime::Fake,
-            configured_model: Some("gpt-5.6-sol".to_string()),
+            configured_model: Some("gpt-6.1-sol".to_string()),
             launched_model: None,
             resolution_observation: ModelResolutionObservation::NotResolved,
         };
@@ -12556,10 +12590,10 @@ mod decomposition_tests {
             let reasoning_effort = intake_judge.backend.reasoning_effort().map(str::to_string);
             intake_judge.backend = crate::review::ReviewLensBackendConfig::Model {
                 backend_id,
-                model: "gpt-5.6-sol".to_string(),
+                model: "gpt-6.1-sol".to_string(),
                 reasoning_effort,
             };
-            assert_eq!(intake_judge.backend.model(), "gpt-5.6-sol");
+            assert_eq!(intake_judge.backend.model(), "gpt-6.1-sol");
             assert_eq!(
                 intake_judge.information_scope,
                 ReviewInformationScope::FullChildTranscript
@@ -12621,7 +12655,7 @@ mod decomposition_tests {
         let budget_ledger =
             RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
         let runtime_model_catalog = RuntimeModelCatalog::Codex(
-            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-6.1-sol"])
                 .expect("fixture runtime model catalog"),
         );
         let cancellation = ProcessCancellation::new();
@@ -12674,7 +12708,7 @@ mod decomposition_tests {
             AgentRole::ChildOrchestrator,
             SupervisorRuntime::Codex,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".to_string()),
+                model: Some("gpt-6.1-sol".to_string()),
                 reasoning_effort: Some("xhigh".to_string()),
                 unavailable_model_fallback: UnavailableModelFallback::FailClosed,
             },
@@ -12769,7 +12803,7 @@ mod decomposition_tests {
             prepared.command.machine_global_retention,
             options.machine_global_retention
         );
-        assert_eq!(prepared.command.model.as_deref(), Some("gpt-5.6-sol"));
+        assert_eq!(prepared.command.model.as_deref(), Some("gpt-6.1-sol"));
         let collected = dispatch_and_collect_child_attempt(
             &context,
             &mut outcome,
@@ -12782,11 +12816,11 @@ mod decomposition_tests {
         assert!(collected.attempt_containment_verified);
         assert_eq!(
             collected.model_provenance.configured_model.as_deref(),
-            Some("gpt-5.6-sol")
+            Some("gpt-6.1-sol")
         );
         assert_eq!(
             collected.model_provenance.launched_model.as_deref(),
-            Some("gpt-5.6-sol")
+            Some("gpt-6.1-sol")
         );
         let completed_launch_model_provenance = collected.model_provenance.clone();
         assert_eq!(outcome.command_records.len(), 1);
@@ -14833,7 +14867,7 @@ done
             },
         );
         let catalog = RuntimeModelCatalog::Codex(
-            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-5.6-sol"])
+            CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-luna", "gpt-6.1-sol"])
                 .context("fixture catalog")?,
         );
         let options = launch_fixture_options(SupervisorRuntime::Codex);
@@ -15696,7 +15730,7 @@ done
         let bound = model_flag.map(|index| argv[index + 1].as_str());
         assert_eq!(bound, Some(RESTORE_FIXTURE));
         assert!(!argv.iter().any(|argument| {
-            argument.contains("gpt-5.6-sol")
+            argument.contains("gpt-6.1-sol")
                 || argument.contains("gpt-5.6-luna")
                 || argument.contains("grok-4.6")
         }));
@@ -16027,7 +16061,7 @@ done
             .iter()
             .any(|argument| argument == WEAK_MECHANICAL_EXECUTOR_FIXTURE));
         assert!(!argv.iter().any(|argument| argument.contains("grok-4.6")
-            || argument.contains("gpt-5.6-sol")
+            || argument.contains("gpt-6.1-sol")
             || argument.contains("gpt-5.6-luna")));
         drop(overlay);
         Ok(())
@@ -16048,7 +16082,7 @@ done
         let mut prior = base
             .models
             .into_iter()
-            .find(|row| row.model == "gpt-5.6-sol")
+            .find(|row| row.model == "gpt-6.1-sol")
             .context("bundled Sol prior")?;
         prior.runtime = "cursor".to_string();
         prior.model = MODEL.to_string();
@@ -16342,7 +16376,7 @@ done
                     .map(|index| args[index + 1].as_str());
                 assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
                 assert!(!args.iter().any(|argument| {
-                    argument.contains("gpt-5.6-sol")
+                    argument.contains("gpt-6.1-sol")
                         || argument.contains("gpt-5.6-luna")
                         || argument.contains("grok-4.6")
                 }));
@@ -16690,7 +16724,7 @@ done
             .position(|argument| argument == "-m")
             .map(|index| argv[index + 1].as_str());
         assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
-        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+        for forbidden in ["gpt-6.1-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
             assert_ne!(matching.model.as_deref(), Some(forbidden));
             assert!(!argv.iter().any(|argument| argument.contains(forbidden)));
         }
@@ -17449,7 +17483,7 @@ done
             .position(|argument| argument == "-m")
             .map(|index| argv[index + 1].as_str());
         assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
-        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+        for forbidden in ["gpt-6.1-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
             assert_ne!(command.model.as_deref(), Some(forbidden));
             assert_ne!(spawn.payload["model"].as_str(), Some(forbidden));
             assert!(!argv.iter().any(|argument| argument.contains(forbidden)));
@@ -17799,7 +17833,7 @@ done
             .position(|argument| argument == "-m")
             .map(|index| argv[index + 1].as_str());
         assert_eq!(bound, Some(WEAK_MECHANICAL_EXECUTOR_FIXTURE));
-        for forbidden in ["gpt-5.6-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
+        for forbidden in ["gpt-6.1-sol", "gpt-5.6-luna", "gpt-5.6-terra", "grok-4.6"] {
             assert_ne!(command.model.as_deref(), Some(forbidden));
             assert_ne!(spawn.payload["model"].as_str(), Some(forbidden));
             assert!(!argv.iter().any(|argument| argument.contains(forbidden)));

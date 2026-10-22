@@ -678,6 +678,42 @@ fn objective_profile_request_round_trips_outside_the_public_plan_struct() {
 fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidence() {
     let (temp, repo_path) = injected_repository();
     let profile_id = "review-sensitive-routing-v1";
+    // Keep the profile-sensitive choice within the required Codex model.
+    // Synthetic effort economics make high cheaper initially while xhigh needs
+    // less human review; these are test priors, not provider prices/evidence.
+    let mut priors = super::selection_bridge::base_selector_priors_with_terminal_worker_economics()
+        .expect("profile fixture baseline priors");
+    let model = priors
+        .models
+        .iter_mut()
+        .find(|model| model.runtime == "codex" && model.model == FRONTIER_PROFILE_MODEL)
+        .expect("required Codex profile");
+    model.source_id = "synthetic-objective-profile-effort-tradeoff".to_string();
+    model.prior_scope = "nonlive objective-profile fixture only".to_string();
+    for row in &mut model.class_fit {
+        if row.task_class == "localized_code_change"
+            && row.effort == crate::selection::ReasoningEffort::High
+        {
+            row.execution_cost_microunits = 60_000;
+            row.review_cost_microunits = 30_000;
+        }
+    }
+    let snapshot = super::prior_input::OperatorPriorSnapshot {
+        schema_version: 1,
+        dataset_id: "synthetic-objective-profile".to_string(),
+        revision: format!("{}+effort-tradeoff-fixture", priors.revision),
+        published_on: priors.published_on,
+        models: priors.models,
+        capability_policy: default_model_capability_policy(),
+    };
+    let prior_path = Path::new("objective-profile-fixture-prior.json");
+    fs::write(
+        repo_path.join(prior_path),
+        serde_json::to_vec(&snapshot).unwrap(),
+    )
+    .unwrap();
+    let _prior = super::prior_input::bind_operator_prior_data(&repo_path, prior_path)
+        .expect("bind synthetic objective-profile effort priors");
     fs::write(
         repo_path.join(crate::objective_profile::OBJECTIVE_PROFILE_OVERRIDE_FILE),
         serde_json::to_vec_pretty(&json!({
@@ -806,6 +842,16 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         .as_ref()
         .expect("adjusted worker choice");
     assert_ne!(default_choice.candidate, adjusted_choice.candidate);
+    assert_eq!(default_choice.candidate.model, FRONTIER_PROFILE_MODEL);
+    assert_eq!(adjusted_choice.candidate.model, FRONTIER_PROFILE_MODEL);
+    assert_eq!(
+        default_choice.candidate.effort,
+        crate::selection::ReasoningEffort::High
+    );
+    assert_eq!(
+        adjusted_choice.candidate.effort,
+        crate::selection::ReasoningEffort::Xhigh
+    );
     assert_eq!(
         adjusted_choice.reason,
         crate::selection::ChoiceReason::LoadedRoutingPolicy
@@ -3482,7 +3528,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     assert!(
         child_argv
             .windows(2)
-            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
+            .any(|arguments| arguments == ["-c", "model=\"gpt-6.1-sol\""]),
         "writable child app-server argv did not preserve the explicit fixture model: {child_argv:?}"
     );
     assert!(child_argv
@@ -3846,7 +3892,7 @@ fn ordered_catalog_chain_rejects_invalid_profile_data_during_plan_load() {
     for (label, chain, expected) in [
         (
             "whitespace",
-            json!({"models": [" gpt-5.6-sol"], "on_exhausted": "runtime_default"}),
+            json!({"models": [" gpt-6.1-sol"], "on_exhausted": "runtime_default"}),
             "must be non-empty and trimmed",
         ),
         (
@@ -4142,11 +4188,10 @@ fn invalid_objective_profile_file_fails_before_external_dispatch() {
 }
 
 #[test]
-fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_authorized_lens_effort()
+fn configured_lens_selection_supersedes_role_effort_and_uses_exact_selector_authorized_lens_effort()
 {
     skip_without_containment!();
-    let _capability =
-        install_named_test_models(&["available-child-model", "available-auditor-model"]);
+    let _capability = install_named_test_models(&[FRONTIER_PROFILE_MODEL]);
     let (temp, repo_path) = injected_repository();
     let mut policy = crate::selection::routing_policy::load_routing_policy(&repo_path)
         .expect("load fixture routing policy")
@@ -4166,7 +4211,7 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("available-child-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -4174,7 +4219,7 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
     plan.role_models.insert(
         AgentRole::Auditor,
         RoleModelSelection {
-            model: Some("available-auditor-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("xhigh".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::RuntimeDefault,
         },
@@ -4187,15 +4232,14 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
     else {
         panic!("default supervisor lens must be model-backed");
     };
-    *model = "available-child-model".to_string();
+    *model = FRONTIER_PROFILE_MODEL.to_string();
     // The selected fixture supplies evidence for this exact lens profile.
     // This low-effort lens meets the fixture's explicit Auditor minimum.
     // Below-minimum refusal is covered by selection_bridge::tests::
     // authored_review_lens_refusals_and_scope_exit_preserve_outer_authority.
     *reasoning_effort = Some("low".to_string());
     let options = injected_options(&repo_path, temp.path(), "independent-auditor-preference");
-    let catalog =
-        injected_codex_runtime_catalog(&["available-child-model", "available-auditor-model"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut child_seen = false;
     let mut auditor_seen = false;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -4207,7 +4251,7 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
         if name.contains("review-auditor") {
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
-            assert_eq!(command.model.as_deref(), Some("available-child-model"));
+            assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
             assert_eq!(command.model_provider.as_deref(), Some("openai"));
             assert_eq!(
                 AgentRole::Auditor.reasoning_effort_floor(),
@@ -4216,10 +4260,20 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
             crate::selection::routing_policy::validate_selected_launch(
                 AgentRole::Auditor.as_str(),
                 SupervisorRuntime::Codex.as_str(),
-                "available-child-model",
+                FRONTIER_PROFILE_MODEL,
                 "low",
             )
             .expect("lens launch must match its exact selector authorization");
+            assert!(
+                crate::selection::routing_policy::validate_selected_launch(
+                    AgentRole::Auditor.as_str(),
+                    SupervisorRuntime::Codex.as_str(),
+                    FRONTIER_PROFILE_MODEL,
+                    "xhigh",
+                )
+                .is_err(),
+                "the role's prior effort must not retain lens launch authority"
+            );
             assert!(fs::read_to_string(&command.prompt)
                 .expect("read resolved auditor prompt")
                 .contains("Reasoning effort: low"));
@@ -4229,7 +4283,7 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
                 .collect::<Vec<_>>();
             assert!(argv
                 .windows(2)
-                .any(|arguments| arguments == ["-m", "available-child-model"]));
+                .any(|arguments| arguments == ["-m", FRONTIER_PROFILE_MODEL]));
             assert!(argv
                 .windows(2)
                 .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"low\""] }));
@@ -4245,9 +4299,10 @@ fn configured_lens_selection_supersedes_role_model_and_uses_exact_selector_autho
                 .into_iter()
                 .map(|argument| argument.to_string_lossy().into_owned())
                 .collect::<Vec<_>>();
-            assert!(argv
-                .windows(2)
-                .any(|arguments| { arguments == ["-c", "model=\"available-child-model\""] }));
+            assert!(argv.windows(2).any(|arguments| {
+                arguments[0] == "-c"
+                    && arguments[1] == format!("model=\"{FRONTIER_PROFILE_MODEL}\"")
+            }));
             write_injected_assignment_report(command, &assignment);
         }
         injected_verified_run(command)
@@ -5020,14 +5075,14 @@ fn supervisor_derives_review_coverage_from_assignment_and_run_report() {
 #[test]
 fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     skip_without_containment!();
-    let _capability = install_named_test_models(&["model-alpha", "model-beta", "child-model"]);
+    let _capability = install_named_test_models(&[FRONTIER_PROFILE_MODEL]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("child-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: None,
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -5037,7 +5092,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             id: "diff-security".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
-                model: "model-alpha".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -5046,37 +5101,24 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             id: "report-consistency".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
-                model: "model-beta".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
         },
     ];
     plan.review_aggregation_policy = ReviewAggregationPolicy::AllMustAccept;
-    plan.model_pricing = BTreeMap::from([
-        (
-            "model-alpha".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 1.0,
-                output_usd_per_million_tokens: 2.0,
-            },
-        ),
-        (
-            "model-beta".to_string(),
-            ModelPricing {
-                input_usd_per_million_tokens: 3.0,
-                output_usd_per_million_tokens: 4.0,
-            },
-        ),
-    ]);
+    // Synthetic plan override for accounting assertions, not vendor pricing.
+    plan.model_pricing = BTreeMap::from([(
+        FRONTIER_PROFILE_MODEL.to_string(),
+        ModelPricing {
+            input_usd_per_million_tokens: 1.0,
+            output_usd_per_million_tokens: 2.0,
+        },
+    )]);
     let options = injected_options(&repo_path, temp.path(), "stacked-review-lenses-execute");
     let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&[
-        FRONTIER_PROFILE_MODEL,
-        "model-alpha",
-        "model-beta",
-        "child-model",
-    ]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut lens_commands = Vec::new();
     let mut lens_prompts = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
@@ -5106,11 +5148,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         }
         let mut run = injected_verified_run(command);
         if name.contains("review-auditor") {
-            let observed_model = if name.contains("lens-0") {
-                "model-alpha"
-            } else {
-                "model-beta"
-            };
+            let observed_model = FRONTIER_PROFILE_MODEL;
             let observed_effort = command.reasoning_effort.as_deref().unwrap();
             crate::selection::routing_policy::validate_selected_launch(
                 "auditor",
@@ -5120,9 +5158,9 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             )
             .expect("current lens has exact selector authority before dispatch");
             let (other_model, other_effort) = if name.contains("lens-0") {
-                ("model-beta", "xhigh")
+                (FRONTIER_PROFILE_MODEL, "xhigh")
             } else {
-                ("model-alpha", "high")
+                (FRONTIER_PROFILE_MODEL, "high")
             };
             assert!(
                 crate::selection::routing_policy::validate_selected_launch(
@@ -5165,14 +5203,20 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
         lens_commands[0].model_provider.as_deref(),
         Some("provider-alpha")
     );
-    assert_eq!(lens_commands[0].model.as_deref(), Some("model-alpha"));
+    assert_eq!(
+        lens_commands[0].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     // Preserve each lens's exact selected effort.
     assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
     assert_eq!(
         lens_commands[1].model_provider.as_deref(),
         Some("provider-beta")
     );
-    assert_eq!(lens_commands[1].model.as_deref(), Some("model-beta"));
+    assert_eq!(
+        lens_commands[1].model.as_deref(),
+        Some(FRONTIER_PROFILE_MODEL)
+    );
     assert_eq!(lens_commands[1].reasoning_effort.as_deref(), Some("xhigh"));
     assert!(lens_prompts[0].contains("\"scope\":\"diff_only\""));
     assert!(!lens_prompts[0].contains("\"scope\":\"output_report_only\""));
@@ -5205,7 +5249,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     );
     assert!(report
         .review_lens_total_cost_usd
-        .is_some_and(|cost| (cost - 0.0009).abs() < 1e-12));
+        .is_some_and(|cost| (cost - 0.00042).abs() < 1e-12));
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open stacked-lens artifacts");
     let events = read_finalized_orchestration_events(&reader);
@@ -5280,14 +5324,14 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
 #[test]
 fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
     skip_without_containment!();
-    let _capability = install_named_test_models(&["child-model"]);
+    let _capability = install_named_test_models(&[FRONTIER_PROFILE_MODEL]);
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("child-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: Some("high".to_string()),
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -5302,7 +5346,7 @@ fn unavailable_lens_runtime_selection_is_reported_and_journaled_procedurally() {
         "unavailable-lens-selection-procedural",
     );
     let run_id = options.run_id.clone();
-    let catalog = injected_codex_runtime_catalog(&["child-model"]);
+    let catalog = injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL]);
     let mut invocations = Vec::new();
     let mut runner = |command: &ExternalAgentCommand| {
         let name = command

@@ -1794,10 +1794,15 @@ fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_it
 fn writable_app_server_accepts_only_the_exact_audited_codex_version() {
     validate_duplex_app_server_version(EnvironmentVersion::new(0, 144, 4))
         .expect("audited Codex app-server version");
+    validate_duplex_app_server_version(EnvironmentVersion::new(0, 162, 0))
+        .expect("captured Codex 0.162.0 app-server protocol");
     for version in [
         EnvironmentVersion::new(0, 144, 3),
         EnvironmentVersion::new(0, 144, 5),
         EnvironmentVersion::new(0, 145, 0),
+        EnvironmentVersion::new(0, 161, 0),
+        EnvironmentVersion::new(0, 162, 1),
+        EnvironmentVersion::new(0, 163, 0),
     ] {
         let error = validate_duplex_app_server_version(version)
             .expect_err("unaudited app-server version must fail closed");

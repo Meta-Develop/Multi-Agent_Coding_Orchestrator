@@ -1,0 +1,106 @@
+Captured 2026-10-22 from the trusted /usr/bin/codex, codex-cli 0.162.0.
+No inference turn or provider worker was launched.
+The production app-server argv surface (--stdio, --strict-config, all eleven
+disabled features, shell-environment controls, project_doc_max_bytes=0 and
+the fixed permission profile) also initialized successfully with this binary.
+
+models.json is the projection of `codex debug models` onto slug,
+default_reasoning_level and supported_reasoning_levels. Large model prompt
+templates and unrelated metadata are deliberately omitted. The capture
+advertised nine models, including gpt-reserve and codex-auto-review.
+
+app-server-start.json contains the actual initialize response, disabled
+remoteControl/status/changed notification, and thread/start response. The
+temporary Codex home/cwd, hostname, installation id and thread/session ids
+are normalized. thread/start requested gpt-6.1-sol, xhigh configuration,
+on-request/user approvals, ephemeral mode, and the fixed read-only MACO
+permission profile. environments=[] was used for this no-turn protocol probe:
+a local-environment probe was blocked by this worker sandbox's protected
+app-server socket directory. This capture does not qualify tool execution,
+containment, authentication, completion, or usage for a live MACO run.
+
+The observed startup notification adds emittedAtMs. That metadata must not
+relax envelope, parameter, duplicate-key, remote-control-state or correlation
+checks. Thread settings still resolve the exact model, effort, cwd, approval
+policy and permission profile using the existing response fields.
+
+R44 round 3 captures, 2026-10-22:
+
+failed-lens-{0,1,2}.jsonl are the entire captured server prefixes from
+/home/rikuu/agent-work/maco-e2e-20261015/runs/e2e-mixed-r44a2/repo/.maco/o2/runs/e2e-mixed-r44a2/logs/readme-worker-review-auditor-lens-{0,1,2}.jsonl.
+They stopped at account/updated, respectively during inference, before the
+thread/start response, and before the turn/start response. Local host/home/cwd
+and thread/turn identities are normalized; method order and fields are intact.
+The regression replays these original prefixes with a successful capture's
+correlated suffix. This stitching is test input, not a claim that the failed
+production lenses completed.
+
+auditor-turn.jsonl and worker-turn.jsonl are full inference captures from the
+trusted /usr/bin/codex (0.162.0), gpt-6.1-sol/xhigh, through turn/completed.
+Both used initialize experimentalApi=true, no opted-out notifications,
+ephemeral threads, local environments, on-request/user approval, and the
+maco_external_codex permission profile with networking disabled. Apps, plugins,
+hooks, browser/computer/image tools, multi_agent, and goals were disabled.
+The private homes used a copy of the existing account credentials; credentials
+were never captured and were removed after each probe.
+
+The read-only auditor reviewed inline README content without tools. The worker
+appended Hello from MACO through native apply_patch to a scratch README in /tmp;
+sandbox startup failed and Codex requested approval to retry the patch; the
+client accepted that exact scratch-file change with grantRoot=null. The
+resulting bytes were independently checked. Neither launched another agent.
+These are protocol/inference probes, not end-to-end MACO containment, journal,
+acceptance or lens qualification. An earlier shell probe failed at this worker
+sandbox's protected app-server socket directory. The worker's outer sandbox
+and the configured MACO permission profile were unchanged.
+
+The two full fixtures preserve all server messages, including timing fields,
+item lifecycles, account/updated, turn/moderationMetadata,
+thread/tokenUsage/updated (including cacheWriteInputTokens), rate limits,
+serverRequest/resolved, and terminal events. Host/home/cwd and thread/turn IDs
+are normalized; account credit balance is replaced with 1.0000. Token counters,
+item IDs, event order, model/effort, request IDs and completion statuses are
+unchanged. Tests replay original JSON lines and verify complete parent identity
+and exact cumulative input/output/cache/reasoning usage. Missing usage remains
+unknown and unsupported methods remain errors.
+
+Additional observed 0.162.0 behavior: turn/started can precede the turn/start
+response. A shell probe captured that order; tests move the real lifecycle
+notice before its response and require matching IDs, uniqueness and a strict
+notification envelope. Only that bounded lifecycle notice is held.
+
+Schema source: `/usr/bin/codex app-server generate-json-schema --experimental`.
+AccountUpdatedNotification enumerates optional/nullable AuthMode and PlanType;
+ServerRequestResolvedNotification requires threadId and requestId. The adapter
+checks these shapes from original bytes, rejects unknown/duplicate envelope
+and parameter fields, bounds account updates across all phases, and correlates
+request resolution with a previously serviced client request.
+
+R44 round 4, 2026-10-22:
+failed-worker-journal.jsonl is the complete captured prefix from
+runs/e2e-codex-r44a3-1/repo/.maco/o2/runs/e2e-codex-r44a3-1/logs/assignment-001.jsonl.
+failed-worker-journal-command.json contains its summary's command array.
+Host/workspace/artifact/output/helper paths and thread/turn/installation identities
+are normalized. Method order, timestamps, requested settings and approval data
+are preserved. The prefix ends at requestApproval: it contains NO completed
+command item with the original denial, so the model's read-only-path reason is
+not a captured syscall diagnostic. The regression must cancel that request;
+it must never turn this prefix into successful execution or acceptance.
+
+The source comparison explaining the missing mount target is:
+https://github.com/openai/codex/blob/rust-v0.144.4/codex-rs/protocol/src/permissions.rs
+https://github.com/openai/codex/blob/rust-v0.162.0/codex-rs/protocol/src/permissions.rs
+(PROTECTED_METADATA_PATH_NAMES adds .aws), and
+https://github.com/openai/codex/blob/rust-v0.162.0/codex-rs/linux-sandbox/src/bwrap.rs
+(append_metadata_path_masks_for_writable_root, append_missing_read_only_subpath_args).
+MACO's carrier already precreated the other three protected targets; the outer
+boundary leaves the carrier read-only and mounts only the held journal writable.
+The .aws target must likewise be empty, owned, canonical and precreated. This
+adds no credential access or writable path. The bound journal's lock is flock
+on the existing file, with no separate lock or temporary file.
+
+A real local 0.162.0 sandbox journal probe was attempted in round 4. This Codex
+worker session masks /tmp/codex-daemon-1000 as a read-only mode-000 tmpfs.
+Codex fails before execution with "app-server socket directory must be a
+user-owned directory with mode 0700". That session boundary was not bypassed.
+The parent must verify actual sandboxed execution outside this session.

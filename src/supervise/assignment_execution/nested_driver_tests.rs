@@ -14,6 +14,17 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // on assertion failure. Its exact native tests run serially in this module.
 static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+const INVALID_CONTINUATION_CASES: [&str; 8] = [
+    "continuation-missing",
+    "continuation-duplicate",
+    "continuation-forged-id",
+    "continuation-forged-summary",
+    "continuation-wrong-attempt-artifact",
+    "continuation-missing-journal",
+    "continuation-restored",
+    "continuation-oversize",
+];
+
 struct GrokBinaryEnvironmentGuard {
     previous: Option<std::ffi::OsString>,
 }
@@ -114,9 +125,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         "max_gate_corrections":0, "child_timeout_seconds":10,
         "semantic_coordination":"off", "assignments":[parent],
         "role_models":{
-            "child_orchestrator":{"model":"gpt-5.6-sol", "reasoning_effort":"high"},
-            "worker":{"model":"gpt-5.6-sol", "reasoning_effort": if case.starts_with("managed-cycle-") { "xhigh" } else { "high" }},
-            "auditor":{"model":"gpt-5.6-sol", "reasoning_effort":"high"}
+            "child_orchestrator":{"model":"gpt-6.1-sol", "reasoning_effort":"high"},
+            "worker":{"model":"gpt-6.1-sol", "reasoning_effort": if case.starts_with("managed-cycle-") { "xhigh" } else { "high" }},
+            "auditor":{"model":"gpt-6.1-sol", "reasoning_effort":"high"}
         }
     }))?;
     let run_id =
@@ -300,7 +311,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     };
     let guide = SupervisorFieldGuidePrompt::empty()?;
     let catalog =
-        RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+        RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])?);
     // This fixture exercises the actual loaded selector and controller path.
     // Its policy preferences are test inputs, not product effort defaults.
     let _routing_policy = if isolated {
@@ -1161,7 +1172,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 SupervisorRuntime::Codex
             },
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".into()),
+                model: Some("gpt-6.1-sol".into()),
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },
@@ -1373,7 +1384,7 @@ fn exercise_fixture_continuation(
             model: Some(if grok_continuation {
                 "grok-4.6".into()
             } else {
-                "gpt-5.6-sol".into()
+                "gpt-6.1-sol".into()
             }),
             reasoning_effort: Some("xhigh".into()),
             ..Default::default()
@@ -1392,6 +1403,40 @@ fn exercise_fixture_continuation(
         driver.execute_worker("worker-two", &policy)?,
     ];
     drop(driver);
+    if case == "continuation-invalid-results" {
+        // Provision the authenticated parent and execute its two deterministic
+        // Workers once. Each refusal still receives independent held evidence;
+        // rebuilding the complete durable fixture eight times can spend the
+        // entire test deadline in filesystem syncs on a busy host.
+        let valid = ParentContinuationLaunch::from_unbound_completed_workers_for_test(
+            context, preflight, &yielded, &completed,
+        )?;
+        assert_eq!(valid.worker_ids(), ["worker-two", "worker"]);
+        drop(valid);
+        for invalid_case in INVALID_CONTINUATION_CASES {
+            let mut invalid = completed.clone();
+            if invalid_case == "continuation-missing" {
+                invalid.pop();
+            } else {
+                nested_worker_executor::corrupt_continuation_evidence_for_test(
+                    &mut invalid,
+                    invalid_case,
+                    MAX_PARENT_CONTINUATION_BYTES,
+                )?;
+            }
+            assert!(
+                ParentContinuationLaunch::from_unbound_completed_workers_for_test(
+                    context, preflight, &yielded, &invalid,
+                )
+                .is_err(),
+                "accepted {invalid_case}"
+            );
+        }
+        assert_eq!(*calls.lock().unwrap(), ["parent", "worker", "worker-two"]);
+        assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
+        assert_eq!(ledger.report()?.active_reservations, 0);
+        return Ok(());
+    }
     if case == "continuation-missing" {
         completed.pop();
     } else {
@@ -1693,19 +1738,7 @@ fn parent_continuation_preparation_accepts_qualified_native_grok_workers() -> Re
 
 #[test]
 fn parent_continuation_rejects_missing_forged_duplicate_or_oversized_held_results() -> Result<()> {
-    for case in [
-        "continuation-missing",
-        "continuation-duplicate",
-        "continuation-forged-id",
-        "continuation-forged-summary",
-        "continuation-wrong-attempt-artifact",
-        "continuation-missing-journal",
-        "continuation-restored",
-        "continuation-oversize",
-    ] {
-        driver_fixture(case)?;
-    }
-    Ok(())
+    driver_fixture("continuation-invalid-results")
 }
 
 #[test]

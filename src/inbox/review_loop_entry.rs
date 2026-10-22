@@ -318,7 +318,7 @@ pub fn select_critical_independent_auditor(
         .objective_profiles
         .first()
         .context("built-in selector priors omitted calibration")?;
-    let input = SelectionInput {
+    let mut input = SelectionInput {
         task,
         catalogs: vec![RuntimeCatalog {
             runtime: "codex".to_string(),
@@ -375,6 +375,7 @@ pub fn select_critical_independent_auditor(
         debug_override: None,
         operational_observations: None,
     };
+    selection::runtime_model_policy::constrain(&mut input);
     selection::select(&input).context("select critical independent auditor")
 }
 
@@ -382,7 +383,10 @@ pub fn compact_independent_auditor_selection(
     decision: &SelectionProvenance,
 ) -> Result<InboxIndependentAuditorSelectionEvidence> {
     if decision.status != DecisionStatus::Selected {
-        bail!("critical independent-auditor selector failed closed");
+        bail!(
+            "critical independent-auditor selector failed closed{}",
+            selection::runtime_model_policy::missing_model_guidance(&decision.normalized_input)
+        );
     }
     let choice = decision
         .choice
@@ -1664,7 +1668,7 @@ mod tests {
 
     #[test]
     fn critical_independent_auditor_selection_records_profile_and_score() {
-        let available = ["gpt-5.6-sol".to_string(), "gpt-5.6-luna".to_string()]
+        let available = ["gpt-6.1-sol".to_string(), "gpt-5.6-luna".to_string()]
             .into_iter()
             .collect();
         let decision =
@@ -1674,7 +1678,7 @@ mod tests {
 
         assert_eq!(decision.status, DecisionStatus::Selected);
         assert_eq!(evidence.runtime, "codex");
-        assert_eq!(evidence.model, "gpt-5.6-sol");
+        assert_eq!(evidence.model, "gpt-6.1-sol");
         assert_eq!(evidence.effort, ReasoningEffort::Xhigh);
         assert!(!evidence.objective_profile_id.is_empty());
         assert!(!evidence.objective_profile_sha256.is_empty());
@@ -1684,6 +1688,17 @@ mod tests {
             .expect("fail-closed selection decision");
         assert_eq!(unavailable.status, DecisionStatus::FailClosed);
         assert!(compact_independent_auditor_selection(&unavailable).is_err());
+        let legacy_only = select_critical_independent_auditor(
+            &["gpt-5.6-sol".to_string(), "gpt-5.6-luna".to_string()]
+                .into_iter()
+                .collect(),
+        )
+        .expect("legacy catalog refusal");
+        assert!(legacy_only.choice.is_none());
+        let error = compact_independent_auditor_selection(&legacy_only)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("gpt-6.1-sol") && error.contains("0.162.0"));
     }
 
     #[test]
@@ -1693,7 +1708,7 @@ mod tests {
             vec![std::path::PathBuf::from("src/inbox.rs")];
         let intake = crate::inbox::pr_intake_report_for_item(&item).expect("clean PR intake");
         let task = intake.task.expect("source-bound audit task");
-        let auditor = independent_auditor_actor("audit-session", "gpt-5.6-sol");
+        let auditor = independent_auditor_actor("audit-session", "gpt-6.1-sol");
         let output = InboxIndependentAuditorOutput {
             version: 1,
             item_id: item.item_id.clone(),
@@ -1703,14 +1718,14 @@ mod tests {
             lenses: vec![
                 LensVerdict {
                     lens_id: "diff".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "adversarial-diff".to_string(),
                     information_scope: "diff-only".to_string(),
                     decision: LensDecision::Accept,
                 },
                 LensVerdict {
                     lens_id: "tests".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "tests-as-contract".to_string(),
                     information_scope: "tests-only".to_string(),
                     decision: LensDecision::Accept,
@@ -1732,7 +1747,7 @@ mod tests {
                 spoofed_model,
                 &item,
                 &task,
-                independent_auditor_actor("audit-session", "gpt-5.6-sol")
+                independent_auditor_actor("audit-session", "gpt-6.1-sol")
             ),
             Err(InboxIndependentAuditLaneBlocker::MissingAuditEvidence { evidence })
                 if evidence.iter().any(|field| field == "bounded_auditor_lens_provenance")
@@ -1746,7 +1761,7 @@ mod tests {
                 rejected,
                 &item,
                 &task,
-                independent_auditor_actor("audit-session", "gpt-5.6-sol")
+                independent_auditor_actor("audit-session", "gpt-6.1-sol")
             ),
             Err(InboxIndependentAuditLaneBlocker::AuditRejected { summary })
                 if summary == "the independent auditor rejected the exact candidate"
@@ -1759,7 +1774,7 @@ mod tests {
                 stale,
                 &item,
                 &task,
-                independent_auditor_actor("audit-session", "gpt-5.6-sol")
+                independent_auditor_actor("audit-session", "gpt-6.1-sol")
             ),
             Err(InboxIndependentAuditLaneBlocker::AuditEvidenceMismatch { field })
                 if field == "head_oid"

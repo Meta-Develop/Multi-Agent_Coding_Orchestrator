@@ -241,7 +241,7 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
 - Native apply_patch/Edit: baseline before editing with bound prefix + --cwd <exact worktree> --auto-timestamps --observe-changes -- true; use the native edit tool ONCE, then IMMEDIATELY invoke that observation prefix again before any other action. Both observation records contain ["true"]. In WorkerReport.commands_run report only the journaled ["true"] observations and wrapped verification commands; omit the native apply_patch/Edit command itself and describe the edit in findings. Never add a native tool command absent from the journal, even when the tool succeeded and its changed bytes were observed.
 - If reporting native apply_patch argv is necessary, replace ONLY the post-edit observation's -- true with -- apply_patch '<exact full patch passed to the native tool as ONE argument>'. Observation never executes argv; do not apply the patch again. Only this payload-bearing observation supports ["apply_patch", "<exact full patch>"] in commands_run. A ["true"] observation cannot support it. The timestamps describe observation time, not an unobserved native edit's execution time.
 - Do not pre-journal apply_patch as shell argv.
-- Append/observation error: stop; no repair/retry, hand JSON, identity discovery, PATH change or recursive journaling. For environment errors include the observed error in environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true. Never rerun outside the wrapper.
+- Append/observation error: stop; no repair/retry except the Codex-only proven-no-launch correction explicitly authorized by the parent-bound operation below. No hand JSON, identity discovery, PATH change or recursive journaling. For environment errors include the observed error in environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true. Never rerun outside the wrapper.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Empty command/payload/cwd/timestamps or invalid paths: WorkerExecutionJournalRecordError; stop.
 - WorkerReport.commands_run cwd is the exact absolute worktree from the journal, not a repository-relative path or a redacted placeholder. WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
 - Report the inner argv after --: direct prefix ... -- bash -lc 'true' or /bin/bash -lc 'prefix ...' reports ["bash","-lc","true"]; the inner bash -lc array stays intact, with a matching finished journal record.
@@ -2091,8 +2091,8 @@ mod regression_tests {
 
     // Cost decision: allow at most 2 KiB per worker template for the integrated
     // native-edit identity, automatic timestamp and serial journal contracts.
-    // The fixed worker is 8,273 bytes (8,104 before the 169-byte serial rule),
-    // already above the older 6,656-byte baseline. The child fixture embeds the
+    // The fixed worker is 8,384 bytes (8,273 before the 111-byte Codex
+    // correction reference), already above the older 6,656-byte baseline. The child fixture embeds the
     // worker contract once and gets the same allowance. This is test-only: production
     // measurement fields and trusted launch/acceptance limits remain unchanged.
     const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 2 * 1024;

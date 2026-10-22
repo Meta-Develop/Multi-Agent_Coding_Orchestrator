@@ -274,6 +274,56 @@ fn worker_journal_native_edit_observes_repeated_edits_and_never_executes_argv() 
 }
 
 #[test]
+fn worker_journal_native_observation_recovers_after_proven_no_launch() {
+    let _fallback = Openat2Error::force(libc::ENOSYS).with_statx_enosys();
+    for tool_startup_failure in [true, false] {
+        let (_temp, worktree, path, identity) = observed_fixture();
+        let observation = observed_entry(&worktree, &["true"]);
+        run_worker_execution_journal_command(&path, &identity, &observation, true).unwrap();
+        let baseline = fs::read(&path).unwrap();
+        // Native edit runs exactly once; the only next successful action is its
+        // observation, even when the execution tool itself rejects its cwd.
+        fs::write(worktree.join("README.md"), "original\nHello from MACO\n").unwrap();
+        let missing = worktree.join("nonexistent-tool-cwd");
+        if tool_startup_failure {
+            let error = std::process::Command::new("/bin/sh")
+                .args(["-c", "touch should-not-run"])
+                .current_dir(&missing)
+                .status()
+                .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
+        } else {
+            let mut rejected = observation.clone();
+            rejected.cwd = missing;
+            let error = run_worker_execution_journal_command(&path, &identity, &rejected, true)
+                .unwrap_err();
+            assert!(error.to_string().contains("WorkerJournalPrelaunchRejected"));
+            assert!(error
+                .to_string()
+                .contains("both --cwd and the execution tool workdir"));
+        }
+        assert_eq!(fs::read(&path).unwrap(), baseline);
+        assert!(!worktree.join("should-not-run").exists());
+        run_worker_execution_journal_command(&path, &identity, &observation, true).unwrap();
+        let entries = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1].changed_paths, [PathBuf::from("README.md")]);
+        let before = entries[0].observation.as_ref().unwrap();
+        let after = entries[1].observation.as_ref().unwrap();
+        assert_eq!(before.after, after.before);
+        assert_eq!(after.phase, WorkerJournalObservationPhase::NativeEdit);
+        assert_eq!(after.after[Path::new("README.md")].len(), 64);
+        assert_eq!(before.worktree_identity, after.worktree_identity);
+        assert_eq!(before.head_oid, after.head_oid);
+        verify_worker_journal_identity(&fs::metadata(&path).unwrap(), &identity).unwrap();
+        assert_eq!(
+            fs::read_to_string(worktree.join("README.md")).unwrap(),
+            "original\nHello from MACO\n"
+        );
+    }
+}
+
+#[test]
 fn worker_journal_lock_release_survives_an_inherited_open_description() {
     let (_temp, worktree, path, identity) = observed_fixture();
     let lock =
@@ -452,7 +502,8 @@ fn worker_journal_failed_command_retains_observed_mutation() {
         &worktree,
         &["/bin/sh", "-c", "printf edited >> README.md; exit 7"],
     );
-    assert!(run_worker_execution_journal_command(&path, &identity, &record, false).is_err());
+    let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
+    assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
     let records =
         parse_worker_execution_journal(&fs::read(path).unwrap(), Path::new("journal")).unwrap();
     assert_eq!(records[1].changed_paths, vec![PathBuf::from("README.md")]);
@@ -465,6 +516,7 @@ fn worker_journal_enosys_launch_failure_has_completed_observation() {
     let record = observed_entry(&worktree, &["/no-such-maco-test-command"]);
     let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
     assert!(error.to_string().contains("failed to launch"));
+    assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
     let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(
@@ -492,6 +544,7 @@ fn worker_journal_enosys_observation_failure_is_terminal_and_refuses_retry() {
             error.to_string().contains("terminal failure preserved"),
             "{error:#}"
         );
+        assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
         let bytes = fs::read(&path).unwrap();
         let records: Vec<WorkerExecutionJournalEntry> = bytes
             .split(|byte| *byte == b'\n')

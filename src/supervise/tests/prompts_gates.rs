@@ -357,6 +357,8 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("Never create, replace, rename, link, truncate, or swap"));
     assert!(prompt.contains("Never reconstruct at the end"));
     assert!(prompt.contains("WorkerExecutionJournalRecordError"));
+    assert!(prompt.contains("except the Codex-only proven-no-launch correction"));
+    assert!(prompt.contains("explicitly authorized by the parent-bound operation below"));
     assert!(prompt.contains("include the observed error in environment_failures"));
     assert!(prompt.contains("sandbox_unavailable for sandbox/syscall failures"));
     assert!(prompt.contains("WorkerReport.commands_run may be a subset of real journal records"));
@@ -1269,14 +1271,14 @@ fn injected_failed_validation_report(
 
 fn gate_positive_child_preference() -> RoleModelSelection {
     RoleModelSelection {
-        model: Some("gate-fixture-model".to_string()),
+        model: Some(FRONTIER_PROFILE_MODEL.to_string()),
         reasoning_effort: None,
         unavailable_model_fallback: UnavailableModelFallback::FailClosed,
     }
 }
 
 fn gate_positive_selected_catalog() -> RuntimeModelCatalog {
-    injected_codex_runtime_catalog(&["gate-fixture-model", DEFAULT_PROFILE_MODEL])
+    injected_codex_runtime_catalog(&[FRONTIER_PROFILE_MODEL])
 }
 
 fn run_positive_gate_selected_plan(
@@ -1285,8 +1287,7 @@ fn run_positive_gate_selected_plan(
     options: SupervisorRunOptions,
     external_runner: &mut (dyn FnMut(&ExternalAgentCommand) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
-    let _gate_fixture_models =
-        install_named_test_models(&["gate-fixture-model", DEFAULT_PROFILE_MODEL]);
+    let _gate_fixture_models = install_named_test_models(&[FRONTIER_PROFILE_MODEL]);
     plan.role_models
         .entry(AgentRole::ChildOrchestrator)
         .or_insert_with(gate_positive_child_preference);

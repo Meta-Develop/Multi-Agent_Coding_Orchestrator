@@ -1,0 +1,4 @@
+{"id":1,"result":{"userAgent":"maco/0.162.0 (Ubuntu 24.4.0; x86_64) dumb (maco; 0.3.0)","codexHome":"/capture-home","platformFamily":"unix","platformOs":"linux"}}
+{"method":"configWarning","params":{"summary":"Project-local config, hooks, and exec policies are disabled in the following folders until the project is trusted, but skills still load.\n    1. /workspace/.codex\n       To load project-local config, hooks, and exec policies, add /workspace as a trusted project in /capture-home/config.toml.\n","details":null},"emittedAtMs":1792651230522}
+{"method":"remoteControl/status/changed","params":{"status":"disabled","serverName":"<host>","installationId":"<installation>","environmentId":null},"emittedAtMs":1792651230522}
+{"method":"account/updated","params":{"authMode":"chatgpt","planType":"promax"},"emittedAtMs":1792651230787}

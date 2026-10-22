@@ -6,6 +6,31 @@
       "model": "grok-4.6",
       "reasoning_effort": "xhigh",
       "unavailable_model_fallback": "fail_closed"
+    },
+    "supervisor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "child_orchestrator": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "researcher": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "gate_classifier": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "auditor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
     }
   },
   "assignments": [

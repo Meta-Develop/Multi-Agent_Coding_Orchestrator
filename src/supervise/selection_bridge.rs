@@ -132,7 +132,7 @@ const TEST_CURSOR_CATALOG_OBSERVED_AT_ENV: &str = "MACO_TEST_CURSOR_CATALOG_OBSE
 #[cfg(test)]
 const TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL: &str = "gpt-5.6-sol-selector-triple-runner-up";
 #[cfg(test)]
-const TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL: &str = "gpt-5.6-sol-review-auditor-below-floor";
+const TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL: &str = FRONTIER_PROFILE_MODEL;
 
 #[cfg(test)]
 thread_local! {
@@ -140,7 +140,6 @@ thread_local! {
         RefCell::new(None)
     };
     static TEST_SELECTOR_TRIPLE_RUNNER_UP_ENABLED: Cell<bool> = const { Cell::new(false) };
-    static TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED: Cell<bool> = const { Cell::new(false) };
 }
 
 #[cfg(test)]
@@ -212,14 +211,8 @@ pub(super) fn bind_test_selector_triple_catalog(
 
 #[cfg(test)]
 struct TestBelowFloorReviewAuditorBindGuard {
-    _model_capability: InstalledModelCapabilityPolicy,
-}
-
-#[cfg(test)]
-impl Drop for TestBelowFloorReviewAuditorBindGuard {
-    fn drop(&mut self) {
-        TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| enabled.set(false));
-    }
+    _prior: super::prior_input::OperatorPriorDataGuard,
+    _temp: tempfile::TempDir,
 }
 
 #[cfg(test)]
@@ -227,17 +220,30 @@ fn bind_test_below_floor_review_auditor() -> Result<(
     TestBelowFloorReviewAuditorBindGuard,
     CodexRuntimeModelCatalog,
 )> {
-    let model_capability = install_test_fixture_models(&[(
-        TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL,
-        ModelCapabilityClass::GeneralJudgment,
-    )])?;
+    // The permitted slug is shared by all roles. Keep this negative capability
+    // fixture thread-local so parallel Auditor tests retain their own baseline.
+    let temp = tempfile::tempdir()?;
+    git2::Repository::init(temp.path())?;
+    let priors = selection::built_in_prior_dataset()?;
+    let mut capabilities = default_model_capability_policy();
+    capabilities
+        .models
+        .retain(|row| row.model == TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL);
+    capabilities.models[0].capability = ModelCapabilityClass::GeneralJudgment;
+    std::fs::write(
+        temp.path().join("prior.json"),
+        serde_json::to_vec(&serde_json::json!({
+            "schema_version": 1, "dataset_id": "below-floor-auditor-fixture",
+            "revision": "below-floor-auditor-fixture-v1", "published_on": priors.published_on,
+            "models": [], "capability_policy": capabilities,
+        }))?,
+    )?;
+    let prior = super::prior_input::bind_operator_prior_data(temp.path(), "prior.json")?;
     let catalog = CodexRuntimeModelCatalog::from_slugs([TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL])?;
-    TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(|enabled| {
-        assert!(!enabled.replace(true), "test fixture cannot be nested");
-    });
     Ok((
         TestBelowFloorReviewAuditorBindGuard {
-            _model_capability: model_capability,
+            _prior: prior,
+            _temp: temp,
         },
         catalog,
     ))
@@ -802,7 +808,7 @@ pub(crate) fn select_executable_review_auditor(
     if provenance.status != DecisionStatus::Selected {
         bail!(
             "critical ReviewAuditor selector failed closed against the supplied live catalog: {}",
-            provenance.decision_reason
+            selection_refusal_message(&provenance, AgentRole::Auditor)
         );
     }
     if provenance.normalized_task.authority_role != AuthorityRole::ReviewAuditor {
@@ -2078,14 +2084,12 @@ fn select_with_live_switch_cost_for_policy(
     input: &SelectionInput,
     routing_policy: Option<&crate::selection::routing_policy::RoutingPolicyReceipt>,
 ) -> Result<SelectionProvenance, selection::SelectionError> {
-    let mut constrained;
-    let input = if super::runtime_executables::captured_binding().is_some() {
-        constrained = input.clone();
+    let mut constrained = input.clone();
+    selection::runtime_model_policy::constrain(&mut constrained);
+    if super::runtime_executables::captured_binding().is_some() {
         super::runtime_executables::constrain_selection(&mut constrained);
-        &constrained
-    } else {
-        input
-    };
+    }
+    let input = &constrained;
     let evidence = live_switch_cost_evidence(input);
     let provenance =
         selection::select_with_loaded_routing_policy(input, &evidence, routing_policy)?;
@@ -2486,9 +2490,10 @@ fn select_account_intake_for_role_with_assessment(
             combined = Some(input);
         }
     }
-    let input = combined.context(
+    let mut input = combined.context(
         "normal intake requires a selected account with observed supported model/effort metadata",
     )?;
+    selection::runtime_model_policy::constrain(&mut input);
     let mut decision = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
     decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
     decision.operator_prior_data = super::prior_input::current_provenance();
@@ -2558,28 +2563,6 @@ pub(super) fn base_selector_priors_with_terminal_worker_economics(
         runner_up.one_shot_environment_fallbacks.clear();
         priors.revision = format!("{}+selector-triple-runner-up-fixture", priors.revision);
         priors.models.push(runner_up);
-    }
-    #[cfg(test)]
-    if TEST_BELOW_FLOOR_REVIEW_AUDITOR_ENABLED.with(Cell::get) {
-        let mut below_floor = priors
-            .models
-            .iter()
-            .find(|prior| {
-                prior.runtime == runtime_name(SupervisorRuntime::Codex)
-                    && prior.model == FRONTIER_PROFILE_MODEL
-            })
-            .cloned()
-            .context("below-floor ReviewAuditor fixture requires the frontier Codex prior")?;
-        below_floor.model = TEST_BELOW_FLOOR_REVIEW_AUDITOR_MODEL.to_string();
-        below_floor.source_id = "test-below-floor-review-auditor-fixture".to_string();
-        below_floor.prior_scope =
-            "test-only ReviewAuditor candidate whose static capability is below the role floor"
-                .to_string();
-        below_floor.limitations = vec![
-            "test fixture only; exercises the post-selection CriticalJudgment floor".to_string(),
-        ];
-        priors.revision = format!("{}+below-floor-review-auditor-fixture", priors.revision);
-        priors.models.push(below_floor);
     }
     let economics = crate::optimizer::objective::terminal_worker_routing_economics()?;
     if priors
@@ -3652,6 +3635,9 @@ fn selection_refusal_message(decision: &SelectionProvenance, role: AgentRole) ->
         decision.decision_reason
     );
     let input = &decision.normalized_input;
+    message.push_str(&selection::runtime_model_policy::missing_model_guidance(
+        input,
+    ));
     for catalog in &input.catalogs {
         if catalog.models.is_empty()
             && catalog
@@ -5129,6 +5115,92 @@ mod tests {
     }
 
     #[test]
+    fn every_codex_role_requires_61_sol_and_preserves_effort_and_authority_gates() -> Result<()> {
+        let _policy = bind_fixture_routing_policy()?;
+        let catalog = codex_catalog()?;
+        let advertised = AdvertisedCatalogSet::empty();
+        let admission = test_admission();
+        let profile = default_resolved_profile();
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Worker,
+            AgentRole::Researcher,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let input = selection_input_for_role(SelectionInputForRoleArgs {
+                role,
+                runtime: SupervisorRuntime::Codex,
+                catalog: &catalog,
+                advertised: &advertised,
+                admission: &admission,
+                resolved_objective_profile: &profile,
+                quota_context: None,
+                quota_ledger: None,
+                account_observation: None,
+                signals: DynamicSignals {
+                    retry_count: 0,
+                    budget_signal: BudgetSignal::Continue,
+                    previous_choice: None,
+                    previous_catalog_digest: None,
+                    environment_rejections: Vec::new(),
+                    observed_cost_per_accepted_task_microunits: None,
+                },
+                debug_override: None,
+                history: None,
+            })?;
+            let decision = select_with_live_switch_cost(&input)?;
+            let choice = decision
+                .choice
+                .as_ref()
+                .with_context(|| format!("{role:?}: {}", decision.decision_reason))?;
+            assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+            let mut reference = input.clone();
+            reference.constraints.allowed_models = ["gpt-6.1-sol".into()].into_iter().collect();
+            assert_eq!(
+                choice.candidate.effort,
+                selection::select(&reference)?
+                    .choice
+                    .context("existing effort selection")?
+                    .candidate
+                    .effort
+            );
+            if role != AgentRole::Worker {
+                assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
+            }
+            assert!(decision
+                .candidate_set
+                .iter()
+                .all(|c| c.candidate.model == "gpt-6.1-sol" || !c.eligible));
+            let mut absent = input.clone();
+            absent.catalogs[0]
+                .models
+                .retain(|m| m.model != "gpt-6.1-sol");
+            let refused = select_with_live_switch_cost(&absent)?;
+            assert!(refused.choice.is_none());
+            let message = selection_refusal_message(&refused, role);
+            assert!(
+                message.contains("gpt-6.1-sol") && message.contains("0.162.0"),
+                "{message}"
+            );
+            // An authored legacy-model override cannot bypass the runtime policy.
+            absent.constraints.allow_debug_override = true;
+            absent.debug_override = Some(DebugOverride {
+                candidate: CandidateKey {
+                    runtime: "codex".into(),
+                    model: "gpt-5.6-sol".into(),
+                    effort: SelectorEffort::Xhigh,
+                },
+                requested_by: "test".into(),
+                reason: "legacy override must fail closed".into(),
+            });
+            assert!(select_with_live_switch_cost(&absent)?.choice.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
     fn executable_review_auditor_refuses_selected_model_below_capability_floor() -> Result<()> {
         let (_guard, catalog) = bind_test_below_floor_review_auditor()?;
 
@@ -5312,7 +5384,9 @@ mod tests {
             .models
             .into_iter()
             .find(|prior| {
-                prior.runtime == runtime_name(SupervisorRuntime::Codex) && predicate(prior)
+                prior.runtime == runtime_name(SupervisorRuntime::Codex)
+                    && prior.model == FRONTIER_PROFILE_MODEL
+                    && predicate(prior)
             })
             .context("built-in selector data has no matching Codex prior")
     }
@@ -5983,7 +6057,12 @@ mod tests {
             .choice
             .as_ref()
             .context("adjusted worker choice")?;
-        assert_ne!(adjusted_choice.candidate, default_choice.candidate);
+        assert_eq!(adjusted_choice.candidate.model, "gpt-6.1-sol");
+        assert_eq!(default_choice.candidate.model, "gpt-6.1-sol");
+        assert_ne!(
+            adjusted_worker.provenance.resolved_objective_profile,
+            default_worker.provenance.resolved_objective_profile
+        );
         assert_eq!(
             adjusted_choice.reason,
             selection::ChoiceReason::LoadedRoutingPolicy
@@ -6000,6 +6079,17 @@ mod tests {
             selection::RoutingScoreSemantics::LoadedPolicyEvidencePenaltyV2
         );
         assert_eq!(score.routing_tradeoff_weights, frozen.profile.tradeoffs);
+        let default_score = default_worker
+            .provenance
+            .candidate_set
+            .iter()
+            .find(|candidate| candidate.candidate == default_choice.candidate)
+            .and_then(|candidate| candidate.score.as_ref())
+            .context("default worker score")?;
+        assert_ne!(
+            score.total_score_microunits,
+            default_score.total_score_microunits
+        );
         assert_eq!(score.retry_rework_adjustment_microunits, 0);
         assert_eq!(
             score.human_review_adjustment_microunits,
@@ -6459,15 +6549,14 @@ mod tests {
     #[test]
     fn partial_profile_retains_typed_authority_refusal_instead_of_catalog_fallback() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
-        let worker_prior = codex_prior_for(|prior| {
-            prior
-                .prohibited_authority_roles
-                .contains(&AuthorityRole::AcceptanceGate)
-                && prior
-                    .class_fit
-                    .iter()
-                    .any(|class_fit| class_fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS)
-        })?;
+        let worker_prior = selection::built_in_prior_dataset()?
+            .models
+            .into_iter()
+            .find(|prior| prior.model == "gpt-5.6-luna")
+            .context("historical leaf-only authority fixture")?;
+        assert!(worker_prior
+            .prohibited_authority_roles
+            .contains(&AuthorityRole::AcceptanceGate));
         let worker_effort = worker_prior
             .class_fit
             .iter()
@@ -6590,7 +6679,7 @@ mod tests {
                 .strong_gate_fallback_efforts
                 .contains(&SelectorEffort::Xhigh)
         })?;
-        let other_prior = codex_prior_for(|prior| prior.model != auditor_prior.model)?;
+        let other_model = "gpt-5.6-sol".to_string();
         let mut plan = test_plan();
         plan.role_models.insert(
             AgentRole::Auditor,
@@ -6600,7 +6689,7 @@ mod tests {
             id: "custom-auditor".to_string(),
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "openai".to_string(),
-                model: other_prior.model,
+                model: other_model,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::FullChildTranscript,
@@ -7175,6 +7264,23 @@ mod tests {
             .context("immediately prior worker choice")?
             .candidate
             .clone();
+        state.advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
+            "grok-4.6",
+            &["  * grok-4.6 (default)"],
+        ))?);
+        // This fixture permits the unchanged Grok worker as an alternate runtime.
+        let worker_input = &mut state
+            .decisions
+            .get_mut(&AgentRole::Worker)
+            .unwrap()
+            .normalized_input;
+        worker_input
+            .constraints
+            .allowed_runtimes
+            .insert("grok".into());
+        let mut grok_pool = worker_input.pools[0].clone();
+        grok_pool.runtime = "grok".into();
+        worker_input.pools.push(grok_pool);
         let priors = selection::built_in_prior_dataset()?;
         let withdrawn_catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
             priors
@@ -7212,15 +7318,16 @@ mod tests {
             .choice
             .as_ref()
             .context("degrade transition selected choice")?;
-        assert_eq!(choice.candidate.runtime, previous.runtime);
+        assert_eq!(choice.candidate.runtime, "grok");
+        assert_eq!(choice.candidate.model, "grok-4.6");
         assert_ne!(choice.candidate.model, previous.model);
         assert_eq!(
             choice.switch_transition,
-            selection::ContextSwitchTransition::ModelChangeSameRuntime
+            selection::ContextSwitchTransition::RuntimeChange
         );
         assert_eq!(
             choice.configured_switch_cost_microunits,
-            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
+            crate::objective_profile::DEFAULT_RUNTIME_CHANGE_SWITCH_COST_MICROUNITS
         );
         assert!(choice.configured_switch_cost_microunits > 0);
         assert!(choice.switch_cost_microunits > 0);
@@ -7420,6 +7527,23 @@ mod tests {
             .context("initial worker choice")?
             .candidate
             .clone();
+        state.advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
+            "grok-4.6",
+            &["  * grok-4.6 (default)"],
+        ))?);
+        // This fixture permits the unchanged Grok worker as an alternate runtime.
+        let worker_input = &mut state
+            .decisions
+            .get_mut(&AgentRole::Worker)
+            .unwrap()
+            .normalized_input;
+        worker_input
+            .constraints
+            .allowed_runtimes
+            .insert("grok".into());
+        let mut grok_pool = worker_input.pools[0].clone();
+        grok_pool.runtime = "grok".into();
+        worker_input.pools.push(grok_pool);
         let priors = selection::built_in_prior_dataset()?;
         let withdrawn_catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
             priors
@@ -7454,11 +7578,11 @@ mod tests {
         assert_ne!(replacement.candidate, previous);
         assert_eq!(
             replacement.switch_transition,
-            selection::ContextSwitchTransition::ModelChangeSameRuntime
+            selection::ContextSwitchTransition::RuntimeChange
         );
         assert_eq!(
             replacement.configured_switch_cost_microunits,
-            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
+            crate::objective_profile::DEFAULT_RUNTIME_CHANGE_SWITCH_COST_MICROUNITS
         );
         assert!(replacement.switch_cost_microunits > 0);
         let replacement_choice = replacement.candidate.clone();
@@ -7484,31 +7608,25 @@ mod tests {
     }
 
     #[test]
-    fn typed_environment_rejection_uses_one_shot_data_declared_fallback() -> Result<()> {
+    fn typed_environment_rejection_never_falls_back_to_another_codex_model() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
         let (catalog, mut state) = automatic_state()?;
-        let previous = state
-            .decisions
-            .get(&AgentRole::Worker)
-            .and_then(|decision| decision.choice.as_ref())
-            .context("initial worker choice")?
+        let previous = state.decisions[&AgentRole::Worker]
+            .choice
+            .as_ref()
+            .unwrap()
             .candidate
             .clone();
-        let prior = codex_prior_for(|prior| prior.model == previous.model)?;
-        let fallback = prior
-            .one_shot_environment_fallbacks
-            .first()
-            .context("initial worker has no data-declared environment fallback")?;
+        assert_eq!(previous.model, "gpt-6.1-sol");
         let rejection = TypedSelectorEnvironmentRejection {
             role: AgentRole::Worker,
             rejection: selection::EnvironmentRejectionState {
                 candidate: previous.clone(),
-                rejection_code: fallback.rejection_code.clone(),
-                evidence_id: "typed-runtime-rejection-1".to_string(),
+                rejection_code: "native_multiagent_v2_model_rejected".into(),
+                evidence_id: "typed-runtime-rejection-1".into(),
                 fallback_transition_used: false,
             },
         };
-
         let reselection = reselect_roles_from_supplied_catalog_snapshot(
             &mut state,
             SupervisorRuntime::Codex,
@@ -7519,71 +7637,21 @@ mod tests {
             &[rejection],
         )?;
         let decision = &reselection.decisions[0].1;
-        let transition = decision
-            .environment_fallback
-            .as_ref()
-            .context("typed one-shot fallback transition")?;
-
-        assert!(decision
-            .triggers
-            .contains(&selection::SelectionTrigger::EnvironmentFallback));
+        assert!(decision.environment_fallback.is_none());
         assert_eq!(
             decision.normalized_input.signals.previous_choice.as_ref(),
             Some(&previous)
         );
-        assert_eq!(transition.source, previous);
-        assert_eq!(transition.target.runtime, fallback.target_runtime);
-        assert_eq!(transition.target.model, fallback.target_model);
-        assert_eq!(transition.target.effort, fallback.target_effort);
-        assert_eq!(transition.transition_ordinal, 1);
-        assert_eq!(transition.maximum_transitions, 1);
+        assert!(decision
+            .candidate_set
+            .iter()
+            .any(|c| c.candidate == previous && !c.eligible));
         let choice = decision
             .choice
             .as_ref()
-            .context("environment fallback selected choice")?;
-        assert_eq!(
-            choice.switch_transition,
-            selection::ContextSwitchTransition::ModelChangeSameRuntime
-        );
-        assert_eq!(
-            choice.configured_switch_cost_microunits,
-            crate::objective_profile::DEFAULT_MODEL_CHANGE_SWITCH_COST_MICROUNITS
-        );
-        assert!(choice.switch_cost_microunits > 0);
-        let target_score = decision
-            .candidate_set
-            .iter()
-            .find(|candidate| candidate.candidate == transition.target)
-            .and_then(|candidate| candidate.score.as_ref())
-            .context("environment fallback target score")?;
-        assert_eq!(target_score.switch_transition, choice.switch_transition);
-        assert_eq!(
-            target_score.configured_switch_cost_microunits,
-            choice.configured_switch_cost_microunits
-        );
-        assert_eq!(
-            target_score.switch_cost_microunits,
-            choice.switch_cost_microunits
-        );
-        let fallback_choice = choice.candidate.clone();
-        let after_fallback = reselect_roles_from_supplied_catalog_snapshot(
-            &mut state,
-            SupervisorRuntime::Codex,
-            &catalog,
-            &[AgentRole::Worker],
-            1,
-            BudgetSignal::Continue,
-            &[],
-        )?;
-        assert_eq!(
-            after_fallback.decisions[0]
-                .1
-                .normalized_input
-                .signals
-                .previous_choice
-                .as_ref(),
-            Some(&fallback_choice)
-        );
+            .context("same-model effort recovery")?;
+        assert_eq!(choice.candidate.model, "gpt-6.1-sol");
+        assert_ne!(choice.candidate.effort, previous.effort);
         Ok(())
     }
 
@@ -9247,6 +9315,8 @@ mod tests {
                 assert_eq!(candidate.effort, selector_effort_from_str("xhigh").unwrap());
             } else {
                 assert_eq!(candidate.runtime, "codex");
+                assert_eq!(candidate.model, "gpt-6.1-sol");
+                assert_eq!(candidate.effort, SelectorEffort::Xhigh);
             }
             assert_eq!(event.provenance.normalized_task.risk, RiskLevel::Low);
             assert_eq!(
@@ -10660,8 +10730,8 @@ mod tests {
             CategoryObservation::observed(ModelsObservation {
                 provenance: None,
                 models: vec![ObservedModel {
-                    model_id: "unmeasured-account-model".into(),
-                    supported_efforts: Some(vec!["none".into()]),
+                    model_id: FRONTIER_PROFILE_MODEL.into(),
+                    supported_efforts: Some(vec!["low".into()]),
                     default_effort: None,
                     access: ModelAccessOutcome::UnknownAccess,
                 }],

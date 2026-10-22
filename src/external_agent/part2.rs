@@ -1361,6 +1361,20 @@ mod catalog_effort_tests {
     use super::*;
 
     #[test]
+    fn captured_codex_0162_catalog_preserves_model_and_supported_efforts() -> Result<()> {
+        let catalog = parse_codex_runtime_model_catalog(include_bytes!(
+            "../../tests/fixtures/codex-0.162.0/models.json"
+        ))?;
+        assert!(catalog.contains("gpt-6.1-sol"));
+        assert_eq!(catalog.slugs.len(), 9);
+        for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
+            assert!(catalog.supports_effort("gpt-6.1-sol", effort));
+        }
+        assert_eq!(catalog.effort_metadata("gpt-6.1-sol").unwrap().default.as_deref(), Some("low"));
+        Ok(())
+    }
+
+    #[test]
     fn parser_retains_exact_efforts_and_refuses_invalid_defaults() -> Result<()> {
         let catalog = parse_codex_runtime_model_catalog(br#"{"models":[{"slug":"catalog-model","supported_reasoning_levels":[{"effort":"minimal"},{"effort":"high"}],"default_reasoning_level":"high"}]}"#)?;
         assert!(catalog.supports_effort("catalog-model", "minimal"));
@@ -3395,7 +3409,12 @@ fn validate_codex_writable_artifact_carrier(
         bail!("worker-journal carrier is missing a declared exact journal file");
     }
     if seen_mount_targets != expected_mount_targets {
-        bail!("worker-journal carrier is missing a required Codex protected mount target");
+        let missing = expected_mount_targets
+            .difference(&seen_mount_targets)
+            .map(|name| name.to_string_lossy())
+            .collect::<Vec<_>>()
+            .join(", ");
+        bail!("worker-journal carrier is missing a required Codex protected mount target: {missing}; recreate the incoming attempt with the current MACO build; do not make the carrier writable");
     }
     Ok(())
 }

@@ -1,10 +1,10 @@
 use super::*;
 
 fn install_budget_fixture_models() -> InstalledModelCapabilityPolicy {
-    install_test_fixture_models(&[
-        ("priced-model", ModelCapabilityClass::CriticalJudgment),
-        ("unpriced-model", ModelCapabilityClass::CriticalJudgment),
-    ])
+    install_test_fixture_models(&[(
+        FRONTIER_PROFILE_MODEL,
+        ModelCapabilityClass::CriticalJudgment,
+    )])
     .expect("budget fixture capability policy")
 }
 
@@ -26,7 +26,7 @@ fn bind_priced_budget_fixture_prior(
         .find(|row| row.runtime == "codex" && row.model == FRONTIER_PROFILE_MODEL)
         .cloned()
         .context("budget fixture baseline profile")?;
-    prior.model = "priced-model".to_string();
+    prior.model = FRONTIER_PROFILE_MODEL.to_string();
     prior.source_id = "synthetic-budget-profile".to_string();
     prior.prior_scope = "budget fixture only; not measured provider/model evidence".to_string();
     prior.limitations.push(
@@ -43,7 +43,7 @@ fn bind_priced_budget_fixture_prior(
             version: 1,
             source: "nonlive budget fixture only".to_string(),
             models: vec![ModelCapabilityEvidence {
-                model: "priced-model".to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
                 capability: ModelCapabilityClass::CriticalJudgment,
                 eligible: true,
                 evidence: "synthetic budget profile; not provider or account evidence".to_string(),
@@ -69,7 +69,7 @@ fn priced_budget_fixture_profile() -> Result<(&'static str, ReasoningEffort)> {
         .and_then(|lens| lens.backend.reasoning_effort())
         .and_then(ReasoningEffort::parse)
         .context("budget fixture authored acceptance effort")?;
-    Ok(("priced-model", effort))
+    Ok((FRONTIER_PROFILE_MODEL, effort))
 }
 
 #[test]
@@ -284,7 +284,7 @@ fn budget_integration_serial_scheduler_accounts_exact_hard_boundary_by_process_r
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let effort = plan.review_lenses[0]
         .backend
         .reasoning_effort()
@@ -367,7 +367,7 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(true);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(15), None, None, 10, 10);
     let options = injected_options(&repo_path, temp.path(), "budget-auditor-typed-denial");
     let mut invocations = 0usize;
@@ -460,12 +460,12 @@ fn budget_integration_auditor_admission_refusal_reaches_typed_child_and_final_re
 
 #[test]
 fn budget_integration_cost_enforcement_refuses_missing_model_pricing_before_launch() {
-    assert_unpriced_dispatch_refused("unpriced-model");
+    assert_unpriced_dispatch_refused(FRONTIER_PROFILE_MODEL);
 }
 
 #[test]
-fn pricing_guard_placeholder_refuses_before_runner_invocation() {
-    assert_unpriced_dispatch_refused("gpt-5.6-sol");
+fn pricing_guard_required_codex_model_without_pricing_refuses_before_runner_invocation() {
+    assert_unpriced_dispatch_refused(FRONTIER_PROFILE_MODEL);
 }
 
 fn assert_unpriced_dispatch_refused(model: &str) {
@@ -559,7 +559,7 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
         injected_named_assignment("child-b", "b.txt"),
     ];
     let mut plan = injected_multi_plan(assignments.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 60, 40);
     let options = injected_options(
         &repo_path,
@@ -673,7 +673,7 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
     if interleave_review {
         plan.review_lenses = default_supervisor_review_lenses();
     }
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     plan.role_models.insert(
         AgentRole::Researcher,
         plan.role_models[&AgentRole::ChildOrchestrator].clone(),
@@ -899,7 +899,7 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
             requested_effort: command.reasoning_effort.clone(),
             rollout_model: CodexParentResolvedField::Unknown,
             rollout_effort: CodexParentResolvedField::Unknown,
-            observed_model: CodexParentResolvedField::Known("priced-model".to_string()),
+            observed_model: CodexParentResolvedField::Known(FRONTIER_PROFILE_MODEL.to_string()),
             observed_effort: CodexParentResolvedField::Known("xhigh".to_string()),
             server_rerouted_model: None,
             model_mismatch: false,
@@ -1287,7 +1287,7 @@ fn budget_lifecycle_child_pre_runner_failure_releases_reservation_and_stops_pend
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let existing_effort = plan
         .review_lenses
         .first()
@@ -1365,7 +1365,7 @@ fn budget_lifecycle_oversized_child_intent_reaches_runner_once() {
     let mut child = injected_named_assignment("child-a", "README.md");
     child.task = Some("x".repeat(8 * 1024 + 1));
     let mut plan = injected_plan(child.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let existing_effort = plan
         .review_lenses
         .first()
@@ -1426,7 +1426,7 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let effort = plan.review_lenses[0]
         .backend
         .reasoning_effort()
@@ -1455,7 +1455,7 @@ fn budget_lifecycle_auditor_pre_runner_failure_releases_reservation_and_stops_pe
         retain_priced_single_turn_fixture(
             &mut run,
             command,
-            "priced-model",
+            FRONTIER_PROFILE_MODEL,
             &fs::read(&command.json_log).expect("complete child capture"),
         );
         run
@@ -1509,7 +1509,7 @@ fn budget_lifecycle_child_runner_panic_reconciles_missing_and_stops_pending() {
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a, child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let existing_effort = plan
         .review_lenses
         .first()
@@ -1583,7 +1583,7 @@ fn budget_lifecycle_auditor_runner_panic_reconciles_missing_and_stops_pending() 
     let child_b = injected_named_assignment("child-b", "src/lib.rs");
     let mut plan = injected_multi_plan(vec![child_a.clone(), child_b], 0);
     plan.semantic_coordination = SemanticCoordinationMode::Block;
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let effort = plan.review_lenses[0]
         .backend
         .reasoning_effort()
@@ -1659,7 +1659,7 @@ fn budget_integration_reservation_is_released_when_codex_process_never_starts() 
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment.clone(), 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let existing_effort = plan
         .review_lenses
         .first()
@@ -1715,7 +1715,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
     let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("uncertain-start command root");
@@ -1727,7 +1727,7 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some(FRONTIER_PROFILE_MODEL.to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -1772,7 +1772,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
     let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("unverified containment command root");
@@ -1784,7 +1784,7 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some(FRONTIER_PROFILE_MODEL.to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -1842,7 +1842,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     let _capability = install_budget_fixture_models();
     let assignment = injected_assignment(false);
     let mut plan = injected_plan(assignment, 0);
-    inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
     let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
     let temp = tempfile::tempdir().expect("truncated capture command root");
@@ -1854,7 +1854,7 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("priced-model".to_string());
+    command.model = Some(FRONTIER_PROFILE_MODEL.to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -1940,11 +1940,11 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
     run.codex_parent_evidence = Some(CodexParentEvidence {
         codex_version: Some("0.144.4".to_string()),
         thread_id: Some("correlated-thread".to_string()),
-        requested_model: Some("gpt-5.6-sol".to_string()),
+        requested_model: Some(FRONTIER_PROFILE_MODEL.to_string()),
         requested_effort: Some("xhigh".to_string()),
         rollout_model: CodexParentResolvedField::Unknown,
         rollout_effort: CodexParentResolvedField::Unknown,
-        observed_model: CodexParentResolvedField::Known("gpt-5.6-sol".to_string()),
+        observed_model: CodexParentResolvedField::Known(FRONTIER_PROFILE_MODEL.to_string()),
         observed_effort: CodexParentResolvedField::Known("xhigh".to_string()),
         server_rerouted_model: None,
         model_mismatch: false,
@@ -2112,14 +2112,14 @@ fn cli_usage_keeps_aggregating_each_turn_even_with_parent_provenance() {
     run.codex_parent_evidence = Some(crate::external_agent::CodexParentEvidence {
         codex_version: Some("0.144.4".to_string()),
         thread_id: Some("cli-thread".to_string()),
-        requested_model: Some("gpt-5.6-sol".to_string()),
+        requested_model: Some(FRONTIER_PROFILE_MODEL.to_string()),
         requested_effort: Some("xhigh".to_string()),
         rollout_model: crate::external_agent::CodexParentResolvedField::Known(
-            "gpt-5.6-sol".to_string(),
+            FRONTIER_PROFILE_MODEL.to_string(),
         ),
         rollout_effort: crate::external_agent::CodexParentResolvedField::Known("xhigh".to_string()),
         observed_model: crate::external_agent::CodexParentResolvedField::Known(
-            "gpt-5.6-sol".to_string(),
+            FRONTIER_PROFILE_MODEL.to_string(),
         ),
         observed_effort: crate::external_agent::CodexParentResolvedField::Known(
             "xhigh".to_string(),
@@ -2154,7 +2154,7 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
         (256, false, DispatchUsageReliability::Missing),
     ] {
         let mut plan = injected_plan(injected_assignment(false), 0);
-        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
         let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
         let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
         let temp = tempfile::tempdir().expect("large capture command root");
@@ -2166,7 +2166,7 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
             temp.path().join("report.json"),
             Duration::from_secs(1),
         );
-        command.model = Some("priced-model".to_string());
+        command.model = Some(FRONTIER_PROFILE_MODEL.to_string());
         let transcript = format!(
             "{}\n{}\n",
             json!({"type": "item.completed", "item": {"text": "x".repeat(40 * 1024)}}),
@@ -2198,7 +2198,7 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
             retain_priced_single_turn_fixture(
                 &mut run,
                 &command,
-                "priced-model",
+                FRONTIER_PROFILE_MODEL,
                 capture.stdout.as_bytes(),
             );
         }
@@ -2448,7 +2448,7 @@ fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
         let mut plan = injected_plan(assignment.clone(), 0);
-        inject_priced_process_roles(&mut plan, "priced-model", 1.0);
+        inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
         let budget = match plan_hard {
             Some(hard) => injected_run_budget(None, Some(hard), None, None, 10, 10),
             None => SupervisorBudgetConfig {
@@ -2512,7 +2512,13 @@ fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runti
         SupervisorRuntime::ClaudeCode,
         SupervisorRuntime::GeminiCli,
     ] {
-        for model in ["gpt-5.6-sol", "gpt-5.6-luna", "fake", "unknown-model"] {
+        for model in [
+            FRONTIER_PROFILE_MODEL,
+            "gpt-5.6-sol",
+            "gpt-5.6-luna",
+            "fake",
+            "unknown-model",
+        ] {
             // A model label never confers Fake launch authority.
             assert!(pricing_for_runtime(&plan, model, runtime).is_none());
         }
@@ -2534,7 +2540,7 @@ fn pricing_guard_reservation_runtime_cannot_drift_from_fake_to_real() {
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("gpt-5.6-sol".to_string());
+    command.model = Some("fake".to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -2589,18 +2595,23 @@ fn assert_pricing_guard_settlement(
     rate: Option<f64>,
     expected_cost: Option<f64>,
 ) {
+    // Project placeholders are usable only for the deterministic Fake runtime.
+    let model = if runtime == SupervisorRuntime::Fake {
+        "fake"
+    } else {
+        FRONTIER_PROFILE_MODEL
+    };
     let mut plan = injected_plan(injected_assignment(false), 0);
     if let Some(rate) = rate {
         plan.model_pricing.insert(
-            "gpt-5.6-sol".to_string(),
+            model.to_string(),
             ModelPricing {
                 input_usd_per_million_tokens: rate,
                 output_usd_per_million_tokens: rate,
             },
         );
         let resolved =
-            crate::llm::provider::resolve_model_pricing(&plan.model_pricing, "gpt-5.6-sol")
-                .unwrap();
+            crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model).unwrap();
         assert_eq!(
             resolved.provenance,
             crate::llm::provider::ModelPricingProvenance::PlanOverride
@@ -2621,7 +2632,7 @@ fn assert_pricing_guard_settlement(
         temp.path().join("report.json"),
         Duration::from_secs(1),
     );
-    command.model = Some("gpt-5.6-sol".to_string());
+    command.model = Some(model.to_string());
     let mut reservation = match reserve_dispatch_budget(
         &plan,
         &budget,
@@ -2648,7 +2659,7 @@ fn assert_pricing_guard_settlement(
         injected_verified_run_without_journals(&command)
     };
     if runtime == SupervisorRuntime::Codex {
-        retain_attribution_fixture(&mut run, &command, Some("gpt-5.6-sol"), false, false);
+        retain_attribution_fixture(&mut run, &command, Some(model), false, false);
     }
     let settlement = reservation
         .settle_bound_runtime(&run, &command)
@@ -3158,7 +3169,7 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
         let mut plan = injected_plan(assignment.clone(), 0);
-        inject_priced_process_roles(&mut plan, "priced-model", 2.0);
+        inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 2.0);
         plan.model_pricing.insert(
             "fallback-model".to_string(),
             ModelPricing {
@@ -3208,7 +3219,13 @@ fn assert_attribution_pipeline_refuses_identity(observed: Option<&str>) {
                 // still fail the actual child/Auditor acceptance gate.
                 assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
             } else {
-                retain_attribution_fixture(&mut run, command, Some("priced-model"), false, false);
+                retain_attribution_fixture(
+                    &mut run,
+                    command,
+                    Some(FRONTIER_PROFILE_MODEL),
+                    false,
+                    false,
+                );
             }
             run
         };
@@ -3283,7 +3300,7 @@ fn researcher_source_inputs_local_refusal_settles_not_started_but_unknown_helper
     use crate::external_agent::researcher_inputs::tests::{failed_local_probe, fixture};
     for unknown_helper in [false, true] {
         let (_root, mut command) = fixture()?;
-        command.model = Some("gpt-5.6-sol".into());
+        command.model = Some(FRONTIER_PROFILE_MODEL.into());
         let plan = injected_plan(injected_assignment(false), 0);
         let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
         budget
@@ -3348,7 +3365,7 @@ fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_qui
         ("changed", true),
     ] {
         let (_root, mut command) = fixture()?;
-        command.model = Some("gpt-5.6-sol".into());
+        command.model = Some(FRONTIER_PROFILE_MODEL.into());
         let plan = injected_plan(injected_assignment(false), 0);
         let mut budget = injected_run_budget(None, Some(100), None, None, 50, 50);
         budget
@@ -3420,7 +3437,7 @@ fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants
     plan.role_models.insert(
         AgentRole::ChildOrchestrator,
         RoleModelSelection {
-            model: Some("unpriced-model".to_string()),
+            model: Some(FRONTIER_PROFILE_MODEL.to_string()),
             reasoning_effort: None,
             unavailable_model_fallback: UnavailableModelFallback::FailClosed,
         },
@@ -3432,7 +3449,7 @@ fn observed_auditor_three_lens_dispatch_preserves_boundaries_and_disjoint_grants
             ..
         } = &mut lens.backend
         {
-            *model = "unpriced-model".to_string();
+            *model = FRONTIER_PROFILE_MODEL.to_string();
             *reasoning_effort = Some("xhigh".to_string());
         }
     }
@@ -3543,7 +3560,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
         let (temp, repo_path) = injected_repository();
         let assignment = injected_assignment(true);
         let mut plan = injected_plan(assignment.clone(), 0);
-        inject_priced_process_roles(&mut plan, "priced-model", 2.0);
+        inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 2.0);
         let budget = injected_run_budget(None, Some(220_000), None, None, 16_384, 16_384);
         // A new registry incarnation must not reuse the previous case's RunId.
         let run_id = format!("observed-auditor-effort-{}", effort.unwrap_or("unknown"));
@@ -3567,7 +3584,13 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
             }
             write_injected_usage(command, 7, 3);
             let mut run = injected_verified_run(command);
-            retain_attribution_fixture(&mut run, command, Some("priced-model"), true, false);
+            retain_attribution_fixture(
+                &mut run,
+                command,
+                Some(FRONTIER_PROFILE_MODEL),
+                true,
+                false,
+            );
             if auditor {
                 let evidence = run.codex_parent_evidence.as_mut().unwrap();
                 evidence.observed_effort = effort

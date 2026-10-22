@@ -96,6 +96,22 @@ same executable before dispatch.
 
 Prerequisites:
 
+- Install **codex-cli 0.162.0 or newer** at the trusted path. The selected
+  account's `codex debug models` catalog must advertise `gpt-6.1-sol`.
+  Every Codex runtime role (supervisor, orchestrator, worker, researcher,
+  reviewer, gate classifier and auditor) uses `gpt-6.1-sol`; assignments differ
+  only by the existing effort selection. Auditor lenses retain the xhigh floor.
+  Missing 6.1 availability fails closed; older Sol and Luna are not fallbacks.
+  `gpt-6-astra` remains prohibited for every role.
+  Use 0.162.0 for this lineup: app-server launches retain an exact protocol
+  qualification gate, so a newer CLI also needs protocol qualification.
+  The 0.162.0 adapter validates asynchronous `account/updated` notices during
+  startup and inference, timestamped moderation metadata, request-resolution
+  notices, and `turn/started` arriving before its response. These notifications
+  remain in the raw stream; completion and usage still require correlated
+  `turn/completed` and `thread/tokenUsage/updated` events.
+- Ripgrep is installed. Codex workers call `rg` for inspection. Run
+  `rg --version`. Install it with `sudo apt-get install -y ripgrep`.
 - Logical `codex` resolves to the first existing path of
   `/run/current-system/sw/bin/codex`, `/usr/bin/codex`, or `/bin/codex`. The
   canonical file must be a root-owned, executable, non-symlink regular file,
@@ -326,8 +342,8 @@ It is a supported routing configuration, not a guarantee of current provider
 availability. Unknown or newer model ids need an evidence-backed operator
 prior via `--prior-data` before use; a similar name is insufficient. Keep
 delegating assignments and all control roles on Codex. The remaining role
-models are selected automatically; the explicit Worker preference cannot
-bypass qualification gates.
+models explicitly use `gpt-6.1-sol` / `xhigh` with fail-closed availability;
+the explicit Worker preference cannot bypass qualification gates.
 
 The supervisor plan is **positional**; there is no `--supervisor-plan` flag.
 `--from-goal FILE` is an alternative source that decomposes a goal/spec and
@@ -444,8 +460,27 @@ a clean target repository; the plan copy requires no target-repository change.
 
 ## Troubleshooting
 
+If selection reports that required model `gpt-6.1-sol` is absent or unavailable,
+check `codex --version` at the canonical trusted executable, install at least
+0.162.0, validate the selected account, and rerun `codex debug models`.
+An older CLI's catalog is insufficient even when login succeeds. Do not select
+another Codex model to bypass this refusal. The mixed plan keeps its
+`grok-4.6` / `xhigh` worker and uses 6.1 for Codex control and audit roles.
+
+A required-edit Grok report with empty `files_changed` and no native
+`tool_call`, `tool_call_update` or `tool_use` event gets one continuation
+in the same session, even if `commands_run` is non-empty and whatever status
+it claims. A second idle turn is rejected as `worker_no_progress`, never
+acceptance evidence.
+
 | Symptom | Action |
 | --- | --- |
+| Codex worker report with a `missing_executable` environment failure such as `bash: line 1: rg: command not found` | The run fails closed even when the edit itself is correct. Install ripgrep with `sudo apt-get install -y ripgrep`. |
+| Codex 0.162.0 journal wrapper is blocked by a read-only sandbox path and requests elevated permissions | Preserve the JSONL and refuse the approval. Use a MACO build that precreates all four empty journal-carrier mount targets: `.git`, `.agents`, `.codex`, and `.aws`. Version 0.162.0 added the `.aws` mask; its creation inside the read-only carrier fails before the wrapper can launch. The carrier and those empty targets stay read-only; only the bound journal file is writable. Do not grant credentials, make the carrier writable, or approve an expansion. |
+| `unexpected app-server message` / `unsupported method` | Keep the lens or worker JSONL and summary, check the trusted binary's `--version`, and report the exact method and captured stream for protocol qualification. Unknown methods still fail closed. On 0.162.0, `account/updated` during startup or inference is supported; a rejection of that valid notification indicates an older MACO build. Do not bypass the lens gate or treat missing usage as zero tokens. |
+| `WorkerJournalPrelaunchRejected: no command launched; journal unchanged` | A Codex worker may correct only the rejected arguments and retry that invocation once through the same bound wrapper. An extra separator (`-- -- bash ...`) must become `-- bash ...`. Copy the exact assigned worktree into both wrapper `--cwd` and execution tool `workdir`. Preserve a successfully corrected input mistake as an informational finding; do not invent a journal row or suppress unresolved environment failures. A second rejection stops the worker. Grok workers retain their stop-on-error contract. |
+| Codex `exec_command` reports `CreateProcess` / `Failed to create unified exec process` before starting the journal wrapper | The worker may retry once with the exact assigned worktree as tool `workdir`, using the copyable call in its prompt. After a native edit, that corrected post-edit observation must be the next action; never reapply the edit or run an inspection first. The saved Codex stream may omit the rejected call's tool `workdir`; inspect stderr and the worker findings without guessing the missing path. |
+| `wrapped command failed to launch; journal retained`, a timeout, or an executed/possibly executed command fails | Stop and preserve the evidence. These errors do not authorize retry, journal repair, or discarding records, even if no changed paths were observed. The no-launch correction applies only to the explicit rejections above. |
 | `current cgroup <path> is not inside a delegated systemd user manager` | The process is outside `user@<uid>.service`. Re-run under `systemd-run --user --scope --quiet -p Delegate=yes` with `XDG_RUNTIME_DIR` and `DBUS_SESSION_BUS_ADDRESS` set as above. The user session must already be up. |
 | Sandboxed or hosted runner with no systemd user manager. Tests print `SKIP <test>: current cgroup <path> is not inside a delegated systemd user manager`. | Same admission rule. GitHub-hosted runners do not provide that manager. The delegated-scope CI script is only for those ephemeral runners. |
 | `explicit Grok executable may not be a symlink` | `MACO_GROK_BIN` is a symlink. Set it with `readlink -f` to the real file, then `test -f` and `test ! -L`. |

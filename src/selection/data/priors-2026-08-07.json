@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "dataset_id": "maco-runtime-model-effort-priors",
-  "revision": "2026-10-15.1",
-  "published_on": "2026-10-15",
+  "revision": "2026-10-22.1",
+  "published_on": "2026-10-22",
   "objective_profiles": [
     {
       "name": "accepted-task-total-cost",
@@ -159,9 +159,9 @@
     {
       "runtime": "codex",
       "model": "gpt-6.1-sol",
-      "observed_on": "2026-10-15",
-      "source_id": "owner-policy-gpt-6-1-sol-baseline-2026-10-15",
-      "prior_scope": "owner-policy default capable model baseline plus strongest approved no-evidence gate fallback",
+      "observed_on": "2026-10-22",
+      "source_id": "owner-policy-gpt-6-1-sol-all-codex-roles-2026-10-22",
+      "prior_scope": "standing owner-policy baseline for every Codex role; assignments differ only by effort; strongest approved no-evidence gate fallback",
       "limitations": ["quality, sample-size weights, and costs are owner-policy baseline values inherited from gpt-5.6-sol, not measured local evidence for gpt-6.1-sol", "strength rank expresses owner-policy default preference, not a measured capability comparison", "not comparable local accepted-task gate evidence", "outcome ledger remains authoritative for local cost and acceptance"],
       "prohibited": false,
       "prohibition_reason": null,

@@ -541,7 +541,7 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
      unavailable-model fallback; the upstream catalog may be cached when refresh fails, so \
      membership is runtime-advertised availability rather than a fresh entitlement guarantee";
 #[cfg(test)]
-const FRONTIER_PROFILE_MODEL: &str = "gpt-5.6-sol";
+const FRONTIER_PROFILE_MODEL: &str = "gpt-6.1-sol";
 #[cfg(test)]
 const BALANCED_PROFILE_MODEL: &str = "gpt-5.6-terra";
 #[cfg(test)]

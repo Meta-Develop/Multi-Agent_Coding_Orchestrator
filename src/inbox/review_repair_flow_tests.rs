@@ -941,7 +941,7 @@ fn complete_abc_fixture() -> CompleteRepairFixture {
         binding.clone(),
     )
     .expect("build audit task independently");
-    let catalog_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+    let catalog_models = ["gpt-6.1-sol".to_string()].into_iter().collect();
     let selection = compact_independent_auditor_selection(
         &select_critical_independent_auditor(&catalog_models).expect("select"),
     )
@@ -1502,7 +1502,7 @@ fn parameterized_refusals_do_not_fabricate_passed_evidence_or_identities() {
             fixture.binding.clone(),
         )
         .expect("task"),
-        "gpt-5.6-sol",
+        "gpt-6.1-sol",
     );
     failed_audit.accepted = false;
     failed_audit.lenses[0].decision = LensDecision::Reject;

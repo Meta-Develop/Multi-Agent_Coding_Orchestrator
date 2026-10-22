@@ -4606,13 +4606,13 @@ where
     };
     let selection = match review_loop_entry::compact_independent_auditor_selection(&decision) {
         Ok(selection) => selection,
-        Err(_) => {
+        Err(error) => {
             let lane = review_loop_entry::blocked_independent_audit_lane_result(
                 item,
                 &task.head_oid,
                 vec![
                     review_loop_entry::InboxIndependentAuditLaneBlocker::UnavailableEligibleAuditor {
-                        detail: decision.decision_reason,
+                        detail: error.to_string(),
                     },
                 ],
                 None,
@@ -6010,7 +6010,7 @@ pub(super) fn launch_inbox_read_only_independent_auditor(
     let decision = review_loop_entry::select_critical_independent_auditor(&available_models)
         .map_err(|error| error.to_string())?;
     let selection = review_loop_entry::compact_independent_auditor_selection(&decision)
-        .map_err(|_| decision.decision_reason)?;
+        .map_err(|error| error.to_string())?;
     let prompt = prompt_builder(&selection)?;
     let auditor_session_id = format!("{}-item-{item_index}-repair-auditor", run_id.as_str());
     let prompt_sha256 = crate::artifacts::state_auth::sha256_hex(prompt.as_bytes());
@@ -7999,14 +7999,14 @@ mod pr_intake_always_on_audit_tests {
             lenses: vec![
                 crate::optimizer::merge_authority::LensVerdict {
                     lens_id: "diff".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "adversarial-diff".to_string(),
                     information_scope: "diff-only".to_string(),
                     decision: crate::optimizer::merge_authority::LensDecision::Accept,
                 },
                 crate::optimizer::merge_authority::LensVerdict {
                     lens_id: "tests".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "tests-as-contract".to_string(),
                     information_scope: "tests-only".to_string(),
                     decision: crate::optimizer::merge_authority::LensDecision::Accept,
@@ -8041,12 +8041,12 @@ mod pr_intake_always_on_audit_tests {
             rolling_budget_quota: None,
         };
         let review_loop = review_loop_entry::evaluate_inbox_item_review_loop(&item);
-        let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let available_models = ["gpt-6.1-sol".to_string()].into_iter().collect();
         let callback_called = Cell::new(false);
         let mut before_launch =
             |session_id: &str, selection: &InboxIndependentAuditorSelectionEvidence| {
                 assert_eq!(session_id, "independent-audit-fake-command-item-1-auditor");
-                assert_eq!(selection.model, "gpt-5.6-sol");
+                assert_eq!(selection.model, "gpt-6.1-sol");
                 assert_eq!(selection.effort, crate::selection::ReasoningEffort::Xhigh);
                 callback_called.set(true);
                 Ok(())
@@ -8075,7 +8075,7 @@ mod pr_intake_always_on_audit_tests {
                     command.workspace_access,
                     crate::process_runner::WorkspaceAccess::ReadOnly
                 );
-                assert_eq!(command.model.as_deref(), Some("gpt-5.6-sol"));
+                assert_eq!(command.model.as_deref(), Some("gpt-6.1-sol"));
                 assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
                 assert_eq!(
                     command.assignment_process_launch_kind,
@@ -8096,7 +8096,7 @@ mod pr_intake_always_on_audit_tests {
                 );
                 assert_eq!(grant.attempt(), 1);
                 assert_eq!(grant.duty(), INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY);
-                assert_eq!(grant.model(), Some("gpt-5.6-sol"));
+                assert_eq!(grant.model(), Some("gpt-6.1-sol"));
                 assert_eq!(
                     command
                         .agent_lifecycle
@@ -8520,7 +8520,7 @@ mod pr_intake_always_on_audit_tests {
             machine_global: None,
             rolling_budget_quota: None,
         };
-        let available_models = ["gpt-5.6-sol".to_string()].into_iter().collect();
+        let available_models = ["gpt-6.1-sol".to_string()].into_iter().collect();
         let expected_session = format!("{}-item-1-auditor", run_id.as_str());
         let runner_calls = Cell::new(0usize);
         let spawn_attempted = Cell::new(0usize);
@@ -8562,7 +8562,7 @@ mod pr_intake_always_on_audit_tests {
                 assert_eq!(grant.subject(), expected_session.as_str());
                 assert_eq!(grant.attempt(), 1);
                 assert_eq!(grant.duty(), INBOX_INDEPENDENT_AUDITOR_PROCESS_DUTY);
-                assert_eq!(grant.model(), Some("gpt-5.6-sol"));
+                assert_eq!(grant.model(), Some("gpt-6.1-sol"));
                 let lifecycle_role = command
                     .agent_lifecycle
                     .as_ref()

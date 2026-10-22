@@ -309,7 +309,7 @@ pub(super) fn exercise<'budget>(
             AgentRole::Worker,
             SupervisorRuntime::Codex,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".into()),
+                model: Some(FRONTIER_PROFILE_MODEL.into()),
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },
@@ -392,8 +392,8 @@ pub(super) fn exercise<'budget>(
                 );
                 assert_eq!(outcome.command_records.len() - commands_start, 2);
             }
-            assert!(context.cancellation.is_cancelled());
-            assert!(outcome.assignment_failed);
+            assert!(context.cancellation.is_cancelled(), "{case}: {error:#}");
+            assert!(outcome.assignment_failed, "{case}: {error:#}");
             let mut recovered = WorkerRequestInbox::recover(
                 repository_authenticator_key_only(context.repo)?,
                 binding.clone(),
@@ -489,7 +489,7 @@ pub(super) fn exercise<'budget>(
             AgentRole::Worker,
             SupervisorRuntime::Codex,
             RoleModelSelection {
-                model: Some("gpt-5.6-sol".into()),
+                model: Some(FRONTIER_PROFILE_MODEL.into()),
                 reasoning_effort: Some("xhigh".into()),
                 ..Default::default()
             },

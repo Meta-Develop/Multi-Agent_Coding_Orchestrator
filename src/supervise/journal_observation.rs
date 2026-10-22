@@ -155,6 +155,11 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
     // Keep semantic validation before opening any append descriptor or running argv.
     let mut encoded = Vec::new();
     append_worker_execution_journal_record(&mut encoded, entry)?;
+    // Reject a duplicated CLI separator before recording intent or attempting
+    // spawn. Never infer retry safety from a spawn error or a command's exit.
+    if !observe_changes && entry.command[0] == "--" {
+        bail!("WorkerJournalPrelaunchRejected: no command launched; journal unchanged; duplicate -- separator: pass exactly one -- before the executable, for example -- bash -lc 'git diff --check'");
+    }
     #[cfg(target_os = "linux")]
     {
         use std::io::Read;
@@ -182,6 +187,12 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
             .iter()
             .rev()
             .find_map(|record| record.observation.as_ref());
+        if let Err(error) = fs::canonicalize(&entry.cwd) {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                bail!("WorkerJournalPrelaunchRejected: no command launched; journal unchanged; --cwd does not exist; copy the exact absolute Assigned worktree into both --cwd and the execution tool workdir; retry only this rejected invocation");
+            }
+            return Err(error).context("cannot resolve journal worktree; stop");
+        }
         let repository = Repository::open(&entry.cwd)
             .context("journal observation requires the assigned Git worktree root")?;
         let root = repository

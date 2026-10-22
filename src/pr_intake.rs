@@ -2620,7 +2620,7 @@ mod tests {
     }
 
     fn sol_catalog() -> Vec<String> {
-        vec!["gpt-5.6-sol".to_string()]
+        vec!["gpt-6.1-sol".to_string()]
     }
 
     fn loaded_sol_catalog() -> Result<CodexRuntimeModelCatalog, String> {
@@ -2781,7 +2781,7 @@ mod tests {
         assert!(task.requires_independent_auditor);
         assert!(!task.grants_merge_permission);
         assert!(!task.auto_merge_performed);
-        assert_eq!(request.selection.model, "gpt-5.6-sol");
+        assert_eq!(request.selection.model, "gpt-6.1-sol");
         assert!(request.selection.effort >= ReasoningEffort::Xhigh);
         assert_eq!(request.authority.role, AgentRole::Auditor);
         assert_eq!(request.authority.phase, OrchestrationPhase::Audit);
@@ -2846,7 +2846,7 @@ mod tests {
             }
         );
         assert_eq!(request.task.head_repository.as_deref(), Some("acme/repo"));
-        assert_eq!(request.selection.model, "gpt-5.6-sol");
+        assert_eq!(request.selection.model, "gpt-6.1-sol");
         assert_eq!(request.selection.effort, ReasoningEffort::Xhigh);
 
         let replay = produce_repository_pr_intake_with(
