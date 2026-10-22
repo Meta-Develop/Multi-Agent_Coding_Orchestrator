@@ -48,8 +48,11 @@ jobs:
       - name: Verify Cargo.lock is current
         run: cargo metadata --locked --format-version 1 > /dev/null
 
-      - name: Require encrypted keyring sessions and no advisory exceptions in both workspaces
+      - name: Require encrypted keyring sessions and no global advisory exceptions
         run: python3 scripts/check_keyring_crypto.py
+
+      - name: Validate version-exact desktop advisory exceptions
+        run: python3 scripts/check_desktop_supply_chain.py --check-only
 
       - name: Verify the locked release package
         run: cargo package --locked --workspace --no-default-features
@@ -71,8 +74,8 @@ jobs:
               print(f"{name.upper()}={value}")
           PY
           )"
-          cargo install --locked --version "${CARGO_AUDIT}" cargo-audit
-          cargo install --locked --version "${CARGO_DENY}" cargo-deny
+          cargo install --locked --version "${CARGO_AUDIT}" cargo-audit --jobs 2
+          cargo install --locked --version "${CARGO_DENY}" cargo-deny --jobs 2
           installed_audit="$(cargo audit --version | awk '{ print $2; exit }')"
           installed_deny="$(cargo deny --version | awk '{ print $2; exit }')"
           if [[ "${installed_audit}" != "${CARGO_AUDIT}" ]]; then
@@ -91,3 +94,6 @@ jobs:
 
       - name: Enforce dependency policy
         run: cargo deny --locked check -D warnings advisories bans licenses sources
+
+      - name: Audit desktop lockfile and enforce desktop dependency policy
+        run: python3 scripts/check_desktop_supply_chain.py

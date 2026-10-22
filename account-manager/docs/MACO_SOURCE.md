@@ -16,10 +16,9 @@ does not migrate or duplicate credentials. Headless `coding-agent-manager`
 `Cargo.lock` resolves MACO and that crate. The desktop shell
 (`coding-agent-manager-desktop` under `src-tauri/`) keeps a separate
 `src-tauri/Cargo.lock` and path-depends on `../core` (one source tree, no copy).
-`package-lock.json` remains independent of MACO's Rust dependencies. The scoped
-native dependency correction and remaining desktop audit warnings are recorded in
-[DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md) (desktop lock only; root supply-chain
-CI does not waive them globally).
+`package-lock.json` remains independent of MACO's Rust dependencies. Desktop dependency updates and version-exact upstream advisory dispositions are
+recorded in [DEPENDENCY_AUDIT.md](DEPENDENCY_AUDIT.md). Supply-chain CI checks
+both lockfiles; desktop exceptions never apply to the root workspace.
 
 ## Native core build
 

@@ -1,0 +1,131 @@
+# Desktop policy: all targets and dev/build dependencies remain in scope.
+# scripts/check_desktop_supply_chain.py enforces version-exact advisory scope.
+# Keep the root policy exception-free; changes here do not apply to headless CAM.
+
+[graph]
+# An empty target list means no platform filtering: inspect every target that
+# Cargo resolves into the lockfile. Keep dev dependencies in the graph too.
+targets = []
+exclude = []
+all-features = false
+no-default-features = false
+exclude-dev = false
+
+[advisories]
+unused-ignored-advisory = "deny"
+unsound = "all"
+ignore = [
+    { id = "RUSTSEC-2024-0370", reason = "proc-macro-error@1.0.4: GTK3 glib-macros/gtk3-macros build dependency; no patched 1.x release. Remove when Tauri no longer needs the GTK3 0.18 macro stack." },
+    { id = "RUSTSEC-2024-0429", reason = "glib@0.18.5: Tauri 2.12 uses GTK3 0.18; patched glib >=0.20 is incompatible. No application call to VariantStrIter/array_iter_str was found; this is not proof of unreachability. Remove when Tauri supports a patched GLib binding without replacing the desktop runtime." },
+    { id = "RUSTSEC-2026-0371", reason = "zbus_names@4.3.4: opener 2.7.2 requires zbus 5; these types are used by its Linux file-manager D-Bus integration. No patched standalone crate exists. Remove when a released opener uses zbus 6 or removes this dependency." },
+    { id = "RUSTSEC-2026-0370", reason = "zvariant@5.15.0: opener 2.7.2 requires zbus 5 and its D-Bus serialization; no patched standalone crate exists. Remove when a released opener uses zbus 6 or removes this dependency." },
+    { id = "RUSTSEC-2026-0372", reason = "zvariant_derive@5.15.0: Build-time derives for the opener zbus 5 serialization stack; no patched standalone crate exists. Remove when a released opener uses zbus 6 or removes this dependency." },
+]
+
+[licenses]
+include-dev = true
+allow = [
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "MIT",
+    "Unicode-3.0",
+    "Unlicense",
+]
+confidence-threshold = 0.8
+exceptions = [
+    # Owned desktop and core packages.
+    { allow = ["GPL-3.0-or-later"], crate = "coding-agent-manager-desktop@0.1.0" },
+    { allow = ["GPL-3.0-or-later"], crate = "coding-agent-manager@0.1.0" },
+    # reqwest -> rustls -> rustls-webpki; registry LICENSE (ISC-style, Brian Smith).
+    { allow = ["ISC"], crate = "rustls-webpki@0.103.16" },
+    { allow = ["ISC"], crate = "untrusted@0.9.0" },
+    # CAM-declared constant-time helper; registry LICENSE is standard BSD-3-Clause.
+    { allow = ["BSD-3-Clause"], crate = "subtle@2.6.1" },
+    # axum -> matchit; MIT in LICENSE, BSD-3-Clause in LICENSE.httprouter (Julien Schmidt).
+    { allow = ["BSD-3-Clause"], crate = "matchit@0.8.4" },
+    # directories -> dirs-sys -> option-ext; registry LICENSE.txt is MPL-2.0 full text.
+    { allow = ["MPL-2.0"], crate = "option-ext@0.2.0" },
+    # reqwest -> rustls-platform-verifier -> webpki-root-certs; registry LICENSE is CDLA-P 2.0.
+    { allow = ["CDLA-Permissive-2.0"], crate = "webpki-root-certs@1.0.10" },
+    # reqwest rustls default crypto; registry LICENSE SPDX matches Cargo.toml.
+    { allow = ["ISC"], crate = "aws-lc-rs@1.18.0" },
+    # Build of aws-lc-rs; bundled upstream licenses (ISC/BSD/MIT/MIT-0) in crate LICENSE.
+    { allow = ["ISC", "BSD-3-Clause", "MIT-0"], crate = "aws-lc-sys@0.44.0" },
+    # Tauri build-time HTML/CSS/compression dependencies; exact crate licenses.
+    { allow = ["BSD-3-Clause"], crate = "alloc-no-stdlib@3.0.0" },
+    { allow = ["BSD-3-Clause"], crate = "alloc-stdlib@0.3.0" },
+    { allow = ["BSD-3-Clause"], crate = "brotli@9.0.0" },
+    { allow = ["MPL-2.0"], crate = "cssparser@0.37.0" },
+    { allow = ["MPL-2.0"], crate = "cssparser-macros@0.7.1" },
+    { allow = ["MPL-2.0"], crate = "dtoa-short@0.3.5" },
+    { allow = ["Zlib"], crate = "foldhash@0.2.0" },
+    { allow = ["MPL-2.0"], crate = "selectors@0.38.0" },
+]
+
+[bans]
+multiple-versions = "deny"
+multiple-versions-include-dev = true
+wildcards = "deny"
+highlight = "all"
+workspace-default-features = "allow"
+external-default-features = "allow"
+allow = []
+allow-workspace = true
+deny = []
+skip = [
+    # digest 0.10 / dbus-secret-service (keyring crypto-rust) vs RustCrypto 0.2 (chacha20poly1305).
+    { name = "block-buffer", version = "=0.10.4", reason = "Pinned by digest 0.10.7 for argon2, sha2, and dbus-secret-service via the explicit dbus keyring store; chacha20poly1305@0.11 requires block-buffer 0.12." },
+    { name = "cipher", version = "=0.4.4", reason = "dbus-secret-service aes/cbc via the explicit dbus keyring store; CAM encrypted store uses cipher 0.5 through chacha20poly1305@0.11." },
+    { name = "crypto-common", version = "=0.1.7", reason = "digest 0.10 stack for keyring/argon2; chacha20poly1305 pulls crypto-common 0.2.2." },
+    { name = "cpufeatures", version = "=0.2.17", reason = "sha2/argon2/dbus-secret-service on digest 0.10; poly1305/chacha20 on cpufeatures 0.3." },
+    { name = "inout", version = "=0.1.4", reason = "cipher 0.4 inout for dbus-secret-service; cipher 0.5 inout 0.2 for chacha20poly1305." },
+    { name = "rand_core", version = "=0.6.4", reason = "password-hash/argon2 salt API; crypto-common 0.2 uses rand_core 0.10." },
+    # Three getrandom majors: CAM+argon2 (0.2), rand/Tauri builds (0.3), chacha20/tempfile (0.4).
+    { name = "getrandom", version = "=0.2.17", reason = "coding-agent-manager lists getrandom 0.2; argon2 password-hash uses rand_core 0.6." },
+    { name = "getrandom", version = "=0.4.3", reason = "crypto-common 0.2 for chacha20poly1305 and tempfile 3.27 dev/runtime paths." },
+    { name = "r-efi", version = "=5.3.0", reason = "Target getrandom 0.3.4 in the rand/Tauri build graph." },
+    { name = "r-efi", version = "=6.0.0", reason = "Target getrandom 0.4.3 for crypto-common 0.2 and tempfile." },
+    # Incompatible upstream major versions in Tauri/GTK and platform bindings.
+    { name = "base64", version = "=0.21.7", reason = "Required by swift-rs@1.0.9. Remove when these upstream constraints converge." },
+    { name = "base64", version = "=0.22.1", reason = "Required by coding-agent-manager@0.1.0, hyper-util@0.1.20, plist@1.10.0, reqwest@0.13.4, serde_with@3.22.0, wry@0.57.0. Remove when these upstream constraints converge." },
+    { name = "bitflags", version = "=1.3.2", reason = "Required by defmt@1.1.1, javascriptcore-rs@1.1.2, webkit2gtk-sys@2.0.2, webkit2gtk@2.0.2. Remove when these upstream constraints converge." },
+    { name = "hashbrown", version = "=0.12.3", reason = "Required by indexmap@1.9.3. Remove when these upstream constraints converge." },
+    { name = "heck", version = "=0.4.1", reason = "Required by glib-macros@0.18.5. Remove when these upstream constraints converge." },
+    { name = "indexmap", version = "=1.9.3", reason = "Required by schemars@0.8.22, serde_with@3.22.0. Remove when these upstream constraints converge." },
+    { name = "jni", version = "=0.21.1", reason = "Required by tao@0.37.1, tauri-runtime-wry@2.12.3, tauri-runtime@2.12.2, tauri@2.12.5, wry@0.57.0. Remove when these upstream constraints converge." },
+    { name = "jni-sys", version = "=0.3.1", reason = "Required by jni@0.21.1, ndk-sys@0.6.0+11769913, ndk@0.9.0. Remove when these upstream constraints converge." },
+    { name = "proc-macro-crate", version = "=1.3.1", reason = "Required by gtk3-macros@0.18.2. Remove when these upstream constraints converge." },
+    { name = "proc-macro-crate", version = "=2.0.2", reason = "Required by glib-macros@0.18.5. Remove when these upstream constraints converge." },
+    { name = "serde_spanned", version = "=0.6.9", reason = "Required by toml@0.8.2, toml_edit@0.20.2. Remove when these upstream constraints converge." },
+    { name = "syn", version = "=1.0.109", reason = "Required by proc-macro-error@1.0.4. Remove when these upstream constraints converge." },
+    { name = "syn", version = "=2.0.119", reason = "Required by async-recursion@1.1.1, darling_core@0.23.0, darling_macro@0.23.0, defmt-macros@1.1.1, derive_more-impl@2.1.1, dlopen2_derive@0.4.3, enumflags2_derive@0.7.12, glib-macros@0.18.5, gtk3-macros@0.18.2, jiff-static@0.2.35, jni-macros@0.22.4, jni-sys-macros@0.4.1, num_enum_derive@0.7.6, phf_macros@0.13.1, schemars_derive@0.8.22, serde_derive_internals@0.29.1, serde_with_macros@3.22.0, serialize-to-javascript-impl@0.1.2, synstructure@0.13.2, tao-macros@0.1.4, tauri-codegen@2.7.4, tauri-macros@2.7.4, thiserror-impl@1.0.69, tracing-attributes@0.1.31, wasm-bindgen-macro-support@0.2.127, webview2-com-macros@0.8.1, windows-implement@0.60.2, windows-interface@0.59.3, yoke-derive@0.8.2, zerofrom-derive@0.1.7, zeroize_derive@1.5.0. Remove when these upstream constraints converge." },
+    { name = "thiserror", version = "=1.0.69", reason = "Required by cairo-rs@0.18.5, gio@0.18.4, glib@0.18.5, jni@0.21.1, ndk@0.9.0. Remove when these upstream constraints converge." },
+    { name = "thiserror-impl", version = "=1.0.69", reason = "Required by thiserror@1.0.69. Remove when these upstream constraints converge." },
+    { name = "toml", version = "=0.8.2", reason = "Required by system-deps@6.2.2. Remove when these upstream constraints converge." },
+    { name = "toml_datetime", version = "=0.6.3", reason = "Required by proc-macro-crate@2.0.2, toml@0.8.2, toml_edit@0.19.15, toml_edit@0.20.2. Remove when these upstream constraints converge." },
+    { name = "toml_edit", version = "=0.19.15", reason = "Required by proc-macro-crate@1.3.1. Remove when these upstream constraints converge." },
+    { name = "toml_edit", version = "=0.20.2", reason = "Required by proc-macro-crate@2.0.2, toml@0.8.2. Remove when these upstream constraints converge." },
+    { name = "windows-sys", version = "=0.45.0", reason = "Required by jni@0.21.1. Remove when these upstream constraints converge." },
+    { name = "windows-sys", version = "=0.59.0", reason = "Required by winreg@0.55.0. Remove when these upstream constraints converge." },
+    { name = "windows-targets", version = "=0.42.2", reason = "Required by windows-sys@0.45.0. Remove when these upstream constraints converge." },
+    { name = "windows_aarch64_gnullvm", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_aarch64_msvc", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_i686_gnu", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_i686_msvc", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_x86_64_gnu", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_x86_64_gnullvm", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "windows_x86_64_msvc", version = "=0.42.2", reason = "Required by windows-targets@0.42.2. Remove when these upstream constraints converge." },
+    { name = "winnow", version = "=0.5.40", reason = "Required by toml_edit@0.19.15, toml_edit@0.20.2. Remove when these upstream constraints converge." },
+]
+skip-tree = []
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []
+
+[sources.allow-org]
+github = []
+gitlab = []
+bitbucket = []

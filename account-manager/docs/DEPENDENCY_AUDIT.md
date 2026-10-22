@@ -1,55 +1,64 @@
-# Imported dependency audit disposition
+# Desktop dependency audit
 
-This records the source import's dependency review on 2026-09-13. It is not a
-blanket exception for later upgrades. The application keeps its own Cargo
-lockfile; MACO's root lockfile and `deny.toml` policy are separate.
+The desktop shell has a separate Cargo lockfile and supply-chain policy. The
+2026-10-22 update selects Tauri 2.12.5, tauri-build 2.7.4 and opener 2.7.2,
+including urlpattern 0.6.0. This removes the five unmaintained `unic-*` crates.
+The root workspace and the explicit keyring-core/native-store migration keep
+separate, exception-free advisory policies.
 
-## Native dependency correction
+From the repository root, run:
 
-The imported lock contained yanked `chacha20` 0.10.1 through
-`chacha20poly1305`, used by the encrypted credential store. The lock now selects
-the unyanked 0.10.2 patch release. RustCrypto documents an SSE backend correction
-in its [changelog][chacha-changelog], and [crates.io][chacha-release] declares
-Rust 1.85 as its minimum. The patch preserves the existing credential format and
-does not add a credential migration. No other package version is upgraded.
+```bash
+cargo audit --deny warnings
+cargo deny --locked check -D warnings advisories bans licenses sources
+python3 scripts/check_desktop_supply_chain.py
+```
 
-## Remaining desktop warnings
+Use the repository-pinned Nix development shell for the tools. The last command
+first checks the exact affected package versions and sources, then runs
+`cargo audit --deny warnings` on the desktop lockfile with only the reviewed
+advisory IDs, followed by `cargo deny` with the desktop policy. CI runs all
+three checks. `--check-only` validates exception scope without network access.
 
-`cargo audit --deny warnings` over the complete application lockfile remains
-unsuccessful because of the following inherited desktop dependencies. These are
-kept visible; no advisory ignore list or broad license/dependency exception is
-introduced. The initial inspection used cargo-audit 0.22.2 and RustSec database
-commit `b50980aad8b8f14f77e25a97b32dd94bf008b0af`.
+## Remaining upstream constraints
 
-| Locked package             | Advisory                                                            | Resolved Linux desktop path                                          |
-| -------------------------- | ------------------------------------------------------------------- | -------------------------------------------------------------------- |
-| `glib` 0.18.5              | [RUSTSEC-2024-0429][glib-advisory], unsound string-variant iterator | Tauri → GTK → glib                                                   |
-| `proc-macro-error` 1.0.4   | [RUSTSEC-2024-0370][macro-advisory], unmaintained                   | Tauri → GTK → gtk3-macros                                            |
-| `unic-char-property` 0.9.0 | [RUSTSEC-2025-0081][property-advisory], unmaintained                | Tauri → tauri-utils → urlpattern → unic-ucd-ident                    |
-| `unic-char-range` 0.9.0    | [RUSTSEC-2025-0075][range-advisory], unmaintained                   | Tauri → tauri-utils → urlpattern → unic-ucd-ident                    |
-| `unic-common` 0.9.0        | [RUSTSEC-2025-0080][common-advisory], unmaintained                  | Tauri → tauri-utils → urlpattern → unic-ucd-ident → unic-ucd-version |
-| `unic-ucd-ident` 0.9.0     | [RUSTSEC-2025-0100][ident-advisory], unmaintained                   | Tauri → tauri-utils → urlpattern                                     |
-| `unic-ucd-version` 0.9.0   | [RUSTSEC-2025-0098][version-advisory], unmaintained                 | Tauri → tauri-utils → urlpattern → unic-ucd-ident                    |
+Five desktop-only advisories have no compatible patched release in the current
+Tauri stack. An unqualified audit of the desktop lockfile still reports them;
+the policy passes with these explicit dispositions, not with zero advisories.
+Their exact versions, rationale and removal conditions are in
+`src-tauri/Cargo.toml` under `package.metadata.desktop-advisories`. The checker
+rejects changed versions, additional versions, source replacements, missing
+packages and differences between the manifest and the deny ignore list.
+`cargo deny` also rejects unused exceptions and checks transitive unsoundness.
 
-The glib advisory identifies a fix in 0.20 or newer; the locked GTK 0.18 series
-requires glib 0.18. Source inspection of the resolved Linux desktop packages
-found `VariantStrIter` and `array_iter_str` only within glib's implementation,
-documentation, and tests. It found no call from this application or its resolved
-dependents. That is a call-site inventory, not a proof covering generated code
-or every runtime path, and the warning remains unresolved. This import does not
-replace GTK or patch third-party implementation code.
+| Advisory                                                                   | Exact package            | Constraint and removal condition                                                                     |
+| -------------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
+| [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370.html) | `proc-macro-error` 1.0.4 | Build-time dependency of GTK3/glib macros. Remove when Tauri drops this macro stack.                 |
+| [RUSTSEC-2024-0429](https://rustsec.org/advisories/RUSTSEC-2024-0429.html) | `glib` 0.18.5            | GTK3 0.18 cannot use patched glib >=0.20. Remove when Tauri supports compatible patched bindings.    |
+| [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html) | `zbus_names` 4.3.4       | Opener 2.7.2 requires zbus 5; name types moved into zbus 6. Remove when released opener migrates.    |
+| [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html) | `zvariant` 5.15.0        | Opener's zbus 5 serialization stack; replacement is in zbus 6. Remove when released opener migrates. |
+| [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | `zvariant_derive` 5.15.0 | Build-time derives for that serialization stack. Remove when released opener migrates.               |
 
-The unmaintained-crate advisories list no patched versions. Replacing their
-upstream consumers is separate dependency work. All seven warning packages are
-absent from the resolved `--no-default-features` native core graph. That graph
-exclusion does not make the whole-lock desktop audit pass.
+Source inspection found no `VariantStrIter` or `array_iter_str` call in the
+application or inspected resolved GTK/Tauri dependents. This is a call-site
+inventory, not proof of runtime unreachability. Opener's zbus path implements
+Linux file-manager integration; the application's login command uses URL
+opening. No GUI or credential service is exercised by the supply-chain checks.
 
-[chacha-changelog]: https://github.com/RustCrypto/stream-ciphers/blob/master/chacha20/CHANGELOG.md
-[chacha-release]: https://crates.io/crates/chacha20/0.10.2
-[glib-advisory]: https://rustsec.org/advisories/RUSTSEC-2024-0429.html
-[macro-advisory]: https://rustsec.org/advisories/RUSTSEC-2024-0370.html
-[property-advisory]: https://rustsec.org/advisories/RUSTSEC-2025-0081.html
-[range-advisory]: https://rustsec.org/advisories/RUSTSEC-2025-0075.html
-[common-advisory]: https://rustsec.org/advisories/RUSTSEC-2025-0080.html
-[ident-advisory]: https://rustsec.org/advisories/RUSTSEC-2025-0100.html
-[version-advisory]: https://rustsec.org/advisories/RUSTSEC-2025-0098.html
+The eliminated advisories are RUSTSEC-2025-0075 (`unic-char-range`),
+RUSTSEC-2025-0080 (`unic-common`), RUSTSEC-2025-0081 (`unic-char-property`),
+RUSTSEC-2025-0098 (`unic-ucd-version`) and RUSTSEC-2025-0100 (`unic-ucd-ident`),
+all formerly at 0.9.0.
+
+## Licenses and duplicate versions
+
+`src-tauri/deny.toml` preserves the root's narrow license allow list and strict
+source policy. Exact-package exceptions cover the owned GPL desktop package,
+the BSD compression dependencies, MPL CSS parser dependencies and Zlib-licensed
+foldhash. These do not grant blanket license permission to future dependencies.
+Incompatible versions required by GTK, Tauri and platform bindings have exact
+version duplicate allowances with their immediate dependency paths and removal
+conditions. The policy still rejects new unreviewed duplicates and licenses.
+
+The encrypted credential format and DH-encrypted Secret Service configuration
+are unchanged. `scripts/check_keyring_crypto.py` continues to check both graphs.

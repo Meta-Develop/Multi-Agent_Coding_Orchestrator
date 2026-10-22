@@ -40,7 +40,8 @@ def check_tree(tree: str) -> None:
 
 def check_policies(root: Path) -> None:
     # No global exception may mask the desktop's independent Tauri dependencies.
-    # Inactivity checks are unnecessary only because there are NO advisory ignores.
+    # Desktop-only dispositions are version-checked separately; they must never
+    # become global exceptions affecting the native core or root workspace.
     for name in (".cargo/audit.toml", "deny.toml"):
         policy = tomllib.loads((root / name).read_text())
         advisories = policy.get("advisories", {})
@@ -82,7 +83,7 @@ def main() -> int:
             failed = True
     if failed:
         return 1
-    print("both workspaces use explicit DH stores; no advisory exceptions")
+    print("both workspaces use explicit DH stores; no global advisory exceptions")
     return 0
 
 
