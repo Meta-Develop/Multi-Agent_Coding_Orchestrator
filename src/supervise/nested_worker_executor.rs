@@ -5,6 +5,7 @@
 use super::*;
 
 /// Evidence for the enclosing parent's gate, never an accepted/materialized change.
+#[cfg_attr(test, derive(Clone))]
 pub(super) struct NestedWorkerAttemptEvidence {
     report: WorkerReport,
     journals: WorkerExecutionJournalEvidenceSet,
@@ -1054,7 +1055,7 @@ mod tests {
         let consultant = SupervisorConsultantPlan::default();
         let guide = SupervisorFieldGuidePrompt::empty()?;
         let catalog =
-            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-5.6-sol"])?);
+            RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])?);
         let calls = AtomicUsize::new(0);
         let runner = |command: &ExternalAgentCommand,
                       _: &ProcessCancellation,

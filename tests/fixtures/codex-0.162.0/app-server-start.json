@@ -1,0 +1,81 @@
+[
+  {
+    "id": 1,
+    "result": {
+      "userAgent": "maco/0.162.0 (Ubuntu 24.4.0; x86_64) xterm-256color (maco; 0.3.0)",
+      "codexHome": "/workspace",
+      "platformFamily": "unix",
+      "platformOs": "linux"
+    }
+  },
+  {
+    "method": "remoteControl/status/changed",
+    "params": {
+      "status": "disabled",
+      "serverName": "<host>",
+      "installationId": "<installation>",
+      "environmentId": null
+    },
+    "emittedAtMs": 1792637352643
+  },
+  {
+    "id": 2,
+    "result": {
+      "thread": {
+        "id": "thread-1",
+        "environments": [],
+        "extra": null,
+        "sessionId": "thread-1",
+        "forkedFromId": null,
+        "parentThreadId": null,
+        "preview": "",
+        "ephemeral": true,
+        "section": null,
+        "sectionEnteredAt": null,
+        "projectId": null,
+        "historyMode": "paginated",
+        "modelProvider": "openai",
+        "model": "gpt-6.1-sol",
+        "reasoningEffort": "xhigh",
+        "createdAt": 1792637352,
+        "updatedAt": 1792637352,
+        "recencyAt": 1792637352,
+        "status": {
+          "type": "idle"
+        },
+        "path": null,
+        "cwd": "/workspace",
+        "cliVersion": "0.162.0",
+        "originator": "maco",
+        "source": "vscode",
+        "canAcceptDirectInput": true,
+        "threadSource": null,
+        "agentNickname": null,
+        "agentRole": null,
+        "gitInfo": null,
+        "name": null,
+        "daybreakEnabled": null,
+        "turns": []
+      },
+      "model": "gpt-6.1-sol",
+      "modelProvider": "openai",
+      "serviceTier": null,
+      "disabledPluginIds": [],
+      "cwd": "/workspace",
+      "runtimeWorkspaceRoots": [],
+      "instructionSources": [],
+      "approvalPolicy": "on-request",
+      "approvalsReviewer": "user",
+      "sandbox": {
+        "type": "readOnly",
+        "networkAccess": false
+      },
+      "activePermissionProfile": {
+        "id": "maco_external_codex",
+        "extends": null
+      },
+      "reasoningEffort": "xhigh",
+      "multiAgentMode": "explicitRequestOnly"
+    }
+  }
+]

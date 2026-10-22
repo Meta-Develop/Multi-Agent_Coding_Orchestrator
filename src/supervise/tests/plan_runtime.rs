@@ -3482,7 +3482,7 @@ fn no_override_selects_single_slug_effort_profile_for_every_role() {
     assert!(
         child_argv
             .windows(2)
-            .any(|arguments| arguments == ["-c", "model=\"gpt-5.6-sol\""]),
+            .any(|arguments| arguments == ["-c", "model=\"gpt-6.1-sol\""]),
         "writable child app-server argv did not preserve the explicit fixture model: {child_argv:?}"
     );
     assert!(child_argv
@@ -3846,7 +3846,7 @@ fn ordered_catalog_chain_rejects_invalid_profile_data_during_plan_load() {
     for (label, chain, expected) in [
         (
             "whitespace",
-            json!({"models": [" gpt-5.6-sol"], "on_exhausted": "runtime_default"}),
+            json!({"models": [" gpt-6.1-sol"], "on_exhausted": "runtime_default"}),
             "must be non-empty and trimmed",
         ),
         (

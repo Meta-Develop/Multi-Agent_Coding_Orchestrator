@@ -51,7 +51,7 @@ pub(super) fn guarded_worker(spec: &ExternalAgentCommand) -> bool {
 
 /// Only a bounded complete native stream can authorize a continuation. Missing
 /// evidence remains missing and is handled by normal output validation.
-fn idle_session(bytes: &[u8]) -> Option<String> {
+fn idle_session(bytes: &[u8], requires_change: bool) -> Option<String> {
     let stream = parse_grok_event_stream(bytes).ok()?;
     if !stream.successful_completion() {
         return None;
@@ -64,13 +64,19 @@ fn idle_session(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let status = report.get("status")?.as_str()?;
-    if !matches!(status, "pending" | "not_started" | "not-started")
-        || !report.get("commands_run")?.as_array()?.is_empty()
-    {
+    let idle_status = matches!(status, "pending" | "not_started" | "not-started");
+    let missing_change = requires_change
+        && report
+            .get("files_changed")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(Vec::is_empty);
+    let no_reported_commands = report.get("commands_run")?.as_array()?.is_empty();
+    if !(missing_change || idle_status && no_reported_commands) {
         return None;
     }
     // Unknown event types do not mint tool progress. These are the native tool
-    // events; commands reported by the Worker also prevent this specific guard.
+    // events. For a required edit with no changes, claimed commands alone
+    // cannot mint progress in the absence of native tool evidence.
     if bytes
         .split(|byte| *byte == b'\n')
         .filter_map(|line| serde_json::from_slice::<serde_json::Value>(line).ok())
@@ -86,8 +92,8 @@ fn idle_session(bytes: &[u8]) -> Option<String> {
     Some(end.session_id().to_owned())
 }
 
-pub(super) fn worker_no_progress(bytes: &[u8]) -> bool {
-    idle_session(bytes).is_some()
+pub(super) fn worker_no_progress(bytes: &[u8], requires_change: bool) -> bool {
+    idle_session(bytes, requires_change).is_some()
 }
 
 fn valid_session_id(session: &str) -> bool {
@@ -104,6 +110,7 @@ fn valid_session_id(session: &str) -> bool {
 
 #[derive(Default)]
 struct Guard {
+    requires_change: bool,
     prior: Option<Vec<u8>>,
     last: Option<Vec<u8>>,
     resumed_session: Option<String>,
@@ -122,7 +129,7 @@ impl Guard {
                 return Err("Grok continuation session changed".into());
             }
         }
-        let Some(session) = idle_session(&bytes) else {
+        let Some(session) = idle_session(&bytes, self.requires_change) else {
             return Ok(None);
         };
         if self.prior.is_some() || code != 0 || !valid_session_id(&session) {
@@ -216,9 +223,23 @@ fn capture_matches(
 pub(super) fn run(
     mut spec: ProcessSpec,
     cancellation: &ProcessCancellation,
+    requires_change: bool,
 ) -> Result<BatchCapture, ProcessRunError> {
+    if spec.timeout.is_none_or(|timeout| timeout.is_zero()) {
+        return Err(ProcessRunError::IoSetup {
+            label: spec.label.clone(),
+            command: "Grok worker continuation".into(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Grok worker continuation requires a nonzero operation timeout",
+            ),
+        });
+    }
     spec.grok_worker_continuation = true;
-    let mut guard = Guard::default();
+    let mut guard = Guard {
+        requires_change,
+        ..Guard::default()
+    };
     let mut final_bytes = None;
     let mut interactive = run_process_interactive(spec, cancellation, |session| {
         let result = interact(session, &mut guard);
@@ -257,6 +278,25 @@ pub(super) fn run(
 mod tests {
     use super::*;
     const SESSION: &str = "6b3056ad-f990-4314-b7ff-f9e58c593ac5";
+
+    #[test]
+    fn grok_worker_continuation_requires_nonzero_deadline_before_launch() {
+        for timeout in [None, Some(Duration::ZERO)] {
+            let spec = ProcessSpec::direct(
+                "missing continuation deadline",
+                "/never-launch-without-deadline",
+                Vec::<String>::new(),
+                "/",
+                1024,
+            )
+            .with_timeout(timeout);
+            let error = run(spec, &ProcessCancellation::new(), true)
+                .expect_err("continuation without a deadline must be refused");
+            assert!(matches!(error, ProcessRunError::IoSetup { .. }));
+            assert!(error.to_string().contains("nonzero operation timeout"));
+        }
+    }
+
     fn stream(status: &str, commands: serde_json::Value, tool: bool) -> Vec<u8> {
         let mut bytes = Vec::new();
         if tool {
@@ -305,10 +345,52 @@ mod tests {
         assert_eq!(guard.finished_turn(bytes, 0).unwrap_err(), NO_PROGRESS);
     }
     #[test]
+    fn grok_required_edit_zero_tool_report_continues_once_whatever_status_it_claims() {
+        let encode = |event: &serde_json::Value| {
+            let mut bytes = serde_json::to_vec(event).unwrap();
+            bytes.push(b'\n');
+            bytes
+        };
+        let captured = include_bytes!("../../tests/fixtures/grok/r43a2-premature-worker.jsonl");
+        assert!(worker_no_progress(captured, true));
+        assert!(!worker_no_progress(captured, false));
+        for status in ["pending", "completed", "failed", "accepted", "not_started"] {
+            for accepted in [true, false] {
+                let mut event: serde_json::Value = serde_json::from_slice(captured).unwrap();
+                event["structuredOutput"]["status"] = serde_json::json!(status);
+                event["structuredOutput"]["accepted"] = serde_json::json!(accepted);
+                let bytes = encode(&event);
+                let mut guard = Guard {
+                    requires_change: true,
+                    ..Guard::default()
+                };
+                assert_eq!(
+                    guard.finished_turn(bytes.clone(), 0).unwrap().as_deref(),
+                    Some(SESSION)
+                );
+                assert_eq!(
+                    guard.finished_turn(bytes.clone(), 0).unwrap_err(),
+                    NO_PROGRESS
+                );
+                let mut with_tool = b"{\"type\":\"tool_call\",\"id\":\"t1\"}\n".to_vec();
+                with_tool.extend_from_slice(&bytes);
+                assert!(!worker_no_progress(&with_tool, true));
+                event["structuredOutput"]["commands_run"] =
+                    serde_json::json!([{"command":["claimed-only"]}]);
+                assert!(worker_no_progress(&encode(&event), true));
+                event["structuredOutput"]["commands_run"] = serde_json::json!([]);
+                event["structuredOutput"]["files_changed"] = serde_json::json!(["README.md"]);
+                if status != "pending" && status != "not_started" {
+                    assert!(!worker_no_progress(&encode(&event), true));
+                }
+            }
+        }
+    }
+    #[test]
     fn grok_no_progress_keeps_unknown_and_real_tool_evidence_distinct() {
-        assert!(idle_session(b"unknown").is_none());
-        assert!(idle_session(&stream("pending", serde_json::json!([]), true)).is_none());
-        assert!(idle_session(&stream("pending", serde_json::json!([{}]), false)).is_none());
+        assert!(idle_session(b"unknown", false).is_none());
+        assert!(idle_session(&stream("pending", serde_json::json!([]), true), false).is_none());
+        assert!(idle_session(&stream("pending", serde_json::json!([{}]), false), false).is_none());
         assert!(!valid_session_id("--option"));
         assert!(!valid_session_id("session title"));
         assert!(valid_session_id(SESSION));

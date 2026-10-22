@@ -29,20 +29,31 @@ const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
+const ACCOUNT_UPDATE_MAX_MESSAGES: usize = 64;
 const MODERATION_METADATA_MAX_MESSAGES: usize = 64;
 const WORKER_REQUEST_TOOL: &str = "maco_worker_request";
 const WORKER_REQUEST_ID_MAX_BYTES: usize = 128;
 const WORKER_REQUEST_RESULT_MAX_BYTES: usize = 64 * 1024;
 
-// Only the informational prelude observed before thread/start on audited Codex 0.144.4.
+// Informational prelude captured before thread/start on Codex 0.144.4 and 0.162.0.
 // Upstream declares both methods as ServerNotification in app-server-protocol's common.rs.
 // Deserialize the original bytes: Value alone would hide duplicate envelope/parameter keys.
 #[derive(serde::Deserialize)]
-#[serde(tag = "method", content = "params", deny_unknown_fields)]
+#[serde(deny_unknown_fields)]
+struct StartupInformationEnvelope {
+    method: String,
+    params: StartupInformation,
+    #[serde(default, rename = "emittedAtMs")]
+    _emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
 enum StartupInformation {
-    #[serde(rename = "configWarning")]
-    ConfigWarning { summary: String, details: Value },
-    #[serde(rename = "remoteControl/status/changed")]
+    ConfigWarning {
+        summary: String,
+        details: Value,
+    },
     RemoteControlStatusChanged {
         status: String,
         #[serde(rename = "serverName")]
@@ -65,18 +76,30 @@ fn valid_startup_information(line: &[u8]) -> bool {
     if line.len() > STARTUP_INFORMATION_MAX_BYTES {
         return false;
     }
-    match serde_json::from_slice::<StartupInformation>(line) {
-        Ok(StartupInformation::ConfigWarning { summary, details }) => {
-            !summary.is_empty() && (details.is_null() || details.is_string())
+    match serde_json::from_slice::<StartupInformationEnvelope>(line) {
+        Ok(StartupInformationEnvelope {
+            method,
+            params: StartupInformation::ConfigWarning { summary, details },
+            ..
+        }) => {
+            method == "configWarning"
+                && !summary.is_empty()
+                && (details.is_null() || details.is_string())
         }
-        Ok(StartupInformation::RemoteControlStatusChanged {
-            status,
-            server_name,
-            installation_id,
-            environment_id,
+        Ok(StartupInformationEnvelope {
+            method,
+            params:
+                StartupInformation::RemoteControlStatusChanged {
+                    status,
+                    server_name,
+                    installation_id,
+                    environment_id,
+                },
+            ..
         }) => {
             // Do not silently admit an active remote-control state or a bound environment.
-            status == "disabled"
+            method == "remoteControl/status/changed"
+                && status == "disabled"
                 && !server_name.is_empty()
                 && !installation_id.is_empty()
                 && environment_id.is_null()
@@ -185,6 +208,133 @@ fn valid_thread_status_changed(line: &[u8]) -> bool {
 struct ThreadLifecycleNotices {
     started: bool,
     status_count: usize,
+    pending_turn_started: Option<Value>,
+}
+
+// Account telemetry is asynchronous: 0.162.0 emits it while waiting for either
+// startup response as well as during inference. It is retained in raw capture,
+// never used as authentication, model, usage, or completion evidence.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountUpdated {
+    method: String,
+    params: AccountUpdatedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct AccountUpdatedParams {
+    auth_mode: Option<AccountAuthMode>,
+    plan_type: Option<AccountPlanType>,
+}
+
+// Enumerations from 0.162.0's generated AccountUpdatedNotification schema.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum AccountAuthMode {
+    Apikey,
+    Chatgpt,
+    ChatgptAuthTokens,
+    Headers,
+    AgentIdentity,
+    PersonalAccessToken,
+    BedrockApiKey,
+    BedrockAccessKeys,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum AccountPlanType {
+    Free,
+    Go,
+    Plus,
+    Pro,
+    Prolite,
+    Promax,
+    Team,
+    SelfServeBusinessProlite,
+    SelfServeBusinessUsageBased,
+    Business,
+    Ent26,
+    EnterpriseCbpAutomation,
+    EnterpriseCbpUsageBased,
+    Enterprise,
+    Edu,
+    EduPlus,
+    EduPro,
+    Unknown,
+}
+
+fn valid_account_updated(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<AccountUpdated>(line),
+            Ok(AccountUpdated { method, .. }) if method == "account/updated"
+        )
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ServerRequestResolved {
+    method: String,
+    params: ServerRequestResolvedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ServerRequestResolvedParams {
+    thread_id: String,
+    request_id: Value,
+}
+
+fn valid_server_request_resolved(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<ServerRequestResolved>(line),
+            Ok(notice) if notice.method == "serverRequest/resolved"
+                && !notice.params.thread_id.is_empty()
+                && RequestId::parse(&notice.params.request_id, "serverRequest/resolved").is_ok()
+        )
+}
+
+// turn/started may race ahead of the turn/start response on 0.162.0. Hold
+// exactly one validated lifecycle notice, then correlate its turn ID against
+// the response before driving any items. No arbitrary notifications are queued.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TurnStarted {
+    method: String,
+    params: TurnStartedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct TurnStartedParams {
+    thread_id: String,
+    turn: StartedTurnIdentity,
+}
+
+#[derive(serde::Deserialize)]
+struct StartedTurnIdentity {
+    id: String,
+    status: String,
+}
+
+fn valid_turn_started(line: &[u8]) -> bool {
+    line.len() <= STARTUP_INFORMATION_MAX_BYTES
+        && matches!(
+            serde_json::from_slice::<TurnStarted>(line),
+            Ok(notice) if notice.method == "turn/started"
+                && validate_identifier(&notice.params.thread_id, "thread id", 256).is_ok()
+                && validate_identifier(&notice.params.turn.id, "turn id", 256).is_ok()
+                && notice.params.turn.status == "inProgress"
+        )
 }
 
 // Codex emits account-wide rate-limit telemetry during a turn. It has no
@@ -261,6 +411,8 @@ fn valid_account_rate_limits_updated(line: &[u8]) -> bool {
 struct TurnModerationMetadata {
     method: String,
     params: TurnModerationMetadataParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1148,6 +1300,8 @@ struct ProtocolState {
     bytes_sent: usize,
     response_ids: BTreeSet<RequestId>,
     server_request_ids: BTreeSet<RequestId>,
+    resolved_server_request_ids: BTreeSet<RequestId>,
+    account_update_notices: usize,
     next_request_id: u64,
     command_snapshot: Option<CommandExecutionSnapshot>,
 }
@@ -1167,6 +1321,8 @@ impl ProtocolState {
             bytes_sent: 0,
             response_ids: BTreeSet::new(),
             server_request_ids: BTreeSet::new(),
+            resolved_server_request_ids: BTreeSet::new(),
+            account_update_notices: 0,
             next_request_id: 1,
             command_snapshot: None,
         })
@@ -1254,6 +1410,39 @@ impl ProtocolState {
                     phase,
                     message: format!("invalid JSON: {error}"),
                 })?;
+            if matches!(phase, "thread/start" | "turn/start" | "turn")
+                && message.get("method").and_then(Value::as_str) == Some("account/updated")
+            {
+                self.account_update_notices += 1;
+                if !valid_account_updated(&line)
+                    || self.account_update_notices > ACCOUNT_UPDATE_MAX_MESSAGES
+                {
+                    return Err(AppServerError::Malformed {
+                        phase,
+                        message: "account update notification is malformed or exceeded its bound"
+                            .to_string(),
+                    });
+                }
+                continue;
+            }
+            if matches!(phase, "turn/start" | "turn")
+                && message.get("method").and_then(Value::as_str) == Some("turn/started")
+                && !valid_turn_started(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "turn/started notification is malformed or oversized".to_string(),
+                });
+            }
+            if phase == "turn"
+                && message.get("method").and_then(Value::as_str) == Some("serverRequest/resolved")
+                && !valid_server_request_resolved(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "server request resolution is malformed or oversized".to_string(),
+                });
+            }
             if phase == "thread/start"
                 && message.get("id").and_then(Value::as_u64) == self.next_request_id.checked_sub(1)
                 && message.get("error").is_none()
@@ -1755,6 +1944,24 @@ where
             continue;
         }
         if phase == "turn/start"
+            && message.get("method").and_then(Value::as_str) == Some("turn/started")
+        {
+            let Some((thread_id, lifecycle)) = thread_started.as_mut() else {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "turn/started arrived without a pending thread".to_string(),
+                });
+            };
+            require_exact_text(&message, &["params", "threadId"], thread_id, phase)?;
+            if lifecycle.pending_turn_started.replace(message).is_some() {
+                return Err(AppServerError::Duplicate {
+                    phase,
+                    message: "turn lifecycle started more than once".to_string(),
+                });
+            }
+            continue;
+        }
+        if phase == "turn/start"
             && message.get("method").and_then(Value::as_str) == Some("thread/started")
         {
             let Some((thread_id, lifecycle)) = thread_started.as_mut() else {
@@ -2045,9 +2252,12 @@ where
 
     let mut budget_failure = None;
     let result = (|| loop {
-        let message = state.receive(transport, "turn", &|| {
-            budget_failure.is_none() && cancelled()
-        })?;
+        let message = match lifecycle.pending_turn_started.take() {
+            Some(message) => message,
+            None => state.receive(transport, "turn", &|| {
+                budget_failure.is_none() && cancelled()
+            })?,
+        };
         // Drain observations only; no further approval, correction or steering calls.
         if budget_failure.is_some()
             && !matches!(
@@ -2100,6 +2310,27 @@ where
         let params = required_object(&message, &["params"], "turn", "params")?;
 
         match method {
+            "serverRequest/resolved" => {
+                require_exact_text(
+                    &message,
+                    &["params", "threadId"],
+                    thread_id,
+                    "serverRequest/resolved",
+                )?;
+                let request_id = RequestId::parse(&params["requestId"], "serverRequest/resolved")?;
+                if !state.server_request_ids.contains(&request_id) {
+                    return Err(AppServerError::Unexpected {
+                        phase: "serverRequest/resolved",
+                        message: "resolved request was not serviced by this client".to_string(),
+                    });
+                }
+                if !state.resolved_server_request_ids.insert(request_id) {
+                    return Err(AppServerError::Duplicate {
+                        phase: "serverRequest/resolved",
+                        message: "server request resolved more than once".to_string(),
+                    });
+                }
+            }
             "thread/started" => {
                 if lifecycle.started {
                     return Err(AppServerError::Duplicate {
@@ -3510,6 +3741,435 @@ mod tests {
         }
     }
 
+    const CODEX_0162_AUDITOR_TURN: &str =
+        include_str!("../tests/fixtures/codex-0.162.0/auditor-turn.jsonl");
+    const CODEX_0162_WORKER_TURN: &str =
+        include_str!("../tests/fixtures/codex-0.162.0/worker-turn.jsonl");
+
+    fn captured_0162_values(capture: &str) -> Vec<Value> {
+        capture
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    fn run_captured_0162_transport(
+        transport: &mut FakeTransport,
+    ) -> Result<AppServerOutcome, AppServerError> {
+        let mut turn = test_turn();
+        turn.model = Some("gpt-6.1-sol".to_string());
+        turn.minimum_effort = Some("xhigh".to_string());
+        run_app_server_turn(
+            transport,
+            &turn,
+            AppServerLimits::default(),
+            &mut |request: ApprovalRequest| {
+                assert_eq!(request.kind, ApprovalKind::FileChange);
+                assert!(!request.ceiling_expansion_requested);
+                Ok(ApprovalReview::accept())
+            },
+            || false,
+        )
+    }
+
+    #[test]
+    fn captured_codex_0162_failed_worker_journal_approval_is_cancelled_without_acceptance() {
+        let capture = include_str!("../tests/fixtures/codex-0.162.0/failed-worker-journal.jsonl");
+        let mut transport = FakeTransport {
+            incoming: capture
+                .lines()
+                .rev()
+                .map(|line| ReaderEvent::Line(line.as_bytes().to_vec()))
+                .collect(),
+            ..FakeTransport::default()
+        };
+        let mut turn = test_turn();
+        turn.model = Some("gpt-6.1-sol".to_string());
+        turn.minimum_effort = Some("xhigh".to_string());
+        let mut reviewed = 0;
+        let mut partial = None;
+        let error = run_app_server_turn_observed(
+            &mut transport,
+            &turn,
+            AppServerLimits::default(),
+            &mut |request: ApprovalRequest| {
+                reviewed += 1;
+                assert_eq!(request.kind, ApprovalKind::CommandExecution);
+                assert!(request
+                    .command
+                    .as_deref()
+                    .unwrap()
+                    .contains("journal-append"));
+                Ok(ApprovalReview::cancel(None))
+            },
+            || false,
+            &mut partial,
+            &mut || panic!("no budget exhaustion"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppServerError::Cancelled { phase: "approval" }
+        ));
+        assert_eq!(reviewed, 1);
+        assert!(transport.incoming.is_empty());
+        assert!(transport
+            .sent
+            .contains(&json!({"id": 0, "result": {"decision": "cancel"}})));
+        assert_eq!(transport.sent.last().unwrap()["method"], "turn/interrupt");
+        assert!(!transport
+            .sent
+            .iter()
+            .any(|message| message.pointer("/result/decision") == Some(&json!("accept"))));
+        assert!(
+            partial.is_some_and(|outcome| outcome.status != TurnTerminalStatus::Completed
+                && outcome.final_message.is_none())
+        );
+    }
+
+    #[test]
+    fn captured_codex_0162_full_turns_preserve_complete_parent_identity_and_usage() {
+        use super::super::codex_parent_evidence::{
+            codex_parent_evidence_from_app_server_run, CodexParentEvidenceInputs,
+            CodexParentTurnUsage,
+        };
+        for (capture, worker) in [
+            (CODEX_0162_AUDITOR_TURN, false),
+            (CODEX_0162_WORKER_TURN, true),
+        ] {
+            // Replay original lines, including timestamps and new item timing fields.
+            let mut transport = FakeTransport {
+                incoming: capture
+                    .lines()
+                    .rev()
+                    .map(|line| ReaderEvent::Line(line.as_bytes().to_vec()))
+                    .collect(),
+                ..FakeTransport::default()
+            };
+            let outcome = run_captured_0162_transport(&mut transport).expect("full captured turn");
+            assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+            assert_eq!(outcome.resolved_model, "gpt-6.1-sol");
+            assert_eq!(outcome.resolved_effort.as_deref(), Some("xhigh"));
+            assert_eq!(outcome.messages_received, capture.lines().count());
+            assert!(transport.incoming.is_empty());
+            assert!(outcome
+                .final_message
+                .as_ref()
+                .is_some_and(|text| !text.is_empty()));
+            assert_eq!(
+                outcome
+                    .item_outcomes
+                    .iter()
+                    .filter(|item| item.item_type == "fileChange" && item.status == "completed")
+                    .count(),
+                usize::from(worker)
+            );
+            assert_eq!(
+                transport
+                    .sent
+                    .iter()
+                    .filter(|message| message.get("result").is_some())
+                    .count(),
+                usize::from(worker)
+            );
+            let values = captured_0162_values(capture);
+            let expected = values
+                .iter()
+                .rev()
+                .find(|value| value["method"] == "thread/tokenUsage/updated")
+                .unwrap();
+            let total = &expected["params"]["tokenUsage"]["total"];
+            let usage = outcome
+                .token_usage
+                .expect("nonzero native cumulative tokens");
+            assert_eq!(usage.input_tokens, total["inputTokens"].as_u64().unwrap());
+            assert_eq!(usage.output_tokens, total["outputTokens"].as_u64().unwrap());
+            assert_eq!(
+                usage.cached_input_tokens,
+                total["cachedInputTokens"].as_u64().unwrap()
+            );
+            assert_eq!(
+                usage.reasoning_output_tokens,
+                total["reasoningOutputTokens"].as_u64().unwrap()
+            );
+            let temp = tempfile::tempdir().unwrap();
+            let home = crate::secure_output::SecureOutputRoot::open_or_create(
+                &temp.path().join("codex-home"),
+            )
+            .unwrap();
+            let inputs = CodexParentEvidenceInputs {
+                codex_version: Some((0, 162, 0)),
+                cwd: std::path::Path::new("/workspace"),
+                requested_model: Some("gpt-6.1-sol"),
+                requested_effort: Some("xhigh"),
+            };
+            let evidence =
+                codex_parent_evidence_from_app_server_run(&inputs, Some(&outcome), &home);
+            assert_eq!(evidence.resolution_status, "complete");
+            assert_eq!(evidence.usage_model(), Some("gpt-6.1-sol"));
+            assert!(!evidence.model_mismatch);
+            assert!(
+                matches!(evidence.turn_usage, CodexParentTurnUsage::Known { input_tokens, output_tokens, .. } if input_tokens > 0 && output_tokens > 0)
+            );
+        }
+    }
+
+    #[test]
+    fn captured_codex_0162_failed_lens_account_updates_resume_at_each_observed_phase() {
+        for (capture, next_event) in [
+            (
+                include_str!("../tests/fixtures/codex-0.162.0/failed-lens-0.jsonl"),
+                "item/started",
+            ),
+            (
+                include_str!("../tests/fixtures/codex-0.162.0/failed-lens-1.jsonl"),
+                "thread/start response",
+            ),
+            (
+                include_str!("../tests/fixtures/codex-0.162.0/failed-lens-2.jsonl"),
+                "turn/start response",
+            ),
+        ] {
+            // Replay each failed prefix verbatim, then supply the corresponding
+            // successful capture's suffix using normalized thread/turn IDs.
+            let completed = captured_0162_values(CODEX_0162_AUDITOR_TURN);
+            let start = completed
+                .iter()
+                .position(|message| match next_event {
+                    "thread/start response" => message["id"] == 2,
+                    "turn/start response" => message["id"] == 3,
+                    _ => message["method"] == next_event,
+                })
+                .unwrap();
+            let mut transport = FakeTransport {
+                incoming: capture
+                    .lines()
+                    .map(|line| ReaderEvent::Line(line.as_bytes().to_vec()))
+                    .chain(
+                        completed[start..]
+                            .iter()
+                            .map(|message| ReaderEvent::Line(message.to_string().into_bytes())),
+                    )
+                    .collect(),
+                ..FakeTransport::default()
+            };
+            transport.incoming.reverse();
+            let outcome = run_captured_0162_transport(&mut transport).unwrap();
+            let baseline =
+                run_captured_0162_transport(&mut FakeTransport::from_values(completed)).unwrap();
+            assert_eq!(
+                outcome.command_execution_evidence,
+                baseline.command_execution_evidence
+            );
+            assert_eq!(outcome.token_usage, baseline.token_usage);
+            assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+            // The same prefixes without a continuation must remain incomplete;
+            // account metadata alone conveys neither tokens nor completion.
+            let mut partial = None;
+            let error = run_app_server_turn_observed(
+                &mut FakeTransport::from_values(captured_0162_values(capture)),
+                &test_turn(),
+                AppServerLimits::default(),
+                &mut |_: ApprovalRequest| panic!("no approval"),
+                || false,
+                &mut partial,
+                &mut || panic!("no budget exhaustion"),
+            )
+            .unwrap_err();
+            assert!(matches!(error, AppServerError::ProtocolLoss { .. }));
+            assert!(partial.is_none_or(|outcome| outcome.token_usage.is_none()));
+        }
+    }
+
+    #[test]
+    fn codex_0162_account_updates_reject_malformed_duplicate_unknown_and_flooded_notices() {
+        let notice = captured_0162_values(CODEX_0162_WORKER_TURN)
+            .into_iter()
+            .find(|value| value["method"] == "account/updated")
+            .unwrap();
+        for (pointer, value) in [
+            ("/id", json!(8)),
+            ("/result", json!({})),
+            ("/error", json!({})),
+            ("/unexpected", json!(true)),
+            ("/emittedAtMs", json!("now")),
+            ("/params/authMode", json!("invented")),
+            ("/params/planType", json!("invented")),
+            ("/params/authMode", json!(17)),
+            ("/params/planType", json!({})),
+            ("/params", Value::Null),
+        ] {
+            let mut invalid = notice.clone();
+            if pointer[1..].contains('/') {
+                *invalid.pointer_mut(pointer).unwrap() = value;
+            } else {
+                invalid[&pointer[1..]] = value;
+            }
+            let mut messages = command_observation_messages();
+            messages.insert(1, invalid);
+            assert!(
+                matches!(
+                    run_command_observation_messages(messages),
+                    Err(AppServerError::Malformed { .. })
+                ),
+                "{pointer}"
+            );
+        }
+        for line in [
+            r#"{"method":"account/updated","params":{"authMode":"chatgpt","authMode":"apikey"}}"#,
+            r#"{"method":"account/updated","params":{"planType":null,"planType":"promax"}}"#,
+            r#"{"method":"account/updated","params":{},"params":{}}"#,
+            r#"{"method":"account/updated","params":{},"emittedAtMs":0,"emittedAtMs":1}"#,
+            r#"{"method":"unknown","method":"account/updated","params":{}}"#,
+            r#"{"method":"account/updated","params":{"unexpected":true}}"#,
+        ] {
+            assert!(!valid_account_updated(line.as_bytes()), "{line}");
+        }
+        let mut oversized = notice.clone();
+        oversized["params"]["planType"] = json!("x".repeat(STARTUP_INFORMATION_MAX_BYTES));
+        assert!(!valid_account_updated(
+            &serde_json::to_vec(&oversized).unwrap()
+        ));
+        for (count, allowed) in [
+            (ACCOUNT_UPDATE_MAX_MESSAGES, true),
+            (ACCOUNT_UPDATE_MAX_MESSAGES + 1, false),
+        ] {
+            let mut messages = command_observation_messages();
+            // The bound spans startup and inference phases, not each phase separately.
+            messages.insert(1, notice.clone());
+            messages.splice(5..5, vec![notice.clone(); count - 1]);
+            assert_eq!(run_command_observation_messages(messages).is_ok(), allowed);
+        }
+        let mut messages = command_observation_messages();
+        messages.insert(0, notice.clone());
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Unexpected { .. })
+        ));
+        let mut unknown = notice;
+        unknown["method"] = json!("account/unknown");
+        let mut messages = command_observation_messages();
+        messages.insert(4, unknown);
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Unexpected { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_0162_early_turn_started_requires_matching_unique_valid_identity() {
+        for (foreign_thread, foreign_turn, duplicate, allowed) in [
+            (false, false, false, true),
+            (true, false, false, false),
+            (false, true, false, false),
+            (false, false, true, false),
+        ] {
+            let mut messages = captured_0162_values(CODEX_0162_AUDITOR_TURN);
+            let position = messages
+                .iter()
+                .position(|message| message["method"] == "turn/started")
+                .unwrap();
+            let mut early = messages.remove(position);
+            if foreign_thread {
+                early["params"]["threadId"] = json!("foreign");
+            }
+            if foreign_turn {
+                early["params"]["turn"]["id"] = json!("foreign");
+            }
+            let response = messages
+                .iter()
+                .position(|message| message["id"] == 3)
+                .unwrap();
+            messages.insert(response, early.clone());
+            if duplicate {
+                messages.insert(response, early);
+            }
+            let result = run_captured_0162_transport(&mut FakeTransport::from_values(messages));
+            assert_eq!(result.is_ok(), allowed, "{result:?}");
+        }
+        for line in [
+            r#"{"method":"turn/started","params":{"threadId":"thread-1","turn":{"id":"turn-1","id":"foreign","status":"inProgress"}}}"#,
+            r#"{"method":"turn/started","params":{"threadId":"foreign","threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}"#,
+            r#"{"method":"turn/started","id":9,"params":{"threadId":"thread-1","turn":{"id":"turn-1","status":"inProgress"}}}"#,
+        ] {
+            assert!(!valid_turn_started(line.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn codex_0162_server_request_resolution_requires_serviced_unique_correlated_request() {
+        for (pointer, value) in [
+            ("/params/threadId", json!("foreign")),
+            ("/params/requestId", json!(999)),
+            ("/params/requestId", Value::Null),
+            ("/emittedAtMs", json!("now")),
+            ("/id", json!(1)),
+            ("/unexpected", json!(true)),
+        ] {
+            let mut messages = captured_0162_values(CODEX_0162_WORKER_TURN);
+            let notice = messages
+                .iter_mut()
+                .find(|message| message["method"] == "serverRequest/resolved")
+                .unwrap();
+            if pointer[1..].contains('/') {
+                *notice.pointer_mut(pointer).unwrap() = value;
+            } else {
+                notice[&pointer[1..]] = value;
+            }
+            assert!(
+                run_captured_0162_transport(&mut FakeTransport::from_values(messages)).is_err(),
+                "{pointer}"
+            );
+        }
+        let mut messages = captured_0162_values(CODEX_0162_WORKER_TURN);
+        let position = messages
+            .iter()
+            .position(|message| message["method"] == "serverRequest/resolved")
+            .unwrap();
+        messages.insert(position, messages[position].clone());
+        assert!(matches!(
+            run_captured_0162_transport(&mut FakeTransport::from_values(messages)),
+            Err(AppServerError::Duplicate {
+                phase: "serverRequest/resolved",
+                ..
+            })
+        ));
+        for line in [
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"thread-1","requestId":0,"requestId":1}}"#,
+            r#"{"method":"serverRequest/resolved","params":{"threadId":"foreign","threadId":"thread-1","requestId":0}}"#,
+        ] {
+            assert!(!valid_server_request_resolved(line.as_bytes()));
+        }
+    }
+
+    #[test]
+    fn codex_0162_moderation_timestamp_preserves_strict_envelope_validation() {
+        let notice = captured_0162_values(CODEX_0162_WORKER_TURN)
+            .into_iter()
+            .find(|message| message["method"] == "turn/moderationMetadata")
+            .unwrap();
+        assert!(valid_turn_moderation_metadata(
+            &serde_json::to_vec(&notice).unwrap()
+        ));
+        for (key, value) in [
+            ("emittedAtMs", json!("now")),
+            ("id", json!(0)),
+            ("unexpected", json!(true)),
+        ] {
+            let mut invalid = notice.clone();
+            invalid[key] = value;
+            assert!(!valid_turn_moderation_metadata(
+                &serde_json::to_vec(&invalid).unwrap()
+            ));
+        }
+        let duplicate = serde_json::to_string(&notice).unwrap().replacen(
+            "\"emittedAtMs\":",
+            "\"emittedAtMs\":0,\"emittedAtMs\":",
+            1,
+        );
+        assert!(!valid_turn_moderation_metadata(duplicate.as_bytes()));
+    }
+
     fn captured_startup_information() -> Vec<Value> {
         // Genuine 0.144.4 prelude; only local paths and machine identifiers are redacted.
         serde_json::from_str(r#"[
@@ -3523,6 +4183,48 @@ mod tests {
         let mut messages = command_observation_messages();
         messages.splice(1..1, prelude);
         messages
+    }
+
+    #[test]
+    fn captured_0162_startup_timestamp_and_resolved_settings_preserve_strict_correlation() {
+        let capture: Vec<Value> = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.162.0/app-server-start.json"
+        ))
+        .unwrap();
+        let notice = capture
+            .iter()
+            .find(|e| e["method"] == "remoteControl/status/changed")
+            .unwrap();
+        assert!(notice["emittedAtMs"].is_i64());
+        assert!(valid_startup_information(
+            &serde_json::to_vec(notice).unwrap()
+        ));
+        let start = capture.iter().find(|e| e["id"] == 2).unwrap();
+        assert!(valid_thread_start_settings_response(
+            &serde_json::to_vec(start).unwrap()
+        ));
+        assert_eq!(start["result"]["model"], "gpt-6.1-sol");
+        assert_eq!(start["result"]["reasoningEffort"], "xhigh");
+        let mut messages = command_observation_messages();
+        messages[0] = capture[0].clone();
+        messages[1] = start.clone();
+        messages.insert(1, notice.clone());
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.resolved_model, "gpt-6.1-sol");
+        assert_eq!(outcome.resolved_effort.as_deref(), Some("xhigh"));
+        for field in ["emittedAtMs", "unexpected"] {
+            let mut invalid = notice.clone();
+            invalid[field] = json!("invalid");
+            assert!(!valid_startup_information(
+                &serde_json::to_vec(&invalid).unwrap()
+            ));
+        }
+        let duplicate = serde_json::to_string(notice).unwrap().replacen(
+            "\"emittedAtMs\":",
+            "\"emittedAtMs\":0,\"emittedAtMs\":",
+            1,
+        );
+        assert!(!valid_startup_information(duplicate.as_bytes()));
     }
 
     #[test]

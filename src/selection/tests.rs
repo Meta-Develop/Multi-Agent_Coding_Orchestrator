@@ -1171,8 +1171,8 @@ fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-10-15.1");
-    assert_eq!(priors.published_on, "2026-10-15");
+    assert_eq!(priors.revision, "2026-10-22.1");
+    assert_eq!(priors.published_on, "2026-10-22");
     assert_eq!(priors.schema_version, 2);
     assert_eq!(priors.models.len(), 9);
     assert_eq!(priors.objective_profiles[0].version, 3);

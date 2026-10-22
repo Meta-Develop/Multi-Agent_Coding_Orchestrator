@@ -343,7 +343,7 @@ fn multiple_assignments_share_one_authenticated_grok_runtime_snapshot() {
     second.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     second.worker_assignments.clear();
     let mut plan = injected_multi_plan(vec![first, second], 0);
-    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
+    let catalog = injected_codex_runtime_catalog(&["gpt-6.1-sol"]);
     let grok_source = include_bytes!(concat!(
         env!("CARGO_MANIFEST_DIR"),
         "/tests/fixtures/runtime_adapter/grok/captured-minimal-20260821.txt"
@@ -434,7 +434,7 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
     .expect("reserve supervise artifact run");
 
     let mut plan = injected_plan(injected_assignment(true), 0);
-    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol"]);
+    let catalog = injected_codex_runtime_catalog(&["gpt-6.1-sol"]);
     let admission = SupervisorAdmissionPolicyInput::resolve(
         &repo_path,
         1,
@@ -627,7 +627,7 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     .expect("reserve supervise artifact run");
 
     let mut plan = injected_plan(injected_assignment(true), 0);
-    let catalog = injected_codex_runtime_catalog(&["gpt-5.6-sol", "gpt-5.6-luna"]);
+    let catalog = injected_codex_runtime_catalog(&["gpt-6.1-sol", "gpt-5.6-luna"]);
     let admission = SupervisorAdmissionPolicyInput::resolve(
         &repo_path,
         1,
@@ -662,9 +662,9 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     ));
     warm.provider = Some(crate::optimizer::ids::ProviderId::new("openai").expect("provider"));
     warm.requested_model =
-        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-sol").expect("slug"));
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-6.1-sol").expect("slug"));
     warm.resolved_model =
-        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-5.6-sol").expect("slug"));
+        Some(crate::optimizer::ids::RuntimeSlug::new("gpt-6.1-sol").expect("slug"));
     warm.requested_effort = Some(crate::optimizer::action::CanonicalEffort::High);
     warm.resolved_effort = Some(crate::optimizer::action::CanonicalEffort::High);
     warm.session_id = Some("session-a".to_string());
@@ -738,12 +738,12 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
     let mut input = initial.provenance.normalized_input.clone();
     input.signals.previous_choice = Some(crate::selection::CandidateKey {
         runtime: "codex".to_string(),
-        model: "gpt-5.6-sol".to_string(),
+        model: "gpt-6.1-sol".to_string(),
         effort: crate::selection::ReasoningEffort::High,
     });
-    push_live_router_identity("codex:gpt-5.6-sol:high");
+    push_live_router_identity("codex:gpt-6.1-sol:high");
     push_live_router_identity("codex:gpt-5.6-luna:high");
-    push_live_router_identity("codex:gpt-5.6-sol:high");
+    push_live_router_identity("codex:gpt-6.1-sol:high");
     route_live_four_arm_for_test(&input).expect("route four-arm comparison");
 
     let mut profile = plan.effective_role_economics_profile();
@@ -858,7 +858,7 @@ fn worker_journals_are_precreated_as_private_exact_files() {
     assert!(parent_metadata.is_dir());
     assert_eq!(parent_metadata.permissions().mode() & 0o777, 0o700);
     #[cfg(target_os = "linux")]
-    for name in CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS {
+    for name in [".git", ".agents", ".codex", ".aws"] {
         let path = journal_parent.join(name);
         let metadata = fs::symlink_metadata(&path).expect("protected mount target metadata");
         assert!(metadata.is_dir());

@@ -1,0 +1,7 @@
+{
+  "effective_date": "2026-10-22",
+  "source": "standing owner decision: Codex roles differ only by reasoning effort",
+  "required_models": {
+    "codex": {"model": "gpt-6.1-sol", "minimum_cli_version": "0.162.0"}
+  }
+}

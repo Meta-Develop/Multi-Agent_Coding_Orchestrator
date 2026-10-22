@@ -1024,6 +1024,46 @@ fn requested_verification_contract(
     directive.verification_contract
 }
 
+/// Recovery hint only; viability and contract validation still run separately.
+pub(in crate::supervise) fn assignment_requires_file_change(
+    assignment: &OrchestratorAssignment,
+) -> bool {
+    if assignment.phase != AssignmentPhase::Execution || assignment.role != AgentRole::Worker {
+        return false;
+    }
+    let Some(contract) = requested_verification_contract(assignment.notes.as_deref()) else {
+        return false;
+    };
+    let (path, binding) = match contract {
+        RequestedPreclaimVerificationContract::DirectExplicitNewFileCreation {
+            assigned_path,
+            execution_assignment,
+        }
+        | RequestedPreclaimVerificationContract::DirectExistingGitVisibleRegularFileEdit {
+            assigned_path,
+            execution_assignment,
+        }
+        | RequestedPreclaimVerificationContract::ExplicitNewFileCreation {
+            assigned_path,
+            execution_assignment,
+            ..
+        }
+        | RequestedPreclaimVerificationContract::ExistingGitVisibleRegularFileEdit {
+            assigned_path,
+            execution_assignment,
+            ..
+        } => (assigned_path, execution_assignment),
+    };
+    binding.id == assignment.id
+        && binding.phase == assignment.phase
+        && binding.role == assignment.role
+        && assignment.role_category == Some(binding.role_category)
+        && assignment.assigned_paths == [PathBuf::from(path)]
+        && assignment.task.as_ref().is_some_and(|task| {
+            crate::artifacts::state_auth::sha256_hex(task.as_bytes()) == binding.task_sha256
+        })
+}
+
 fn safe_requested_contract_path(value: &str) -> Option<PathBuf> {
     let path = safe_existing_requested_contract_path(value)?;
     (!crate::planning::is_protected_new_file_path(&path)).then_some(path)
@@ -2292,7 +2332,7 @@ mod tests {
         let (temp, map) = repository_map_for_file(path, &contents, true);
         let mut lenses = serde_json::to_value(default_supervisor_review_lenses()).unwrap();
         for lens in lenses.as_array_mut().unwrap() {
-            lens["backend"]["model"] = serde_json::json!("gpt-5.6-sol");
+            lens["backend"]["model"] = serde_json::json!("gpt-6.1-sol");
             lens["backend"]["reasoning_effort"] = serde_json::json!("xhigh");
         }
         let loaded = parse_supervisor_plan_with_consultant(&serde_json::json!({
@@ -2301,8 +2341,8 @@ mod tests {
             "max_gate_corrections": 0, "child_timeout_seconds": 240,
             "review_lenses": lenses,
             "role_models": {
-                "researcher": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"},
-                "auditor": {"model": "gpt-5.6-sol", "reasoning_effort": "xhigh"}
+                "researcher": {"model": "gpt-6.1-sol", "reasoning_effort": "xhigh"},
+                "auditor": {"model": "gpt-6.1-sol", "reasoning_effort": "xhigh"}
             },
             "run_budget": {"hard_tokens": 220000, "role_token_reservations": {
                 "researcher": 16384, "auditor": 16384, "child_orchestrator": 16384
@@ -3598,6 +3638,13 @@ mod tests {
         };
         assert_eq!(assignment.task.as_deref(), Some(loaded.plan.task.as_str()));
         assert_eq!(assignment.runtime, Some(SupervisorRuntime::Grok));
+        assert!(assignment_requires_file_change(assignment));
+        let mut drifted = assignment.clone();
+        drifted.task = Some("Read README.md without changing it.".into());
+        assert!(!assignment_requires_file_change(&drifted));
+        drifted = assignment.clone();
+        drifted.notes = None;
+        assert!(!assignment_requires_file_change(&drifted));
         let directive: RequestedPreclaimDirective = serde_json::from_str(
             assignment
                 .notes

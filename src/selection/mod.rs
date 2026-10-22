@@ -7,6 +7,7 @@
 
 mod quota_input;
 pub mod routing_policy;
+pub(crate) mod runtime_model_policy;
 mod schema;
 mod selector;
 mod types;

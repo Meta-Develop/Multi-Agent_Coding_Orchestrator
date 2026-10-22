@@ -46,10 +46,13 @@ fn final_turn(spec: &ExternalAgentCommand, bytes: &[u8]) -> Result<GrokParsedEve
             continue;
         }
         let first = parse_grok_event_stream(&bytes[..offset])?;
-        if !grok_progress::worker_no_progress(&bytes[..offset]) {
+        if !grok_progress::worker_no_progress(&bytes[..offset], spec.worker_change_required) {
             bail!("Grok continuation has no bounded idle-turn authorization");
         }
         let last = parse_grok_event_stream(&bytes[offset..])?;
+        if grok_progress::worker_no_progress(&bytes[offset..], spec.worker_change_required) {
+            bail!("worker_no_progress");
+        }
         if let (GrokStreamOutcome::Completed(first), GrokStreamOutcome::Completed(last_end)) =
             (first.outcome(), last.outcome())
         {
@@ -219,6 +222,25 @@ mod tests {
         };
         assert_eq!(serde_json::from_slice::<Value>(&output)?, report());
         Ok(())
+    }
+
+    #[test]
+    fn required_edit_rejects_idle_final_turn_even_in_combined_continuation_capture() {
+        let mut spec = command();
+        spec.worker_change_required = true;
+        let captured = include_bytes!("../../tests/fixtures/grok/r43a2-premature-worker.jsonl");
+        let mut combined = captured.to_vec();
+        combined.extend_from_slice(captured);
+        for data in [captured.as_slice(), combined.as_slice()] {
+            let error = runtime_adapter_captured_output(&spec, data, b"", true).unwrap_err();
+            assert!(
+                error.to_string().contains("worker_no_progress"),
+                "{error:#}"
+            );
+        }
+        combined = captured.to_vec();
+        combined.extend_from_slice(&bytes(&[end(report())]));
+        assert!(runtime_adapter_captured_output(&spec, &combined, b"", true).is_ok());
     }
 
     #[test]

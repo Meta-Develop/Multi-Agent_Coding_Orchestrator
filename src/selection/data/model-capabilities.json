@@ -1,9 +1,9 @@
 {
   "id": "maco-default-model-capability-v2",
   "version": 2,
-  "source": "agent-registry#38 dated 2026-07/08 priors; cost per accepted task; owner-policy gpt-6.1-sol baseline dated 2026-10-15",
+  "source": "agent-registry#38 dated 2026-07/08 priors; cost per accepted task; owner-policy gpt-6.1-sol all-Codex-role baseline dated 2026-10-22",
   "models": [
-    {"model":"gpt-6.1-sol","capability":"critical_judgment","eligible":true,"evidence":"standing owner-policy default capable model; judgment baseline inherited from gpt-5.6-sol, not measured local accepted-task evidence; retain xhigh no-evidence gate floor","as_of":"2026-10-15"},
+    {"model":"gpt-6.1-sol","capability":"critical_judgment","eligible":true,"evidence":"standing owner-policy model for every Codex role; judgment baseline inherited from gpt-5.6-sol, not measured local accepted-task evidence; retain xhigh no-evidence gate floor","as_of":"2026-10-22"},
     {"model":"gpt-5.6-sol","capability":"critical_judgment","eligible":true,"evidence":"repo-task pass 63.7%; SWE-Bench Pro 64.6%; planner/gate tier","as_of":"2026-08-17"},
     {"model":"gpt-5.6-luna","capability":"general_judgment","eligible":true,"evidence":"Coding Agent Index 75 at ~20% of Sol per-task cost; Terminal-Bench 2.1 84.7%; SWE-Bench Pro 62.7%; tightly specified leaves only","as_of":"2026-08-17"},
     {"model":"gpt-5.6-terra","capability":"weak_mechanical","eligible":false,"evidence":"agentic rank #112/302; repo-task pass 40.7%; ~2.65x tokens/solved task so higher cost per accepted task than Sol; do not use","as_of":"2026-08-17"}

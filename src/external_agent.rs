@@ -116,13 +116,16 @@ const MAX_CREDENTIAL_REDACTION_PATTERNS: usize = 32;
 const MAX_CREDENTIAL_REDACTION_PATTERN_BYTES: usize = 128 * 1024;
 const CREDENTIAL_REDACTION: &[u8] = b"[REDACTED]";
 const CODEX_MINIMUM_VERSION: (u64, u64, u64) = (0, 138, 0);
-const CODEX_DUPLEX_AUDITED_VERSION: (u64, u64, u64) = (0, 144, 4);
+const CODEX_DUPLEX_AUDITED_VERSIONS: &[(u64, u64, u64)] = &[(0, 144, 4), (0, 162, 0)];
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
 const OUTER_SYSTEMD_POLICY_ID: &str = "maco_external_codex_outer_systemd_v1";
 const INNER_CODEX_POLICY_ID: &str = "maco_external_codex_inner_v1";
 #[cfg(target_os = "linux")]
+// Codex 0.162.0 adds .aws to the metadata masks beneath every writable root.
+// The journal carrier is read-only in the outer sandbox: every inner mount
+// target must therefore already exist, even when it contains no credentials.
 pub(crate) const CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS: &[&str] =
-    &[".git", ".agents", ".codex"];
+    &[".git", ".agents", ".codex", ".aws"];
 const WORKTREE_DECLARED_ROOT_ID: &str = "worktree";
 const PERMANENT_CONTROL_ROOTS: &[&str] = &[".maco", ".maco-cache", ".codex"];
 const POLICY_CONTROL_ROOTS: &[&str] = &[".agents"];
@@ -299,6 +302,8 @@ pub struct ExternalAgentCommand {
     pub(crate) researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     /// Typed precreated worker journals bound to the original incoming report root.
     pub worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
+    /// Parent-bound assignment requires a file creation or edit.
+    pub(crate) worker_change_required: bool,
     pub timeout: Duration,
     pub workspace_access: WorkspaceAccess,
     pub hidden_roots: Vec<PathBuf>,
@@ -1948,6 +1953,110 @@ mod worker_journal_append_binding_tests {
     }
 
     #[test]
+    fn captured_codex_0162_worker_journal_requires_empty_aws_target_without_new_write_grants(
+    ) -> Result<()> {
+        use std::os::unix::fs::{symlink, DirBuilderExt, PermissionsExt};
+
+        let (_temp, spec, controls) = fixture();
+        let incoming = controls.writable_artifact_root.as_ref().unwrap();
+        let carrier = incoming.join("worker-journals");
+        fs::set_permissions(&carrier, fs::Permissions::from_mode(0o700))?;
+        // The passing 0.144.4 carrier had only these three targets. 0.162.0
+        // also masks .aws, whose mount point cannot be created in a RO carrier.
+        for name in [".git", ".agents", ".codex"] {
+            fs::DirBuilder::new()
+                .mode(0o700)
+                .create(carrier.join(name))?;
+        }
+        let validate = || {
+            validate_codex_writable_artifact_carrier(
+                incoming,
+                &controls.exact_writable_artifact_files,
+            )
+        };
+        assert!(validate()
+            .unwrap_err()
+            .to_string()
+            .contains("missing a required Codex protected mount target: .aws"));
+        let before = codex_app_server_argv(&spec, &controls);
+        let aws = carrier.join(".aws");
+        fs::DirBuilder::new().mode(0o700).create(&aws)?;
+        validate()?;
+
+        let captured: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/codex-0.162.0/failed-worker-journal-command.json"
+        ))?;
+        let argv = captured["command"].as_array().unwrap();
+        assert!(argv
+            .iter()
+            .any(|arg| arg == "default_permissions=\"maco_external_codex\""));
+        assert!(argv
+            .iter()
+            .any(|arg| arg == "permissions.maco_external_codex.network={enabled=false}"));
+        let captured_permissions = argv
+            .iter()
+            .filter_map(serde_json::Value::as_str)
+            .find(|arg| arg.starts_with("permissions.maco_external_codex.filesystem="))
+            .unwrap();
+        assert!(captured_permissions.contains("\":workspace_roots\"={\".\"=\"write\"}"));
+        for path in [
+            "/run-artifacts/incoming-assignment-0000-attempt-01/worker-journals",
+            "/primary/.git/worktrees/assignment-001/maco-private-git-v1",
+            "/output",
+        ] {
+            assert!(
+                captured_permissions.contains(&format!("{}=\"write\"", toml_basic_string(path)))
+            );
+        }
+        assert_eq!(captured_permissions.matches("=\"write\"").count(), 4);
+
+        // Precreation affects the mount targets, never the permission map. The
+        // production outer boundary still mounts the carrier RO and the exact
+        // held journal RW; its lock is flock on that same descriptor.
+        let profile = external_side_effect_profile(
+            &spec,
+            Path::new("/nix/store/codex/bin/codex"),
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+            bail!("expected Codex profile");
+        };
+        assert!(profile.visible_read_only_roots().contains(&carrier));
+        assert!(!profile.visible_read_write_roots().contains(&carrier));
+        assert_eq!(
+            profile.visible_read_write_files(),
+            &[controls.exact_writable_artifact_files[0].path.clone()]
+        );
+        assert_eq!(before, codex_app_server_argv(&spec, &controls));
+        assert!(!before
+            .iter()
+            .any(|arg| arg.to_string_lossy().contains(".aws\"=\"write\"")));
+
+        // An empty mount target is not a credential directory or an alias.
+        fs::write(aws.join("credentials"), "inert fixture")?;
+        assert!(validate()
+            .unwrap_err()
+            .to_string()
+            .contains("must be empty"));
+        fs::remove_file(aws.join("credentials"))?;
+        fs::remove_dir(&aws)?;
+        symlink(carrier.join(".codex"), &aws)?;
+        assert!(validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-symlink 0700"));
+        fs::remove_file(&aws)?;
+        fs::DirBuilder::new().mode(0o755).create(&aws)?;
+        fs::set_permissions(&aws, fs::Permissions::from_mode(0o755))?;
+        assert!(validate()
+            .unwrap_err()
+            .to_string()
+            .contains("non-symlink 0700"));
+        Ok(())
+    }
+
+    #[test]
     fn worker_append_production_binding_preserves_native_flags_and_mounts_only_current_executable()
     {
         let (_temp, spec, controls) = fixture();
@@ -2599,6 +2708,7 @@ struct WorktreeConfinementSnapshot {
     read_only_input_files: Vec<PathBuf>,
     researcher_source_inputs: Vec<researcher_inputs::ResearcherSourceInput>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactSpec>,
+    worker_change_required: bool,
     workspace_access: WorkspaceAccess,
     hidden_roots: Vec<PathBuf>,
     worktree_control_exceptions: Vec<PathBuf>,
@@ -2635,6 +2745,7 @@ impl WorktreeConfinementSnapshot {
             read_only_input_files: command.read_only_input_files.clone(),
             researcher_source_inputs: command.researcher_source_inputs.clone(),
             worker_journal_artifacts: command.worker_journal_artifacts.clone(),
+            worker_change_required: command.worker_change_required,
             workspace_access: command.workspace_access,
             hidden_roots: command.hidden_roots.clone(),
             worktree_control_exceptions: command.worktree_control_exceptions.clone(),
@@ -3353,6 +3464,7 @@ impl ExternalAgentCommand {
             read_only_input_files: Vec::new(),
             researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
+            worker_change_required: false,
             timeout,
             workspace_access: WorkspaceAccess::ReadWrite,
             hidden_roots: Vec::new(),
@@ -3407,6 +3519,7 @@ impl ExternalAgentCommand {
             read_only_input_files: Vec::new(),
             researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
+            worker_change_required: false,
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -3461,6 +3574,7 @@ impl ExternalAgentCommand {
             read_only_input_files: Vec::new(),
             researcher_source_inputs: Vec::new(),
             worker_journal_artifacts: Vec::new(),
+            worker_change_required: false,
             timeout,
             workspace_access: WorkspaceAccess::ReadOnly,
             hidden_roots: Vec::new(),
@@ -9363,7 +9477,11 @@ fn run_external_agent_runtime(
         let batch = if grok_progress::guarded_worker(&target_spec)
             && runtime == ExternalExecutionRuntime::Verified
         {
-            grok_progress::run(process_spec, cancellation)
+            grok_progress::run(
+                process_spec,
+                cancellation,
+                target_spec.worker_change_required,
+            )
         } else {
             run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
                 .map(|(output, filesystem)| (output, filesystem, None))
@@ -9813,14 +9931,17 @@ fn validate_universal_pre_action_coverage(target: WritableLaunchTarget) -> Resul
 }
 
 fn validate_duplex_app_server_version(version: EnvironmentVersion) -> Result<()> {
-    let audited = EnvironmentVersion::new(
-        CODEX_DUPLEX_AUDITED_VERSION.0,
-        CODEX_DUPLEX_AUDITED_VERSION.1,
-        CODEX_DUPLEX_AUDITED_VERSION.2,
-    );
-    if version != audited {
+    if !CODEX_DUPLEX_AUDITED_VERSIONS
+        .iter()
+        .any(|&(major, minor, patch)| version == EnvironmentVersion::new(major, minor, patch))
+    {
+        let audited = CODEX_DUPLEX_AUDITED_VERSIONS
+            .iter()
+            .map(|(major, minor, patch)| format!("{major}.{minor}.{patch}"))
+            .collect::<Vec<_>>()
+            .join(", ");
         bail!(
-            "Codex {version} does not match the audited writable app-server protocol version {audited}"
+            "Codex {version} does not match the audited writable app-server protocol versions: {audited}"
         );
     }
     Ok(())
@@ -10854,7 +10975,7 @@ fn runtime_adapter_captured_output_with_claude_evidence(
         if !target_completed_successfully {
             return Ok(RuntimeAdapterCapturedOutput::Unavailable);
         }
-        if grok_progress::worker_no_progress(stdout) {
+        if grok_progress::worker_no_progress(stdout, spec.worker_change_required) {
             bail!("worker_no_progress");
         }
         return Ok(RuntimeAdapterCapturedOutput::Captured(

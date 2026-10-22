@@ -772,7 +772,14 @@ fn prepare_selected_merge_arbiter_command(
         &objective,
         Some(&assessment),
     )?;
-    let selected = selected.context("merge review has no admissible selected Auditor account")?;
+    let selected = selected.with_context(|| {
+        format!(
+            "merge review has no admissible selected Auditor account{}",
+            crate::selection::runtime_model_policy::missing_model_guidance(
+                &decision.normalized_input
+            )
+        )
+    })?;
     let candidate = selected.candidate();
     let provider = &selected.account_binding().provider_id;
     let live = if let Some(socket) =

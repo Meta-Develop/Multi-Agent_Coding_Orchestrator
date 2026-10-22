@@ -986,7 +986,7 @@ mod tests {
         InboxIndependentAuditorSelectionEvidence {
             selector_schema_version: 1,
             runtime: "codex".to_string(),
-            model: "gpt-5.6-sol".to_string(),
+            model: "gpt-6.1-sol".to_string(),
             effort: ReasoningEffort::Xhigh,
             objective_profile_id: "test".to_string(),
             objective_profile_version: 1,
@@ -1018,14 +1018,14 @@ mod tests {
             lenses: vec![
                 LensVerdict {
                     lens_id: "diff".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "adversarial-diff".to_string(),
                     information_scope: "diff-only".to_string(),
                     decision: LensDecision::Accept,
                 },
                 LensVerdict {
                     lens_id: "feedback".to_string(),
-                    model_label: "gpt-5.6-sol".to_string(),
+                    model_label: "gpt-6.1-sol".to_string(),
                     framing: "feedback-map".to_string(),
                     information_scope: "feedback-only".to_string(),
                     decision: LensDecision::Accept,
@@ -1101,7 +1101,7 @@ mod tests {
             .expect("build task");
         let output = accepted_output(&task);
         let record = launch_record(task, &output);
-        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-5.6-sol");
+        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-6.1-sol");
         let proof = verify_repair_disposition_audit_capture(
             temp.path(),
             &state,
@@ -1136,7 +1136,7 @@ mod tests {
         let state = active_state(snapshot.clone(), policy.clone());
         let task = build_repair_disposition_audit_task(temp.path(), &state, &policy, binding)
             .expect("task");
-        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-5.6-sol");
+        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-6.1-sol");
         let producer = repair_producer();
         let mut omitted = accepted_output(&task);
         omitted.feedback.clear();
@@ -1199,7 +1199,7 @@ mod tests {
         let state = active_state(snapshot.clone(), policy.clone());
         let task = build_repair_disposition_audit_task(temp.path(), &state, &policy, binding)
             .expect("task");
-        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-5.6-sol");
+        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-6.1-sol");
         let producer = repair_producer();
         let mut stale_output = accepted_output(&task);
         stale_output.prior_head_oid = "c".repeat(40);
@@ -1293,7 +1293,7 @@ mod tests {
         let state = active_state(snapshot.clone(), policy.clone());
         let task = build_repair_disposition_audit_task(temp.path(), &state, &policy, binding)
             .expect("task");
-        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-5.6-sol");
+        let auditor = repair_disposition_auditor_actor("repair-audit-session", "gpt-6.1-sol");
         let conflict_producer = ProducerFingerprint {
             actor: auditor.clone(),
             commit_authors: vec!["repair-worker".to_string()],
@@ -1350,7 +1350,7 @@ mod tests {
                 &state,
                 &policy,
                 &launch_record(task, &weak),
-                repair_disposition_auditor_actor("repair-audit-session", "gpt-5.6-sol"),
+                repair_disposition_auditor_actor("repair-audit-session", "gpt-6.1-sol"),
                 &repair_producer(),
             ),
             Err(RepairDispositionAuditBlocker::MissingAuditEvidence(evidence))

@@ -236,11 +236,12 @@ impl ModelCapabilityPolicy {
     }
 }
 
-/// Shipped default: dated 2026-08 priors from agent-registry#38.
+/// Shipped capability history plus the 2026-10-22 owner baseline for gpt-6.1-sol.
 ///
 /// This table is fallback-only when no measured catalog/evidence prior exists
 /// for a slug. It must not authorize a model that dated evidence marks
-/// ineligible. `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a
+/// ineligible. Runtime selection separately requires gpt-6.1-sol for every
+/// Codex role. The historical `gpt-5.6-sol` is the judgment/planner tier. `gpt-5.6-luna` is a
 /// capable worker for tightly specified leaves, not a weak-mechanical-only
 /// model. `gpt-5.6-terra` is recorded as ineligible: weaker than luna on
 /// agentic coding and more expensive per solved task.

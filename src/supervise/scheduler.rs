@@ -18,6 +18,7 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::observe_selected_account;
 
 mod preclaim;
+pub(super) use preclaim::assignment_requires_file_change;
 #[cfg(test)]
 use preclaim::evaluate_preclaim_viability;
 use preclaim::{
@@ -6011,8 +6012,11 @@ pub(crate) fn select_normal_intake(
             )?;
         let selected = selected.with_context(|| {
             format!(
-                "normal account-bound intake refused before dispatch: {}",
-                decision.decision_reason
+                "normal account-bound intake refused before dispatch: {}{}",
+                decision.decision_reason,
+                crate::selection::runtime_model_policy::missing_model_guidance(
+                    &decision.normalized_input
+                )
             )
         })?;
         let runtime = super::selection_bridge::runtime_from_name(&selected.candidate().runtime)?;
@@ -8321,7 +8325,7 @@ mod selection_policy_tests {
                 provenance,
                 "worker-b",
                 "codex",
-                "gpt-5.6-sol",
+                "gpt-6.1-sol",
                 crate::selection::ReasoningEffort::High,
             ),
         ];
