@@ -110,6 +110,8 @@ Prerequisites:
   notices, and `turn/started` arriving before its response. These notifications
   remain in the raw stream; completion and usage still require correlated
   `turn/completed` and `thread/tokenUsage/updated` events.
+- Ripgrep is installed. Codex workers call `rg` for inspection. Run
+  `rg --version`. Install it with `sudo apt-get install -y ripgrep`.
 - Logical `codex` resolves to the first existing path of
   `/run/current-system/sw/bin/codex`, `/usr/bin/codex`, or `/bin/codex`. The
   canonical file must be a root-owned, executable, non-symlink regular file,
@@ -465,13 +467,15 @@ An older CLI's catalog is insufficient even when login succeeds. Do not select
 another Codex model to bypass this refusal. The mixed plan keeps its
 `grok-4.6` / `xhigh` worker and uses 6.1 for Codex control and audit roles.
 
-A Grok worker with no tool calls, no reported commands and no changed files on
-a bound file-edit assignment receives one continuation in the same session,
-regardless of its claimed status or `accepted` flag. A second idle report is
-`worker_no_progress`, never acceptance evidence.
+A required-edit Grok report with empty `files_changed` and no native
+`tool_call`, `tool_call_update` or `tool_use` event gets one continuation
+in the same session, even if `commands_run` is non-empty and whatever status
+it claims. A second idle turn is rejected as `worker_no_progress`, never
+acceptance evidence.
 
 | Symptom | Action |
 | --- | --- |
+| Codex worker report with a `missing_executable` environment failure such as `bash: line 1: rg: command not found` | The run fails closed even when the edit itself is correct. Install ripgrep with `sudo apt-get install -y ripgrep`. |
 | Codex 0.162.0 journal wrapper is blocked by a read-only sandbox path and requests elevated permissions | Preserve the JSONL and refuse the approval. Use a MACO build that precreates all four empty journal-carrier mount targets: `.git`, `.agents`, `.codex`, and `.aws`. Version 0.162.0 added the `.aws` mask; its creation inside the read-only carrier fails before the wrapper can launch. The carrier and those empty targets stay read-only; only the bound journal file is writable. Do not grant credentials, make the carrier writable, or approve an expansion. |
 | `unexpected app-server message` / `unsupported method` | Keep the lens or worker JSONL and summary, check the trusted binary's `--version`, and report the exact method and captured stream for protocol qualification. Unknown methods still fail closed. On 0.162.0, `account/updated` during startup or inference is supported; a rejection of that valid notification indicates an older MACO build. Do not bypass the lens gate or treat missing usage as zero tokens. |
 | `WorkerJournalPrelaunchRejected: no command launched; journal unchanged` | A Codex worker may correct only the rejected arguments and retry that invocation once through the same bound wrapper. An extra separator (`-- -- bash ...`) must become `-- bash ...`. Copy the exact assigned worktree into both wrapper `--cwd` and execution tool `workdir`. Preserve a successfully corrected input mistake as an informational finding; do not invent a journal row or suppress unresolved environment failures. A second rejection stops the worker. Grok workers retain their stop-on-error contract. |
