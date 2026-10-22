@@ -11774,6 +11774,7 @@ mod decomposition_tests {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn local_auth_direct_worker_prepares_app_server_authority() -> Result<()> {
         exercise_child_and_parent_auditor_issuers(true)
