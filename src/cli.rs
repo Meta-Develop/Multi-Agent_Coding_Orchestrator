@@ -5263,6 +5263,76 @@ mod cli_integration_tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn worker_journal_append_cli_duplicate_separator_rejects_before_launch_and_allows_correction(
+    ) -> Result<()> {
+        let _fallback =
+            crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+        let dir = tempfile::tempdir()?;
+        let root = dir.path().canonicalize()?;
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let device = identity.device.to_string();
+        let inode = identity.file.to_string();
+        let cwd = root.join("worktree");
+        let prefix = vec![
+            "maco",
+            "supervise",
+            "journal-append",
+            "--journal",
+            path.to_str().unwrap(),
+            "--device",
+            &device,
+            "--inode",
+            &inode,
+            "--cwd",
+            cwd.to_str().unwrap(),
+            "--auto-timestamps",
+        ];
+        let mut baseline = prefix.clone();
+        baseline.extend(["--observe-changes", "--", "true"]);
+        Cli::try_parse_from(baseline)?.run()?;
+        let bytes = fs::read(&path)?;
+        let mut malformed = prefix.clone();
+        malformed.extend([
+            "--",
+            "--",
+            "bash",
+            "-lc",
+            "printf 'Hello from MACO\\n' >> README.md",
+        ]);
+        let error = Cli::try_parse_from(malformed)?.run().unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("WorkerJournalPrelaunchRejected: no command launched; journal unchanged"));
+        assert!(error.to_string().contains("exactly one --"));
+        assert_eq!(fs::read(&path)?, bytes);
+        assert!(!cwd.join("README.md").exists());
+        let mut corrected = prefix;
+        corrected.extend([
+            "--",
+            "bash",
+            "-lc",
+            "printf 'Hello from MACO\\n' >> README.md",
+        ]);
+        Cli::try_parse_from(corrected)?.run()?;
+        let records = supervise::parse_worker_execution_journal(&fs::read(&path)?, &path)?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(
+            records[1].command,
+            ["bash", "-lc", "printf 'Hello from MACO\\n' >> README.md"]
+        );
+        assert_eq!(records[1].command, records[2].command);
+        assert_eq!(records[2].changed_paths, [PathBuf::from("README.md")]);
+        assert_eq!(records[2].cwd, cwd);
+        assert_eq!(
+            fs::read_to_string(cwd.join("README.md"))?,
+            "Hello from MACO\n"
+        );
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn worker_journal_auto_timestamps_bracket_execution_and_observe_native_edits() -> Result<()> {
         // Exercise the Linux syscall fallback used on this worker host too.
         let _fallback =

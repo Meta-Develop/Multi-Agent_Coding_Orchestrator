@@ -1041,6 +1041,10 @@ mod grok_worker_journal_binding_tests {
         assert_eq!(fs::read(&target.prompt)?, prompt);
         assert!(String::from_utf8_lossy(&prompt)
             .contains("Read-only validation must omit --changed-path"));
+        let rendered = String::from_utf8_lossy(&prompt);
+        assert!(rendered.contains("If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal."));
+        assert!(!rendered.contains("Codex workers only, proven-no-launch correction:"));
+        assert!(!rendered.contains("Copyable Codex exec_command"));
         assert!(target.prompt.starts_with(staging.root_path()));
         let mut expected = original_argv;
         let position = expected
@@ -1526,9 +1530,23 @@ fn bind_worker_journal_append_operation(
     {
         bail!("worker journal appender overlaps a workspace, private, or protected path");
     }
-    let prefix = serde_json::to_string(&binding.command_prefix()?)?;
+    let command_prefix = binding.command_prefix()?;
+    let prefix = serde_json::to_string(&command_prefix)?;
+    let examples = if codex {
+        format!(
+            "{}\n",
+            worker_journal_invocation_examples(&command_prefix, &spec.cwd)?
+        )
+    } else {
+        String::new()
+    };
+    let failure_rule = if codex {
+        "Codex workers only, proven-no-launch correction: if the wrapper returns WorkerJournalPrelaunchRejected (no command launched; journal unchanged), correct only the rejected argv/cwd and retry that invocation ONCE through the same bound wrapper. A Codex exec_command CreateProcess rejection explicitly stating Failed to create unified exec process also permits ONE retry with the exact Assigned worktree as tool workdir. A generic nonzero exit, timeout, missing output, wrapped command failed to launch; journal retained, or any executed/possibly executed call never permits retry. After a rejected post-edit observation, the corrected observation must be the very next action: no edit, inspection, validation, or reapplication of the native edit. Preserve the rejection in findings as an informational finding after successful correction. Use environment_failures=[] for recovered input misuse only when no unresolved typed environment failure remains. Do not invent a commands_run journal row for an invocation that never reached the journal. A second rejection stops the worker. Otherwise stop and report WorkerExecutionJournalRecordError without repairing the journal."
+    } else {
+        "If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal."
+    };
     let appendix = format!(
-        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal. Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n{examples}- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. {failure_rule} Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
         binding.helper_sha256,
     );
     if prompt
@@ -1830,6 +1848,39 @@ impl ExternalAgentCommand {
     }
 }
 
+/// Copyable calls keep the execution tool cwd and the wrapper cwd identical.
+/// Quote each shell word separately, including paths containing apostrophes.
+#[cfg(target_os = "linux")]
+fn worker_journal_invocation_examples(prefix: &[String], cwd: &Path) -> Result<String> {
+    let cwd = cwd.to_str().context("worker journal cwd requires UTF-8")?;
+    let mut base = prefix.to_vec();
+    base.extend(["--cwd".into(), cwd.into(), "--auto-timestamps".into()]);
+    let mut observation = base.clone();
+    observation.extend(["--observe-changes".into(), "--".into(), "true".into()]);
+    let mut wrapped = base;
+    wrapped.extend([
+        "--".into(),
+        "bash".into(),
+        "-lc".into(),
+        "git diff --check".into(),
+    ]);
+    let call = |argv: &[String]| -> Result<String> {
+        let cmd = argv
+            .iter()
+            .map(|word| format!("'{}'", word.replace('\'', "'\\''")))
+            .collect::<Vec<_>>()
+            .join(" ");
+        Ok(serde_json::to_string(
+            &serde_json::json!({"cmd": cmd, "workdir": cwd}),
+        )?)
+    };
+    Ok(format!(
+        "- Exact execution tool workdir/cwd (also used for wrapper --cwd): {}\n- Copyable observation argv (baseline and immediate post-edit; executes nothing): {}\n- Copyable Codex exec_command observation arguments: {}\n- Copyable wrapped verification argv (exactly ONE -- separator): {}\n- Copyable Codex exec_command verification arguments: {}\n- Use the assigned worktree above, never the journal directory or a guessed path, as the execution tool workdir. After a native edit, only its immediate observation (or the single permitted no-launch correction of that observation) may run next.",
+        serde_json::to_string(cwd)?, serde_json::to_string(&observation)?, call(&observation)?,
+        serde_json::to_string(&wrapped)?, call(&wrapped)?,
+    ))
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod worker_journal_append_binding_tests {
     use super::*;
@@ -1996,9 +2047,56 @@ mod worker_journal_append_binding_tests {
         assert!(prompt.starts_with("original prompt"));
         assert!(prompt.contains(&serde_json::to_string(&prefix).unwrap()));
         assert!(prompt.contains(&binding.helper_sha256));
+        assert!(prompt.contains(&worker_journal_invocation_examples(&prefix, &spec.cwd).unwrap()));
+        assert!(prompt
+            .contains("WorkerJournalPrelaunchRejected (no command launched; journal unchanged)"));
+        assert!(prompt.contains("retry that invocation ONCE through the same bound wrapper"));
+        assert!(prompt.contains("Failed to create unified exec process"));
+        assert!(prompt.contains("the corrected observation must be the very next action"));
+        assert!(prompt.contains("any executed/possibly executed call never permits retry"));
+        assert!(prompt.contains("Preserve the rejection in findings"));
+        assert!(prompt.contains("informational finding after successful correction"));
+        assert!(prompt.contains("no unresolved typed environment failure remains"));
+        assert!(prompt.contains("A second rejection stops the worker"));
         assert!(controls.exact_read_only_input_files.is_empty());
         binding.revalidate().unwrap();
         assert!(fs::read(&binding.journal.path).unwrap().is_empty());
+    }
+
+    #[test]
+    fn worker_journal_copyable_calls_preserve_argv_and_tool_workdir() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let cwd = temp.path().canonicalize()?.join("work tree's");
+        fs::create_dir(&cwd)?;
+        // A harmless argv recorder exercises the generated shell quoting.
+        let prefix = ["/bin/sh", "-c", "printf '%s\\n' \"$@\"", "recorder"].map(str::to_owned);
+        let examples = worker_journal_invocation_examples(&prefix, &cwd)?;
+        let lines = examples.lines().collect::<Vec<_>>();
+        for (argv_line, call_line, tail) in [
+            (1, 2, vec!["--observe-changes", "--", "true"]),
+            (3, 4, vec!["--", "bash", "-lc", "git diff --check"]),
+        ] {
+            let argv: Vec<String> =
+                serde_json::from_str(lines[argv_line].split_once(": ").unwrap().1)?;
+            let call: serde_json::Value =
+                serde_json::from_str(lines[call_line].split_once(": ").unwrap().1)?;
+            assert_eq!(call["workdir"], cwd.to_str().unwrap());
+            assert_eq!(argv.iter().filter(|arg| *arg == "--").count(), 1);
+            let mut expected = vec!["--cwd", cwd.to_str().unwrap(), "--auto-timestamps"];
+            expected.extend(tail);
+            let output = std::process::Command::new("/bin/sh")
+                .args(["-c", call["cmd"].as_str().unwrap()])
+                .current_dir(&cwd)
+                .output()?;
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout)?
+                    .lines()
+                    .collect::<Vec<_>>(),
+                expected
+            );
+        }
+        Ok(())
     }
 
     #[test]
