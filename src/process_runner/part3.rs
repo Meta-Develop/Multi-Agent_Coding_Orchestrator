@@ -965,6 +965,8 @@ impl SystemdUnit {
         cancellation: &ProcessCancellation,
         timings: &mut PhaseTimings,
     ) -> std::io::Result<()> {
+        #[cfg(test)]
+        run_attach_test_hook("attach_deadline_selected");
         let now = attach_now();
         timings.enter("ownership_observation", now);
         let deadline = systemd_attach_deadline(now, operation_deadline);
@@ -1099,7 +1101,7 @@ impl SystemdUnit {
         timings: &mut PhaseTimings,
     ) -> std::io::Result<()> {
         loop {
-            check_attach_budget(deadline, cancellation)?;
+            self.check_attach_launcher_budget(child, deadline, cancellation)?;
             if matches!(cgroup_populated(&self.cgroup_path)?, Some(true)) {
                 self.observed_owned = true;
             }
@@ -1169,7 +1171,7 @@ impl SystemdUnit {
                 }
             }
             if self.environment_published && !self.environment_released {
-                check_attach_budget(deadline, cancellation)?;
+                self.check_attach_launcher_budget(child, deadline, cancellation)?;
                 timings.enter("environment_release", Instant::now());
                 match signal_systemd_fifo(&self.environment_fifo_path, b"environment\n") {
                     Ok(()) => {
@@ -1180,7 +1182,7 @@ impl SystemdUnit {
                     Err(error) => return Err(error),
                 }
             }
-            check_attach_budget(deadline, cancellation)?;
+            self.check_attach_launcher_budget(child, deadline, cancellation)?;
             if self.environment_released && self.ready_path.is_file() {
                 if self.sandbox.is_some() && !self.sandbox_verified {
                     timings.enter("sandbox_verification", Instant::now());
@@ -1217,6 +1219,30 @@ impl SystemdUnit {
             }
             thread::sleep(IO_CANCEL_POLL_INTERVAL);
         }
+    }
+
+    fn check_attach_launcher_budget(
+        &mut self,
+        child: &mut Child,
+        deadline: Instant,
+        cancellation: &ProcessCancellation,
+    ) -> io::Result<()> {
+        #[cfg(test)]
+        run_attach_test_hook("before_attach_budget_check");
+        if let Err(error) = check_attach_budget(deadline, cancellation) {
+            if let Some(status) = child.try_wait()? {
+                self.launcher_completed = true;
+                let output = collect_exited_child_startup_output(child);
+                return Err(systemd_launcher_exit_error(
+                    status,
+                    &output,
+                    self.target_program_path.as_deref(),
+                    "before transient-unit attachment completed",
+                ));
+            }
+            return Err(error);
+        }
+        Ok(())
     }
 
     fn side_effect_evidence(&self) -> SideEffectConfinementEvidence {
@@ -1784,7 +1810,14 @@ fn run_control_command_capture_bounded_until(
     let status = loop {
         let backlog = drainers.drain_ready();
         let status = child.try_wait()?;
+        #[cfg(test)]
+        run_attach_test_hook("before_control_budget_check");
         if let Err(error) = check_attach_budget(deadline, cancellation) {
+            if status.is_some() {
+                let _ = finish_output_drainers_after_exit(&mut drainers, EXIT_AND_DRAIN_GRACE);
+                let _ = drainers.cancel_incomplete(label);
+                return Err(error);
+            }
             let cleanup = terminate_unix_process_group(&mut child, false, label);
             let status = wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)?
                 .unwrap_or_else(|| fail_closed_stuck_owner(label));
@@ -2372,13 +2405,18 @@ fn attach_now() -> Instant {
 #[cfg(target_os = "linux")]
 fn attach_checkpoint(phase: &'static str, deadline: Instant, cancellation: &ProcessCancellation) -> io::Result<()> {
     #[cfg(test)]
+    run_attach_test_hook(phase);
+    let _ = phase;
+    check_attach_budget(deadline, cancellation)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+fn run_attach_test_hook(phase: &'static str) {
     ATTACH_TEST_HOOK.with(|hook| {
         if let Some(hook) = hook.borrow_mut().as_mut() {
             hook(phase);
         }
     });
-    let _ = phase;
-    check_attach_budget(deadline, cancellation)
 }
 
 #[cfg(all(test, target_os = "linux"))]

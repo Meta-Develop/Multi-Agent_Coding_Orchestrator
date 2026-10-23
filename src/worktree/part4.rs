@@ -296,16 +296,24 @@ where
             AtomicStateWriter::write_direct(&info_root, "exclude", exclude)?;
         }
         ensure_worktree_status_deadline(deadline, "after bounded-status Git root setup")?;
+    #[cfg(test)]
+    worktree_status_test_checkpoint("before_index_staging");
     timings.enter("index_staging", worktree_status_now());
         if let Some(index) = &index {
             AtomicStateWriter::write_direct(&git_root, "index", index)?;
         }
         ensure_worktree_status_deadline(deadline, "after bounded-status index staging")?;
+    #[cfg(test)]
+    worktree_status_test_checkpoint("before_callback");
     timings.enter("callback", worktree_status_now());
         after_index_snapshot(&runtime_root)?;
         ensure_worktree_status_deadline(deadline, "after bounded-status setup callback")?;
+    #[cfg(test)]
+    worktree_status_test_checkpoint("before_head_staging");
     timings.enter("head_staging", worktree_status_now());
         AtomicStateWriter::write_direct(&git_root, "HEAD", &head)?;
+        #[cfg(test)]
+        worktree_status_test_checkpoint("after_head_staging");
         ensure_worktree_status_deadline(deadline, "after bounded-status HEAD staging")?;
     timings.enter("object_link", worktree_status_now());
         create_validated_object_link(&git_root, common_objects.path())?;
@@ -1341,7 +1349,20 @@ fn worktree_status_now() -> Instant {
 }
 
 #[cfg(test)]
+type WorktreeStatusTestHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(test)]
+fn worktree_status_test_checkpoint(phase: &'static str) {
+    WORKTREE_STATUS_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(phase);
+        }
+    });
+}
+
+#[cfg(test)]
 thread_local! {
+    static WORKTREE_STATUS_TEST_HOOK: std::cell::RefCell<Option<WorktreeStatusTestHook>> = const { std::cell::RefCell::new(None) };
     static WORKTREE_STATUS_TEST_CLOCK: std::cell::Cell<Option<Instant>> = const {
         std::cell::Cell::new(None)
     };
@@ -1768,6 +1789,8 @@ fn run_bounded_git_records<const N: usize>(
         let stderr = output.stderr.summarize_chars(512);
         bail!("worktree status command failed: {}", stderr.text);
     }
+    #[cfg(test)]
+    worktree_status_test_checkpoint("after_bounded_git_validation");
     ensure_worktree_status_deadline(deadline, "after bounded Git command validation")?;
     let bytes = output.stdout.as_bytes();
     if !bytes.is_empty() && !bytes.ends_with(&[0]) {

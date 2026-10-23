@@ -3845,6 +3845,9 @@ fn run_process_cancellable_with_interaction(
         let output_backlog = output_drainers.drain_ready();
         input_writer.drain_ready();
 
+        #[cfg(test)]
+        let test_observed_at = PROCESS_WAIT_TEST_HOOK
+            .with(|hook| hook.borrow_mut().as_mut().map(|hook| hook(&mut child)));
         if status.is_none() {
             status = match child.try_wait() {
                 Ok(status) => status,
@@ -3866,11 +3869,14 @@ fn run_process_cancellable_with_interaction(
             };
         }
 
+        let observed_at = Instant::now();
+        #[cfg(test)]
+        let observed_at = test_observed_at.unwrap_or(observed_at);
         let loop_decision = process_loop_decision(
             status.is_some(),
             cancellation.is_cancelled(),
             operation_deadline,
-            Instant::now(),
+            observed_at,
         );
 
         if loop_decision == ProcessLoopDecision::Cancel {
@@ -4052,6 +4058,14 @@ fn run_process_cancellable_with_interaction(
         #[cfg(target_os = "linux")]
         read_only,
     })
+}
+
+#[cfg(test)]
+type ProcessWaitTestHook = Box<dyn FnMut(&mut Child) -> Instant>;
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_WAIT_TEST_HOOK: std::cell::RefCell<Option<ProcessWaitTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

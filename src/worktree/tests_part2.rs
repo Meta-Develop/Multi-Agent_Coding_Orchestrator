@@ -1622,17 +1622,67 @@
         let started = Instant::now();
         let deadline = started + Duration::from_secs(60);
         WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started)));
-        let mut timings = crate::process_runner::PhaseTimings::new(worktree_status_now(), Some(deadline), Duration::from_secs(60), Duration::ZERO, "index_staging");
-        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(25))));
-        timings.enter("callback", worktree_status_now());
-        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(59))));
-        timings.enter("head_staging", worktree_status_now());
-        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(deadline + Duration::from_secs(1))));
-        let failure = ensure_worktree_status_deadline(deadline, "after bounded-status HEAD staging");
-        let message = format!("{:#}", diagnose_bounded_status_result(failure, &timings).unwrap_err());
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        WORKTREE_STATUS_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                let elapsed = match phase {
+                    "before_index_staging" => 0,
+                    "before_callback" => 25,
+                    "before_head_staging" => 59,
+                    "after_head_staging" => 61,
+                    _ => return,
+                };
+                WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(elapsed))));
+            }));
+        });
+        let error = bounded_worktree_status_in_runtime_until(
+            &repo_path, MAX_WORKTREE_STATUS_ENTRIES, MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            &root, |_| Ok(()), deadline, false, BoundedGitIsolation::Verified,
+        ).err().expect("deadline must refuse completion");
+        let message = format!("{error:#}");
+        assert_status_root_contains_only_lock(&root);
         for expected in ["after bounded-status HEAD staging", "phase=head_staging phase_elapsed_ms=2000", "index_staging=25000ms", "callback=34000ms", "largest_phase=callback", "admitted_elapsed_ms=61000"] {
             assert!(message.contains(expected), "missing {expected}: {message}");
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_git_records_reject_success_observed_after_deadline() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        let started = Instant::now();
+        let deadline = started + WORKTREE_STATUS_TIMEOUT;
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started)));
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = reached.clone();
+        WORKTREE_STATUS_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == "after_bounded_git_validation" {
+                    observed.set(true);
+                    WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(deadline + Duration::from_secs(1))));
+                }
+            }));
+        });
+        let error = bounded_worktree_status_in_runtime_until(
+            &repo_path, MAX_WORKTREE_STATUS_ENTRIES, MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            &root, |_| Ok(()), deadline, false, BoundedGitIsolation::Trusted,
+        ).err().expect("deadline must refuse completion");
+        assert!(reached.get(), "must run and validate the real Git command: {error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("after bounded Git command validation"), "{message}");
+        assert!(message.contains("phase=git_index_listing"), "{message}");
+        assert_status_root_contains_only_lock(&root);
     }
 
     #[cfg(target_os = "linux")]
@@ -1671,6 +1721,7 @@
     impl Drop for WorktreeStatusTestClockGuard {
         fn drop(&mut self) {
             WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(None));
+            WORKTREE_STATUS_TEST_HOOK.with(|hook| hook.borrow_mut().take());
         }
     }
 

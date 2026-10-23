@@ -5772,6 +5772,175 @@ fn phase_diagnostics_preserve_typed_environment_and_io_causes() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn systemd_attach_budget_failure_preserves_exited_launcher_status() {
+    let _guard = AttachTestGuard;
+    let temp = tempfile::tempdir().unwrap();
+    let mut unit = systemd_unit_fixture(temp.path(), None);
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "printf launcher-failure >&2; exit 17"])
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    assert_eq!(child.wait().unwrap().code(), Some(17));
+    let now = Instant::now();
+    ATTACH_TEST_NOW.with(|clock| clock.set(Some(now)));
+    let mut timings =
+        PhaseTimings::new(now, Some(now), Duration::ZERO, Duration::ZERO, "attachment");
+    let error = unit
+        .confirm_attached_inner(&mut child, now, &ProcessCancellation::new(), &mut timings)
+        .unwrap_err();
+    assert!(unit.launcher_completed);
+    assert!(error.to_string().contains("17"), "{error}");
+    assert!(error.to_string().contains("launcher-failure"), "{error}");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_attach_cancellation_redacts_launcher_failure_and_rolls_back() {
+    let _guard = AttachTestGuard;
+    let temp = tempfile::tempdir().unwrap();
+    let mut unit = systemd_unit_fixture(temp.path(), None);
+    unit.cgroup_path = temp.path().join("absent-cgroup");
+    unit.target_program_path = Some(PathBuf::from("/private/SECRET-program"));
+    let marker = temp.path().join("rollback-marker");
+    fs::write(&marker, b"private").unwrap();
+    unit.runtime_file_paths.push(marker.clone());
+    let mut child = Command::new("/bin/sh")
+        .args([
+            "-c",
+            "printf SECRET-stdout; printf SECRET-stderr >&2; exit 17",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.wait().unwrap();
+    let cancellation = ProcessCancellation::new();
+    let signal = cancellation.clone();
+    ATTACH_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase == "before_attach_budget_check" {
+                signal.cancel();
+            }
+        }));
+    });
+    let prepared = PreparedProcessTree {
+        backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
+        side_effects: SideEffectConfinementEvidence::Unverified(
+            SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        ),
+    };
+    let now = Instant::now();
+    let mut timings = PhaseTimings::new(
+        now,
+        None,
+        SYSTEMD_OPERATION_GRACE,
+        Duration::ZERO,
+        "attachment",
+    );
+    let error = prepared
+        .attach(
+            &mut child,
+            "cancel fixture",
+            "redacted command",
+            None,
+            &cancellation,
+            &mut timings,
+        )
+        .err()
+        .expect("attachment must be cancelled");
+    let evidence = error.cancellation_evidence().unwrap();
+    assert!(evidence.process_tree.is_verified_empty());
+    let message = evidence.process_error.as_ref().unwrap();
+    assert!(message.contains("was cancelled by its run supervisor"));
+    assert!(
+        message.contains("phase=") && message.contains("pre-cleanup gate:"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("SECRET") && !message.contains("/private"),
+        "{message}"
+    );
+    assert!(
+        !marker.exists(),
+        "real attachment rollback removes private files"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_property_probe_never_signals_reaped_leader_group() {
+    use std::os::unix::process::CommandExt;
+    let _guard = AttachTestGuard;
+    let temp = tempfile::tempdir().unwrap();
+    let pid_file = temp.path().join("leader");
+    let release = temp.path().join("release");
+    let witness = std::rc::Rc::new(std::cell::RefCell::new(None::<Child>));
+    let observed_witness = witness.clone();
+    let now = Instant::now();
+    ATTACH_TEST_NOW.with(|clock| clock.set(Some(now)));
+    let observed_pid_file = pid_file.clone();
+    let observed_release = release.clone();
+    ATTACH_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase != "before_control_budget_check" || !observed_pid_file.exists() {
+                return;
+            }
+            let Some(pid) = fs::read_to_string(&observed_pid_file)
+                .ok()
+                .and_then(|pid| pid.trim().parse::<i32>().ok())
+            else {
+                return;
+            };
+            if observed_witness.borrow().is_none() {
+                let child = Command::new("/bin/sleep")
+                    .arg("30")
+                    .process_group(pid)
+                    .spawn()
+                    .unwrap();
+                *observed_witness.borrow_mut() = Some(child);
+                fs::write(&observed_release, b"release").unwrap();
+            } else if !Path::new(&format!("/proc/{pid}")).exists() {
+                // try_wait has reaped the leader. Its still-live group must not be signalled.
+                ATTACH_TEST_NOW
+                    .with(|clock| clock.set(Some(Instant::now() + Duration::from_secs(30))));
+            }
+        }));
+    });
+    let args = [
+        OsString::from("-c"),
+        OsString::from(format!(
+            "echo $$ > '{}'; while [ ! -f '{}' ]; do /bin/sleep 0.01; done",
+            pid_file.display(),
+            release.display()
+        )),
+    ];
+    let result = run_control_command_capture_bounded_until(
+        Path::new("/bin/sh"),
+        &args,
+        "reaped leader",
+        temp.path(),
+        None,
+        &ProcessCancellation::new(),
+    );
+    let mut witness = witness
+        .borrow_mut()
+        .take()
+        .expect("same-group witness started");
+    let witness_status = witness.try_wait().unwrap();
+    if witness_status.is_none() {
+        witness.kill().unwrap();
+    }
+    witness.wait().unwrap();
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::TimedOut);
+    assert!(
+        witness_status.is_none(),
+        "reaped leader's group was signalled"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn bounded_git_absolute_deadline_caps_relative_command_timeout() {
     let temp = tempfile::tempdir().unwrap();
     let marker = temp.path().join("must-not-run");
@@ -5829,14 +5998,27 @@ fn bounded_git_absolute_deadline_caps_relative_command_timeout() {
     assert!(matches!(error, ProcessRunError::SetupTimeout { .. }));
     assert!(error.to_string().contains("phase=preflight"));
     assert!(!marker.exists());
-    assert_eq!(
-        process_loop_decision(true, false, Some(now), now),
-        ProcessLoopDecision::Timeout
+    // Exercise an actual exit first observed after the absolute deadline.
+    let _guard = AttachTestGuard;
+    let deadline = Instant::now() + Duration::from_secs(60);
+    PROCESS_WAIT_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |child| {
+            assert!(child.wait().unwrap().success());
+            deadline + Duration::from_secs(1)
+        }));
+    });
+    let output = run_process(
+        ProcessSpec::direct("late true", "/bin/true", [] as [&str; 0], temp.path(), 128)
+            .with_containment(ContainmentPolicy::TrustedBestEffort)
+            .with_absolute_deadline(deadline),
+    )
+    .unwrap();
+    assert!(
+        output.status.unwrap().success(),
+        "the real child exited successfully"
     );
-    assert_eq!(
-        process_loop_decision(true, false, Some(now), now + Duration::from_secs(1)),
-        ProcessLoopDecision::Timeout
-    );
+    assert!(output.timed_out, "a late observation must still time out");
+    assert!(!output.safety_sensitive_succeeded());
 }
 
 #[cfg(target_os = "linux")]
@@ -5847,6 +6029,7 @@ impl Drop for AttachTestGuard {
     fn drop(&mut self) {
         ATTACH_TEST_NOW.with(|clock| clock.set(None));
         ATTACH_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+        PROCESS_WAIT_TEST_HOOK.with(|hook| hook.borrow_mut().take());
     }
 }
 
@@ -5858,12 +6041,17 @@ fn systemd_attach_delayed_ready_retains_full_ownership_and_sandbox_proof() {
     let marker = temp.path().join("target-ran");
     let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
     let observed = advanced.clone();
-    let now = Instant::now();
+    let mut selected_at = None;
     ATTACH_TEST_HOOK.with(|hook| {
         *hook.borrow_mut() = Some(Box::new(move |phase| {
-            if phase == "after_sandbox_verification" {
+            if phase == "attach_deadline_selected" {
+                let base = attach_now();
+                selected_at = Some(base);
+                ATTACH_TEST_NOW.with(|clock| clock.set(Some(base)));
+            } else if phase == "after_sandbox_verification" {
                 observed.set(true);
-                ATTACH_TEST_NOW.with(|clock| clock.set(Some(now + Duration::from_secs(4))));
+                let base = selected_at.expect("capture the deadline-selection clock");
+                ATTACH_TEST_NOW.with(|clock| clock.set(Some(base + Duration::from_secs(4))));
             }
         }))
     });
@@ -5996,21 +6184,32 @@ fn systemd_attach_cancel_or_expire_after_verification_never_releases_target() {
 fn sandbox_property_probe_obeys_attach_deadline_and_cancellation() {
     let temp = tempfile::tempdir().unwrap();
     for cancel in [false, true] {
+        let _guard = AttachTestGuard;
+        let now = Instant::now();
+        ATTACH_TEST_NOW.with(|clock| clock.set(Some(now)));
         let pid_file = temp
             .path()
             .join(if cancel { "cancel-pid" } else { "timeout-pid" });
         let cancellation = ProcessCancellation::new();
         let signal = cancellation.clone();
         let child_pid_file = pid_file.clone();
-        let thread = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            while !child_pid_file.exists() && Instant::now() < deadline {
-                thread::sleep(POLL_INTERVAL);
-            }
-            assert!(child_pid_file.exists(), "control child must start");
-            if cancel {
-                signal.cancel();
-            }
+        ATTACH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == "before_control_budget_check"
+                    && fs::read_to_string(&child_pid_file)
+                        .ok()
+                        .and_then(|pid| pid.trim().parse::<u32>().ok())
+                        .is_some()
+                {
+                    if cancel {
+                        signal.cancel();
+                    } else {
+                        ATTACH_TEST_NOW.with(|clock| {
+                            clock.set(Some(Instant::now() + Duration::from_secs(30)))
+                        });
+                    }
+                }
+            }));
         });
         let args = [
             OsString::from("-c"),
@@ -6024,11 +6223,10 @@ fn sandbox_property_probe_obeys_attach_deadline_and_cancellation() {
             &args,
             "bounded property fixture",
             temp.path(),
-            Some(Instant::now() + Duration::from_millis(500)),
+            None,
             &cancellation,
         )
         .unwrap_err();
-        thread.join().unwrap();
         assert_eq!(
             error.kind(),
             if cancel {
@@ -6060,6 +6258,7 @@ fn sandbox_property_probe_obeys_attach_deadline_and_cancellation() {
     assert!(!marker.exists());
     for cancel in [false, true] {
         let _guard = AttachTestGuard;
+        ATTACH_TEST_NOW.with(|clock| clock.set(Some(Instant::now())));
         let cancellation = ProcessCancellation::new();
         let signal = cancellation.clone();
         let observed = std::rc::Rc::new(std::cell::Cell::new(false));
@@ -6083,7 +6282,7 @@ fn sandbox_property_probe_obeys_attach_deadline_and_cancellation() {
             &[],
             "late property success",
             temp.path(),
-            Some(Instant::now() + Duration::from_secs(1)),
+            None,
             &cancellation,
         )
         .unwrap_err();

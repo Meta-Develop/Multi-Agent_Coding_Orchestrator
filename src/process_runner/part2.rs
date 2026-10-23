@@ -906,6 +906,12 @@ impl PreparedProcessTree {
                 unit.launcher_spawned = true;
                 if let Err(source) = unit.confirm_attached_timed(child, operation_deadline, cancellation, timings)
                 {
+                    // Only the wrapper's fixed phase/gate diagnostics are safe to expose.
+                    // Its underlying source may contain launcher output or FIFO paths.
+                    let cancellation_diagnostics = source.get_ref()
+                        .and_then(|source| source.downcast_ref::<PhaseDiagnosticSource>())
+                        .map(|source| source.diagnostics.clone())
+                        .unwrap_or_else(|| timings.snapshot(Instant::now()));
                     let rollback_started = Instant::now();
                     if let Err(error) = unit.rollback_startup(label) {
                         fail_closed_stuck_owner(&format!(
@@ -928,7 +934,7 @@ impl PreparedProcessTree {
                                 ),
                                 side_effects: self.side_effects,
                                 process_error: Some(format!(
-                                    "{label} was cancelled by its run supervisor; {source}"
+                                    "process was cancelled by its run supervisor; {cancellation_diagnostics}"
                                 )),
                                 stdin_error: None,
                             })),
