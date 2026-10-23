@@ -297,7 +297,9 @@ jobs:
   linux-integration:
     name: Linux integration tests
     needs: nix-package
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 hits the candidate-validation readiness timeout; keep the
+    # last verified image until its sandbox startup behavior is qualified.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out repository
