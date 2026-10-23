@@ -1616,6 +1616,58 @@
     struct WorktreeStatusTestClockGuard;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_phase_diagnostics_distinguish_prior_setup_from_head_staging() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started)));
+        let mut timings = crate::process_runner::PhaseTimings::new(worktree_status_now(), Some(deadline), Duration::from_secs(60), Duration::ZERO, "index_staging");
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(25))));
+        timings.enter("callback", worktree_status_now());
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(59))));
+        timings.enter("head_staging", worktree_status_now());
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(deadline + Duration::from_secs(1))));
+        let failure = ensure_worktree_status_deadline(deadline, "after bounded-status HEAD staging");
+        let message = format!("{:#}", diagnose_bounded_status_result(failure, &timings).unwrap_err());
+        for expected in ["after bounded-status HEAD staging", "phase=head_staging phase_elapsed_ms=2000", "index_staging=25000ms", "callback=34000ms", "largest_phase=callback", "admitted_elapsed_ms=61000"] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_failure_diagnostics_exclude_queue_and_separate_cleanup() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let temp = TempDir::new().unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        let lock = KernelStateLock::acquire_direct_with_timeout(&root, WORKTREE_STATUS_RUNTIME_LOCK, Duration::from_secs(1)).unwrap();
+        for cleanup_fails in [false, true] {
+            let started = Instant::now();
+            let main_end = started + Duration::from_secs(61);
+            WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(main_end)));
+            let mut timings = crate::process_runner::PhaseTimings::new(started, Some(started + Duration::from_secs(60)), Duration::from_secs(60), Duration::from_secs(120), "head_staging");
+            timings.freeze(worktree_status_now());
+            let _hook = crate::safe_state::set_scavenge_deadline_hook(move |phase| {
+                if phase == "before private directory scavenging" {
+                    WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(main_end + Duration::from_secs(if cleanup_fails { 31 } else { 2 }))));
+                }
+                false
+            });
+            let main: Result<()> = Err(std::io::Error::other("original main failure").into());
+            let result = finish_bounded_status_runtime(main, &root, &lock);
+            let error = diagnose_bounded_status_result(result, &timings).unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some(), "typed main cause retained");
+            let message = format!("{error:#}");
+            for expected in ["original main failure", "queue_wait_ms=120000", "admitted_elapsed_ms=61000", "phase_elapsed_ms=61000", "budget_ms=60000 remaining_ms=0"] {
+                assert!(message.contains(expected), "missing {expected}: {message}");
+            }
+            assert!(message.contains(if cleanup_fails { "cleanup: elapsed_ms=31000 completed=false" } else { "cleanup: elapsed_ms=2000 completed=true" }), "{message}");
+            assert_eq!(message.contains("cleanup also failed"), cleanup_fails, "{message}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     impl Drop for WorktreeStatusTestClockGuard {
         fn drop(&mut self) {
             WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(None));
@@ -1661,6 +1713,17 @@
             message.contains("after bounded-status setup callback"),
             "{message}"
         );
+        // Exercise the production phase boundaries and frozen main snapshot,
+        // in addition to the accumulator's deterministic arithmetic tests.
+        for expected in [
+            "phase=callback phase_elapsed_ms=61000",
+            "admitted_elapsed_ms=61000",
+            "largest_phase=callback",
+            "bounded-status cleanup:",
+            "completed=true",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
         assert!(!message.contains("cleanup also failed"), "{message}");
         assert_status_root_contains_only_lock(&runtime_root);
     }

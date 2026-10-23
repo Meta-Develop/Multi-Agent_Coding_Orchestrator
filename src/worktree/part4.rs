@@ -87,10 +87,14 @@ fn bounded_worktree_records_mode(
 ) -> Result<BoundedWorktreeRecords> {
     let (_process_lock, deadline, process_queue_wait) =
         enter_bounded_status_process_scope(timeout)?;
+    let mut timings = crate::process_runner::PhaseTimings::new(
+        deadline - timeout, Some(deadline), timeout, process_queue_wait, "runtime_root_setup",
+    );
+    let result = (|| {
     ensure_worktree_status_deadline(deadline, "before bounded-status runtime-root setup")?;
     let state_root = bounded_status_runtime_root(path)?;
     ensure_worktree_status_deadline(deadline, "after bounded-status runtime-root setup")?;
-    let mut records = bounded_worktree_status_in_runtime_until(
+    let mut records = bounded_worktree_status_in_runtime_until_timed(
         path,
         max_entries,
         max_output_bytes,
@@ -99,9 +103,18 @@ fn bounded_worktree_records_mode(
         deadline,
         collect_ignored,
         isolation,
+        &mut timings,
     )?;
     records.process_queue_wait = process_queue_wait;
     Ok(records)
+    })();
+    diagnose_bounded_status_result(result, &timings)
+}
+
+fn diagnose_bounded_status_result<T>(result: Result<T>, timings: &crate::process_runner::PhaseTimings) -> Result<T> {
+    let summary = timings.snapshot(worktree_status_now());
+    tracing::debug!(timings = %summary, completed = result.is_ok(), "bounded-status main operation finished");
+    result.with_context(|| format!("bounded-status main timing: {summary}"))
 }
 
 fn enter_bounded_status_process_scope(
@@ -175,6 +188,7 @@ where
     .map(|records| records.status.is_empty())
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 fn bounded_worktree_status_in_runtime_until<F>(
     path: &Path,
@@ -189,9 +203,32 @@ fn bounded_worktree_status_in_runtime_until<F>(
 where
     F: FnOnce(&SafeRoot) -> Result<()>,
 {
+    let now = worktree_status_now();
+    let mut timings = crate::process_runner::PhaseTimings::new(now, Some(deadline), deadline.saturating_duration_since(now), Duration::ZERO, "repository_binding");
+    let result = bounded_worktree_status_in_runtime_until_timed(path, max_entries, max_output_bytes, state_root, after_index_snapshot, deadline, collect_ignored, isolation, &mut timings);
+    diagnose_bounded_status_result(result, &timings)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn bounded_worktree_status_in_runtime_until_timed<F>(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    state_root: &SafeRoot,
+    after_index_snapshot: F,
+    deadline: Instant,
+    collect_ignored: bool,
+    isolation: BoundedGitIsolation,
+    timings: &mut crate::process_runner::PhaseTimings,
+) -> Result<BoundedWorktreeRecords>
+where
+    F: FnOnce(&SafeRoot) -> Result<()>,
+{
+    timings.enter("repository_binding", worktree_status_now());
     let repository_binding = RepositoryBindingGuard::bind(path)
         .context("failed to bind bounded-status repository association")?;
     let worktree_binding = repository_binding.worktree_binding();
+    timings.enter("kernel_runtime_lock", worktree_status_now());
     let lock_timeout = remaining_worktree_status_time(
         deadline,
         "before global bounded-status runtime lock acquisition",
@@ -205,10 +242,12 @@ where
     .context("failed to acquire global bounded-status runtime lock")?;
     ensure_worktree_status_deadline(deadline, "after bounded-status runtime lock acquisition")?;
     status_lock.verify_direct_binding(state_root)?;
+    timings.enter("startup_scavenging", worktree_status_now());
     scavenge_bounded_status_runtimes_until(state_root, WORKTREE_STATUS_SCAVENGE_LIMITS, deadline)
         .context("failed to scavenge bounded-status crash residue")?;
     status_lock.verify_direct_binding(state_root)?;
     ensure_worktree_status_deadline(deadline, "after bounded-status startup cleanup")?;
+    timings.enter("metadata_validation", worktree_status_now());
     let git_dir_binding = DirectoryBindingGuard::bind(repository_binding.git_dir())
         .context("failed to bind bounded-status Git directory")?;
     let common_dir_binding = DirectoryBindingGuard::bind(repository_binding.common_dir())
@@ -216,12 +255,14 @@ where
     verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
     let git_text_inputs = validate_bounded_git_text_inputs_bound(&repository_binding, deadline)?;
     ensure_worktree_status_deadline(deadline, "after opening bounded-status repository")?;
+    timings.enter("head_capture", worktree_status_now());
     let raw_head = repository_binding
         .read_git_relative(Path::new("HEAD"), MAX_WORKTREE_HEAD_BYTES)
         .context("failed to capture bounded-status HEAD")?;
     validate_bounded_head(&raw_head)?;
     let head = resolve_bounded_head(&repository_binding, &raw_head)?;
     ensure_worktree_status_deadline(deadline, "after capturing bounded-status HEAD")?;
+    timings.enter("index_capture_validation", worktree_status_now());
     let index = repository_binding
         .read_git_relative_optional(Path::new("index"), MAX_WORKTREE_INDEX_BYTES)
         .context("failed to capture bounded-status index")?;
@@ -229,17 +270,23 @@ where
         validate_bounded_index_bytes(index)?;
     }
     ensure_worktree_status_deadline(deadline, "after capturing bounded-status index")?;
+    timings.enter("objects_binding", worktree_status_now());
     let common_objects = SafeRoot::open_existing(repository_binding.common_dir().join("objects"))?;
     ensure_worktree_status_deadline(deadline, "after binding bounded-status objects")?;
+    timings.enter("runtime_reservation", worktree_status_now());
     let runtime = state_root.reserve_random_direct_child_directory(WORKTREE_STATUS_RUNTIME_SEED)?;
     let result = (|| -> Result<BoundedWorktreeRecords> {
         ensure_worktree_status_deadline(deadline, "after reserving bounded-status runtime")?;
+    timings.enter("runtime_open", worktree_status_now());
         let runtime_root = SafeRoot::open_existing(runtime.path())?;
         ensure_worktree_status_deadline(deadline, "after opening bounded-status runtime")?;
+    timings.enter("home_setup", worktree_status_now());
         runtime_root.reserve_direct_child_directory("home")?;
         ensure_worktree_status_deadline(deadline, "after bounded-status HOME setup")?;
+    timings.enter("tmp_setup", worktree_status_now());
         runtime_root.reserve_direct_child_directory("tmp")?;
         ensure_worktree_status_deadline(deadline, "after bounded-status TMP setup")?;
+    timings.enter("git_root_setup", worktree_status_now());
         let git_dir = runtime_root.reserve_direct_child_directory("git")?;
         let git_root = SafeRoot::open_existing(git_dir.path())?;
         git_root.reserve_direct_child_directory("refs")?;
@@ -249,16 +296,21 @@ where
             AtomicStateWriter::write_direct(&info_root, "exclude", exclude)?;
         }
         ensure_worktree_status_deadline(deadline, "after bounded-status Git root setup")?;
+    timings.enter("index_staging", worktree_status_now());
         if let Some(index) = &index {
             AtomicStateWriter::write_direct(&git_root, "index", index)?;
         }
         ensure_worktree_status_deadline(deadline, "after bounded-status index staging")?;
+    timings.enter("callback", worktree_status_now());
         after_index_snapshot(&runtime_root)?;
         ensure_worktree_status_deadline(deadline, "after bounded-status setup callback")?;
+    timings.enter("head_staging", worktree_status_now());
         AtomicStateWriter::write_direct(&git_root, "HEAD", &head)?;
         ensure_worktree_status_deadline(deadline, "after bounded-status HEAD staging")?;
+    timings.enter("object_link", worktree_status_now());
         create_validated_object_link(&git_root, common_objects.path())?;
         ensure_worktree_status_deadline(deadline, "after bounded-status object-link setup")?;
+    timings.enter("worktree_link", worktree_status_now());
         let worktree_alias = create_bounded_status_worktree_link(&runtime_root, path)?;
         ensure_worktree_status_deadline(deadline, "after bounded-status worktree-link setup")?;
         let git_context = BoundedGitContext {
@@ -270,6 +322,7 @@ where
             core_filemode: git_text_inputs.core_filemode,
             isolation,
         };
+    timings.enter("git_index_listing", worktree_status_now());
         let visible = run_bounded_git_records(
             &git_context,
             [
@@ -286,6 +339,7 @@ where
             "bounded managed-worktree index listing",
         )?;
         ensure_worktree_status_deadline(deadline, "after bounded managed-worktree index listing")?;
+    timings.enter("git_index_flag_validation", worktree_status_now());
         let index_flags = run_bounded_git_records(
             &git_context,
             [
@@ -302,6 +356,7 @@ where
             "bounded managed-worktree index flag validation",
         )?;
         validate_bounded_git_index_records(&index_flags, max_entries)?;
+    timings.enter("git_fsmonitor_validation", worktree_status_now());
         let fsmonitor_flags = run_bounded_git_records(
             &git_context,
             [
@@ -318,6 +373,7 @@ where
             "bounded managed-worktree fsmonitor flag validation",
         )?;
         validate_bounded_git_index_records(&fsmonitor_flags, max_entries)?;
+    timings.enter("git_status", worktree_status_now());
         let bytes = run_bounded_git_records(
             &git_context,
             [
@@ -343,6 +399,7 @@ where
             .checked_sub(bytes.len())
             .context("bounded worktree status exceeded its combined output limit")?;
         let ignored = if collect_ignored {
+    timings.enter("git_ignored_listing", worktree_status_now());
             let ignored = run_bounded_git_records(
                 &git_context,
                 [
@@ -379,7 +436,9 @@ where
         } else {
             Vec::new()
         };
+    timings.enter("repository_verification", worktree_status_now());
         verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
+        ensure_worktree_status_deadline(deadline, "after bounded-status repository verification")?;
         Ok(BoundedWorktreeRecords {
             visible,
             status: bytes,
@@ -388,20 +447,28 @@ where
             cleanup_elapsed: Duration::ZERO,
         })
     })();
+    // Cleanup has a separate budget; it must not become part of the failing main phase.
+    timings.freeze(worktree_status_now());
     let finished = finish_bounded_status_runtime(result, state_root, &status_lock).map(
         |(mut records, cleanup_elapsed)| {
             records.cleanup_elapsed = cleanup_elapsed;
             records
         },
     );
+    let verification_started = worktree_status_now();
     let finished = finish_with_status_lock_verification(
         finished,
         status_lock.verify_direct_binding(state_root),
     );
-    finish_with_repository_binding_verification(
+    let lock_elapsed = worktree_status_now().saturating_duration_since(verification_started);
+    let repository_started = worktree_status_now();
+    let finished = finish_with_repository_binding_verification(
         finished,
         repository_binding.verify_status_generation(),
-    )
+    );
+    let repository_elapsed = worktree_status_now().saturating_duration_since(repository_started);
+    tracing::debug!(lock_verification_ms = lock_elapsed.as_millis(), repository_verification_ms = repository_elapsed.as_millis(), "bounded-status final verification finished");
+    finished.with_context(|| format!("bounded-status final verification: lock_elapsed_ms={} repository_elapsed_ms={}", lock_elapsed.as_millis(), repository_elapsed.as_millis()))
 }
 
 /// Final cleanup has its own finite budget. A main-operation timeout must not
@@ -432,14 +499,16 @@ fn finish_bounded_status_runtime<T>(
         completed = cleanup.is_ok(),
         "bounded-status private runtime cleanup finished"
     );
-    match (result, cleanup) {
+    let cleanup_completed = cleanup.is_ok();
+    let finished = match (result, cleanup) {
         (Ok(value), Ok(_)) => Ok((value, cleanup_elapsed)),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
         (Err(error), Err(cleanup_error)) => Err(error.context(format!(
             "bounded-status runtime cleanup also failed: {cleanup_error:#}"
         ))),
-    }
+    };
+    finished.with_context(|| format!("bounded-status cleanup: elapsed_ms={} completed={cleanup_completed}", cleanup_elapsed.as_millis()))
 }
 
 fn validate_bounded_head(bytes: &[u8]) -> Result<()> {
@@ -1599,8 +1668,6 @@ fn run_bounded_git_records<const N: usize>(
 ) -> Result<Vec<u8>> {
     let git = crate::merge::resolve_trusted_executable("git")
         .context("failed to resolve trusted Git for bounded worktree status")?;
-    let remaining = remaining_worktree_status_time(deadline, "before bounded Git command")?
-        .min(WORKTREE_STATUS_COMMAND_TIMEOUT);
     context.runtime_root.verify()?;
     let mut environment = BTreeMap::new();
     environment.insert("GIT_ATTR_NOSYSTEM".to_string(), "1".to_string());
@@ -1651,6 +1718,9 @@ fn run_bounded_git_records<const N: usize>(
     if !context.objects_target.starts_with(context.worktree_target) {
         side_effects = side_effects.with_visible_read_only_root(context.objects_target);
     }
+    // Spec preparation spends the caller's original budget, never a renewed duration.
+    let remaining = remaining_worktree_status_time(deadline, "before bounded Git command")?
+        .min(WORKTREE_STATUS_COMMAND_TIMEOUT);
     let spec = ProcessSpec::direct(
         label,
         git,
@@ -1660,7 +1730,8 @@ fn run_bounded_git_records<const N: usize>(
     )
     .with_environment(EnvironmentMode::ClearAndSet(environment))
     .with_stdin(StdinMode::Null)
-    .with_timeout(Some(remaining));
+    .with_timeout(Some(remaining))
+    .with_absolute_deadline(deadline);
     let spec = match context.isolation {
         BoundedGitIsolation::Verified => spec
             .with_containment(ContainmentPolicy::Required)
@@ -1669,6 +1740,7 @@ fn run_bounded_git_records<const N: usize>(
             )),
         BoundedGitIsolation::Trusted => spec.with_containment(ContainmentPolicy::TrustedBestEffort),
     };
+    ensure_worktree_status_deadline(deadline, "before bounded Git launch")?;
     let started = Instant::now();
     let output = run_process(spec);
     tracing::debug!(
@@ -1696,6 +1768,7 @@ fn run_bounded_git_records<const N: usize>(
         let stderr = output.stderr.summarize_chars(512);
         bail!("worktree status command failed: {}", stderr.text);
     }
+    ensure_worktree_status_deadline(deadline, "after bounded Git command validation")?;
     let bytes = output.stdout.as_bytes();
     if !bytes.is_empty() && !bytes.ends_with(&[0]) {
         bail!("worktree status returned a malformed non-NUL-terminated record");
@@ -1704,7 +1777,9 @@ fn run_bounded_git_records<const N: usize>(
     if entries > max_entries {
         bail!("worktree status reported {entries} entries, exceeding its limit of {max_entries}");
     }
-    Ok(bytes.to_vec())
+    let records = bytes.to_vec();
+    ensure_worktree_status_deadline(deadline, "after bounded Git records validation")?;
+    Ok(records)
 }
 
 #[cfg(test)]

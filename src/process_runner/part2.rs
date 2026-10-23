@@ -715,7 +715,10 @@ impl PreparedProcessTree {
         command: &str,
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
+        timings: &mut PhaseTimings,
     ) -> Result<Self, ProcessRunError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = &timings;
         let unavailable = |source| ProcessRunError::ContainmentUnavailable {
             label: label.to_string(),
             command: command.to_string(),
@@ -754,7 +757,7 @@ impl PreparedProcessTree {
                     ReviewedRequiredContainmentBackend::LinuxSystemdCgroupV2 => {
                         #[cfg(target_os = "linux")]
                         {
-                            match SystemdUnit::prepare(operation_deadline, cancellation) {
+                            match SystemdUnit::prepare(operation_deadline, cancellation, timings) {
                                 Ok(unit) => Ok(Self {
                                     backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
                                     side_effects,
@@ -775,13 +778,13 @@ impl PreparedProcessTree {
                                         label,
                                         command,
                                         "strict containment slot acquisition",
-                                        source.to_string(),
+                                        format!("{source}; {}", timings.snapshot(Instant::now())),
                                     ))
                                 }
                                 Err(source) => Err(containment_setup_error(
                                     label.to_string(),
                                     command.to_string(),
-                                    source,
+                                    with_phase_diagnostics(source, timings.snapshot(Instant::now())),
                                 )),
                             }
                         }
@@ -893,18 +896,25 @@ impl PreparedProcessTree {
         command: &str,
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
+        timings: &mut PhaseTimings,
     ) -> Result<AttachedProcessTree, ProcessRunError> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = &timings;
         match self.backend {
             #[cfg(target_os = "linux")]
             PreparedContainmentBackend::Systemd(mut unit) => {
                 unit.launcher_spawned = true;
-                if let Err(source) = unit.confirm_attached(child, operation_deadline, cancellation)
+                if let Err(source) = unit.confirm_attached_timed(child, operation_deadline, cancellation, timings)
                 {
+                    let rollback_started = Instant::now();
                     if let Err(error) = unit.rollback_startup(label) {
                         fail_closed_stuck_owner(&format!(
                             "{label} systemd containment startup rollback: {error}"
                         ));
                     }
+                    let rollback_elapsed = rollback_started.elapsed();
+                    tracing::debug!(elapsed_ms = rollback_elapsed.as_millis(), "systemd attachment rollback verified empty");
+                    let source = with_phase_diagnostics(source, format!("attachment rollback: elapsed_ms={} completed=true", rollback_elapsed.as_millis()));
                     return if cancellation.is_cancelled() {
                         Err(ProcessRunError::Cancelled {
                             label: label.to_string(),
@@ -918,7 +928,7 @@ impl PreparedProcessTree {
                                 ),
                                 side_effects: self.side_effects,
                                 process_error: Some(format!(
-                                    "{label} was cancelled by its run supervisor"
+                                    "{label} was cancelled by its run supervisor; {source}"
                                 )),
                                 stdin_error: None,
                             })),

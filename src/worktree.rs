@@ -160,8 +160,8 @@ const WORKTREE_STATUS_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 // lease; the 60-second budget stays the bound for registry commits only.
 const MANAGED_WORKTREE_REGISTRY_LOCK_TIMEOUT: Duration = Duration::from_secs(60);
 // Verified Git commands can spend 30 seconds acquiring a containment slot
-// before the three-second start-gate handshakes. Include setup headroom in the
-// command cap on loaded hosts; the caller's absolute deadline still wins.
+// before deadline-clipped adaptive attachment (up to ten seconds). Include setup
+// headroom in the command cap on loaded hosts; the caller's absolute deadline still wins.
 const WORKTREE_STATUS_COMMAND_TIMEOUT: Duration = Duration::from_secs(40);
 // Leave room for private filesystem staging and the remaining Git commands
 // after one slow containment setup. Final runtime cleanup is separately bound.

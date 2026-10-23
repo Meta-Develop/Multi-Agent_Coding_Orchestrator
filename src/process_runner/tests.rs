@@ -3249,6 +3249,16 @@ fn systemd_start_gate_timeout_preserves_bounded_redacted_diagnostics_before_clea
         "{message}"
     );
     assert!(message.contains("pre-cleanup gate: owned=true fifo_waiting=true fifos_prepared=true owner_channel=true guardian_waiting=true environment_published=true environment_released=true ready=false sandbox_verified=false"), "{message}");
+    for timing in [
+        "phase=",
+        "phase_elapsed_ms=",
+        "completed=[",
+        "attach_allowance_ms=",
+        "operation_remaining_ms=",
+    ] {
+        assert!(message.contains(timing), "{message}");
+    }
+    assert!(message.contains("operation_remaining_ms=0"), "{message}");
     assert!(
         message.contains("maco containment guardian: could not inspect sandbox mount"),
         "{message}"
@@ -5718,6 +5728,383 @@ fn required_containment_unavailable_refuses_before_spawn() {
         .expect("run unavailable-containment child test");
     assert!(status.success());
     assert!(!marker.exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn phase_diagnostics_preserve_typed_environment_and_io_causes() {
+    let source = environment_failure_io(
+        EnvironmentFailure::sandbox_unavailable("fixture namespace refusal".to_string()),
+        false,
+    );
+    let wrapped = with_phase_diagnostics(
+        with_phase_diagnostics(source, "phase=sandbox_verification".to_string()),
+        "attachment rollback: completed=true".to_string(),
+    );
+    let error = process_ownership_error("typed fixture".to_string(), "true".to_string(), wrapped);
+    match error {
+        ProcessRunError::EnvironmentFailure {
+            failure,
+            target_process_started,
+            ..
+        } => {
+            assert!(!target_process_started);
+            assert!(failure.summary.contains("fixture namespace refusal"));
+            assert!(failure.summary.contains("phase=sandbox_verification"));
+            assert!(failure
+                .summary
+                .contains("attachment rollback: completed=true"));
+        }
+        other => panic!("typed environment classification lost: {other:?}"),
+    }
+    let wrapped = with_phase_diagnostics(
+        io::Error::from_raw_os_error(libc::EACCES),
+        "phase=fifo_preparation".to_string(),
+    );
+    assert_eq!(wrapped.kind(), io::ErrorKind::PermissionDenied);
+    let inner = wrapped
+        .get_ref()
+        .unwrap()
+        .downcast_ref::<PhaseDiagnosticSource>()
+        .unwrap();
+    assert_eq!(inner.source.raw_os_error(), Some(libc::EACCES));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn bounded_git_absolute_deadline_caps_relative_command_timeout() {
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("must-not-run");
+    let now = Instant::now();
+    let base = ProcessSpec::shell(
+        "absolute status budget",
+        Shell::UnixSh,
+        format!("touch '{}'", marker.display()),
+        temp.path(),
+        128,
+    )
+    .with_timeout(Some(Duration::from_secs(40)));
+    assert_eq!(base.absolute_deadline, None);
+    assert_eq!(
+        ProcessSpec::direct(
+            "direct default",
+            "/bin/true",
+            [] as [&str; 0],
+            temp.path(),
+            128
+        )
+        .absolute_deadline,
+        None
+    );
+    let clipped = base
+        .clone()
+        .with_absolute_deadline(now + Duration::from_secs(12));
+    assert_eq!(
+        clipped.operation_deadline(now).unwrap(),
+        Some(now + Duration::from_secs(12))
+    );
+    // Spec preparation cannot renew the enclosing deadline.
+    assert_eq!(
+        clipped
+            .operation_deadline(now + Duration::from_secs(5))
+            .unwrap(),
+        Some(now + Duration::from_secs(12))
+    );
+    assert_eq!(
+        base.clone()
+            .with_absolute_deadline(now + Duration::from_secs(60))
+            .operation_deadline(now)
+            .unwrap(),
+        Some(now + Duration::from_secs(40))
+    );
+    assert!(matches!(
+        base.clone()
+            .with_timeout(Some(Duration::MAX))
+            .with_absolute_deadline(now)
+            .operation_deadline(now),
+        Err(ProcessRunError::SetupTimeout { .. })
+    ));
+    let expired = base.with_absolute_deadline(now);
+    let error = run_process(expired).unwrap_err();
+    assert!(matches!(error, ProcessRunError::SetupTimeout { .. }));
+    assert!(error.to_string().contains("phase=preflight"));
+    assert!(!marker.exists());
+    assert_eq!(
+        process_loop_decision(true, false, Some(now), now),
+        ProcessLoopDecision::Timeout
+    );
+    assert_eq!(
+        process_loop_decision(true, false, Some(now), now + Duration::from_secs(1)),
+        ProcessLoopDecision::Timeout
+    );
+}
+
+#[cfg(target_os = "linux")]
+struct AttachTestGuard;
+
+#[cfg(target_os = "linux")]
+impl Drop for AttachTestGuard {
+    fn drop(&mut self) {
+        ATTACH_TEST_NOW.with(|clock| clock.set(None));
+        ATTACH_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_attach_delayed_ready_retains_full_ownership_and_sandbox_proof() {
+    let _guard = AttachTestGuard;
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("target-ran");
+    let advanced = std::rc::Rc::new(std::cell::Cell::new(false));
+    let observed = advanced.clone();
+    let now = Instant::now();
+    ATTACH_TEST_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move |phase| {
+            if phase == "after_sandbox_verification" {
+                observed.set(true);
+                ATTACH_TEST_NOW.with(|clock| clock.set(Some(now + Duration::from_secs(4))));
+            }
+        }))
+    });
+    let capture = TestSystemdUnitNameCapture::start();
+    let output = run_process(
+        ProcessSpec::shell(
+            "delayed attach proof",
+            Shell::UnixSh,
+            format!("touch '{}'", marker.display()),
+            temp.path(),
+            128,
+        )
+        .with_timeout(Some(Duration::from_secs(12))),
+    )
+    .expect("strict production path must pass with four-second injected readiness");
+    assert!(advanced.get(), "must reach real sandbox verification");
+    assert!(output.status.unwrap().success() && !output.timed_out);
+    assert!(output.safety_evidence_verified(), "{output:?}");
+    assert!(marker.exists());
+    assert_systemd_units_have_no_residue(&capture.finish());
+    ATTACH_TEST_NOW.with(|clock| clock.set(None));
+    ATTACH_TEST_HOOK.with(|hook| hook.borrow_mut().take());
+
+    // Ready flags alone are insufficient: a missing mount report still refuses attachment.
+    let runtime = temp.path().join("fixture");
+    fs::create_dir(&runtime).unwrap();
+    let mut unit = systemd_unit_fixture(&runtime, None);
+    let spec = ProcessSpec::shell(
+        "missing sandbox proof",
+        Shell::UnixSh,
+        ":",
+        temp.path(),
+        128,
+    );
+    unit.build_command(&spec).unwrap();
+    unit.observed_owned = true;
+    unit.fifos_prepared = true;
+    unit.owner_channel = Some(tempfile::tempfile().unwrap());
+    unit.environment_published = true;
+    unit.environment_released = true;
+    fs::write(&unit.ready_path, b"").unwrap();
+    let mut child = Command::new("/bin/sleep")
+        .arg("30")
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let result = unit.confirm_attached(
+        &mut child,
+        Some(Instant::now() + Duration::from_secs(12)),
+        &ProcessCancellation::new(),
+    );
+    child.kill().unwrap();
+    child.wait().unwrap();
+    assert!(result.is_err() && !unit.sandbox_verified);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn systemd_attach_cancel_or_expire_after_verification_never_releases_target() {
+    for checkpoint in [
+        "before_sandbox_property_probe",
+        "after_sandbox_verification",
+        "before_attachment_success",
+    ] {
+        for cancel in [false, true] {
+            let _guard = AttachTestGuard;
+            let temp = tempfile::tempdir().unwrap();
+            let marker = temp.path().join("must-not-run");
+            let cancellation = ProcessCancellation::new();
+            let observed_cancel = cancellation.clone();
+            let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+            let observed = reached.clone();
+            ATTACH_TEST_HOOK.with(|hook| {
+                *hook.borrow_mut() = Some(Box::new(move |phase| {
+                    if phase == checkpoint {
+                        observed.set(true);
+                        if cancel {
+                            observed_cancel.cancel();
+                        } else {
+                            ATTACH_TEST_NOW.with(|clock| {
+                                clock.set(Some(Instant::now() + Duration::from_secs(30)))
+                            });
+                        }
+                    }
+                }))
+            });
+            let capture = TestSystemdUnitNameCapture::start();
+            let error = run_process_cancellable(
+                ProcessSpec::shell(
+                    "stale attach proof",
+                    Shell::UnixSh,
+                    format!("touch '{}'", marker.display()),
+                    temp.path(),
+                    128,
+                )
+                .with_timeout(Some(Duration::from_secs(12))),
+                &cancellation,
+            )
+            .unwrap_err();
+            assert!(reached.get(), "must exercise {checkpoint}: {error:?}");
+            if cancel {
+                assert!(error.is_cancelled());
+                assert!(error
+                    .cancellation_evidence()
+                    .unwrap()
+                    .process_tree
+                    .is_verified_empty());
+                assert!(error
+                    .cancellation_evidence()
+                    .unwrap()
+                    .process_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("phase="));
+            } else {
+                assert!(
+                    matches!(error, ProcessRunError::ProcessOwnership { ref source, .. } if source.kind() == io::ErrorKind::TimedOut),
+                    "{error:?}"
+                );
+                assert!(error.to_string().contains("attach_allowance_ms="));
+            }
+            assert!(!marker.exists());
+            assert_systemd_units_have_no_residue(&capture.finish());
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_property_probe_obeys_attach_deadline_and_cancellation() {
+    let temp = tempfile::tempdir().unwrap();
+    for cancel in [false, true] {
+        let pid_file = temp
+            .path()
+            .join(if cancel { "cancel-pid" } else { "timeout-pid" });
+        let cancellation = ProcessCancellation::new();
+        let signal = cancellation.clone();
+        let child_pid_file = pid_file.clone();
+        let thread = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while !child_pid_file.exists() && Instant::now() < deadline {
+                thread::sleep(POLL_INTERVAL);
+            }
+            assert!(child_pid_file.exists(), "control child must start");
+            if cancel {
+                signal.cancel();
+            }
+        });
+        let args = [
+            OsString::from("-c"),
+            OsString::from(format!(
+                "echo $$ > '{}'; exec /bin/sleep 30",
+                pid_file.display()
+            )),
+        ];
+        let error = run_control_command_capture_bounded_until(
+            Path::new("/bin/sh"),
+            &args,
+            "bounded property fixture",
+            temp.path(),
+            Some(Instant::now() + Duration::from_millis(500)),
+            &cancellation,
+        )
+        .unwrap_err();
+        thread.join().unwrap();
+        assert_eq!(
+            error.kind(),
+            if cancel {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::TimedOut
+            }
+        );
+        let pid = fs::read_to_string(pid_file).unwrap();
+        assert_process_gone(&pid, "property fixture must be reaped");
+    }
+    let cancellation = ProcessCancellation::new();
+    cancellation.cancel();
+    let marker = temp.path().join("never-started");
+    let args = [
+        OsString::from("-c"),
+        OsString::from(format!("touch '{}'", marker.display())),
+    ];
+    let error = run_control_command_capture_bounded_until(
+        Path::new("/bin/sh"),
+        &args,
+        "cancelled before spawn",
+        temp.path(),
+        Some(Instant::now()),
+        &cancellation,
+    )
+    .unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::Interrupted);
+    assert!(!marker.exists());
+    for cancel in [false, true] {
+        let _guard = AttachTestGuard;
+        let cancellation = ProcessCancellation::new();
+        let signal = cancellation.clone();
+        let observed = std::rc::Rc::new(std::cell::Cell::new(false));
+        let reached = observed.clone();
+        ATTACH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == "before_control_success" {
+                    reached.set(true);
+                    if cancel {
+                        signal.cancel();
+                    } else {
+                        ATTACH_TEST_NOW.with(|clock| {
+                            clock.set(Some(Instant::now() + Duration::from_secs(30)))
+                        });
+                    }
+                }
+            }))
+        });
+        let error = run_control_command_capture_bounded_until(
+            Path::new("/bin/true"),
+            &[],
+            "late property success",
+            temp.path(),
+            Some(Instant::now() + Duration::from_secs(1)),
+            &cancellation,
+        )
+        .unwrap_err();
+        assert!(observed.get());
+        assert_eq!(
+            error.kind(),
+            if cancel {
+                io::ErrorKind::Interrupted
+            } else {
+                io::ErrorKind::TimedOut
+            }
+        );
+    }
+    let (status, _, _) = run_control_command_capture_bounded(
+        Path::new("/bin/true"),
+        &[],
+        "legacy control cap",
+        temp.path(),
+    )
+    .unwrap();
+    assert!(status.success());
 }
 
 #[cfg(target_os = "linux")]

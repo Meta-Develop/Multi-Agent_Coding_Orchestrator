@@ -396,6 +396,7 @@ impl SystemdUnit {
     fn prepare(
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
+        timings: &mut PhaseTimings,
     ) -> std::io::Result<Self> {
         #[cfg(test)]
         if env::var_os("MACO_TEST_DISABLE_STRICT_CONTAINMENT").is_some() {
@@ -405,7 +406,9 @@ impl SystemdUnit {
             ));
         }
         let client_runtime = trusted_linux_runtime_root()?;
+        timings.enter("permit_wait", Instant::now());
         let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline, cancellation)?;
+        timings.enter("containment_preparation", Instant::now());
         let systemd_run = find_trusted_unix_executable(
             "systemd-run",
             &[
@@ -943,29 +946,43 @@ impl SystemdUnit {
         Ok(())
     }
 
+    #[cfg(test)]
     fn confirm_attached(
         &mut self,
         child: &mut Child,
         operation_deadline: Option<Instant>,
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
-        let result = self.confirm_attached_inner(child, operation_deadline, cancellation);
-        match result {
-            Err(source)
-                if matches!(
-                    source.kind(),
-                    io::ErrorKind::TimedOut | io::ErrorKind::Interrupted
-                ) =>
-            {
-                // Observe before attach() rolls back the unit and removes its gate files.
-                let diagnostics = self.start_gate_diagnostics(child);
-                Err(io::Error::new(
-                    source.kind(),
-                    format!("{source}; {diagnostics}"),
-                ))
-            }
-            other => other,
-        }
+        let now = Instant::now();
+        let mut timings = PhaseTimings::new(now, operation_deadline, operation_deadline.map(|d| d.saturating_duration_since(now)).unwrap_or(SYSTEMD_OPERATION_GRACE), Duration::ZERO, "attachment");
+        self.confirm_attached_timed(child, operation_deadline, cancellation, &mut timings)
+    }
+
+    fn confirm_attached_timed(
+        &mut self,
+        child: &mut Child,
+        operation_deadline: Option<Instant>,
+        cancellation: &ProcessCancellation,
+        timings: &mut PhaseTimings,
+    ) -> std::io::Result<()> {
+        let now = attach_now();
+        timings.enter("ownership_observation", now);
+        let deadline = systemd_attach_deadline(now, operation_deadline);
+        let allowance = deadline.as_ref().map(|d| d.saturating_duration_since(now).as_millis()).unwrap_or(0);
+        let result = if cancellation.is_cancelled() {
+            check_attach_budget(now, cancellation)
+        } else { match deadline {
+            Ok(deadline) => self.confirm_attached_inner(child, deadline, cancellation, timings),
+            Err(source) => Err(source),
+        }};
+        // Freeze timings before diagnostics and attach() rollback remove the gate evidence.
+        let observed = attach_now();
+        let summary = format!("{} attach_allowance_ms={} operation_remaining_ms={}", timings.snapshot(observed), allowance, operation_deadline.map(|d| d.saturating_duration_since(observed).as_millis()).unwrap_or(u128::MAX));
+        tracing::debug!(timings = %summary, completed = result.is_ok(), "systemd attachment finished before cleanup");
+        result.map_err(|source| {
+            let diagnostics = format!("systemd transient unit {}; {}", self.name, self.start_gate_diagnostics(child));
+            with_phase_diagnostics(source, format!("{summary}; {diagnostics}"))
+        })
     }
 
     fn start_gate_diagnostics(&self, child: &mut Child) -> String {
@@ -1077,28 +1094,17 @@ impl SystemdUnit {
     fn confirm_attached_inner(
         &mut self,
         child: &mut Child,
-        operation_deadline: Option<Instant>,
+        deadline: Instant,
         cancellation: &ProcessCancellation,
+        timings: &mut PhaseTimings,
     ) -> std::io::Result<()> {
-        let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
         loop {
-            if cancellation.is_cancelled() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::Interrupted,
-                    "systemd containment attachment was cancelled",
-                ));
-            }
-            if Instant::now() >= deadline {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!(
-                        "systemd transient unit {} did not reach its start gate before the bounded setup deadline",
-                        self.name
-                    ),
-                ));
-            }
+            check_attach_budget(deadline, cancellation)?;
             if matches!(cgroup_populated(&self.cgroup_path)?, Some(true)) {
                 self.observed_owned = true;
+            }
+            if self.observed_owned && !self.fifos_prepared {
+                timings.enter("fifo_preparation", Instant::now());
             }
             if !self.fifos_prepared && self.fifo_waiting_path.is_file() {
                 prepare_systemd_gate_fifos(
@@ -1111,11 +1117,16 @@ impl SystemdUnit {
                     ],
                 )?;
                 self.fifos_prepared = true;
+                timings.enter(if self.observed_owned { "owner_channel" } else { "ownership_observation" }, Instant::now());
             }
             if self.observed_owned && self.owner_channel.is_none() && self.owner_fifo_path.exists()
             {
+                timings.enter("owner_channel", Instant::now());
                 match open_systemd_owner_fifo(&self.owner_fifo_path) {
-                    Ok(channel) => self.owner_channel = Some(channel),
+                    Ok(channel) => {
+                        self.owner_channel = Some(channel);
+                        timings.enter("guardian_wait", Instant::now());
+                    }
                     Err(error) if error.raw_os_error() == Some(libc::ENOENT) => {}
                     Err(error) => return Err(error),
                 }
@@ -1124,6 +1135,7 @@ impl SystemdUnit {
                 && self.waiting_path.is_file()
                 && !self.environment_published
             {
+                timings.enter("environment_publication", Instant::now());
                 for private_file in std::mem::take(&mut self.pending_runtime_files) {
                     let path = match private_file.destination {
                         PrivateRuntimeFileDestination::RuntimeDirectory => {
@@ -1157,15 +1169,23 @@ impl SystemdUnit {
                 }
             }
             if self.environment_published && !self.environment_released {
+                check_attach_budget(deadline, cancellation)?;
+                timings.enter("environment_release", Instant::now());
                 match signal_systemd_fifo(&self.environment_fifo_path, b"environment\n") {
-                    Ok(()) => self.environment_released = true,
+                    Ok(()) => {
+                        self.environment_released = true;
+                        timings.enter("ready_wait", Instant::now());
+                    }
                     Err(error) if error.raw_os_error() == Some(libc::ENXIO) => {}
                     Err(error) => return Err(error),
                 }
             }
+            check_attach_budget(deadline, cancellation)?;
             if self.environment_released && self.ready_path.is_file() {
                 if self.sandbox.is_some() && !self.sandbox_verified {
-                    self.verify_effective_sandbox()?;
+                    timings.enter("sandbox_verification", Instant::now());
+                    self.verify_effective_sandbox(deadline, cancellation)?;
+                    attach_checkpoint("after_sandbox_verification", deadline, cancellation)?;
                     self.sandbox_verified = true;
                     // Only this successful native verification can issue pending proof.
                     self.pending_read_only = self.prepared_read_only.take().map(|prepared| {
@@ -1182,6 +1202,7 @@ impl SystemdUnit {
                 if env::var_os("MACO_TEST_ABORT_BEFORE_START_RELEASE").is_some() {
                     std::process::abort();
                 }
+                attach_checkpoint("before_attachment_success", deadline, cancellation)?;
                 return Ok(());
             }
             if let Some(status) = child.try_wait()? {
@@ -1210,24 +1231,29 @@ impl SystemdUnit {
         }
     }
 
-    fn verify_effective_sandbox(&self) -> std::io::Result<()> {
+    fn verify_effective_sandbox(&self, deadline: Instant, cancellation: &ProcessCancellation) -> std::io::Result<()> {
+        check_attach_budget(deadline, cancellation)?;
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             std::io::Error::other("strict sandbox verification omitted requested profile")
         })?;
         sandbox.verify_path_identities()?;
         verify_sandbox_mount_report(&self.sandbox_report_path, &sandbox.mount_checks)?;
+        attach_checkpoint("before_sandbox_property_probe", deadline, cancellation)?;
         let properties = systemd_show_properties(
             &self.systemctl,
             &self.client_runtime,
             &self.name,
             SYSTEMD_SANDBOX_SHOW_PROPERTIES,
+            deadline,
+            cancellation,
         )?;
         verify_systemd_sandbox_properties(
             sandbox,
             &properties,
             &self.runtime_dir,
             self.isolated_root.as_ref().map(tempfile::TempDir::path),
-        )
+        )?;
+        check_attach_budget(deadline, cancellation)
     }
 
     fn release_start_gate(
@@ -1657,6 +1683,8 @@ fn systemd_show_properties(
     client_runtime: &Path,
     unit: &str,
     names: &[&str],
+    deadline: Instant,
+    cancellation: &ProcessCancellation,
 ) -> std::io::Result<BTreeMap<String, String>> {
     let mut args = vec![
         OsString::from("--user"),
@@ -1669,11 +1697,13 @@ fn systemd_show_properties(
             .map(|name| OsString::from(format!("--property={name}"))),
     );
     args.push(OsString::from(unit));
-    let (status, stdout, stderr) = run_control_command_capture_bounded(
+    let (status, stdout, stderr) = run_control_command_capture_bounded_until(
         systemctl,
         &args,
         "systemctl sandbox verification",
         client_runtime,
+        Some(deadline),
+        cancellation,
     )?;
     if !status.success() {
         return Err(std::io::Error::other(format!(
@@ -1698,18 +1728,36 @@ fn systemd_show_properties(
         .filter_map(|line| line.split_once('='))
         .map(|(name, value)| (name.to_string(), value.to_string()))
         .collect::<BTreeMap<_, _>>();
+    check_attach_budget(deadline, cancellation)?;
     Ok(properties)
 }
 
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn run_control_command_capture_bounded(
     program: &Path,
     args: &[OsString],
     label: &str,
     client_runtime: &Path,
 ) -> std::io::Result<(ExitStatus, CapturedBytes, CapturedBytes)> {
+    run_control_command_capture_bounded_until(program, args, label, client_runtime, None, &ProcessCancellation::new())
+}
+
+#[cfg(target_os = "linux")]
+fn run_control_command_capture_bounded_until(
+    program: &Path,
+    args: &[OsString],
+    label: &str,
+    client_runtime: &Path,
+    operation_deadline: Option<Instant>,
+    cancellation: &ProcessCancellation,
+) -> std::io::Result<(ExitStatus, CapturedBytes, CapturedBytes)> {
     use std::os::unix::process::CommandExt;
 
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "systemd sandbox property probe was cancelled"));
+    }
+    let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
+    check_attach_budget(deadline, cancellation)?;
     let mut command = Command::new(program);
     command
         .env_clear()
@@ -1719,6 +1767,7 @@ fn run_control_command_capture_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .process_group(0);
+    check_attach_budget(deadline, cancellation)?;
     let mut child = command.spawn()?;
     let stdout = child
         .stdout
@@ -1732,22 +1781,22 @@ fn run_control_command_capture_bounded(
     configure_cancellable_io(&stderr)?;
     let mut drainers =
         OutputDrainers::start(stdout, stderr, label, 64 * 1024, 64 * 1024, None, None);
-    let deadline = Instant::now() + SYSTEMD_OPERATION_GRACE;
     let status = loop {
         let backlog = drainers.drain_ready();
-        if let Some(status) = child.try_wait()? {
-            break status;
-        }
-        if Instant::now() >= deadline {
+        let status = child.try_wait()?;
+        if let Err(error) = check_attach_budget(deadline, cancellation) {
             let cleanup = terminate_unix_process_group(&mut child, false, label);
             let status = wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)?
                 .unwrap_or_else(|| fail_closed_stuck_owner(label));
             let detail = cleanup.unwrap_or_else(|| {
-                format!("{label} exceeded its bounded deadline and was terminated with {status}")
+                format!("{label} control rollback completed with {status}")
             });
             let _ = finish_output_drainers_after_exit(&mut drainers, EXIT_AND_DRAIN_GRACE);
             let _ = drainers.cancel_incomplete(label);
-            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, detail));
+            return Err(with_phase_diagnostics(error, detail));
+        }
+        if let Some(status) = status {
+            break status;
         }
         if !backlog {
             thread::sleep(POLL_INTERVAL);
@@ -1763,6 +1812,7 @@ fn run_control_command_capture_bounded(
     if let Some(error) = output_error {
         return Err(std::io::Error::other(error));
     }
+    attach_checkpoint("before_control_success", deadline, cancellation)?;
     Ok((status, stdout, stderr))
 }
 
@@ -2285,6 +2335,59 @@ fn enforce_total_operation_deadline(operation_deadline: Option<Instant>) -> std:
         ));
     }
     Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn systemd_attach_deadline(now: Instant, operation_deadline: Option<Instant>) -> io::Result<Instant> {
+    let allowance = match operation_deadline {
+        Some(deadline) => {
+            let remaining = deadline.checked_duration_since(now).filter(|r| !r.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "systemd attachment operation deadline is exhausted"))?;
+            remaining.min(SYSTEMD_OPERATION_GRACE.max(SYSTEMD_ATTACH_CEILING.min(remaining / 2)))
+        }
+        None => SYSTEMD_OPERATION_GRACE,
+    };
+    clamp_platform_operation_deadline(now, allowance, operation_deadline)
+}
+
+#[cfg(target_os = "linux")]
+fn check_attach_budget(deadline: Instant, cancellation: &ProcessCancellation) -> io::Result<()> {
+    if cancellation.is_cancelled() {
+        return Err(io::Error::new(io::ErrorKind::Interrupted, "systemd containment attachment was cancelled"));
+    }
+    if attach_now() >= deadline {
+        return Err(io::Error::new(io::ErrorKind::TimedOut, "systemd transient unit did not reach its start gate before the bounded setup deadline"));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn attach_now() -> Instant {
+    #[cfg(test)]
+    if let Some(now) = ATTACH_TEST_NOW.with(|clock| clock.get()) {
+        return now;
+    }
+    Instant::now()
+}
+
+#[cfg(target_os = "linux")]
+fn attach_checkpoint(phase: &'static str, deadline: Instant, cancellation: &ProcessCancellation) -> io::Result<()> {
+    #[cfg(test)]
+    ATTACH_TEST_HOOK.with(|hook| {
+        if let Some(hook) = hook.borrow_mut().as_mut() {
+            hook(phase);
+        }
+    });
+    let _ = phase;
+    check_attach_budget(deadline, cancellation)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+type AttachTestHook = Box<dyn FnMut(&'static str)>;
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static ATTACH_TEST_NOW: std::cell::Cell<Option<Instant>> = const { std::cell::Cell::new(None) };
+    static ATTACH_TEST_HOOK: std::cell::RefCell<Option<AttachTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(target_os = "linux")]
@@ -4010,6 +4113,28 @@ fn duration_millis(duration: Duration) -> u64 {
 mod start_gate_deadline_phase_tests {
     use super::*;
     use std::time::{Duration, Instant};
+
+    #[test]
+    fn adaptive_attach_budget_scales_and_clips_without_renewal() {
+        let now = Instant::now();
+        for (remaining, expected) in [(40, 10), (12, 6), (6, 3), (1, 1)] {
+            let operation = now + Duration::from_secs(remaining);
+            let deadline = systemd_attach_deadline(now, Some(operation)).unwrap();
+            assert_eq!(deadline, now + Duration::from_secs(expected));
+            for poll in 0..expected {
+                let observed = now + Duration::from_secs(poll);
+                // The selected deadline is retained by confirm_attached_inner, never recomputed.
+                assert!(observed < deadline && deadline <= operation);
+            }
+        }
+        for expired in [now, now - Duration::from_nanos(1)] {
+            assert_eq!(systemd_attach_deadline(now, Some(expired)).unwrap_err().kind(), io::ErrorKind::TimedOut);
+        }
+        assert_eq!(systemd_attach_deadline(now, None).unwrap(), now + SYSTEMD_OPERATION_GRACE);
+        if let Some(large) = now.checked_add(Duration::from_secs(u32::MAX as u64)) {
+            assert_eq!(systemd_attach_deadline(large, Some(large + Duration::from_secs(12))).unwrap(), large + Duration::from_secs(6));
+        }
+    }
 
     #[test]
     fn platform_start_gate_grace_is_clamped_from_the_supplied_now() {
