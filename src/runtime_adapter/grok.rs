@@ -143,6 +143,7 @@ fn is_inference_authentication_error(error: &str) -> bool {
     let lower = error.to_ascii_lowercase();
     lower.contains("unauthenticated")
         || lower.contains("not authenticated")
+        || lower.contains("not signed in")
         || lower.contains("unauthorized")
         || lower.contains("authentication required")
         || lower.contains("invalid api key")
@@ -2407,6 +2408,7 @@ mod tests {
             "HTTP 401: secret-fixture",
             "HTTP status 403 Forbidden: secret-fixture",
             "Unauthenticated: secret-fixture",
+            "nOt SiGnEd In: secret-fixture",
         ] {
             let event = serde_json::json!({"type": "error", "message": error}).to_string();
             assert!(inference_stream_authentication_failed(event.as_bytes()));
@@ -2433,6 +2435,22 @@ mod tests {
         assert!(!inference_stream_authentication_failed(
             b"{\"type\":\"available_commands\"}\n"
         ));
+        let captured = include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/fixtures/runtime_adapter/grok/not-signed-in.streaming-json"
+        ));
+        assert!(inference_stream_authentication_failed(captured));
+        let message = serde_json::from_slice::<Value>(captured)?["message"]
+            .as_str()
+            .context("captured auth message")?
+            .to_string();
+        assert!(!inference_stream_authentication_failed(message.as_bytes()));
+        for kind in ["text", "available_commands"] {
+            let event = serde_json::json!({"type": kind, "message": message, "data": message});
+            assert!(!inference_stream_authentication_failed(
+                event.to_string().as_bytes()
+            ));
+        }
         Ok(())
     }
 
