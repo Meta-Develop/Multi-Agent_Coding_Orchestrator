@@ -1711,6 +1711,91 @@
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn bounded_status_both_fail_diagnostics_redact_secondary_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("private-status-root"))
+            .expect("runtime root");
+        let lock = KernelStateLock::acquire_direct_with_timeout(
+            &root,
+            WORKTREE_STATUS_RUNTIME_LOCK,
+            Duration::from_secs(1),
+        )
+        .expect("runtime lock");
+        let private_path = root.path().join("unexpected-private-entry");
+        fs::write(&private_path, "unexpected").expect("inject cleanup failure");
+        let private_path = private_path.display().to_string();
+        let cleanup_error =
+            scavenge_bounded_status_runtimes(&root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+                .expect_err("unexpected entry must fail cleanup");
+        assert!(format!("{cleanup_error:#}").contains(&private_path));
+
+        let operation_error = || {
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "original typed cause",
+            ))
+            .context("original classified failure")
+        };
+        let binding_error = || {
+            anyhow::anyhow!("binding disappeared: {private_path}")
+                .context(format!("verification failed at {private_path}"))
+        };
+        let results = [
+            (
+                "runtime cleanup also failed",
+                finish_bounded_status_runtime::<()>(Err(operation_error()), &root, &lock)
+                    .map(|_| ()),
+            ),
+            (
+                "repository pathname binding",
+                finish_with_repository_binding_verification::<()>(
+                    Err(operation_error()),
+                    Err(binding_error()),
+                ),
+            ),
+            (
+                "bounded-status lock-path binding",
+                finish_with_status_lock_verification::<()>(
+                    Err(operation_error()),
+                    Err(binding_error()),
+                ),
+            ),
+        ];
+        for (secondary, result) in results {
+            let started = Instant::now();
+            let timings = crate::process_runner::PhaseTimings::new(
+                started,
+                None,
+                Duration::from_secs(60),
+                Duration::ZERO,
+                "callback",
+            );
+            let error = diagnose_bounded_status_result(result, &timings).unwrap_err();
+            for message in [error.to_string(), format!("{error:#}")] {
+                assert!(
+                    message.starts_with("original classified failure; "),
+                    "{message}"
+                );
+                assert!(message.contains(secondary), "{message}");
+                assert!(message.contains("<redacted:"), "{message}");
+                assert!(message.contains("bounded-status main timing:"), "{message}");
+                assert!(
+                    !message.contains(&temp.path().display().to_string()),
+                    "{message}"
+                );
+                assert!(!message.contains("unexpected-private-entry"), "{message}");
+            }
+            let cause = error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed cause retained");
+            assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(cause.to_string(), "original typed cause");
+            assert!(error.root_cause().is::<std::io::Error>());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn bounded_status_failure_diagnostics_exclude_queue_and_separate_cleanup() {
         let _clock_guard = WorktreeStatusTestClockGuard;
         let temp = TempDir::new().unwrap();

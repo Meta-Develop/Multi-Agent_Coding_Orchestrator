@@ -125,6 +125,7 @@ fn append_bounded_status_diagnostics(
 ) -> anyhow::Error {
     // Keep the original Display classification and anyhow's typed cause chain.
     // Do not expand the source chain here: inner errors can contain sensitive data.
+    // Callers must also summarize secondary failures without their private paths.
     let message = format!("{error}; {diagnostics}");
     error.context(message)
 }
@@ -526,9 +527,10 @@ fn finish_bounded_status_runtime<T>(
         (Ok(value), Ok(_)) => Ok((value, cleanup_elapsed)),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(append_bounded_status_diagnostics(error, format!(
-            "bounded-status runtime cleanup also failed: {cleanup_error:#}"
-        ))),
+        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+            error,
+            "bounded-status runtime cleanup also failed: <redacted:cleanup-error>",
+        )),
     };
     finished.map_err(|error| {
         append_bounded_status_diagnostics(error, format!("bounded-status cleanup: elapsed_ms={} completed={cleanup_completed}", cleanup_elapsed.as_millis()))
@@ -588,9 +590,10 @@ fn finish_with_repository_binding_verification<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(binding_error)) => Err(binding_error),
-        (Err(error), Err(binding_error)) => Err(error.context(format!(
-            "operation also lost its repository pathname binding: {binding_error:#}"
-        ))),
+        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+            error,
+            "operation also lost its repository pathname binding: <redacted:binding-error>",
+        )),
     }
 }
 
@@ -1305,9 +1308,10 @@ fn finish_with_status_lock_verification<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(lock_error)) => Err(lock_error),
-        (Err(error), Err(lock_error)) => Err(error.context(format!(
-            "operation also lost its bounded-status lock-path binding: {lock_error:#}"
-        ))),
+        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+            error,
+            "operation also lost its bounded-status lock-path binding: <redacted:lock-error>",
+        )),
     }
 }
 
