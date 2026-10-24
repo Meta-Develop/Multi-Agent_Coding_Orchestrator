@@ -1685,6 +1685,30 @@
         assert_status_root_contains_only_lock(&root);
     }
 
+    #[test]
+    fn bounded_status_diagnostics_preserve_display_and_typed_cause() {
+        let cause = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret=hidden-token /private/hidden-path",
+        );
+        let error = anyhow::Error::new(cause).context("original classified failure");
+        let error = append_bounded_status_diagnostics(error, "bounded-status cleanup: completed=true");
+        let started = Instant::now();
+        let timings = crate::process_runner::PhaseTimings::new(
+            started, None, Duration::from_secs(60), Duration::ZERO, "callback",
+        );
+        let error = diagnose_bounded_status_result::<()>(Err(error), &timings).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("original classified failure; bounded-status cleanup:"), "{message}");
+        assert!(message.contains("bounded-status main timing: phase=callback"), "{message}");
+        for hidden in ["hidden-token", "/private/hidden-path"] {
+            assert!(!message.contains(hidden), "diagnostics exposed a hidden source: {message}");
+        }
+        let cause = error.downcast_ref::<std::io::Error>().expect("typed cause retained");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.root_cause().is::<std::io::Error>());
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn bounded_status_failure_diagnostics_exclude_queue_and_separate_cleanup() {
@@ -1708,7 +1732,8 @@
             let result = finish_bounded_status_runtime(main, &root, &lock);
             let error = diagnose_bounded_status_result(result, &timings).unwrap_err();
             assert!(error.downcast_ref::<std::io::Error>().is_some(), "typed main cause retained");
-            let message = format!("{error:#}");
+            let message = error.to_string();
+            assert!(message.starts_with("original main failure; "), "{message}");
             for expected in ["original main failure", "queue_wait_ms=120000", "admitted_elapsed_ms=61000", "phase_elapsed_ms=61000", "budget_ms=60000 remaining_ms=0"] {
                 assert!(message.contains(expected), "missing {expected}: {message}");
             }

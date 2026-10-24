@@ -114,7 +114,19 @@ fn bounded_worktree_records_mode(
 fn diagnose_bounded_status_result<T>(result: Result<T>, timings: &crate::process_runner::PhaseTimings) -> Result<T> {
     let summary = timings.snapshot(worktree_status_now());
     tracing::debug!(timings = %summary, completed = result.is_ok(), "bounded-status main operation finished");
-    result.with_context(|| format!("bounded-status main timing: {summary}"))
+    result.map_err(|error| {
+        append_bounded_status_diagnostics(error, format!("bounded-status main timing: {summary}"))
+    })
+}
+
+fn append_bounded_status_diagnostics(
+    error: anyhow::Error,
+    diagnostics: impl std::fmt::Display,
+) -> anyhow::Error {
+    // Keep the original Display classification and anyhow's typed cause chain.
+    // Do not expand the source chain here: inner errors can contain sensitive data.
+    let message = format!("{error}; {diagnostics}");
+    error.context(message)
 }
 
 fn enter_bounded_status_process_scope(
@@ -476,7 +488,9 @@ where
     );
     let repository_elapsed = worktree_status_now().saturating_duration_since(repository_started);
     tracing::debug!(lock_verification_ms = lock_elapsed.as_millis(), repository_verification_ms = repository_elapsed.as_millis(), "bounded-status final verification finished");
-    finished.with_context(|| format!("bounded-status final verification: lock_elapsed_ms={} repository_elapsed_ms={}", lock_elapsed.as_millis(), repository_elapsed.as_millis()))
+    finished.map_err(|error| {
+        append_bounded_status_diagnostics(error, format!("bounded-status final verification: lock_elapsed_ms={} repository_elapsed_ms={}", lock_elapsed.as_millis(), repository_elapsed.as_millis()))
+    })
 }
 
 /// Final cleanup has its own finite budget. A main-operation timeout must not
@@ -512,11 +526,13 @@ fn finish_bounded_status_runtime<T>(
         (Ok(value), Ok(_)) => Ok((value, cleanup_elapsed)),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(cleanup_error)) => Err(error.context(format!(
+        (Err(error), Err(cleanup_error)) => Err(append_bounded_status_diagnostics(error, format!(
             "bounded-status runtime cleanup also failed: {cleanup_error:#}"
         ))),
     };
-    finished.with_context(|| format!("bounded-status cleanup: elapsed_ms={} completed={cleanup_completed}", cleanup_elapsed.as_millis()))
+    finished.map_err(|error| {
+        append_bounded_status_diagnostics(error, format!("bounded-status cleanup: elapsed_ms={} completed={cleanup_completed}", cleanup_elapsed.as_millis()))
+    })
 }
 
 fn validate_bounded_head(bytes: &[u8]) -> Result<()> {
