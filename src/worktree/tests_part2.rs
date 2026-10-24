@@ -1728,6 +1728,13 @@
             scavenge_bounded_status_runtimes(&root, WORKTREE_STATUS_SCAVENGE_LIMITS)
                 .expect_err("unexpected entry must fail cleanup");
         assert!(format!("{cleanup_error:#}").contains(&private_path));
+        let deadline_error = anyhow::anyhow!(
+            "worktree status exhausted its total time budget after {private_path}"
+        );
+        assert_eq!(
+            redacted_bounded_status_secondary(&deadline_error, "cleanup"),
+            "worktree status exhausted its total time budget: <redacted:cleanup-error>"
+        );
 
         let operation_error = || {
             anyhow::Error::new(std::io::Error::new(
@@ -1737,17 +1744,22 @@
             .context("original classified failure")
         };
         let binding_error = || {
-            anyhow::anyhow!("binding disappeared: {private_path}")
+            anyhow::anyhow!("directory pathname binding disappeared: {private_path}")
                 .context(format!("verification failed at {private_path}"))
         };
         let results = [
             (
                 "runtime cleanup also failed",
+                &[
+                    "failed to remove bounded-status private runtime",
+                    "unexpected entry in private residue root requires manual inspection",
+                ][..],
                 finish_bounded_status_runtime::<()>(Err(operation_error()), &root, &lock)
                     .map(|_| ()),
             ),
             (
                 "repository pathname binding",
+                &["directory pathname binding disappeared"][..],
                 finish_with_repository_binding_verification::<()>(
                     Err(operation_error()),
                     Err(binding_error()),
@@ -1755,13 +1767,26 @@
             ),
             (
                 "bounded-status lock-path binding",
+                &["kernel state lock path does not name its opened descriptor"][..],
                 finish_with_status_lock_verification::<()>(
                     Err(operation_error()),
-                    Err(binding_error()),
+                    Err(anyhow::anyhow!(
+                        "kernel state lock path does not name its opened descriptor: {private_path}"
+                    )),
+                ),
+            ),
+            (
+                "repository pathname binding",
+                &[][..],
+                finish_with_repository_binding_verification::<()>(
+                    Err(operation_error()),
+                    Err(anyhow::anyhow!(
+                        "unknown failure at {private_path}: directory pathname binding changed"
+                    )),
                 ),
             ),
         ];
-        for (secondary, result) in results {
+        for (secondary, classifications, result) in results {
             let started = Instant::now();
             let timings = crate::process_runner::PhaseTimings::new(
                 started,
@@ -1777,6 +1802,19 @@
                     "{message}"
                 );
                 assert!(message.contains(secondary), "{message}");
+                for &classification in classifications {
+                    assert!(
+                        message.contains(classification),
+                        "missing {classification}: {message}"
+                    );
+                }
+                for hidden in [
+                    "verification failed at",
+                    "unknown failure at",
+                    "directory pathname binding changed",
+                ] {
+                    assert!(!message.contains(hidden), "{message}");
+                }
                 assert!(message.contains("<redacted:"), "{message}");
                 assert!(message.contains("bounded-status main timing:"), "{message}");
                 assert!(

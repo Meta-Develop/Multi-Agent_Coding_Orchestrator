@@ -130,6 +130,76 @@ fn append_bounded_status_diagnostics(
     error.context(message)
 }
 
+/// Copy only known classification labels, never the secondary error's dynamic
+/// text or source chain. Unknown errors still receive the redacted category.
+fn redacted_bounded_status_secondary(error: &anyhow::Error, category: &str) -> String {
+    const CLASSIFICATIONS: &[&str] = &[
+        "failed to remove bounded-status private runtime",
+        "private directory scavenging exceeded its total time budget",
+        "private directory scavenging limits must be non-zero",
+        "private directory scavenging deadline overflowed",
+        "worktree status exhausted its total time budget",
+        "worktree status total time budget overflowed",
+        "unexpected entry in private residue root requires manual inspection",
+        "private residue root is missing its held stable lock file",
+        "private residue root contains duplicate directory identities",
+        "private residue tree exceeded its bounded safety contract",
+        "private residue lock is unsafe or changed",
+        "private residue entry is not an owner-private directory",
+        "private residue directory identity changed while binding",
+        "private residue directory changed before bounded audit",
+        "private residue quarantine does not encode a canonical source name",
+        "private residue quarantine identity is malformed or changed",
+        "private residue entry changed owner or filesystem",
+        "private residue directory has unsafe mode",
+        "private residue directory identity changed",
+        "private residue file is not owner-private and single-link",
+        "private residue symlink has an unsafe link count",
+        "private residue contains a special file",
+        "held directory binding changed",
+        "directory pathname binding disappeared",
+        "directory pathname binding changed",
+        "held regular-file binding changed",
+        "regular-file pathname binding disappeared",
+        "regular-file pathname binding changed",
+        "Git directory association marker changed",
+        "kernel state lock was presented with a different root inode",
+        "kernel state lock descriptor identity changed unexpectedly",
+        "kernel state lock path does not name its opened descriptor",
+        "kernel state lock path was rebound while its original inode remained locked",
+        "kernel state lock is not an owner-private single-link regular file",
+        "safe root path is no longer reachable",
+        "safe root identity changed",
+        "safe root path was replaced",
+        "safe root mount binding changed",
+        "safe root mount id changed",
+    ];
+    let mut labels = Vec::new();
+    for cause in error.chain() {
+        let message = cause.to_string();
+        for &label in CLASSIFICATIONS {
+            if (message == label
+                || message.strip_prefix(label).is_some_and(|suffix| {
+                    suffix.starts_with(": ")
+                        || suffix.starts_with(" at ")
+                        || (label == "worktree status exhausted its total time budget"
+                            && [" before ", " after ", " during "]
+                                .iter()
+                                .any(|&phase| suffix.starts_with(phase)))
+                }))
+                && !labels.contains(&label)
+            {
+                labels.push(label);
+            }
+        }
+    }
+    if labels.is_empty() {
+        format!("<redacted:{category}-error>")
+    } else {
+        format!("{}: <redacted:{category}-error>", labels.join(": "))
+    }
+}
+
 fn enter_bounded_status_process_scope(
     timeout: Duration,
 ) -> Result<(std::sync::MutexGuard<'static, ()>, Instant, Duration)> {
@@ -527,9 +597,12 @@ fn finish_bounded_status_runtime<T>(
         (Ok(value), Ok(_)) => Ok((value, cleanup_elapsed)),
         (Err(error), Ok(_)) => Err(error),
         (Ok(_), Err(cleanup_error)) => Err(cleanup_error),
-        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+        (Err(error), Err(cleanup_error)) => Err(append_bounded_status_diagnostics(
             error,
-            "bounded-status runtime cleanup also failed: <redacted:cleanup-error>",
+            format!(
+                "bounded-status runtime cleanup also failed: {}",
+                redacted_bounded_status_secondary(&cleanup_error, "cleanup")
+            ),
         )),
     };
     finished.map_err(|error| {
@@ -590,9 +663,12 @@ fn finish_with_repository_binding_verification<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(binding_error)) => Err(binding_error),
-        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+        (Err(error), Err(binding_error)) => Err(append_bounded_status_diagnostics(
             error,
-            "operation also lost its repository pathname binding: <redacted:binding-error>",
+            format!(
+                "operation also lost its repository pathname binding: {}",
+                redacted_bounded_status_secondary(&binding_error, "binding")
+            ),
         )),
     }
 }
@@ -1308,9 +1384,12 @@ fn finish_with_status_lock_verification<T>(
         (Ok(value), Ok(())) => Ok(value),
         (Err(error), Ok(())) => Err(error),
         (Ok(_), Err(lock_error)) => Err(lock_error),
-        (Err(error), Err(_)) => Err(append_bounded_status_diagnostics(
+        (Err(error), Err(lock_error)) => Err(append_bounded_status_diagnostics(
             error,
-            "operation also lost its bounded-status lock-path binding: <redacted:lock-error>",
+            format!(
+                "operation also lost its bounded-status lock-path binding: {}",
+                redacted_bounded_status_secondary(&lock_error, "lock")
+            ),
         )),
     }
 }
