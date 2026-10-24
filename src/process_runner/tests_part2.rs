@@ -723,6 +723,7 @@
             "sh",
             None,
             &cancellation,
+            &mut PhaseTimings::new(Instant::now(), None, Duration::MAX, Duration::ZERO, "fixture"),
         )
         .expect("prepare evidence containment");
         let mut command = prepared_tree
@@ -734,7 +735,7 @@
             .stderr(Stdio::piped());
         let mut child = command.spawn().expect("spawn evidence child");
         let attached_tree = prepared_tree
-            .attach(&mut child, "evidence child", "sh", None, &cancellation)
+            .attach(&mut child, "evidence child", "sh", None, &cancellation, &mut PhaseTimings::new(Instant::now(), None, Duration::MAX, Duration::ZERO, "fixture"))
             .expect("attach evidence child");
         let prepared = PreparedChildIo::take(&mut child, &StdinMode::Null)
             .expect("prepare evidence child I/O");
@@ -1235,6 +1236,7 @@
             "no-systemd-probe",
             None,
             &cancellation,
+            &mut PhaseTimings::new(Instant::now(), None, Duration::MAX, Duration::ZERO, "fixture"),
         )
         .expect("trusted simulation compatibility must not require systemd");
 

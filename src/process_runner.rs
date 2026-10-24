@@ -98,6 +98,9 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
+// Attachment alone may use this ceiling, always inside the original operation deadline.
+#[cfg(target_os = "linux")]
+const SYSTEMD_ATTACH_CEILING: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
 // Keep both supervise admission and strict containment deterministic in the unit-test binary.
@@ -2314,6 +2317,8 @@ pub struct ProcessSpec {
     /// extend the return past this deadline to prove that no owned process remains. On strict Linux
     /// runs this value also sizes the independent orphan-safety fuse.
     pub timeout: Option<Duration>,
+    /// An enclosing operation may already have spent part of its budget preparing this spec.
+    absolute_deadline: Option<Instant>,
     pub stdout: StreamCapture,
     pub stderr: StreamCapture,
     /// Optional nested-worker usage journal harvested after the child returns. When set, the
@@ -2402,6 +2407,7 @@ impl ProcessSpec {
             read_only_input_snapshots: Vec::new(),
             pinned_direct: None,
             timeout: None,
+            absolute_deadline: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
             nested_usage: None,
@@ -2443,6 +2449,7 @@ impl ProcessSpec {
             read_only_input_snapshots: Vec::new(),
             pinned_direct: None,
             timeout: None,
+            absolute_deadline: None,
             stdout: StreamCapture::bounded(capture_limit_bytes),
             stderr: StreamCapture::bounded(capture_limit_bytes),
             nested_usage: None,
@@ -2617,6 +2624,31 @@ impl ProcessSpec {
     pub fn with_timeout(mut self, timeout: Option<Duration>) -> Self {
         self.timeout = timeout;
         self
+    }
+
+    pub(crate) fn with_absolute_deadline(mut self, deadline: Instant) -> Self {
+        self.absolute_deadline = Some(deadline);
+        self
+    }
+
+    fn operation_deadline(&self, started: Instant) -> Result<Option<Instant>, ProcessRunError> {
+        let relative = self
+            .timeout
+            .map(|timeout| {
+                started.checked_add(timeout).ok_or_else(|| {
+                    setup_timeout_error(
+                        &self.label,
+                        &self.command_display(),
+                        "timeout validation",
+                        "requested duration exceeds the platform Instant range",
+                    )
+                })
+            })
+            .transpose()?;
+        Ok(match (relative, self.absolute_deadline) {
+            (Some(relative), Some(absolute)) => Some(relative.min(absolute)),
+            (relative, absolute) => relative.or(absolute),
+        })
     }
 
     pub fn with_stdout(mut self, stdout: StreamCapture) -> Self {
@@ -3133,6 +3165,137 @@ where
 type ProcessStartGateCallback<'callback> =
     dyn for<'gate> FnMut(&ContainedProcessStartGate<'gate>) -> Result<(), String> + 'callback;
 
+/// Bounded, static-label diagnostics only: no paths, arguments, environment or poll history.
+pub(crate) struct PhaseTimings {
+    started: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    completed: [Option<(&'static str, Duration)>; 32],
+    count: usize,
+    deadline: Option<Instant>,
+    budget: Duration,
+    queue_wait: Duration,
+    frozen: Option<String>,
+}
+
+impl PhaseTimings {
+    pub(crate) fn new(
+        started: Instant,
+        deadline: Option<Instant>,
+        budget: Duration,
+        queue_wait: Duration,
+        phase: &'static str,
+    ) -> Self {
+        Self {
+            started,
+            phase_started: started,
+            phase,
+            completed: [None; 32],
+            count: 0,
+            deadline,
+            budget,
+            queue_wait,
+            frozen: None,
+        }
+    }
+
+    pub(crate) fn enter(&mut self, phase: &'static str, now: Instant) {
+        if self.phase == phase {
+            return;
+        }
+        if let Some(slot) = self.completed.get_mut(self.count) {
+            *slot = Some((
+                self.phase,
+                now.saturating_duration_since(self.phase_started),
+            ));
+            self.count += 1;
+        }
+        self.phase = phase;
+        self.phase_started = now;
+    }
+
+    pub(crate) fn snapshot(&self, now: Instant) -> String {
+        if let Some(snapshot) = &self.frozen {
+            return snapshot.clone();
+        }
+        use std::fmt::Write as _;
+        let elapsed = now.saturating_duration_since(self.phase_started);
+        let mut largest = (self.phase, elapsed);
+        let mut completed = String::new();
+        for (label, duration) in self.completed.iter().flatten() {
+            if *duration > largest.1 {
+                largest = (label, *duration);
+            }
+            let _ = write!(completed, "{label}={}ms,", duration.as_millis());
+        }
+        format!(
+            "phase={} phase_elapsed_ms={} admitted_elapsed_ms={} budget_ms={} remaining_ms={} queue_wait_ms={} completed=[{}] largest_phase={} largest_phase_ms={}",
+            self.phase,
+            elapsed.as_millis(),
+            now.saturating_duration_since(self.started).as_millis(),
+            self.budget.as_millis(),
+            self.deadline.map(|d| d.saturating_duration_since(now).as_millis()).unwrap_or(u128::MAX),
+            self.queue_wait.as_millis(),
+            completed,
+            largest.0,
+            largest.1.as_millis(),
+        )
+    }
+
+    pub(crate) fn freeze(&mut self, now: Instant) {
+        self.frozen = Some(self.snapshot(now));
+    }
+
+    fn timeout_context(&self, error: ProcessRunError) -> ProcessRunError {
+        match error {
+            ProcessRunError::SetupTimeout {
+                label,
+                command,
+                phase,
+                source,
+            } => {
+                let summary = self.snapshot(Instant::now());
+                tracing::debug!(timings = %summary, "process setup deadline exhausted");
+                ProcessRunError::SetupTimeout {
+                    label,
+                    command,
+                    phase,
+                    source: with_phase_diagnostics(source, summary),
+                }
+            }
+            other => other,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct PhaseDiagnosticSource {
+    source: io::Error,
+    diagnostics: String,
+}
+
+impl fmt::Display for PhaseDiagnosticSource {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}; {}", self.source, self.diagnostics)
+    }
+}
+
+impl std::error::Error for PhaseDiagnosticSource {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+fn with_phase_diagnostics(source: io::Error, diagnostics: String) -> io::Error {
+    io::Error::new(
+        source.kind(),
+        PhaseDiagnosticSource {
+            source,
+            diagnostics,
+        },
+    )
+}
+
 fn run_process_cancellable_with_interaction(
     mut spec: ProcessSpec,
     cancellation: &ProcessCancellation,
@@ -3222,24 +3385,21 @@ fn run_process_cancellable_with_interaction(
         }
     }
     ensure_not_cancelled(cancellation, &spec.label, &command_display, "initial setup")?;
-    let operation_deadline = spec
-        .timeout
-        .map(|timeout| {
-            started.checked_add(timeout).ok_or_else(|| {
-                setup_timeout_error(
-                    &spec.label,
-                    &command_display,
-                    "timeout validation",
-                    "requested duration exceeds the platform Instant range",
-                )
-            })
-        })
-        .transpose()?;
+    let operation_deadline = spec.operation_deadline(started)?;
+    let mut timings = PhaseTimings::new(
+        started,
+        operation_deadline,
+        operation_deadline
+            .map(|d| d.saturating_duration_since(started))
+            .unwrap_or(Duration::MAX),
+        Duration::ZERO,
+        "preflight",
+    );
     preflight_direct_program(&spec.command).map_err(|source| ProcessRunError::Spawn {
         label: spec.label.clone(),
         command: command_display.clone(),
         current_dir: spec.current_dir.clone(),
-        source,
+        source: with_phase_diagnostics(source, timings.snapshot(Instant::now())),
     })?;
     ensure_not_cancelled(
         cancellation,
@@ -3252,7 +3412,9 @@ fn run_process_cancellable_with_interaction(
         &spec.label,
         &command_display,
         "preflight",
-    )?;
+    )
+    .map_err(|error| timings.timeout_context(error))?;
+    timings.enter("io_preparation", Instant::now());
     let prepared_tees = prepare_tees(
         &spec.label,
         &spec.stdout,
@@ -3261,6 +3423,7 @@ fn run_process_cancellable_with_interaction(
         operation_deadline,
         &command_display,
     )?;
+    timings.enter("containment_preflight", Instant::now());
     let mut prepared_process_tree = PreparedProcessTree::prepare(
         spec.containment,
         &spec.side_effects,
@@ -3268,7 +3431,9 @@ fn run_process_cancellable_with_interaction(
         &command_display,
         operation_deadline,
         cancellation,
+        &mut timings,
     )?;
+    timings.enter("native_preparation", Instant::now());
     if let Err(source) =
         prepared_process_tree.prepare_native_entry(&spec, operation_deadline, cancellation)
     {
@@ -3284,24 +3449,31 @@ fn run_process_cancellable_with_interaction(
             &spec.label,
             &command_display,
             "sealed native preparation",
-        )?;
+        )
+        .map_err(|error| timings.timeout_context(error))?;
         return Err(containment_setup_error(
             spec.label.clone(),
             command_display.clone(),
-            source,
+            with_phase_diagnostics(source, timings.snapshot(Instant::now())),
         ));
     }
+    timings.enter("command_build", Instant::now());
     let mut command = prepared_process_tree
         .build_command(&spec)
         .map_err(|source| {
-            containment_setup_error(spec.label.clone(), command_display.clone(), source)
+            containment_setup_error(
+                spec.label.clone(),
+                command_display.clone(),
+                with_phase_diagnostics(source, timings.snapshot(Instant::now())),
+            )
         })?;
     ensure_setup_budget(
         operation_deadline,
         &spec.label,
         &command_display,
         "containment and I/O setup",
-    )?;
+    )
+    .map_err(|error| timings.timeout_context(error))?;
     prepared_process_tree
         .configure_stdin(&mut command, &spec.stdin)
         .map_err(|source| {
@@ -3313,7 +3485,8 @@ fn run_process_cancellable_with_interaction(
         &spec.label,
         &command_display,
         "stdin relay setup",
-    )?;
+    )
+    .map_err(|error| timings.timeout_context(error))?;
     ensure_not_cancelled(
         cancellation,
         &spec.label,
@@ -3334,11 +3507,19 @@ fn run_process_cancellable_with_interaction(
             source: std::io::Error::other("synthetic child spawn failure"),
         });
     }
+    timings.enter("spawn", Instant::now());
+    ensure_setup_budget(
+        operation_deadline,
+        &spec.label,
+        &command_display,
+        "child spawn gate",
+    )
+    .map_err(|error| timings.timeout_context(error))?;
     let mut child = command.spawn().map_err(|source| ProcessRunError::Spawn {
         label: spec.label.clone(),
         command: command_display.clone(),
         current_dir: spec.current_dir.clone(),
-        source,
+        source: with_phase_diagnostics(source, timings.snapshot(Instant::now())),
     })?;
     #[cfg(test)]
     if let Some(marker) = env::var_os("MACO_TEST_AFTER_CHILD_SPAWN_MARKER") {
@@ -3361,6 +3542,7 @@ fn run_process_cancellable_with_interaction(
         &command_display,
         operation_deadline,
         cancellation,
+        &mut timings,
     ) {
         Ok(process_tree) => process_tree,
         Err(error) => {
@@ -3663,6 +3845,9 @@ fn run_process_cancellable_with_interaction(
         let output_backlog = output_drainers.drain_ready();
         input_writer.drain_ready();
 
+        #[cfg(test)]
+        let test_observed_at = PROCESS_WAIT_TEST_HOOK
+            .with(|hook| hook.borrow_mut().as_mut().map(|hook| hook(&mut child)));
         if status.is_none() {
             status = match child.try_wait() {
                 Ok(status) => status,
@@ -3684,11 +3869,14 @@ fn run_process_cancellable_with_interaction(
             };
         }
 
+        let observed_at = Instant::now();
+        #[cfg(test)]
+        let observed_at = test_observed_at.unwrap_or(observed_at);
         let loop_decision = process_loop_decision(
             status.is_some(),
             cancellation.is_cancelled(),
             operation_deadline,
-            Instant::now(),
+            observed_at,
         );
 
         if loop_decision == ProcessLoopDecision::Cancel {
@@ -3870,6 +4058,14 @@ fn run_process_cancellable_with_interaction(
         #[cfg(target_os = "linux")]
         read_only,
     })
+}
+
+#[cfg(test)]
+type ProcessWaitTestHook = Box<dyn FnMut(&mut Child) -> Instant>;
+
+#[cfg(test)]
+thread_local! {
+    static PROCESS_WAIT_TEST_HOOK: std::cell::RefCell<Option<ProcessWaitTestHook>> = const { std::cell::RefCell::new(None) };
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4778,10 +4974,22 @@ fn process_ownership_error(
 fn environment_failure_from_source(source: &std::io::Error) -> Option<(EnvironmentFailure, bool)> {
     #[cfg(target_os = "linux")]
     {
-        source
-            .get_ref()
-            .and_then(|source| source.downcast_ref::<EnvironmentFailureSource>())
-            .map(|source| (source.failure.clone(), source.target_process_started))
+        let mut current = source;
+        let mut diagnostics = Vec::new();
+        loop {
+            let inner = current.get_ref()?;
+            if let Some(failure) = inner.downcast_ref::<EnvironmentFailureSource>() {
+                let mut value = failure.failure.clone();
+                for context in diagnostics {
+                    value.summary.push_str("; ");
+                    value.summary.push_str(context);
+                }
+                return Some((value, failure.target_process_started));
+            }
+            let context = inner.downcast_ref::<PhaseDiagnosticSource>()?;
+            diagnostics.push(context.diagnostics.as_str());
+            current = &context.source;
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
