@@ -48,7 +48,9 @@ jobs:
   linux-library:
     name: Linux library tests (${{ matrix.shard }})
     needs: nix-package
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 shards exceeded the 45-minute job timeout mid-test; keep
+    # 24.04 (last within budget) until 26.04 test runtime fits the timeout.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
@@ -297,7 +299,9 @@ jobs:
   linux-integration:
     name: Linux integration tests
     needs: nix-package
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 hits the candidate-validation readiness timeout; keep the
+    # last verified image until its sandbox startup behavior is qualified.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     steps:
       - name: Check out repository
