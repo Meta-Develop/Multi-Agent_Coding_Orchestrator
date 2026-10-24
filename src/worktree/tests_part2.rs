@@ -1616,9 +1616,260 @@
     struct WorktreeStatusTestClockGuard;
 
     #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_phase_diagnostics_distinguish_prior_setup_from_head_staging() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let started = Instant::now();
+        let deadline = started + Duration::from_secs(60);
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started)));
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        WORKTREE_STATUS_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                let elapsed = match phase {
+                    "before_index_staging" => 0,
+                    "before_callback" => 25,
+                    "before_head_staging" => 59,
+                    "after_head_staging" => 61,
+                    _ => return,
+                };
+                WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started + Duration::from_secs(elapsed))));
+            }));
+        });
+        let error = bounded_worktree_status_in_runtime_until(
+            &repo_path, MAX_WORKTREE_STATUS_ENTRIES, MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            &root, |_| Ok(()), deadline, false, BoundedGitIsolation::Verified,
+        ).err().expect("deadline must refuse completion");
+        let message = format!("{error:#}");
+        assert_status_root_contains_only_lock(&root);
+        for expected in ["after bounded-status HEAD staging", "phase=head_staging phase_elapsed_ms=2000", "index_staging=25000ms", "callback=34000ms", "largest_phase=callback", "admitted_elapsed_ms=61000"] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_git_records_reject_success_observed_after_deadline() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let temp = TempDir::new().unwrap();
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").unwrap();
+        let repo = crate::git_repository::open(&repo_path).unwrap();
+        commit_readme(&repo).unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        let started = Instant::now();
+        let deadline = started + WORKTREE_STATUS_TIMEOUT;
+        WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(started)));
+        let reached = std::rc::Rc::new(std::cell::Cell::new(false));
+        let observed = reached.clone();
+        WORKTREE_STATUS_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == "after_bounded_git_validation" {
+                    observed.set(true);
+                    WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(deadline + Duration::from_secs(1))));
+                }
+            }));
+        });
+        let error = bounded_worktree_status_in_runtime_until(
+            &repo_path, MAX_WORKTREE_STATUS_ENTRIES, MAX_WORKTREE_STATUS_OUTPUT_BYTES,
+            &root, |_| Ok(()), deadline, false, BoundedGitIsolation::Trusted,
+        ).err().expect("deadline must refuse completion");
+        assert!(reached.get(), "must run and validate the real Git command: {error:#}");
+        let message = format!("{error:#}");
+        assert!(message.contains("after bounded Git command validation"), "{message}");
+        assert!(message.contains("phase=git_index_listing"), "{message}");
+        assert_status_root_contains_only_lock(&root);
+    }
+
+    #[test]
+    fn bounded_status_diagnostics_preserve_display_and_typed_cause() {
+        let cause = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "secret=hidden-token /private/hidden-path",
+        );
+        let error = anyhow::Error::new(cause).context("original classified failure");
+        let error = append_bounded_status_diagnostics(error, "bounded-status cleanup: completed=true");
+        let started = Instant::now();
+        let timings = crate::process_runner::PhaseTimings::new(
+            started, None, Duration::from_secs(60), Duration::ZERO, "callback",
+        );
+        let error = diagnose_bounded_status_result::<()>(Err(error), &timings).unwrap_err();
+        let message = error.to_string();
+        assert!(message.starts_with("original classified failure; bounded-status cleanup:"), "{message}");
+        assert!(message.contains("bounded-status main timing: phase=callback"), "{message}");
+        for hidden in ["hidden-token", "/private/hidden-path"] {
+            assert!(!message.contains(hidden), "diagnostics exposed a hidden source: {message}");
+        }
+        let cause = error.downcast_ref::<std::io::Error>().expect("typed cause retained");
+        assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+        assert!(error.root_cause().is::<std::io::Error>());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_both_fail_diagnostics_redact_secondary_paths() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_or_create(temp.path().join("private-status-root"))
+            .expect("runtime root");
+        let lock = KernelStateLock::acquire_direct_with_timeout(
+            &root,
+            WORKTREE_STATUS_RUNTIME_LOCK,
+            Duration::from_secs(1),
+        )
+        .expect("runtime lock");
+        let private_path = root.path().join("unexpected-private-entry");
+        fs::write(&private_path, "unexpected").expect("inject cleanup failure");
+        let private_path = private_path.display().to_string();
+        let cleanup_error =
+            scavenge_bounded_status_runtimes(&root, WORKTREE_STATUS_SCAVENGE_LIMITS)
+                .expect_err("unexpected entry must fail cleanup");
+        assert!(format!("{cleanup_error:#}").contains(&private_path));
+        let deadline_error = anyhow::anyhow!(
+            "worktree status exhausted its total time budget after {private_path}"
+        );
+        assert_eq!(
+            redacted_bounded_status_secondary(&deadline_error, "cleanup"),
+            "worktree status exhausted its total time budget: <redacted:cleanup-error>"
+        );
+
+        let operation_error = || {
+            anyhow::Error::new(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "original typed cause",
+            ))
+            .context("original classified failure")
+        };
+        let binding_error = || {
+            anyhow::anyhow!("directory pathname binding disappeared: {private_path}")
+                .context(format!("verification failed at {private_path}"))
+        };
+        let results = [
+            (
+                "runtime cleanup also failed",
+                &[
+                    "failed to remove bounded-status private runtime",
+                    "unexpected entry in private residue root requires manual inspection",
+                ][..],
+                finish_bounded_status_runtime::<()>(Err(operation_error()), &root, &lock)
+                    .map(|_| ()),
+            ),
+            (
+                "repository pathname binding",
+                &["directory pathname binding disappeared"][..],
+                finish_with_repository_binding_verification::<()>(
+                    Err(operation_error()),
+                    Err(binding_error()),
+                ),
+            ),
+            (
+                "bounded-status lock-path binding",
+                &["kernel state lock path does not name its opened descriptor"][..],
+                finish_with_status_lock_verification::<()>(
+                    Err(operation_error()),
+                    Err(anyhow::anyhow!(
+                        "kernel state lock path does not name its opened descriptor: {private_path}"
+                    )),
+                ),
+            ),
+            (
+                "repository pathname binding",
+                &[][..],
+                finish_with_repository_binding_verification::<()>(
+                    Err(operation_error()),
+                    Err(anyhow::anyhow!(
+                        "unknown failure at {private_path}: directory pathname binding changed"
+                    )),
+                ),
+            ),
+        ];
+        for (secondary, classifications, result) in results {
+            let started = Instant::now();
+            let timings = crate::process_runner::PhaseTimings::new(
+                started,
+                None,
+                Duration::from_secs(60),
+                Duration::ZERO,
+                "callback",
+            );
+            let error = diagnose_bounded_status_result(result, &timings).unwrap_err();
+            for message in [error.to_string(), format!("{error:#}")] {
+                assert!(
+                    message.starts_with("original classified failure; "),
+                    "{message}"
+                );
+                assert!(message.contains(secondary), "{message}");
+                for &classification in classifications {
+                    assert!(
+                        message.contains(classification),
+                        "missing {classification}: {message}"
+                    );
+                }
+                for hidden in [
+                    "verification failed at",
+                    "unknown failure at",
+                    "directory pathname binding changed",
+                ] {
+                    assert!(!message.contains(hidden), "{message}");
+                }
+                assert!(message.contains("<redacted:"), "{message}");
+                assert!(message.contains("bounded-status main timing:"), "{message}");
+                assert!(
+                    !message.contains(&temp.path().display().to_string()),
+                    "{message}"
+                );
+                assert!(!message.contains("unexpected-private-entry"), "{message}");
+            }
+            let cause = error
+                .downcast_ref::<std::io::Error>()
+                .expect("typed cause retained");
+            assert_eq!(cause.kind(), std::io::ErrorKind::PermissionDenied);
+            assert_eq!(cause.to_string(), "original typed cause");
+            assert!(error.root_cause().is::<std::io::Error>());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bounded_status_failure_diagnostics_exclude_queue_and_separate_cleanup() {
+        let _clock_guard = WorktreeStatusTestClockGuard;
+        let temp = TempDir::new().unwrap();
+        let root = SafeRoot::open_or_create(temp.path().join("status-root")).unwrap();
+        let lock = KernelStateLock::acquire_direct_with_timeout(&root, WORKTREE_STATUS_RUNTIME_LOCK, Duration::from_secs(1)).unwrap();
+        for cleanup_fails in [false, true] {
+            let started = Instant::now();
+            let main_end = started + Duration::from_secs(61);
+            WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(main_end)));
+            let mut timings = crate::process_runner::PhaseTimings::new(started, Some(started + Duration::from_secs(60)), Duration::from_secs(60), Duration::from_secs(120), "head_staging");
+            timings.freeze(worktree_status_now());
+            let _hook = crate::safe_state::set_scavenge_deadline_hook(move |phase| {
+                if phase == "before private directory scavenging" {
+                    WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(Some(main_end + Duration::from_secs(if cleanup_fails { 31 } else { 2 }))));
+                }
+                false
+            });
+            let main: Result<()> = Err(std::io::Error::other("original main failure").into());
+            let result = finish_bounded_status_runtime(main, &root, &lock);
+            let error = diagnose_bounded_status_result(result, &timings).unwrap_err();
+            assert!(error.downcast_ref::<std::io::Error>().is_some(), "typed main cause retained");
+            let message = error.to_string();
+            assert!(message.starts_with("original main failure; "), "{message}");
+            for expected in ["original main failure", "queue_wait_ms=120000", "admitted_elapsed_ms=61000", "phase_elapsed_ms=61000", "budget_ms=60000 remaining_ms=0"] {
+                assert!(message.contains(expected), "missing {expected}: {message}");
+            }
+            assert!(message.contains(if cleanup_fails { "cleanup: elapsed_ms=31000 completed=false" } else { "cleanup: elapsed_ms=2000 completed=true" }), "{message}");
+            assert_eq!(message.contains("cleanup also failed"), cleanup_fails, "{message}");
+        }
+    }
+
+    #[cfg(target_os = "linux")]
     impl Drop for WorktreeStatusTestClockGuard {
         fn drop(&mut self) {
             WORKTREE_STATUS_TEST_CLOCK.with(|clock| clock.set(None));
+            WORKTREE_STATUS_TEST_HOOK.with(|hook| hook.borrow_mut().take());
         }
     }
 
@@ -1661,6 +1912,17 @@
             message.contains("after bounded-status setup callback"),
             "{message}"
         );
+        // Exercise the production phase boundaries and frozen main snapshot,
+        // in addition to the accumulator's deterministic arithmetic tests.
+        for expected in [
+            "phase=callback phase_elapsed_ms=61000",
+            "admitted_elapsed_ms=61000",
+            "largest_phase=callback",
+            "bounded-status cleanup:",
+            "completed=true",
+        ] {
+            assert!(message.contains(expected), "missing {expected}: {message}");
+        }
         assert!(!message.contains("cleanup also failed"), "{message}");
         assert_status_root_contains_only_lock(&runtime_root);
     }
