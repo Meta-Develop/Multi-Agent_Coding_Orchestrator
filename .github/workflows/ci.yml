@@ -48,7 +48,9 @@ jobs:
   linux-library:
     name: Linux library tests (${{ matrix.shard }})
     needs: nix-package
-    runs-on: ubuntu-latest
+    # Ubuntu 26.04 library runs hit the 45-minute timeout; keep the last
+    # qualified image until its systemd/Nix sandbox behavior is qualified.
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     strategy:
       fail-fast: false
