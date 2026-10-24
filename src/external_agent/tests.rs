@@ -15312,7 +15312,13 @@ fn grok_native_auth_failure_is_environment_and_fails_closed() -> Result<()> {
     }
     // The same projection is used for held error/cancellation captures, before
     // summarized stdout can discard the error event.
+    let captured = include_bytes!(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/runtime_adapter/grok/not-signed-in.streaming-json"
+    ));
     for (stdout, stderr) in [
+        (captured.as_slice(), b"".as_slice()),
+        (b"".as_slice(), captured.as_slice()),
         (
             b"{\"type\":\"error\",\"message\":\"HTTP 401\"}\n".as_slice(),
             b"".as_slice(),
@@ -15336,6 +15342,17 @@ fn grok_native_auth_failure_is_environment_and_fails_closed() -> Result<()> {
         );
         retain_grok_stream_auth_failure(&mut report, ExternalAgentInvocation::Grok, stdout, stderr);
         assert_eq!(report.environment_failures().len(), 1);
+        assert_eq!(
+            serde_json::to_value(report.environment_failures()[0].category)?,
+            "provider_auth_required"
+        );
+        assert!(report.environment_blocked());
+        assert!(report
+            .error
+            .as_deref()
+            .unwrap()
+            .contains("provider_auth_required"));
+        assert!(!report.publishable);
         assert!(!report.succeeded());
     }
     Ok(())
