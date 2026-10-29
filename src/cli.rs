@@ -4788,6 +4788,9 @@ struct RunExperimentArgs {
         value_parser = parse_additional_runtime_bin
     )]
     additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
+    /// Dated selection priors and capability evidence inside --source-repo. Real-provider only.
+    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
+    prior_data: Option<PathBuf>,
     /// Exact reviewed machine-global config. Required with real-provider; never inferred from --source-repo.
     #[arg(long, value_name = "PATH")]
     machine_global_config: Option<PathBuf>,
@@ -4909,11 +4912,12 @@ fn resolve_held_out_real_provider_cli(
             || args.runtime.is_some()
             || args.runtime_bin.is_some()
             || !args.additional_runtime_bin.is_empty()
+            || args.prior_data.is_some()
             || args.machine_global_config.is_some()
             || args.machine_global_runtime_root_id.is_some()
         {
             bail!(
-                "provider plan, runtime, and retention options require --execution real-provider"
+                "provider plan, runtime, prior-data, and retention options require --execution real-provider"
             );
         }
         return Ok(None);
@@ -4949,6 +4953,13 @@ fn resolve_held_out_real_provider_cli(
         crate::evaluation::HeldOutRealProviderExperimentRequest {
             execution: args.execution,
             allow_real_provider: args.allow_real_provider,
+            prior_data: args
+                .prior_data
+                .as_ref()
+                .map(|path| {
+                    crate::evaluation::HeldOutPriorDataInput::freeze(&source.source_repo, path)
+                })
+                .transpose()?,
             source,
             provider_plan,
             runtime,
@@ -5616,6 +5627,12 @@ mod cli_integration_tests {
             .to_string()
             .contains("require --execution real-provider"));
         args.additional_runtime_bin.clear();
+        args.prior_data = Some(PathBuf::from("priors.json"));
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect_err("prior-data requires explicit execution mode")
+            .to_string()
+            .contains("require --execution real-provider"));
+        args.prior_data = None;
         args.execution = crate::evaluation::EvaluationExecution::RealProvider;
         assert!(resolve_held_out_real_provider_cli(&args, None)
             .expect_err("real execution requires the complete tuple")
