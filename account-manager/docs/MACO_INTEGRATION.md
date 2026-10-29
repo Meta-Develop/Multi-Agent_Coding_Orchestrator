@@ -224,11 +224,30 @@ finalize once. `LeasedChild::cancel` kills only its owned child and waits for
 exit. Wait failure or abandoned custody with unknown exit retains the use lease
 and reports `ExitUnknown`, without claiming cancellation or finalization. The
 existing account mutation barrier continues to refuse replacement during use.
-Coordinated credential rotation/revocation, durable recovery, work-proposal
-operation dispatch, and the root external executor bridge remain separate
-integration work. The closed service launch path uses asynchronous cancellation
+The root Grok external executor transfers that lease to the same closed operation
+without a gap. It opens the selected vendor-home capability during guarded
+construction, checks expiry/revocation before runner dispatch, and records only
+run/account identity, inherited-input names, and lifecycle state in public run
+metadata. A confirmed empty process tree is required to finalize normal/nonzero
+exit or cancellation; unconfirmed preflight or target cleanup retains custody.
+Setup deadline exhaustion and tee conflicts are confirmed pre-release refusals;
+they do not create unknown-child custody or erase an earlier uncertain child.
+The outer selected-use lease also remains held until launch-authority teardown,
+covering retained credential descriptors and later reporting after child exit.
+Restored metadata cannot recreate live custody or authorize finalization.
+
+Active-child rotation or revocation must use the existing cancellation path and
+wait for confirmed exit before replacing/deleting the account incarnation. An
+admission revoke cannot cancel an active child. The account mutation barrier
+refuses replacement while that child or an unknown-exit lease remains active.
+The closed service launch path uses asynchronous cancellation
 requests through the same child custody; a successful signal alone cannot
 release the lease or finalize the guard.
+This does not introduce a credential rotation service. Coordinated credential
+rotation/revocation, durable recovery, work-proposal operation dispatch, and
+equivalent root-executor lifecycle integration for the other provider-specific
+account paths remain separate work. Synthetic fixtures do not qualify a real
+provider account or replace provider-specific acceptance.
 
 The initial operation kind is `work-proposal`: one fresh proposal turn, with no
 provider-owned workspace mutation, nested orchestration, or independent review.

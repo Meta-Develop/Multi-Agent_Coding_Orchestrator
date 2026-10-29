@@ -11068,17 +11068,6 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
             path: PathBuf::from("injected-tee"),
             source: std::io::Error::other("injected tee failure"),
         },
-        ProcessRunError::TeeConflict {
-            label: "codex version preflight".to_string(),
-            stdout: PathBuf::from("injected-stdout"),
-            stderr: PathBuf::from("injected-stderr"),
-        },
-        ProcessRunError::SetupTimeout {
-            label: "codex version preflight".to_string(),
-            command: "codex --version".to_string(),
-            phase: "injected post-spawn setup",
-            source: std::io::Error::other("injected setup timeout"),
-        },
         ProcessRunError::ProcessOwnership {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -11130,6 +11119,17 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
     }
 
     let pre_spawn_errors = vec![
+        ProcessRunError::TeeConflict {
+            label: "codex version preflight".to_string(),
+            stdout: PathBuf::from("injected-stdout"),
+            stderr: PathBuf::from("injected-stderr"),
+        },
+        ProcessRunError::SetupTimeout {
+            label: "codex version preflight".to_string(),
+            command: "codex --version".to_string(),
+            phase: "injected pre-release setup",
+            source: std::io::Error::other("injected setup timeout"),
+        },
         ProcessRunError::Spawn {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -13888,6 +13888,53 @@ fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
             .account_id,
         "account-b"
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_cam_lifecycle_refusal_serializes_references_only() -> Result<()> {
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+    use coding_agent_manager_lib::providers::launch_lifecycle::{LaunchFinalization, LaunchPhase};
+
+    let _no_socket = CamSocketEnvGuard::unset();
+    let temp = tempfile::tempdir()?;
+    let (harness, home, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let _fixture_guard = crate::account_authority::activate_cam_grok_test_harness(harness);
+    GROK_PREFLIGHT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::rename(home.join("auth.json"), home.join("held-auth.json")).unwrap();
+        }));
+    });
+    let report = run_external_agent(&command);
+    assert!(GROK_PREFLIGHT_HOOK.with(|hook| hook.borrow().is_none()));
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.environment_blocked());
+    let lifecycle = report
+        .provider_launch_lifecycle()
+        .context("declared lifecycle missing")?;
+    assert_eq!(lifecycle.run_id, "verified-grok-cam");
+    assert_eq!(
+        lifecycle.binding.account_incarnation,
+        expected_binding.account_incarnation
+    );
+    assert_eq!(
+        lifecycle.phase,
+        LaunchPhase::Finalized(LaunchFinalization::Refused)
+    );
+    let serialized = serde_json::to_string(&report)?;
+    assert!(!serialized.contains("FAKE-managed-refresh"));
+    let restored: ExternalAgentRun = serde_json::from_str(&serialized)?;
+    assert_eq!(restored.provider_launch_lifecycle(), Some(lifecycle));
+    assert!(restored
+        .stdout
+        .run_metadata
+        .launch_lifecycle_handle
+        .is_none());
+    registry.select_complete("grok-cli", "account-b")?;
+    registry.begin_delete("grok-cli", "account-a")?;
     Ok(())
 }
 

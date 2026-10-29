@@ -65,6 +65,9 @@ use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
+use coding_agent_manager_lib::providers::launch_lifecycle::{
+    ExternalLaunchCustody, LaunchLifecycleHandle,
+};
 use git2::Oid;
 use serde::{Deserialize, Serialize};
 #[cfg(target_os = "linux")]
@@ -4724,6 +4727,17 @@ impl std::fmt::Debug for RedactedByteCount {
 }
 
 impl ExternalAgentRun {
+    pub fn provider_launch_lifecycle(
+        &self,
+    ) -> Option<crate::secret_lifecycle::ProviderLaunchMetadata> {
+        self.stdout
+            .run_metadata
+            .launch_lifecycle_handle
+            .as_ref()
+            .map(|handle| handle.snapshot().into())
+            .or_else(|| self.stdout.run_metadata.launch_lifecycle_metadata.clone())
+    }
+
     pub fn environment_preflight_results(&self) -> &[EnvironmentPreflightResult] {
         &self.stdout.run_metadata.environment_preflight_results
     }
@@ -5287,6 +5301,8 @@ struct ExternalAgentRunWireRef<'a> {
     managed_gemini_selection: &'a Option<ManagedGeminiAccountSelectionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_cursor_selection: &'a Option<ManagedCursorAccountSelectionEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    provider_launch_lifecycle: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
 
 #[derive(Deserialize)]
@@ -5342,6 +5358,8 @@ struct ExternalAgentRunWireOwned {
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
     #[serde(default)]
     managed_cursor_selection: Option<ManagedCursorAccountSelectionEvidence>,
+    #[serde(default)]
+    provider_launch_lifecycle: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
 
 impl Serialize for ExternalAgentRun {
@@ -5389,6 +5407,7 @@ impl Serialize for ExternalAgentRun {
             managed_codex_selection: &self.stdout.run_metadata.managed_codex_selection,
             managed_gemini_selection: &self.stdout.run_metadata.managed_gemini_selection,
             managed_cursor_selection: &self.stdout.run_metadata.managed_cursor_selection,
+            provider_launch_lifecycle: self.provider_launch_lifecycle(),
         }
         .serialize(serializer)
     }
@@ -5418,6 +5437,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         stdout.run_metadata.managed_codex_selection = wire.managed_codex_selection;
         stdout.run_metadata.managed_gemini_selection = wire.managed_gemini_selection;
         stdout.run_metadata.managed_cursor_selection = wire.managed_cursor_selection;
+        stdout.run_metadata.launch_lifecycle_metadata = wire.provider_launch_lifecycle;
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -5484,6 +5504,8 @@ struct ExternalAgentRunMetadata {
     managed_codex_selection: Option<FrozenCodexSelectedBinding>,
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
     managed_cursor_selection: Option<ManagedCursorAccountSelectionEvidence>,
+    launch_lifecycle_handle: Option<LaunchLifecycleHandle>,
+    launch_lifecycle_metadata: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
 
 /// Native successful end-turn, applied read-only filesystem and materialized held-output facts.
@@ -6591,9 +6613,23 @@ struct ClaudeVerifiedAccountSession {
 #[cfg(target_os = "linux")]
 fn prepare_verified_grok_account_session(
     spec: &ExternalAgentCommand,
+    deadline: Instant,
+    lifecycle: &mut Option<LaunchLifecycleHandle>,
 ) -> Result<GrokVerifiedAccountSession> {
     let frozen = spec.grok_run_account_binding.as_ref();
-    let authority = crate::account_authority::grok::acquire_grok_launch_authority(frozen)?;
+    let operation_id = private_parent_nonce()?;
+    let run_id = spec
+        .agent_lifecycle
+        .as_ref()
+        .map(|identity| identity.run_id.as_str())
+        .unwrap_or(&operation_id);
+    let authority = crate::account_authority::grok::acquire_guarded_grok_launch_authority(
+        frozen,
+        run_id,
+        &operation_id,
+        deadline,
+        lifecycle,
+    )?;
     if let Some(frozen) = frozen {
         let evidence = authority.selection_evidence();
         if !frozen.matches_selection_evidence(&evidence) {
@@ -6607,8 +6643,9 @@ fn prepare_verified_grok_account_session(
             );
         }
     }
-    let credentials =
-        AdmittedGrokCredentials::from_managed_grok_home(authority.managed_grok_home())?;
+    let credentials = authority.construct_material(AdmittedGrokCredentials::from_managed_grok_home);
+    *lifecycle = authority.launch_lifecycle();
+    let credentials = credentials?;
     Ok(GrokVerifiedAccountSession {
         authority,
         credentials,
@@ -7789,7 +7826,11 @@ fn run_external_agent_runtime(
     let grok_session = if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
-        match prepare_verified_grok_account_session(spec) {
+        match prepare_verified_grok_account_session(
+            spec,
+            started.checked_add(spec.timeout).unwrap_or(started),
+            &mut report.stdout.run_metadata.launch_lifecycle_handle,
+        ) {
             Ok(session) => {
                 report.stdout.run_metadata.managed_grok_selection =
                     Some(session.authority.selection_evidence());
@@ -8341,6 +8382,15 @@ fn run_external_agent_runtime(
         report.stdout.run_metadata.environment_preflight_results = preflight.results;
         report.stdout.run_metadata.environment_failures = preflight.failures;
         retain_environment_preflight_process_evidence(&mut report, &preflight.process_evidence);
+        #[cfg(target_os = "linux")]
+        if preflight.process_evidence.may_have_live_child() {
+            if let Some(mut custody) = grok_session
+                .as_ref()
+                .and_then(|session| session.authority.launch_custody())
+            {
+                custody.exit_unknown();
+            }
+        }
         if report.environment_blocked() {
             report.duration_ms = duration_millis(started.elapsed());
             report.error = Some(environment_blocked_message(report.environment_failures()));
@@ -8728,6 +8778,13 @@ fn run_external_agent_runtime(
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(timeout))
     .with_stdout(StreamCapture::bounded(OUTPUT_TEE_LIMIT_BYTES));
+    let process_spec = if target_spec.invocation == ExternalAgentInvocation::Grok {
+        // The runner carries this same admission deadline through containment
+        // setup and the paused start gate, including time spent before dispatch.
+        process_spec.with_absolute_deadline(started.checked_add(spec.timeout).unwrap_or(started))
+    } else {
+        process_spec
+    };
     let mut process_spec = match runtime {
         ExternalExecutionRuntime::Verified => {
             let Some(side_effect_profile) = side_effect_profile else {
@@ -8985,6 +9042,12 @@ fn run_external_agent_runtime(
     let mut retained_review_metrics = None;
     let mut failed_claude_broker_witness: Option<(ClaudeWholeCallWitness, ClaudeBrokerBinding)> =
         None;
+    #[cfg(target_os = "linux")]
+    let mut grok_launch_custody = grok_session
+        .as_ref()
+        .and_then(|session| session.authority.launch_custody());
+    #[cfg(not(target_os = "linux"))]
+    let mut grok_launch_custody: Option<&mut ExternalLaunchCustody> = None;
     let process_result = if app_server_required {
         let Some(prompt) = app_server_prompt else {
             report.duration_ms = duration_millis(started.elapsed());
@@ -9193,6 +9256,7 @@ fn run_external_agent_runtime(
             &target_spec,
             prompt,
             timeout,
+            grok_launch_custody.as_deref_mut(),
         ) {
             Ok(interactive) => {
                 let mut parent_evidence = None;
@@ -9474,18 +9538,25 @@ fn run_external_agent_runtime(
             unreachable!("managed Cursor was refused before process construction")
         }
     } else {
-        let batch = if grok_progress::guarded_worker(&target_spec)
-            && runtime == ExternalExecutionRuntime::Verified
-        {
-            grok_progress::run(
-                process_spec,
-                cancellation,
-                target_spec.worker_change_required,
-            )
-        } else {
-            run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
-                .map(|(output, filesystem)| (output, filesystem, None))
-        };
+        let batch = executor::launch_lifecycle::execute(
+            grok_launch_custody.as_deref_mut(),
+            cancellation,
+            || {
+                if grok_progress::guarded_worker(&target_spec)
+                    && runtime == ExternalExecutionRuntime::Verified
+                {
+                    grok_progress::run(
+                        process_spec,
+                        cancellation,
+                        target_spec.worker_change_required,
+                    )
+                } else {
+                    run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
+                        .map(|(output, filesystem)| (output, filesystem, None))
+                }
+            },
+            |(output, _, _)| output,
+        );
         batch.map(|(output, filesystem, prior)| {
             // Bind the original supervisor command, not target_spec's private
             // staging destination. Retain spend before any fallible materialization.
@@ -10755,6 +10826,7 @@ fn run_grok_acp_external_process(
     spec: &ExternalAgentCommand,
     prompt: String,
     operation_timeout: Duration,
+    custody: Option<&mut ExternalLaunchCustody>,
 ) -> Result<InteractiveProcessOutput<GrokAcpInteractiveOutcome>, ProcessRunError> {
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         let context = LaunchContext {
@@ -10811,31 +10883,38 @@ fn run_grok_acp_external_process(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
         })?;
 
-    let interactive = run_process_interactive(process_spec, cancellation, |session| {
-        let mut transport = GrokAcpContainedTransport::new(session);
-        let cancelled = || cancellation.is_cancelled();
-        let evidence = if let Some(bridge) = steering_bridge.as_mut() {
-            crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
-                &mut transport,
-                &turn,
-                limits,
-                cancelled,
-                bridge,
-            )
-        } else {
-            crate::runtime_adapter::grok_acp::run_grok_acp_turn(
-                &mut transport,
-                &turn,
-                limits,
-                cancelled,
-            )
-        }
-        .map_err(|error| error.to_string())?;
-        Ok(GrokAcpInteractiveOutcome {
-            evidence,
-            launch_schema: turn.output_schema.clone(),
-        })
-    });
+    let interactive = executor::launch_lifecycle::execute(
+        custody,
+        cancellation,
+        || {
+            run_process_interactive(process_spec, cancellation, |session| {
+                let mut transport = GrokAcpContainedTransport::new(session);
+                let cancelled = || cancellation.is_cancelled();
+                let evidence = if let Some(bridge) = steering_bridge.as_mut() {
+                    crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
+                        &mut transport,
+                        &turn,
+                        limits,
+                        cancelled,
+                        bridge,
+                    )
+                } else {
+                    crate::runtime_adapter::grok_acp::run_grok_acp_turn(
+                        &mut transport,
+                        &turn,
+                        limits,
+                        cancelled,
+                    )
+                }
+                .map_err(|error| error.to_string())?;
+                Ok(GrokAcpInteractiveOutcome {
+                    evidence,
+                    launch_schema: turn.output_schema.clone(),
+                })
+            })
+        },
+        |interactive| &interactive.process,
+    );
 
     if let Some(bridge) = steering_bridge {
         bridge
@@ -12037,6 +12116,14 @@ struct EnvironmentPreflightProcessEvidence {
 }
 
 impl EnvironmentPreflightProcessEvidence {
+    #[cfg(target_os = "linux")]
+    fn may_have_live_child(&self) -> bool {
+        self.started
+            && !self
+                .process_tree
+                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+    }
+
     fn record_output(&mut self, output: &ProcessOutput) {
         self.record(
             output.process_tree,
@@ -12073,8 +12160,6 @@ impl EnvironmentPreflightProcessEvidence {
                 evidence.process_tree.is_verified_empty() && evidence.side_effects.is_verified(),
             ),
             ProcessRunError::OpenTee { .. }
-            | ProcessRunError::TeeConflict { .. }
-            | ProcessRunError::SetupTimeout { .. }
             | ProcessRunError::ProcessOwnership { .. }
             | ProcessRunError::IoSetup { .. } => self.record(
                 ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
@@ -12094,6 +12179,8 @@ impl EnvironmentPreflightProcessEvidence {
                 false,
             ),
             ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::SetupTimeout { .. }
+            | ProcessRunError::TeeConflict { .. }
             | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {
@@ -12128,6 +12215,8 @@ fn process_run_error_definitely_before_process_start(error: &ProcessRunError) ->
     matches!(
         error,
         ProcessRunError::Cancelled { evidence: None, .. }
+            | ProcessRunError::SetupTimeout { .. }
+            | ProcessRunError::TeeConflict { .. }
             | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {

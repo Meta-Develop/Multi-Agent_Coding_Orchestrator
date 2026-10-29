@@ -17,8 +17,11 @@ use super::{
     launch_spec_for, spawn_command, spawn_launch_with, LaunchEnvironment, ProviderAdapter,
 };
 
+mod external;
+pub use external::ExternalLaunchCustody;
+
 /// Closed finalization reasons. An unconfirmed exit is never a finalization.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LaunchFinalization {
     Refused,
     SpawnFailed,
@@ -27,7 +30,7 @@ pub enum LaunchFinalization {
     Cancelled,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum LaunchPhase {
     Prepared,
     Constructing,
@@ -37,7 +40,7 @@ pub enum LaunchPhase {
 }
 
 /// Names and sources only; no inherited or resolved environment values.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CredentialEnvironmentInput {
     SelectedCredential(String),
     Removed(String),
@@ -61,6 +64,14 @@ pub struct LaunchLifecycleView {
 /// Observation and pre-spawn revocation capability, without child custody.
 #[derive(Clone)]
 pub struct LaunchLifecycleHandle(Arc<Mutex<LaunchLifecycleView>>);
+
+impl PartialEq for LaunchLifecycleHandle {
+    fn eq(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.0, &other.0)
+    }
+}
+
+impl Eq for LaunchLifecycleHandle {}
 
 impl LaunchLifecycleHandle {
     pub fn snapshot(&self) -> LaunchLifecycleView {

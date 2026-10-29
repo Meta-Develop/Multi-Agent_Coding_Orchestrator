@@ -11,6 +11,9 @@ use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
 use coding_agent_manager_lib::error::Error as CamError;
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::grok_cli::GrokCliAdapter;
+use coding_agent_manager_lib::providers::launch_lifecycle::{
+    ExternalLaunchCustody, LaunchLifecycle, LaunchLifecycleHandle,
+};
 use coding_agent_manager_lib::providers::launch_spec_for;
 
 pub(crate) use super::GROK_CLI_PROVIDER_ID;
@@ -26,12 +29,35 @@ pub(crate) struct GrokLaunchAuthority {
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
     // Held until this launch authority is dropped, including failed runs.
-    _selected_use_lease: SelectedUseLease,
+    _selected_use_lease: Option<SelectedUseLease>,
+    launch_custody: Option<std::cell::RefCell<ExternalLaunchCustody>>,
+    launch_lifecycle: Option<LaunchLifecycleHandle>,
     managed_grok_home: PathBuf,
     launch_env_removals: Vec<String>,
 }
 
 impl GrokLaunchAuthority {
+    /// Open the credential capability only inside guarded construction.
+    pub(crate) fn construct_material<T>(
+        &self,
+        construct: impl FnOnce(&Path) -> Result<T>,
+    ) -> Result<T> {
+        let custody = self
+            .launch_custody()
+            .context("Grok launch admission is missing")?;
+        custody.construct(|| construct(&self.managed_grok_home))
+    }
+
+    pub(crate) fn launch_custody(&self) -> Option<std::cell::RefMut<'_, ExternalLaunchCustody>> {
+        self.launch_custody
+            .as_ref()
+            .map(std::cell::RefCell::borrow_mut)
+    }
+
+    pub(crate) fn launch_lifecycle(&self) -> Option<LaunchLifecycleHandle> {
+        self.launch_lifecycle.clone()
+    }
+
     #[cfg(test)]
     pub(crate) fn binding(&self) -> &SelectedAccountBinding {
         &self.binding
@@ -120,6 +146,38 @@ impl GrokLaunchAuthority {
 pub(crate) fn acquire_grok_launch_authority(
     carried: Option<&FrozenGrokSelectedBinding>,
 ) -> Result<GrokLaunchAuthority> {
+    acquire_grok_launch_authority_inner(carried, None)
+}
+
+struct GrokLaunchAdmission<'a> {
+    run_id: &'a str,
+    operation_id: &'a str,
+    deadline: std::time::Instant,
+    handle: &'a mut Option<LaunchLifecycleHandle>,
+}
+
+pub(crate) fn acquire_guarded_grok_launch_authority(
+    carried: Option<&FrozenGrokSelectedBinding>,
+    run_id: &str,
+    operation_id: &str,
+    deadline: std::time::Instant,
+    handle: &mut Option<LaunchLifecycleHandle>,
+) -> Result<GrokLaunchAuthority> {
+    acquire_grok_launch_authority_inner(
+        carried,
+        Some(&mut GrokLaunchAdmission {
+            run_id,
+            operation_id,
+            deadline,
+            handle,
+        }),
+    )
+}
+
+fn acquire_grok_launch_authority_inner(
+    carried: Option<&FrozenGrokSelectedBinding>,
+    admission: Option<&mut GrokLaunchAdmission<'_>>,
+) -> Result<GrokLaunchAuthority> {
     let socket_path = super::cam_socket_for_frozen_selection(
         carried.and_then(|frozen| frozen.authority_socket.as_deref()),
     )?;
@@ -131,9 +189,9 @@ pub(crate) fn acquire_grok_launch_authority(
             )
         })?;
         revalidate_frozen_selection_via_socket(socket_path, frozen)?;
-        return acquire_from_execution_registry(Some(frozen), Some(socket_path.clone()));
+        return acquire_from_execution_registry(Some(frozen), Some(socket_path.clone()), admission);
     }
-    acquire_from_execution_registry(frozen, socket_path)
+    acquire_from_execution_registry(frozen, socket_path, admission)
 }
 
 /// Acquire a selected CAM account for optional live catalog discovery.
@@ -209,7 +267,10 @@ fn revalidate_frozen_selection_via_socket(
 fn acquire_from_execution_registry(
     frozen: Option<&FrozenGrokSelectedBinding>,
     socket_path: Option<PathBuf>,
+    admission: Option<&mut GrokLaunchAdmission<'_>>,
 ) -> Result<GrokLaunchAuthority> {
+    #[cfg(test)]
+    let mut admission = admission;
     #[cfg(test)]
     {
         let override_result = CAM_GROK_TEST_OVERRIDE.with(|cell| {
@@ -219,6 +280,7 @@ fn acquire_from_execution_registry(
                     &harness.adapter,
                     frozen,
                     socket_path.clone(),
+                    admission.as_deref_mut(),
                 )
             })
         });
@@ -237,6 +299,7 @@ fn acquire_from_execution_registry(
         &GrokCliAdapter::default(),
         frozen,
         socket_path,
+        admission,
     )
 }
 
@@ -246,7 +309,7 @@ pub(crate) fn acquire_grok_launch_authority_from(
     registry: &StoredAccountRegistry,
     adapter: &GrokCliAdapter,
 ) -> Result<GrokLaunchAuthority> {
-    acquire_grok_launch_authority_from_bound(registry, adapter, None, None)
+    acquire_grok_launch_authority_from_bound(registry, adapter, None, None, None)
 }
 
 fn acquire_grok_launch_authority_from_bound(
@@ -254,6 +317,7 @@ fn acquire_grok_launch_authority_from_bound(
     adapter: &GrokCliAdapter,
     frozen: Option<&FrozenGrokSelectedBinding>,
     socket_path: Option<PathBuf>,
+    admission: Option<&mut GrokLaunchAdmission<'_>>,
 ) -> Result<GrokLaunchAuthority> {
     let current = registry
         .selected_binding(GROK_CLI_PROVIDER_ID)
@@ -269,7 +333,14 @@ fn acquire_grok_launch_authority_from_bound(
     } else {
         (current, None)
     };
-    finish_grok_launch_authority(registry, adapter, binding, authority_id, socket_path)
+    finish_grok_launch_authority(
+        registry,
+        adapter,
+        binding,
+        authority_id,
+        socket_path,
+        admission,
+    )
 }
 
 fn require_execution_matches_frozen(
@@ -297,23 +368,54 @@ fn finish_grok_launch_authority(
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
+    admission: Option<&mut GrokLaunchAdmission<'_>>,
 ) -> Result<GrokLaunchAuthority> {
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
         .map_err(map_cam_error)?;
-    let account = registry
-        .complete(GROK_CLI_PROVIDER_ID, &binding.account_id)
-        .map_err(map_cam_error)?;
-    let launch_spec = launch_spec_for(adapter, &account).map_err(map_cam_error)?;
-    let managed_grok_home = grok_home_from_launch_spec(&launch_spec)
-        .context("Coding Agent Manager Grok launch spec did not declare GROK_HOME")?;
-    let launch_env_removals = launch_spec.environment_removals();
+    let (managed_grok_home, launch_env_removals, launch_custody, launch_lifecycle) =
+        if let Some(admission) = admission {
+            let guard = LaunchLifecycle::new(
+                admission.run_id,
+                admission.operation_id,
+                binding.clone(),
+                Some(admission.deadline),
+            )?;
+            let handle = guard.handle();
+            *admission.handle = Some(handle.clone());
+            let (custody, (home, removals)) =
+                guard.prepare_external(registry, adapter, |spec| {
+                    Ok::<_, anyhow::Error>((
+                        grok_home_from_launch_spec(spec)?,
+                        spec.environment_removals(),
+                    ))
+                })?;
+            (
+                home,
+                removals,
+                Some(std::cell::RefCell::new(custody)),
+                Some(handle),
+            )
+        } else {
+            let account = registry
+                .complete(GROK_CLI_PROVIDER_ID, &binding.account_id)
+                .map_err(map_cam_error)?;
+            let spec = launch_spec_for(adapter, &account).map_err(map_cam_error)?;
+            (
+                grok_home_from_launch_spec(&spec)?,
+                spec.environment_removals(),
+                None,
+                None,
+            )
+        };
     Ok(GrokLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
         socket_path,
-        _selected_use_lease: selected_use_lease,
+        _selected_use_lease: Some(selected_use_lease),
+        launch_custody,
+        launch_lifecycle,
         managed_grok_home,
         launch_env_removals,
     })
@@ -1125,6 +1227,7 @@ mod tests {
                     &harness.adapter,
                     None,
                     socket_path,
+                    None,
                 )
             },
             |authority| authority.verify_binding_unchanged(),
