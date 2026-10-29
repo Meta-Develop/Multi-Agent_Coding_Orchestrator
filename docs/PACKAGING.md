@@ -24,6 +24,11 @@ declaration at `share/maco/main-helper.json`, and a setup declaration at
 Darwin retains the `maco`-only output. The app and default package still select
 `maco`; packaging does not start an authority or provider.
 
+Continuous package build and installed-binary checks cover `x86_64-linux`.
+The `x86_64-darwin` and `aarch64-darwin` outputs are evaluation-only in CI;
+their package builds, installation and runtime behavior remain unqualified.
+The exported `aarch64-linux` output is also unqualified by package CI.
+
 The deterministic manifest records `schema_version: 1`, `source_revision`,
 `source_state`, and sorted relative source entries. Regular files carry their
 SHA-256, size, and executable bit; symbolic links carry a SHA-256 of their link
@@ -81,6 +86,16 @@ and only on ephemeral GitHub-hosted Linux runners; the shared installer passes
 an allowlisted environment without credential exports to curl and the official
 installer. The package workflow also supports manual diagnostics but has no
 separate automatic PR/push build.
+
+Before building, the producer runs
+`python3 -I -B .github/scripts/test_nix_package_fileset.py`. This standard-library
+fixture copies Git-listed source files into a temporary directory and first
+requires locked `x86_64-linux` package evaluation to succeed. It then removes
+`build.rs` from that copy and requires evaluation to reject the missing fileset
+input explicitly. Missing Nix, prerequisite failures and unrelated evaluation
+errors fail the fixture. The checkout is never modified, and both evaluations
+must preserve the copied lockfile bytes. This check shares the producer's
+required Rust CI aggregate and existing CI failure intake.
 
 The producer exports the complete public runtime closure with standard
 `nix-store --export` and uploads only that payload and its public JSON receipt.
