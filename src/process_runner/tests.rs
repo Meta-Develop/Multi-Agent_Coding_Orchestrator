@@ -687,6 +687,199 @@ fn verified_contained_interactive_session_proves_tree_and_side_effects() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn private_channel_reports_owned_target_exit_before_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let spec = private_channel_fixture(
+        temp.path(),
+        "printf '%s\\n' 'bootstrap: pre_handshake_profile' 'credential-secret' >&2; exit 23",
+    );
+    let unit_capture = TestSystemdUnitNameCapture::start();
+    let result = run_process_interactive(spec, &ProcessCancellation::new(), |session| {
+        assert!(
+            session.private_target.is_some(),
+            "target must be pinned before release"
+        );
+        let started = Instant::now();
+        loop {
+            if let Err(error) = session.check_private_channel_live() {
+                assert!(started.elapsed() < Duration::from_secs(5));
+                return Err::<(), _>(error);
+            }
+            thread::sleep(Duration::from_millis(2));
+        }
+    });
+    let unit_names = unit_capture.finish();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if is_verified_backend_unavailable(&error) => {
+            report_verified_backend_unavailable_skip(&error, &unit_names);
+            return;
+        }
+        Err(error) => panic!("private-channel runner failed: {error:?}"),
+    };
+    let error = result.interaction.unwrap_err();
+    assert_eq!(
+        error,
+        "contained private-channel target exited before protocol completion"
+    );
+    assert_eq!(result.process.stdin_error.as_deref(), Some(error.as_str()));
+    assert_eq!(
+        result.process.status.and_then(|status| status.code()),
+        Some(23)
+    );
+    assert!(!result.process.timed_out);
+    assert!(result.process.safety_evidence_verified());
+    assert!(String::from_utf8_lossy(result.process.stderr.as_bytes())
+        .contains("bootstrap: pre_handshake_profile"));
+    assert!(!error.contains("credential-secret"));
+    assert_systemd_units_have_no_residue(&unit_names);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_channel_live_silent_target_keeps_deadline() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let spec = private_channel_fixture(temp.path(), "read -r _");
+    let unit_capture = TestSystemdUnitNameCapture::start();
+    let result = run_process_interactive(
+        spec,
+        &ProcessCancellation::new(),
+        |session| -> Result<(), String> {
+            assert_eq!(session.private_target_state(), PrivateTargetState::Alive);
+            loop {
+                session.check_private_channel_live()?;
+                thread::sleep(Duration::from_millis(2));
+            }
+        },
+    );
+    let unit_names = unit_capture.finish();
+    let result = match result {
+        Ok(result) => result,
+        Err(error) if is_verified_backend_unavailable(&error) => {
+            report_verified_backend_unavailable_skip(&error, &unit_names);
+            return;
+        }
+        Err(error) => panic!("private-channel runner failed: {error:?}"),
+    };
+    assert_eq!(
+        result.interaction.unwrap_err(),
+        "contained interactive session reached its operation deadline"
+    );
+    assert!(result.process.timed_out);
+    assert!(result.process.safety_evidence_verified());
+    assert_systemd_units_have_no_residue(&unit_names);
+}
+
+#[cfg(target_os = "linux")]
+fn private_channel_fixture(root: &Path, script: &str) -> ProcessSpec {
+    let workspace = root.join("workspace");
+    let control = root.join("control");
+    let profile = control.join("profile");
+    fs::create_dir_all(&workspace).unwrap();
+    fs::create_dir_all(&profile).unwrap();
+    ProcessSpec::shell(
+        "private-channel target fixture",
+        Shell::UnixSh,
+        script,
+        &workspace,
+        1024,
+    )
+    .with_stdin_limit(64)
+    .with_timeout(Some(CONTENTION_RESILIENT_PROCESS_TEST_TIMEOUT))
+    .with_side_effect_confinement(SideEffectConfinementProfile::GeminiOfflineBridge(
+        GeminiOfflineBridgeProfile::new(&workspace, &control, &profile),
+    ))
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_channel_exit_watch_is_bound_to_the_held_incarnation() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut child = Command::new("/bin/sh")
+        .args(["-c", "read -r _; exit 19"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let pid = child.id();
+    let start = crate::agent_lifecycle::process_start_time(pid).unwrap();
+    // Controlled membership fixture; containment is exercised separately above.
+    fs::write(temp.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+    let watch = PrivateTargetExitWatch::capture(pid, &start, temp.path());
+    let before = watch.as_ref().map(PrivateTargetExitWatch::observe);
+    drop(child.stdin.take());
+    let status = child.wait().unwrap();
+    assert_eq!(status.code(), Some(19));
+    assert_eq!(before, Some(PrivateTargetState::Alive));
+    // Reaping and rebinding the membership path cannot retarget the held descriptor.
+    fs::write(
+        temp.path().join("cgroup.procs"),
+        format!("{}\n", std::process::id()),
+    )
+    .unwrap();
+    assert_eq!(watch.unwrap().observe(), PrivateTargetState::Exited);
+    assert!(PrivateTargetExitWatch::capture(std::process::id(), &start, temp.path()).is_none());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn private_channel_unknown_target_never_claims_exit() {
+    let pid = std::process::id();
+    let start = crate::agent_lifecycle::process_start_time(pid).unwrap();
+    let temp = tempfile::tempdir().unwrap();
+    let cancellation = ProcessCancellation::new();
+    let empty_reader = |stream| PipeReader {
+        stream,
+        receiver: None,
+        thread: None,
+        tee_helper: None,
+        capture: BoundedBuffer::new(64),
+        complete: true,
+        error: None,
+    };
+    let mut session = ContainedProcessSession {
+        peer_binding: Some((pid, start.clone(), temp.path().to_path_buf())),
+        private_target: None,
+        label: "private-channel unknown target fixture".into(),
+        cancellation: &cancellation,
+        operation_deadline: None,
+        stdin: None,
+        stdin_bytes_written: 0,
+        max_stdin_bytes: 64,
+        pending_stdout: Vec::new(),
+        stdout_eof: true,
+        io_error: None,
+        output_drainers: OutputDrainers {
+            stdout: empty_reader("stdout"),
+            stderr: empty_reader("stderr"),
+            label: "private-channel unknown target fixture".into(),
+        },
+    };
+    // Neither EOF nor unavailable cgroup evidence establishes the captured target's exit.
+    assert!(PrivateTargetExitWatch::capture(pid, &start, temp.path()).is_none());
+    assert_eq!(session.private_target_state(), PrivateTargetState::Unknown);
+    assert!(session.check_private_channel_live().is_ok());
+    fs::write(temp.path().join("cgroup.procs"), format!("{pid}\n")).unwrap();
+    // A rebound PID must not acquire a watch for a different start-time identity.
+    assert!(PrivateTargetExitWatch::capture(pid, "private-identity-secret", temp.path()).is_none());
+    assert!(PrivateTargetExitWatch::capture(0, &start, temp.path()).is_none());
+    assert!(session.check_private_channel_live().is_ok());
+    assert!(session.io_error.is_none());
+    session.operation_deadline = Some(Instant::now());
+    assert_eq!(
+        session.check_private_channel_live().unwrap_err(),
+        "contained interactive session reached its operation deadline"
+    );
+    cancellation.cancel();
+    assert_eq!(
+        session.check_private_channel_live().unwrap_err(),
+        "contained interactive session was cancelled"
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn private_peer_identity_refusal_is_fixed_and_preserves_guard_order() {
     use std::os::unix::net::UnixStream;
 
@@ -708,6 +901,7 @@ fn private_peer_identity_refusal_is_fixed_and_preserves_guard_order() {
     // This exercises the peer guard directly, not launched-child containment.
     let session = |peer_binding| ContainedProcessSession {
         peer_binding,
+        private_target: None,
         label: "private peer guard fixture".into(),
         cancellation: &cancellation,
         operation_deadline: None,
