@@ -1,0 +1,316 @@
+{
+  "version": 1,
+  "task": "Read `examples/supervise/qualification-data/source-packet.md` through the contained command channel and perform a substantive read-only review. Report function and actual line ranges, concrete counterexamples for all five cases, corrected ordering and idempotency invariants, and distinguish source defects from untested runtime claims. Do not merely echo the case list. Do not edit any file or delegate. Use authentic command observations and the native Researcher report schema with read_only and no_further_delegation. Independent reviewers must check the cited source before acceptance; an empty diff or a visibility receipt alone is insufficient.",
+  "max_depth": 3,
+  "max_child_assignments": 3,
+  "max_child_retries": 0,
+  "max_gate_corrections": 0,
+  "child_timeout_seconds": 1200,
+  "role_models": {
+    "supervisor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "child_orchestrator": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "worker": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "researcher": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "medium",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "gate_classifier": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "auditor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    }
+  },
+  "run_budget": {
+    "hard_tokens": 160000,
+    "role_token_reservations": {
+      "child_orchestrator": 4000,
+      "worker": 1000,
+      "researcher": 4000,
+      "auditor": 4000
+    }
+  },
+  "assignments": [
+    {
+      "id": "source-packet-researcher",
+      "phase": "execution",
+      "role": "researcher",
+      "role_category": "read_only_researcher",
+      "runtime": "codex",
+      "assigned_paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "task": "Read `examples/supervise/qualification-data/source-packet.md` through the contained command channel and perform a substantive read-only review. Report function and actual line ranges, concrete counterexamples for all five cases, corrected ordering and idempotency invariants, and distinguish source defects from untested runtime claims. Do not merely echo the case list. Do not edit any file or delegate. Use authentic command observations and the native Researcher report schema with read_only and no_further_delegation. Independent reviewers must check the cited source before acceptance; an empty diff or a visibility receipt alone is insufficient.",
+      "source_inputs": [
+        {
+          "path": "examples/supervise/qualification-data/source-packet.md",
+          "sha256": "1cfe51c5e96a38d3dabe431faf3b50e34b2512221c585e80d3b313cd3a87f53e"
+        }
+      ]
+    }
+  ],
+  "resolved_routing_policy": {
+    "policy": {
+      "default_role": {
+        "minimum_effort": null,
+        "minimum_quality_basis_points": 6000,
+        "minimum_samples": 1,
+        "preferred_effort": null,
+        "require_measured_quality": false
+      },
+      "objective": {
+        "accepted_cycle_cost_weight": 1,
+        "effort_distance_weight": 1,
+        "rejected_attempt_weight": 1,
+        "unknown_evidence_penalty": 1000000
+      },
+      "policy_id": "standard-routing-v1",
+      "role_preferences": {},
+      "schema_version": 1,
+      "task_estimation": {
+        "boundedness_bands": [
+          {
+            "max_complexity": 2499,
+            "max_dependency_edges": 0,
+            "max_scope_modules": 1,
+            "max_scope_paths": 1,
+            "value": "tightly_bounded"
+          },
+          {
+            "max_complexity": 5499,
+            "max_dependency_edges": 4,
+            "max_scope_modules": 4,
+            "max_scope_paths": 8,
+            "value": "bounded"
+          },
+          {
+            "max_complexity": 10000,
+            "max_dependency_edges": 2048,
+            "max_scope_modules": 2048,
+            "max_scope_paths": 2048,
+            "value": "cross_cutting"
+          }
+        ],
+        "complexity": {
+          "base": 500,
+          "per_assignment": 600,
+          "per_declared_kib": 100,
+          "per_dependency_edge": 700,
+          "per_fragment": 400,
+          "per_scope_module": 450,
+          "per_scope_path": 150
+        },
+        "context": {
+          "base_tokens": 512,
+          "bytes_per_estimated_token": 4,
+          "max_estimated_tokens": 4000000,
+          "per_assignment_tokens": 512,
+          "per_scope_module_tokens": 256,
+          "per_scope_path_tokens": 512
+        },
+        "context_bands": [
+          {
+            "max_inclusive": 8192,
+            "value": "small"
+          },
+          {
+            "max_inclusive": 32000,
+            "value": "medium"
+          },
+          {
+            "max_inclusive": 128000,
+            "value": "large"
+          },
+          {
+            "max_inclusive": 4000000,
+            "value": "long"
+          }
+        ],
+        "horizon": {
+          "base": 500,
+          "per_assignment": 650,
+          "per_declared_kib": 100,
+          "per_dependency_edge": 400,
+          "per_fragment": 350,
+          "per_scope_module": 150,
+          "per_scope_path": 80
+        },
+        "horizon_bands": [
+          {
+            "max_inclusive": 2499,
+            "value": "short"
+          },
+          {
+            "max_inclusive": 5999,
+            "value": "medium"
+          },
+          {
+            "max_inclusive": 10000,
+            "value": "long"
+          }
+        ],
+        "max_assignments": 256,
+        "max_declaration_bytes": 262144,
+        "max_fragments": 256,
+        "max_rules": 64,
+        "max_scope_items": 2048,
+        "risk": {
+          "base": 500,
+          "per_assignment": 0,
+          "per_declared_kib": 0,
+          "per_dependency_edge": 150,
+          "per_fragment": 0,
+          "per_scope_module": 100,
+          "per_scope_path": 40
+        },
+        "risk_bands": [
+          {
+            "max_inclusive": 2499,
+            "value": "low"
+          },
+          {
+            "max_inclusive": 4999,
+            "value": "medium"
+          },
+          {
+            "max_inclusive": 7499,
+            "value": "high"
+          },
+          {
+            "max_inclusive": 10000,
+            "value": "critical"
+          }
+        ],
+        "rules": [
+          {
+            "complexity_basis_points": 0,
+            "horizon_basis_points": 0,
+            "id": "declared-deletion",
+            "match_kind": "declared_task_contains_ascii_insensitive",
+            "pattern": "delete",
+            "risk_basis_points": 6000
+          },
+          {
+            "complexity_basis_points": 1500,
+            "horizon_basis_points": 2000,
+            "id": "declared-migration",
+            "match_kind": "declared_task_contains_ascii_insensitive",
+            "pattern": "migration",
+            "risk_basis_points": 3000
+          },
+          {
+            "complexity_basis_points": 500,
+            "horizon_basis_points": 1000,
+            "id": "declared-deployment",
+            "match_kind": "declared_task_contains_ascii_insensitive",
+            "pattern": "deploy",
+            "risk_basis_points": 2500
+          },
+          {
+            "complexity_basis_points": 1000,
+            "horizon_basis_points": 3500,
+            "id": "declared-multi-stage",
+            "match_kind": "declared_task_contains_ascii_insensitive",
+            "pattern": "multi-stage",
+            "risk_basis_points": 0
+          },
+          {
+            "complexity_basis_points": 0,
+            "horizon_basis_points": 4500,
+            "id": "declared-long-running",
+            "match_kind": "declared_task_contains_ascii_insensitive",
+            "pattern": "long-running",
+            "risk_basis_points": 0
+          },
+          {
+            "complexity_basis_points": 500,
+            "horizon_basis_points": 0,
+            "id": "declared-authentication-scope",
+            "match_kind": "scope_path_prefix",
+            "pattern": "src/account_authority",
+            "risk_basis_points": 3500
+          }
+        ],
+        "score_cap_basis_points": 10000
+      },
+      "tree": {
+        "coordinated_complexity_min": 5000,
+        "coordinated_context_tokens_min": 32000,
+        "coordinated_horizon_min": 5000,
+        "coordinated_risk_min": 5000,
+        "coordinated_scope_paths_min": 2,
+        "max_depth": 4,
+        "max_workers": 8,
+        "min_independent_groups": 2
+      },
+      "unknown_access_policy": "unknown_access_for_productive_attempt"
+    },
+    "sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
+    "source": "bundled-routing-policy"
+  },
+  "task_routing_assessment": {
+    "declaration": {
+      "declared_task": "Read `examples/supervise/qualification-data/source-packet.md` through the contained command channel and perform a substantive read-only review. Report function and actual line ranges, concrete counterexamples for all five cases, corrected ordering and idempotency invariants, and distinguish source defects from untested runtime claims. Do not merely echo the case list. Do not edit any file or delegate. Use authentic command observations and the native Researcher report schema with read_only and no_further_delegation. Independent reviewers must check the cited source before acceptance; an empty diff or a visibility receipt alone is insufficient.",
+      "fragments": [
+        {
+          "id": "source-packet-researcher-scope",
+          "text": "Read `examples/supervise/qualification-data/source-packet.md` through the contained command channel and perform a substantive read-only review. Report function and actual line ranges, concrete counterexamples for all five cases, corrected ordering and idempotency invariants, and distinguish source defects from untested runtime claims. Do not merely echo the case list. Do not edit any file or delegate. Use authentic command observations and the native Researcher report schema with read_only and no_further_delegation. Independent reviewers must check the cited source before acceptance; an empty diff or a visibility receipt alone is insufficient."
+        }
+      ],
+      "assignments": [
+        {
+          "id": "source-packet-researcher",
+          "task": "Read `examples/supervise/qualification-data/source-packet.md` through the contained command channel and perform a substantive read-only review. Report function and actual line ranges, concrete counterexamples for all five cases, corrected ordering and idempotency invariants, and distinguish source defects from untested runtime claims. Do not merely echo the case list. Do not edit any file or delegate. Use authentic command observations and the native Researcher report schema with read_only and no_further_delegation. Independent reviewers must check the cited source before acceptance; an empty diff or a visibility receipt alone is insufficient.",
+          "fragment_ids": [
+            "source-packet-researcher-scope"
+          ],
+          "assigned_paths": [
+            "examples/supervise/qualification-data/source-packet.md"
+          ],
+          "semantic_symbols": [],
+          "semantic_modules": [],
+          "decision_dependencies": []
+        }
+      ]
+    },
+    "declared_input_sha256": "9338a2b03563eb7743471b657200447f8648d150d2608536c5c3223d6f4f6465",
+    "features": {
+      "scope_paths": 1,
+      "scope_modules": 0,
+      "dependency_edges": 0,
+      "independent_groups": 1,
+      "evidence": [
+        "canonical_scope_and_disjointness_revalidated",
+        "fragment_coverage_revalidated",
+        "dependency_edges_are_declared_decision_incidences",
+        "independent_groups_are_conservative_decision_components",
+        "assessment_basis_policy_heuristic_not_observed",
+        "context_estimates_encoded_declared_inputs_and_policy_allowances_only",
+        "score_saturation_is_explicit_loaded_policy"
+      ],
+      "complexity": 1950,
+      "risk": 540,
+      "horizon": 1880,
+      "context_tokens": 2110
+    },
+    "policy_sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
+    "provenance": "policy_heuristic"
+  }
+}
