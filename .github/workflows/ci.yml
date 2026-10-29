@@ -53,7 +53,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise-core, supervise-fixtures, rest]
+        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested, supervise-fixtures, external-agent, worktree, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -307,10 +307,14 @@ jobs:
         run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"
 
   linux-integration:
-    name: Linux integration tests
+    name: Linux integration tests (${{ matrix.shard }})
     needs: nix-package
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [merge, other]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -518,7 +522,7 @@ jobs:
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
       - name: Run integration and binary tests
-        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib "${{ matrix.shard }}"
 
   linux-gate:
     name: Linux fmt, check, clippy, and test

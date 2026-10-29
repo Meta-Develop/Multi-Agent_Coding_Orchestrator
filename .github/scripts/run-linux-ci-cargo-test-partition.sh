@@ -3,13 +3,15 @@
 set -euo pipefail
 
 if [[ "$#" -lt 1 || "$#" -gt 2 ]]; then
-  printf '%s\n' "usage: $0 lib <autopilot|supervise-core|supervise-fixtures|rest> | non-lib" >&2
+  printf '%s\n' "usage: $0 lib <shard> | non-lib [merge|other]" >&2
   exit 1
 fi
 
 partition="$1"
 case "${partition}:${2:-}" in
-  lib:autopilot | lib:supervise-core | lib:supervise-fixtures | lib:rest | non-lib:) ;;
+  lib:autopilot | lib:supervise-core | lib:supervise-bound | lib:supervise-decomposition | lib:supervise-parent | \
+  lib:supervise-nested | lib:supervise-fixtures | lib:external-agent | lib:worktree | lib:rest | \
+  non-lib: | non-lib:merge | non-lib:other) ;;
   *)
     printf '%s\n' "invalid partition: ${partition}" >&2
     exit 1
@@ -25,8 +27,12 @@ python3 "${partition_py}" verify --manifest-dir "${repo_root}"
 
 partition_argv_output=""
 argv_status=0
+shard_args=()
+if [[ "${partition}" == non-lib && -n "${2:-}" ]]; then
+  shard_args=(--shard "$2")
+fi
 partition_argv_output="$(
-  python3 "${partition_py}" argv "${partition}" --manifest-dir "${repo_root}"
+  python3 "${partition_py}" argv "${partition}" "${shard_args[@]}" --manifest-dir "${repo_root}"
 )" || argv_status=$?
 if [[ "${argv_status}" -ne 0 ]]; then
   exit "${argv_status}"
