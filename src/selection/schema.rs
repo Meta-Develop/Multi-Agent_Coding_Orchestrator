@@ -325,7 +325,7 @@ fn one_shot_environment_fallback() -> Value {
 }
 
 fn model_prior() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "runtime" => nonempty_string(),
         "model" => nonempty_string(),
         "observed_on" => date(),
@@ -341,7 +341,14 @@ fn model_prior() -> Value {
         "class_fit" => array(class_fit_prior()),
         "authority_evidence" => array(authority_evidence_prior()),
         "one_shot_environment_fallbacks" => array(one_shot_environment_fallback()),
-    )
+    );
+    schema["properties"]["task_shape_ceiling"] = nullable(strict_object!(
+        "boundedness" => set(boundedness(false)),
+        "maximum_risk" => risk(false),
+        "maximum_context" => context_size(false),
+        "maximum_horizon" => task_horizon(false),
+    ));
+    schema
 }
 
 fn prior_dataset() -> Value {

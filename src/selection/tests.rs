@@ -1168,11 +1168,150 @@ fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
 }
 
 #[test]
+fn cheap_lane_shape_ceilings_survive_pressure_and_loaded_policy() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for widened in [false, true] {
+        let mut input = base_input();
+        input.task.risk = RiskLevel::Low;
+        input.task.boundedness = Boundedness::TightlyBounded;
+        input.task.context = ContextSize::Small;
+        input.task.horizon = TaskHorizon::Short;
+        configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok", "cursor"]);
+        input.signals.budget_signal = BudgetSignal::Degrade;
+        for prior in &mut input.priors.models {
+            if prior.model == "gpt-5.6-sol" {
+                continue;
+            }
+            prior.long_context_eligible = true;
+            prior.task_shape_ceiling = widened.then(|| TaskShapeCeiling {
+                boundedness: [
+                    Boundedness::TightlyBounded,
+                    Boundedness::Bounded,
+                    Boundedness::CrossCutting,
+                ]
+                .into_iter()
+                .collect(),
+                maximum_risk: RiskLevel::Critical,
+                maximum_context: ContextSize::Long,
+                maximum_horizon: TaskHorizon::Long,
+            });
+        }
+        for loaded in [false, true] {
+            let evaluate = |input: &SelectionInput| {
+                select_with_loaded_routing_policy(input, &[], loaded.then_some(&receipt))
+            };
+            let tight = evaluate(&input)?;
+            assert!(tight.choice.is_some(), "bounded task remains eligible");
+            let mut unknown = input.clone();
+            unknown.task.risk = RiskLevel::Unknown;
+            assert!(evaluate(&unknown).is_err());
+            for catalog in &tight.normalized_input.catalogs {
+                for model in &catalog.models {
+                    if model.model != "gpt-5.6-sol" {
+                        assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+                        assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+                    }
+                }
+            }
+            for dimension in ["risk", "boundedness", "context", "horizon"] {
+                let mut broad = input.clone();
+                match dimension {
+                    "risk" => broad.task.risk = RiskLevel::High,
+                    "boundedness" => broad.task.boundedness = Boundedness::CrossCutting,
+                    "context" => broad.task.context = ContextSize::Large,
+                    "horizon" => broad.task.horizon = TaskHorizon::Long,
+                    _ => unreachable!(),
+                }
+                let decision = evaluate(&broad)?;
+                assert!(decision.choice.is_none(), "{dimension}, loaded={loaded}");
+                for candidate in decision
+                    .candidate_set
+                    .iter()
+                    .filter(|candidate| candidate.candidate.model != "gpt-5.6-sol")
+                {
+                    assert!(!candidate.eligible);
+                    assert!(candidate.ineligibility_reasons.iter().any(|reason| {
+                        reason.code == IneligibilityCode::TaskShapeNotAdvertised
+                    }));
+                }
+                assert_eq!(evaluate(&decision.normalized_input)?, decision);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn task_shape_ceiling_prior_compatibility_and_validation() -> anyhow::Result<()> {
+    let priors = built_in_prior_dataset()?;
+    validate_prior_dataset(&priors)?;
+    let prior = priors
+        .models
+        .iter()
+        .find(|prior| prior.model == "gpt-5.6-luna")
+        .unwrap();
+    let mut legacy = serde_json::to_value(prior)?;
+    legacy.as_object_mut().unwrap().remove("task_shape_ceiling");
+    let legacy: ModelPrior = serde_json::from_value(legacy)?;
+    assert!(legacy.task_shape_ceiling.is_none());
+    assert_eq!(
+        effective_task_shape_ceiling(&legacy.runtime, &legacy.model, None)?,
+        TaskShapeCeiling::bounded_terminal()
+    );
+    let mut invalid = priors.clone();
+    invalid.models[0]
+        .task_shape_ceiling
+        .as_mut()
+        .unwrap()
+        .maximum_risk = RiskLevel::Unknown;
+    assert!(validate_prior_dataset(&invalid).is_err());
+    let mut input = base_input();
+    input.priors = invalid;
+    assert!(select(&input).is_err());
+    let mut narrow = TaskShapeCeiling::bounded_terminal();
+    narrow.maximum_risk = RiskLevel::Low;
+    let mut input = base_input();
+    input
+        .priors
+        .models
+        .iter_mut()
+        .find(|model| model.model == prior.model)
+        .unwrap()
+        .task_shape_ceiling = Some(narrow);
+    let decision = select(&input)?;
+    let narrowed = decision
+        .candidate_set
+        .iter()
+        .find(|row| row.candidate.model == prior.model)
+        .unwrap();
+    assert!(!narrowed.eligible);
+    assert!(narrowed
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| { reason.code == IneligibilityCode::TaskShapeNotAdvertised }));
+    let unqualified = effective_task_shape_ceiling("unknown", "new-model", None)?;
+    assert_eq!(unqualified, TaskShapeCeiling::bounded_terminal());
+    let wire = serde_json::to_value(select(&base_input())?)?;
+    let decoded: SelectionProvenance = serde_json::from_value(wire)?;
+    assert_eq!(select(&decoded.normalized_input)?, decoded);
+    let schema = selection_event_schema_value();
+    let model_schema = &schema["properties"]["provenance"]["properties"]["normalized_input"]
+        ["properties"]["priors"]["properties"]["models"]["items"];
+    assert!(model_schema["properties"]["task_shape_ceiling"].is_object());
+    assert!(!model_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "task_shape_ceiling"));
+    Ok(())
+}
+
+#[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-10-22.1");
-    assert_eq!(priors.published_on, "2026-10-22");
+    assert_eq!(priors.revision, "2026-10-29.1");
+    assert_eq!(priors.published_on, "2026-10-29");
     assert_eq!(priors.schema_version, 2);
     assert_eq!(priors.models.len(), 9);
     assert_eq!(priors.objective_profiles[0].version, 3);

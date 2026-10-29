@@ -20392,6 +20392,63 @@
                                       },
                                       "type": "array",
                                       "uniqueItems": true
+                                    },
+                                    "task_shape_ceiling": {
+                                      "oneOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "boundedness": {
+                                              "items": {
+                                                "enum": [
+                                                  "tightly_bounded",
+                                                  "bounded",
+                                                  "cross_cutting"
+                                                ],
+                                                "type": "string"
+                                              },
+                                              "type": "array",
+                                              "uniqueItems": true
+                                            },
+                                            "maximum_context": {
+                                              "enum": [
+                                                "small",
+                                                "medium",
+                                                "large",
+                                                "long"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "maximum_horizon": {
+                                              "enum": [
+                                                "short",
+                                                "medium",
+                                                "long"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "maximum_risk": {
+                                              "enum": [
+                                                "low",
+                                                "medium",
+                                                "high",
+                                                "critical"
+                                              ],
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "boundedness",
+                                            "maximum_risk",
+                                            "maximum_context",
+                                            "maximum_horizon"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
                                     }
                                   },
                                   "required": [

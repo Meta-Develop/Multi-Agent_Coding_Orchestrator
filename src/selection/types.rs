@@ -133,6 +133,54 @@ pub struct TaskProfile {
     pub authority_role: AuthorityRole,
 }
 
+/// Identity reserved for a parent-validated assignment shape, including its
+/// exact task, paths and frozen policy. A missing key is unproven, never a
+/// match for another missing key. A profile or role alone cannot supply it.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
+#[serde(try_from = "AssignmentShapeIdentityWire")]
+pub struct AssignmentShapeIdentity {
+    version: u32,
+    sha256: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AssignmentShapeIdentityWire {
+    version: u32,
+    sha256: String,
+}
+
+impl AssignmentShapeIdentity {
+    /// Checks the key encoding only; the parent must validate its bound inputs.
+    pub fn v1(sha256: String) -> Result<Self, &'static str> {
+        Self::try_from(AssignmentShapeIdentityWire { version: 1, sha256 })
+    }
+
+    pub fn sha256(&self) -> &str {
+        &self.sha256
+    }
+}
+
+impl TryFrom<AssignmentShapeIdentityWire> for AssignmentShapeIdentity {
+    type Error = &'static str;
+
+    fn try_from(wire: AssignmentShapeIdentityWire) -> Result<Self, Self::Error> {
+        if wire.version != 1
+            || wire.sha256.len() != 64
+            || !wire
+                .sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err("unsupported or malformed assignment shape identity");
+        }
+        Ok(Self {
+            version: wire.version,
+            sha256: wire.sha256,
+        })
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct CandidateKey {
@@ -325,11 +373,61 @@ pub struct ModelPrior {
     pub prohibition_reason: Option<String>,
     pub prohibited_authority_roles: BTreeSet<AuthorityRole>,
     pub long_context_eligible: bool,
+    /// Optional qualified task bounds. Omission cannot widen bundled bounds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task_shape_ceiling: Option<TaskShapeCeiling>,
     pub strong_gate_fallback_efforts: BTreeSet<ReasoningEffort>,
     pub strength_rank: u16,
     pub class_fit: Vec<ClassFitPrior>,
     pub authority_evidence: Vec<AuthorityEvidencePrior>,
     pub one_shot_environment_fallbacks: Vec<OneShotEnvironmentFallback>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskShapeCeiling {
+    pub boundedness: BTreeSet<Boundedness>,
+    pub maximum_risk: RiskLevel,
+    pub maximum_context: ContextSize,
+    pub maximum_horizon: TaskHorizon,
+}
+
+impl TaskShapeCeiling {
+    pub fn bounded_terminal() -> Self {
+        Self {
+            boundedness: [Boundedness::TightlyBounded, Boundedness::Bounded]
+                .into_iter()
+                .collect(),
+            maximum_risk: RiskLevel::Medium,
+            maximum_context: ContextSize::Medium,
+            maximum_horizon: TaskHorizon::Medium,
+        }
+    }
+
+    pub fn intersect(&self, other: &Self) -> Self {
+        Self {
+            boundedness: self
+                .boundedness
+                .intersection(&other.boundedness)
+                .copied()
+                .collect(),
+            maximum_risk: self.maximum_risk.min(other.maximum_risk),
+            maximum_context: self.maximum_context.min(other.maximum_context),
+            maximum_horizon: self.maximum_horizon.min(other.maximum_horizon),
+        }
+    }
+
+    pub fn constrain(&self, capabilities: &mut CandidateCapabilities) {
+        capabilities.boundedness = capabilities
+            .boundedness
+            .intersection(&self.boundedness)
+            .copied()
+            .collect();
+        capabilities.maximum_risk = capabilities.maximum_risk.min(self.maximum_risk);
+        capabilities.maximum_context = capabilities.maximum_context.min(self.maximum_context);
+        capabilities.maximum_horizon = capabilities.maximum_horizon.min(self.maximum_horizon);
+        capabilities.long_context &= self.maximum_context == ContextSize::Long;
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
