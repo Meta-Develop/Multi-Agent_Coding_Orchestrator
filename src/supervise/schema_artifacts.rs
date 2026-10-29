@@ -9,6 +9,15 @@ pub(super) fn write_plan_snapshot(
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<()> {
     let value = supervisor_plan_value(plan, consultant, assignment_metadata, plan_metadata)?;
+    if plan_metadata.operator_pricing.is_some() {
+        write_schema(
+            writer,
+            Path::new("schemas/operator-pricing-plan-v1.schema.json"),
+            serde_json::from_str(include_str!(
+                "../../schemas/operator-pricing-plan-v1.schema.json"
+            ))?,
+        )?;
+    }
     write_artifact_json(
         writer,
         relative,

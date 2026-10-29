@@ -2951,7 +2951,7 @@ mod cursor_managed_usage_evidence {
             ledger,
             reservation,
             pricing: None,
-            model_pricing: BTreeMap::new(),
+            pricing_model: None,
             state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Cursor),
         };
         held.mark_invoked_for_runtime(SupervisorRuntime::Cursor)
@@ -2979,6 +2979,165 @@ mod cursor_managed_usage_evidence {
         )
         .expect("conflicting mutable Codex-shaped log");
         command
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cursor_contract_settlement_preserves_rolling_usd_cost_completeness() {
+        use crate::budget_ledger::{
+            bind_rolling_budget, RollingBudgetQuota, WorkspaceBudgetLedger,
+        };
+        use coding_agent_manager_lib::account_authority::SelectedAccountBinding;
+
+        for expired_at_settlement in [false, true] {
+            let temp = tempfile::tempdir().unwrap();
+            git2::Repository::init(temp.path()).unwrap();
+            let run_id = format!("synthetic-cursor-pricing-{expired_at_settlement}");
+            let selected = SelectedAccountBinding {
+                provider_id: "cursor".into(),
+                account_id: "synthetic-cursor-account".into(),
+                account_incarnation: "synthetic-cursor-incarnation".into(),
+                selection_revision: 1,
+            };
+            crate::account_authority::record_observed_cursor_selection(
+                Some(&run_id),
+                "cursor",
+                Some("synthetic-authority".into()),
+                Some(&selected),
+            );
+            let _rolling = bind_rolling_budget(
+                temp.path(),
+                RollingBudgetQuota {
+                    max_tokens: None,
+                    max_cost_usd: Some(1.0),
+                    window_seconds: 3600,
+                },
+                &run_id,
+            )
+            .unwrap();
+            let mut plan: SupervisorPlan = serde_json::from_value(json!({
+                "model_pricing": {"synthetic-cursor-model": {
+                    "input_usd_per_million_tokens": 2.0,
+                    "output_usd_per_million_tokens": 3.0
+                }}
+            }))
+            .unwrap();
+            let input = operator_pricing::synthetic_input(&plan, &selected.account_id).unwrap();
+            let input = serde_json::to_value(input).unwrap();
+            let mut contract: Value =
+                serde_json::from_str(input["contract_json"].as_str().unwrap()).unwrap();
+            contract["scopes"][0]["runtime"] = json!("cursor");
+            if expired_at_settlement {
+                contract["valid_through"] = json!("2001-01-01");
+            }
+            let source = json!({
+                "pricing_contract": contract,
+                "pricing_plan_id": "synthetic-plan",
+                "model_pricing": plan.model_pricing,
+            });
+            let view = operator_pricing::load(&source.to_string(), &mut plan)
+                .unwrap()
+                .unwrap()
+                .bind(&run_id)
+                .unwrap();
+            let budget = SupervisorBudgetConfig {
+                limits: RunBudgetLimits {
+                    hard_cost_usd: Some(1.0),
+                    ..Default::default()
+                },
+                role_token_reservations: BTreeMap::from([(AgentRole::Worker, 64)]),
+            };
+            let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+            ledger.operator_pricing = Some(view.clone());
+            let mut command = command(temp.path());
+            command.model = Some("synthetic-cursor-model".into());
+            let mut held = if expired_at_settlement {
+                // An already-invoked reservation can outlive the contract's date.
+                // Its old estimate must not substitute for a fresh applicability check.
+                let BudgetAdmission::Admitted { reservation, .. } = ledger
+                    .reserve(BudgetReservationRequest {
+                        role: AgentRole::Worker,
+                        tokens: 64,
+                        cost_usd: Some(0.000192),
+                    })
+                    .unwrap()
+                else {
+                    panic!("held pre-expiry reservation")
+                };
+                DispatchBudgetReservation {
+                    ledger: &ledger,
+                    reservation,
+                    pricing: Some(plan.model_pricing["synthetic-cursor-model"]),
+                    pricing_model: command.model.clone(),
+                    state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Cursor),
+                }
+            } else {
+                let DispatchBudgetAdmission::Admitted(mut held) = reserve_dispatch_budget(
+                    &plan,
+                    &budget,
+                    &ledger,
+                    (AgentRole::Worker, SupervisorRuntime::Cursor),
+                    &command,
+                )
+                .unwrap() else {
+                    panic!("matching Cursor contract admission")
+                };
+                held.mark_invoked_for_runtime(SupervisorRuntime::Cursor)
+                    .unwrap();
+                held
+            };
+            let settled = held
+                .settle_bound_runtime(&fixture(&command), &command)
+                .unwrap();
+            let expected_cost = (!expired_at_settlement).then_some(0.000029);
+            assert_eq!(settled.reliability, DispatchUsageReliability::Reliable);
+            assert_eq!(settled.reliable_usage().unwrap().total_tokens, 13);
+            assert_eq!(settled.cost_usd, expected_cost);
+            let report = ledger.report().unwrap();
+            assert_eq!(report.consumed.cost_usd, expected_cost);
+            assert_eq!(report.new_dispatch_allowed, !expired_at_settlement);
+            assert_eq!(
+                report.reasons.contains(&BudgetReason::MissingActualCost),
+                expired_at_settlement
+            );
+            drop(held);
+            drop(ledger);
+            let history = WorkspaceBudgetLedger::open_or_create(temp.path()).unwrap();
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs();
+            assert_eq!(
+                history.usage_in_window(3600, now).unwrap().cost_usd,
+                expected_cost
+            );
+            drop(history);
+            let mut next = RunBudgetLedger::new(budget.limits).unwrap();
+            next.operator_pricing = Some(view);
+            assert_eq!(
+                next.report().unwrap().new_dispatch_allowed,
+                !expired_at_settlement
+            );
+            if !expired_at_settlement {
+                let DispatchBudgetAdmission::Admitted(mut held) = reserve_dispatch_budget(
+                    &plan,
+                    &budget,
+                    &next,
+                    (AgentRole::Worker, SupervisorRuntime::Cursor),
+                    &command,
+                )
+                .unwrap() else {
+                    panic!("priced rolling history must permit the next dispatch")
+                };
+                held.settle_not_started().unwrap();
+            }
+            crate::account_authority::record_observed_cursor_selection(
+                Some(&run_id),
+                "cursor",
+                None,
+                None,
+            );
+        }
     }
 
     #[test]

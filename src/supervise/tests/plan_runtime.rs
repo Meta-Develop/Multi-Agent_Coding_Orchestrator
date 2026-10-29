@@ -1,4 +1,154 @@
 use super::*;
+
+#[test]
+fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+    let document = super::budget::operator_pricing_document(&plan);
+    let source = document.to_string();
+    let loaded = parse_supervisor_plan_with_consultant(&source).unwrap();
+    let normalized = supervisor_plan_value(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .unwrap();
+    let reloaded = parse_supervisor_plan_with_consultant(&normalized.to_string()).unwrap();
+    assert_eq!(
+        loaded.plan_metadata.operator_pricing,
+        reloaded.plan_metadata.operator_pricing
+    );
+
+    let schema: Value = serde_json::from_str(include_str!(
+        "../../../schemas/operator-pricing-plan-v1.schema.json"
+    ))
+    .unwrap();
+    let url = "urn:test:operator-pricing-plan";
+    let mut compiler = boon::Compiler::new();
+    compiler.set_default_draft(boon::Draft::V2020_12);
+    compiler.add_resource(url, schema).unwrap();
+    let mut schemas = boon::Schemas::new();
+    let index = compiler.compile(url, &mut schemas).unwrap();
+    schemas.validate(&document, index).unwrap();
+    schemas.validate(&normalized, index).unwrap();
+    let mut invalid = document.clone();
+    invalid["pricing_contract"]["unexpected"] = json!(true);
+    assert!(schemas.validate(&invalid, index).is_err());
+    assert!(parse_supervisor_plan_with_consultant(&invalid.to_string()).is_err());
+
+    for duplicate in [
+        source.replacen("\"schema_version\":1", "\"schema_version\":1,\"schema_version\":1", 1),
+        source.replacen("\"input_usd_per_million_tokens\":2.0", "\"input_usd_per_million_tokens\":2.0,\"input_usd_per_million_tokens\":2.0", 1),
+        source.replacen("\"model_pricing\":", &format!("\"model_pricing\":{},\"model_pricing\":", document["model_pricing"]), 1),
+        source.replacen("\"synthetic-model\":{", "\"synthetic-model\":{\"input_usd_per_million_tokens\":2.0,\"output_usd_per_million_tokens\":2.0},\"synthetic-model\":{", 1),
+    ] {
+        assert_ne!(duplicate, source);
+        assert!(parse_supervisor_plan_with_consultant(&duplicate).is_err());
+    }
+    assert!(parse_supervisor_plan_with_consultant(
+        &" ".repeat(MAX_SUPERVISOR_INPUT_BYTES as usize + 1)
+    )
+    .is_err());
+}
+
+#[cfg(unix)]
+#[test]
+fn operator_contract_frozen_bytes_and_resume_reject_mutation_expiry_and_scope() {
+    let (_temp, repo) = injected_repository();
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "synthetic-model", 0.0);
+    let document = super::budget::operator_pricing_document(&plan);
+    let price_bytes = serde_json::to_string_pretty(&document["model_pricing"]).unwrap();
+    let contract_bytes = serde_json::to_string_pretty(&document["pricing_contract"]).unwrap();
+    let source = document
+        .to_string()
+        .replace(&document["model_pricing"].to_string(), &price_bytes)
+        .replace(&document["pricing_contract"].to_string(), &contract_bytes);
+    let loaded = parse_supervisor_plan_with_consultant(&source).unwrap();
+    let binding =
+        serde_json::to_value(loaded.plan_metadata.operator_pricing.as_ref().unwrap()).unwrap();
+    assert_eq!(binding["contract_json"], contract_bytes);
+    assert_eq!(binding["price_map_json"], price_bytes);
+    let run_id = RunId::new("operator-contract-frozen").unwrap();
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "pricing-test",
+    )
+    .unwrap();
+    write_plan_snapshot(
+        &mut writer,
+        Path::new("assignments/supervisor-plan.json"),
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .unwrap();
+    let snapshot = writer
+        .read_authenticated(
+            Path::new("assignments/supervisor-plan.json"),
+            MAX_SUPERVISOR_INPUT_BYTES as usize,
+        )
+        .unwrap();
+    operator_pricing::verify_snapshot(&snapshot, Some(&loaded.plan_metadata)).unwrap();
+    for changed in [
+        document.to_string(),
+        source.replace("synthetic-plan", "different-plan"),
+    ] {
+        let current = parse_supervisor_plan_with_consultant(&changed).unwrap();
+        assert!(
+            operator_pricing::verify_snapshot(&snapshot, Some(&current.plan_metadata)).is_err()
+        );
+    }
+    let mut expired = document.clone();
+    expired["pricing_contract"]["valid_through"] = json!("2001-01-01");
+    let expired = parse_supervisor_plan_with_consultant(&expired.to_string()).unwrap();
+    let expired = supervisor_plan_value(
+        &expired.plan,
+        &expired.consultant,
+        &expired.assignment_metadata,
+        &expired.plan_metadata,
+    )
+    .unwrap();
+    assert!(
+        operator_pricing::verify_snapshot(&serde_json::to_vec(&expired).unwrap(), None).is_err()
+    );
+    let mut changed_plan = loaded.plan.clone();
+    changed_plan
+        .model_pricing
+        .get_mut("synthetic-model")
+        .unwrap()
+        .input_usd_per_million_tokens = 1.0;
+    assert!(supervisor_plan_value(
+        &changed_plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata
+    )
+    .is_err());
+    writer
+        .write_bytes(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            b"{}\n",
+            ArtifactFileDisposition::PrivateEvidence,
+        )
+        .unwrap();
+    let path = writer.run_dir().join("assignments/supervisor-plan.json");
+    writer
+        .finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            false,
+        )
+        .unwrap();
+    operator_pricing::verify_continuation(&repo, &run_id, Some(&loaded.plan_metadata)).unwrap();
+    fs::write(path, b"{}\n").unwrap();
+    assert!(
+        operator_pricing::verify_continuation(&repo, &run_id, Some(&loaded.plan_metadata)).is_err()
+    );
+}
 use crate::supervise::selection_bridge::{
     bind_test_selector_triple_catalog, selector_effort_as_str,
 };
@@ -2700,6 +2850,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
         0,
     );
     let metadata = SupervisorPlanMetadata {
+        operator_pricing: None,
         objective_profile: None,
         resolved_objective_profile: None,
         execution_target: None,
@@ -2767,6 +2918,7 @@ fn supervisor_traceability_reports_missing_changes_and_diff_binding() {
 fn supervisor_traceability_binds_ordinary_success_to_observed_paths_and_diff() {
     let plan = injected_multi_plan(vec![injected_named_assignment("child-a", "src/a.rs")], 0);
     let metadata = SupervisorPlanMetadata {
+        operator_pricing: None,
         objective_profile: None,
         resolved_objective_profile: None,
         execution_target: None,
@@ -2929,6 +3081,7 @@ fn admitted_nested_assignment_retains_ordinary_pipeline_and_acceptance_evidence(
         diff_oid: "3333333333333333333333333333333333333333".to_string(),
     };
     let metadata = SupervisorPlanMetadata {
+        operator_pricing: None,
         objective_profile: None,
         resolved_objective_profile: None,
         execution_target: None,

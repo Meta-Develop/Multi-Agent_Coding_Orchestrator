@@ -3890,6 +3890,11 @@ fn prepare_supervisor_run(
         options.budget_max_duration_seconds,
     )
     .context("failed to initialize the supervise run budget ledger")?;
+    budget_ledger.operator_pricing = plan_metadata
+        .operator_pricing
+        .as_ref()
+        .map(|pricing| pricing.bind(options.run_id.as_str()))
+        .transpose()?;
     plan_metadata.run_budget.limits = budget_ledger.effective_limits();
     let quota_context = live_quota_context_for_run(&repo)?;
     if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
@@ -4085,6 +4090,19 @@ fn activate_cam_observe_test_harness(harness: CamObserveTestHarness) -> CamObser
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn captured_cam_observe_test_harness() -> Option<Arc<CamObserveTestHarness>> {
     CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn pricing_fixture_account() -> Result<Option<String>> {
+    let binding = captured_cam_observe_test_harness()
+        .map(|fixture| {
+            fixture
+                .registry
+                .selected_binding("codex-cli")
+                .map(|binding| binding.map(|binding| binding.account_id))
+        })
+        .transpose()?;
+    Ok(binding.flatten())
 }
 
 #[cfg(all(test, target_os = "linux"))]

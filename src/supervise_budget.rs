@@ -362,6 +362,7 @@ pub(super) type Result<T> = std::result::Result<T, BudgetError>;
 
 #[derive(Debug, Clone)]
 pub(super) struct RunBudgetLedger {
+    pub(super) operator_pricing: Option<crate::supervise::operator_pricing::RunPricing>,
     limits: RunBudgetLimits,
     max_duration_seconds: Option<u64>,
     sources: Option<RunBudgetSources>,
@@ -545,6 +546,7 @@ impl RunBudgetLedger {
                 },
             });
         let mut ledger = Self {
+            operator_pricing: None,
             limits,
             max_duration_seconds,
             sources,
