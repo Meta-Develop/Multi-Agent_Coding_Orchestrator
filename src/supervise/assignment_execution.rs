@@ -11222,6 +11222,7 @@ mod decomposition_tests {
                     &mut plan,
                     &mut plan_metadata,
                     super::scheduler::PreparedSupervisorSelectionRequest {
+                        assignment_shapes: None,
                         repo: &repo,
                         current_run: Some(&options.run_id),
                         runtime: options.runtime,
@@ -11593,6 +11594,7 @@ mod decomposition_tests {
                     &mut plan,
                     &mut plan_metadata,
                     super::scheduler::PreparedSupervisorSelectionRequest {
+                        assignment_shapes: None,
                         repo: &repo,
                         current_run: Some(&options.run_id),
                         runtime: options.runtime,

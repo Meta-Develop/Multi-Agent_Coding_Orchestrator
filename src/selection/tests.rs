@@ -132,6 +132,7 @@ fn configure_exhausted_quota(
 pub(crate) fn base_input() -> SelectionInput {
     SelectionInput {
         task: leaf_task(),
+        assignment_shape_identity: None,
         catalogs: vec![
             catalog(
                 "codex",
@@ -217,6 +218,69 @@ pub(crate) fn loaded_policy_test_receipt() -> anyhow::Result<routing_policy::Rou
             evidence: vec!["test scope".into()],
         },
     })
+}
+
+#[test]
+fn outcome_history_and_replay_bind_exact_assignment_shape() -> anyhow::Result<()> {
+    let mut input = base_input();
+    let identity = AssignmentShapeIdentity::v1("a".repeat(64)).map_err(anyhow::Error::msg)?;
+    input.assignment_shape_identity = Some(identity.clone());
+    let candidate = select(&input)?.choice.expect("candidate").candidate;
+    let row = OutcomeRecord {
+        pricing: Vec::new(),
+        attempt_id: "shape-outcome".into(),
+        task: input.task.clone(),
+        assignment_shape_identity: Some(identity),
+        candidate: candidate.clone(),
+        result: OutcomeResult::Accepted,
+        failure_class: None,
+        execution_cost_microunits: 10,
+        review_cost_microunits: 0,
+        rework_cost_microunits: 0,
+        rereview_cost_microunits: 0,
+        environment_cost_microunits: 0,
+        environment_failures: Vec::new(),
+        fixed_cause_relaunch: None,
+    };
+    for (shape, expected) in [
+        (None, 0),
+        (
+            Some(AssignmentShapeIdentity::v1("b".repeat(64)).unwrap()),
+            0,
+        ),
+        (input.assignment_shape_identity.clone(), 1),
+    ] {
+        let mut row = row.clone();
+        row.assignment_shape_identity = shape;
+        input.outcomes = vec![row];
+        let result = select(&input)?;
+        assert_eq!(
+            result
+                .candidate_set
+                .iter()
+                .find(|entry| entry.candidate == candidate)
+                .unwrap()
+                .ledger
+                .matching_attempts,
+            expected
+        );
+        let decoded: SelectionInput =
+            serde_json::from_slice(&serde_json::to_vec(&result.normalized_input)?)?;
+        assert_eq!(select(&decoded)?, result);
+    }
+    let original = select(&input)?;
+    input.assignment_shape_identity = Some(AssignmentShapeIdentity::v1("b".repeat(64)).unwrap());
+    let changed = select(&input)?;
+    assert_ne!(original.input_digests.task, changed.input_digests.task);
+    assert_ne!(
+        original.input_digests.normalized_input,
+        changed.input_digests.normalized_input
+    );
+    input.assignment_shape_identity = None;
+    let wire = serde_json::to_value(&input)?;
+    assert!(wire.get("assignment_shape_identity").is_none());
+    assert!(serde_json::from_value::<SelectionInput>(wire).is_ok());
+    Ok(())
 }
 
 fn single_current_prior_input() -> SelectionInput {
@@ -558,6 +622,7 @@ fn loaded_policy_observed_ledger_without_class_fit_applies_review_tradeoffs() ->
         pricing: Vec::new(),
         attempt_id: "attempt-1".to_string(),
         task: input.task.clone(),
+        assignment_shape_identity: None,
         candidate: candidate.clone(),
         result: OutcomeResult::Accepted,
         failure_class: None,
@@ -2577,6 +2642,7 @@ fn judgment_fallback_below_xhigh_remains_ineligible_despite_prior_declaration() 
         pricing: Vec::new(),
         attempt_id: "verified-low-gate-outcome-fixture".to_string(),
         task: input.task.clone(),
+        assignment_shape_identity: None,
         candidate: CandidateKey {
             runtime: runtime.clone(),
             model,
@@ -2842,6 +2908,7 @@ fn accepted_task_cost_ledger_includes_every_cost_class() {
         pricing: Vec::new(),
         attempt_id: "attempt-1".to_string(),
         task: input.task.clone(),
+        assignment_shape_identity: None,
         candidate: candidate.clone(),
         result: OutcomeResult::Accepted,
         failure_class: None,
@@ -3099,6 +3166,7 @@ fn conflicting_duplicate_outcome_attempt_ids_fail_independent_of_order() {
         pricing: Vec::new(),
         attempt_id: "duplicate-attempt".to_string(),
         task: input.task.clone(),
+        assignment_shape_identity: None,
         candidate: candidate.clone(),
         result: OutcomeResult::Accepted,
         failure_class: None,

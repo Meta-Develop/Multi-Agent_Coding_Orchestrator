@@ -48,6 +48,10 @@ use std::path::Path;
 #[path = "selection_preflight.rs"]
 pub(super) mod selection_preflight;
 
+#[path = "assignment_selection.rs"]
+mod assignment_selection;
+pub(super) use assignment_selection::AssignmentSelectionShapes;
+
 /// Account observation is a Linux-only CAM type. Non-Linux keeps
 /// `account_observation=None` and the advertised-catalog path.
 #[cfg(target_os = "linux")]
@@ -658,6 +662,8 @@ pub(super) struct SupervisorSelectionPreflightFailure {
 #[derive(Debug, Clone)]
 pub(super) struct SupervisorAutomaticSelectionState {
     decisions: BTreeMap<AgentRole, SelectionProvenance>,
+    assignment_shapes: AssignmentSelectionShapes,
+    history: Option<FrozenOutcomeHistory>,
     advertised: AdvertisedCatalogSet,
     quota_context: Option<LiveQuotaSelectionContext>,
     quota_ledger: Option<RunBudgetLedger>,
@@ -671,6 +677,8 @@ pub(super) struct SupervisorAutomaticSelectionState {
 impl PartialEq for SupervisorAutomaticSelectionState {
     fn eq(&self, other: &Self) -> bool {
         self.decisions == other.decisions
+            && self.assignment_shapes == other.assignment_shapes
+            && self.history == other.history
             && self.advertised == other.advertised
             && self.quota_context == other.quota_context
             && self.accepted_task_cost_observations == other.accepted_task_cost_observations
@@ -750,6 +758,7 @@ pub(crate) fn select_executable_review_auditor(
         .context("built-in selector data has no objective profile")?;
     let mut input = SelectionInput {
         task,
+        assignment_shape_identity: None,
         catalogs: vec![runtime_catalog],
         pools: vec![RuntimePoolState {
             runtime: runtime_name(SupervisorRuntime::Codex).to_string(),
@@ -973,6 +982,7 @@ pub(super) fn initialize_supervisor_selection_with_accounts(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[cfg(test)]
 pub(super) fn initialize_supervisor_selection_with_assessment(
     plan: &mut SupervisorPlan,
     runtime: SupervisorRuntime,
@@ -984,6 +994,35 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
     history: Option<&FrozenOutcomeHistory>,
     account_observations: &[(SupervisorRuntime, AccountObserveResult)],
     assessment: Option<&TaskRoutingAssessment>,
+) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_shapes(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        history,
+        account_observations,
+        assessment,
+        &AssignmentSelectionShapes::default(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn initialize_supervisor_selection_with_shapes(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
+    account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+    assessment: Option<&TaskRoutingAssessment>,
+    assignment_shapes: &AssignmentSelectionShapes,
 ) -> Result<SupervisorSelectionResolution> {
     let frozen_policy = crate::selection::routing_policy::current_routing_policy();
     let routing_features =
@@ -1108,6 +1147,24 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
                 Some(&routing_features),
                 frozen_policy.as_ref(),
             )?;
+            if let Some(task) = assignment_shapes.role_profile(plan, role)? {
+                input.task = task;
+                input.outcomes = history
+                    .map(|snapshot| snapshot.outcomes_for(&input.task))
+                    .unwrap_or_default();
+                input.catalogs = if account_observations.is_empty() {
+                    constructed_selection_catalogs(
+                        runtime,
+                        catalog,
+                        advertised,
+                        &input.task,
+                        &input.priors,
+                        account_observation,
+                    )?
+                } else {
+                    account_selection_catalogs(account_observations, &input.task, &input.priors)?
+                };
+            }
             selection_preflight::apply_frozen_quota(
                 &mut input,
                 runtime,
@@ -1237,7 +1294,7 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
         validate_custom_review_lens_contracts(plan)?;
     }
 
-    let automatic_state = automatic
+    let mut automatic_state = automatic
         .then(|| {
             SupervisorAutomaticSelectionState::from_initial_decisions(
                 &decisions,
@@ -1250,6 +1307,10 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             )
         })
         .transpose()?;
+    if let Some(state) = automatic_state.as_mut() {
+        state.assignment_shapes = assignment_shapes.clone();
+        state.history = history.cloned();
+    }
     Ok(SupervisorSelectionResolution {
         mode: if automatic {
             SupervisorSelectionMode::Automatic
@@ -1302,6 +1363,8 @@ impl SupervisorAutomaticSelectionState {
         }
         Ok(Self {
             decisions: by_role,
+            assignment_shapes: AssignmentSelectionShapes::default(),
+            history: None,
             advertised,
             quota_context,
             quota_ledger,
@@ -1311,6 +1374,21 @@ impl SupervisorAutomaticSelectionState {
             this_run_outcomes: Vec::new(),
             this_run_exclusions: Vec::new(),
         })
+    }
+
+    pub(super) fn validate_current_assignment(
+        &self,
+        plan: &SupervisorPlan,
+        assignment: &OrchestratorAssignment,
+    ) -> Result<()> {
+        self.assignment_shapes.validate_current_assignment(
+            plan,
+            assignment,
+            self.decisions
+                .get(&assignment.role)
+                .and_then(|decision| decision.routing_policy.as_ref())
+                .map(|receipt| &receipt.frozen),
+        )
     }
 
     pub(super) fn set_observed_accepted_task_cost(
@@ -1421,6 +1499,9 @@ impl SupervisorAutomaticSelectionState {
             }
             previous_key = Some(key);
 
+            self.assignment_shapes
+                .validate_event(assignment_id, event)?;
+
             let normalized_role = role_for_task_profile(&event.provenance.normalized_task)?;
             if normalized_role != event.role {
                 bail!(
@@ -1485,6 +1566,7 @@ impl SupervisorAutomaticSelectionState {
     }
 }
 
+#[cfg(test)]
 pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     state: &mut SupervisorAutomaticSelectionState,
     runtime: SupervisorRuntime,
@@ -1493,6 +1575,29 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
     retry_count: u32,
     budget_signal: BudgetSignal,
     environment_rejections: &[TypedSelectorEnvironmentRejection],
+) -> Result<SupervisorReselection> {
+    reselect_assignment_from_supplied_catalog_snapshot(
+        state,
+        runtime,
+        catalog,
+        roles,
+        retry_count,
+        budget_signal,
+        environment_rejections,
+        None,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(super) fn reselect_assignment_from_supplied_catalog_snapshot(
+    state: &mut SupervisorAutomaticSelectionState,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    roles: &[AgentRole],
+    retry_count: u32,
+    budget_signal: BudgetSignal,
+    environment_rejections: &[TypedSelectorEnvironmentRejection],
+    assignment_id: Option<&str>,
 ) -> Result<SupervisorReselection> {
     let advertised = state.advertised.clone();
     let mut next_decisions = state.decisions.clone();
@@ -1510,6 +1615,19 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             )
         })?;
         let mut input = previous.normalized_input.clone();
+        if let Some(assignment_id) = assignment_id {
+            state
+                .assignment_shapes
+                .bind_input(assignment_id, role, &mut input)?;
+            input.outcomes = state
+                .history
+                .as_ref()
+                .map(|history| {
+                    history
+                        .outcomes_for_shape(&input.task, input.assignment_shape_identity.as_ref())
+                })
+                .unwrap_or_default();
+        }
         let constructed = if state.account_observations.is_empty() {
             constructed_selection_catalogs(
                 runtime,
@@ -1541,8 +1659,16 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             .filter(|rejection| rejection.role == role)
             .map(|rejection| rejection.rejection.clone())
             .collect();
-        // Role-level replay has no parent-validated target assignment shape.
-        input.signals.accepted_task_cost_context = None;
+        input.signals.accepted_task_cost_context =
+            input
+                .assignment_shape_identity
+                .clone()
+                .map(
+                    |assignment_shape_identity| selection::AcceptedTaskCostContext {
+                        role,
+                        assignment_shape_identity,
+                    },
+                );
         input.signals.accepted_task_cost_observations =
             state.accepted_task_cost_observations.clone();
         if let Some(quota_context) = &state.quota_context {
@@ -1638,7 +1764,9 @@ fn merge_this_run_outcomes_into_input(
     this_run_outcomes: &[OutcomeRecord],
 ) {
     for outcome in this_run_outcomes {
-        if outcome.task != input.task {
+        if outcome.task != input.task
+            || outcome.assignment_shape_identity != input.assignment_shape_identity
+        {
             continue;
         }
         if input
@@ -2752,6 +2880,7 @@ fn selection_input_for_role_with_assessment(
         .collect();
     let mut input = SelectionInput {
         task,
+        assignment_shape_identity: None,
         catalogs,
         pools,
         quota_source: None,
@@ -4802,6 +4931,7 @@ pub(super) mod tests {
     #[cfg(target_os = "linux")]
     use super::super::environment_observation::environment_cost_microunits_from_account_observe;
     use super::*;
+    include!("assignment_selection_tests.rs");
     #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,

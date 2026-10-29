@@ -320,6 +320,7 @@ pub fn select_critical_independent_auditor(
         .context("built-in selector priors omitted calibration")?;
     let mut input = SelectionInput {
         task,
+        assignment_shape_identity: None,
         catalogs: vec![RuntimeCatalog {
             runtime: "codex".to_string(),
             revision: format!("independent-auditor-catalog-sha256:{catalog_sha256}"),
