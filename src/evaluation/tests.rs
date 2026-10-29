@@ -1584,6 +1584,8 @@ fn quality_and_pareto_retain_breadth_and_anti_shortcut_signals() {
     shortcut.mean_cost_usd = 1.0;
     shortcut.aggregate_usage = high_quality.aggregate_usage;
     shortcut.mean_wall_time_ms = high_quality.mean_wall_time_ms;
+    shortcut.mean_churn_count = high_quality.mean_churn_count;
+    shortcut.mean_review_findings = high_quality.mean_review_findings;
     shortcut.mean_loc_added = PreciseMean { total: 1, count: 1 };
     shortcut.mean_quality = precise_quality(shortcut_quality);
 
@@ -1681,6 +1683,8 @@ fn loc_or_held_out_pass_inflation_alone_cannot_win_quality() {
     broad.mean_cost_usd = 1.0;
     broad.aggregate_usage = inflated.aggregate_usage;
     broad.mean_wall_time_ms = inflated.mean_wall_time_ms;
+    broad.mean_churn_count = inflated.mean_churn_count;
+    broad.mean_review_findings = inflated.mean_review_findings;
     broad.mean_loc_added = PreciseMean { total: 1, count: 1 };
     broad.mean_quality = precise_quality(broad_quality);
 
@@ -3088,3 +3092,151 @@ fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_befo
 
 #[path = "executed_observation_capture_tests.rs"]
 mod executed_observation_capture_tests;
+
+#[test]
+fn every_supported_objective_axis_survives_pareto_pruning() {
+    use crate::objective_profile::{
+        default_objective_profile, ObjectiveProfileSource, TradeoffWeights,
+    };
+
+    let manifest = manifest();
+    let template = run_fake(&manifest, 723).expect("synthetic observations");
+    for axis in ["quota", "latency", "rework", "review"] {
+        let mut runs = template.runs.clone();
+        let baseline = runs[0].metrics.clone();
+        for run in &mut runs {
+            run.metrics = baseline.clone();
+            let specialist = run.profile_id == manifest.profiles[1].id;
+            run.metrics.total_cost_usd = if specialist { 2.0 } else { 1.0 };
+            run.metrics.total_usage = Usage {
+                input_tokens: 100,
+                output_tokens: 0,
+                total_tokens: 100,
+            };
+            run.metrics.wall_time_ms = 100;
+            run.metrics.churn_count = 100;
+            run.metrics.review.findings = vec![
+                Finding {
+                    severity: FindingSeverity::Info,
+                    message: "review observation".to_string(),
+                    paths: Vec::new(),
+                };
+                100
+            ];
+            if specialist {
+                match axis {
+                    "quota" => {
+                        run.metrics.total_usage = Usage {
+                            input_tokens: 1,
+                            output_tokens: 0,
+                            total_tokens: 1,
+                        }
+                    }
+                    "latency" => run.metrics.wall_time_ms = 1,
+                    "rework" => run.metrics.churn_count = 1,
+                    "review" => run.metrics.review.findings.truncate(1),
+                    _ => unreachable!(),
+                }
+            }
+        }
+        let (summaries, frontier) =
+            summarize_profiles(&manifest, &runs).expect("prune observations");
+        assert_eq!(frontier.len(), 2, "{axis}");
+        let mut profile = default_objective_profile();
+        profile.tradeoffs = TradeoffWeights {
+            monetary_cost_percent: 0,
+            quota_consumption_percent: u32::from(axis == "quota") * 100,
+            latency_percent: u32::from(axis == "latency") * 100,
+            retry_rework_percent: u32::from(axis == "rework") * 100,
+            human_review_percent: u32::from(axis == "review") * 100,
+        };
+        let objective = ResolvedObjectiveProfile {
+            profile: profile.binding().expect("axis binding"),
+            source: ObjectiveProfileSource::BuiltIn,
+        };
+        let selected = select_evaluation_frontier(&objective, &summaries, &frontier)
+            .expect("score frontier")
+            .expect("nonempty selection");
+        assert_eq!(
+            selected.selected_profile_id, manifest.profiles[1].id,
+            "{axis}"
+        );
+        runs.reverse();
+        let (replayed, replayed_frontier) = summarize_profiles(&manifest, &runs).expect("replay");
+        assert_eq!(frontier, replayed_frontier);
+        assert_eq!(
+            Some(selected),
+            select_evaluation_frontier(&objective, &replayed, &replayed_frontier)
+                .expect("replay scores")
+        );
+    }
+}
+
+#[test]
+fn pareto_unknown_review_is_incomparable_and_cannot_hide_missing_evidence() {
+    use crate::objective_profile::{default_objective_profile, ObjectiveProfileSource};
+
+    let mut summaries = run_fake(&manifest(), 723)
+        .expect("summary shells")
+        .profile_summaries;
+    summaries.truncate(2);
+    summaries[1] = summaries[0].clone();
+    summaries[1].profile_id = "unknown-review".to_string();
+    summaries[1].mean_cost_usd += 1.0;
+    summaries[1].mean_review_findings = None;
+    for known in [None, Some(PreciseMean { total: 0, count: 1 })] {
+        summaries[0].mean_review_findings = known;
+        assert!(!dominates(&summaries[0], &summaries[1]));
+        assert!(!dominates(&summaries[1], &summaries[0]));
+    }
+    let frontier = summaries
+        .iter()
+        .map(|summary| ParetoPoint {
+            profile_id: summary.profile_id.clone(),
+            mean_cost_usd: summary.mean_cost_usd,
+            mean_quota_consumption_tokens: Some(PreciseMean { total: 1, count: 1 }),
+            mean_wall_time_ms: Some(summary.mean_wall_time_ms),
+            quality_basis_points: summary.mean_quality.overall_basis_points,
+            held_out_basis_points: summary.mean_quality.held_out_basis_points,
+            breadth_basis_points: summary.mean_quality.breadth_basis_points,
+            anti_shortcut_basis_points: summary.mean_quality.anti_shortcut_basis_points,
+        })
+        .collect::<Vec<_>>();
+    let mut profile = default_objective_profile();
+    profile.tradeoffs.monetary_cost_percent = 0;
+    profile.tradeoffs.human_review_percent = 100;
+    let objective = ResolvedObjectiveProfile {
+        profile: profile.binding().expect("review binding"),
+        source: ObjectiveProfileSource::BuiltIn,
+    };
+    assert!(select_evaluation_frontier(&objective, &summaries, &frontier).is_err());
+}
+
+#[test]
+fn pareto_rework_and_review_compare_exact_fractional_means() {
+    let base = run_fake(&manifest(), 723)
+        .expect("summary shell")
+        .profile_summaries
+        .remove(0);
+    for review in [false, true] {
+        let mut lower = base.clone();
+        let mut higher = base.clone();
+        let lower_mean = PreciseMean {
+            total: u64::MAX - 1,
+            count: 2,
+        };
+        let higher_mean = PreciseMean {
+            total: u64::MAX,
+            count: 2,
+        };
+        if review {
+            lower.mean_review_findings = Some(lower_mean);
+            higher.mean_review_findings = Some(higher_mean);
+        } else {
+            lower.mean_churn_count = lower_mean;
+            higher.mean_churn_count = higher_mean;
+        }
+        assert!(dominates(&lower, &higher));
+        assert!(!dominates(&higher, &lower));
+    }
+}
