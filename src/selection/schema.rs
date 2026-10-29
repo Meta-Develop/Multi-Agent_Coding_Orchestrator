@@ -378,7 +378,7 @@ fn fixed_cause_relaunch() -> Value {
 }
 
 fn outcome_record() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "attempt_id" => nonempty_string(),
         "task" => task_profile(true),
         "candidate" => candidate_key(),
@@ -391,7 +391,9 @@ fn outcome_record() -> Value {
         "environment_cost_microunits" => nonnegative_integer(),
         "environment_failures" => array(environment_failure()),
         "fixed_cause_relaunch" => nullable(fixed_cause_relaunch()),
-    )
+    );
+    schema["properties"]["pricing"] = array(crate::supervise::outcome_charge_schema_value());
+    schema
 }
 
 fn debug_override() -> Value {
@@ -962,6 +964,8 @@ mod tests {
                         &["loaded_policy_evidence"][..]
                     } else if path == policy_path {
                         &["task_estimation"][..]
+                    } else if path == "$/properties/provenance/properties/normalized_input/properties/outcomes/items" {
+                        &["pricing"][..]
                     } else if path == format!("{policy_path}/properties/default_role")
                         || path == format!("{role_map_path}/additionalProperties")
                     {

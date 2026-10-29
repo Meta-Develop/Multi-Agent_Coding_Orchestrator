@@ -552,6 +552,9 @@ pub struct FixedCauseRelaunchEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutcomeRecord {
+    /// Settlement provenance for each attributable dispatch; empty on legacy rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pricing: Vec<crate::supervise::OutcomeChargePricing>,
     pub attempt_id: String,
     pub task: TaskProfile,
     pub candidate: CandidateKey,

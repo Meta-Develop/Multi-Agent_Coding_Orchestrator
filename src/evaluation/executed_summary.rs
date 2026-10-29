@@ -47,6 +47,12 @@ pub struct ExecutedProfileSummary {
     pub aggregate_reported_usage: Option<Usage>,
     pub aggregate_reported_cost_usd: Option<f64>,
     pub mean_reported_cost_usd: Option<f64>,
+    /// Per-repetition identities are retained because contracts may differ.
+    #[serde(default)]
+    pub pricing: Vec<ExecutedRunPricing>,
+    /// None on legacy exports without settlement provenance.
+    #[serde(default)]
+    pub priced_cost_complete: Option<bool>,
     pub mean_lines_added: Option<PreciseMean>,
     pub mean_lines_deleted: Option<PreciseMean>,
     pub mean_bytes_added: Option<PreciseMean>,
@@ -54,6 +60,13 @@ pub struct ExecutedProfileSummary {
     pub outcome_counts: ExecutedOutcomeCounts,
     pub accepted_quality: ExecutedAcceptedQualitySummary,
     pub pareto_optimal: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ExecutedRunPricing {
+    pub repetition: u32,
+    pub pricing: Option<super::executed_measurements::ObservedRunPricing>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -344,11 +357,23 @@ fn aggregate_profiles(
         let mut qualified_accepted = 0u32;
         let mut qualified_total = 0u32;
         let mut quality_refusal: Option<String> = None;
+        let mut pricing = Vec::new();
         for run in profile_runs {
             wall_time_ms = wall_time_ms
                 .checked_add(run.wall_time_ms)
                 .ok_or_else(|| anyhow!("profile wall-time aggregate overflowed"))?;
             let measurements = run.measurements.as_ref();
+            pricing.push(ExecutedRunPricing {
+                repetition: run.held_out.run.repetition,
+                pricing: measurements.and_then(|measurements| measurements.pricing.clone()),
+            });
+            if measurements
+                .and_then(|measurements| measurements.pricing.as_ref())
+                .is_some_and(|pricing| !pricing.cost_complete)
+            {
+                cost_complete = false;
+                aggregate_cost = None;
+            }
             if cost_complete {
                 match measurements.and_then(|measurements| measurements.total_cost_usd) {
                     Some(cost) if cost.is_finite() && cost >= 0.0 => {
@@ -495,6 +520,18 @@ fn aggregate_profiles(
             aggregate_reported_usage: aggregate_usage,
             aggregate_reported_cost_usd: aggregate_cost,
             mean_reported_cost_usd,
+            priced_cost_complete: if pricing.iter().any(|run| {
+                run.pricing
+                    .as_ref()
+                    .is_some_and(|pricing| !pricing.cost_complete)
+            }) {
+                Some(false)
+            } else if pricing.iter().all(|run| run.pricing.is_some()) {
+                Some(true)
+            } else {
+                None
+            },
+            pricing,
             mean_lines_added: lines_added
                 .map(|total| precise_mean(total, manifest.repetitions))
                 .transpose()?,
@@ -1269,6 +1306,88 @@ mod tests {
             ExecutedObservationParetoStatus::RefusedIncompleteReportedCost
         );
         assert!(summary.pareto_frontier.is_empty());
+    }
+
+    #[test]
+    fn legacy_budget_capture_preserves_cost_without_pricing_provenance() {
+        let mut manifest = observation_manifest();
+        manifest.profiles.truncate(1);
+        manifest.repetitions = 2;
+        let manifest_sha256 = sha256_hex(&serde_json::to_vec(&manifest).expect("manifest"));
+        let mut first = observed_run(&manifest.profiles[0], &manifest_sha256, 0.125, "worker");
+        let mut report = build_supervisor_report(0.125, "worker", true);
+        let ledger =
+            crate::supervise_budget::RunBudgetLedger::new(Default::default()).expect("ledger");
+        report.run_budget = Some(ledger.report().expect("budget"));
+        let mut document = serde_json::to_value(report).expect("report");
+        let budget = document["run_budget"]
+            .as_object_mut()
+            .expect("budget object");
+        for field in ["pricing_contract", "charges", "cost_complete"] {
+            assert!(budget.remove(field).is_some());
+        }
+        let bytes = serde_json::to_vec(&document).expect("legacy report bytes");
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        git2::Repository::init(workspace.path()).expect("init");
+        let measurements = observed_run_measurements_from_retained_supervisor_final_report(
+            &first.held_out,
+            &bytes,
+            workspace.path(),
+            &BTreeSet::new(),
+        )
+        .expect("legacy measurements");
+        assert!(measurements.pricing.is_none());
+        assert_eq!(measurements.total_cost_usd, Some(0.125));
+        first.measurements = Some(measurements);
+        let mut second = first.clone();
+        second.held_out.run.repetition = 1;
+        second.measurements.as_mut().unwrap().repetition = 1;
+        let summary = aggregate_profiles(&manifest, &[first, second]).expect("profile summary");
+        assert_eq!(summary[0].aggregate_reported_cost_usd, Some(0.25));
+        assert_eq!(summary[0].mean_reported_cost_usd, Some(0.125));
+        assert_eq!(summary[0].priced_cost_complete, None);
+        let document = serde_json::to_value(&summary[0]).expect("summary json");
+        assert!(document["priced_cost_complete"].is_null());
+    }
+
+    #[test]
+    fn profile_summary_retains_per_repetition_pricing_and_unknown_completeness() {
+        use super::super::executed_measurements::synthetic_pricing;
+        let mut manifest = observation_manifest();
+        manifest.profiles.truncate(1);
+        manifest.repetitions = 2;
+        let manifest_sha256 = sha256_hex(&serde_json::to_vec(&manifest).unwrap());
+        let first = observed_run(&manifest.profiles[0], &manifest_sha256, 0.01, "worker");
+        let mut second = first.clone();
+        second.held_out.run.repetition = 1;
+        second.measurements.as_mut().unwrap().repetition = 1;
+        let mut runs = vec![first, second];
+        let mut a = synthetic_pricing(true);
+        let mut b = synthetic_pricing(false);
+        b.contract.as_mut().unwrap().contract.revision = "second-synthetic-revision".to_string();
+        let contract = b.contract.as_mut().unwrap();
+        contract.normalized_sha256 = sha256_hex(&serde_json::to_vec(&contract.contract).unwrap());
+        b.charges[0].pricing.contract = b.contract.clone();
+        for (run, pricing) in runs.iter_mut().zip([a.clone(), b.clone()]) {
+            run.measurements.as_mut().unwrap().pricing = Some(pricing);
+        }
+        let summary = aggregate_profiles(&manifest, &runs).unwrap();
+        assert_eq!(summary[0].priced_cost_complete, Some(false));
+        assert_eq!(summary[0].pricing[0].pricing, Some(a.clone()));
+        assert_eq!(summary[0].pricing[1].pricing, Some(b));
+        assert!(summary[0].aggregate_reported_cost_usd.is_none());
+        runs[1].measurements.as_mut().unwrap().pricing = None;
+        assert_eq!(
+            aggregate_profiles(&manifest, &runs).unwrap()[0].priced_cost_complete,
+            None
+        );
+        a.charges[0].pricing.basis = crate::supervise::ChargePricingBasis::Synthetic;
+        runs[1].measurements.as_mut().unwrap().pricing = Some(a);
+        runs[1].measurements.as_mut().unwrap().total_cost_usd = Some(0.0125);
+        assert_eq!(
+            aggregate_profiles(&manifest, &runs).unwrap()[0].priced_cost_complete,
+            Some(true)
+        );
     }
 
     #[test]

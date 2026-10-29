@@ -3050,9 +3050,9 @@ fn prepare_child_attempt_with_purpose<'a>(
             record_budget_dispatch_refusal(
                 outcome,
                 assignment,
-                &assignment.id,
-                assignment.role,
+                (&assignment.id, assignment.role),
                 &refusal,
+                (launch_runtime, &command, budget_ledger),
                 artifacts,
                 journal_parent_id,
             )?;
@@ -6797,9 +6797,9 @@ fn prepare_parent_auditor<'a>(
             record_budget_dispatch_refusal(
                 outcome,
                 assignment,
-                &auditor_id,
-                AgentRole::Auditor,
+                (&auditor_id, AgentRole::Auditor),
                 &refusal,
+                (launch_runtime, &auditor_command, budget_ledger),
                 artifacts,
                 journal_parent_id,
             )?;
@@ -6871,7 +6871,6 @@ struct ParentAuditorDispatchFrame<'a> {
     journal_parent_id: &'a str,
     auditor_attempt: usize,
     review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
-    dated_plan_pricing: &'a BTreeMap<String, ModelPricing>,
 }
 
 // A grant authenticates the exact launch, including the final duration. Parent
@@ -6935,7 +6934,6 @@ fn dispatch_and_collect_parent_auditor(
 ) -> Result<ParentAuditorCollection> {
     let journal_parent_id = frame.journal_parent_id;
     let auditor_attempt = frame.auditor_attempt;
-    let dated_plan_pricing = frame.dated_plan_pricing;
     let review_cost_binding = &mut frame.review_cost_binding;
     let AssignmentExecutionContext {
         repo,
@@ -7109,13 +7107,20 @@ fn dispatch_and_collect_parent_auditor(
             return Err(error).context("failed to produce deterministic parent auditor output");
         }
     };
-    review_cost_binding.observe_parent_auditor_external_run(&auditor_run, dated_plan_pricing);
     let auditor_environment_blocked = auditor_run.environment_blocked();
     outcome
         .gate_denials
         .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
-        auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
+        auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command);
+    // Retain actual review dispatch even when settlement or its projection fails.
+    let pricing_charge = review_cost_binding.observe_settled_parent_auditor(
+        auditor_budget_reservation.ledger,
+        auditor_budget_reservation.reservation.id,
+        native_outcome_cost_microunits(&auditor_run),
+    );
+    let usage_settlement = usage_settlement?;
+    pricing_charge?;
     match usage_settlement.role_sample(AgentRole::Auditor, Some(lens.id.clone())) {
         Some(sample) => {
             let usage = sample.usage;
@@ -7967,6 +7972,10 @@ fn execute_supervisor_assignment_inner(
                     AssignmentExecutionDisposition::Complete => return Ok(()),
                 };
                 let attempted_launch_model_provenance = prepared.model_provenance.clone();
+                let attempt_settlement = (
+                    prepared.budget_reservation.ledger,
+                    prepared.budget_reservation.reservation.id,
+                );
                 let requested_effort = prepared.command.reasoning_effort.clone();
                 let account_observe = active_budget_policy.account_observe_environment_decision();
                 let collected = match if managed_parent_cycle {
@@ -8015,6 +8024,7 @@ fn execute_supervisor_assignment_inner(
                                 completed_parent_review_cycles,
                             )),
                             account_observe,
+                            Some(attempt_settlement),
                         )?;
                         return Err(error);
                     }
@@ -8055,6 +8065,7 @@ fn execute_supervisor_assignment_inner(
                                 completed_parent_review_cycles,
                             )),
                             account_observe,
+                            Some(attempt_settlement),
                         )?;
                         return Err(error);
                     }
@@ -8079,6 +8090,7 @@ fn execute_supervisor_assignment_inner(
                         completed_parent_review_cycles,
                     )),
                     account_observe,
+                    Some(attempt_settlement),
                 )?;
                 match disposition {
                     ChildAttemptDisposition::Retry => {
@@ -8439,7 +8451,6 @@ fn execute_supervisor_assignment_inner(
                         journal_parent_id,
                         auditor_attempt,
                         review_cost_binding: &mut review_cost_binding,
-                        dated_plan_pricing: &active_plan.model_pricing,
                     };
                     match dispatch_and_collect_parent_auditor(
                         context,
@@ -10231,7 +10242,6 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
-            dated_plan_pricing: &plan.model_pricing,
         };
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
@@ -10815,6 +10825,7 @@ mod decomposition_tests {
             child_context
                 .budget_policy
                 .account_observe_environment_decision(),
+            None,
         )
         .expect("record worker attempt outcome");
         let execution_cost_before_persist =
@@ -10929,7 +10940,6 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
-            dated_plan_pricing: &plan.model_pricing,
         };
         dispatch_and_collect_parent_auditor(
             &grok_context,
@@ -10984,6 +10994,10 @@ mod decomposition_tests {
         assert_eq!(
             stored.costs.review_cost_microunits,
             Some(REVIEW_COST_MICROUNITS)
+        );
+        assert_eq!(
+            stored.pricing[0].pricing.basis,
+            ChargePricingBasis::ProviderNativeCostEquivalent
         );
         assert_eq!(
             stored.costs.execution_cost_microunits,
@@ -11044,6 +11058,7 @@ mod decomposition_tests {
     #[cfg(unix)]
     #[test]
     fn execute_supervisor_assignment_persists_cycle_proof_on_assignment_complete_after_dispatch() {
+        skip_without_containment!();
         use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
         use std::sync::atomic::{AtomicUsize, Ordering};
 

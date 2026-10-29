@@ -461,6 +461,16 @@ pub(super) fn execute_nested_worker_attempt(
         )? {
             DispatchBudgetAdmission::Admitted(reservation) => reservation,
             DispatchBudgetAdmission::Refused(refusal) => {
+                if matches!(refusal, BudgetAdmissionRefusal::MissingCostEstimate) {
+                    bail!(
+                        "nested worker budget refused: {}",
+                        operator_pricing::missing_cost_estimate_guidance(
+                            runtime,
+                            &command,
+                            context.budget_ledger,
+                        )
+                    );
+                }
                 bail!("nested worker budget refused: {refusal:?}")
             }
         };
@@ -1032,6 +1042,11 @@ mod tests {
                 hard_tokens: Some(1),
                 ..Default::default()
             }
+        } else if case == "missing-cost" {
+            RunBudgetLimits {
+                hard_cost_usd: Some(1.0),
+                ..Default::default()
+            }
         } else if matches!(case, "live-budget" | "live-report" | "live-partial") {
             RunBudgetLimits {
                 hard_tokens: Some(220_000),
@@ -1370,6 +1385,23 @@ mod tests {
                     .to_string()
                     .contains("nested worker budget refused: HardTokenCeiling"));
             }
+            if case == "missing-cost" {
+                let message = result.as_ref().err().unwrap().to_string();
+                for required in [
+                    "MissingCostEstimate",
+                    "runtime='codex'",
+                    FRONTIER_PROFILE_MODEL,
+                    "account_id=",
+                    "pricing_plan_id",
+                    "model_pricing",
+                    "pricing_contract",
+                    "source_reference",
+                    "scopes",
+                    "price_map_sha256",
+                ] {
+                    assert!(message.contains(required), "{message}");
+                }
+            }
             assert_eq!(
                 calls.load(Ordering::SeqCst),
                 usize::from(matches!(
@@ -1404,6 +1436,7 @@ mod tests {
                 | "revoked"
                 | "cancelled"
                 | "budget"
+                | "missing-cost"
                 | "foreign-permit"
                 | "wrong-permit-attempt"
         );
@@ -1540,7 +1573,15 @@ mod tests {
         ignore = "requires Linux authenticated managed resources"
     )]
     fn nested_executor_refuses_before_dispatch_and_cleans_reserved_scratch() -> Result<()> {
-        for case in ["unknown", "revoked", "cancelled", "budget", "snapshot"] {
+        skip_without_containment!(ok);
+        for case in [
+            "unknown",
+            "revoked",
+            "cancelled",
+            "budget",
+            "missing-cost",
+            "snapshot",
+        ] {
             execution_fixture(case)?;
         }
         Ok(())

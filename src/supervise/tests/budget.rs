@@ -185,6 +185,26 @@ fn operator_contract_absent_or_mismatched_refuses_before_launch() {
             "{case}"
         );
         assert_eq!(ledger.report().unwrap().active_reservations, 0);
+        let guidance = operator_pricing::missing_cost_estimate_guidance(
+            SupervisorRuntime::Codex,
+            &command,
+            &ledger,
+        );
+        assert!(
+            guidance.contains(command.model.as_deref().unwrap()),
+            "{case}"
+        );
+        assert!(guidance.contains("runtime='codex'"), "{case}");
+        if case == "expired" {
+            assert!(guidance.contains("has expired"));
+        } else if case == "future" {
+            assert!(guidance.contains("not yet effective"));
+        } else if case == "unverified-account" {
+            assert!(guidance.contains("selected account scope is unavailable"));
+        } else if ["account", "runtime", "model", "plan"].contains(&case) {
+            assert!(guidance.contains("no pricing_contract scope matches"));
+            assert!(guidance.contains("account_id='synthetic-account'"));
+        }
         command.model = Some("synthetic-model".into());
     }
 
@@ -792,6 +812,23 @@ fn pricing_guard_required_codex_model_without_pricing_refuses_before_runner_invo
     assert_unpriced_dispatch_refused(FRONTIER_PROFILE_MODEL);
 }
 
+#[test]
+fn operator_pricing_template_refuses_synthetic_placeholder_rates() {
+    let template = include_str!("../../../examples/supervise/operator-pricing.template.json");
+    let document: Value = serde_json::from_str(template).unwrap();
+    let mut schemas = boon::Schemas::new();
+    let mut compiler = boon::Compiler::new();
+    let url = "urn:operator-pricing-template";
+    compiler
+        .add_resource(url, operator_pricing_plan_schema_value())
+        .unwrap();
+    let schema = compiler.compile(url, &mut schemas).unwrap();
+    assert!(schemas.validate(&document, schema).is_err());
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    let error = operator_pricing::load(template, &mut plan).unwrap_err();
+    assert!(format!("{error:#}").contains("model_pricing is invalid"));
+}
+
 fn assert_unpriced_dispatch_refused(model: &str) {
     let _capability = install_budget_fixture_models();
     let (temp, repo_path) = injected_repository();
@@ -843,6 +880,34 @@ fn assert_unpriced_dispatch_refused(model: &str) {
 
     assert!(!report.success);
     assert_eq!(invocations, 0);
+    let guidance = report
+        .findings
+        .iter()
+        .map(|finding| finding.message.as_str())
+        .collect::<Vec<_>>()
+        .join(" ");
+    for required in [
+        "MissingCostEstimate",
+        "runtime='codex'",
+        model,
+        "account_id=",
+        "pricing_plan_id",
+        "model_pricing",
+        "source_reference",
+        "source_attribution",
+        "effective_date",
+        "valid_through",
+        "scopes",
+        "price_map_sha256",
+        "docs/OPERATOR_PRICING.md",
+        "Rolling USD admission",
+        "Preserve the configured USD ceilings",
+    ] {
+        assert!(
+            guidance.contains(required),
+            "missing {required}: {guidance}"
+        );
+    }
     let budget = report.run_budget.expect("missing pricing budget report");
     assert_eq!(budget.consumed.tokens, 0);
     assert_eq!(budget.reserved.tokens, 0);

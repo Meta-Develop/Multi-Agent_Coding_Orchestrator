@@ -20,6 +20,8 @@ pub enum ChargePricingBasis {
     Synthetic,
     Unpriced,
     ConservativeReservation,
+    /// Parent-observed native cost-equivalent units, without a USD conversion.
+    ProviderNativeCostEquivalent,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -31,6 +33,37 @@ pub struct ChargePricing {
     pub runtime: Option<String>,
     /// The settlement allocation; absent when a single model cannot be established.
     pub model: Option<String>,
+}
+
+/// Pricing basis for one attributable dispatch and its outcome cost phase.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct OutcomeChargePricing {
+    pub reservation_id: u64,
+    pub phase: OutcomeCostPhase,
+    pub pricing: ChargePricing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutcomeCostPhase {
+    Execution,
+    Rework,
+    Review,
+    Rereview,
+    UnknownReview,
+}
+
+pub(crate) fn outcome_charge_schema_value() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["reservation_id", "phase", "pricing"],
+        "properties": {
+            "reservation_id": {"type": "integer", "minimum": 1},
+            "phase": {"enum": ["execution", "rework", "review", "rereview", "unknown_review"]},
+            "pricing": charge_schema_value(serde_json::json!({}))["properties"]["pricing"].clone()
+        }
+    })
 }
 
 pub(super) fn contract_schema_value() -> serde_json::Value {
@@ -59,7 +92,7 @@ pub(super) fn charge_schema_value(role_schema: serde_json::Value) -> serde_json:
                 "type": "object", "additionalProperties": false,
                 "required": ["basis", "contract", "runtime", "model"],
                 "properties": {
-                    "basis": {"enum": ["unattributed", "operator_contract_estimate", "synthetic", "unpriced", "conservative_reservation"]},
+                    "basis": {"enum": ["unattributed", "operator_contract_estimate", "synthetic", "unpriced", "conservative_reservation", "provider_native_cost_equivalent"]},
                     "contract": {"oneOf": [{"type": "null"}, contract_schema_value()]},
                     "runtime": {"type": ["string", "null"]},
                     "model": {"type": ["string", "null"]}

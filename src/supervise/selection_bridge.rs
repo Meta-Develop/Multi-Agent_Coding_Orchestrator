@@ -7267,6 +7267,7 @@ pub(super) mod tests {
         failure_class: Option<crate::selection::FailureClass>,
     ) -> AttemptOutcomeEvidence {
         AttemptOutcomeEvidence {
+            pricing: Vec::new(),
             version: 1,
             run_id: "this-run".to_string(),
             assignment_id: "assignment-1".to_string(),
