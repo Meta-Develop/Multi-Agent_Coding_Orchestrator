@@ -1,5 +1,5 @@
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { appendFileSync, cpSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawnSync } from "node:child_process";
@@ -7,6 +7,78 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 const uiRoot = fileURLToPath(new URL("..", import.meta.url));
+const embedded = fileURLToPath(new URL("../../src/scope/placeholder.html", import.meta.url));
+
+function embeddedFixture(t) {
+  const root = mkdtempSync(join(tmpdir(), "maco-scope-embedded-test-"));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const ui = join(root, "scope-ui");
+  cpSync(uiRoot, ui, { recursive: true });
+  mkdirSync(join(root, "src/scope"), { recursive: true });
+  const artifact = join(root, "src/scope/placeholder.html");
+  cpSync(embedded, artifact);
+  return {
+    ui,
+    artifact,
+    check: () => spawnSync(process.execPath, [join(ui, "scripts/check-embedded.mjs")], {
+      cwd: root,
+      encoding: "utf8",
+    }),
+  };
+}
+
+test("embedded check matches the shipped client without rewriting it", (t) => {
+  const fixture = embeddedFixture(t);
+  const before = readFileSync(fixture.artifact);
+  const result = fixture.check();
+  assert.equal(result.status, 0, result.stderr || result.stdout);
+  assert.match(result.stdout, /Embedded Scope UI matches/);
+  assert.deepEqual(readFileSync(fixture.artifact), before);
+});
+
+test("embedded check accepts LF and CRLF artifact newlines", (t) => {
+  const fixture = embeddedFixture(t);
+  const lf = readFileSync(fixture.artifact, "utf8").replace(/\r\n/g, "\n");
+  for (const content of [lf, lf.replace(/\n/g, "\r\n")]) {
+    writeFileSync(fixture.artifact, content);
+    const result = fixture.check();
+    assert.equal(result.status, 0, result.stderr || result.stdout);
+    assert.equal(readFileSync(fixture.artifact, "utf8"), content);
+  }
+});
+
+test("embedded check rejects a source edit without regenerating the artifact", (t) => {
+  const fixture = embeddedFixture(t);
+  const before = readFileSync(fixture.artifact);
+  appendFileSync(join(fixture.ui, "src/views/app.css"), "\nbody { color: rebeccapurple; }\n");
+  const result = fixture.check();
+  assert.equal(result.status, 1);
+  assert.match(result.stderr, /Embedded Scope UI is stale/);
+  assert.match(result.stderr, /npm --prefix scope-ui run build/);
+  assert.deepEqual(readFileSync(fixture.artifact), before);
+});
+
+test("embedded check preserves whitespace, lone CR bytes, and final newlines", (t) => {
+  const fixture = embeddedFixture(t);
+  const original = readFileSync(fixture.artifact, "utf8").replace(/\r\n/g, "\n");
+  for (const content of [original + " ", original + "\r", original.replace(/\n$/, "")]) {
+    writeFileSync(fixture.artifact, content);
+    const result = fixture.check();
+    assert.equal(result.status, 1, result.stderr || result.stdout);
+    assert.match(result.stderr, /Embedded Scope UI is stale/);
+  }
+});
+
+test("embedded check propagates build subprocess failures", (t) => {
+  const fixture = embeddedFixture(t);
+  const before = readFileSync(fixture.artifact);
+  writeFileSync(join(fixture.ui, "scripts/build.mjs"), 'console.error("fixture build failure"); process.exit(23);\n');
+  const result = fixture.check();
+  assert.equal(result.status, 23);
+  assert.match(result.stderr, /fixture build failure/);
+  assert.match(result.stderr, /Scope UI build failed/);
+  assert.deepEqual(readFileSync(fixture.artifact), before);
+});
 
 test("built client keeps the live-first HTML contract and adds the new pages", () => {
   const temp = mkdtempSync(join(tmpdir(), "maco-scope-ui-"));
