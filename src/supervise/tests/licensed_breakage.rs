@@ -279,6 +279,7 @@ fn dual_dependent_failure_child(assignment: &OrchestratorAssignment) -> Orchestr
 
 fn licensed_follow_up_assignment_for_ordinal(ordinal: usize) -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: format!("child-a-licensed-update-{ordinal:02}"),
         phase: AssignmentPhase::Execution,
         runtime: None,
@@ -427,6 +428,7 @@ fn licensed_auditor_report(
 
 fn licensed_follow_up_assignment() -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: "child-a-licensed-update-01".to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,

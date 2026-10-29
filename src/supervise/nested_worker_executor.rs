@@ -122,6 +122,7 @@ fn terminal_subject(
     // This projection is for existing terminal prompt/model/journal helpers only.
     // It must never be used to acquire or identify a worktree or a path claim.
     Ok(OrchestratorAssignment {
+        assignment_shape: None,
         id: worker.id.clone(),
         phase: AssignmentPhase::Execution,
         runtime: None,

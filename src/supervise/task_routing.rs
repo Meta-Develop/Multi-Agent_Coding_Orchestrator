@@ -106,7 +106,7 @@ impl TaskRoutingAssessment {
     }
 }
 
-fn effective_estimator(frozen: &FrozenRoutingPolicy) -> Result<&TaskEstimationPolicy> {
+pub(super) fn effective_estimator(frozen: &FrozenRoutingPolicy) -> Result<&TaskEstimationPolicy> {
     frozen.policy.validate()?;
     let digest = crate::artifacts::state_auth::sha256_hex(&serde_json::to_vec(&frozen.policy)?);
     if frozen.sha256 != digest {
@@ -321,7 +321,7 @@ pub fn assess_task_routing(
     })
 }
 
-fn canonical_estimation_scope(path: &std::path::Path) -> Result<String> {
+pub(super) fn canonical_estimation_scope(path: &std::path::Path) -> Result<String> {
     let normalized = normalize_repo_relative_path(path)?;
     Ok(normalized
         .to_str()

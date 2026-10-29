@@ -3734,6 +3734,116 @@
                       "type": "array",
                       "uniqueItems": true
                     },
+                    "assignment_shape": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "assignment_input_sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "delegation": {
+                          "enum": [
+                            "terminal",
+                            "delegating"
+                          ]
+                        },
+                        "effects": {
+                          "enum": [
+                            "read_only",
+                            "repository_write",
+                            "external_side_effects",
+                            "publication"
+                          ]
+                        },
+                        "policy_sha256": {
+                          "pattern": "^[0-9a-f]{64}$",
+                          "type": "string"
+                        },
+                        "profile": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "authority_role": {
+                              "enum": [
+                                "terminal_leaf",
+                                "delegating",
+                                "acceptance_gate",
+                                "review_auditor",
+                                "audit",
+                                "conflict_resolution",
+                                "failure_classification",
+                                "git_publication",
+                                "unknown_judgment"
+                              ],
+                              "type": "string"
+                            },
+                            "boundedness": {
+                              "enum": [
+                                "tightly_bounded",
+                                "bounded",
+                                "cross_cutting",
+                                "unknown"
+                              ],
+                              "type": "string"
+                            },
+                            "context": {
+                              "enum": [
+                                "small",
+                                "medium",
+                                "large",
+                                "long",
+                                "unknown"
+                              ],
+                              "type": "string"
+                            },
+                            "horizon": {
+                              "enum": [
+                                "short",
+                                "medium",
+                                "long",
+                                "unknown"
+                              ],
+                              "type": "string"
+                            },
+                            "risk": {
+                              "enum": [
+                                "low",
+                                "medium",
+                                "high",
+                                "critical",
+                                "unknown"
+                              ],
+                              "type": "string"
+                            },
+                            "task_class": {
+                              "minLength": 1,
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "task_class",
+                            "risk",
+                            "boundedness",
+                            "context",
+                            "horizon",
+                            "authority_role"
+                          ],
+                          "type": "object"
+                        },
+                        "version": {
+                          "const": 1,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "version",
+                        "policy_sha256",
+                        "assignment_input_sha256",
+                        "profile",
+                        "effects",
+                        "delegation"
+                      ],
+                      "type": "object"
+                    },
                     "decision_refs": {
                       "description": "Optional citations of resolved DecisionRecord question keys. Non-empty citations load an existing DecisionStore and fail closed on missing, stale, open, or superseded records. Omitted or empty citations do not require a store.",
                       "items": {
@@ -10549,6 +10659,116 @@
                             },
                             "type": "array",
                             "uniqueItems": true
+                          },
+                          "assignment_shape": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "assignment_input_sha256": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "delegation": {
+                                "enum": [
+                                  "terminal",
+                                  "delegating"
+                                ]
+                              },
+                              "effects": {
+                                "enum": [
+                                  "read_only",
+                                  "repository_write",
+                                  "external_side_effects",
+                                  "publication"
+                                ]
+                              },
+                              "policy_sha256": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "profile": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "authority_role": {
+                                    "enum": [
+                                      "terminal_leaf",
+                                      "delegating",
+                                      "acceptance_gate",
+                                      "review_auditor",
+                                      "audit",
+                                      "conflict_resolution",
+                                      "failure_classification",
+                                      "git_publication",
+                                      "unknown_judgment"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "boundedness": {
+                                    "enum": [
+                                      "tightly_bounded",
+                                      "bounded",
+                                      "cross_cutting",
+                                      "unknown"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "context": {
+                                    "enum": [
+                                      "small",
+                                      "medium",
+                                      "large",
+                                      "long",
+                                      "unknown"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "horizon": {
+                                    "enum": [
+                                      "short",
+                                      "medium",
+                                      "long",
+                                      "unknown"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "risk": {
+                                    "enum": [
+                                      "low",
+                                      "medium",
+                                      "high",
+                                      "critical",
+                                      "unknown"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "task_class": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "task_class",
+                                  "risk",
+                                  "boundedness",
+                                  "context",
+                                  "horizon",
+                                  "authority_role"
+                                ],
+                                "type": "object"
+                              },
+                              "version": {
+                                "const": 1,
+                                "type": "integer"
+                              }
+                            },
+                            "required": [
+                              "version",
+                              "policy_sha256",
+                              "assignment_input_sha256",
+                              "profile",
+                              "effects",
+                              "delegation"
+                            ],
+                            "type": "object"
                           },
                           "decision_refs": {
                             "description": "Optional citations of resolved DecisionRecord question keys. Non-empty citations load an existing DecisionStore and fail closed on missing, stale, open, or superseded records. Omitted or empty citations do not require a store.",

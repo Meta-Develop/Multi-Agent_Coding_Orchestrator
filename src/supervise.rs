@@ -254,6 +254,10 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+mod assignment_shape;
+pub use assignment_shape::{
+    AssignmentDelegation, AssignmentEffects, AssignmentShapeDeclaration, ValidatedAssignmentShape,
+};
 mod assignment_executor;
 pub mod authored_checks;
 pub(crate) use plan_api::{
@@ -2144,6 +2148,14 @@ pub enum AssignmentPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
+    /// Parent-declared fitness, revalidated against exact assignment inputs and
+    /// frozen policy. Omission remains unproven and grants no eligibility.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "assignment_shape::deserialize_shape"
+    )]
+    pub assignment_shape: Option<AssignmentShapeDeclaration>,
     /// Planning-versus-execution capability selector for implementation roles.
     /// A Researcher remains read-only in either phase.
     ///

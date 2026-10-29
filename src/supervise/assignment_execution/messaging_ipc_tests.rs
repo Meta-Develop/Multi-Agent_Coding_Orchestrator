@@ -394,6 +394,7 @@ fn commit_fixture_repository(path: &Path) {
 
 fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
     let coord = OrchestratorAssignment {
+        assignment_shape: None,
         id: COORD_ID.to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,
@@ -411,6 +412,7 @@ fn messaging_plan_and_metadata() -> (SupervisorPlan, SupervisorPlanMetadata) {
         decision_refs: Vec::new(),
     };
     let worker = OrchestratorAssignment {
+        assignment_shape: None,
         id: WORKER_ID.to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,

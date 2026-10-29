@@ -382,6 +382,7 @@ mod tests {
 
     fn review_assignment(id: &str, task: String) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

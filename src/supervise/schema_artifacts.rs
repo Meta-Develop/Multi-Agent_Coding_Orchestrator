@@ -323,6 +323,7 @@ mod parent_initial_yield_schema_tests {
 
     fn delegating_parent(worker_ids: &[&str]) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: "parent-yield".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -2886,6 +2887,7 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
             "semantic_symbols": string_array_schema_value(),
             "semantic_modules": string_array_schema_value(),
             "task": {"type": "string"},
+            "assignment_shape": assignment_shape_schema_value(),
             "worker_assignments": {"type": "array", "items": worker_assignment_schema_value()},
             "environment_requirements": {"type": "array", "items": environment_requirement_schema_value()},
             "licensed_breakage": licensed_breakage_declaration_schema_value(),
@@ -2903,6 +2905,28 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
                     }
                 }
             }
+        }
+    })
+}
+
+fn assignment_shape_schema_value() -> serde_json::Value {
+    let event = crate::selection::selection_event_schema_value();
+    let input = &event["properties"]["provenance"]["properties"]["normalized_input"];
+    // Declarations, like historical task profiles, must preserve Unknown axes.
+    let profile = input["properties"]["outcomes"]["items"]["properties"]["task"].clone();
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "policy_sha256", "assignment_input_sha256", "profile", "effects", "delegation"
+        ],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "assignment_input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "profile": profile,
+            "effects": {"enum": ["read_only", "repository_write", "external_side_effects", "publication"]},
+            "delegation": {"enum": ["terminal", "delegating"]}
         }
     })
 }
@@ -4803,6 +4827,81 @@ pub(super) fn write_private_prompt(
 mod selection_schema_tests {
     use super::*;
 
+    #[test]
+    fn assignment_shape_schema_is_optional_closed_and_versioned() -> Result<()> {
+        let schema = orchestrator_assignment_schema_value();
+        let mut assignment = json!({
+            "id": "leaf", "phase": "execution", "role": "worker",
+            "assigned_paths": ["README.md"], "semantic_symbols": [], "semantic_modules": [],
+            "worker_assignments": [], "environment_requirements": []
+        });
+        let schema_id = "https://example.invalid/assignment-shape";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, schema)
+            .expect("register assignment schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile assignment schema");
+        assert!(schemas.validate(&assignment, index).is_ok());
+        let shape = json!({
+            "version": 1, "policy_sha256": "a".repeat(64),
+            "assignment_input_sha256": "b".repeat(64),
+            "profile": {
+                "task_class": "localized_code_change", "risk": "unknown",
+                "boundedness": "unknown", "context": "unknown", "horizon": "unknown",
+                "authority_role": "terminal_leaf"
+            },
+            "effects": "repository_write", "delegation": "terminal"
+        });
+        assignment["assignment_shape"] = shape.clone();
+        assert!(schemas.validate(&assignment, index).is_ok());
+        let typed: OrchestratorAssignment = serde_json::from_value(assignment.clone())?;
+        assert_eq!(serde_json::to_value(typed.assignment_shape)?, shape);
+        for (field, invalid) in [
+            ("version", json!(2)),
+            ("policy_sha256", json!("invalid")),
+            ("effects", json!("none")),
+            ("delegation", json!("none")),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = assignment.clone();
+            changed["assignment_shape"][field] = invalid;
+            assert!(schemas.validate(&changed, index).is_err(), "{field}");
+        }
+        for field in shape.as_object().unwrap().keys() {
+            let mut changed = assignment.clone();
+            changed["assignment_shape"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                schemas.validate(&changed, index).is_err(),
+                "missing {field}"
+            );
+        }
+        assignment["assignment_shape"] = Value::Null;
+        assert!(schemas.validate(&assignment, index).is_err());
+        for published in [
+            supervisor_final_report_schema_value(),
+            supervisor_collect_report_schema_value(),
+            serde_json::from_str(include_str!(
+                "../../schemas/supervisor-final-report-v1.schema.json"
+            ))?,
+            serde_json::from_str(include_str!(
+                "../../schemas/supervisor-collect-report-v1.schema.json"
+            ))?,
+        ] {
+            let carried = &published["properties"]["generated_follow_up_tasks"]["items"]
+                ["properties"]["supervisor_plan"]["properties"]["assignments"]["items"]
+                ["properties"]["assignment_shape"];
+            assert_eq!(*carried, assignment_shape_schema_value());
+        }
+        Ok(())
+    }
+
     fn open_object_schema_paths(value: &serde_json::Value) -> Vec<String> {
         fn walk(value: &serde_json::Value, path: &str, open: &mut Vec<String>) {
             match value {
@@ -4868,6 +4967,7 @@ mod selection_schema_tests {
             }],
         };
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "source-child".into(),
             phase: AssignmentPhase::Execution,
             runtime: None,

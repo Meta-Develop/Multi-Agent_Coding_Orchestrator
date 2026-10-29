@@ -505,6 +505,7 @@ pub(super) fn validate_supervisor_plan_in_repo(
         .collect();
 
     validate_assignment_decision_refs_for_repo(&plan.assignments, repo)?;
+    assignment_shape::validate_assignment_shapes(&plan, &metadata)?;
     Ok((plan, metadata))
 }
 
@@ -1487,6 +1488,7 @@ mod plan_validation_decision_ref_tests {
 
     fn assignment_with_refs(refs: Vec<DecisionRef>) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
