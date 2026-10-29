@@ -6,6 +6,16 @@ use crate::{
 };
 use std::path::Path;
 
+pub(super) fn validate_authored_check_metadata(
+    plan: &SupervisorPlan,
+    metadata: &AssignmentMetadata,
+) -> Result<()> {
+    for (parent_id, checks) in &metadata.authored_independent_checks {
+        authored_checks::validate_declarations(plan, parent_id, checks)?;
+    }
+    Ok(())
+}
+
 pub(super) fn validate_assignment_phase_contract(plan: &SupervisorPlan) -> Result<()> {
     for assignment in &plan.assignments {
         if assignment.phase != AssignmentPhase::Planning {

@@ -253,6 +253,7 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+pub mod authored_checks;
 pub(crate) use plan_api::{
     load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,
     validate_generated_follow_up_plan_document_in_repo,
@@ -1988,6 +1989,7 @@ struct AssignmentMetadata {
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
     source_inputs:
         BTreeMap<String, Vec<crate::external_agent::researcher_inputs::ResearcherSourceInput>>,
+    authored_independent_checks: BTreeMap<String, Vec<authored_checks::AuthoredIndependentCheck>>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -2037,6 +2039,8 @@ impl AssignmentMetadata {
     fn retain_assignment(&mut self, assignment_id: &str) {
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.source_inputs.retain(|owner, _| owner == assignment_id);
+        self.authored_independent_checks
+            .retain(|owner, _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.direct_mechanical_duties
@@ -2051,6 +2055,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
             source_inputs: BTreeMap::new(),
+            authored_independent_checks: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }
