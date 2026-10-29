@@ -798,6 +798,13 @@ pub(super) fn import_external_attempt_evidence(
         runtime,
     } = context;
     let import_result = (|| -> Result<()> {
+        super::target_containment::persist(
+            writer,
+            artifacts,
+            external_command,
+            runtime,
+            external_run,
+        )?;
         if raw_report_validated {
             if let Some(contents) = external_run.output_last_message() {
                 if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
@@ -823,15 +830,6 @@ pub(super) fn import_external_attempt_evidence(
         writer.write_bytes(
             &artifacts.raw_stdout_relative,
             stdout_bytes,
-            ArtifactFileDisposition::PrivateEvidence,
-        )?;
-        let command_record =
-            command_record_from_external_for_runtime(external_run, external_command, runtime);
-        write_artifact_json(
-            writer,
-            &artifacts.command_record_relative,
-            &command_record,
-            MAX_SUPERVISOR_REPORT_BYTES,
             ArtifactFileDisposition::PrivateEvidence,
         )?;
         Ok(())
