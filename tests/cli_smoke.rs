@@ -174,6 +174,15 @@ fn cli_literal_entrypoint_preserves_explicit_subcommands_and_top_level_help_and_
         help_stdout.contains("Usage: maco <COMMAND>"),
         "{help_stdout}"
     );
+    for guidance in [
+        "maco -- <instruction>",
+        "first word matches a subcommand or starts with '-'",
+        "maco -- review the parser",
+        "live supervised run",
+        "normal account, model, and admission requirements",
+    ] {
+        assert!(help_stdout.contains(guidance), "{help_stdout}");
+    }
     Ok(())
 }
 
@@ -228,6 +237,12 @@ fn cli_literal_entrypoint_double_dash_forces_subcommand_shaped_literal_but_not_t
         .output()
         .context("force subcommand-shaped literal instruction")?;
     assert_literal_route_attempts_safe_defaults(&escaped);
+
+    let review = cli_without_machine_global_bindings()
+        .args(["--", "review", "the", "parser"])
+        .output()
+        .context("route documented review instruction")?;
+    assert_literal_route_attempts_safe_defaults(&review);
 
     let option = cli_without_machine_global_bindings()
         .arg("--not-a-maco-option")
