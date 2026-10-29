@@ -244,6 +244,10 @@ The current implementation covers a local-first command-line slice:
   `.agents/scripts/o2-autopilot`.
 - `maco <instruction>` is the live local-first entrypoint: a bare instruction
   routes into supervised goal/spec (`supervise run --literal-goal`). Use
+  `maco -- <instruction>` when its first word matches a subcommand or starts
+  with `-`; for example, `maco -- review the parser`. Literal routing starts
+  a live supervised run with normal account, model, and admission requirements.
+  Explicit subcommands and top-level options keep their normal meaning. Use
   `maco supervise plan/run/status/collect` for authored plans or `--from-goal`
   files, and `maco inbox scan/run/status/collect/watch` for the fake-first
   reaction loop. Inbox still uses the autopilot library path; it does not
@@ -1257,11 +1261,16 @@ from repository maps, semantic maps, and task-path proposal helpers.
 
 ## Install
 
-Agent execution and repository mapping currently require Linux with a delegated
-systemd user manager. Native Windows and macOS builds are compile-portability
-targets, not full runtime support. On Windows, use a configured WSL2 Linux
-environment for coding workflows; the native `maco scope serve` command can
-serve the local monitoring UI at `http://127.0.0.1:7878`.
+Local read/plan commands such as `maco repo map` (including `--semantic`),
+`maco llm`, and `maco supervise plan` have portable implementations and do not
+require Linux containment. Live supervised execution, including
+`maco <instruction>` and `maco supervise run`, requires Linux with a delegated
+systemd user manager on unified cgroup v2. Commands using Linux-only primitives
+fail explicitly on other platforms; see [Platform boundary](#platform-boundary).
+Native Windows and macOS builds are compile-portability targets; full native
+command runtime qualification remains unverified. On Windows, use a configured
+WSL2 Linux environment for contained execution; the native `maco scope serve`
+command can serve the local monitoring UI at `http://127.0.0.1:7878`.
 
 Install `maco` once as a machine-global binary. Do not invoke it through a
 per-repository `cargo run` wrapper around a pinned checkout. See
@@ -1298,7 +1307,7 @@ Clippy and rustfmt, plus the Python interpreter used by the
 repository-portability gate. An ambient system toolchain is not evidence of CI
 parity.
 
-Run the CI-equivalent Linux and repository-portability gates with:
+Run the Linux toolchain and repository-portability checks with:
 
 ```bash
 export CARGO_INCREMENTAL=0
@@ -1310,7 +1319,17 @@ nix develop path:$PWD -c python3 scripts/check_repository_portability.py
 nix develop path:$PWD -c cargo fmt --all -- --check
 nix develop path:$PWD -c cargo check --locked --all-targets
 nix develop path:$PWD -c cargo clippy --locked --all-targets -- -D warnings
-nix develop path:$PWD -c cargo test --locked --all-targets
+```
+
+For containment-test parity, the Linux host must already have an active,
+configured systemd user manager, its user bus/runtime directory, delegated
+unified cgroup v2 controllers, and the sandbox prerequisites used by the tests.
+From that user's session, run the tests inside a delegated user scope with the
+same Nix toolchain:
+
+```bash
+systemd-run --user --scope --quiet -p Delegate=yes --working-directory="$PWD" -- \
+  nix develop "path:$PWD" -c cargo test --locked --all-targets
 ```
 
 Full verification is a one-shot sweep, so CI and this recipe disable Cargo's
@@ -1321,12 +1340,23 @@ Before treating a branch as fully CI-green, push it or open a draft pull request
 and wait for both the `macos-latest` and `windows-latest` `portable-build` jobs;
 a draft pull request is the cheapest honest way to close that residual gap.
 
-GitHub-hosted Linux runners do not provide the delegated systemd user manager
-required by strict containment. Containment-dependent lib tests and CLI
-integration tests share the same cgroup probe and print one `SKIP <test>:
-<reason>` line when that manager is absent. CI runs plain
-`cargo test --locked --all-targets`; tests decide at runtime whether to execute.
-A Linux runner inside a delegated user manager runs the complete suite.
+GitHub-hosted Linux CI explicitly configures the user manager and sandbox
+prerequisites. The test partition runner,
+`.github/scripts/run-linux-ci-cargo-test-partition.sh`, invokes
+`run-linux-all-tests-in-delegated-user-scope.sh`, which enters a delegated user
+scope, verifies its cgroup, and probes nested transient process startup before
+executing the library shards or non-library tests. Containment coverage is a
+required CI gate. This setup wrapper is restricted to ephemeral hosted runners;
+do not run it or the partition runner on developer hosts because it can enable
+lingering and start the user manager. The local command above assumes those
+prerequisites are already configured and does not perform that setup.
+
+On ordinary developer hosts without the verified containment backend,
+containment-dependent tests can self-skip with a reason. A plain Cargo test
+success with such skips does not establish containment parity. The local
+recipe also does not replace CI's source-bound helper, nested sandbox, package
+build, or native platform gates; compilation, package installation, and live
+runtime acceptance are separate evidence.
 
 The Nix development shell also pins the supply-chain tools through
 `flake.lock`. Audit the exact Cargo lockfile and enforce the repository policy
@@ -3980,6 +4010,10 @@ Run the fake-first autonomous workflow:
 
 The shipped spine is `maco <instruction>`, `maco supervise run`, and
 `maco inbox run`. A bare instruction routes into supervised goal/spec.
+Use `maco -- <instruction>` if its first word matches a subcommand or starts
+with `-`, for example `maco -- review the parser`. Literal routing starts a
+live supervised run with normal account, model, and admission requirements;
+explicit subcommands and top-level options retain their normal meaning.
 `supervise run` accepts a positional task/plan or decomposes
 `--from-goal <file>` through the same planner as `supervise plan`, then
 executes the validated plan through the live supervisor gates. Pass
