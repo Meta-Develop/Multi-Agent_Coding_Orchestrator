@@ -5,8 +5,11 @@
 //!
 //! This module is the lifecycle governance surface. It does **not** replace
 //! bounded credential redaction in `external_agent` (presence detection plus
-//! log/report scrubbing). Callers that still copy host environment values into
-//! child processes, plans, or journals remain a cross-lane handoff.
+//! log/report scrubbing). CAM selected launches and root Grok dispatch use the
+//! equivalent closed operation: an exact incarnation/use lease and run-bound admission.
+//! The root Grok executor opens its vendor-home capability during guarded
+//! construction and settles custody only from live process-tree evidence.
+//! [`ProviderLaunchMetadata`] is reference-only descriptive evidence.
 //!
 //! The contract is:
 //!
@@ -46,11 +49,13 @@
 mod audit;
 mod injection;
 mod material;
+mod provider_dispatch;
 mod types;
 mod vault;
 
 pub use audit::{SecretAuditAction, SecretAuditEvent, SecretAuditOutcome, SecretAuditTrail};
 pub use injection::{SecretEnvironment, SecretLease};
+pub use provider_dispatch::ProviderLaunchMetadata;
 pub use types::{
     DelegationPolicy, PersistencePolicy, SecretDeclaration, SecretLifecycleError,
     SecretPlanBinding, SecretRef, SecretScope, SecretState, SecretStatusView,

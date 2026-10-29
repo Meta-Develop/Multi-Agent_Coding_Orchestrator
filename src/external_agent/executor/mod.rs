@@ -18,6 +18,7 @@
 //! outside this executor-owned foundation.
 
 mod checksum;
+pub(crate) mod launch_lifecycle;
 mod local;
 mod selection;
 mod ssh;
