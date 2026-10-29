@@ -177,6 +177,7 @@ mod tests {
         spec: LaunchSpec,
         declarations: AtomicUsize,
         refuse: bool,
+        switch_selection: bool,
     }
 
     impl ProviderAdapter for ProbeAdapter {
@@ -216,6 +217,13 @@ mod tests {
                 self.binding.account_incarnation
             );
             assert_in_use(&self.registry);
+            if self.switch_selection {
+                self.registry.select_complete(PROVIDER, "other")?;
+                assert!(
+                    account.is_selected,
+                    "launch uses the frozen metadata snapshot"
+                );
+            }
             if self.refuse {
                 return Err(Error::NotImplemented("fixture launch refusal"));
             }
@@ -259,10 +267,6 @@ mod tests {
             registry.begin_delete(PROVIDER, "work"),
             Err(Error::AccountAuthorityBusy { .. })
         ));
-        assert!(matches!(
-            registry.select_complete(PROVIDER, "other"),
-            Err(Error::AccountAuthorityBusy { .. })
-        ));
     }
 
     fn fixture(directory: &Path) -> ProbeAdapter {
@@ -296,6 +300,7 @@ mod tests {
             spec,
             declarations: AtomicUsize::new(0),
             refuse: false,
+            switch_selection: false,
         }
     }
 
@@ -365,6 +370,15 @@ mod tests {
             await_file(&directory.path().join("ready"));
             assert!(child.0.try_wait().unwrap().is_none());
             assert_in_use(&registry);
+            let future = registry
+                .select_complete_revision(
+                    PROVIDER,
+                    "other",
+                    Some(adapter.binding.selection_revision),
+                )
+                .unwrap();
+            assert_eq!(future.account_id, "other");
+            assert_eq!(child.0.binding(), &adapter.binding);
             let reaper = std::thread::spawn(move || child.0.wait());
             assert_in_use(&registry);
             release_child(
@@ -397,6 +411,31 @@ mod tests {
                 adapter.binding.account_incarnation
             );
         }
+    }
+
+    #[test]
+    fn selection_changed_during_launch_keeps_frozen_material() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut adapter = fixture(directory.path());
+        adapter.switch_selection = true;
+        let registry = &adapter.registry;
+        let mut child = TestChild(
+            spawn_selected_launch(registry, &adapter, &adapter.binding, || {
+                Ok(Box::new(ProbeStore {
+                    registry: Arc::clone(registry),
+                    reads: Arc::new(AtomicUsize::new(0)),
+                    missing: false,
+                }))
+            })
+            .unwrap(),
+        );
+        await_file(&directory.path().join("ready"));
+        assert_eq!(registry.selected(PROVIDER).unwrap().unwrap().id, "other");
+        assert_eq!(child.0.binding(), &adapter.binding);
+        assert_in_use(registry);
+        release_child(directory.path(), b"ok");
+        assert!(child.0.wait().unwrap().success());
+        registry.begin_delete(PROVIDER, "work").unwrap();
     }
 
     #[test]

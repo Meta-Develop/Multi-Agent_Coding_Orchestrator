@@ -63,18 +63,8 @@ impl GeminiLaunchAuthority {
             ));
         }
         if let Some(socket_path) = &self.socket_path {
-            let live = super::selected_binding_via_authority_socket(
-                socket_path,
-                GEMINI_CLI_PROVIDER_ID,
-            )
-            .context(
-                "failed to revalidate Coding Agent Manager Gemini selection via authority socket",
-            )?;
-            let Some((authority_id, binding)) = live else {
-                return Err(anyhow!(
-                    "no complete account is selected for Coding Agent Manager provider `{GEMINI_CLI_PROVIDER_ID}`"
-                ));
-            };
+            let authority_id = super::socket_client::authority_id_via_authority_socket(socket_path)
+                .context("failed to revalidate Coding Agent Manager Gemini authority socket")?;
             if self
                 .authority_id
                 .as_ref()
@@ -84,21 +74,15 @@ impl GeminiLaunchAuthority {
                     "Coding Agent Manager authority identity does not match the frozen Gemini authority"
                 ));
             }
-            if binding != self.binding {
-                return Err(map_binding_drift(&self.binding, &binding));
-            }
         }
-        let current = self
+        let account = self
             .registry
-            .selected_binding(GEMINI_CLI_PROVIDER_ID)
-            .context("failed to read Coding Agent Manager Gemini selection")?
-            .ok_or_else(|| {
-                anyhow!(
-                    "no complete account is selected for Coding Agent Manager provider `{GEMINI_CLI_PROVIDER_ID}`"
-                )
-            })?;
-        if current != self.binding {
-            return Err(map_binding_drift(&self.binding, &current));
+            .complete(GEMINI_CLI_PROVIDER_ID, &self.binding.account_id)
+            .context("leased Coding Agent Manager Gemini account is no longer complete")?;
+        if account.account_incarnation != self.binding.account_incarnation {
+            return Err(anyhow!(
+                "leased Coding Agent Manager Gemini account was replaced"
+            ));
         }
         if let Some(expected) = &self.authority_id {
             if authority_id_for(self.registry.metadata_path()) != *expected {
@@ -386,6 +370,8 @@ mod tests {
 
     #[test]
     fn gemini_launch_authority_retains_selected_use_lease_until_drop() {
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
         let temp = tempfile::tempdir().expect("tempdir");
         let metadata = stored_accounts_path(temp.path());
         let registry = StoredAccountRegistry::new(&metadata);
@@ -419,14 +405,41 @@ mod tests {
             environment.get(GOOGLE_GENAI_USE_GCA).map(String::as_str),
             Some("true")
         );
-        let busy = registry
-            .select_complete_revision(GEMINI_CLI_PROVIDER_ID, "personal", None)
-            .expect_err("authority must retain selected-use lease");
-        assert!(matches!(busy, CamError::AccountAuthorityBusy { .. }));
-        drop(authority);
         registry
             .select_complete_revision(GEMINI_CLI_PROVIDER_ID, "personal", None)
-            .expect("selection may change after authority drop");
+            .expect("future selection may change");
+        authority.verify_binding_unchanged().unwrap();
+        registry
+            .begin_delete(GEMINI_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        registry
+            .finish_delete(GEMINI_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        authority.verify_binding_unchanged().unwrap();
+        assert!(matches!(
+            registry.begin_delete(GEMINI_CLI_PROVIDER_ID, "work"),
+            Err(CamError::AccountAuthorityBusy { .. })
+        ));
+        let original = std::fs::read(registry.metadata_path()).unwrap();
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            document["accounts"][0][field] = value.into();
+            std::fs::write(
+                registry.metadata_path(),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
+        std::fs::write(registry.metadata_path(), original).unwrap();
+        authority.verify_binding_unchanged().unwrap();
+        drop(authority);
+        registry
+            .begin_delete(GEMINI_CLI_PROVIDER_ID, "work")
+            .expect("leased account may be deleted after authority drop");
     }
 
     #[test]

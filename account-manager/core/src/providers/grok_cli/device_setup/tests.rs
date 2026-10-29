@@ -290,7 +290,7 @@ fn newly_writable_ancestor_blocks_existing_metadata_and_completion() {
 }
 
 #[test]
-fn pending_login_and_selected_use_leases_block_atomic_completion() {
+fn pending_login_blocks_completion_while_other_selected_use_allows_it() {
     let fixture = Fixture::new();
     let account = fixture.prepare("work");
     fixture.seed_auth(&account);
@@ -320,14 +320,20 @@ fn pending_login_and_selected_use_leases_block_atomic_completion() {
         .unwrap()
         .unwrap();
     let lease = fixture.registry.acquire_selected_use(&binding).unwrap();
-    let before = fixture.bytes();
+    fixture.complete(&next).unwrap();
+    assert_eq!(
+        fixture.registry.selected(PROVIDER_ID).unwrap().unwrap().id,
+        "next"
+    );
     assert!(matches!(
-        fixture.complete(&next),
+        fixture.registry.begin_delete(PROVIDER_ID, &account.id),
         Err(Error::AccountAuthorityBusy { .. })
     ));
-    assert_eq!(fixture.bytes(), before);
     drop(lease);
-    fixture.complete(&next).unwrap();
+    fixture
+        .registry
+        .begin_delete(PROVIDER_ID, &account.id)
+        .unwrap();
 }
 
 #[test]

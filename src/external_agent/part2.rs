@@ -7719,9 +7719,11 @@ mod selected_codex_auth_tests {
         assert_eq!(auth.bytes, SELECTED);
         assert_eq!(ValidatedCodexAuth::load()?.unwrap().bytes, AMBIENT);
         auth.verify_source_unchanged()?; // same check used by paused pre-release
-        assert!(registry
-            .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
-            .is_err());
+        registry.select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)?;
+        auth.verify_source_unchanged()?;
+        registry.begin_delete(CODEX_CLI_PROVIDER_ID, "personal")?;
+        registry.finish_delete(CODEX_CLI_PROVIDER_ID, "personal")?;
+        auth.verify_source_unchanged()?;
         assert!(registry
             .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
             .is_err());
@@ -7742,7 +7744,6 @@ mod selected_codex_auth_tests {
         fs::remove_file(managed_home.join("auth.json"))?;
 
         // A new revision or materialization cannot reuse this run's frozen slot.
-        registry.select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)?;
         write_synthetic_auth(&managed_home, SELECTED)?;
         assert!(ValidatedCodexAuth::load_for_command(&spec).is_err());
         registry.begin_delete(CODEX_CLI_PROVIDER_ID, "work")?;

@@ -174,8 +174,7 @@ impl LaunchLifecycle {
         if binding.provider_id != adapter.id() {
             return Err(Error::UnknownProvider(binding.provider_id.clone()));
         }
-        let lease = registry.acquire_selected_use(&binding)?;
-        let account = registry.complete(adapter.id(), &binding.account_id)?;
+        let (lease, account) = registry.acquire_selected_use_snapshot(&binding)?;
         let spec = launch_spec_for(adapter, &account)?;
         {
             let mut view = self.handle.0.lock().expect("launch lifecycle lock");
