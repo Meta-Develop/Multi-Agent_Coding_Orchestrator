@@ -20181,6 +20181,23 @@
                       "normalized_input": {
                         "additionalProperties": false,
                         "properties": {
+                          "assignment_shape_identity": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "sha256": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "version": {
+                                "const": 1
+                              }
+                            },
+                            "required": [
+                              "version",
+                              "sha256"
+                            ],
+                            "type": "object"
+                          },
                           "catalogs": {
                             "items": {
                               "additionalProperties": false,
@@ -20521,6 +20538,23 @@
                             "items": {
                               "additionalProperties": false,
                               "properties": {
+                                "assignment_shape_identity": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "sha256": {
+                                      "pattern": "^[0-9a-f]{64}$",
+                                      "type": "string"
+                                    },
+                                    "version": {
+                                      "const": 1
+                                    }
+                                  },
+                                  "required": [
+                                    "version",
+                                    "sha256"
+                                  ],
+                                  "type": "object"
+                                },
                                 "attempt_id": {
                                   "minLength": 1,
                                   "type": "string"

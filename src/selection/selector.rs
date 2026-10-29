@@ -2364,7 +2364,11 @@ fn ledger_summary(
     let matching = input
         .outcomes
         .iter()
-        .filter(|record| record.task == input.task && record.candidate == *candidate)
+        .filter(|record| {
+            record.task == input.task
+                && record.assignment_shape_identity == input.assignment_shape_identity
+                && record.candidate == *candidate
+        })
         .collect::<Vec<_>>();
     let accepted = matching
         .iter()
@@ -2586,7 +2590,10 @@ fn input_digests(
     Ok(InputDigests {
         normalized_input: digest(input)?,
         switch_cost_evidence: digest(switch_cost_evidence)?,
-        task: digest(&input.task)?,
+        task: match &input.assignment_shape_identity {
+            Some(identity) => digest(&(&input.task, identity))?,
+            None => digest(&input.task)?,
+        },
         catalogs: digest(&input.catalogs)?,
         pools: digest(&input.pools)?,
         constraints: digest(&input.constraints)?,

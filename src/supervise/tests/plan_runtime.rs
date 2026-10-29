@@ -797,6 +797,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         &mut default_loaded.plan,
         &mut default_loaded.plan_metadata,
         PreparedSupervisorSelectionRequest {
+            assignment_shapes: None,
             repo: &repo_path,
             current_run: None,
             runtime: SupervisorRuntime::Codex,
@@ -811,6 +812,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         &mut authored_loaded.plan,
         &mut authored_loaded.plan_metadata,
         PreparedSupervisorSelectionRequest {
+            assignment_shapes: None,
             repo: &repo_path,
             current_run: None,
             runtime: SupervisorRuntime::Codex,

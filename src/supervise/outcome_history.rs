@@ -893,7 +893,11 @@ fn selection_binding_for_attempt(
                     .value
                     .clone(),
                 task: event.provenance.normalized_task.clone(),
-                assignment_shape_identity: None,
+                assignment_shape_identity: event
+                    .provenance
+                    .normalized_input
+                    .assignment_shape_identity
+                    .clone(),
                 requested_candidate: choice.candidate.clone(),
             })
         },
@@ -983,9 +987,17 @@ pub(super) struct FrozenOutcomeHistory {
 
 impl FrozenOutcomeHistory {
     pub fn outcomes_for(&self, task: &TaskProfile) -> Vec<OutcomeRecord> {
+        self.outcomes_for_shape(task, None)
+    }
+
+    pub(super) fn outcomes_for_shape(
+        &self,
+        task: &TaskProfile,
+        identity: Option<&crate::selection::AssignmentShapeIdentity>,
+    ) -> Vec<OutcomeRecord> {
         self.rows
             .iter()
-            .filter(|row| &row.task == task)
+            .filter(|row| &row.task == task && row.assignment_shape_identity.as_ref() == identity)
             .cloned()
             .collect()
     }
@@ -1138,6 +1150,9 @@ pub(super) fn load_frozen_outcome_history(
                         && event.provenance.input_digests.normalized_input.value
                             == binding.normalized_input_sha256
                         && event.provenance.normalized_task == binding.task
+                        && event.provenance.normalized_input.task == binding.task
+                        && event.provenance.normalized_input.assignment_shape_identity
+                            == binding.assignment_shape_identity
                         && event
                             .provenance
                             .choice
@@ -1254,6 +1269,7 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
     Some(OutcomeRecord {
         attempt_id,
         task: binding.task.clone(),
+        assignment_shape_identity: binding.assignment_shape_identity.clone(),
         candidate: observed.clone(),
         result,
         failure_class: row.failure_class,
@@ -1489,6 +1505,69 @@ mod tests {
         wire["selection"]["assignment_shape_identity"]["version"] = serde_json::json!(2);
         assert!(serde_json::from_value::<AttemptOutcomeEvidence>(wire).is_err());
         assert!(crate::selection::AssignmentShapeIdentity::v1("not-a-digest".into()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_identity_flows_from_dispatch_to_history_and_cost_cohorts() -> Result<()> {
+        let mut input = crate::selection::selection_test_base_input();
+        let identity = crate::selection::AssignmentShapeIdentity::v1("c".repeat(64)).unwrap();
+        input.assignment_shape_identity = Some(identity.clone());
+        let provenance = crate::selection::select(&input)?;
+        let event = SupervisorSelectionEvent {
+            assignment_id: Some("assignment-1".into()),
+            attempt: 0,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance,
+        };
+        let binding = selection_binding_for_attempt(
+            AgentRole::Worker,
+            "assignment-1",
+            1,
+            std::slice::from_ref(&event),
+            &[],
+        )
+        .context("assignment binding")?;
+        assert_eq!(binding.assignment_shape_identity, Some(identity.clone()));
+        let mut evidence = fixture();
+        evidence.requested_runtime = binding.requested_candidate.runtime.clone();
+        evidence.requested_model = Some(binding.requested_candidate.model.clone());
+        evidence.requested_effort = Some(binding.requested_candidate.effort.as_str().into());
+        evidence.observed_candidate = Some(binding.requested_candidate.clone());
+        evidence.selection = Some(binding);
+        let row = project_numeric_row(&evidence).context("projected history")?;
+        assert_eq!(row.assignment_shape_identity, Some(identity.clone()));
+        let frozen = FrozenOutcomeHistory {
+            provenance: crate::selection::AuthenticatedOutcomeHistoryProvenance {
+                snapshot_sha256: "d".repeat(64),
+                source_digests: Vec::new(),
+                exclusions: Vec::new(),
+                projected_attempt_count: 1,
+            },
+            rows: vec![row],
+        };
+        assert_eq!(
+            frozen
+                .outcomes_for_shape(&input.task, Some(&identity))
+                .len(),
+            1
+        );
+        assert!(frozen.outcomes_for(&input.task).is_empty());
+        assert!(frozen
+            .outcomes_for_shape(
+                &input.task,
+                Some(&crate::selection::AssignmentShapeIdentity::v1("e".repeat(64)).unwrap())
+            )
+            .is_empty());
+        let record = super::super::accepted_task_cost::attempt_cost_record(
+            evidence.selection,
+            evidence.costs,
+            evidence.parent_result,
+        );
+        let cohorts = super::super::accepted_task_cost::rollup_selection_cost_cohorts(&[record])?;
+        assert_eq!(cohorts.lanes.len(), 1);
+        assert_eq!(cohorts.lanes[0].lane.assignment_shape_identity, identity);
         Ok(())
     }
 

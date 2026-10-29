@@ -259,6 +259,7 @@ mod tests {
         let priors = crate::selection::built_in_prior_dataset().expect("priors");
         let profile = priors.objective_profiles[0].clone();
         SelectionInput {
+            assignment_shape_identity: None,
             task: TaskProfile {
                 task_class: "localized_code_change".to_string(),
                 risk: RiskLevel::Medium,

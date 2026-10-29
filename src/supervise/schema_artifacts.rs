@@ -5552,6 +5552,52 @@ mod selection_schema_tests {
     }
 
     #[test]
+    fn published_selection_identity_is_optional_closed_and_versioned() -> Result<()> {
+        let mut input = crate::selection::selection_test_base_input();
+        input.assignment_shape_identity =
+            Some(crate::selection::AssignmentShapeIdentity::v1("a".repeat(64)).unwrap());
+        let event = json!({
+            "assignment_id": "leaf", "attempt": 0, "role": "worker", "primary_cause": "initial",
+            "provenance": crate::selection::select(&input)?,
+        });
+        for schema in [
+            supervisor_final_report_schema_value(),
+            supervisor_collect_report_schema_value(),
+        ] {
+            let schema = &schema["properties"]["role_economics_profile"]["properties"]["execution"]
+                ["properties"]["selection_decisions"]["items"];
+            let schema_id = "https://example.invalid/selection-assignment-identity";
+            let mut compiler = boon::Compiler::new();
+            compiler.set_default_draft(boon::Draft::V2020_12);
+            compiler
+                .add_resource(schema_id, schema.clone())
+                .expect("register selection identity schema");
+            let mut schemas = boon::Schemas::new();
+            let index = compiler
+                .compile(schema_id, &mut schemas)
+                .expect("compile selection identity schema");
+            assert!(schemas.validate(&event, index).is_ok());
+            let mut legacy = event.clone();
+            legacy["provenance"]["normalized_input"]
+                .as_object_mut()
+                .unwrap()
+                .remove("assignment_shape_identity");
+            assert!(schemas.validate(&legacy, index).is_ok());
+            for invalid in [
+                json!({"version": 2, "sha256": "a".repeat(64)}),
+                json!({"version": 1, "sha256": "bad"}),
+                json!({"version": 1, "sha256": "a".repeat(64), "extra": true}),
+                serde_json::Value::Null,
+            ] {
+                let mut malformed = event.clone();
+                malformed["provenance"]["normalized_input"]["assignment_shape_identity"] = invalid;
+                assert!(schemas.validate(&malformed, index).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn published_selection_prior_ceiling_is_required_nullable_and_closed() -> Result<()> {
         let decision = crate::selection::select(&crate::selection::selection_test_base_input())?;
         let event = json!({
