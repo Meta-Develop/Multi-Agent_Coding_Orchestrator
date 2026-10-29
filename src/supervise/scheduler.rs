@@ -8956,6 +8956,7 @@ mod selection_policy_tests {
             ("legacy", None),
         ] {
             let evidence = AttemptOutcomeEvidence {
+                pricing: Vec::new(),
                 version: 1,
                 run_id: "cost-cohorts".to_string(),
                 assignment_id: id.to_string(),
