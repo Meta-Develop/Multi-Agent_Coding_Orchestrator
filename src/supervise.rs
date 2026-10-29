@@ -418,7 +418,11 @@ mod dispatch;
 pub(crate) mod operator_pricing;
 mod pricing_provenance;
 use dispatch::*;
-pub use pricing_provenance::{ChargePricing, ChargePricingBasis, PricingContractProvenance};
+pub(crate) use pricing_provenance::outcome_charge_schema_value;
+pub use pricing_provenance::{
+    ChargePricing, ChargePricingBasis, OutcomeChargePricing, OutcomeCostPhase,
+    PricingContractProvenance,
+};
 
 mod gate_health;
 pub use gate_health::*;

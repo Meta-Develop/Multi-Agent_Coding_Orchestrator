@@ -5966,6 +5966,26 @@ mod selection_schema_tests {
 
     #[test]
     fn generated_complete_contracts_match_tracked_schemas() -> Result<()> {
+        if std::env::var_os("MACO_REGENERATE_REPORT_SCHEMAS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            for (name, schema) in [
+                (
+                    "supervisor-final-report-v1.schema.json",
+                    supervisor_final_report_schema_value(),
+                ),
+                (
+                    "supervisor-collect-report-v1.schema.json",
+                    supervisor_collect_report_schema_value(),
+                ),
+            ] {
+                println!(
+                    "GENERATED_REPORT_SCHEMA:{name}:{}",
+                    serde_json::to_string_pretty(&schema)?
+                );
+            }
+            return Ok(());
+        }
         let tracked: serde_json::Value = serde_json::from_str(include_str!(
             "../../schemas/supervisor-final-report-v1.schema.json"
         ))?;

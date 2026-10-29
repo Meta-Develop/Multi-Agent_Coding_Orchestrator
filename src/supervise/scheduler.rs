@@ -8941,6 +8941,7 @@ mod selection_policy_tests {
         let attempts = run_dir.path().join("selection-attempts");
         std::fs::create_dir_all(&attempts)?;
         let evidence = AttemptOutcomeEvidence {
+            pricing: Vec::new(),
             version: 1,
             run_id: "cpo-refresh".to_string(),
             assignment_id: "assignment-1".to_string(),

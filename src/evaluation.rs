@@ -3755,15 +3755,16 @@ pub use executed_measurements::{
     observed_run_measurements_from_captured_supervisor_final_report,
     observed_run_measurements_from_retained_supervisor_final_report,
     review_aggregate_establishes_full_independent_coverage, ObservedCandidateFootprint,
-    ObservedRunMeasurements, ParentReviewCaptureObservation, OBSERVED_RUN_MEASUREMENTS_VERSION,
-    REPORTED_COST_EQUIVALENT_NOTICE,
+    ObservedRunMeasurements, ObservedRunPricing, ParentReviewCaptureObservation,
+    OBSERVED_RUN_MEASUREMENTS_VERSION, REPORTED_COST_EQUIVALENT_NOTICE,
 };
 pub use executed_summary::{
     summarize_executed_observation_runs, ExecutedAcceptedQualityStatus,
     ExecutedAcceptedQualitySummary, ExecutedExperimentSummary, ExecutedObservationParetoConclusion,
     ExecutedObservationParetoStatus, ExecutedOutcomeCount, ExecutedOutcomeCounts,
-    ExecutedParetoPoint, ExecutedProfileSummary, EXECUTED_SUMMARY_SCHEMA_VERSION,
-    MISSING_PARENT_REVIEW_PRODUCER_NOTICE, QUALIFIED_ACCEPTED_TASK_FRACTION_LABEL,
+    ExecutedParetoPoint, ExecutedProfileSummary, ExecutedRunPricing,
+    EXECUTED_SUMMARY_SCHEMA_VERSION, MISSING_PARENT_REVIEW_PRODUCER_NOTICE,
+    QUALIFIED_ACCEPTED_TASK_FRACTION_LABEL,
 };
 pub mod rescore;
 pub use experiment::{

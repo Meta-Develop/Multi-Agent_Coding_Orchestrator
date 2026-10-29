@@ -125,12 +125,13 @@ pub(super) fn external_dispatch_may_have_started(
 pub(super) fn record_budget_dispatch_refusal(
     outcome: &mut AssignmentExecutionOutcome,
     assignment: &OrchestratorAssignment,
-    owner: &str,
-    role: AgentRole,
+    owner_role: (&str, AgentRole),
     refusal: &BudgetAdmissionRefusal,
+    pricing_context: (SupervisorRuntime, &ExternalAgentCommand, &RunBudgetLedger),
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     journal_parent_id: &str,
 ) -> Result<()> {
+    let (owner, role) = owner_role;
     let denial = GateDenial::new(
         outcome
             .gate_tracker
@@ -167,10 +168,16 @@ pub(super) fn record_budget_dispatch_refusal(
         .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
     outcome.assignment_failed = true;
     outcome.budget_dispatch_stopped = true;
+    let guidance = if matches!(refusal, BudgetAdmissionRefusal::MissingCostEstimate) {
+        let (runtime, command, ledger) = pricing_context;
+        operator_pricing::missing_cost_estimate_guidance(runtime, command, ledger)
+    } else {
+        "inspect the typed gate denial and run_budget report".to_string()
+    };
     outcome.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "run budget denied new '{}' dispatch for assignment '{}'; inspect the typed gate denial and run_budget report",
+            "run budget denied new '{}' dispatch for assignment '{}'; {guidance}",
             role.as_str(),
             assignment.id
         ),

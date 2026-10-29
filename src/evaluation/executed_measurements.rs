@@ -15,8 +15,9 @@ use crate::{
         ReviewLensVerdictStatus,
     },
     supervise::{
-        held_out::HeldOutCandidateEvidence, AgentRole, Finding, OrchestratorReviewReport,
-        RoleUsageReport, SupervisorFinalReport,
+        held_out::HeldOutCandidateEvidence, AgentRole, BudgetChargeReport, Finding,
+        OrchestratorReviewReport, PricingContractProvenance, RoleUsageReport,
+        SupervisorFinalReport,
     },
 };
 use anyhow::{Context, Result};
@@ -66,6 +67,9 @@ pub struct ObservedRunMeasurements {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_usage: Option<Usage>,
     pub total_cost_usd: Option<f64>,
+    /// Copied from the retained budget ledger without repricing reported usage.
+    #[serde(default)]
+    pub pricing: Option<ObservedRunPricing>,
     #[serde(default = "reported_cost_notice")]
     pub cost_notice: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -94,6 +98,29 @@ pub struct ObservedRunMeasurements {
     pub parent_review_capture_unavailable_reason: Option<String>,
     #[serde(skip)]
     pub(crate) parent_review_capture_proof: Option<ParentReviewCaptureProof>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObservedRunPricing {
+    pub contract: Option<PricingContractProvenance>,
+    pub charges: Vec<BudgetChargeReport>,
+    pub cost_complete: bool,
+}
+
+impl ObservedRunPricing {
+    pub(crate) fn from_report(report: &SupervisorFinalReport) -> Option<Self> {
+        let budget = report.run_budget.as_ref()?;
+        // Historical budgets default these absent settlement fields during deserialization.
+        if budget.pricing_contract.is_none() && budget.charges.is_empty() && !budget.cost_complete {
+            return None;
+        }
+        Some(Self {
+            contract: budget.pricing_contract.clone(),
+            charges: budget.charges.clone(),
+            cost_complete: budget.cost_complete,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -126,6 +153,7 @@ fn binding_from_held_out(held_out: &HeldOutCandidateEvidence) -> ObservedRunMeas
         retained_supervisor_report_unavailable_reason: None,
         total_usage: None,
         total_cost_usd: None,
+        pricing: None,
         cost_notice: reported_cost_notice(),
         role_usage: BTreeMap::new(),
         usage_complete: None,
@@ -232,6 +260,7 @@ fn lift_observational_fields(
     measurements.retained_supervisor_report_sha256 = Some(sha256_hex(report_bytes));
     measurements.total_usage = report.total_usage;
     measurements.total_cost_usd = report.total_cost_usd;
+    measurements.pricing = ObservedRunPricing::from_report(report);
     measurements.role_usage = report.role_usage.clone();
     measurements.usage_complete = Some(report.usage_complete);
     measurements.findings = report.findings.clone();
@@ -781,6 +810,63 @@ pub(super) fn supervisor_final_report_execution_fixture_bytes() -> Vec<u8> {
 }
 
 #[cfg(test)]
+pub(super) fn synthetic_pricing(cost_complete: bool) -> ObservedRunPricing {
+    let prices = BTreeMap::from([(
+        "synthetic-model".to_string(),
+        crate::llm::provider::ModelPricing {
+            input_usd_per_million_tokens: 1.0,
+            output_usd_per_million_tokens: 2.0,
+        },
+    )]);
+    let contract = crate::llm::pricing_contract::OperatorPricingContract {
+        schema_version: 1,
+        contract_id: "synthetic-contract".to_string(),
+        revision: "synthetic-revision".to_string(),
+        effective_date: "2000-01-01".to_string(),
+        valid_through: "9999-12-31".to_string(),
+        source_reference: "urn:synthetic:test".to_string(),
+        source_attribution: "Synthetic test rates only".to_string(),
+        currency: "USD".to_string(),
+        unit: "per_million_tokens".to_string(),
+        billing: "flat_input_output".to_string(),
+        scopes: vec![crate::llm::pricing_contract::PricingScope {
+            runtime: crate::supervise::SupervisorRuntime::Codex,
+            model: "synthetic-model".to_string(),
+            account_id: "synthetic-account".to_string(),
+            plan_id: "synthetic-plan".to_string(),
+        }],
+        price_map_sha256: crate::llm::pricing_contract::price_map_sha256(&prices).unwrap(),
+    };
+    let validated = contract.validate(&prices).unwrap();
+    let provenance = PricingContractProvenance {
+        contract,
+        normalized_sha256: validated.content_sha256().to_string(),
+        plan_id: "synthetic-plan".to_string(),
+    };
+    ObservedRunPricing {
+        contract: Some(provenance.clone()),
+        cost_complete,
+        charges: vec![BudgetChargeReport {
+            reservation_id: 1,
+            role: AgentRole::Worker,
+            tokens: 10,
+            cost_usd: cost_complete.then_some(0.0125),
+            usage_complete: true,
+            pricing: crate::supervise::ChargePricing {
+                basis: if cost_complete {
+                    crate::supervise::ChargePricingBasis::OperatorContractEstimate
+                } else {
+                    crate::supervise::ChargePricingBasis::Unpriced
+                },
+                contract: Some(provenance),
+                runtime: Some("codex".to_string()),
+                model: cost_complete.then(|| "synthetic-model".to_string()),
+            },
+        }],
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::merge::CandidateValidationBinding;
@@ -869,6 +955,46 @@ mod tests {
         assert!(measurements.observed_dispatch.is_some());
         assert!(measurements.execution_unavailable_reason.is_none());
         assert_eq!(measurements.cost_notice, REPORTED_COST_EQUIVALENT_NOTICE);
+    }
+
+    #[test]
+    fn evaluation_capture_preserves_frozen_pricing_without_repricing() -> Result<()> {
+        for complete in [true, false] {
+            let held_out = sample_binding();
+            let workspace = tempfile::TempDir::new()?;
+            git2::Repository::init(workspace.path())?;
+            let mut report: SupervisorFinalReport =
+                serde_json::from_slice(&supervisor_final_report_execution_fixture_bytes())?;
+            let pricing = synthetic_pricing(complete);
+            let ledger = crate::supervise_budget::RunBudgetLedger::new(Default::default())?;
+            let mut budget = ledger.report()?;
+            budget.pricing_contract = pricing.contract.clone();
+            budget.charges = pricing.charges.clone();
+            budget.cost_complete = pricing.cost_complete;
+            report.run_budget = Some(budget);
+            report.total_cost_usd = complete.then_some(0.0125);
+            let bytes = serde_json::to_vec(&report)?;
+            let captured = observed_run_measurements_from_captured_supervisor_final_report(
+                &held_out,
+                &report,
+                &bytes,
+                workspace.path(),
+                &BTreeSet::new(),
+            )?;
+            assert_eq!(captured.pricing, Some(pricing.clone()));
+            assert_eq!(captured.total_cost_usd, report.total_cost_usd);
+            assert_eq!(captured.usage_complete, Some(report.usage_complete));
+            let mut json = serde_json::to_value(&captured)?;
+            assert_eq!(
+                serde_json::from_value::<ObservedRunMeasurements>(json.clone())?.pricing,
+                Some(pricing)
+            );
+            json.as_object_mut().unwrap().remove("pricing");
+            assert!(serde_json::from_value::<ObservedRunMeasurements>(json)?
+                .pricing
+                .is_none());
+        }
+        Ok(())
     }
 
     #[test]

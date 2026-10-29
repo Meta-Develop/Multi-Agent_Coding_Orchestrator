@@ -202,6 +202,42 @@ fn selected_account(run_id: &str, runtime: SupervisorRuntime) -> Option<String> 
     }
 }
 
+pub(super) fn missing_cost_estimate_guidance(
+    runtime: SupervisorRuntime,
+    command: &ExternalAgentCommand,
+    ledger: &RunBudgetLedger,
+) -> String {
+    let model = command.model.as_deref().unwrap_or("<unresolved model>");
+    let view = ledger.operator_pricing.as_ref();
+    let run_id = view.map(|view| view.run_id.as_str()).or_else(|| {
+        command
+            .agent_lifecycle
+            .as_ref()
+            .map(|identity| identity.run_id.as_str())
+    });
+    let account = run_id.and_then(|run_id| selected_account(run_id, runtime));
+    let plan_id = view.map_or("<missing pricing_plan_id>", |view| view.plan_id.as_str());
+    let reason = match (view, account.as_deref(), current_date()) {
+        (None, _, _) => "pricing_contract is missing or unbound".to_string(),
+        (_, None, _) => "selected account scope is unavailable".to_string(),
+        (Some(view), Some(account_id), Ok(date)) => view.contract.price_for(&PricingContext {
+            runtime,
+            model,
+            account_id,
+            plan_id,
+            as_of: &date,
+        }).map_or_else(|error| error.to_string(), |_| {
+            "current scope is priced; inspect changed model_pricing, unsupported usage allocation, reservation overflow, and unpriced rolling-window history".to_string()
+        }),
+        (_, _, Err(_)) => "pricing applicability date is unavailable".to_string(),
+    };
+    format!(
+        "MissingCostEstimate: runtime='{}', model='{model}', account_id='{}', pricing_plan_id='{plan_id}': {reason}. Fill authored-plan model_pricing['{model}'].input_usd_per_million_tokens and output_usd_per_million_tokens, pricing_plan_id, and pricing_contract (contract_id, revision, effective_date, valid_through, source_reference, source_attribution, currency, unit, billing, scopes with exact runtime/model/account_id/plan_id, price_map_sha256). See docs/OPERATOR_PRICING.md and examples/supervise/operator-pricing.template.json. Rolling USD admission also requires priceable history throughout its window; a new contract cannot retroactively price unknown charges. Preserve the configured USD ceilings and start a new run after correcting the inputs.",
+        runtime.as_str(),
+        account.as_deref().unwrap_or("<unresolved selected account>")
+    )
+}
+
 fn current_date() -> Result<String> {
     Ok(
         crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())?[..10]
