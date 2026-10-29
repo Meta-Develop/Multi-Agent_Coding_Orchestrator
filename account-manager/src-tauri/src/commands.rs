@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::account_authority::SelectedAccountBinding;
 use crate::error::{Error, Result};
 use crate::model::{
-    Account, AccountListError, AccountListErrorKind, AccountListOutcome, AuthKind, LaunchedProcess,
+    Account, AccountListError, AccountListErrorKind, AccountListOutcome, AuthKind,
     ProviderAccountList, ProviderDescriptor, ProviderQuotaList, QuotaListError, QuotaListErrorKind,
     QuotaListOutcome, QuotaSnapshot, RelayStatus, RouteRule, StoredAccountMetadata,
     StoredAccountState,
@@ -26,8 +26,9 @@ use crate::relay;
 use crate::router::{self, RouteError, RouteRuleField};
 use crate::storage;
 
-#[path = "authority_client.rs"]
-mod authority_client;
+use crate::account_authority::{LaunchOperationStatus, OperationHandle};
+use crate::authority_client;
+use crate::launch_client::{DesktopLaunch, ManagedLaunchService};
 #[path = "login_commands.rs"]
 mod login_commands;
 #[path = "observe_commands.rs"]
@@ -375,48 +376,30 @@ fn delete_account_with_authority(
 /// declares the command; core resolves any credential only at spawn time and
 /// returns non-secret process metadata.
 #[tauri::command]
-pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
-    let adapter = adapter_for(&provider_id)?;
-    if adapter.activation_mechanism() != ActivationMechanism::LaunchEnvironment {
-        return Err(Error::NotImplemented("launch_provider"));
-    }
-    let authority = account_authority()?;
-    launch_provider_with_authority(adapter.as_ref(), &authority)
+pub fn launch_provider(
+    provider_id: String,
+    service: tauri::State<'_, ManagedLaunchService>,
+) -> Result<DesktopLaunch> {
+    service.start(adapter_for(&provider_id)?.as_ref())
 }
 
-fn launch_provider_with_authority(
-    adapter: &dyn ProviderAdapter,
-    authority: &AccountAuthority,
-) -> Result<LaunchedProcess> {
-    let registry = match authority {
-        AccountAuthority::InProcess(registry) => registry,
-        AccountAuthority::Remote(_) => return Err(Error::NotImplemented("remote launch_provider")),
-    };
-    let binding = registry
-        .selected_binding(adapter.id())?
-        .ok_or_else(|| Error::NoSelectedAccount(adapter.id().to_string()))?;
-    let child =
-        providers::spawn_selected_launch(registry, adapter, &binding, storage::default_store)?;
-    let process = LaunchedProcess {
-        provider_id: binding.provider_id,
-        account_id: binding.account_id,
-        process_id: child.id(),
-    };
-    // Waiting outside the command keeps an exited CLI from becoming a zombie
-    // while allowing the IPC call to return as soon as the process starts.
-    let _ = reap_launch(child);
-    Ok(process)
+/// Refresh only a launch reference issued by this desktop process.
+#[tauri::command]
+pub fn launch_status(
+    handle: OperationHandle,
+    service: tauri::State<'_, ManagedLaunchService>,
+) -> Result<LaunchOperationStatus> {
+    service.status(&handle, false)
 }
 
-fn reap_launch(
-    mut child: providers::LeasedChild,
-) -> std::thread::JoinHandle<io::Result<std::process::ExitStatus>> {
-    std::thread::spawn(move || child.wait())
+/// Request cancellation; only the authority can confirm the child's exit.
+#[tauri::command]
+pub fn launch_cancel(
+    handle: OperationHandle,
+    service: tauri::State<'_, ManagedLaunchService>,
+) -> Result<LaunchOperationStatus> {
+    service.status(&handle, true)
 }
-
-#[cfg(test)]
-#[path = "commands_launch_tests.rs"]
-mod launch_tests;
 
 /// One honest quota result for every registered provider.
 ///
@@ -677,6 +660,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            app.manage(ManagedLaunchService::new(account_authority()?));
             let login = build_managed_login_service(account_authority()?);
             app.manage(login);
             Ok(())
@@ -688,6 +672,8 @@ pub fn run() {
             activate_account,
             delete_account,
             launch_provider,
+            launch_status,
+            launch_cancel,
             list_quota,
             list_route_rules,
             replace_route_rules,

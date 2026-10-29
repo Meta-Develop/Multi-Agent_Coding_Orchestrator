@@ -4,6 +4,7 @@ import type {
   AccountObserveResult,
   AuthKind,
   LaunchedProcess,
+  LaunchOperationStatus,
   LoginAccountBinding,
   LoginStatus,
   ProviderAccountList,
@@ -83,6 +84,16 @@ export function observeAccount(
  */
 export function launchProvider(providerId: string): Promise<LaunchedProcess> {
   return invoke<LaunchedProcess>('launch_provider', { providerId })
+}
+
+/** Queries only a handle retained by this desktop process. */
+export function launchStatus(handle: string): Promise<LaunchOperationStatus> {
+  return invoke<LaunchOperationStatus>('launch_status', { handle })
+}
+
+/** A cancellation request is not confirmation of child exit. */
+export function launchCancel(handle: string): Promise<LaunchOperationStatus> {
+  return invoke<LaunchOperationStatus>('launch_cancel', { handle })
 }
 
 export function listQuota(): Promise<ProviderQuotaList[]> {

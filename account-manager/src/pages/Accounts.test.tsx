@@ -814,6 +814,36 @@ describe('Accounts page', () => {
     expect(alert).not.toHaveTextContent(/switched|active session changed/i)
   })
 
+  it('reports an unconfirmed remote launch only after a lost reply', async () => {
+    const user = userEvent.setup()
+    const reason =
+      'configuration for `account-authority` could not be read: launch reply unconfirmed; retry Launch to recover a pending start, or Check launch status for a known handle'
+    stubInvoke({
+      providers: [launchProviderDescriptor('grok-cli', 'Grok CLI')],
+      listings: [
+        listing('grok-cli', {
+          accounts: [
+            account({
+              id: 'work',
+              providerId: 'grok-cli',
+              label: 'Work',
+              isSelectedForLaunch: true,
+            }),
+          ],
+        }),
+      ],
+      launch: async () => {
+        throw reason
+      },
+    })
+    renderApp()
+
+    await user.click(await screen.findByRole('button', { name: 'Launch Work' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent(
+      `Could not confirm launch of Grok CLI for Work: ${reason}`,
+    )
+  })
+
   it('offers Gemini Google sign-in and sends oauth without a password field', async () => {
     const user = userEvent.setup()
     const loginStart = vi.fn(async () => loginStatusFixture('waiting-for-user'))

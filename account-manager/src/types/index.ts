@@ -84,11 +84,29 @@ export interface StoredAccountMetadata {
 }
 
 /** Non-secret result of launching a selected provider account. */
-export interface LaunchedProcess {
+export interface LocalLaunchedProcess {
   providerId: ProviderId
   accountId: string
   processId: number
 }
+
+/** Closed authority launch response; contains no command, output, or material. */
+export interface LaunchOperationStatus {
+  handle: string
+  state:
+    | 'starting'
+    | 'running'
+    | 'cancelling'
+    | 'exited'
+    | 'cancelled'
+    | 'failed'
+    | 'outcome-unknown'
+  processId: number | null
+  exitCode: number | null
+  failureCode: string | null
+}
+
+export type LaunchedProcess = LocalLaunchedProcess | LaunchOperationStatus
 
 /** One user-authored routing rule, evaluated in list order (FR-7). */
 export interface RouteRule {
