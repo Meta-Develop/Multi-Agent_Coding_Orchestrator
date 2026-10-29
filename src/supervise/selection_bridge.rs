@@ -1158,17 +1158,31 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             provenance: decision,
         });
     }
-    if !report.compatible {
+    // An unavailable authored lens is refused by the existing review dispatch
+    // path, which records its procedural verdict and journal entry. The pure
+    // preflight report still includes that diagnostic without granting a lens
+    // launch authorization here.
+    let first_failure = report.diagnostics.iter().find(|entry| {
+        entry.status != selection_preflight::SelectionPreflightStatus::Compatible
+            && !(entry.lens_id.is_some()
+                && entry.rejection
+                    == Some(selection_preflight::SelectionPreflightRejection::ModelUnavailable))
+    });
+    if let Some(first) = first_failure {
         let message = selection_preflight::refusal_message(&report)?;
         // Preserve malformed-input errors while reporting every reachable failure.
         if !report.frozen_inputs.unavailable.is_empty() {
             bail!("{message}");
         }
-        let first = report
-            .diagnostics
-            .iter()
-            .find(|entry| entry.status != selection_preflight::SelectionPreflightStatus::Compatible)
-            .context("incompatible selection preflight omitted its diagnostic")?;
+        if let Some(invalid) = report.diagnostics.iter().find(|entry| {
+            entry.rejection == Some(selection_preflight::SelectionPreflightRejection::InvalidInput)
+        }) {
+            bail!(
+                "automatic selector rejected role '{}': {}; {message}",
+                invalid.role.as_str(),
+                invalid.message
+            );
+        }
         return Ok(SupervisorSelectionResolution {
             mode: if automatic {
                 SupervisorSelectionMode::Automatic
@@ -1190,7 +1204,7 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             }),
         });
     }
-    // All roles and lenses passed. Only now may selection authority be bound.
+    // All role and nonprocedural lens gates passed. Only now bind role authority.
     let mut resolved = BTreeMap::new();
     for event in &decisions {
         let choice = match executable_choice(&event.provenance, runtime, event.role)? {
