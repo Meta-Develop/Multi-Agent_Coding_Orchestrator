@@ -383,9 +383,25 @@ changes `launchServiceId`: an old start cannot be replayed against the new
 instance, and lost operations require reconciliation rather than a new key or
 automatic replay. These records are in memory, not durable recovery evidence.
 
-The desktop remote-launch command remains disabled pending its typed client
-integration and corresponding desktop transport/status/cancellation tests.
-The existing in-process desktop path continues to use leased child custody.
+The desktop uses these operations for socket-backed authorities. Its webview
+receives only the opaque handle and closed process status; status and cancel
+accept only handles retained by that desktop process. The native client keeps
+the original authority/service identity and freezes a pending start's binding
+and retry key until a reply is confirmed. A lost start reply can be recovered
+by retrying Launch without spawning again. Status/cancel disconnects preserve
+the last confirmed status and never imply exit or cancellation. References
+survive page navigation, but are not durable across desktop process restarts.
+The in-process desktop path continues to use leased child custody.
+
+Confirmed `access-denied`, `busy`, or `unavailable` start refusals occur before
+the retry key is recorded. They discard the pending desktop snapshot so a later
+Launch discovers the current service identity and uses a fresh key. Unconfirmed
+transport replies, invalid launch-status results, and `state-unavailable`
+errors retain the original binding and key because dispatch may have occurred.
+
+The existing provider-wide registry barrier still refuses future-selection
+changes while a launch uses that provider. Narrowing that barrier to permit
+selection-only changes without replacing active material remains separate.
 
 Before enabling a client, review the complete wire schema and its closed
 provider-specific projections, transport bounds, identifier encoding, and
