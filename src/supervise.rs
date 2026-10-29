@@ -6,8 +6,8 @@ use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 #[cfg(test)]
 use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
-    BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
-    RunBudgetReport, RunBudgetSource, RunBudgetSources,
+    BudgetAction, BudgetAmount, BudgetChargeReport, BudgetReason, BudgetRemaining,
+    RoleBudgetReport, RunBudgetLimits, RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -434,7 +434,14 @@ mod plan_validation;
 use plan_validation::*;
 
 mod dispatch;
+pub(crate) mod operator_pricing;
+mod pricing_provenance;
 use dispatch::*;
+pub(crate) use pricing_provenance::outcome_charge_schema_value;
+pub use pricing_provenance::{
+    ChargePricing, ChargePricingBasis, OutcomeChargePricing, OutcomeCostPhase,
+    PricingContractProvenance,
+};
 
 mod gate_health;
 pub use gate_health::*;
@@ -2090,6 +2097,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
+    operator_pricing: Option<operator_pricing::FrozenOperatorPricing>,
     resolved_routing_policy: Option<crate::selection::routing_policy::FrozenRoutingPolicy>,
     task_routing_assessment: Option<TaskRoutingAssessment>,
     normal_intake_selection: Option<crate::selection::routing_policy::SelectedLaunchRequest>,
@@ -3518,7 +3526,16 @@ pub struct SupervisorResumeReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_denial: Option<GateDenial>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_report: Option<SupervisorFinalReport>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("supervisor resume refused: {diagnostic} ({gate_denial:?})")]
+pub struct SupervisorResumeRefusal {
+    pub gate_denial: GateDenial,
+    pub diagnostic: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3761,9 +3778,9 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         SupervisorRunLifecycle::Finalized => status
             .final_report
             .context("finalized injected cascade source report is missing")?,
-        SupervisorRunLifecycle::Resumable => resume_supervisor_run(&repo, run_id.clone())?
-            .final_report
-            .context("resumed injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Resumable => {
+            plan_api::source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?
+        }
         SupervisorRunLifecycle::Active
         | SupervisorRunLifecycle::Interrupted
         | SupervisorRunLifecycle::Uncertain => {

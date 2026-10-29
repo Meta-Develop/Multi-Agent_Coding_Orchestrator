@@ -196,6 +196,40 @@ revocation. Reauthentication failure leaves a truthful recoverable state.
 
 ## 6. Frozen operation lifecycle
 
+The in-process selected-launch path uses a one-shot
+`providers::launch_lifecycle::LaunchLifecycle` operation. Its immutable public
+view binds a run ID, operation ID, and exact `SelectedAccountBinding`; credential
+references and environment input names contain no material. Callers with run
+identity construct the guard explicitly. The compatibility
+`spawn_selected_launch` entry assigns a fresh operation ID within its local
+process run. This identity is not a durable remote operation handle.
+
+Service `launch.*` operations consume the same guard, with `launchServiceId` as
+the run ID and the opaque operation handle as the operation ID. The guard is
+created once before provider resolution and reused by idempotent retries;
+its reference-only view remains internal to the service. Service stdio is
+detached at the guarded spawn edge.
+
+The guard acquires the selected-use lease before adapter declaration or store
+resolution. Optional monotonic expiry and pre-spawn revocation are checked
+before resolution and again at the spawn edge. Revocation and spawn share an
+admission lock. Expiry governs admission, not an already-running child's
+lifetime. Adapters declare inherited credential input names; each must be
+removed or replaced from the selected store. Their existing home confinement,
+authentication clearing, and child-only environment actions remain in force.
+This is an explicit adapter contract, not a scan of all ambient credentials.
+
+Refusal, spawn failure, confirmed normal/nonzero exit, and confirmed cancellation
+finalize once. `LeasedChild::cancel` kills only its owned child and waits for
+exit. Wait failure or abandoned custody with unknown exit retains the use lease
+and reports `ExitUnknown`, without claiming cancellation or finalization. The
+existing account mutation barrier continues to refuse replacement during use.
+Coordinated credential rotation/revocation, durable recovery, work-proposal
+operation dispatch, and the root external executor bridge remain separate
+integration work. The closed service launch path uses asynchronous cancellation
+requests through the same child custody; a successful signal alone cannot
+release the lease or finalize the guard.
+
 The initial operation kind is `work-proposal`: one fresh proposal turn, with no
 provider-owned workspace mutation, nested orchestration, or independent review.
 The adapter must establish the provider's tool restrictions before advertising
@@ -293,6 +327,46 @@ states are the UX goals; no code, assets, or text from another manager may be
 copied under [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## 9. Implementation acceptance
+
+### Closed service-owned launches
+
+The authority advertises `launch.start`, `launch.status`, and `launch.cancel`
+separately from the unadvertised work-proposal `operation.*` lifecycle. A start
+request contains only `authorityId`, `serviceId`, an exact selected `binding`
+(provider, account, incarnation, selection revision), and `idempotencyKey` in
+addition to the versioned envelope. `serviceId` is the `launchServiceId` from
+`authority.describe`. Status and cancel require the same authority/service and
+the opaque returned handle. The caller is the socket's authorized OS user;
+requests cannot supply caller identity, programs, arguments, environment, or
+credential references.
+
+The service atomically acquires the selected-use lease before resolving the
+adapter-declared command or material. It owns the child and lease independently
+of every client connection. Stdio is detached; responses contain only the
+handle, state, PID, exit code, and a closed failure code. Cancel signals the
+owned child and remains `cancelling` (or `outcome-unknown` on an uncertain wait
+or signal) until exit is confirmed. Only confirmed exit releases the lease.
+Deletion, replacement, and selection changes retain the registry's existing
+barriers.
+
+The accept loop dispatches connections to at most 16 workers. When that cap is
+full, additional connections close without dispatch or a response. A blocked
+lookup occupies its worker while other admitted connections can status/cancel
+existing operations. Uncertain waits stop background polling but retain child
+and lease custody in the operation row for later status/reconciliation.
+
+Identical start retries return the original operation, including terminal spawn
+failure, exit, and cancellation. Reusing a key with a different binding refuses.
+Terminal records are retained for the listener's lifetime; at 1,024 records the
+service refuses new operations instead of evicting retry protection. A lost
+response or disconnect never cancels or launches again. A service restart
+changes `launchServiceId`: an old start cannot be replayed against the new
+instance, and lost operations require reconciliation rather than a new key or
+automatic replay. These records are in memory, not durable recovery evidence.
+
+The desktop remote-launch command remains disabled pending its typed client
+integration and corresponding desktop transport/status/cancellation tests.
+The existing in-process desktop path continues to use leased child custody.
 
 Before enabling a client, review the complete wire schema and its closed
 provider-specific projections, transport bounds, identifier encoding, and

@@ -227,6 +227,7 @@ fn outcome_history_and_replay_bind_exact_assignment_shape() -> anyhow::Result<()
     input.assignment_shape_identity = Some(identity.clone());
     let candidate = select(&input)?.choice.expect("candidate").candidate;
     let row = OutcomeRecord {
+        pricing: Vec::new(),
         attempt_id: "shape-outcome".into(),
         task: input.task.clone(),
         assignment_shape_identity: Some(identity),
@@ -618,6 +619,7 @@ fn loaded_policy_observed_ledger_without_class_fit_applies_review_tradeoffs() ->
         effort: ReasoningEffort::None,
     };
     input.outcomes.push(OutcomeRecord {
+        pricing: Vec::new(),
         attempt_id: "attempt-1".to_string(),
         task: input.task.clone(),
         assignment_shape_identity: None,
@@ -2637,6 +2639,7 @@ fn judgment_fallback_below_xhigh_remains_ineligible_despite_prior_declaration() 
     )];
     input.pools = vec![pool(&runtime, 0)];
     input.outcomes.push(OutcomeRecord {
+        pricing: Vec::new(),
         attempt_id: "verified-low-gate-outcome-fixture".to_string(),
         task: input.task.clone(),
         assignment_shape_identity: None,
@@ -2902,6 +2905,7 @@ fn accepted_task_cost_ledger_includes_every_cost_class() {
         effort: ReasoningEffort::High,
     };
     input.outcomes.push(OutcomeRecord {
+        pricing: Vec::new(),
         attempt_id: "attempt-1".to_string(),
         task: input.task.clone(),
         assignment_shape_identity: None,
@@ -3159,6 +3163,7 @@ fn conflicting_duplicate_outcome_attempt_ids_fail_independent_of_order() {
         effort: input.catalogs[0].models[0].supported_efforts[0],
     };
     let accepted = OutcomeRecord {
+        pricing: Vec::new(),
         attempt_id: "duplicate-attempt".to_string(),
         task: input.task.clone(),
         assignment_shape_identity: None,

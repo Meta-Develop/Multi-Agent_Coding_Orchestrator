@@ -1,18 +1,14 @@
 use super::*;
 
-/// Placeholder catalog rates describe simulations, not real-provider prices.
-/// Keep explicit valid plan prices, including zero, distinct from those defaults.
+/// Catalog rates and unbound tables are usable only for simulations.
 pub(super) fn pricing_for_runtime(
     plan: &SupervisorPlan,
     model: &str,
     runtime: SupervisorRuntime,
 ) -> Option<ModelPricing> {
-    use crate::llm::provider::{resolve_model_pricing, ModelPricingProvenance};
-    resolve_model_pricing(&plan.model_pricing, model)
-        .filter(|resolved| {
-            runtime == SupervisorRuntime::Fake
-                || resolved.provenance == ModelPricingProvenance::PlanOverride
-        })
+    (runtime == SupervisorRuntime::Fake)
+        .then(|| crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model))
+        .flatten()
         .map(|resolved| resolved.pricing)
 }
 
@@ -51,7 +47,17 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
     let pricing = command
         .model
         .as_ref()
-        .and_then(|model| pricing_for_runtime(plan, model, runtime))
+        .and_then(|model| {
+            if runtime == SupervisorRuntime::Fake {
+                pricing_for_runtime(plan, model, runtime)
+            } else {
+                ledger
+                    .operator_pricing
+                    .as_ref()
+                    .filter(|view| view.matches_prices(&plan.model_pricing))
+                    .and_then(|view| view.price_for(runtime, model))
+            }
+        })
         .filter(|_| runtime != SupervisorRuntime::GeminiCli || !command.uses_gemini_bridge());
     let cost_usd = pricing
         .map(|pricing| {
@@ -96,7 +102,7 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
                 ledger,
                 reservation,
                 pricing,
-                model_pricing: plan.model_pricing.clone(),
+                pricing_model: command.model.clone(),
                 state: DispatchBudgetReservationState::Reserved(runtime),
             },
         )),
@@ -119,12 +125,13 @@ pub(super) fn external_dispatch_may_have_started(
 pub(super) fn record_budget_dispatch_refusal(
     outcome: &mut AssignmentExecutionOutcome,
     assignment: &OrchestratorAssignment,
-    owner: &str,
-    role: AgentRole,
+    owner_role: (&str, AgentRole),
     refusal: &BudgetAdmissionRefusal,
+    pricing_context: (SupervisorRuntime, &ExternalAgentCommand, &RunBudgetLedger),
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     journal_parent_id: &str,
 ) -> Result<()> {
+    let (owner, role) = owner_role;
     let denial = GateDenial::new(
         outcome
             .gate_tracker
@@ -161,10 +168,16 @@ pub(super) fn record_budget_dispatch_refusal(
         .escalate(denial, artifacts, &assignment.id, journal_parent_id)?;
     outcome.assignment_failed = true;
     outcome.budget_dispatch_stopped = true;
+    let guidance = if matches!(refusal, BudgetAdmissionRefusal::MissingCostEstimate) {
+        let (runtime, command, ledger) = pricing_context;
+        operator_pricing::missing_cost_estimate_guidance(runtime, command, ledger)
+    } else {
+        "inspect the typed gate denial and run_budget report".to_string()
+    };
     outcome.findings.push(Finding {
         severity: FindingSeverity::Error,
         message: format!(
-            "run budget denied new '{}' dispatch for assignment '{}'; inspect the typed gate denial and run_budget report",
+            "run budget denied new '{}' dispatch for assignment '{}'; {guidance}",
             role.as_str(),
             assignment.id
         ),

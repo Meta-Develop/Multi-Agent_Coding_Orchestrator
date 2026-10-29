@@ -1,0 +1,30 @@
+{
+  "pricing_plan_id": "REPLACE_WITH_EXACT_PLAN_LABEL",
+  "model_pricing": {
+    "REPLACE_WITH_EXACT_MODEL": {
+      "input_usd_per_million_tokens": "SYNTHETIC_PLACEHOLDER_NOT_A_REAL_RATE",
+      "output_usd_per_million_tokens": "SYNTHETIC_PLACEHOLDER_NOT_A_REAL_RATE"
+    }
+  },
+  "pricing_contract": {
+    "schema_version": 1,
+    "contract_id": "REPLACE_WITH_OPERATOR_CONTRACT_ID",
+    "revision": "REPLACE_WITH_SOURCE_REVISION",
+    "effective_date": "YYYY-MM-DD",
+    "valid_through": "YYYY-MM-DD",
+    "source_reference": "REPLACE_WITH_APPLICABLE_DATED_SOURCE_REFERENCE",
+    "source_attribution": "SYNTHETIC TEMPLATE ONLY; replace with actual source attribution",
+    "currency": "USD",
+    "unit": "per_million_tokens",
+    "billing": "flat_input_output",
+    "scopes": [
+      {
+        "runtime": "codex",
+        "model": "REPLACE_WITH_EXACT_MODEL",
+        "account_id": "REPLACE_WITH_SELECTED_ACCOUNT_LABEL",
+        "plan_id": "REPLACE_WITH_EXACT_PLAN_LABEL"
+      }
+    ],
+    "price_map_sha256": "RECOMPUTE_FROM_COMPLETED_NORMALIZED_RATE_MAP"
+  }
+}

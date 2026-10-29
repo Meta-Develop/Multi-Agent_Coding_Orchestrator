@@ -4,6 +4,11 @@ One `maco supervise run` on Linux, or on WSL2 when that guest already has a
 systemd user session. Native Windows is refused before spawn. The commands
 below are the ones the CLI accepts.
 
+For USD ceilings or rolling USD quotas, prepare a
+[dated operator pricing contract](OPERATOR_PRICING.md) using the deliberately
+invalid [fill-in template](../examples/supervise/operator-pricing.template.json).
+No real prices ship with that template.
+
 ## Host
 
 Writable runs use the Linux systemd and cgroup v2 backend. Before spawn,

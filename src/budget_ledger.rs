@@ -12,6 +12,7 @@ use crate::{
     llm::ProviderError,
     optimizer::quota_pools::{ConsumptionLedger, LedgerEntry, PoolKey, QuotaConfig, ResetWindow},
     state_journal::{AuthenticatedStateJournal, JournalRecord, JournalSpec},
+    supervise::{ChargePricing, PricingContractProvenance},
 };
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -53,6 +54,23 @@ impl JournalSpec for BudgetLedgerJournalSpec {
 }
 
 type BudgetJournal = AuthenticatedStateJournal<BudgetLedgerJournalSpec>;
+
+// Bound contract metadata before dispatch, leaving room for the settlement
+// allocation, event fields and authenticated journal envelope in a 64 KiB record.
+pub(crate) const MAX_PRICING_PROVENANCE_BYTES: usize =
+    BudgetLedgerJournalSpec::MAX_RECORD_BYTES as usize / 4;
+
+pub(crate) fn validate_pricing_provenance_size(
+    provenance: &PricingContractProvenance,
+) -> Result<()> {
+    if serde_json::to_vec(provenance)?.len() > MAX_PRICING_PROVENANCE_BYTES {
+        bail!(
+            "pricing_contract provenance exceeds the rolling journal binding limit of {} bytes",
+            MAX_PRICING_PROVENANCE_BYTES
+        );
+    }
+    Ok(())
+}
 
 thread_local! {
     static BINDING: RefCell<Option<RollingBudgetBinding>> = const { RefCell::new(None) };
@@ -178,6 +196,8 @@ enum BudgetLedgerEvent {
     Reservation {
         version: u32,
         reservation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pricing: Option<ChargePricing>,
         tokens: usize,
         #[serde(default)]
         requests: u64,
@@ -190,6 +210,8 @@ enum BudgetLedgerEvent {
     ReservationReconciled {
         version: u32,
         reservation_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pricing: Option<ChargePricing>,
         tokens: usize,
         requests: u64,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -211,6 +233,8 @@ enum BudgetLedgerEvent {
     PoolConsume {
         version: u32,
         completion_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        pricing: Option<ChargePricing>,
         pool: PoolKey,
         tokens: u64,
         requests: u64,
@@ -351,6 +375,18 @@ impl std::fmt::Debug for WorkspaceBudgetLedger {
 }
 
 impl WorkspaceBudgetLedger {
+    #[cfg(test)]
+    pub(crate) fn settled_pricing(&self) -> Vec<&ChargePricing> {
+        self.events
+            .iter()
+            .filter_map(|event| match event {
+                BudgetLedgerEvent::ReservationReconciled { pricing, .. }
+                | BudgetLedgerEvent::PoolConsume { pricing, .. } => pricing.as_ref(),
+                _ => None,
+            })
+            .collect()
+    }
+
     pub fn open_or_create(repo: impl AsRef<Path>) -> Result<Self> {
         let authenticator = repository_auth_writer(repo.as_ref())
             .context("failed to open repository authentication for the rolling budget ledger")?
@@ -370,9 +406,19 @@ impl WorkspaceBudgetLedger {
         &mut self,
         reservation: DurableBudgetReservation,
     ) -> Result<DurableReservationRecordOutcome> {
+        self.record_reservation_with_pricing(reservation, None)
+    }
+
+    pub fn record_reservation_with_pricing(
+        &mut self,
+        reservation: DurableBudgetReservation,
+        pricing: Option<ChargePricing>,
+    ) -> Result<DurableReservationRecordOutcome> {
         validate_durable_reservation(&reservation)?;
         if let Some(existing) = self.reservation(&reservation.reservation_id) {
-            if existing == reservation && !self.reservation_is_terminal(&reservation.reservation_id)
+            if existing == reservation
+                && self.reservation_pricing(&reservation.reservation_id) == pricing
+                && !self.reservation_is_terminal(&reservation.reservation_id)
             {
                 return Ok(DurableReservationRecordOutcome::AlreadyRecorded);
             }
@@ -389,6 +435,7 @@ impl WorkspaceBudgetLedger {
         self.ensure_append_capacity(pending_after)?;
         self.publish(BudgetLedgerEvent::Reservation {
             version: LEDGER_FORMAT_VERSION,
+            pricing,
             reservation_id: reservation.reservation_id,
             tokens: reservation.tokens,
             requests: reservation.requests,
@@ -405,13 +452,22 @@ impl WorkspaceBudgetLedger {
         &mut self,
         reconciliation: DurableBudgetReconciliation,
     ) -> Result<DurableReservationRecordOutcome> {
-        self.reconcile_reservation_inner(reconciliation, false)
+        self.reconcile_reservation_with_pricing(reconciliation, None)
+    }
+
+    pub fn reconcile_reservation_with_pricing(
+        &mut self,
+        reconciliation: DurableBudgetReconciliation,
+        pricing: Option<ChargePricing>,
+    ) -> Result<DurableReservationRecordOutcome> {
+        self.reconcile_reservation_inner(reconciliation, false, pricing)
     }
 
     fn reconcile_reservation_inner(
         &mut self,
         reconciliation: DurableBudgetReconciliation,
         recovered_after_process_death: bool,
+        pricing: Option<ChargePricing>,
     ) -> Result<DurableReservationRecordOutcome> {
         validate_durable_reconciliation(&reconciliation)?;
         let reservation = self
@@ -422,16 +478,28 @@ impl WorkspaceBudgetLedger {
                     reconciliation.reservation_id
                 )
             })?;
+        let frozen_contract = self
+            .reservation_pricing(&reconciliation.reservation_id)
+            .and_then(|pricing| pricing.contract);
+        if frozen_contract
+            != pricing
+                .as_ref()
+                .and_then(|pricing| pricing.contract.clone())
+        {
+            bail!("workspace budget reconciliation changed its frozen pricing contract");
+        }
         if let Some(terminal) = self.reservation_terminal(&reconciliation.reservation_id) {
             if matches!(
                 terminal,
                 BudgetLedgerEvent::ReservationReconciled {
+                    pricing: held_pricing,
                     tokens,
                     requests,
                     cost_usd,
                     pool,
                     ..
-                } if *tokens == reconciliation.tokens
+                } if *held_pricing == pricing
+                    && *tokens == reconciliation.tokens
                     && *requests == reconciliation.requests
                     && *cost_usd == reconciliation.cost_usd
                     && *pool == reconciliation.pool
@@ -451,6 +519,7 @@ impl WorkspaceBudgetLedger {
         self.ensure_append_capacity(pending_after)?;
         self.publish(BudgetLedgerEvent::ReservationReconciled {
             version: LEDGER_FORMAT_VERSION,
+            pricing,
             reservation_id: reconciliation.reservation_id,
             tokens: reconciliation.tokens,
             requests: reconciliation.requests,
@@ -473,6 +542,7 @@ impl WorkspaceBudgetLedger {
         let recovered_at = unix_now()
             .context("failed to timestamp conservative workspace budget crash recovery")?;
         for reservation in pending {
+            let pricing = self.reservation_pricing(&reservation.reservation_id);
             self.reconcile_reservation_inner(
                 DurableBudgetReconciliation {
                     reservation_id: reservation.reservation_id,
@@ -483,6 +553,7 @@ impl WorkspaceBudgetLedger {
                     unix_seconds: recovered_at.max(reservation.unix_seconds),
                 },
                 true,
+                pricing,
             )?;
         }
         Ok(())
@@ -506,6 +577,17 @@ impl WorkspaceBudgetLedger {
                 pool: pool.clone(),
                 unix_seconds: *unix_seconds,
             }),
+            _ => None,
+        })
+    }
+
+    fn reservation_pricing(&self, reservation_id: &str) -> Option<ChargePricing> {
+        self.events.iter().find_map(|event| match event {
+            BudgetLedgerEvent::Reservation {
+                reservation_id: event_id,
+                pricing,
+                ..
+            } if event_id == reservation_id => pricing.clone(),
             _ => None,
         })
     }
@@ -643,9 +725,18 @@ impl WorkspaceBudgetLedger {
         &mut self,
         completion: CompletedPoolConsumption,
     ) -> Result<PoolConsumptionRecordOutcome> {
+        self.record_completed_pool_consumption_with_pricing(completion, None)
+    }
+
+    pub fn record_completed_pool_consumption_with_pricing(
+        &mut self,
+        completion: CompletedPoolConsumption,
+        pricing: Option<ChargePricing>,
+    ) -> Result<PoolConsumptionRecordOutcome> {
         validate_completed_pool_consumption(&completion)?;
         for event in &self.events {
             let BudgetLedgerEvent::PoolConsume {
+                pricing: held_pricing,
                 completion_id,
                 pool,
                 tokens,
@@ -660,6 +751,7 @@ impl WorkspaceBudgetLedger {
                 continue;
             }
             if pool == &completion.pool
+                && held_pricing == &pricing
                 && *tokens == completion.tokens
                 && *requests == completion.requests
                 && *cost_usd == completion.cost_usd
@@ -674,6 +766,7 @@ impl WorkspaceBudgetLedger {
         self.ensure_append_capacity(self.unsettled_reservations().len())?;
         self.publish(BudgetLedgerEvent::PoolConsume {
             version: LEDGER_FORMAT_VERSION,
+            pricing,
             completion_id: completion.completion_id,
             pool: completion.pool,
             tokens: completion.tokens,
@@ -982,6 +1075,7 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
     let mut events = Vec::with_capacity(records.len());
     let mut pool_completion_ids = BTreeSet::new();
     let mut reservations = BTreeMap::new();
+    let mut reservation_contracts = BTreeMap::new();
     let mut reservation_terminals = BTreeSet::new();
     for record in records {
         let event = serde_json::from_value::<BudgetLedgerEvent>(record.payload.clone())
@@ -993,11 +1087,13 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
             BudgetLedgerEvent::Reservation {
                 version,
                 reservation_id,
+                pricing,
                 tokens,
                 requests,
                 cost_usd,
                 pool,
                 unix_seconds,
+                ..
             } => {
                 if *version != LEDGER_FORMAT_VERSION {
                     bail!("unsupported workspace budget reservation version {version}");
@@ -1011,6 +1107,12 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                     unix_seconds: *unix_seconds,
                 };
                 validate_durable_reservation(&reservation)?;
+                reservation_contracts.insert(
+                    reservation_id.clone(),
+                    pricing
+                        .as_ref()
+                        .and_then(|pricing| pricing.contract.clone()),
+                );
                 if reservations
                     .insert(reservation_id.clone(), reservation)
                     .is_some()
@@ -1024,12 +1126,14 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
             BudgetLedgerEvent::ReservationReconciled {
                 version,
                 reservation_id,
+                pricing,
                 tokens,
                 requests,
                 cost_usd,
                 pool,
                 unix_seconds,
                 recovered_after_process_death,
+                ..
             } => {
                 if *version != LEDGER_FORMAT_VERSION {
                     bail!("unsupported workspace budget reconciliation version {version}");
@@ -1048,6 +1152,15 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                         reservation_id
                     )
                 })?;
+                if reservation_contracts
+                    .get(reservation_id)
+                    .and_then(Option::as_ref)
+                    != pricing
+                        .as_ref()
+                        .and_then(|pricing| pricing.contract.as_ref())
+                {
+                    bail!("workspace budget reconciliation changed its frozen pricing contract");
+                }
                 if *unix_seconds < reservation.unix_seconds {
                     bail!(
                         "workspace budget reconciliation predates reservation '{}'",
@@ -1096,6 +1209,7 @@ fn replay_events(records: &[JournalRecord]) -> Result<Vec<BudgetLedgerEvent>> {
                 requests,
                 cost_usd,
                 unix_seconds,
+                ..
             } => {
                 let completion = CompletedPoolConsumption {
                     completion_id: completion_id.clone(),
@@ -1361,6 +1475,164 @@ mod tests {
     use git2::Repository;
     use std::fs;
     use tempfile::TempDir;
+
+    fn pricing(revision: &str) -> ChargePricing {
+        use crate::llm::pricing_contract::{
+            price_map_sha256, OperatorPricingContract, PricingScope,
+        };
+        use crate::supervise::{ChargePricingBasis, PricingContractProvenance};
+        let prices = BTreeMap::from([(
+            "synthetic-model".to_string(),
+            crate::llm::provider::ModelPricing {
+                input_usd_per_million_tokens: 2.0,
+                output_usd_per_million_tokens: 3.0,
+            },
+        )]);
+        let contract = OperatorPricingContract {
+            schema_version: 1,
+            contract_id: "synthetic-contract".into(),
+            revision: revision.into(),
+            effective_date: "2000-01-01".into(),
+            valid_through: "9999-12-31".into(),
+            source_reference: "urn:synthetic:test-only".into(),
+            source_attribution: "Synthetic test rates".into(),
+            currency: "USD".into(),
+            unit: "per_million_tokens".into(),
+            billing: "flat_input_output".into(),
+            scopes: vec![PricingScope {
+                runtime: crate::runtime_adapter::RuntimeId::Codex,
+                model: "synthetic-model".into(),
+                account_id: "synthetic-account".into(),
+                plan_id: "synthetic-plan".into(),
+            }],
+            price_map_sha256: price_map_sha256(&prices).unwrap(),
+        };
+        let validated = contract.validate(&prices).unwrap();
+        ChargePricing {
+            basis: ChargePricingBasis::OperatorContractEstimate,
+            contract: Some(PricingContractProvenance {
+                contract,
+                normalized_sha256: validated.content_sha256().to_string(),
+                plan_id: "synthetic-plan".into(),
+            }),
+            runtime: Some("codex".into()),
+            model: Some("synthetic-model".into()),
+        }
+    }
+
+    #[test]
+    fn pricing_provenance_survives_rolling_replay_recovery_and_contract_changes() {
+        use crate::supervise::ChargePricingBasis;
+        let (_temp, repo) = repository();
+        let first = pricing("revision-1");
+        let mut second = pricing("revision-2");
+        second.basis = ChargePricingBasis::ConservativeReservation;
+        {
+            let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+            let held = reservation("first/reservation/1", 40, 1);
+            ledger
+                .record_reservation_with_pricing(held.clone(), Some(first.clone()))
+                .unwrap();
+            assert!(ledger
+                .record_reservation_with_pricing(held, Some(second.clone()))
+                .is_err());
+            let terminal = DurableBudgetReconciliation {
+                reservation_id: "first/reservation/1".into(),
+                tokens: 10,
+                requests: 0,
+                cost_usd: Some(0.000023),
+                pool: None,
+                unix_seconds: 2,
+            };
+            assert!(ledger
+                .reconcile_reservation_with_pricing(terminal.clone(), Some(second.clone()))
+                .is_err());
+            ledger
+                .reconcile_reservation_with_pricing(terminal.clone(), Some(first.clone()))
+                .unwrap();
+            assert_eq!(
+                ledger
+                    .reconcile_reservation_with_pricing(terminal.clone(), Some(first.clone()))
+                    .unwrap(),
+                DurableReservationRecordOutcome::AlreadyRecorded
+            );
+            assert!(ledger
+                .reconcile_reservation_with_pricing(terminal, Some(second.clone()))
+                .is_err());
+            ledger
+                .record_reservation_with_pricing(
+                    reservation("second/reservation/1", 50, 3),
+                    Some(second.clone()),
+                )
+                .unwrap();
+        }
+        let mut ledger = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+        assert!(matches!(
+            &ledger.events[1],
+            BudgetLedgerEvent::ReservationReconciled { pricing: Some(held), .. }
+                if held == &first
+        ));
+        assert!(matches!(
+            ledger.events.last().unwrap(),
+            BudgetLedgerEvent::ReservationReconciled {
+                pricing: Some(held), recovered_after_process_death: true, ..
+            } if held == &second
+        ));
+        let unpriced = ChargePricing {
+            basis: ChargePricingBasis::Unpriced,
+            ..Default::default()
+        };
+        let completion = CompletedPoolConsumption {
+            completion_id: "unpriced/pool/1".into(),
+            pool: pool("codex", ResetWindow::None),
+            tokens: 7,
+            requests: 1,
+            cost_usd: None,
+            unix_seconds: unix_now().unwrap(),
+        };
+        ledger
+            .record_completed_pool_consumption_with_pricing(
+                completion.clone(),
+                Some(unpriced.clone()),
+            )
+            .unwrap();
+        assert_eq!(
+            ledger
+                .record_completed_pool_consumption_with_pricing(
+                    completion.clone(),
+                    Some(unpriced.clone()),
+                )
+                .unwrap(),
+            PoolConsumptionRecordOutcome::AlreadyRecorded
+        );
+        assert!(ledger
+            .record_completed_pool_consumption_with_pricing(completion, Some(first.clone()))
+            .is_err());
+        drop(ledger);
+        let reopened = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+        assert!(matches!(
+            reopened.events.last().unwrap(),
+            BudgetLedgerEvent::PoolConsume { pricing: Some(held), cost_usd: None, .. }
+                if held == &unpriced
+        ));
+        assert_eq!(
+            reopened
+                .usage_in_window(u64::MAX, unix_now().unwrap())
+                .unwrap()
+                .cost_usd,
+            None
+        );
+        // Historical records have no provenance and remain readable without inventing it.
+        let legacy: BudgetLedgerEvent = serde_json::from_value(serde_json::json!({
+            "kind": "reservation", "version": 1, "reservation_id": "legacy/1",
+            "tokens": 10, "unix_seconds": 1
+        }))
+        .unwrap();
+        assert!(matches!(
+            legacy,
+            BudgetLedgerEvent::Reservation { pricing: None, .. }
+        ));
+    }
 
     fn repository() -> (TempDir, PathBuf) {
         let temp = TempDir::new().expect("temporary directory");
@@ -1640,6 +1912,7 @@ mod tests {
             let mut journal = raw_journal(&duplicate_repo);
             let event = BudgetLedgerEvent::Reservation {
                 version: LEDGER_FORMAT_VERSION,
+                pricing: None,
                 reservation_id: "duplicate/reservation/1".to_string(),
                 tokens: 10,
                 requests: 0,
@@ -1664,6 +1937,7 @@ mod tests {
             let mut journal = raw_journal(&unknown_repo);
             let event = BudgetLedgerEvent::ReservationReconciled {
                 version: LEDGER_FORMAT_VERSION,
+                pricing: None,
                 reservation_id: "unknown/reservation/1".to_string(),
                 tokens: 10,
                 requests: 0,
@@ -1686,6 +1960,7 @@ mod tests {
             let mut journal = raw_journal(&terminal_repo);
             let reservation = BudgetLedgerEvent::Reservation {
                 version: LEDGER_FORMAT_VERSION,
+                pricing: None,
                 reservation_id: "terminal/reservation/1".to_string(),
                 tokens: 10,
                 requests: 0,
@@ -1695,6 +1970,7 @@ mod tests {
             };
             let first = BudgetLedgerEvent::ReservationReconciled {
                 version: LEDGER_FORMAT_VERSION,
+                pricing: None,
                 reservation_id: "terminal/reservation/1".to_string(),
                 tokens: 4,
                 requests: 0,
@@ -1705,6 +1981,7 @@ mod tests {
             };
             let conflicting = BudgetLedgerEvent::ReservationReconciled {
                 version: LEDGER_FORMAT_VERSION,
+                pricing: None,
                 reservation_id: "terminal/reservation/1".to_string(),
                 tokens: 5,
                 requests: 0,

@@ -1,0 +1,179 @@
+{
+  "$defs": {
+    "contract": {
+      "additionalProperties": false,
+      "properties": {
+        "billing": {
+          "const": "flat_input_output"
+        },
+        "contract_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "currency": {
+          "const": "USD"
+        },
+        "effective_date": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        },
+        "price_map_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "revision": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "schema_version": {
+          "const": 1
+        },
+        "scopes": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "account_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "model": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "plan_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "runtime": {
+                "enum": [
+                  "fake",
+                  "codex",
+                  "grok",
+                  "cursor",
+                  "claude-code",
+                  "gemini-cli"
+                ]
+              }
+            },
+            "required": [
+              "runtime",
+              "model",
+              "account_id",
+              "plan_id"
+            ],
+            "type": "object"
+          },
+          "minItems": 1,
+          "type": "array",
+          "uniqueItems": true
+        },
+        "source_attribution": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "source_reference": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "unit": {
+          "const": "per_million_tokens"
+        },
+        "valid_through": {
+          "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+          "type": "string"
+        }
+      },
+      "required": [
+        "schema_version",
+        "contract_id",
+        "revision",
+        "effective_date",
+        "valid_through",
+        "source_reference",
+        "source_attribution",
+        "currency",
+        "unit",
+        "billing",
+        "scopes",
+        "price_map_sha256"
+      ],
+      "type": "object"
+    }
+  },
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/operator-pricing-plan-v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "dependentRequired": {
+    "pricing_binding": [
+      "pricing_contract"
+    ],
+    "pricing_contract": [
+      "model_pricing",
+      "pricing_plan_id"
+    ],
+    "pricing_plan_id": [
+      "pricing_contract"
+    ]
+  },
+  "description": "Contract for the optional pricing-field envelope extracted from a supervisor plan; other plan fields are outside this schema.",
+  "properties": {
+    "model_pricing": {
+      "additionalProperties": {
+        "additionalProperties": false,
+        "properties": {
+          "input_usd_per_million_tokens": {
+            "minimum": 0,
+            "type": "number"
+          },
+          "output_usd_per_million_tokens": {
+            "minimum": 0,
+            "type": "number"
+          }
+        },
+        "required": [
+          "input_usd_per_million_tokens",
+          "output_usd_per_million_tokens"
+        ],
+        "type": "object"
+      },
+      "type": "object"
+    },
+    "pricing_binding": {
+      "additionalProperties": false,
+      "properties": {
+        "contract_json": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "normalized_sha256": {
+          "pattern": "^[0-9a-f]{64}$",
+          "type": "string"
+        },
+        "plan_id": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "price_map_json": {
+          "minLength": 1,
+          "type": "string"
+        }
+      },
+      "required": [
+        "contract_json",
+        "price_map_json",
+        "plan_id",
+        "normalized_sha256"
+      ],
+      "type": "object"
+    },
+    "pricing_contract": {
+      "$ref": "#/$defs/contract"
+    },
+    "pricing_plan_id": {
+      "minLength": 1,
+      "type": "string"
+    }
+  },
+  "title": "Optional operator pricing fields for supervisor plans",
+  "type": "object"
+}

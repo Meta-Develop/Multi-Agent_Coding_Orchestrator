@@ -1,0 +1,30 @@
+{
+  "pricing_plan_id": "synthetic-fixture-plan",
+  "model_pricing": {
+    "synthetic-fixture-model": {
+      "input_usd_per_million_tokens": 2.0,
+      "output_usd_per_million_tokens": 3.0
+    }
+  },
+  "pricing_contract": {
+    "schema_version": 1,
+    "contract_id": "synthetic-fixture-contract",
+    "revision": "synthetic-1",
+    "effective_date": "2020-01-01",
+    "valid_through": "2099-12-31",
+    "source_reference": "https://example.invalid/synthetic-operator-rates",
+    "source_attribution": "Synthetic schema fixture rates only; not real operator pricing.",
+    "currency": "USD",
+    "unit": "per_million_tokens",
+    "billing": "flat_input_output",
+    "scopes": [
+      {
+        "runtime": "codex",
+        "model": "synthetic-fixture-model",
+        "account_id": "synthetic-fixture-account",
+        "plan_id": "synthetic-fixture-plan"
+      }
+    ],
+    "price_map_sha256": "709aae4120a208c1ce59c4016ba298ff5b692ab66c9234c8d531f895f4686212"
+  }
+}

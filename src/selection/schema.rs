@@ -393,6 +393,7 @@ fn outcome_record() -> Value {
         "fixed_cause_relaunch" => nullable(fixed_cause_relaunch()),
     );
     schema["properties"]["assignment_shape_identity"] = assignment_shape_identity();
+    schema["properties"]["pricing"] = array(crate::supervise::outcome_charge_schema_value());
     schema
 }
 
@@ -969,10 +970,10 @@ mod tests {
                         let required = object["required"].as_array().expect("object required");
                         let optional = if path == "$/properties/provenance" {
                         &["outcome_history", "operator_prior_data", "routing_policy"][..]
-                    } else if path == "$/properties/provenance/properties/normalized_input"
-                        || path == "$/properties/provenance/properties/normalized_input/properties/outcomes/items"
-                    {
+                    } else if path == "$/properties/provenance/properties/normalized_input" {
                         &["assignment_shape_identity"][..]
+                    } else if path == "$/properties/provenance/properties/normalized_input/properties/outcomes/items" {
+                        &["assignment_shape_identity", "pricing"][..]
                     } else if path
                         == "$/properties/provenance/properties/normalized_input/properties/catalogs/items/properties/models/items"
                     {
