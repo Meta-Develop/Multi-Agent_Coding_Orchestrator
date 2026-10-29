@@ -333,3 +333,119 @@ fn v2_real_provider_stays_inert_after_opt_in() {
     let error = parse_manifest_v2(&encoded).expect_err("real provider remains unavailable");
     assert_eq!(error, EvalHarnessV2Error::RealProviderUnavailable);
 }
+
+#[test]
+fn v2_objective_axes_survive_pareto_pruning() {
+    use super::issue26::{pareto_frontier, select_objective, V2ProfileSummary, V2Quality};
+    use crate::objective_profile::TradeoffWeights;
+
+    for axis in ["quota", "latency", "rework", "review"] {
+        let cheap = V2ProfileSummary {
+            profile_id: "cheap".to_string(),
+            repetitions: 1,
+            mean_cost_microusd: 1,
+            mean_tokens: 100,
+            mean_wall_time_ms: 100,
+            mean_churn_count: 100,
+            mean_review_findings: 100,
+            quality: V2Quality {
+                held_out_basis_points: 9_000,
+                breadth_basis_points: 9_000,
+                anti_shortcut_basis_points: 9_000,
+                overall_basis_points: 9_000,
+            },
+            pareto_optimal: false,
+        };
+        let mut specialist = cheap.clone();
+        specialist.profile_id = "specialist".to_string();
+        specialist.mean_cost_microusd = 2;
+        let mut profile = default_objective_profile();
+        profile.tradeoffs = TradeoffWeights {
+            monetary_cost_percent: 0,
+            quota_consumption_percent: 0,
+            latency_percent: 0,
+            retry_rework_percent: 0,
+            human_review_percent: 0,
+        };
+        match axis {
+            "quota" => {
+                specialist.mean_tokens = 1;
+                profile.tradeoffs.quota_consumption_percent = 100;
+            }
+            "latency" => {
+                specialist.mean_wall_time_ms = 1;
+                profile.tradeoffs.latency_percent = 100;
+            }
+            "rework" => {
+                specialist.mean_churn_count = 1;
+                profile.tradeoffs.retry_rework_percent = 100;
+            }
+            "review" => {
+                specialist.mean_review_findings = 1;
+                profile.tradeoffs.human_review_percent = 100;
+            }
+            _ => unreachable!(),
+        }
+        let objective = ResolvedObjectiveProfile {
+            profile: profile.binding().expect("axis objective binding"),
+            source: ObjectiveProfileSource::BuiltIn,
+        };
+        let summaries = vec![cheap, specialist];
+        let frontier = pareto_frontier(&summaries);
+        assert_eq!(frontier, ["cheap", "specialist"], "{axis}");
+        let selected = select_objective(&objective, &summaries, &frontier).expect("score frontier");
+        assert_eq!(selected.selected_profile_id, "specialist", "{axis}");
+        let mut reversed = summaries.clone();
+        reversed.reverse();
+        assert_eq!(
+            selected,
+            select_objective(&objective, &reversed, &pareto_frontier(&reversed))
+                .expect("deterministic selection")
+        );
+
+        let mut dominated = summaries[1].clone();
+        dominated.mean_cost_microusd = 1;
+        assert_eq!(
+            pareto_frontier(&[summaries[0].clone(), dominated]),
+            ["specialist"]
+        );
+    }
+}
+
+#[test]
+fn v2_pareto_preserves_raw_quality_and_deterministic_replay() {
+    use super::issue26::{execute_v2_local_fake, pareto_frontier, validate_v2_execution_results};
+
+    let mut value = complete_v2_manifest(json!({}));
+    value["profiles"] = json!([
+        {"id": "economy", "mix": [
+            {"role": "planner", "model": "fake-economy"},
+            {"role": "worker", "model": "fake-economy"},
+            {"role": "supervisor", "model": "fake-economy"},
+            {"role": "auditor", "model": "fake-economy"}
+        ]},
+        {"id": "quality", "mix": [
+            {"role": "planner", "model": "fake-quality"},
+            {"role": "worker", "model": "fake-quality"},
+            {"role": "supervisor", "model": "fake-quality"},
+            {"role": "auditor", "model": "fake-quality"}
+        ]}
+    ]);
+    let manifest = parse_manifest_v2(&serde_json::to_vec(&value).expect("manifest bytes"))
+        .expect("execution manifest");
+    let results = execute_v2_local_fake(&manifest).expect("execute fixture");
+    validate_v2_execution_results(&manifest, &results).expect("replay validates provenance");
+    assert_eq!(
+        results,
+        execute_v2_local_fake(&manifest).expect("repeat execution")
+    );
+    let mut forged = results.clone();
+    forged.objective_citation.content_hash = "0".repeat(64);
+    assert!(validate_v2_execution_results(&manifest, &forged).is_err());
+
+    let first = results.profile_summaries[0].clone();
+    let mut second = first.clone();
+    second.profile_id = "same-raw-quality".to_string();
+    second.quality.overall_basis_points += 1;
+    assert_eq!(pareto_frontier(&[first, second]).len(), 2);
+}

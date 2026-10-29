@@ -45,6 +45,28 @@ jobs:
       - name: Check tracked path portability
         run: python3 scripts/check_repository_portability.py
 
+  scope-ui:
+    name: Scope UI tests and embedded HTML
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install supported Node runtime
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: scope-ui/package.json
+          package-manager-cache: false
+
+      - name: Test Scope UI
+        run: npm --prefix scope-ui test
+
+      - name: Verify embedded Scope UI matches sources
+        run: npm --prefix scope-ui run check:embedded
+
   linux-library:
     name: Linux library tests (${{ matrix.shard }})
     needs: nix-package
@@ -563,20 +585,23 @@ jobs:
       - repository-portability
       - linux-gate
       - portable-build
+      - scope-ui
     if: always()
     timeout-minutes: 5
     steps:
-      - name: Require portability, Linux tests, and portable builds
+      - name: Require portability, Linux tests, portable builds, and Scope UI
         env:
           PACKAGE_RESULT: ${{ needs.nix-package.result }}
           PORTABILITY_RESULT: ${{ needs.repository-portability.result }}
           LINUX_RESULT: ${{ needs.linux-gate.result }}
           PORTABLE_RESULT: ${{ needs.portable-build.result }}
+          SCOPE_UI_RESULT: ${{ needs.scope-ui.result }}
         run: |
-          if [[ "${PACKAGE_RESULT}" != "success" || "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" ]]; then
+          if [[ "${PACKAGE_RESULT}" != "success" || "${PORTABILITY_RESULT}" != "success" || "${LINUX_RESULT}" != "success" || "${PORTABLE_RESULT}" != "success" || "${SCOPE_UI_RESULT}" != "success" ]]; then
             echo "nix-package result: ${PACKAGE_RESULT}"
             echo "repository-portability result: ${PORTABILITY_RESULT}"
             echo "linux-gate result: ${LINUX_RESULT}"
             echo "portable-build result: ${PORTABLE_RESULT}"
+            echo "scope-ui result: ${SCOPE_UI_RESULT}"
             exit 1
           fi
