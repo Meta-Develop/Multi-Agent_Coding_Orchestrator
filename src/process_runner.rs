@@ -2858,7 +2858,7 @@ pub struct ProcessFailureEvidence {
 /// Live rollback evidence from the runner, never reconstructed from error text.
 #[derive(Debug, Error)]
 #[error("{message}")]
-struct AgentRegistrationFailure {
+struct PreReleaseRollbackFailure {
     message: String,
     evidence: ProcessFailureEvidence,
 }
@@ -3006,17 +3006,18 @@ impl ProcessRunError {
         Self::ProcessOwnership {
             label,
             command,
-            source: std::io::Error::other(AgentRegistrationFailure { message, evidence }),
+            source: std::io::Error::other(PreReleaseRollbackFailure { message, evidence }),
         }
     }
 
-    pub(crate) fn registration_rollback_evidence(&self) -> Option<&ProcessFailureEvidence> {
-        let Self::ProcessOwnership { source, .. } = self else {
-            return None;
+    pub(crate) fn pre_release_rollback_evidence(&self) -> Option<&ProcessFailureEvidence> {
+        let source = match self {
+            Self::ProcessOwnership { source, .. } | Self::IoSetup { source, .. } => source,
+            _ => return None,
         };
         source
             .get_ref()?
-            .downcast_ref::<AgentRegistrationFailure>()
+            .downcast_ref::<PreReleaseRollbackFailure>()
             .map(|failure| &failure.evidence)
     }
 
@@ -3164,6 +3165,24 @@ where
 
 type ProcessStartGateCallback<'callback> =
     dyn for<'gate> FnMut(&ContainedProcessStartGate<'gate>) -> Result<(), String> + 'callback;
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static START_GATE_WAIT_UNPROVEN: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Withhold wait evidence while still reaping the exact owned fixture child.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_unproven_start_gate_wait_for_test<T>(run: impl FnOnce() -> T) -> T {
+    struct Restore(bool);
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            START_GATE_WAIT_UNPROVEN.with(|slot| slot.set(self.0));
+        }
+    }
+    let _restore = Restore(START_GATE_WAIT_UNPROVEN.with(|slot| slot.replace(true)));
+    run()
+}
 
 /// Bounded, static-label diagnostics only: no paths, arguments, environment or poll history.
 pub(crate) struct PhaseTimings {
@@ -3328,6 +3347,11 @@ fn run_process_cancellable_with_interaction(
         current_dir: spec.current_dir.clone(),
         source,
     })?;
+    #[cfg(all(test, target_os = "linux"))]
+    if start_gate_fixture_tests::enabled() {
+        return start_gate_fixture_tests::run(&spec, start_gate.as_deref_mut());
+    }
+
     if let StdinMode::Bytes(bytes) = &spec.stdin {
         if bytes.len() > spec.max_stdin_bytes {
             return Err(ProcessRunError::StdinTooLarge {
@@ -3641,22 +3665,13 @@ fn run_process_cancellable_with_interaction(
                 &spec.label,
                 "pre-start owner callback rollback",
             );
-            let cleanup_error = append_error(
-                cleanup.error,
-                wait_for_child_cleanup(
-                    &mut child,
-                    &spec.label,
-                    "pre-start owner callback rollback",
-                ),
-            );
-            return Err(ProcessRunError::IoSetup {
-                label: spec.label.clone(),
-                command: command_display,
-                source: std::io::Error::other(
-                    append_error(Some(error), cleanup_error)
-                        .unwrap_or_else(|| "pre-start owner callback failed".to_string()),
-                ),
-            });
+            return Err(start_gate_rollback_failure(
+                &mut child,
+                &spec.label,
+                command_display,
+                error,
+                cleanup,
+            ));
         }
     }
     if let Some(metadata) = &spec.agent_lifecycle {
@@ -4790,6 +4805,45 @@ pub fn resolve_existing_path_without_symlinks(
 fn terminate_unowned_child(child: &mut Child, label: &str) -> Option<String> {
     let (_, error) = kill_and_reap_child(child, label, "unowned-child rollback");
     error
+}
+
+fn start_gate_rollback_failure(
+    child: &mut Child,
+    label: &str,
+    command: String,
+    error: String,
+    cleanup: TreeCleanup,
+) -> ProcessRunError {
+    let wait_error = wait_for_child_cleanup(child, label, "pre-start owner callback rollback");
+    let reaped = child.try_wait().ok().flatten().is_some();
+    #[cfg(all(test, target_os = "linux"))]
+    let reaped = reaped && !START_GATE_WAIT_UNPROVEN.with(std::cell::Cell::get);
+    let process_tree = match (reaped, cleanup.process_tree) {
+        (true, evidence) => evidence,
+        (
+            false,
+            ProcessTreeEvidence::VerifiedEmpty(backend)
+            | ProcessTreeEvidence::TrustedBestEffort(backend)
+            | ProcessTreeEvidence::Unverified(backend),
+        ) => ProcessTreeEvidence::Unverified(backend),
+    };
+    let cleanup_error = append_error(cleanup.error, wait_error);
+    ProcessRunError::IoSetup {
+        label: label.to_string(),
+        command,
+        source: std::io::Error::other(PreReleaseRollbackFailure {
+            message: append_error(Some(error), cleanup_error.clone())
+                .unwrap_or_else(|| "pre-start owner callback failed".to_string()),
+            evidence: ProcessFailureEvidence {
+                stdout: CapturedBytes::default(),
+                stderr: CapturedBytes::default(),
+                process_tree,
+                side_effects: cleanup.side_effects,
+                process_error: cleanup_error,
+                stdin_error: None,
+            },
+        }),
+    }
 }
 
 fn wait_for_child_cleanup(child: &mut Child, label: &str, context: &str) -> Option<String> {
@@ -6163,3 +6217,6 @@ mod mechanical_executor_lifecycle_tests {
         assert!(!root.is_cancelled());
     }
 }
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod start_gate_fixture_tests;

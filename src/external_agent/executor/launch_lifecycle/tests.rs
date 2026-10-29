@@ -251,7 +251,7 @@ fn exercise_launch_paths(strict: bool) {
             "FAKE-managed-refresh",
             "FAKE-inherited-input",
             "FAKE-inherited-path",
-            "GROK_HOME",
+            credentials.grok_home_environment().unwrap(),
             "auth.json",
         ] {
             assert!(!serialized.contains(private));
@@ -264,6 +264,11 @@ fn exercise_launch_paths(strict: bool) {
         assert!(metadata
             .environment
             .contains(&CredentialEnvironmentInput::Removed("XAI_API_KEY".into())));
+        assert!(metadata
+            .environment
+            .contains(&CredentialEnvironmentInput::SelectedCredential(
+                "GROK_HOME".into()
+            )));
         drop(credentials);
         assert_busy(&registry);
         drop(authority);

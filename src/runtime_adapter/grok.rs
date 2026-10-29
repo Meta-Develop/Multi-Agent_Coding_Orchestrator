@@ -1501,24 +1501,34 @@ impl GrokCatalogCommandRunner for ScreenedGrokCatalogCommandRunner {
 
 /// Catalog runner bound to an already selected managed Grok home.
 #[cfg(target_os = "linux")]
-pub(crate) struct BoundGrokCatalogCommandRunner {
+pub(crate) struct BoundGrokCatalogCommandRunner<'a> {
     sources: GrokCredentialSource,
+    authority: Option<&'a crate::account_authority::GrokLaunchAuthority>,
 }
 
 #[cfg(target_os = "linux")]
-impl BoundGrokCatalogCommandRunner {
+impl<'a> BoundGrokCatalogCommandRunner<'a> {
+    pub(crate) fn with_authority(
+        authority: &'a crate::account_authority::GrokLaunchAuthority,
+    ) -> Result<Self> {
+        let mut runner = authority.construct_material(Self::new)?;
+        runner.authority = Some(authority);
+        Ok(runner)
+    }
+
     pub(crate) fn new(managed_grok_home: &Path) -> Result<Self> {
         Ok(Self {
             sources: GrokCredentialSource::from_environment(
                 None,
                 Some(managed_grok_home.as_os_str()),
             )?,
+            authority: None,
         })
     }
 }
 
 #[cfg(target_os = "linux")]
-impl GrokCatalogCommandRunner for BoundGrokCatalogCommandRunner {
+impl GrokCatalogCommandRunner for BoundGrokCatalogCommandRunner<'_> {
     fn run(&self, spec: &GrokCatalogCommandSpec) -> Result<GrokCatalogCommandOutput> {
         let program = resolve_catalog_program(spec.program())?;
         let process_spec = screened_grok_catalog_process_spec_with_credential_source(
@@ -1526,7 +1536,15 @@ impl GrokCatalogCommandRunner for BoundGrokCatalogCommandRunner {
             program,
             &self.sources,
         )?;
-        run_screened_grok_catalog_process(process_spec)
+        let mut custody = self
+            .authority
+            .and_then(|authority| authority.launch_custody());
+        if let Some(custody) = &custody {
+            if let EnvironmentMode::ClearAndSet(environment) = &process_spec.environment {
+                custody.declare_inherited_environment(environment.keys());
+            }
+        }
+        run_screened_grok_catalog_process_with_custody(process_spec, custody.as_deref_mut())
     }
 }
 
@@ -1896,9 +1914,22 @@ fn run_screened_grok_catalog_command(
 fn run_screened_grok_catalog_process(
     process_spec: ProcessSpec,
 ) -> Result<GrokCatalogCommandOutput> {
-    let output = run_process(process_spec).context(
-        "Grok runtime model catalog command failed before a verified result was available",
-    )?;
+    run_screened_grok_catalog_process_with_custody(process_spec, None)
+}
+
+fn run_screened_grok_catalog_process_with_custody(
+    process_spec: ProcessSpec,
+    custody: Option<
+        &mut coding_agent_manager_lib::providers::launch_lifecycle::ExternalLaunchCustody,
+    >,
+) -> Result<GrokCatalogCommandOutput> {
+    let output = crate::external_agent::executor::launch_lifecycle::execute(
+        custody,
+        &crate::process_runner::ProcessCancellation::new(),
+        || run_grok_catalog_process(process_spec),
+        |output| output,
+    )
+    .context("Grok runtime model catalog command failed before a verified result was available")?;
     if output.process_error.is_some() || output.stdin_error.is_some() {
         bail!("Grok runtime model catalog process ownership cleanup was incomplete");
     }
@@ -1912,6 +1943,40 @@ fn run_screened_grok_catalog_process(
         process_tree: output.process_tree,
         side_effects: output.side_effects,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+thread_local! {
+    static CATALOG_PROCESS_RESULT: std::cell::RefCell<Option<Result<crate::process_runner::ProcessOutput, crate::process_runner::ProcessRunError>>> = const { std::cell::RefCell::new(None) };
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn with_catalog_process_result_for_test<T>(
+    result: Result<crate::process_runner::ProcessOutput, crate::process_runner::ProcessRunError>,
+    run: impl FnOnce() -> T,
+) -> T {
+    struct Restore(
+        Option<
+            Result<crate::process_runner::ProcessOutput, crate::process_runner::ProcessRunError>,
+        >,
+    );
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            CATALOG_PROCESS_RESULT.with(|slot| *slot.borrow_mut() = self.0.take());
+        }
+    }
+    let _restore = Restore(CATALOG_PROCESS_RESULT.with(|slot| slot.replace(Some(result))));
+    run()
+}
+
+fn run_grok_catalog_process(
+    spec: ProcessSpec,
+) -> Result<crate::process_runner::ProcessOutput, crate::process_runner::ProcessRunError> {
+    #[cfg(all(test, target_os = "linux"))]
+    if let Some(result) = CATALOG_PROCESS_RESULT.with(|slot| slot.borrow_mut().take()) {
+        return result;
+    }
+    run_process(spec)
 }
 
 fn screened_grok_catalog_process_spec(spec: &GrokCatalogCommandSpec) -> Result<ProcessSpec> {

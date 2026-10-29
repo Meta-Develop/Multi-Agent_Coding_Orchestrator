@@ -351,12 +351,25 @@ fn advertised_catalogs_from_live_runtimes(repo: &Path) -> Result<AdvertisedCatal
     let grok = if grok_binding.as_ref().is_some_and(Option::is_none) {
         None
     } else {
-        match crate::account_authority::grok::acquire_optional_grok_catalog_authority()? {
+        static CATALOG_OPERATION: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
+        let operation_id = format!(
+            "grok-catalog-{}-{}-{}",
+            std::process::id(),
+            observed_at_unix_millis,
+            CATALOG_OPERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
+        let mut lifecycle = None;
+        let mut admission = crate::account_authority::selected_launch::LaunchAdmission {
+            run_id: &operation_id,
+            operation_id: &operation_id,
+            deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+            handle: &mut lifecycle,
+        };
+        match crate::account_authority::grok::acquire_optional_grok_catalog_authority_with_admission(Some(&mut admission))? {
             Some(authority) => {
                 authority.verify_binding_unchanged()?;
-                let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::new(
-                    authority.managed_grok_home(),
-                )?;
+                let runner = crate::runtime_adapter::grok::BoundGrokCatalogCommandRunner::with_authority(&authority)?;
                 let observed = observe_optional_live_grok_catalog(
                     &runner,
                     repo,
