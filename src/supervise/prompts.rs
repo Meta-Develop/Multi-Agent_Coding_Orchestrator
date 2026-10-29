@@ -2145,6 +2145,7 @@ mod regression_tests {
             report_path: None,
         };
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: child_id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -2311,6 +2312,7 @@ mod regression_tests {
             .into_iter()
             .collect();
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-runtime".to_string(),
             phase,
             runtime: Some(child_runtime),
@@ -2415,6 +2417,7 @@ mod regression_tests {
     #[test]
     fn worker_embedding_multiplier_uses_all_worker_roles_in_the_run() {
         let assignment = |id: &str, worker_count: usize| OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -2590,6 +2593,7 @@ mod regression_tests {
             report_path: None,
         };
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-lite".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -2679,6 +2683,7 @@ mod regression_tests {
     #[test]
     fn judgment_and_auditor_prompts_never_receive_the_lite_profile() {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-judgment".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -3064,6 +3069,7 @@ mod regression_tests {
         ])
         .expect("review-lens fixture capability policy");
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-decorrelated".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -3345,6 +3351,7 @@ mod regression_tests {
     #[test]
     fn review_lens_prompt_accepts_bounded_full_transcript_above_fixture_ceiling() -> Result<()> {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-bounded-lens".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -3441,6 +3448,7 @@ mod regression_tests {
             report_path: None,
         };
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "parent-yield".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

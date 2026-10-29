@@ -1695,6 +1695,7 @@ fn experiment_plan(manifest: &ExperimentManifest, profile: &EvaluationProfile) -
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

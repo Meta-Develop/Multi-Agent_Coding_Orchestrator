@@ -329,6 +329,7 @@ fn run_injected_git(repo: &Path, args: &[&str]) {
 
 fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: "child-a".to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,
@@ -363,6 +364,7 @@ fn injected_assignment(with_worker: bool) -> OrchestratorAssignment {
 
 fn injected_named_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: id.to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,

@@ -9,6 +9,7 @@ static TEST_RUNTIME_MODEL_CATALOG: RuntimeModelCatalog =
 
 fn test_assignment(id: &str, path: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: id.to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,
@@ -77,6 +78,7 @@ fn insert_mechanical_metadata(metadata: &mut AssignmentMetadata, assignment_id: 
 
 fn direct_mechanical_assignment(id: &str) -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: id.to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,

@@ -560,6 +560,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         if !direct_worker {
             let planning_index = assignments.len();
             assignments.push(OrchestratorAssignment {
+                assignment_shape: None,
                 id: planning_id.clone(),
                 phase: AssignmentPhase::Planning,
                 runtime: None,
@@ -593,6 +594,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             .insert(assignment.id.clone(), assignment.fragment_ids.clone());
         let execution_index = assignments.len();
         assignments.push(OrchestratorAssignment {
+            assignment_shape: None,
             id: assignment.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -746,6 +748,7 @@ fn lower_coordinated_execution_proposal(
         });
     }
     let parent = OrchestratorAssignment {
+        assignment_shape: None,
         id:parent_id.clone(), phase:AssignmentPhase::Execution, runtime:None,
         role:AgentRole::ChildOrchestrator, role_category:Some(RoleCategory::DelegatingCoordinator),
         selection_source:None, assigned_paths:paths.into_iter().collect(),
@@ -2846,6 +2849,7 @@ fn lower_provider_assignment_tree(
 
     let flattened_index = assignments.len();
     assignments.push(OrchestratorAssignment {
+        assignment_shape: None,
         id: node.id.clone(),
         phase: if is_leaf {
             AssignmentPhase::Execution
@@ -4008,6 +4012,7 @@ fn validate_task_routing_assessment_binding(
     plan: &SupervisorPlan,
     metadata: &SupervisorPlanMetadata,
 ) -> Result<()> {
+    assignment_shape::validate_assignment_shapes(plan, metadata)?;
     let Some(assessment) = &metadata.task_routing_assessment else {
         return Ok(());
     };
@@ -8116,6 +8121,7 @@ mod generated_design_decision_lifecycle_tests {
         task: Option<&str>,
     ) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase,
             runtime: None,

@@ -1193,6 +1193,7 @@ fn dispatch_isolated_parent_workers_inner(
             bail!("isolated dispatch grant order differs from the frozen authored turn");
         }
         let subject = OrchestratorAssignment {
+            assignment_shape: None,
             id: worker.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: Some(nested_worker_launch_runtime(
@@ -9279,6 +9280,7 @@ mod decomposition_tests {
             .acquire_repository_cleanliness()
             .expect("source cleanliness capability");
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "leased-source-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9751,6 +9753,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -10178,6 +10181,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -10914,6 +10918,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -11290,6 +11295,7 @@ mod decomposition_tests {
         fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
         commit_fixture_repository(&repo);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -11784,6 +11790,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -12525,6 +12532,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -13385,6 +13393,7 @@ done
 
     fn phase_fixture_assignment(id: &str, phase: AssignmentPhase) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase,
             runtime: None,
@@ -13637,6 +13646,7 @@ done
 
     fn valid_child_plan_with_nested_worker() -> Result<SupervisorPlan> {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-with-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14217,6 +14227,7 @@ done
         fs::write(&grok, "fixture")?;
         let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14404,6 +14415,7 @@ done
         let (_environment_lock, _environment_guard) =
             GrokBinaryEnvironmentGuard::install_with(&grok, extra_env);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14639,6 +14651,7 @@ done
     #[test]
     fn writable_grok_binding_requires_the_explicit_terminal_worker_category() -> Result<()> {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14689,6 +14702,7 @@ done
         fs::write(&grok, "fixture")?;
         let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-planner".to_string(),
             phase: AssignmentPhase::Planning,
             runtime: None,
@@ -14775,6 +14789,7 @@ done
     #[test]
     fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "worker-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Cursor),
@@ -14809,6 +14824,7 @@ done
     #[test]
     fn admission_consumes_stored_category_and_refuses_luna_coordinator() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "leaf-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -15146,6 +15162,7 @@ done
     #[test]
     fn retry_selected_runtime_supersedes_the_assignment_initial_runtime() {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "worker-retry".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Codex),
@@ -15426,6 +15443,7 @@ done
 
     fn weak_mechanical_executor_worker(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -16812,6 +16830,7 @@ done
         commit_fixture_repository(&repo);
         chmod_control_dirs(&repo)?;
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "luna-named-codex".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -17850,6 +17869,7 @@ done
         let sync_store = open_sync_with_sim_remote(&repo, sim.shared_clone())?;
         let manager = WorktreeManager::new(&repo);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "remote-bind-agent".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

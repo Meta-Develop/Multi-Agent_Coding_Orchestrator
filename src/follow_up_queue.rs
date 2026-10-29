@@ -3424,6 +3424,7 @@ mod tests {
             operator_defaults,
         };
         let assignments = vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: assignment_id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -3824,6 +3825,7 @@ mod tests {
             review_lens_correlation: Default::default(),
             review_aggregation_policy: template.review_aggregation_policy,
             assignments: vec![OrchestratorAssignment {
+                assignment_shape: None,
                 id: "child-a".to_string(),
                 phase: AssignmentPhase::Execution,
                 runtime: None,

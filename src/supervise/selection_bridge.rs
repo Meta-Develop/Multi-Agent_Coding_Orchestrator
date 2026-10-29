@@ -3578,7 +3578,7 @@ pub(super) fn runtime_catalog_from_priors(
     })
 }
 
-fn task_profile_for_role(role: AgentRole) -> TaskProfile {
+pub(super) fn task_profile_for_role(role: AgentRole) -> TaskProfile {
     match role {
         AgentRole::Researcher => TaskProfile {
             task_class: JUDGMENT_SELECTION_TASK_CLASS.to_string(),
@@ -6358,6 +6358,7 @@ pub(super) mod tests {
 
     fn child_assignment(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -8091,6 +8092,7 @@ pub(super) mod tests {
 
     fn worker_assignment() -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: "worker-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

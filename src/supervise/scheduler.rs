@@ -8248,6 +8248,7 @@ mod selection_policy_tests {
 
     fn terminal_worker_assignment(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -8622,6 +8623,7 @@ mod selection_policy_tests {
         let mut plan = test_plan();
         plan.review_lenses = single_parent_acceptance_review_lenses();
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "active-effort-assignment".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9446,6 +9448,7 @@ mod selection_policy_tests {
         let (temporary, repo) = initialized_repository();
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "assignment-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9514,6 +9517,7 @@ mod selection_policy_tests {
         let (temporary, repo) = initialized_repository();
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "assignment-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
