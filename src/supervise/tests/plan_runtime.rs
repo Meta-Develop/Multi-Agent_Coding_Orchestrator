@@ -24,6 +24,7 @@ fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
         "../../../schemas/operator-pricing-plan-v1.schema.json"
     ))
     .unwrap();
+    assert_eq!(schema, operator_pricing_plan_schema_value());
     let url = "urn:test:operator-pricing-plan";
     let mut compiler = boon::Compiler::new();
     compiler.set_default_draft(boon::Draft::V2020_12);
@@ -87,6 +88,16 @@ fn operator_contract_frozen_bytes_and_resume_reject_mutation_expiry_and_scope() 
         &loaded.plan_metadata,
     )
     .unwrap();
+    let archived_schema = writer
+        .read_authenticated(
+            Path::new("schemas/operator-pricing-plan-v1.schema.json"),
+            MAX_SUPERVISOR_REPORT_BYTES as usize,
+        )
+        .unwrap();
+    assert_eq!(
+        serde_json::from_slice::<Value>(&archived_schema).unwrap(),
+        operator_pricing_plan_schema_value()
+    );
     let snapshot = writer
         .read_authenticated(
             Path::new("assignments/supervisor-plan.json"),
