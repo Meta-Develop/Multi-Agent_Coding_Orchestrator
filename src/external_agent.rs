@@ -65,6 +65,7 @@ use crate::secure_output::{ReservedOutputFile, SecureOutputRoot};
 use crate::supervise::AgentRole;
 use crate::worktree::normalize_agent_id;
 use anyhow::{bail, Context, Result};
+#[cfg(target_os = "linux")]
 use coding_agent_manager_lib::providers::launch_lifecycle::{
     ExternalLaunchCustody, LaunchLifecycleHandle,
 };
@@ -4727,6 +4728,7 @@ impl std::fmt::Debug for RedactedByteCount {
 }
 
 impl ExternalAgentRun {
+    #[cfg(target_os = "linux")]
     pub fn provider_launch_lifecycle(
         &self,
     ) -> Option<crate::secret_lifecycle::ProviderLaunchMetadata> {
@@ -5301,6 +5303,7 @@ struct ExternalAgentRunWireRef<'a> {
     managed_gemini_selection: &'a Option<ManagedGeminiAccountSelectionEvidence>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     managed_cursor_selection: &'a Option<ManagedCursorAccountSelectionEvidence>,
+    #[cfg(target_os = "linux")]
     #[serde(skip_serializing_if = "Option::is_none")]
     provider_launch_lifecycle: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
@@ -5358,6 +5361,7 @@ struct ExternalAgentRunWireOwned {
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
     #[serde(default)]
     managed_cursor_selection: Option<ManagedCursorAccountSelectionEvidence>,
+    #[cfg(target_os = "linux")]
     #[serde(default)]
     provider_launch_lifecycle: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
@@ -5407,6 +5411,7 @@ impl Serialize for ExternalAgentRun {
             managed_codex_selection: &self.stdout.run_metadata.managed_codex_selection,
             managed_gemini_selection: &self.stdout.run_metadata.managed_gemini_selection,
             managed_cursor_selection: &self.stdout.run_metadata.managed_cursor_selection,
+            #[cfg(target_os = "linux")]
             provider_launch_lifecycle: self.provider_launch_lifecycle(),
         }
         .serialize(serializer)
@@ -5437,7 +5442,10 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
         stdout.run_metadata.managed_codex_selection = wire.managed_codex_selection;
         stdout.run_metadata.managed_gemini_selection = wire.managed_gemini_selection;
         stdout.run_metadata.managed_cursor_selection = wire.managed_cursor_selection;
-        stdout.run_metadata.launch_lifecycle_metadata = wire.provider_launch_lifecycle;
+        #[cfg(target_os = "linux")]
+        {
+            stdout.run_metadata.launch_lifecycle_metadata = wire.provider_launch_lifecycle;
+        }
         Ok(Self {
             command: wire.command,
             cwd: wire.cwd,
@@ -5504,7 +5512,9 @@ struct ExternalAgentRunMetadata {
     managed_codex_selection: Option<FrozenCodexSelectedBinding>,
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
     managed_cursor_selection: Option<ManagedCursorAccountSelectionEvidence>,
+    #[cfg(target_os = "linux")]
     launch_lifecycle_handle: Option<LaunchLifecycleHandle>,
+    #[cfg(target_os = "linux")]
     launch_lifecycle_metadata: Option<crate::secret_lifecycle::ProviderLaunchMetadata>,
 }
 
@@ -9046,8 +9056,6 @@ fn run_external_agent_runtime(
     let mut grok_launch_custody = grok_session
         .as_ref()
         .and_then(|session| session.authority.launch_custody());
-    #[cfg(not(target_os = "linux"))]
-    let mut grok_launch_custody: Option<&mut ExternalLaunchCustody> = None;
     let process_result = if app_server_required {
         let Some(prompt) = app_server_prompt else {
             report.duration_ms = duration_millis(started.elapsed());
@@ -9256,6 +9264,7 @@ fn run_external_agent_runtime(
             &target_spec,
             prompt,
             timeout,
+            #[cfg(target_os = "linux")]
             grok_launch_custody.as_deref_mut(),
         ) {
             Ok(interactive) => {
@@ -9538,25 +9547,29 @@ fn run_external_agent_runtime(
             unreachable!("managed Cursor was refused before process construction")
         }
     } else {
+        let run_batch = || {
+            if grok_progress::guarded_worker(&target_spec)
+                && runtime == ExternalExecutionRuntime::Verified
+            {
+                grok_progress::run(
+                    process_spec,
+                    cancellation,
+                    target_spec.worker_change_required,
+                )
+            } else {
+                run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
+                    .map(|(output, filesystem)| (output, filesystem, None))
+            }
+        };
+        #[cfg(target_os = "linux")]
         let batch = executor::launch_lifecycle::execute(
             grok_launch_custody.as_deref_mut(),
             cancellation,
-            || {
-                if grok_progress::guarded_worker(&target_spec)
-                    && runtime == ExternalExecutionRuntime::Verified
-                {
-                    grok_progress::run(
-                        process_spec,
-                        cancellation,
-                        target_spec.worker_change_required,
-                    )
-                } else {
-                    run_codex_batch_process(process_spec, cancellation, codex_auth.as_ref())
-                        .map(|(output, filesystem)| (output, filesystem, None))
-                }
-            },
+            run_batch,
             |(output, _, _)| output,
         );
+        #[cfg(not(target_os = "linux"))]
+        let batch = run_batch();
         batch.map(|(output, filesystem, prior)| {
             // Bind the original supervisor command, not target_spec's private
             // staging destination. Retain spend before any fallible materialization.
@@ -10826,7 +10839,7 @@ fn run_grok_acp_external_process(
     spec: &ExternalAgentCommand,
     prompt: String,
     operation_timeout: Duration,
-    custody: Option<&mut ExternalLaunchCustody>,
+    #[cfg(target_os = "linux")] custody: Option<&mut ExternalLaunchCustody>,
 ) -> Result<InteractiveProcessOutput<GrokAcpInteractiveOutcome>, ProcessRunError> {
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         let context = LaunchContext {
@@ -10883,38 +10896,42 @@ fn run_grok_acp_external_process(
             source: std::io::Error::new(std::io::ErrorKind::InvalidInput, error.to_string()),
         })?;
 
+    let run_interactive = || {
+        run_process_interactive(process_spec, cancellation, |session| {
+            let mut transport = GrokAcpContainedTransport::new(session);
+            let cancelled = || cancellation.is_cancelled();
+            let evidence = if let Some(bridge) = steering_bridge.as_mut() {
+                crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
+                    &mut transport,
+                    &turn,
+                    limits,
+                    cancelled,
+                    bridge,
+                )
+            } else {
+                crate::runtime_adapter::grok_acp::run_grok_acp_turn(
+                    &mut transport,
+                    &turn,
+                    limits,
+                    cancelled,
+                )
+            }
+            .map_err(|error| error.to_string())?;
+            Ok(GrokAcpInteractiveOutcome {
+                evidence,
+                launch_schema: turn.output_schema.clone(),
+            })
+        })
+    };
+    #[cfg(target_os = "linux")]
     let interactive = executor::launch_lifecycle::execute(
         custody,
         cancellation,
-        || {
-            run_process_interactive(process_spec, cancellation, |session| {
-                let mut transport = GrokAcpContainedTransport::new(session);
-                let cancelled = || cancellation.is_cancelled();
-                let evidence = if let Some(bridge) = steering_bridge.as_mut() {
-                    crate::runtime_adapter::grok_acp::run_grok_acp_turn_with_steering(
-                        &mut transport,
-                        &turn,
-                        limits,
-                        cancelled,
-                        bridge,
-                    )
-                } else {
-                    crate::runtime_adapter::grok_acp::run_grok_acp_turn(
-                        &mut transport,
-                        &turn,
-                        limits,
-                        cancelled,
-                    )
-                }
-                .map_err(|error| error.to_string())?;
-                Ok(GrokAcpInteractiveOutcome {
-                    evidence,
-                    launch_schema: turn.output_schema.clone(),
-                })
-            })
-        },
+        run_interactive,
         |interactive| &interactive.process,
     );
+    #[cfg(not(target_os = "linux"))]
+    let interactive = run_interactive();
 
     if let Some(bridge) = steering_bridge {
         bridge
@@ -12110,6 +12127,7 @@ struct EnvironmentPreflightReport {
 #[derive(Debug, Default)]
 struct EnvironmentPreflightProcessEvidence {
     started: bool,
+    unconfirmed_child: bool,
     process_tree: Option<ProcessTreeEvidence>,
     side_effects: Option<SideEffectConfinementEvidence>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
@@ -12118,10 +12136,7 @@ struct EnvironmentPreflightProcessEvidence {
 impl EnvironmentPreflightProcessEvidence {
     #[cfg(target_os = "linux")]
     fn may_have_live_child(&self) -> bool {
-        self.started
-            && !self
-                .process_tree
-                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+        self.unconfirmed_child
     }
 
     fn record_output(&mut self, output: &ProcessOutput) {
@@ -12178,9 +12193,18 @@ impl EnvironmentPreflightProcessEvidence {
                 ),
                 false,
             ),
+            ProcessRunError::SetupTimeout { .. } | ProcessRunError::TeeConflict { .. } => {
+                // Preserve the attempted containment in reports without implying
+                // that this pre-release refusal created a possibly live child.
+                self.record_containment(
+                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+                    SideEffectConfinementEvidence::Unverified(
+                        SideEffectConfinementProfileKind::ExternalCodex,
+                    ),
+                    false,
+                );
+            }
             ProcessRunError::Cancelled { evidence: None, .. }
-            | ProcessRunError::SetupTimeout { .. }
-            | ProcessRunError::TeeConflict { .. }
             | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {
@@ -12192,6 +12216,16 @@ impl EnvironmentPreflightProcessEvidence {
     }
 
     fn record(
+        &mut self,
+        process_tree: ProcessTreeEvidence,
+        side_effects: SideEffectConfinementEvidence,
+        verified: bool,
+    ) {
+        self.unconfirmed_child |= !process_tree.is_verified_empty();
+        self.record_containment(process_tree, side_effects, verified);
+    }
+
+    fn record_containment(
         &mut self,
         process_tree: ProcessTreeEvidence,
         side_effects: SideEffectConfinementEvidence,

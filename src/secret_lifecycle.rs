@@ -9,7 +9,7 @@
 //! equivalent closed operation: an exact incarnation/use lease and run-bound admission.
 //! The root Grok executor opens its vendor-home capability during guarded
 //! construction and settles custody only from live process-tree evidence.
-//! [`ProviderLaunchMetadata`] is reference-only descriptive evidence.
+//! On Linux, `ProviderLaunchMetadata` is reference-only descriptive evidence.
 //!
 //! The contract is:
 //!
@@ -49,12 +49,14 @@
 mod audit;
 mod injection;
 mod material;
+#[cfg(target_os = "linux")]
 mod provider_dispatch;
 mod types;
 mod vault;
 
 pub use audit::{SecretAuditAction, SecretAuditEvent, SecretAuditOutcome, SecretAuditTrail};
 pub use injection::{SecretEnvironment, SecretLease};
+#[cfg(target_os = "linux")]
 pub use provider_dispatch::ProviderLaunchMetadata;
 pub use types::{
     DelegationPolicy, PersistencePolicy, SecretDeclaration, SecretLifecycleError,
