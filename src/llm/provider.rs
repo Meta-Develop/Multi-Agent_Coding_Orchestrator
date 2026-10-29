@@ -255,6 +255,7 @@ impl Usage {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct ModelPricing {
     pub input_usd_per_million_tokens: f64,
     pub output_usd_per_million_tokens: f64,

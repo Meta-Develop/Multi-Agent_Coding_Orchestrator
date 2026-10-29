@@ -45,6 +45,9 @@ use coding_agent_manager_lib::account_authority::{
 };
 use std::path::Path;
 
+#[path = "selection_preflight.rs"]
+pub(super) mod selection_preflight;
+
 /// Account observation is a Linux-only CAM type. Non-Linux keeps
 /// `account_observation=None` and the advertised-catalog path.
 #[cfg(target_os = "linux")]
@@ -660,7 +663,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     quota_ledger: Option<RunBudgetLedger>,
     account_observation: Option<AccountObserveResult>,
     account_observations: Vec<(SupervisorRuntime, AccountObserveResult)>,
-    observed_cost_per_accepted_task_microunits: Option<u64>,
+    accepted_task_cost_observations: Vec<selection::AcceptedTaskCostObservation>,
     this_run_outcomes: Vec<OutcomeRecord>,
     this_run_exclusions: Vec<String>,
 }
@@ -670,8 +673,7 @@ impl PartialEq for SupervisorAutomaticSelectionState {
         self.decisions == other.decisions
             && self.advertised == other.advertised
             && self.quota_context == other.quota_context
-            && self.observed_cost_per_accepted_task_microunits
-                == other.observed_cost_per_accepted_task_microunits
+            && self.accepted_task_cost_observations == other.accepted_task_cost_observations
             && self.this_run_outcomes == other.this_run_outcomes
             && self.this_run_exclusions == other.this_run_exclusions
     }
@@ -796,7 +798,8 @@ pub(crate) fn select_executable_review_auditor(
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_context: None,
+            accepted_task_cost_observations: Vec::new(),
         },
         debug_override: None,
         operational_observations: None,
@@ -1024,6 +1027,20 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             .unwrap_or(
                 "verified Cursor runtime model catalog observation is missing without recorded failure evidence",
             );
+        let report = selection_preflight::evaluate_supervisor_selection_preflight(
+            plan,
+            runtime,
+            selection_preflight::FrozenSupervisorSelectionInputs {
+                schema_version: 1,
+                plan_sha256: selection_preflight::plan_digest(plan)?,
+                roles: BTreeMap::new(),
+                unavailable: roles
+                    .iter()
+                    .map(|role| (*role, detail.to_string()))
+                    .collect(),
+            },
+        )?;
+        let aggregate = selection_preflight::refusal_message(&report)?;
         return Ok(SupervisorSelectionResolution {
             mode: if automatic {
                 SupervisorSelectionMode::Automatic
@@ -1036,121 +1053,173 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
                 role,
                 kind: SupervisorSelectionPreflightFailureKind::FailClosed,
                 message: format!(
-                    "selected Cursor runtime requires a verified runtime-advertised model catalog before role '{}': {detail}",
+                    "selected Cursor runtime requires a verified runtime-advertised model catalog before role '{}': {detail}; {aggregate}",
                     role.as_str()
                 ),
             }),
         });
     }
-    let mut resolved = BTreeMap::new();
-    let mut decisions = Vec::with_capacity(roles.len());
+    let mut frozen_inputs = selection_preflight::FrozenSupervisorSelectionInputs {
+        schema_version: 1,
+        plan_sha256: selection_preflight::plan_digest(plan)?,
+        roles: BTreeMap::new(),
+        unavailable: BTreeMap::new(),
+    };
+    let frozen_quota_ledger =
+        selection_preflight::freeze_quota_ledger(quota_context, quota_ledger)?;
     for role in roles.iter().copied() {
-        let configured = plan.role_models.get(&role);
-        let debug_override = configured
-            .map(|selection| {
-                debug_override_for_role(
+        let result = (|| -> Result<_> {
+            let debug_override = plan
+                .role_models
+                .get(&role)
+                .map(|selection| {
+                    debug_override_for_role(
+                        role,
+                        authored_override_runtime(plan, role, runtime)?,
+                        selection,
+                    )
+                })
+                .transpose()?;
+            let mut input = selection_input_for_role_with_assessment_and_accounts(
+                SelectionInputForRoleArgs {
                     role,
-                    authored_override_runtime(plan, role, runtime)?,
-                    selection,
-                )
-            })
-            .transpose()?;
-        let input = selection_input_for_role_with_assessment_and_accounts(
-            SelectionInputForRoleArgs {
-                role,
-                runtime,
-                catalog,
-                advertised,
-                admission,
-                resolved_objective_profile: &resolved_objective_profile,
-                quota_context,
-                quota_ledger,
-                account_observation,
-                signals: DynamicSignals {
-                    retry_count: 0,
-                    budget_signal: BudgetSignal::Continue,
-                    previous_choice: None,
-                    previous_catalog_digest: None,
-                    environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
-                },
-                debug_override,
-                history,
-            },
-            account_observations,
-            assessment,
-            Some(&routing_features),
-            frozen_policy.as_ref(),
-        )?;
-        let routing_policy = frozen_policy.as_ref().map(|frozen| {
-            crate::selection::routing_policy::RoutingPolicyReceipt {
-                frozen: frozen.clone(),
-                role: role.as_str().to_string(),
-                features: routing_features.clone(),
-            }
-        });
-        let mut decision = select_with_live_switch_cost_for_policy(&input, routing_policy.as_ref())
-            .map_err(|error| {
-                anyhow!(
-                    "automatic selector rejected role '{}': {error}",
-                    role.as_str()
-                )
-            })?;
-        decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
-        decision.operator_prior_data = super::prior_input::current_provenance();
-        let primary_cause = if configured.is_some() {
-            SupervisorSelectionEventCause::DebugOverride
-        } else {
-            SupervisorSelectionEventCause::Initial
-        };
-        let event = SupervisorSelectionEvent {
-            assignment_id: None,
-            attempt: 0,
-            role,
-            primary_cause,
-            provenance: decision,
-        };
-        let choice = match executable_choice(&event.provenance, runtime, role)? {
-            ExecutableChoiceResolution::Executable(choice) => choice,
-            ExecutableChoiceResolution::PreflightFailure(failure) => {
-                decisions.push(event);
-                return Ok(SupervisorSelectionResolution {
-                    mode: if automatic {
-                        SupervisorSelectionMode::Automatic
-                    } else {
-                        SupervisorSelectionMode::DebugOverride
+                    runtime,
+                    catalog,
+                    advertised,
+                    admission,
+                    resolved_objective_profile: &resolved_objective_profile,
+                    quota_context: None,
+                    quota_ledger: None,
+                    account_observation,
+                    signals: DynamicSignals {
+                        retry_count: 0,
+                        budget_signal: BudgetSignal::Continue,
+                        previous_choice: None,
+                        previous_catalog_digest: None,
+                        environment_rejections: Vec::new(),
+                        accepted_task_cost_context: None,
+                        accepted_task_cost_observations: Vec::new(),
                     },
-                    decisions,
-                    automatic_state: None,
-                    selection_preflight_failure: Some(failure),
-                });
+                    debug_override,
+                    history,
+                },
+                account_observations,
+                assessment,
+                Some(&routing_features),
+                frozen_policy.as_ref(),
+            )?;
+            selection_preflight::apply_frozen_quota(
+                &mut input,
+                runtime,
+                quota_context,
+                frozen_quota_ledger.as_ref(),
+            )?;
+            let routing_policy = frozen_policy.as_ref().map(|frozen| {
+                crate::selection::routing_policy::RoutingPolicyReceipt {
+                    frozen: frozen.clone(),
+                    role: role.as_str().to_string(),
+                    features: routing_features.clone(),
+                }
+            });
+            Ok(selection_preflight::freeze_role_input(
+                input,
+                routing_policy,
+            ))
+        })();
+        match result {
+            Ok(input) => {
+                frozen_inputs.roles.insert(role, input);
             }
-        };
-        crate::selection::routing_policy::seal_selected_candidate(
-            role.as_str(),
-            &event.provenance,
-        )?;
-        if configured.is_some() {
-            let requested = &input
-                .debug_override
-                .as_ref()
-                .context("explicit role_models entry lost its selector debug override")?
-                .candidate;
-            if requested != &choice.candidate {
-                bail!(
-                    "debug runtime/model/effort override for role '{}' was not applied exactly by the selector: requested '{}:{}:{:?}', selected '{}:{}:{:?}'",
-                    role.as_str(),
-                    requested.runtime,
-                    requested.model,
-                    requested.effort,
-                    choice.candidate.runtime,
-                    choice.candidate.model,
-                    choice.candidate.effort,
-                );
+            Err(error) => {
+                frozen_inputs.unavailable.insert(role, format!("{error:#}"));
             }
         }
-        resolved.insert(role, role_selection_from_choice(choice));
-        decisions.push(event);
+    }
+    let report =
+        selection_preflight::evaluate_supervisor_selection_preflight(plan, runtime, frozen_inputs)?;
+    let mut decisions = Vec::with_capacity(roles.len());
+    for diagnostic in &report.diagnostics {
+        if diagnostic.lens_id.is_some() {
+            continue;
+        }
+        let Some(mut decision) = diagnostic.decision.clone() else {
+            continue;
+        };
+        decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
+        decision.operator_prior_data = super::prior_input::current_provenance();
+        decisions.push(SupervisorSelectionEvent {
+            assignment_id: None,
+            attempt: 0,
+            role: diagnostic.role,
+            primary_cause: if plan.role_models.contains_key(&diagnostic.role) {
+                SupervisorSelectionEventCause::DebugOverride
+            } else {
+                SupervisorSelectionEventCause::Initial
+            },
+            provenance: decision,
+        });
+    }
+    // An unavailable authored lens is refused by the existing review dispatch
+    // path, which records its procedural verdict and journal entry. The pure
+    // preflight report still includes that diagnostic without granting a lens
+    // launch authorization here.
+    let first_failure = report.diagnostics.iter().find(|entry| {
+        entry.status != selection_preflight::SelectionPreflightStatus::Compatible
+            && !(entry.lens_id.is_some()
+                && entry.rejection
+                    == Some(selection_preflight::SelectionPreflightRejection::ModelUnavailable))
+    });
+    if let Some(first) = first_failure {
+        let message = selection_preflight::refusal_message(&report)?;
+        // Preserve malformed-input errors while reporting every reachable failure.
+        if !report.frozen_inputs.unavailable.is_empty() {
+            bail!("{message}");
+        }
+        if let Some(invalid) = report.diagnostics.iter().find(|entry| {
+            entry.rejection == Some(selection_preflight::SelectionPreflightRejection::InvalidInput)
+        }) {
+            bail!(
+                "automatic selector rejected role '{}': {}; {message}",
+                invalid.role.as_str(),
+                invalid.message
+            );
+        }
+        return Ok(SupervisorSelectionResolution {
+            mode: if automatic {
+                SupervisorSelectionMode::Automatic
+            } else {
+                SupervisorSelectionMode::DebugOverride
+            },
+            decisions,
+            automatic_state: None,
+            selection_preflight_failure: Some(SupervisorSelectionPreflightFailure {
+                role: first.role,
+                kind: if first.rejection
+                    == Some(selection_preflight::SelectionPreflightRejection::UnexecutableRuntime)
+                {
+                    SupervisorSelectionPreflightFailureKind::ActiveRuntimeMismatch
+                } else {
+                    SupervisorSelectionPreflightFailureKind::FailClosed
+                },
+                message,
+            }),
+        });
+    }
+    // All role and nonprocedural lens gates passed. Only now bind role authority.
+    let mut resolved = BTreeMap::new();
+    for event in &decisions {
+        let choice = match executable_choice(&event.provenance, runtime, event.role)? {
+            ExecutableChoiceResolution::Executable(choice) => choice,
+            ExecutableChoiceResolution::PreflightFailure(failure) => bail!("{}", failure.message),
+        };
+        route_live_four_arm_comparison(&event.provenance.normalized_input)?;
+        resolved.insert(event.role, role_selection_from_choice(choice));
+    }
+    for event in &decisions {
+        crate::selection::routing_policy::seal_selected_candidate(
+            event.role.as_str(),
+            &event.provenance,
+        )?;
     }
 
     plan.role_models = resolved;
@@ -1238,14 +1307,17 @@ impl SupervisorAutomaticSelectionState {
             quota_ledger,
             account_observation,
             account_observations,
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_observations: Vec::new(),
             this_run_outcomes: Vec::new(),
             this_run_exclusions: Vec::new(),
         })
     }
 
-    pub(super) fn set_observed_accepted_task_cost(&mut self, cost: Option<u64>) {
-        self.observed_cost_per_accepted_task_microunits = cost;
+    pub(super) fn set_observed_accepted_task_cost(
+        &mut self,
+        observations: Vec<selection::AcceptedTaskCostObservation>,
+    ) {
+        self.accepted_task_cost_observations = observations;
     }
 
     pub(super) fn set_this_run_outcomes(
@@ -1469,8 +1541,10 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             .filter(|rejection| rejection.role == role)
             .map(|rejection| rejection.rejection.clone())
             .collect();
-        input.signals.observed_cost_per_accepted_task_microunits =
-            state.observed_cost_per_accepted_task_microunits;
+        // Role-level replay has no parent-validated target assignment shape.
+        input.signals.accepted_task_cost_context = None;
+        input.signals.accepted_task_cost_observations =
+            state.accepted_task_cost_observations.clone();
         if let Some(quota_context) = &state.quota_context {
             let source_runtime = input
                 .signals
@@ -2470,7 +2544,8 @@ fn select_account_intake_for_role_with_assessment(
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: vec![],
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history,
@@ -2605,6 +2680,7 @@ pub(super) fn base_selector_priors_with_terminal_worker_economics(
         .into_iter()
         .collect(),
         long_context_eligible: false,
+        task_shape_ceiling: Some(selection::TaskShapeCeiling::bounded_terminal()),
         strong_gate_fallback_efforts: BTreeSet::new(),
         strength_rank: 40,
         class_fit: vec![selection::ClassFitPrior {
@@ -2970,7 +3046,7 @@ fn constructed_selection_catalogs(
         } else if let Some(gap) = &advertised.cursor_evidence_gap {
             catalogs.push(runtime_catalog_from_unavailable_priors(
                 "cursor", gap, task, priors,
-            ));
+            )?);
         }
     }
     if runtime != SupervisorRuntime::Grok {
@@ -3092,7 +3168,7 @@ fn runtime_catalog_from_observed_models(
     let mut models = Vec::new();
     for observed_model in &observed.models {
         if let Some(catalog_model) =
-            catalog_model_from_observed(runtime, observed_model, task, priors)
+            catalog_model_from_observed(runtime, observed_model, task, priors)?
         {
             models.push(catalog_model);
         }
@@ -3131,23 +3207,28 @@ fn catalog_model_from_observed(
     observed: &ObservedModel,
     task: &TaskProfile,
     priors: &selection::PriorDataset,
-) -> Option<CatalogModel> {
+) -> Result<Option<CatalogModel>> {
     let mut supported_efforts = Vec::new();
     if let Some(raw_efforts) = &observed.supported_efforts {
         for effort in raw_efforts {
-            supported_efforts.push(selector_effort_from_str(effort)?);
+            let Some(effort) = selector_effort_from_str(effort) else {
+                return Ok(None);
+            };
+            supported_efforts.push(effort);
         }
     }
     supported_efforts.sort();
     supported_efforts.dedup();
     if supported_efforts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let capabilities = priors
+    let prior = priors
         .models
         .iter()
-        .find(|prior| prior.runtime == runtime && prior.model == observed.model_id)
+        .find(|prior| prior.runtime == runtime && prior.model == observed.model_id);
+    let mut capabilities = prior
         .map(|prior| capabilities_from_prior(prior, task))
+        .transpose()?
         .unwrap_or_else(|| CandidateCapabilities {
             task_classes: BTreeSet::new(),
             authority_roles: BTreeSet::new(),
@@ -3163,7 +3244,11 @@ fn catalog_model_from_observed(
             maximum_horizon: TaskHorizon::Long,
             long_context: false,
         });
-    Some(CatalogModel {
+    if prior.is_none() {
+        selection::effective_task_shape_ceiling(runtime, &observed.model_id, None)?
+            .constrain(&mut capabilities);
+    }
+    Ok(Some(CatalogModel {
         model: observed.model_id.clone(),
         access: Some(observed.access),
         available: match observed.access {
@@ -3176,14 +3261,13 @@ fn catalog_model_from_observed(
         },
         supported_efforts,
         capabilities,
-    })
+    }))
 }
 
-#[cfg(target_os = "linux")]
 fn capabilities_from_prior(
     prior: &selection::ModelPrior,
     task: &TaskProfile,
-) -> CandidateCapabilities {
+) -> Result<CandidateCapabilities> {
     let mut authority_roles = prior
         .authority_evidence
         .iter()
@@ -3199,7 +3283,7 @@ fn capabilities_from_prior(
     {
         authority_roles.insert(task.authority_role);
     }
-    CandidateCapabilities {
+    let mut capabilities = CandidateCapabilities {
         task_classes: prior
             .class_fit
             .iter()
@@ -3217,7 +3301,14 @@ fn capabilities_from_prior(
         maximum_context: ContextSize::Long,
         maximum_horizon: TaskHorizon::Long,
         long_context: prior.long_context_eligible,
-    }
+    };
+    selection::effective_task_shape_ceiling(
+        &prior.runtime,
+        &prior.model,
+        prior.task_shape_ceiling.as_ref(),
+    )?
+    .constrain(&mut capabilities);
+    Ok(capabilities)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -3333,15 +3424,15 @@ fn runtime_catalog_from_unavailable_priors(
     gap: &CursorCatalogEvidenceGap,
     task: &TaskProfile,
     priors: &selection::PriorDataset,
-) -> RuntimeCatalog {
+) -> Result<RuntimeCatalog> {
     let mut models = priors
         .models
         .iter()
         .filter(|prior| prior.runtime == runtime_name)
-        .filter_map(|prior| catalog_model_from_prior(prior, task, false))
-        .collect::<Vec<_>>();
+        .filter_map(|prior| catalog_model_from_prior(prior, task, false).transpose())
+        .collect::<Result<Vec<_>>>()?;
     models.sort_by(|left, right| left.model.cmp(&right.model));
-    RuntimeCatalog {
+    Ok(RuntimeCatalog {
         runtime: runtime_name.to_string(),
         revision: format!(
             "cursor-unavailable-sha256:{}",
@@ -3349,7 +3440,7 @@ fn runtime_catalog_from_unavailable_priors(
         ),
         advertised_at: gap.observed_at_unix_millis.to_string(),
         models,
-    }
+    })
 }
 
 fn pools_for_constructed_catalogs(
@@ -3405,7 +3496,7 @@ fn runtime_catalog_from_advertised_slugs<'a>(
         if !advertised.contains(&prior.model) {
             continue;
         }
-        if let Some(model) = catalog_model_from_prior(prior, task, true) {
+        if let Some(model) = catalog_model_from_prior(prior, task, true)? {
             models.push(model);
         }
     }
@@ -3422,7 +3513,7 @@ fn catalog_model_from_prior(
     prior: &selection::ModelPrior,
     task: &TaskProfile,
     available: bool,
-) -> Option<CatalogModel> {
+) -> Result<Option<CatalogModel>> {
     let mut supported_efforts = prior
         .class_fit
         .iter()
@@ -3443,48 +3534,15 @@ fn catalog_model_from_prior(
         .collect::<Vec<_>>();
     supported_efforts.sort();
     if supported_efforts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut authority_roles = prior
-        .authority_evidence
-        .iter()
-        .map(|evidence| evidence.role)
-        .collect::<BTreeSet<_>>();
-    if !prior.class_fit.is_empty() {
-        authority_roles.insert(AuthorityRole::TerminalLeaf);
-    }
-    if !prior.strong_gate_fallback_efforts.is_empty()
-        && !prior
-            .prohibited_authority_roles
-            .contains(&task.authority_role)
-    {
-        authority_roles.insert(task.authority_role);
-    }
-    Some(CatalogModel {
+    Ok(Some(CatalogModel {
         model: prior.model.clone(),
         available,
         access: None,
         supported_efforts,
-        capabilities: CandidateCapabilities {
-            task_classes: prior
-                .class_fit
-                .iter()
-                .map(|class_fit| class_fit.task_class.clone())
-                .collect(),
-            authority_roles,
-            boundedness: [
-                Boundedness::TightlyBounded,
-                Boundedness::Bounded,
-                Boundedness::CrossCutting,
-            ]
-            .into_iter()
-            .collect(),
-            maximum_risk: RiskLevel::Critical,
-            maximum_context: ContextSize::Long,
-            maximum_horizon: TaskHorizon::Long,
-            long_context: prior.long_context_eligible,
-        },
-    })
+        capabilities: capabilities_from_prior(prior, task)?,
+    }))
 }
 
 pub(super) fn runtime_catalog_from_priors(
@@ -3502,69 +3560,9 @@ pub(super) fn runtime_catalog_from_priors(
         let available = catalog
             .availability(Some(&prior.model), runtime_from_name(runtime_name)?)?
             == RoleModelAvailability::Available;
-        let mut supported_efforts = prior
-            .class_fit
-            .iter()
-            .filter(|class_fit| class_fit.task_class == task.task_class)
-            .map(|class_fit| class_fit.effort)
-            .chain(
-                prior
-                    .authority_evidence
-                    .iter()
-                    .filter(|evidence| {
-                        evidence.task_class == task.task_class
-                            && evidence.role == task.authority_role
-                    })
-                    .map(|evidence| evidence.effort),
-            )
-            .chain(prior.strong_gate_fallback_efforts.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        supported_efforts.sort();
-        if supported_efforts.is_empty() {
-            continue;
+        if let Some(model) = catalog_model_from_prior(prior, task, available)? {
+            models.push(model);
         }
-        let mut authority_roles = prior
-            .authority_evidence
-            .iter()
-            .map(|evidence| evidence.role)
-            .collect::<BTreeSet<_>>();
-        if !prior.class_fit.is_empty() {
-            authority_roles.insert(AuthorityRole::TerminalLeaf);
-        }
-        if !prior.strong_gate_fallback_efforts.is_empty()
-            && !prior
-                .prohibited_authority_roles
-                .contains(&task.authority_role)
-        {
-            authority_roles.insert(task.authority_role);
-        }
-        models.push(CatalogModel {
-            model: prior.model.clone(),
-            available,
-            access: None,
-            supported_efforts,
-            capabilities: CandidateCapabilities {
-                task_classes: prior
-                    .class_fit
-                    .iter()
-                    .map(|class_fit| class_fit.task_class.clone())
-                    .collect(),
-                authority_roles,
-                boundedness: [
-                    Boundedness::TightlyBounded,
-                    Boundedness::Bounded,
-                    Boundedness::CrossCutting,
-                ]
-                .into_iter()
-                .collect(),
-                maximum_risk: RiskLevel::Critical,
-                maximum_context: ContextSize::Long,
-                maximum_horizon: TaskHorizon::Long,
-                long_context: prior.long_context_eligible,
-            },
-        });
     }
     models.sort_by(|left, right| left.model.cmp(&right.model));
     let revision_material =
@@ -4800,7 +4798,7 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[cfg(target_os = "linux")]
     use super::super::environment_observation::environment_cost_microunits_from_account_observe;
     use super::*;
@@ -4818,8 +4816,8 @@ mod tests {
         }
     }
 
-    fn bind_fixture_routing_policy() -> Result<crate::selection::routing_policy::RoutingPolicyGuard>
-    {
+    pub(in crate::supervise) fn bind_fixture_routing_policy(
+    ) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
         use crate::selection::routing_policy::{
             bind_routing_policy, FrozenRoutingPolicy, LoadedRoutingPolicy,
         };
@@ -4846,6 +4844,76 @@ mod tests {
         )?;
         let (assessment, features) = fixture_task_assessment_for_policy(plan, &frozen)?;
         Ok((assessment, features, frozen))
+    }
+
+    pub(in crate::supervise) fn frozen_preflight_fixture(
+        plan: &SupervisorPlan,
+    ) -> Result<selection_preflight::FrozenSupervisorSelectionInputs> {
+        let (assessment, features, policy) = fixture_task_assessment(plan)?;
+        let mut roles = BTreeMap::new();
+        for role in required_selector_roles(plan) {
+            let input = selection_input_for_role_with_assessment_and_accounts(
+                SelectionInputForRoleArgs {
+                    role,
+                    runtime: SupervisorRuntime::Codex,
+                    catalog: &codex_catalog()?,
+                    advertised: &AdvertisedCatalogSet::empty(),
+                    admission: &test_admission(),
+                    resolved_objective_profile: &default_resolved_profile(),
+                    quota_context: None,
+                    quota_ledger: None,
+                    account_observation: None,
+                    history: None,
+                    debug_override: plan
+                        .role_models
+                        .get(&role)
+                        .map(|value| debug_override_for_role(role, SupervisorRuntime::Codex, value))
+                        .transpose()?,
+                    signals: DynamicSignals {
+                        retry_count: 0,
+                        budget_signal: BudgetSignal::Continue,
+                        previous_choice: None,
+                        previous_catalog_digest: None,
+                        environment_rejections: Vec::new(),
+                        accepted_task_cost_context: None,
+                        accepted_task_cost_observations: Vec::new(),
+                    },
+                },
+                &[],
+                Some(&assessment),
+                Some(&features),
+                Some(&policy),
+            )?;
+            roles.insert(
+                role,
+                selection_preflight::freeze_role_input(
+                    input,
+                    Some(crate::selection::routing_policy::RoutingPolicyReceipt {
+                        frozen: policy.clone(),
+                        role: role.as_str().to_string(),
+                        features: features.clone(),
+                    }),
+                ),
+            );
+        }
+        Ok(selection_preflight::FrozenSupervisorSelectionInputs {
+            schema_version: 1,
+            plan_sha256: selection_preflight::plan_digest(plan)?,
+            roles,
+            unavailable: BTreeMap::new(),
+        })
+    }
+
+    pub(in crate::supervise) fn initialize_preflight_fixture(
+        plan: &mut SupervisorPlan,
+    ) -> Result<SupervisorSelectionResolution> {
+        initialize_supervisor_selection(
+            plan,
+            SupervisorRuntime::Codex,
+            &codex_catalog()?,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )
     }
 
     fn fixture_task_assessment_for_policy(
@@ -5073,6 +5141,186 @@ mod tests {
         )
     }
 
+    #[test]
+    fn cheap_lane_capabilities_cannot_be_widened_by_operator_priors() -> Result<()> {
+        let task = task_profile_for_role(AgentRole::Worker);
+        let mut priors = selector_priors_with_terminal_worker_economics()?;
+        let wide = selection::TaskShapeCeiling {
+            boundedness: [
+                Boundedness::TightlyBounded,
+                Boundedness::Bounded,
+                Boundedness::CrossCutting,
+            ]
+            .into_iter()
+            .collect(),
+            maximum_risk: RiskLevel::Critical,
+            maximum_context: ContextSize::Long,
+            maximum_horizon: TaskHorizon::Long,
+        };
+        for prior in &mut priors.models {
+            prior.task_shape_ceiling = Some(wide.clone());
+            prior.long_context_eligible = true;
+        }
+        let advertised = runtime_catalog_from_advertised_slugs(
+            "codex",
+            ["gpt-5.6-luna"],
+            "fixture".into(),
+            "2026-10-29".into(),
+            &task,
+            &priors,
+        )?;
+        let membership = runtime_catalog_from_priors("codex", &codex_catalog()?, &task, &priors)?;
+        let unavailable = runtime_catalog_from_unavailable_priors(
+            "codex",
+            &CursorCatalogEvidenceGap {
+                message: "fixture".into(),
+                observed_at_unix_millis: 1,
+            },
+            &task,
+            &priors,
+        )?;
+        for catalog in [advertised, membership, unavailable] {
+            let model = catalog
+                .models
+                .iter()
+                .find(|model| model.model == "gpt-5.6-luna")
+                .context("bounded prior catalog model")?;
+            assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+            assert_eq!(model.capabilities.maximum_context, ContextSize::Medium);
+            assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+            assert!(!model
+                .capabilities
+                .boundedness
+                .contains(&Boundedness::CrossCutting));
+            assert!(!model.capabilities.long_context);
+        }
+        let terminal = priors
+            .models
+            .iter()
+            .find(|prior| prior.model == "grok-4.6")
+            .context("terminal economics prior")?;
+        assert_eq!(
+            capabilities_from_prior(terminal, &task)?.maximum_risk,
+            RiskLevel::Medium
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let observed = ObservedModel {
+                model_id: "gpt-5.6-luna".into(),
+                access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::Available,
+                supported_efforts: Some(vec!["high".into()]),
+                default_effort: Some("high".into()),
+            };
+            let model = catalog_model_from_observed("codex", &observed, &task, &priors)?
+                .context("observed bounded model")?;
+            assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+            assert_eq!(model.capabilities.maximum_context, ContextSize::Medium);
+            assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+            assert!(!model
+                .capabilities
+                .boundedness
+                .contains(&Boundedness::CrossCutting));
+            assert!(!model.capabilities.long_context);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_observed_unbundled_prior_preserves_explicit_shape_ceiling() -> Result<()> {
+        let task = task_profile_for_role(AgentRole::Worker);
+        let mut priors = selector_priors_with_terminal_worker_economics()?;
+        let mut prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.model == FRONTIER_PROFILE_MODEL)
+            .context("qualified prior fixture")?
+            .clone();
+        prior.model = "qualified-unbundled-fixture".into();
+        prior.long_context_eligible = true;
+        let model_id = prior.model.clone();
+        priors.models.push(prior);
+        let observed = ObservedModel {
+            model_id: model_id.clone(),
+            access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::Available,
+            supported_efforts: Some(vec!["high".into()]),
+            default_effort: Some("high".into()),
+        };
+        let gap = CursorCatalogEvidenceGap {
+            message: "fixture".into(),
+            observed_at_unix_millis: 1,
+        };
+        for explicit in [true, false] {
+            if !explicit {
+                priors.models.last_mut().unwrap().task_shape_ceiling = None;
+            }
+            let account = catalog_model_from_observed("codex", &observed, &task, &priors)?
+                .context("observed qualified model")?;
+            let advertised = runtime_catalog_from_advertised_slugs(
+                "codex",
+                [model_id.as_str()],
+                "fixture".into(),
+                "2026-10-29".into(),
+                &task,
+                &priors,
+            )?;
+            let membership =
+                runtime_catalog_from_priors("codex", &codex_catalog()?, &task, &priors)?;
+            let unavailable =
+                runtime_catalog_from_unavailable_priors("codex", &gap, &task, &priors)?;
+            for catalog in [advertised, membership, unavailable] {
+                let model = catalog
+                    .models
+                    .iter()
+                    .find(|model| model.model == model_id)
+                    .context("qualified catalog model")?;
+                assert_eq!(account.capabilities, model.capabilities);
+            }
+            assert_eq!(
+                account.capabilities.maximum_risk,
+                if explicit {
+                    RiskLevel::Critical
+                } else {
+                    RiskLevel::Medium
+                }
+            );
+            assert_eq!(
+                account.capabilities.maximum_context,
+                if explicit {
+                    ContextSize::Long
+                } else {
+                    ContextSize::Medium
+                }
+            );
+            assert_eq!(
+                account.capabilities.maximum_horizon,
+                if explicit {
+                    TaskHorizon::Long
+                } else {
+                    TaskHorizon::Medium
+                }
+            );
+            assert_eq!(
+                account
+                    .capabilities
+                    .boundedness
+                    .contains(&Boundedness::CrossCutting),
+                explicit
+            );
+            assert_eq!(account.capabilities.long_context, explicit);
+        }
+        priors.models.retain(|prior| prior.model != model_id);
+        let unknown = catalog_model_from_observed("codex", &observed, &task, &priors)?
+            .context("unattributed observed model")?;
+        assert_eq!(unknown.capabilities.maximum_risk, RiskLevel::Medium);
+        assert_eq!(unknown.capabilities.maximum_context, ContextSize::Medium);
+        assert_eq!(unknown.capabilities.maximum_horizon, TaskHorizon::Medium);
+        assert!(!unknown.capabilities.long_context);
+        assert!(unknown.capabilities.task_classes.is_empty());
+        assert!(unknown.capabilities.authority_roles.is_empty());
+        Ok(())
+    }
+
     fn codex_catalog() -> Result<RuntimeModelCatalog> {
         let priors = selection::built_in_prior_dataset()?;
         Ok(RuntimeModelCatalog::Codex(
@@ -5145,7 +5393,8 @@ mod tests {
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history: None,
@@ -5909,7 +6158,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -6670,8 +6920,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_review_lens_keeps_its_authored_triple_for_independent_dispatch_selection(
-    ) -> Result<()> {
+    fn custom_review_lens_refuses_its_incompatible_triple_before_dispatch() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let auditor_prior = codex_prior_for(|prior| {
@@ -6703,7 +6952,10 @@ mod tests {
             &test_admission(),
             &AdvertisedCatalogSet::empty(),
         )?;
-        assert!(resolution.selection_preflight_failure.is_none());
+        let failure = resolution
+            .selection_preflight_failure
+            .context("custom lens preflight refusal")?;
+        assert!(failure.message.contains("custom-auditor"));
         assert_eq!(plan.review_lenses, authored);
         let mut precomputed = plan.clone();
         precomputed.review_lenses[0].backend = ReviewLensBackendConfig::Precomputed {
@@ -7025,6 +7277,7 @@ mod tests {
                 event_attempt: 0,
                 normalized_input_sha256: "this-run-digest".to_string(),
                 task: task.clone(),
+                assignment_shape_identity: None,
                 requested_candidate: candidate.clone(),
             }),
             requested_runtime: candidate.runtime.clone(),
@@ -8364,7 +8617,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: Some(DebugOverride {
                 candidate: CandidateKey {
@@ -8427,7 +8681,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -10639,7 +10894,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -10942,7 +11198,9 @@ mod tests {
             .models
             .iter()
             .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Grok))
-            .filter_map(|prior| catalog_model_from_prior(prior, &task, false))
+            .filter_map(|prior| catalog_model_from_prior(prior, &task, false).transpose())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter_map(|mut model| {
                 model
                     .supported_efforts
@@ -11455,7 +11713,8 @@ mod tests {
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history: None,
@@ -11614,7 +11873,14 @@ mod tests {
         assert!(failure.message.contains("--runtime codex"));
         assert!(failure.message.contains("docs/OPERATOR_QUICKSTART.md"));
         assert!(plan.role_models.is_empty());
-        assert_eq!(resolution.decisions.len(), 1);
+        assert_eq!(
+            resolution.decisions.len(),
+            required_selector_roles(&plan).len()
+        );
+        assert!(resolution
+            .decisions
+            .iter()
+            .all(|event| event.provenance.status == DecisionStatus::FailClosed));
         let decision = &resolution.decisions[0].provenance;
         assert_eq!(decision.status, DecisionStatus::FailClosed);
         assert_eq!(
@@ -11916,7 +12182,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -11974,7 +12241,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,

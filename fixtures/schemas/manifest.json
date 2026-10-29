@@ -197,6 +197,23 @@
           "expected_error": "$.profile_summaries[0].mean_tokens: required"
         }
       ]
+    },
+    {
+      "schema": "operator-pricing-plan-v1.schema.json",
+      "valid": [
+        "operator-pricing-plan-v1.valid.json",
+        "operator-pricing-plan-zero-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "operator-pricing-plan-v1.invalid.json",
+          "expected_error": "$.pricing_contract.schema_version: const"
+        },
+        {
+          "path": "operator-pricing-plan-digest-v1.invalid.json",
+          "expected_error": "$.pricing_contract.price_map_sha256: pattern"
+        }
+      ]
     }
   ]
 }

@@ -79,6 +79,12 @@ pub struct OperationPrepareIdentity {
 #[serde(transparent)]
 pub struct OperationHandle(String);
 
+impl OperationHandle {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Recorded operation state for this in-library slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
@@ -290,7 +296,7 @@ fn replay_or_refuse(
     Ok(row.clone())
 }
 
-fn new_operation_handle() -> Result<OperationHandle> {
+pub(super) fn new_operation_handle() -> Result<OperationHandle> {
     let mut bytes = [0u8; 24];
     getrandom::getrandom(&mut bytes)
         .map_err(|_| prepare_refused("account-metadata", "operation handle entropy unavailable"))?;
@@ -661,7 +667,7 @@ mod tests {
 
     #[test]
     fn persist_does_not_advertise_or_dispatch_operation_lifecycle() {
-        assert_eq!(ADVERTISED_OPERATIONS.len(), 8);
+        assert_eq!(ADVERTISED_OPERATIONS.len(), 11);
         for name in [
             "operation.prepare",
             "operation.start",

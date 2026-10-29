@@ -340,7 +340,7 @@ advertises work-proposal tool restrictions"
 
 #[test]
 fn operation_lifecycle_operations_stay_unadvertised() {
-    assert_eq!(ADVERTISED_OPERATIONS.len(), 8);
+    assert_eq!(ADVERTISED_OPERATIONS.len(), 11);
     for operation in [
         "operation.prepare",
         "operation.start",
@@ -991,7 +991,7 @@ mod unix {
     }
 
     #[test]
-    fn describe_lists_the_eight_ops() {
+    fn describe_lists_the_closed_ops() {
         let (_dir, registry) = isolated_registry();
         let ctx = AuthorityContext::new(registry).without_registry_fallback();
         let (_guard, listener) = listen_fixture(ctx);
@@ -1002,7 +1002,7 @@ mod unix {
             r#"{"protocolVersion":1,"requestId":"d","operation":"authority.describe"}"#,
         );
         let operations = response["result"]["operations"].as_array().expect("ops");
-        assert_eq!(operations.len(), 8);
+        assert_eq!(operations.len(), 11);
         let names: Vec<_> = operations
             .iter()
             .map(|value| value.as_str().expect("op"))
@@ -1062,9 +1062,15 @@ mod unix {
         let joined = thread::spawn(move || listener.accept_once());
         let mut stream = UnixStream::connect(&socket_path).expect("connect");
         joined.join().expect("accept").expect("once");
-        assert!(started.elapsed() < REQUEST_IO_DEADLINE);
+        stream
+            .set_read_timeout(Some(REQUEST_IO_DEADLINE))
+            .expect("read deadline");
         let mut buf = Vec::new();
-        let _ = stream.read_to_end(&mut buf);
+        stream
+            .read_to_end(&mut buf)
+            .expect("idle connection closes");
+        assert!(buf.is_empty());
+        assert!(started.elapsed() < REQUEST_IO_DEADLINE);
         drop(guard);
     }
 

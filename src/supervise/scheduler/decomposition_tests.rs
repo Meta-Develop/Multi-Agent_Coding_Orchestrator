@@ -4317,6 +4317,7 @@ fn fake_simulation_complete_accepted_row(assignment_id: &str) -> ThisRunAttemptC
     ThisRunAttemptCostRow {
         assignment_id: assignment_id.to_string(),
         attempt: 1,
+        selection: None,
         parent_result: Some(OutcomeResult::Accepted),
         costs: AttemptAttributableCosts {
             execution_cost_microunits: Some(10),
@@ -4332,6 +4333,7 @@ fn grok_verified_environment_unknown_accepted_row(assignment_id: &str) -> ThisRu
     ThisRunAttemptCostRow {
         assignment_id: assignment_id.to_string(),
         attempt: 1,
+        selection: None,
         parent_result: Some(OutcomeResult::Accepted),
         costs: AttemptAttributableCosts {
             execution_cost_microunits: Some(500),
@@ -4420,3 +4422,7 @@ fn finalize_does_not_coerce_environment_none_to_zero() {
         "environment None must not become a zero bucket in the average"
     );
 }
+
+#[cfg(unix)]
+#[path = "authored_check_tests.rs"]
+mod authored_check_tests;

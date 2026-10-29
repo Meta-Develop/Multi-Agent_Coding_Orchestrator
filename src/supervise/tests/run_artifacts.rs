@@ -529,6 +529,7 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         selection_decisions: vec![event],
         assignment_selection_ledger,
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,
@@ -772,6 +773,7 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
             SupervisorRuntime::Codex,
         ),
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,
@@ -2001,6 +2003,9 @@ fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private
         &artifacts.report_path,
         Duration::from_secs(1),
     );
+    let mut command =
+        command.with_agent_lifecycle(&repo_path, "child_orchestrator", run_id.as_str(), "child-a");
+    command.assignment_process_launch_attempt = Some(1);
     let external_run = deterministic_fake_run(&command, child_bytes.clone());
     import_external_attempt_evidence(
         &mut writer,
@@ -2077,6 +2082,13 @@ fn attempted_unverified_target_preserves_both_scratches_and_has_no_marker() {
         serde_json::to_vec(&injected_child_report(&assignment)).expect("serialize report");
     fs::write(&artifacts.report_path, &child_bytes).expect("write incoming report");
     fs::write(&artifacts.log_path, b"unverified capture\n").expect("write capture");
+    let mut command = command.with_agent_lifecycle(
+        &repo_path,
+        "child_orchestrator",
+        "artifact-unverified-target",
+        "child-unverified",
+    );
+    command.assignment_process_launch_attempt = Some(1);
     let mut run = deterministic_fake_run(&command, child_bytes);
     run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
     run.process_tree = Some(ProcessTreeEvidence::Unverified(
@@ -2297,11 +2309,26 @@ fn interrupted_final_report_checkpoint(
     repo: &Path,
     run_id: &RunId,
 ) -> (RunBudgetReport, PathBuf, PathClaim) {
-    let assignment = injected_assignment(false);
-    let plan = injected_plan(assignment.clone(), 0);
-    let consultant = SupervisorConsultantPlan::default();
-    let assignment_metadata = AssignmentMetadata::new();
-    let plan_metadata = SupervisorPlanMetadata::default();
+    interrupted_final_report_checkpoint_with_pricing(repo, run_id, None)
+}
+
+fn interrupted_final_report_checkpoint_with_pricing(
+    repo: &Path,
+    run_id: &RunId,
+    loaded: Option<LoadedSupervisorPlan>,
+) -> (RunBudgetReport, PathBuf, PathClaim) {
+    let LoadedSupervisorPlan {
+        plan,
+        consultant,
+        assignment_metadata,
+        plan_metadata,
+    } = loaded.unwrap_or_else(|| LoadedSupervisorPlan {
+        plan: injected_plan(injected_assignment(false), 0),
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata: SupervisorPlanMetadata::default(),
+    });
+    let assignment = plan.assignments[0].clone();
     let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).expect("resume budget ledger");
     let mut writer = ArtifactRunWriter::reserve(
         repo,
@@ -2310,6 +2337,17 @@ fn interrupted_final_report_checkpoint(
         "resume-checkpoint-test",
     )
     .expect("reserve interrupted artifact run");
+    if plan_metadata.operator_pricing.is_some() {
+        write_plan_snapshot(
+            &mut writer,
+            Path::new("assignments/supervisor-plan.json"),
+            &plan,
+            &consultant,
+            &assignment_metadata,
+            &plan_metadata,
+        )
+        .unwrap();
+    }
     let mut checkpoint = SupervisorCheckpointWriter::create(
         repo,
         SupervisorCheckpointPreparation::new(
@@ -2409,6 +2447,83 @@ fn interrupted_final_report_checkpoint(
 }
 
 #[test]
+fn pricing_resume_refusal_retains_diagnostic_and_cascade_gate_denial() {
+    skip_without_containment!();
+    for case in ["expired", "mutated"] {
+        let (temp, repo) = injected_repository();
+        let run_id = RunId::new(format!("pricing-resume-{case}")).unwrap();
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+        let mut document = super::budget::operator_pricing_document(&plan);
+        if case == "expired" {
+            document["pricing_contract"]["valid_through"] = json!("2001-01-01");
+        }
+        let options = injected_options(&repo, temp.path(), run_id.as_str());
+        fs::write(&options.plan_file, document.to_string()).unwrap();
+        let loaded = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+        let (_budget, side_effect, _claim) =
+            interrupted_final_report_checkpoint_with_pricing(&repo, &run_id, Some(loaded));
+        if case == "mutated" {
+            fs::write(
+                repo.join(RunArtifactFamily::Supervise.run_root())
+                    .join(run_id.as_str())
+                    .join("assignments/supervisor-plan.json"),
+                b"{}\n",
+            )
+            .unwrap();
+        }
+        assert_eq!(
+            supervisor_status(&repo, run_id.clone()).unwrap().lifecycle,
+            SupervisorRunLifecycle::Resumable
+        );
+        let resumed = resume_supervisor_run(&repo, run_id.clone()).unwrap();
+        assert!(!resumed.success);
+        assert!(resumed.final_report.is_none());
+        let diagnostic = resumed
+            .diagnostic
+            .as_deref()
+            .expect("retain the original resume cause");
+        if case == "expired" {
+            assert!(
+                diagnostic.contains("pricing_contract") && diagnostic.contains("expired"),
+                "{diagnostic}"
+            );
+        } else {
+            assert!(
+                diagnostic.contains("artifact") || diagnostic.contains("manifest"),
+                "{diagnostic}"
+            );
+        }
+        assert_eq!(
+            serde_json::to_value(&resumed).unwrap()["diagnostic"],
+            diagnostic
+        );
+        let denial = resumed.gate_denial.as_ref().unwrap();
+        assert_eq!(
+            denial.reason,
+            GateDenialReason::ResumeCheckpoint {
+                denial: ResumeCheckpointDenial::IntegrityFailure
+            }
+        );
+        let error = resume_supervisor_plan_file_cascade_with_concurrency_policy(
+            options,
+            SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+        )
+        .expect_err("cascade must propagate the authenticated resume refusal");
+        let refused = error
+            .downcast_ref::<SupervisorResumeRefusal>()
+            .expect("typed resume gate denial");
+        assert_eq!(&refused.gate_denial, denial);
+        assert_eq!(refused.diagnostic, diagnostic);
+        assert!(!error.to_string().contains("source report is missing"));
+        assert_eq!(
+            fs::read_to_string(side_effect).unwrap(),
+            "execution-count=1\n"
+        );
+    }
+}
+
+#[test]
 fn supervise_collect_publishes_schema_valid_resumable_snapshot() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("artifact-collect-resumable").expect("valid resumable run id");
@@ -2437,6 +2552,7 @@ fn authenticated_resume_finalizes_without_reexecuting_completed_work_and_preserv
     let resumed = resume_supervisor_run(&repo, run_id.clone()).expect("resume finalization");
     assert!(resumed.success);
     assert!(resumed.resumed);
+    assert!(resumed.diagnostic.is_none());
     assert!(resumed.budget_reconciled_from_checkpoint);
     assert_eq!(resumed.lifecycle, SupervisorRunLifecycle::Finalized);
     assert_eq!(resumed.completed_assignments, vec!["child-a"]);

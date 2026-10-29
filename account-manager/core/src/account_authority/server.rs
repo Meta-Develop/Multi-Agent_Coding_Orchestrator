@@ -4,12 +4,15 @@
 //! Windows has no TCP fallback: listen reports [`SocketPathError::UnsupportedPlatform`].
 
 use std::io;
+#[cfg(unix)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 #[cfg(unix)]
 use crate::account_authority::protocol::{
-    decode_request, dispatch, AuthorityResponse, ErrorCode, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    decode_request, dispatch_for_peer, AuthorityResponse, ErrorCode, MAX_REQUEST_BYTES,
+    MAX_RESPONSE_BYTES,
 };
 use crate::account_authority::protocol::{AuthorityContext, LoginPort};
 use crate::account_authority::{SafeSocketPath, SocketPathError};
@@ -20,6 +23,35 @@ use crate::providers::codex_cli::CodexCliAdapter;
 use crate::providers::cursor::CursorAdapter;
 use crate::providers::gemini_cli::GeminiCliAdapter;
 use crate::providers::grok_cli::GrokCliAdapter;
+
+#[cfg(unix)]
+const MAX_ACTIVE_CONNECTIONS: usize = 16;
+
+#[cfg(unix)]
+struct ConnectionPermit(Arc<AtomicUsize>);
+
+#[cfg(unix)]
+impl ConnectionPermit {
+    fn acquire(active: &Arc<AtomicUsize>) -> Option<Self> {
+        active
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
+                if count < MAX_ACTIVE_CONNECTIONS {
+                    Some(count + 1)
+                } else {
+                    None
+                }
+            })
+            .ok()
+            .map(|_| Self(Arc::clone(active)))
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ConnectionPermit {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+}
 
 /// Operator configuration for one authority listener.
 pub struct AuthorityServerConfig {
@@ -234,6 +266,8 @@ pub struct AuthorityListener {
     path: std::path::PathBuf,
     #[cfg(unix)]
     config: Arc<AuthorityServerConfig>,
+    #[cfg(unix)]
+    active_connections: Arc<AtomicUsize>,
     #[cfg(not(unix))]
     #[allow(dead_code)]
     _private: (),
@@ -298,6 +332,7 @@ fn listen_inner(
         listener,
         path: socket_path,
         config: Arc::new(config),
+        active_connections: Arc::new(AtomicUsize::new(0)),
     })
 }
 
@@ -308,33 +343,49 @@ impl AuthorityListener {
         &self.path
     }
 
-    /// Accept and serve one connection. Unauthorized peers receive no bytes.
+    /// Accept one connection and dispatch it to a bounded worker. Unauthorized
+    /// peers and connections exceeding the hard concurrency cap receive no bytes.
     #[cfg(unix)]
     pub fn accept_once(&self) -> io::Result<()> {
         let (stream, _) = self.listener.accept()?;
-        self.serve_connection(stream);
+        let Some(permit) = ConnectionPermit::acquire(&self.active_connections) else {
+            return Ok(());
+        };
+        let config = Arc::clone(&self.config);
+        let _worker = std::thread::Builder::new()
+            .name("authority-request".into())
+            .spawn(move || {
+                let _permit = permit;
+                Self::serve_connection(&config, stream);
+            })?;
         Ok(())
     }
 
     #[cfg(unix)]
-    fn serve_connection(&self, mut stream: std::os::unix::net::UnixStream) {
+    fn serve_connection(
+        config: &AuthorityServerConfig,
+        mut stream: std::os::unix::net::UnixStream,
+    ) {
         use std::os::unix::io::AsRawFd;
 
-        let authorized = match self.config.peer_policy {
-            PeerPolicy::DenyAll => false,
+        let peer = match config.peer_policy {
+            PeerPolicy::DenyAll => None,
             PeerPolicy::EffectiveUid => match super::peer::peer_credentials(stream.as_raw_fd()) {
-                Ok(peer) => super::peer::authorize_peer(peer, super::peer::effective_uid()),
-                Err(_) => false,
+                Ok(peer) if super::peer::authorize_peer(peer, super::peer::effective_uid()) => {
+                    Some(peer)
+                }
+                _ => None,
             },
         };
-        if !authorized {
+        let Some(peer) = peer else {
             return;
-        }
+        };
+        let caller = format!("uid:{}", peer.uid);
 
-        let deadline = std::time::Instant::now() + self.config.context.bounds.request_io_deadline;
+        let deadline = std::time::Instant::now() + config.context.bounds.request_io_deadline;
         let request = match read_request(
             &mut stream,
-            self.config.context.bounds.max_request_bytes,
+            config.context.bounds.max_request_bytes,
             deadline,
         ) {
             Ok(bytes) => bytes,
@@ -343,7 +394,7 @@ impl AuthorityListener {
                 let _ = write_response(
                     &mut stream,
                     &response,
-                    self.config.context.bounds.max_response_bytes,
+                    config.context.bounds.max_response_bytes,
                     deadline,
                 );
                 return;
@@ -351,13 +402,13 @@ impl AuthorityListener {
         };
 
         let response = match decode_request(&request) {
-            Ok(decoded) => dispatch(&self.config.context, &decoded),
+            Ok(decoded) => dispatch_for_peer(&config.context, &decoded, Some(&caller)),
             Err(failure) => AuthorityResponse::from_failure(failure),
         };
         let _ = write_response(
             &mut stream,
             &response,
-            self.config.context.bounds.max_response_bytes,
+            config.context.bounds.max_response_bytes,
             deadline,
         );
     }
@@ -444,38 +495,85 @@ fn encode_response_bytes(
 #[cfg(unix)]
 fn read_exact_deadline(
     stream: &mut std::os::unix::net::UnixStream,
-    buf: &mut [u8],
+    mut buf: &mut [u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     use std::io::Read;
-    apply_timeouts(stream, deadline)?;
-    stream.read_exact(buf)
+    stream.set_nonblocking(true)?;
+    while !buf.is_empty() {
+        let read = io_before_deadline(stream, libc::POLLIN, deadline, |stream| stream.read(buf))?;
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        buf = &mut buf[read..];
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 fn write_all_deadline(
     stream: &mut std::os::unix::net::UnixStream,
-    buf: &[u8],
+    mut buf: &[u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     use std::io::Write;
-    apply_timeouts(stream, deadline)?;
-    stream.write_all(buf)
+    stream.set_nonblocking(true)?;
+    while !buf.is_empty() {
+        let written =
+            io_before_deadline(stream, libc::POLLOUT, deadline, |stream| stream.write(buf))?;
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        buf = &buf[written..];
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn apply_timeouts(
-    stream: &std::os::unix::net::UnixStream,
+fn io_before_deadline<T>(
+    stream: &mut std::os::unix::net::UnixStream,
+    events: libc::c_short,
     deadline: std::time::Instant,
-) -> io::Result<()> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "request I/O deadline elapsed",
-        ));
+    mut operation: impl FnMut(&mut std::os::unix::net::UnixStream) -> io::Result<T>,
+) -> io::Result<T> {
+    use std::os::unix::io::AsRawFd;
+
+    // Darwin rejects SO_RCVTIMEO/SO_SNDTIMEO after a peer closes, even with
+    // buffered request bytes. Nonblocking I/O can still drain those bytes;
+    // poll bounds waits without changing socket options on a closed connection.
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request I/O deadline elapsed",
+            ));
+        }
+        match operation(stream) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            result => return result,
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let timeout = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: descriptor is valid for one entry and stream owns its fd for
+        // the whole call. Read/write retries handle readiness, EOF and errors.
+        if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
-    stream.set_read_timeout(Some(remaining))?;
-    stream.set_write_timeout(Some(remaining))?;
-    Ok(())
 }
+
+#[cfg(all(test, unix))]
+#[path = "server_tests.rs"]
+mod tests;

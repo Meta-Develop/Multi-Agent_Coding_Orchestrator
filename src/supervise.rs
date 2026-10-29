@@ -1,3 +1,4 @@
+use crate::external_agent::executor::ExecutorSelection;
 #[cfg(target_os = "linux")]
 use crate::external_agent::CODEX_WRITABLE_ROOT_PROTECTED_MOUNT_TARGETS;
 #[cfg(test)]
@@ -5,8 +6,8 @@ use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 #[cfg(test)]
 use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
-    BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
-    RunBudgetReport, RunBudgetSource, RunBudgetSources,
+    BudgetAction, BudgetAmount, BudgetChargeReport, BudgetReason, BudgetRemaining,
+    RoleBudgetReport, RunBudgetLimits, RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -253,6 +254,8 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+mod assignment_executor;
+pub mod authored_checks;
 pub(crate) use plan_api::{
     load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,
     validate_generated_follow_up_plan_document_in_repo,
@@ -293,6 +296,15 @@ mod scheduler;
 pub use scheduler::*;
 
 mod selection_bridge;
+#[cfg(test)]
+#[path = "supervise/selection_preflight_tests.rs"]
+mod selection_preflight_tests;
+pub use selection_bridge::selection_preflight::{
+    evaluate_supervisor_selection_preflight, supervisor_selection_preflight_file,
+    FrozenRoleSelectionInput, FrozenSupervisorSelectionInputs, SelectionPreflightDiagnostic,
+    SelectionPreflightRejection, SelectionPreflightRequested, SelectionPreflightStatus,
+    SupervisorSelectionPreflightReport,
+};
 use selection_bridge::*;
 #[cfg(target_os = "linux")]
 pub(crate) use selection_bridge::{
@@ -305,10 +317,13 @@ pub(crate) use task_routing::assess_task_routing;
 pub use task_routing::TaskRoutingAssessment;
 
 mod accepted_task_cost;
-pub use accepted_task_cost::AcceptedTaskCostRollup;
+pub use accepted_task_cost::{
+    AcceptedTaskCostCohort, AcceptedTaskCostCohorts, AcceptedTaskCostRollup,
+};
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
+pub(crate) use prior_input::{FrozenOperatorPriorData, OperatorPriorDataGuard};
 mod runtime_executables;
 use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};
@@ -415,7 +430,10 @@ mod plan_validation;
 use plan_validation::*;
 
 mod dispatch;
+pub(crate) mod operator_pricing;
+mod pricing_provenance;
 use dispatch::*;
+pub use pricing_provenance::{ChargePricing, ChargePricingBasis, PricingContractProvenance};
 
 mod gate_health;
 pub use gate_health::*;
@@ -433,6 +451,7 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+mod target_containment;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use reporting::append_precreated_worker_execution_journal;
 #[cfg(target_os = "linux")]
@@ -1570,6 +1589,9 @@ pub struct SupervisorExecutionMetadata {
     /// this field and deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_task_cost: Option<AcceptedTaskCostRollup>,
+    /// Complete per-lane cohorts and explicitly unattributed cost evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_task_cost_cohorts: Option<AcceptedTaskCostCohorts>,
     pub usage: SupervisorExecutionUsageReport,
 }
 
@@ -1988,6 +2010,9 @@ struct AssignmentMetadata {
     reasoning_efforts: BTreeMap<String, ReasoningEffort>,
     source_inputs:
         BTreeMap<String, Vec<crate::external_agent::researcher_inputs::ResearcherSourceInput>>,
+    authored_independent_checks: BTreeMap<String, Vec<authored_checks::AuthoredIndependentCheck>>,
+    /// Parent assignment and optional nested Worker id; omission selects Local.
+    executors: BTreeMap<(String, Option<String>), ExecutorSelection>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -2035,8 +2060,12 @@ impl AssignmentMetadata {
     }
 
     fn retain_assignment(&mut self, assignment_id: &str) {
+        self.executors
+            .retain(|(owner, _), _| owner == assignment_id);
         self.workers.retain(|(owner, _), _| owner == assignment_id);
         self.source_inputs.retain(|owner, _| owner == assignment_id);
+        self.authored_independent_checks
+            .retain(|owner, _| owner == assignment_id);
         self.reasoning_efforts
             .retain(|owner, _| owner == assignment_id);
         self.direct_mechanical_duties
@@ -2051,6 +2080,8 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             parent_validation: None,
             reasoning_efforts: BTreeMap::new(),
             source_inputs: BTreeMap::new(),
+            authored_independent_checks: BTreeMap::new(),
+            executors: BTreeMap::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }
@@ -2058,6 +2089,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
 
 #[derive(Debug, Clone, Default, PartialEq)]
 struct SupervisorPlanMetadata {
+    operator_pricing: Option<operator_pricing::FrozenOperatorPricing>,
     resolved_routing_policy: Option<crate::selection::routing_policy::FrozenRoutingPolicy>,
     task_routing_assessment: Option<TaskRoutingAssessment>,
     normal_intake_selection: Option<crate::selection::routing_policy::SelectedLaunchRequest>,
@@ -3478,7 +3510,16 @@ pub struct SupervisorResumeReport {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gate_denial: Option<GateDenial>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub final_report: Option<SupervisorFinalReport>,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("supervisor resume refused: {diagnostic} ({gate_denial:?})")]
+pub struct SupervisorResumeRefusal {
+    pub gate_denial: GateDenial,
+    pub diagnostic: String,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -3721,9 +3762,9 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         SupervisorRunLifecycle::Finalized => status
             .final_report
             .context("finalized injected cascade source report is missing")?,
-        SupervisorRunLifecycle::Resumable => resume_supervisor_run(&repo, run_id.clone())?
-            .final_report
-            .context("resumed injected cascade source report is missing")?,
+        SupervisorRunLifecycle::Resumable => {
+            plan_api::source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?
+        }
         SupervisorRunLifecycle::Active
         | SupervisorRunLifecycle::Interrupted
         | SupervisorRunLifecycle::Uncertain => {

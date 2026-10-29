@@ -1076,6 +1076,18 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
+        SuperviseSubcommand::SelectionPreflight(args) => {
+            let report = supervise::supervisor_selection_preflight_file(
+                &args.plan_file,
+                args.runtime,
+                args.frozen_inputs.as_deref(),
+            )?;
+            print_query_report(&report, args.json)?;
+            if !report.compatible {
+                bail!("selection preflight refused: incompatible or unknown frozen inputs");
+            }
+            Ok(())
+        }
         SuperviseSubcommand::JournalAppend(args) => {
             supervise::run_worker_execution_journal_command_with_clock(
                 &args.journal,
@@ -1502,6 +1514,8 @@ enum SuperviseSubcommand {
     JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
+    /// Evaluate all reachable roles and custom lenses using frozen inputs, without dispatch.
+    SelectionPreflight(SelectionPreflightArgs),
     /// Run a supervisor plan with child orchestrators for a selected runtime.
     Run(RunSuperviseArgs),
     /// Re-run only evidence/report and parent audit stages for a preserved assignment diff.
@@ -1567,6 +1581,20 @@ struct PlanSuperviseArgs {
     #[arg(long, value_name = "NAME")]
     objective_profile: Option<String>,
     /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SelectionPreflightArgs {
+    /// Supervisor plan to evaluate.
+    plan_file: PathBuf,
+    #[arg(long, value_enum, default_value = "codex")]
+    runtime: supervise::SupervisorRuntime,
+    /// FrozenSupervisorSelectionInputs JSON from a preflight report's frozen_inputs.
+    /// Omission reports unknown live inputs without fetching them.
+    #[arg(long, value_name = "FILE")]
+    frozen_inputs: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
@@ -3389,7 +3417,7 @@ struct ListAgentsArgs {
 struct StopAgentsArgs {
     /// Run id, task/assignment id, or decimal PID. The selector must match exactly one process.
     selector: Option<String>,
-    /// Stop every live process in the run selected by --run-id.
+    /// Stop every registered process in the run selected by --run-id.
     #[arg(long)]
     all: bool,
     /// Run id used with --all.
@@ -4788,6 +4816,9 @@ struct RunExperimentArgs {
         value_parser = parse_additional_runtime_bin
     )]
     additional_runtime_bin: Vec<crate::evaluation::HeldOutAdditionalRuntimeBinding>,
+    /// Dated selection priors and capability evidence inside --source-repo. Real-provider only.
+    #[arg(long, value_name = "REPO_RELATIVE_FILE")]
+    prior_data: Option<PathBuf>,
     /// Exact reviewed machine-global config. Required with real-provider; never inferred from --source-repo.
     #[arg(long, value_name = "PATH")]
     machine_global_config: Option<PathBuf>,
@@ -4909,11 +4940,12 @@ fn resolve_held_out_real_provider_cli(
             || args.runtime.is_some()
             || args.runtime_bin.is_some()
             || !args.additional_runtime_bin.is_empty()
+            || args.prior_data.is_some()
             || args.machine_global_config.is_some()
             || args.machine_global_runtime_root_id.is_some()
         {
             bail!(
-                "provider plan, runtime, and retention options require --execution real-provider"
+                "provider plan, runtime, prior-data, and retention options require --execution real-provider"
             );
         }
         return Ok(None);
@@ -4949,6 +4981,13 @@ fn resolve_held_out_real_provider_cli(
         crate::evaluation::HeldOutRealProviderExperimentRequest {
             execution: args.execution,
             allow_real_provider: args.allow_real_provider,
+            prior_data: args
+                .prior_data
+                .as_ref()
+                .map(|path| {
+                    crate::evaluation::HeldOutPriorDataInput::freeze(&source.source_repo, path)
+                })
+                .transpose()?,
             source,
             provider_plan,
             runtime,
@@ -5616,6 +5655,12 @@ mod cli_integration_tests {
             .to_string()
             .contains("require --execution real-provider"));
         args.additional_runtime_bin.clear();
+        args.prior_data = Some(PathBuf::from("priors.json"));
+        assert!(resolve_held_out_real_provider_cli(&args, None)
+            .expect_err("prior-data requires explicit execution mode")
+            .to_string()
+            .contains("require --execution real-provider"));
+        args.prior_data = None;
         args.execution = crate::evaluation::EvaluationExecution::RealProvider;
         assert!(resolve_held_out_real_provider_cli(&args, None)
             .expect_err("real execution requires the complete tuple")

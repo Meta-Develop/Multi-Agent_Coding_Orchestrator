@@ -68,6 +68,75 @@ pub(crate) struct BoundPriorData {
     provenance: selection::OperatorPriorDataProvenance,
 }
 
+/// Immutable validated input, independent of the thread that later uses it.
+#[derive(Debug, Clone)]
+pub(crate) struct FrozenOperatorPriorData(Arc<BoundPriorData>);
+
+impl PartialEq for FrozenOperatorPriorData {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.repo == other.0.repo
+            && self.0.raw == other.0.raw
+            && self.0.provenance == other.0.provenance
+    }
+}
+
+impl Eq for FrozenOperatorPriorData {}
+
+impl FrozenOperatorPriorData {
+    pub(crate) fn read(repo: &Path, relative_path: &Path) -> Result<Self> {
+        require_supported_prior_input_platform()?;
+        let repo = crate::artifacts::discover_repo_root(repo)?;
+        let relative_path = normalize_repo_relative_path(relative_path)
+            .context("operator prior-data path must be repository-relative")?;
+        let raw = BoundedRegularReader::read_relative(
+            &repo,
+            &relative_path,
+            MAX_OPERATOR_PRIOR_INPUT_BYTES,
+        )
+        .context("failed to read bounded repository-local operator prior data")?;
+        Ok(Self(bind_from_bytes(repo, relative_path, raw)?))
+    }
+
+    pub(crate) fn verify_source(&self, repo: &Path) -> Result<()> {
+        if crate::artifacts::discover_repo_root(repo)? != self.0.repo {
+            bail!("operator prior snapshot belongs to a different source repository");
+        }
+        let raw = BoundedRegularReader::read_relative(
+            &self.0.repo,
+            Path::new(&self.0.provenance.relative_path),
+            MAX_OPERATOR_PRIOR_INPUT_BYTES,
+        )?;
+        if raw != self.0.raw {
+            bail!("--prior-data changed from the frozen source snapshot");
+        }
+        Ok(())
+    }
+
+    /// Rebind frozen evidence to an isolated repository without rereading input.
+    /// An absent input explicitly clears inherited thread-local prior authority.
+    pub(crate) fn bind_for_repo(
+        snapshot: Option<&Self>,
+        repo: &Path,
+    ) -> Result<OperatorPriorDataGuard> {
+        let binding = snapshot
+            .map(|snapshot| -> Result<_> {
+                let mut binding = (*snapshot.0).clone();
+                binding.repo = crate::artifacts::discover_repo_root(repo)?;
+                Ok(Arc::new(binding))
+            })
+            .transpose()?;
+        Ok(install(binding))
+    }
+
+    pub(crate) fn provenance(&self) -> &selection::OperatorPriorDataProvenance {
+        &self.0.provenance
+    }
+
+    pub(crate) fn archive(&self, writer: &mut ArtifactRunWriter, prefix: &Path) -> Result<()> {
+        archive_binding(&self.0, writer, prefix)
+    }
+}
+
 thread_local! {
     static BOUND_PRIOR_DATA: RefCell<Option<Arc<BoundPriorData>>> = const { RefCell::new(None) };
 }
@@ -135,18 +204,26 @@ pub(crate) fn archive_current(writer: &mut ArtifactRunWriter, repo: &Path) -> Re
     let Some(binding) = captured_binding() else {
         return Ok(());
     };
+    archive_binding(&binding, writer, Path::new(""))
+}
+
+fn archive_binding(
+    binding: &BoundPriorData,
+    writer: &mut ArtifactRunWriter,
+    prefix: &Path,
+) -> Result<()> {
     writer.write_bytes(
-        RAW_ARTIFACT,
+        prefix.join(RAW_ARTIFACT),
         &binding.raw,
         ArtifactFileDisposition::PrivateEvidence,
     )?;
     writer.write_json(
-        EFFECTIVE_ARTIFACT,
+        prefix.join(EFFECTIVE_ARTIFACT),
         &binding.effective,
         ArtifactFileDisposition::PrivateEvidence,
     )?;
     writer.write_json(
-        BINDING_ARTIFACT,
+        prefix.join(BINDING_ARTIFACT),
         &binding.provenance,
         ArtifactFileDisposition::PrivateEvidence,
     )?;
@@ -157,19 +234,8 @@ pub fn bind_operator_prior_data(
     repo: impl AsRef<Path>,
     relative_path: impl AsRef<Path>,
 ) -> Result<OperatorPriorDataGuard> {
-    require_supported_prior_input_platform()?;
-    let repo = crate::artifacts::discover_repo_root(repo.as_ref())?;
-    let relative_path = normalize_repo_relative_path(relative_path.as_ref())
-        .context("operator prior-data path must be repository-relative")?;
-    let raw =
-        BoundedRegularReader::read_relative(&repo, &relative_path, MAX_OPERATOR_PRIOR_INPUT_BYTES)
-            .with_context(|| {
-                format!(
-                    "failed to read bounded repository-local operator prior data {}",
-                    relative_path.display()
-                )
-            })?;
-    Ok(install(Some(bind_from_bytes(repo, relative_path, raw)?)))
+    let snapshot = FrozenOperatorPriorData::read(repo.as_ref(), relative_path.as_ref())?;
+    Ok(install(Some(snapshot.0)))
 }
 
 fn bind_from_bytes(
@@ -714,6 +780,63 @@ mod tests {
         assert!(bind_operator_prior_data(&repo, "../foreign/prior.json").is_err());
         std::os::unix::fs::symlink(repo.join("prior.json"), repo.join("link.json"))?;
         assert!(bind_operator_prior_data(&repo, "link.json").is_err());
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn frozen_snapshot_rebinds_isolated_repo_and_captured_threads_without_scope_leakage(
+    ) -> Result<()> {
+        let (_source_owner, source) = super::super::tests::injected_repository();
+        let (_profile_owner, profile) = super::super::tests::injected_repository();
+        let raw = serde_json::to_vec(&new_model_snapshot("isolated-prior-model")?)?;
+        std::fs::write(source.join("prior.json"), &raw)?;
+        let snapshot = FrozenOperatorPriorData::read(&source, Path::new("prior.json"))?;
+        snapshot.verify_source(&source)?;
+        assert!(snapshot.verify_source(&profile).is_err());
+        let _source = FrozenOperatorPriorData::bind_for_repo(Some(&snapshot), &source)?;
+        assert!(require_binding_repo(&profile).is_err());
+        let source_provenance = current_provenance();
+        std::fs::write(source.join("prior.json"), b"{}")?;
+        assert!(snapshot.verify_source(&source).is_err());
+        let expected_digest = {
+            let mut input = selection::selection_test_base_input();
+            input.priors = current_priors().context("source priors")?;
+            selection::select(&input)?.input_digests.priors.value
+        };
+        {
+            let _profile = FrozenOperatorPriorData::bind_for_repo(Some(&snapshot), &profile)?;
+            require_binding_repo(&profile)?;
+            assert!(require_binding_repo(&source).is_err());
+            let captured = captured_binding();
+            let thread_repo = profile.clone();
+            let expected_provenance = snapshot.provenance().clone();
+            let observed = std::thread::spawn(move || -> Result<String> {
+                assert!(current_priors().is_none());
+                let _thread = install_captured(captured);
+                require_binding_repo(&thread_repo)?;
+                assert_eq!(current_provenance(), Some(expected_provenance));
+                validate_known_judgment_role_model(
+                    AgentRole::Auditor,
+                    Some("isolated-prior-model"),
+                )?;
+                let mut input = selection::selection_test_base_input();
+                input.priors =
+                    super::super::selection_bridge::selector_priors_with_terminal_worker_economics(
+                    )?;
+                Ok(selection::select(&input)?.input_digests.priors.value)
+            })
+            .join()
+            .expect("captured profile thread")?;
+            assert_eq!(observed, expected_digest);
+            {
+                let _absent = FrozenOperatorPriorData::bind_for_repo(None, &profile)?;
+                assert!(current_priors().is_none());
+            }
+            assert_eq!(current_provenance(), source_provenance);
+        }
+        require_binding_repo(&source)?;
+        assert_eq!(current_provenance(), source_provenance);
         Ok(())
     }
 

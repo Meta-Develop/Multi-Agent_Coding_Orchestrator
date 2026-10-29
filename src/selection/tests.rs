@@ -191,7 +191,8 @@ pub(crate) fn base_input() -> SelectionInput {
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_context: None,
+            accepted_task_cost_observations: Vec::new(),
         },
         debug_override: None,
         operational_observations: None,
@@ -1168,11 +1169,156 @@ fn legacy_v2_selector_wire_is_explicitly_rejected_after_objective_split() {
 }
 
 #[test]
+fn cheap_lane_shape_ceilings_survive_pressure_and_loaded_policy() -> anyhow::Result<()> {
+    let receipt = loaded_policy_test_receipt()?;
+    for widened in [false, true] {
+        let mut input = base_input();
+        input.task.risk = RiskLevel::Low;
+        input.task.boundedness = Boundedness::TightlyBounded;
+        input.task.context = ContextSize::Small;
+        input.task.horizon = TaskHorizon::Short;
+        configure_exhausted_quota(&mut input, ExhaustionBehavior::Degrade, &["grok", "cursor"]);
+        input.signals.budget_signal = BudgetSignal::Degrade;
+        for prior in &mut input.priors.models {
+            if prior.model == "gpt-5.6-sol" {
+                continue;
+            }
+            prior.long_context_eligible = true;
+            prior.task_shape_ceiling = widened.then(|| TaskShapeCeiling {
+                boundedness: [
+                    Boundedness::TightlyBounded,
+                    Boundedness::Bounded,
+                    Boundedness::CrossCutting,
+                ]
+                .into_iter()
+                .collect(),
+                maximum_risk: RiskLevel::Critical,
+                maximum_context: ContextSize::Long,
+                maximum_horizon: TaskHorizon::Long,
+            });
+        }
+        for loaded in [false, true] {
+            let evaluate = |input: &SelectionInput| {
+                select_with_loaded_routing_policy(input, &[], loaded.then_some(&receipt))
+            };
+            let tight = evaluate(&input)?;
+            assert!(tight.choice.is_some(), "bounded task remains eligible");
+            let mut unknown = input.clone();
+            unknown.task.risk = RiskLevel::Unknown;
+            assert!(evaluate(&unknown).is_err());
+            for catalog in &tight.normalized_input.catalogs {
+                for model in &catalog.models {
+                    if model.model != "gpt-5.6-sol" {
+                        assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+                        assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+                    }
+                }
+            }
+            for dimension in ["risk", "boundedness", "context", "horizon"] {
+                let mut broad = input.clone();
+                match dimension {
+                    "risk" => broad.task.risk = RiskLevel::High,
+                    "boundedness" => broad.task.boundedness = Boundedness::CrossCutting,
+                    "context" => broad.task.context = ContextSize::Large,
+                    "horizon" => broad.task.horizon = TaskHorizon::Long,
+                    _ => unreachable!(),
+                }
+                let decision = evaluate(&broad)?;
+                assert!(decision.choice.is_none(), "{dimension}, loaded={loaded}");
+                for candidate in decision
+                    .candidate_set
+                    .iter()
+                    .filter(|candidate| candidate.candidate.model != "gpt-5.6-sol")
+                {
+                    assert!(!candidate.eligible);
+                    assert!(candidate.ineligibility_reasons.iter().any(|reason| {
+                        reason.code == IneligibilityCode::TaskShapeNotAdvertised
+                    }));
+                }
+                assert_eq!(evaluate(&decision.normalized_input)?, decision);
+            }
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn task_shape_ceiling_prior_compatibility_and_validation() -> anyhow::Result<()> {
+    let priors = built_in_prior_dataset()?;
+    validate_prior_dataset(&priors)?;
+    let prior = priors
+        .models
+        .iter()
+        .find(|prior| prior.model == "gpt-5.6-luna")
+        .unwrap();
+    let mut legacy = serde_json::to_value(prior)?;
+    legacy.as_object_mut().unwrap().remove("task_shape_ceiling");
+    let legacy: ModelPrior = serde_json::from_value(legacy)?;
+    assert!(legacy.task_shape_ceiling.is_none());
+    let legacy_wire = serde_json::to_value(&legacy)?;
+    assert_eq!(
+        legacy_wire.get("task_shape_ceiling"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(serde_json::from_value::<ModelPrior>(legacy_wire)?, legacy);
+    assert_eq!(
+        effective_task_shape_ceiling(&legacy.runtime, &legacy.model, None)?,
+        TaskShapeCeiling::bounded_terminal()
+    );
+    let mut invalid = priors.clone();
+    invalid.models[0]
+        .task_shape_ceiling
+        .as_mut()
+        .unwrap()
+        .maximum_risk = RiskLevel::Unknown;
+    assert!(validate_prior_dataset(&invalid).is_err());
+    let mut input = base_input();
+    input.priors = invalid;
+    assert!(select(&input).is_err());
+    let mut narrow = TaskShapeCeiling::bounded_terminal();
+    narrow.maximum_risk = RiskLevel::Low;
+    let mut input = base_input();
+    input
+        .priors
+        .models
+        .iter_mut()
+        .find(|model| model.model == prior.model)
+        .unwrap()
+        .task_shape_ceiling = Some(narrow);
+    let decision = select(&input)?;
+    let narrowed = decision
+        .candidate_set
+        .iter()
+        .find(|row| row.candidate.model == prior.model)
+        .unwrap();
+    assert!(!narrowed.eligible);
+    assert!(narrowed
+        .ineligibility_reasons
+        .iter()
+        .any(|reason| { reason.code == IneligibilityCode::TaskShapeNotAdvertised }));
+    let unqualified = effective_task_shape_ceiling("unknown", "new-model", None)?;
+    assert_eq!(unqualified, TaskShapeCeiling::bounded_terminal());
+    let wire = serde_json::to_value(select(&base_input())?)?;
+    let decoded: SelectionProvenance = serde_json::from_value(wire)?;
+    assert_eq!(select(&decoded.normalized_input)?, decoded);
+    let schema = selection_event_schema_value();
+    let model_schema = &schema["properties"]["provenance"]["properties"]["normalized_input"]
+        ["properties"]["priors"]["properties"]["models"]["items"];
+    assert!(model_schema["properties"]["task_shape_ceiling"].is_object());
+    assert!(model_schema["required"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|field| field == "task_shape_ceiling"));
+    Ok(())
+}
+
+#[test]
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-10-22.1");
-    assert_eq!(priors.published_on, "2026-10-22");
+    assert_eq!(priors.revision, "2026-10-29.1");
+    assert_eq!(priors.published_on, "2026-10-29");
     assert_eq!(priors.schema_version, 2);
     assert_eq!(priors.models.len(), 9);
     assert_eq!(priors.objective_profiles[0].version, 3);
@@ -1481,6 +1627,24 @@ fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_overrid
                 .priors
                 .models
                 .retain(|prior| prior.model != target.model);
+            if authority != AuthorityRole::TerminalLeaf {
+                let broad = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
+                assert!(broad.environment_fallback.is_none());
+                assert!(broad
+                    .candidate_set
+                    .iter()
+                    .filter(|evaluation| evaluation.candidate.model == target.model)
+                    .all(|evaluation| !evaluation.eligible
+                        && evaluation.ineligibility_reasons.iter().any(|reason| {
+                            reason.code == IneligibilityCode::TaskShapeNotAdvertised
+                        })));
+            }
+            // Isolate authority from the independent bundled shape ceiling.
+            input.task.risk = RiskLevel::Medium;
+            input.task.boundedness = Boundedness::Bounded;
+            input.task.context = ContextSize::Medium;
+            input.task.horizon = TaskHorizon::Medium;
+            no_prior.task = input.task.clone();
             let control = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
             assert_eq!(
                 control
@@ -1550,6 +1714,16 @@ fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_overrid
         for routing in [None, Some(&receipt)] {
             let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
             assert!(decision.environment_fallback.is_none());
+            assert!(decision
+                .candidate_set
+                .iter()
+                .filter(|evaluation| evaluation.candidate.model == target.model)
+                .all(|evaluation| !evaluation.eligible
+                    && evaluation.score.is_none()
+                    && evaluation
+                        .ineligibility_reasons
+                        .iter()
+                        .any(|reason| { reason.code == IneligibilityCode::PolicyProhibited })));
             assert!(decision
                 .choice
                 .is_none_or(|choice| choice.candidate.model == "gpt-6.1-sol"));
@@ -2534,57 +2708,123 @@ fn retry_degrade_and_catalog_change_are_provenance_triggers() {
 }
 
 #[test]
-fn complete_observed_cpo_overrides_only_previous_choice_expected_cost() {
+fn observed_cost_feedback_requires_exact_lane_match() {
+    use crate::supervise::AgentRole;
+
     let initial = select(&base_input()).expect("initial decision");
-    let previous = initial
+    let candidate = initial
         .choice
         .as_ref()
-        .map(|choice| choice.candidate.clone())
-        .expect("initial choice");
-    let catalog_expected = initial
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
-        .expect("catalog expected cost");
-
-    let mut unchanged = base_input();
-    unchanged.signals.previous_choice = Some(previous.clone());
-    unchanged.signals.previous_catalog_digest = Some(initial.input_digests.catalogs.value.clone());
-    let none_decision = select(&unchanged).expect("none observed CPO");
-    let none_expected = none_decision
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
-        .expect("none observed expected cost");
-    assert_eq!(none_expected, catalog_expected);
-
-    let mut observed = unchanged;
-    observed.signals.observed_cost_per_accepted_task_microunits = Some(9_000_001);
-    let observed_decision = select(&observed).expect("observed CPO");
-    let previous_score = observed_decision
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .expect("previous choice score");
-    assert_eq!(
-        previous_score.expected_total_cost_per_accepted_task_microunits,
-        9_000_001
-    );
-    for evaluation in &observed_decision.candidate_set {
-        if evaluation.candidate == previous {
-            continue;
+        .expect("initial choice")
+        .candidate
+        .clone();
+    let shape = AssignmentShapeIdentity::v1("a".repeat(64)).expect("shape");
+    let context = AcceptedTaskCostContext {
+        role: AgentRole::Worker,
+        assignment_shape_identity: shape.clone(),
+    };
+    let observation = AcceptedTaskCostObservation {
+        lane: AcceptedTaskCostLane {
+            role: AgentRole::Worker,
+            task: base_input().task,
+            assignment_shape_identity: shape,
+            candidate: candidate.clone(),
+        },
+        cost_per_accepted_task_microunits: 9_000_001,
+    };
+    let expected_cost = |input: &SelectionInput| {
+        select(input)
+            .expect("cost feedback decision")
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("candidate score")
+            .expected_total_cost_per_accepted_task_microunits
+    };
+    let baseline = expected_cost(&base_input());
+    let mut exact = base_input();
+    exact.signals.accepted_task_cost_context = Some(context);
+    exact.signals.accepted_task_cost_observations = vec![observation.clone()];
+    // Candidate identity, rather than the previous choice, determines attribution.
+    assert!(exact.signals.previous_choice.is_none());
+    assert_eq!(expected_cost(&exact), 9_000_001);
+    for mismatch in 0..8 {
+        let mut input = exact.clone();
+        let lane = &mut input.signals.accepted_task_cost_observations[0].lane;
+        match mismatch {
+            0 => lane.candidate.runtime = "other-runtime".to_string(),
+            1 => lane.candidate.model = "other-model".to_string(),
+            2 => lane.candidate.effort = ReasoningEffort::Ultra,
+            3 => lane.role = AgentRole::Researcher,
+            4 => {
+                lane.assignment_shape_identity =
+                    AssignmentShapeIdentity::v1("b".repeat(64)).expect("different shape");
+            }
+            5 => lane.task.context = ContextSize::Long,
+            6 => input.signals.accepted_task_cost_context = None,
+            7 => input
+                .signals
+                .accepted_task_cost_observations
+                .push(observation.clone()),
+            _ => unreachable!(),
         }
-        if let Some(score) = evaluation.score.as_ref() {
-            assert_ne!(
-                score.expected_total_cost_per_accepted_task_microunits,
-                9_000_001
-            );
-        }
+        assert_eq!(expected_cost(&input), baseline, "mismatch {mismatch}");
+    }
+    let wire = serde_json::to_value(&exact).expect("serialize selection input");
+    assert!(wire["signals"].get("accepted_task_cost_context").is_none());
+    assert!(wire["signals"]
+        .get("accepted_task_cost_observations")
+        .is_none());
+    let decoded: SelectionInput = serde_json::from_value(wire).expect("wire selection input");
+    assert!(decoded.signals.accepted_task_cost_context.is_none());
+    assert!(decoded.signals.accepted_task_cost_observations.is_empty());
+    assert_eq!(expected_cost(&decoded), baseline);
+}
+
+#[test]
+fn observed_cost_feedback_keeps_two_candidate_costs_separate() {
+    use crate::supervise::AgentRole;
+
+    let mut input = base_input();
+    let decision = select(&input).expect("initial decision");
+    let candidates = decision
+        .candidate_set
+        .iter()
+        .filter(|evaluation| evaluation.score.is_some())
+        .take(2)
+        .map(|evaluation| evaluation.candidate.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 2);
+    let shape = AssignmentShapeIdentity::v1("a".repeat(64)).expect("shape");
+    input.signals.accepted_task_cost_context = Some(AcceptedTaskCostContext {
+        role: AgentRole::Worker,
+        assignment_shape_identity: shape.clone(),
+    });
+    input.signals.accepted_task_cost_observations = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| AcceptedTaskCostObservation {
+            lane: AcceptedTaskCostLane {
+                role: AgentRole::Worker,
+                task: input.task.clone(),
+                assignment_shape_identity: shape.clone(),
+                candidate: candidate.clone(),
+            },
+            cost_per_accepted_task_microunits: 9_000_001 + index as u64,
+        })
+        .collect();
+    input.signals.previous_choice = Some(candidates[1].clone());
+    let decision = select(&input).expect("lane-bound decision");
+    for (index, candidate) in candidates.iter().enumerate() {
+        let cost = decision
+            .candidate_set
+            .iter()
+            .find(|evaluation| &evaluation.candidate == candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("candidate score")
+            .expected_total_cost_per_accepted_task_microunits;
+        assert_eq!(cost, 9_000_001 + index as u64);
     }
 }
 
