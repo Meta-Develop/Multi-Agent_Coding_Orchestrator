@@ -381,30 +381,42 @@ pub fn launch_provider(provider_id: String) -> Result<LaunchedProcess> {
         return Err(Error::NotImplemented("launch_provider"));
     }
     let authority = account_authority()?;
-    let account = match &authority {
-        AccountAuthority::InProcess(registry) => registry
-            .selected(&provider_id)?
-            .ok_or_else(|| Error::NoSelectedAccount(provider_id.clone()))?,
+    launch_provider_with_authority(adapter.as_ref(), &authority)
+}
+
+fn launch_provider_with_authority(
+    adapter: &dyn ProviderAdapter,
+    authority: &AccountAuthority,
+) -> Result<LaunchedProcess> {
+    let registry = match authority {
+        AccountAuthority::InProcess(registry) => registry,
         AccountAuthority::Remote(_) => return Err(Error::NotImplemented("remote launch_provider")),
     };
-    let spec = providers::launch_spec_for(adapter.as_ref(), &account)?;
-    let store = spec
-        .requires_credential()
-        .then(storage::default_store)
-        .transpose()?;
-    let mut child = providers::spawn_launch(spec, &account, store.as_deref())?;
+    let binding = registry
+        .selected_binding(adapter.id())?
+        .ok_or_else(|| Error::NoSelectedAccount(adapter.id().to_string()))?;
+    let child =
+        providers::spawn_selected_launch(registry, adapter, &binding, storage::default_store)?;
     let process = LaunchedProcess {
-        provider_id,
-        account_id: account.id,
+        provider_id: binding.provider_id,
+        account_id: binding.account_id,
         process_id: child.id(),
     };
     // Waiting outside the command keeps an exited CLI from becoming a zombie
     // while allowing the IPC call to return as soon as the process starts.
-    std::thread::spawn(move || {
-        let _ = child.wait();
-    });
+    let _ = reap_launch(child);
     Ok(process)
 }
+
+fn reap_launch(
+    mut child: providers::LeasedChild,
+) -> std::thread::JoinHandle<io::Result<std::process::ExitStatus>> {
+    std::thread::spawn(move || child.wait())
+}
+
+#[cfg(test)]
+#[path = "commands_launch_tests.rs"]
+mod launch_tests;
 
 /// One honest quota result for every registered provider.
 ///
