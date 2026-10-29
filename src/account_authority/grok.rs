@@ -68,16 +68,8 @@ impl GrokLaunchAuthority {
             ));
         }
         if let Some(socket_path) = &self.socket_path {
-            let live =
-                super::selected_binding_via_authority_socket(socket_path, GROK_CLI_PROVIDER_ID)
-                    .context(
-                    "failed to revalidate Coding Agent Manager Grok selection via authority socket",
-                )?;
-            let Some((authority_id, binding)) = live else {
-                return Err(anyhow!(
-                    "no complete account is selected for Coding Agent Manager provider `{GROK_CLI_PROVIDER_ID}`"
-                ));
-            };
+            let authority_id = super::socket_client::authority_id_via_authority_socket(socket_path)
+                .context("failed to revalidate Coding Agent Manager Grok authority socket")?;
             if let Some(expected_authority) = &self.authority_id {
                 if authority_id != *expected_authority {
                     return Err(anyhow!(
@@ -85,21 +77,15 @@ impl GrokLaunchAuthority {
                     ));
                 }
             }
-            if binding != self.binding {
-                return Err(map_binding_drift(&self.binding, &binding));
-            }
         }
-        let current = self
+        let account = self
             .registry
-            .selected_binding(GROK_CLI_PROVIDER_ID)
-            .context("failed to read Coding Agent Manager Grok selection")?
-            .ok_or_else(|| {
-                anyhow!(
-                    "no complete account is selected for Coding Agent Manager provider `{GROK_CLI_PROVIDER_ID}`"
-                )
-            })?;
-        if current != self.binding {
-            return Err(map_binding_drift(&self.binding, &current));
+            .complete(GROK_CLI_PROVIDER_ID, &self.binding.account_id)
+            .context("leased Coding Agent Manager Grok account is no longer complete")?;
+        if account.account_incarnation != self.binding.account_incarnation {
+            return Err(anyhow!(
+                "leased Coding Agent Manager Grok account was replaced"
+            ));
         }
         if let Some(expected_authority) = &self.authority_id {
             let actual = authority_id_for(self.registry.metadata_path());
@@ -813,7 +799,8 @@ mod tests {
     }
 
     #[test]
-    fn active_use_lease_blocks_selection_and_delete() -> Result<()> {
+    fn active_use_lease_allows_future_selection_and_unrelated_delete() -> Result<()> {
+        let _socket = SocketEnvGuard::unset();
         let fixture = Fixture::new();
         add_managed_account(&fixture.registry, &fixture.adapter, "account-a", "A", None)
             .map_err(map_cam_error)?;
@@ -826,16 +813,34 @@ mod tests {
             .selected_binding(GROK_CLI_PROVIDER_ID)
             .map_err(map_cam_error)?
             .expect("binding");
-        let selected_use_lease = fixture
-            .registry
-            .acquire_selected_use(&binding)
-            .map_err(map_cam_error)?;
-        assert!(select_launch_account(&fixture.registry, &fixture.adapter, "account-b").is_err());
-        assert!(
-            delete_managed_account(&fixture.registry, &fixture.adapter, "account-b", None).is_err()
-        );
-        drop(selected_use_lease);
+        let authority = acquire_grok_launch_authority_from(&fixture.registry, &fixture.adapter)?;
         select_launch_account(&fixture.registry, &fixture.adapter, "account-b")
+            .map_err(map_cam_error)?;
+        authority.verify_binding_unchanged()?;
+        delete_managed_account(&fixture.registry, &fixture.adapter, "account-b", None)
+            .map_err(map_cam_error)?;
+        authority.verify_binding_unchanged()?;
+        assert_eq!(authority.binding(), &binding);
+        assert!(
+            delete_managed_account(&fixture.registry, &fixture.adapter, "account-a", None).is_err()
+        );
+        let original = fs::read(fixture.registry.metadata_path())?;
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_slice(&original)?;
+            document["accounts"][0][field] = value.into();
+            fs::write(
+                fixture.registry.metadata_path(),
+                serde_json::to_vec(&document)?,
+            )?;
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
+        fs::write(fixture.registry.metadata_path(), original)?;
+        authority.verify_binding_unchanged()?;
+        drop(authority);
+        delete_managed_account(&fixture.registry, &fixture.adapter, "account-a", None)
             .map_err(map_cam_error)?;
         Ok(())
     }
@@ -1161,6 +1166,16 @@ mod tests {
         let evidence = authority.selection_evidence();
         assert_eq!(evidence.account_id, expected_account);
         assert_eq!(evidence.authority_id, expected_authority);
+        authority.verify_binding_unchanged()?;
+        authority
+            .registry
+            .select_complete_revision(GROK_CLI_PROVIDER_ID, "account-b", None)?;
+        authority
+            .registry
+            .begin_delete(GROK_CLI_PROVIDER_ID, "account-b")?;
+        authority
+            .registry
+            .finish_delete(GROK_CLI_PROVIDER_ID, "account-b")?;
         authority.verify_binding_unchanged()?;
         // Both endpoints serve exactly the same registry and binding. The path
         // itself remains part of the launch contract.

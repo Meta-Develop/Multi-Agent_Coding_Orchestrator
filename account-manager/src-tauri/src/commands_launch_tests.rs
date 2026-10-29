@@ -85,16 +85,18 @@ fn launch_reaper_retains_exact_selected_use_lease() {
     let registry = crate::account_authority::StoredAccountRegistry::new(
         directory.path().join("accounts.json"),
     );
-    registry
-        .begin_add(
-            PROVIDER,
-            "work",
-            "Work",
-            AuthKind::OAuth,
-            StoredAccountMaterial::VendorHome,
-        )
-        .unwrap();
-    registry.complete_add(PROVIDER, "work").unwrap();
+    for id in ["work", "other"] {
+        registry
+            .begin_add(
+                PROVIDER,
+                id,
+                id,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .unwrap();
+        registry.complete_add(PROVIDER, id).unwrap();
+    }
     registry.select_complete(PROVIDER, "work").unwrap();
     let expected = registry.selected_binding(PROVIDER).unwrap().unwrap();
     let authority = AccountAuthority::InProcess(registry);
@@ -107,7 +109,13 @@ fn launch_reaper_retains_exact_selected_use_lease() {
     assert_eq!(process.account_id, expected.account_id);
     assert_ne!(process.process_id, 0);
     await_file(&directory.path().join("ready"));
-    assert_eq!(registry.selected_binding(PROVIDER).unwrap(), Some(expected));
+    let future = registry
+        .select_complete_revision(PROVIDER, "other", Some(expected.selection_revision))
+        .unwrap();
+    assert_eq!(future.account_id, "other");
+    assert_eq!(process.account_id, expected.account_id);
+    registry.begin_delete(PROVIDER, "other").unwrap();
+    registry.finish_delete(PROVIDER, "other").unwrap();
     let deletion = registry.begin_delete(PROVIDER, "work");
     // Always release the fixture child before asserting, including on failure.
     fs::write(directory.path().join("release"), b"ok").unwrap();

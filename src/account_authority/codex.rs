@@ -6,6 +6,7 @@ use anyhow::{anyhow, Context, Result};
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
+use coding_agent_manager_lib::model::StoredAccountMetadata;
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::{launch_spec_for, LaunchSpec};
@@ -49,13 +50,13 @@ impl CodexLaunchAuthority {
             ));
         }
         if let Some(path) = &self.socket_path {
-            revalidate_socket(path, &self.frozen)?;
+            let authority_id = super::socket_client::authority_id_via_authority_socket(path)
+                .context("failed to revalidate selected Codex authority socket")?;
+            if authority_id != self.frozen.authority_id {
+                return Err(anyhow!("selected Codex socket authority changed"));
+            }
         }
-        require_registry_binding(&self.registry, &self.frozen)?;
-        let account = self
-            .registry
-            .complete(CODEX_CLI_PROVIDER_ID, &self.frozen.account_id)
-            .context("selected Codex account is no longer complete")?;
+        let account = require_leased_registry_account(&self.registry, &self.frozen)?;
         let adapter = adapter_for_registry(&self.registry)?;
         let spec = launch_spec_for(&adapter, &account)
             .context("selected Codex launch declaration is no longer valid")?;
@@ -141,14 +142,10 @@ fn finish_codex_launch_authority(
     let lease = registry
         .acquire_selected_use(&binding)
         .context("failed to acquire selected Codex account use lease")?;
-    let account = registry
-        .complete(CODEX_CLI_PROVIDER_ID, &binding.account_id)
-        .context("selected Codex account is not complete")?;
+    let account = require_leased_registry_account(registry, frozen)?;
     let spec = launch_spec_for(&adapter_for_registry(registry)?, &account)
         .context("selected Codex adapter refused its launch declaration")?;
     let managed_codex_home = codex_home_from_launch_spec(&spec)?;
-    // A concurrent mutation before lease acquisition cannot become the captured source.
-    require_registry_binding(registry, frozen)?;
     Ok(CodexLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         frozen: frozen.clone(),
@@ -156,6 +153,24 @@ fn finish_codex_launch_authority(
         _selected_use_lease: lease,
         managed_codex_home,
     })
+}
+
+fn require_leased_registry_account(
+    registry: &StoredAccountRegistry,
+    frozen: &FrozenCodexSelectedBinding,
+) -> Result<StoredAccountMetadata> {
+    if frozen.provider_id != CODEX_CLI_PROVIDER_ID
+        || frozen.authority_id != authority_id_for(registry.metadata_path())
+    {
+        return Err(anyhow!("selected Codex execution authority changed"));
+    }
+    let account = registry
+        .complete(CODEX_CLI_PROVIDER_ID, &frozen.account_id)
+        .context("leased Codex account is no longer complete")?;
+    if account.account_incarnation != frozen.account_incarnation {
+        return Err(anyhow!("leased Codex account was replaced"));
+    }
+    Ok(account)
 }
 
 fn codex_home_from_launch_spec(spec: &LaunchSpec) -> Result<PathBuf> {
@@ -259,28 +274,40 @@ mod tests {
         let (_root, registry, frozen) = selected_fixture();
         let authority = finish_codex_launch_authority(&registry, &frozen, None).unwrap();
         authority.verify_binding_unchanged().unwrap();
-        assert!(registry
+        registry
             .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
-            .is_err());
+            .unwrap();
+        authority.verify_binding_unchanged().unwrap();
+        registry
+            .begin_delete(CODEX_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        registry
+            .finish_delete(CODEX_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        authority.verify_binding_unchanged().unwrap();
         assert!(registry
             .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
             .is_err());
-        // Simulate an out-of-band registry writer rather than weakening the lease.
+        // A writer bypassing the lease must not replace or invalidate its account.
         let original = std::fs::read(registry.metadata_path()).unwrap();
-        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        document["selectionRevisions"][CODEX_CLI_PROVIDER_ID] =
-            (frozen.selection_revision + 1).into();
-        std::fs::write(
-            registry.metadata_path(),
-            serde_json::to_vec(&document).unwrap(),
-        )
-        .unwrap();
-        assert!(authority.verify_binding_unchanged().is_err());
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            document["accounts"][0][field] = value.into();
+            std::fs::write(
+                registry.metadata_path(),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
         std::fs::write(registry.metadata_path(), original).unwrap();
         authority.verify_binding_unchanged().unwrap();
         drop(authority);
         registry
-            .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
+            .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
             .unwrap();
         assert!(require_registry_binding(&registry, &frozen).is_err());
     }

@@ -290,6 +290,21 @@ fn lost_start_reply_retries_frozen_binding_and_key() {
     assert!(fixture.service.start(&fixture.adapter).is_err());
     until(|| fixture.root.join("ready").exists());
     fixture.assert_busy();
+    fixture
+        .registry
+        .begin_add(
+            PROVIDER,
+            "other",
+            "Other",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )
+        .unwrap();
+    fixture.registry.complete_add(PROVIDER, "other").unwrap();
+    fixture.registry.select_complete(PROVIDER, "other").unwrap();
+    fixture.registry.begin_delete(PROVIDER, "other").unwrap();
+    fixture.registry.finish_delete(PROVIDER, "other").unwrap();
+    fixture.assert_busy();
     let status = fixture.start();
     assert_eq!(status.state, LaunchOperationState::Running);
     let requests = fixture.requests.lock().unwrap();

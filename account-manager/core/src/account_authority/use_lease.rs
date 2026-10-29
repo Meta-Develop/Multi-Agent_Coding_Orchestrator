@@ -8,6 +8,7 @@ use fs2::FileExt;
 
 use crate::error::{Error, Result};
 use crate::fsx;
+use crate::model::StoredAccountMetadata;
 
 use super::binding::SelectedAccountBinding;
 use super::document::metadata_write_error;
@@ -140,10 +141,28 @@ pub(crate) fn use_lock_dir(metadata_path: &Path) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("stored-account-use-locks"))
 }
 
-/// Non-blocking probe: refuse provider-scoped authority mutations while a use lease is held.
-pub(crate) fn refuse_provider_authority_mutations(
+/// Validate lease state without preventing changes to future selection.
+pub(crate) fn validate_provider_use_leases(metadata_path: &Path, provider_id: &str) -> Result<()> {
+    check_provider_use_leases(metadata_path, provider_id, None)
+}
+
+/// Refuse material mutations only for the exact leased account incarnation.
+/// The caller must hold the registry lock through the metadata mutation.
+pub(crate) fn refuse_account_authority_mutations(
+    metadata_path: &Path,
+    account: &StoredAccountMetadata,
+) -> Result<()> {
+    check_provider_use_leases(
+        metadata_path,
+        &account.provider_id,
+        Some((&account.id, &account.account_incarnation)),
+    )
+}
+
+fn check_provider_use_leases(
     metadata_path: &Path,
     provider_id: &str,
+    mutation_target: Option<(&str, &str)>,
 ) -> Result<()> {
     if !account_id_is_safe_in_use_lease(provider_id) {
         return Err(metadata_write_error(
@@ -152,9 +171,19 @@ pub(crate) fn refuse_provider_authority_mutations(
         ));
     }
     let directory = use_lock_dir(metadata_path);
+    match fs::symlink_metadata(&directory) {
+        Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+            return Err(metadata_write_error(
+                provider_id,
+                "account use lock directory is unsafe",
+            ));
+        }
+        Ok(_) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(fsx::io_at(&directory, error)),
+    }
     let entries = match fs::read_dir(&directory) {
         Ok(entries) => entries,
-        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
         Err(error) => return Err(fsx::io_at(&directory, error)),
     };
     let prefix = format!("{provider_id}__");
@@ -165,12 +194,9 @@ pub(crate) fn refuse_provider_authority_mutations(
         if !name.starts_with(prefix.as_str()) || !name.ends_with(".lock") {
             continue;
         }
-        if !use_lock_name_is_safe(&name, provider_id) {
-            return Err(metadata_write_error(
-                provider_id,
-                "account use lock file name is malformed",
-            ));
-        }
+        let identity = use_lock_identity(&name, provider_id).ok_or_else(|| {
+            metadata_write_error(provider_id, "account use lock file name is malformed")
+        })?;
         let path = entry.path();
         let metadata = fs::symlink_metadata(&path).map_err(|error| fsx::io_at(&path, error))?;
         if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -184,14 +210,23 @@ pub(crate) fn refuse_provider_authority_mutations(
             .write(true)
             .open(&path)
             .map_err(|error| fsx::io_at(&path, error))?;
-        match FileExt::try_lock_exclusive(&file) {
+        let probe = FileExt::try_lock_exclusive(&file);
+        if !open_file_identity_matches_path(&file, &path, "account use lease")? {
+            return Err(metadata_write_error(
+                provider_id,
+                "account use lease was replaced during probe",
+            ));
+        }
+        match probe {
             Ok(()) => {
                 let _ = FileExt::unlock(&file);
             }
             Err(error) if is_lock_contention(&error) => {
-                return Err(Error::AccountAuthorityBusy {
-                    reason: format!("provider `{provider_id}` has an active account-use lease"),
-                });
+                if mutation_target == Some(identity) {
+                    return Err(Error::AccountAuthorityBusy {
+                        reason: format!("account `{}` has an active account-use lease", identity.0),
+                    });
+                }
             }
             Err(error) => return Err(fsx::io_at(&path, error)),
         }
@@ -199,24 +234,16 @@ pub(crate) fn refuse_provider_authority_mutations(
     Ok(())
 }
 
-fn use_lock_name_is_safe(name: &str, provider_id: &str) -> bool {
+fn use_lock_identity<'a>(name: &'a str, provider_id: &str) -> Option<(&'a str, &'a str)> {
     let stem = name.strip_suffix(".lock").unwrap_or(name);
     let mut parts = stem.splitn(3, "__");
-    let Some(file_provider) = parts.next() else {
-        return false;
-    };
-    let Some(account_id) = parts.next() else {
-        return false;
-    };
-    let Some(incarnation) = parts.next() else {
-        return false;
-    };
-    if parts.next().is_some() {
-        return false;
-    }
-    file_provider == provider_id
+    let file_provider = parts.next()?;
+    let account_id = parts.next()?;
+    let incarnation = parts.next()?;
+    (file_provider == provider_id
         && account_id_is_safe_in_use_lease(account_id)
-        && validate_account_incarnation(incarnation).is_ok()
+        && validate_account_incarnation(incarnation).is_ok())
+    .then_some((account_id, incarnation))
 }
 
 pub(crate) fn account_id_is_safe_in_use_lease(account_id: &str) -> bool {
