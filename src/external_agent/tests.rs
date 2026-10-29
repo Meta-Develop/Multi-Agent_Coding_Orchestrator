@@ -11118,7 +11118,7 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
         assert!(!report.environment_preflight_quiescence_verified());
     }
 
-    let pre_spawn_errors = vec![
+    let pre_release_errors = vec![
         ProcessRunError::TeeConflict {
             label: "codex version preflight".to_string(),
             stdout: PathBuf::from("injected-stdout"),
@@ -11130,6 +11130,28 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
             phase: "injected pre-release setup",
             source: std::io::Error::other("injected setup timeout"),
         },
+    ];
+    for error in pre_release_errors {
+        assert!(process_run_error_definitely_before_process_start(&error));
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        evidence.record_error(&error);
+        assert!(evidence.started);
+        assert!(!evidence.unconfirmed_child);
+        assert_eq!(
+            evidence.process_tree,
+            Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService
+            ))
+        );
+        assert_eq!(
+            evidence.side_effects,
+            Some(SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex
+            ))
+        );
+    }
+
+    let pre_spawn_errors = vec![
         ProcessRunError::Spawn {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),

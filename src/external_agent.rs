@@ -12127,6 +12127,7 @@ struct EnvironmentPreflightReport {
 #[derive(Debug, Default)]
 struct EnvironmentPreflightProcessEvidence {
     started: bool,
+    unconfirmed_child: bool,
     process_tree: Option<ProcessTreeEvidence>,
     side_effects: Option<SideEffectConfinementEvidence>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
@@ -12135,10 +12136,7 @@ struct EnvironmentPreflightProcessEvidence {
 impl EnvironmentPreflightProcessEvidence {
     #[cfg(target_os = "linux")]
     fn may_have_live_child(&self) -> bool {
-        self.started
-            && !self
-                .process_tree
-                .is_some_and(ProcessTreeEvidence::is_verified_empty)
+        self.unconfirmed_child
     }
 
     fn record_output(&mut self, output: &ProcessOutput) {
@@ -12195,9 +12193,18 @@ impl EnvironmentPreflightProcessEvidence {
                 ),
                 false,
             ),
+            ProcessRunError::SetupTimeout { .. } | ProcessRunError::TeeConflict { .. } => {
+                // Preserve the attempted containment in reports without implying
+                // that this pre-release refusal created a possibly live child.
+                self.record_containment(
+                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
+                    SideEffectConfinementEvidence::Unverified(
+                        SideEffectConfinementProfileKind::ExternalCodex,
+                    ),
+                    false,
+                );
+            }
             ProcessRunError::Cancelled { evidence: None, .. }
-            | ProcessRunError::SetupTimeout { .. }
-            | ProcessRunError::TeeConflict { .. }
             | ProcessRunError::Spawn { .. }
             | ProcessRunError::ContainmentUnavailable { .. }
             | ProcessRunError::EnvironmentFailure {
@@ -12209,6 +12216,16 @@ impl EnvironmentPreflightProcessEvidence {
     }
 
     fn record(
+        &mut self,
+        process_tree: ProcessTreeEvidence,
+        side_effects: SideEffectConfinementEvidence,
+        verified: bool,
+    ) {
+        self.unconfirmed_child |= !process_tree.is_verified_empty();
+        self.record_containment(process_tree, side_effects, verified);
+    }
+
+    fn record_containment(
         &mut self,
         process_tree: ProcessTreeEvidence,
         side_effects: SideEffectConfinementEvidence,

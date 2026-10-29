@@ -155,6 +155,13 @@ pub(super) fn prepare_source_inputs(
             .stdout
             .run_metadata
             .environment_preflight_process_started,
+        unconfirmed_child: report
+            .stdout
+            .run_metadata
+            .environment_preflight_process_started
+            && !report
+                .process_tree
+                .is_some_and(ProcessTreeEvidence::is_verified_empty),
         process_tree: report.process_tree,
         side_effects: report.side_effects,
         fixed_version_probe_evidence: report
