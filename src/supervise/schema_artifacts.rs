@@ -9,6 +9,13 @@ pub(super) fn write_plan_snapshot(
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<()> {
     let value = supervisor_plan_value(plan, consultant, assignment_metadata, plan_metadata)?;
+    if plan_metadata.operator_pricing.is_some() {
+        write_schema(
+            writer,
+            Path::new("schemas/operator-pricing-plan-v1.schema.json"),
+            operator_pricing_plan_schema_value(),
+        )?;
+    }
     write_artifact_json(
         writer,
         relative,
@@ -17,6 +24,66 @@ pub(super) fn write_plan_snapshot(
         ArtifactFileDisposition::PrivateEvidence,
     )
     .with_context(|| format!("failed to write plan snapshot {}", relative.display()))
+}
+
+pub(super) fn operator_pricing_plan_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "title": "Optional operator pricing fields for supervisor plans",
+        "type": "object",
+        "properties": {
+            "pricing_contract": {"$ref": "#/$defs/contract"},
+            "pricing_plan_id": {"type": "string", "minLength": 1},
+            "model_pricing": {
+                "type": "object", "additionalProperties": model_pricing_schema_value()
+            },
+            "pricing_binding": {
+                "type": "object", "additionalProperties": false,
+                "required": ["contract_json", "price_map_json", "plan_id", "normalized_sha256"],
+                "properties": {
+                    "contract_json": {"type": "string", "minLength": 1},
+                    "price_map_json": {"type": "string", "minLength": 1},
+                    "plan_id": {"type": "string", "minLength": 1},
+                    "normalized_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                }
+            }
+        },
+        "dependentRequired": {
+            "pricing_contract": ["model_pricing", "pricing_plan_id"],
+            "pricing_plan_id": ["pricing_contract"],
+            "pricing_binding": ["pricing_contract"]
+        },
+        "$defs": {"contract": {
+            "type": "object", "additionalProperties": false,
+            "required": ["schema_version", "contract_id", "revision", "effective_date", "valid_through", "source_reference", "source_attribution", "currency", "unit", "billing", "scopes", "price_map_sha256"],
+            "properties": {
+                "schema_version": {"const": 1},
+                "contract_id": {"type": "string", "minLength": 1},
+                "revision": {"type": "string", "minLength": 1},
+                "effective_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                "valid_through": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+                "source_reference": {"type": "string", "minLength": 1},
+                "source_attribution": {"type": "string", "minLength": 1},
+                "currency": {"const": "USD"},
+                "unit": {"const": "per_million_tokens"},
+                "billing": {"const": "flat_input_output"},
+                "price_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+                "scopes": {
+                    "type": "array", "minItems": 1, "uniqueItems": true,
+                    "items": {
+                        "type": "object", "additionalProperties": false,
+                        "required": ["runtime", "model", "account_id", "plan_id"],
+                        "properties": {
+                            "runtime": {"enum": ["fake", "codex", "grok", "cursor", "claude-code", "gemini-cli"]},
+                            "model": {"type": "string", "minLength": 1},
+                            "account_id": {"type": "string", "minLength": 1},
+                            "plan_id": {"type": "string", "minLength": 1}
+                        }
+                    }
+                }
+            }
+        }}
+    })
 }
 
 pub(super) fn write_orchestrator_schema(

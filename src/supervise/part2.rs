@@ -148,7 +148,7 @@ struct DispatchBudgetReservation<'a> {
     ledger: &'a RunBudgetLedger,
     reservation: BudgetReservation,
     pricing: Option<ModelPricing>,
-    model_pricing: BTreeMap<String, ModelPricing>,
+    pricing_model: Option<String>,
     state: DispatchBudgetReservationState,
 }
 
@@ -210,6 +210,17 @@ impl DispatchBudgetReservation<'_> {
         }
         if self.ledger.dispatch_stopped() {
             bail!("run budget stopped before provider invocation");
+        }
+        if launch_runtime != SupervisorRuntime::Fake && self.pricing.is_some() {
+            let current = self.pricing_model.as_deref().and_then(|model| {
+                self.ledger
+                    .operator_pricing
+                    .as_ref()
+                    .and_then(|view| view.price_for(launch_runtime, model))
+            });
+            if current != self.pricing {
+                bail!("pricing_contract applicability changed before provider invocation");
+            }
         }
         #[cfg(test)]
         if DISPATCH_PRE_RUNNER_FAULT
@@ -302,18 +313,16 @@ impl DispatchBudgetReservation<'_> {
             _ => command.model.clone(),
         };
         let pricing = match launch_runtime {
-            SupervisorRuntime::Codex => model.as_deref().and_then(|model| {
-                crate::llm::provider::resolve_model_pricing(&self.model_pricing, model)
-                    .filter(|resolved| {
-                        resolved.provenance
-                            == crate::llm::provider::ModelPricingProvenance::PlanOverride
-                    })
-                    .map(|resolved| resolved.pricing)
-            }),
+            SupervisorRuntime::Fake => self.pricing,
             // Neither native stream attests provider pricing. Reservation estimates do not
             // establish actual money spent.
             SupervisorRuntime::Grok | SupervisorRuntime::ClaudeCode => None,
-            _ => self.pricing,
+            _ => model.as_deref().and_then(|model| {
+                self.ledger
+                    .operator_pricing
+                    .as_ref()
+                    .and_then(|view| view.price_for(launch_runtime, model))
+            }),
         };
         let cost_usd = usage
             .and_then(|usage| pricing.map(|pricing| pricing.cost_usd(usage)))
@@ -661,6 +670,7 @@ fn run_supervisor_plan_with_budget_catalog_and_runner(
 ) -> Result<SupervisorFinalReport> {
     let mut plan_metadata = SupervisorPlanMetadata {
         run_budget,
+        operator_pricing: tests::synthetic_fixture_pricing(&plan, options.runtime)?,
         ..SupervisorPlanMetadata::default()
     };
     // Simulation retains its existing legacy path. Explicit loaded-plan and
@@ -755,6 +765,7 @@ fn run_supervisor_plan_with_budget_and_concurrent_runner(
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
     let mut plan_metadata = SupervisorPlanMetadata {
         run_budget,
+        operator_pricing: tests::synthetic_fixture_pricing(&plan, options.runtime)?,
         ..SupervisorPlanMetadata::default()
     };
     scheduler::carry_selected_concurrent_fixture_metadata(
@@ -788,7 +799,10 @@ fn run_supervisor_plan_with_concurrent_cancellable_runner(
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
     let runtime_model_catalog = test_runtime_model_catalog(&plan, options.runtime)?;
-    let mut plan_metadata = SupervisorPlanMetadata::default();
+    let mut plan_metadata = SupervisorPlanMetadata {
+        operator_pricing: tests::synthetic_fixture_pricing(&plan, options.runtime)?,
+        ..SupervisorPlanMetadata::default()
+    };
     scheduler::carry_selected_concurrent_fixture_metadata(
         &plan,
         &options,
@@ -1177,11 +1191,8 @@ mod grok_native_settlement_tests {
         DispatchBudgetReservation {
             ledger,
             reservation,
-            pricing: Some(ModelPricing {
-                input_usd_per_million_tokens: 7.0,
-                output_usd_per_million_tokens: 7.0,
-            }),
-            model_pricing: BTreeMap::new(),
+            pricing: None,
+            pricing_model: None,
             state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Grok),
         }
     }

@@ -8588,7 +8588,7 @@ mod decomposition_tests {
                 ledger: &ledger,
                 reservation,
                 pricing: None,
-                model_pricing: BTreeMap::new(),
+                pricing_model: None,
                 state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex),
             };
             let authority = held_out::ParentValidationAuthority::new(
@@ -8676,7 +8676,7 @@ mod decomposition_tests {
                 ledger: &ledger,
                 reservation,
                 pricing: None,
-                model_pricing: BTreeMap::new(),
+                pricing_model: None,
                 state: DispatchBudgetReservationState::Reserved(runtime),
             };
             // Fake uses a Codex-shaped command. The selected reservation runtime, not its

@@ -887,6 +887,19 @@ impl ArtifactRunWriter {
         self.run.path()
     }
 
+    pub(crate) fn read_optional_authenticated(
+        &self,
+        relative: &Path,
+        max_bytes: usize,
+    ) -> Result<Option<Vec<u8>>> {
+        self.run_lock.verify(&self.run)?;
+        let relative = validate_artifact_relative_path(relative)?;
+        if !self.files.contains_key(&relative) {
+            return Ok(None);
+        }
+        self.read_authenticated(&relative, max_bytes).map(Some)
+    }
+
     /// Reads one manifested artifact while sibling invocations may still own
     /// scratch directories. The caller must retain exclusive access to this
     /// writer throughout the read; no manifest update or append can interleave.

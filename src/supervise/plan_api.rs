@@ -653,6 +653,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
+        operator_pricing: None,
         objective_profile: None,
         resolved_objective_profile: None,
         execution_target: None,
@@ -2762,6 +2763,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         assignments,
     };
     let metadata = SupervisorPlanMetadata {
+        operator_pricing: None,
         objective_profile: None,
         resolved_objective_profile: None,
         execution_target: None,
@@ -3683,6 +3685,9 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
     contents: &str,
     repo: Option<&Path>,
 ) -> Result<LoadedSupervisorPlan> {
+    if contents.len() as u64 > MAX_SUPERVISOR_INPUT_BYTES {
+        bail!("supervisor plan exceeds its input byte limit");
+    }
     let value: Value = serde_json::from_str(contents).context("supervisor plan is not JSON")?;
     let consultant = consultant_from_plan_value(&value)?;
     let mut plan: SupervisorPlan =
@@ -3692,7 +3697,8 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
             .validate_model_fallback()
             .with_context(|| format!("role_models.{} fallback is invalid", role.as_str()))?;
     }
-    let plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
+    let mut plan_metadata = supervisor_plan_metadata_from_value(&value, plan.max_depth)?;
+    plan_metadata.operator_pricing = operator_pricing::load(contents, &mut plan)?;
     plan.assignments = assignments_from_plan_value(&value)?;
     let (mut plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, plan_metadata, repo)?;
     bind_assignment_role_categories(&mut plan);
@@ -4528,6 +4534,7 @@ pub(super) fn supervisor_plan_value(
     validate_authored_check_metadata(plan, assignment_metadata)?;
     let mut value =
         serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
+    operator_pricing::write_plan_value(&mut value, plan, plan_metadata)?;
     let assignments = value
         .get_mut("assignments")
         .and_then(Value::as_array_mut)
@@ -5711,9 +5718,7 @@ fn resume_generated_follow_up_cascade(
             true,
         ),
         SupervisorRunLifecycle::Resumable => (
-            resume_supervisor_run(&repo, run_id.clone())?
-                .final_report
-                .context("resumed supervise cascade source report is missing")?,
+            source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?,
             false,
         ),
         SupervisorRunLifecycle::Active => {
@@ -5729,6 +5734,7 @@ fn resume_generated_follow_up_cascade(
     if source_was_finalized {
         ensure_generated_follow_up_cascade_needs_resume(&repo, &loaded, &source_report)?;
     }
+    operator_pricing::verify_continuation(&repo, &run_id, Some(&loaded.plan_metadata))?;
     let source_plan_sha256 = normalized_supervisor_plan_sha256(
         &loaded.plan,
         &loaded.consultant,
@@ -6153,6 +6159,7 @@ pub(super) fn evidence_only_reaudit_plan_from_source(
     let mut fragments_by_assignment = BTreeMap::new();
     fragments_by_assignment.insert(assignment_id.clone(), fragments.clone());
     let plan_metadata = SupervisorPlanMetadata {
+        operator_pricing: source_loaded.plan_metadata.operator_pricing.clone(),
         objective_profile: source_loaded.plan_metadata.objective_profile,
         resolved_objective_profile: source_report
             .role_economics_profile
@@ -6337,6 +6344,7 @@ pub fn resume_supervisor_run(
             pending_assignments: Vec::new(),
             uncertain_assignments: Vec::new(),
             gate_denial: None,
+            diagnostic: None,
             final_report: Some(report),
         });
     }
@@ -6379,6 +6387,7 @@ pub fn resume_supervisor_run(
             pending_assignments: snapshot.pending_assignments,
             uncertain_assignments: snapshot.uncertain_assignments,
             gate_denial: Some(denial),
+            diagnostic: None,
             final_report: None,
         });
     }
@@ -6484,6 +6493,27 @@ pub fn resume_supervisor_run(
             )
         }
     };
+    let pricing_check = artifact_writer
+        .read_optional_authenticated(
+            Path::new("assignments/supervisor-plan.json"),
+            MAX_SUPERVISOR_INPUT_BYTES as usize,
+        )
+        .and_then(|bytes| {
+            bytes.map_or(Ok(()), |bytes| {
+                operator_pricing::verify_snapshot(&bytes, None)
+            })
+        });
+    if let Err(error) = pricing_check {
+        return resume_refusal(
+            &run_id,
+            SupervisorRunLifecycle::Interrupted,
+            ResumeCheckpointDenial::IntegrityFailure,
+            snapshot.completed_assignments,
+            snapshot.pending_assignments,
+            snapshot.uncertain_assignments,
+            Some(format!("{error:#}")),
+        );
+    }
     if !plan.artifact_committed {
         checkpoint.final_report_committed(
             &plan.report,
@@ -6513,6 +6543,7 @@ pub fn resume_supervisor_run(
         pending_assignments: snapshot.pending_assignments,
         uncertain_assignments: snapshot.uncertain_assignments,
         gate_denial: None,
+        diagnostic: None,
         final_report: Some(report),
     })
 }
@@ -6535,7 +6566,6 @@ fn resume_refusal(
             std::iter::empty::<&Path>(),
         )?,
     )?;
-    let _ = diagnostic;
     Ok(SupervisorResumeReport {
         run_id: run_id.clone(),
         repo: PathBuf::from("."),
@@ -6548,8 +6578,105 @@ fn resume_refusal(
         pending_assignments,
         uncertain_assignments,
         gate_denial: Some(gate_denial),
+        diagnostic,
         final_report: None,
     })
+}
+
+pub(super) fn source_report_from_resume(
+    resumed: SupervisorResumeReport,
+) -> Result<SupervisorFinalReport> {
+    if let Some(report) = resumed.final_report {
+        return Ok(report);
+    }
+    if let Some(gate_denial) = resumed.gate_denial {
+        return Err(SupervisorResumeRefusal {
+            gate_denial,
+            diagnostic: resumed
+                .diagnostic
+                .unwrap_or_else(|| "authenticated checkpoint refused continuation".to_string()),
+        }
+        .into());
+    }
+    bail!("resumed supervise cascade source report is missing")
+}
+
+#[cfg(test)]
+mod resume_refusal_tests {
+    use super::*;
+
+    #[test]
+    fn pricing_resume_diagnostics_and_typed_gate_survive_cascade_conversion() {
+        let mut plan: SupervisorPlan = serde_json::from_value(json!({
+            "model_pricing": {"synthetic-model": {
+                "input_usd_per_million_tokens": 2.0,
+                "output_usd_per_million_tokens": 3.0
+            }}
+        }))
+        .unwrap();
+        let input = operator_pricing::synthetic_input(&plan, "synthetic-account").unwrap();
+        let binding = serde_json::to_value(input).unwrap();
+        let contract: Value =
+            serde_json::from_str(binding["contract_json"].as_str().unwrap()).unwrap();
+        let source = json!({
+            "pricing_contract": contract,
+            "pricing_plan_id": "synthetic-plan",
+            "model_pricing": plan.model_pricing,
+            "pricing_binding": binding,
+        });
+        operator_pricing::load(&source.to_string(), &mut plan).unwrap();
+        for (case, expected_cause) in [
+            ("expired", "expired"),
+            ("scope", "does not match"),
+            ("mutation", "binding changed"),
+        ] {
+            let mut source = source.clone();
+            match case {
+                "expired" => {
+                    source["pricing_contract"]["valid_through"] = json!("2001-01-01");
+                    source.as_object_mut().unwrap().remove("pricing_binding");
+                }
+                "scope" => source["pricing_plan_id"] = json!("another-plan"),
+                _ => source["pricing_binding"]["normalized_sha256"] = json!("0".repeat(64)),
+            }
+            let cause =
+                operator_pricing::verify_snapshot(&serde_json::to_vec(&source).unwrap(), None)
+                    .expect_err("invalid pricing must refuse continuation");
+            let diagnostic = format!("{cause:#}");
+            assert!(diagnostic.contains(expected_cause), "{diagnostic}");
+            let report = resume_refusal(
+                &RunId::new(format!("synthetic-resume-{case}")).unwrap(),
+                SupervisorRunLifecycle::Interrupted,
+                ResumeCheckpointDenial::IntegrityFailure,
+                vec!["completed".into()],
+                vec!["pending".into()],
+                Vec::new(),
+                Some(diagnostic.clone()),
+            )
+            .unwrap();
+            assert!(!report.success && report.final_report.is_none());
+            assert_eq!(
+                serde_json::to_value(&report).unwrap()["diagnostic"],
+                diagnostic
+            );
+            let denial = report.gate_denial.clone().unwrap();
+            assert_eq!(
+                denial.reason,
+                GateDenialReason::ResumeCheckpoint {
+                    denial: ResumeCheckpointDenial::IntegrityFailure
+                }
+            );
+            let error = source_report_from_resume(report)
+                .expect_err("propagate the original resume refusal");
+            let refused = error
+                .downcast_ref::<SupervisorResumeRefusal>()
+                .expect("typed gate denial");
+            assert_eq!(refused.gate_denial, denial);
+            assert_eq!(refused.diagnostic, diagnostic);
+            assert!(error.to_string().contains(expected_cause));
+            assert!(!error.to_string().contains("source report is missing"));
+        }
+    }
 }
 
 pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<SupervisorStatusReport> {

@@ -507,6 +507,20 @@ fn inject_priced_process_roles(plan: &mut SupervisorPlan, model: &str, rate: f64
     );
 }
 
+pub(super) fn synthetic_fixture_pricing(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+) -> Result<Option<operator_pricing::FrozenOperatorPricing>> {
+    if plan.model_pricing.is_empty() || runtime != SupervisorRuntime::Codex {
+        return Ok(None);
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(account_id) = super::scheduler::pricing_fixture_account()? {
+        return operator_pricing::synthetic_input(plan, &account_id).map(Some);
+    }
+    Ok(None)
+}
+
 pub(crate) fn write_injected_usage(
     command: &ExternalAgentCommand,
     input_tokens: usize,
@@ -858,6 +872,7 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
     )?;
     let mut plan_metadata = SupervisorPlanMetadata {
         run_budget: budget,
+        operator_pricing: synthetic_fixture_pricing(&plan, options.runtime)?,
         ..SupervisorPlanMetadata::default()
     };
     super::scheduler::carry_selected_concurrent_fixture_metadata(

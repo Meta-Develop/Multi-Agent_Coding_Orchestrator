@@ -1,5 +1,234 @@
 use super::*;
 
+pub(super) fn operator_pricing_document(plan: &SupervisorPlan) -> Value {
+    let metadata = SupervisorPlanMetadata {
+        operator_pricing: Some(
+            operator_pricing::synthetic_input(plan, "synthetic-account").unwrap(),
+        ),
+        ..Default::default()
+    };
+    let mut document = serde_json::to_value(plan).unwrap();
+    operator_pricing::write_plan_value(&mut document, plan, &metadata).unwrap();
+    document.as_object_mut().unwrap().remove("pricing_binding");
+    document
+}
+
+#[test]
+fn operator_contract_absent_or_mismatched_refuses_before_launch() {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+    let source = operator_pricing_document(&plan);
+    let temp = tempfile::tempdir().unwrap();
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("usage"),
+        temp.path().join("report"),
+        Duration::from_secs(1),
+    );
+    command.model = Some("synthetic-model".into());
+    let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+    for case in [
+        "absent",
+        "source-less",
+        "expired",
+        "future",
+        "runtime",
+        "account",
+        "plan",
+        "model",
+        "digest",
+        "unverified-account",
+    ] {
+        let mut document = source.clone();
+        match case {
+            "absent" => {
+                document.as_object_mut().unwrap().remove("pricing_contract");
+                document.as_object_mut().unwrap().remove("pricing_plan_id");
+            }
+            "source-less" => document["pricing_contract"]["source_reference"] = json!(""),
+            "expired" => document["pricing_contract"]["valid_through"] = json!("2001-01-01"),
+            "future" => document["pricing_contract"]["effective_date"] = json!("9999-01-01"),
+            "runtime" => document["pricing_contract"]["scopes"][0]["runtime"] = json!("grok"),
+            "account" => {
+                document["pricing_contract"]["scopes"][0]["account_id"] = json!("another-account")
+            }
+            "plan" => document["pricing_plan_id"] = json!("another-plan"),
+            "model" => command.model = Some("another-model".into()),
+            "digest" => document["pricing_contract"]["price_map_sha256"] = json!("0".repeat(64)),
+            _ => {}
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&document.to_string());
+        if ["source-less", "digest"].contains(&case) {
+            assert!(loaded.is_err(), "{case}");
+            continue;
+        }
+        let loaded = loaded.unwrap();
+        let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let run_id = format!("operator-refusal-{case}");
+        if case != "unverified-account" {
+            crate::account_authority::install_pricing_account_fixture(&run_id, "synthetic-account");
+        }
+        ledger.operator_pricing = loaded
+            .plan_metadata
+            .operator_pricing
+            .as_ref()
+            .map(|input| input.bind(&run_id).unwrap());
+        assert!(
+            matches!(
+                reserve_dispatch_budget(
+                    &loaded.plan,
+                    &budget,
+                    &ledger,
+                    (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+                    &command
+                )
+                .unwrap(),
+                DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::MissingCostEstimate)
+            ),
+            "{case}"
+        );
+        assert_eq!(ledger.report().unwrap().active_reservations, 0);
+        command.model = Some("synthetic-model".into());
+    }
+
+    // An unbound numeric table remains usable for tokens, without a USD claim.
+    let budget = injected_run_budget(None, Some(1000), None, None, 50, 50);
+    let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+    let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+        &command,
+    )
+    .unwrap() else {
+        panic!("token-only admission")
+    };
+    reservation.mark_invoked().unwrap();
+    write_injected_usage(&command, 7, 3);
+    let mut run = injected_verified_run_without_journals(&command);
+    retain_attribution_fixture(&mut run, &command, Some("synthetic-model"), false, false);
+    let settlement = reservation.settle_bound_runtime(&run, &command).unwrap();
+    assert!(settlement.cost_usd.is_none());
+    assert_eq!(settlement.reliable_usage().unwrap().total_tokens, 10);
+    assert!(ledger.report().unwrap().usage_complete);
+}
+
+#[test]
+fn operator_contract_rolling_usd_quota_includes_unpriced_history() {
+    use crate::budget_ledger::{bind_rolling_budget, RollingBudgetQuota};
+    for history in ["none", "priced", "unpriced"] {
+        let (_temp, repo) = injected_repository();
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+        if history != "none" {
+            let _binding = bind_rolling_budget(
+                &repo,
+                RollingBudgetQuota {
+                    max_tokens: Some(1000),
+                    max_cost_usd: None,
+                    window_seconds: 3600,
+                },
+                "previous-run",
+            )
+            .unwrap();
+            let ledger = RunBudgetLedger::new(RunBudgetLimits::default()).unwrap();
+            let cost = (history == "priced").then_some(0.99995);
+            let BudgetAdmission::Admitted { reservation, .. } = ledger
+                .reserve(BudgetReservationRequest {
+                    role: AgentRole::ChildOrchestrator,
+                    tokens: 10,
+                    cost_usd: cost,
+                })
+                .unwrap()
+            else {
+                panic!("history admission")
+            };
+            ledger
+                .reconcile(
+                    reservation.id,
+                    UsageMeasurement::Reliable {
+                        tokens: 10,
+                        cost_usd: cost,
+                    },
+                )
+                .unwrap();
+        }
+        let _binding = bind_rolling_budget(
+            &repo,
+            RollingBudgetQuota {
+                max_tokens: None,
+                max_cost_usd: Some(1.0),
+                window_seconds: 3600,
+            },
+            "current-run",
+        )
+        .unwrap();
+        let budget = injected_run_budget(None, Some(1000), None, None, 50, 50);
+        let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = ExternalAgentCommand::codex(
+            "unused",
+            temp.path(),
+            temp.path().join("prompt"),
+            temp.path().join("usage"),
+            temp.path().join("report"),
+            Duration::from_secs(1),
+        );
+        command.model = Some("synthetic-model".into());
+        if history == "none" {
+            assert!(matches!(
+                reserve_dispatch_budget(
+                    &plan,
+                    &budget,
+                    &ledger,
+                    (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+                    &command
+                )
+                .unwrap(),
+                DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::MissingCostEstimate)
+            ));
+            // A refusal latches this ledger; a fresh run can supply the contract.
+            drop(ledger);
+            ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        }
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        match reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+            &command,
+        )
+        .unwrap()
+        {
+            DispatchBudgetAdmission::Admitted(mut held) => {
+                assert_eq!(history, "none");
+                assert_eq!(ledger.report().unwrap().reserved.cost_usd, Some(0.0001));
+                held.settle_not_started().unwrap();
+            }
+            DispatchBudgetAdmission::Refused(refusal) => {
+                if history == "unpriced" {
+                    assert_eq!(refusal, BudgetAdmissionRefusal::NewDispatchStopped);
+                    assert!(ledger
+                        .report()
+                        .unwrap()
+                        .reasons
+                        .contains(&BudgetReason::MissingPricing));
+                } else {
+                    assert_eq!(history, "priced");
+                    assert!(matches!(
+                        refusal,
+                        BudgetAdmissionRefusal::HardCostCeiling { .. }
+                    ));
+                }
+            }
+        };
+    }
+}
+
 fn install_budget_fixture_models() -> InstalledModelCapabilityPolicy {
     install_test_fixture_models(&[(
         FRONTIER_PROFILE_MODEL,
@@ -1878,7 +2107,10 @@ fn budget_integration_uncertain_start_is_conservatively_reconciled_not_released(
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    if !plan.model_pricing.is_empty() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
     let temp = tempfile::tempdir().expect("uncertain-start command root");
     let mut command = ExternalAgentCommand::codex(
         "codex",
@@ -1935,7 +2167,10 @@ fn budget_integration_parseable_usage_without_verified_containment_is_estimated(
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    if !plan.model_pricing.is_empty() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
     let temp = tempfile::tempdir().expect("unverified containment command root");
     let mut command = ExternalAgentCommand::codex(
         "codex",
@@ -2005,7 +2240,10 @@ fn budget_integration_parseable_usage_from_truncated_capture_is_estimated() {
     let mut plan = injected_plan(assignment, 0);
     inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+    if !plan.model_pricing.is_empty() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
     let temp = tempfile::tempdir().expect("truncated capture command root");
     let mut command = ExternalAgentCommand::codex(
         "codex",
@@ -2158,7 +2396,7 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
             ledger: &ledger,
             reservation,
             pricing: None,
-            model_pricing: BTreeMap::new(),
+            pricing_model: None,
             state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
         };
         let settled = held.settle_bound_runtime(&incomplete, &command).unwrap();
@@ -2222,7 +2460,7 @@ fn completed_app_server_parent_usage_is_available_without_cli_jsonl() {
         ledger: &ledger,
         reservation,
         pricing: None,
-        model_pricing: BTreeMap::new(),
+        pricing_model: None,
         state: DispatchBudgetReservationState::Invoked(SupervisorRuntime::Codex),
     };
     assert_eq!(
@@ -2317,7 +2555,10 @@ fn budget_integration_large_capture_distinguishes_display_shortening_from_raw_lo
         let mut plan = injected_plan(injected_assignment(false), 0);
         inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
         let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let mut ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let temp = tempfile::tempdir().expect("large capture command root");
         let mut command = ExternalAgentCommand::codex(
             "codex",
@@ -2514,8 +2755,11 @@ fn budget_reliability_uses_bound_adapter_runtime_completion() {
         let assignment = injected_assignment(false);
         let mut plan = injected_plan(assignment, 0);
         inject_priced_process_roles(&mut plan, "priced-model", 1.0);
-        let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-        let ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        let budget = injected_run_budget(None, Some(100), None, None, 50, 50);
+        let mut ledger = RunBudgetLedger::new(budget.limits).expect("budget ledger");
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let temp = tempfile::tempdir().expect("adapter budget command root");
         let mut command = ExternalAgentCommand::codex(
             "grok",
@@ -2691,7 +2935,10 @@ fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runti
 fn pricing_guard_reservation_runtime_cannot_drift_from_fake_to_real() {
     let plan = injected_plan(injected_assignment(false), 0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    if !plan.model_pricing.is_empty() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
     let temp = tempfile::tempdir().expect("command root");
     let mut command = ExternalAgentCommand::codex(
         "unused",
@@ -2783,7 +3030,10 @@ fn assert_pricing_guard_settlement(
         assert_eq!(persisted.model_pricing, plan.model_pricing);
     }
     let budget = injected_run_budget(None, Some(100), None, expected_cost.map(|_| 1.0), 50, 50);
-    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    if !plan.model_pricing.is_empty() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
     let temp = tempfile::tempdir().expect("command root");
     let mut command = ExternalAgentCommand::codex(
         "unused",
@@ -3022,7 +3272,10 @@ fn model_attribution_settlement_and_all_role_reports_share_verified_allocation()
                     AgentRole::Worker,
                     AgentRole::Auditor,
                 ] {
-                    let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+                    let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+                    if !plan.model_pricing.is_empty() {
+                        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+                    }
                     let mut role_budget = budget.clone();
                     role_budget.role_token_reservations.insert(role, 50);
                     let DispatchBudgetAdmission::Admitted(mut reservation) =
@@ -3126,7 +3379,10 @@ fn model_attribution_public_identity_and_conflicting_allocation_cannot_restore_c
             run.codex_parent_evidence = public;
         }
         let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
-        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
             &plan,
             &budget,
@@ -3201,7 +3457,10 @@ fn model_attribution_cli_invalid_aggregate_retains_unpriced_partial_lower_bound(
         }
         assert!(run.authenticated_codex_usage().is_none());
         assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
-        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
             &plan,
             &budget,
@@ -3261,7 +3520,10 @@ fn model_attribution_cli_multiple_turns_use_private_aggregate_for_ledger_and_rol
     // A later writable log cannot replace the parent-held aggregate.
     write_injected_usage(&command, 1, 1);
     for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
-        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let mut ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
             &plan,
             &budget,
@@ -3467,7 +3729,10 @@ fn researcher_source_inputs_local_refusal_settles_not_started_but_unknown_helper
         budget
             .role_token_reservations
             .insert(AgentRole::Researcher, 50);
-        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let mut ledger = RunBudgetLedger::new(budget.limits)?;
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
             &plan,
             &budget,
@@ -3532,7 +3797,10 @@ fn researcher_source_inputs_late_refusal_after_successful_probe_refunds_only_qui
         budget
             .role_token_reservations
             .insert(AgentRole::Researcher, 50);
-        let ledger = RunBudgetLedger::new(budget.limits)?;
+        let mut ledger = RunBudgetLedger::new(budget.limits)?;
+        if !plan.model_pricing.is_empty() {
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+        }
         let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
             &plan,
             &budget,
