@@ -36,6 +36,8 @@ const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
 const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 const MAX_PROMPT_EXCERPT_BYTES: usize = 256 * 1024;
+const ASSIGNMENT_CLEANLINESS_CONTEXT: &str =
+    "agent assignment creation requires a capability-bound repository cleanliness input";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AgentExecutionRuntime {
@@ -710,11 +712,9 @@ fn select_worktree(
     let record = manager.create_for_test(create_options)?;
     #[cfg(not(test))]
     let record = {
-        let cleanliness = manager.acquire_repository_cleanliness().context(
-            "agent assignment creation requires a capability-bound repository \
-             cleanliness input; commit, stash, or remove pending changes in the \
-             primary repository, then rerun the agent",
-        )?;
+        let cleanliness = manager
+            .acquire_repository_cleanliness()
+            .context(ASSIGNMENT_CLEANLINESS_CONTEXT)?;
         manager.create_with_repository_cleanliness(create_options, &cleanliness)?
     };
     let lease = manager
@@ -1351,6 +1351,28 @@ mod tests {
     use git2::{Oid, Signature};
     use std::{io::Read, sync::mpsc, thread};
     use tempfile::TempDir;
+
+    #[test]
+    fn assignment_cleanliness_context_preserves_failure_without_pending_changes_advice() {
+        for cause in [
+            "repository inventory exceeded its time limit before directory stream open; \
+             failure_class=inventory_timeout relative_directory=\"vendor/sdk\" \
+             elapsed_ms=50 entries_inspected=0",
+            "primary repository is dirty; managed worktree creation requires clean repository state",
+            "failed to bind primary repository cleanliness",
+        ] {
+            let result: Result<()> = Err(anyhow::anyhow!(cause));
+            let error = result
+                .context(ASSIGNMENT_CLEANLINESS_CONTEXT)
+                .expect_err("cleanliness failure must remain an error");
+            let message = format!("{error:#}");
+            assert!(message.starts_with("agent assignment creation requires a capability-bound"));
+            assert!(message.ends_with(cause), "cause must be preserved: {message}");
+            for advice in ["commit", "stash", "remove pending changes"] {
+                assert!(!message.contains(advice), "unsupported advice: {message}");
+            }
+        }
+    }
 
     #[test]
     fn provider_rate_limit_crosses_agent_boundary_and_latches_workspace_pool() -> Result<()> {
