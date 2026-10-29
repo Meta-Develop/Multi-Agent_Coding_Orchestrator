@@ -91,7 +91,7 @@ fn operator_contract_frozen_bytes_and_resume_reject_mutation_expiry_and_scope() 
     let archived_schema = writer
         .read_authenticated(
             Path::new("schemas/operator-pricing-plan-v1.schema.json"),
-            MAX_SUPERVISOR_REPORT_BYTES as usize,
+            MAX_SUPERVISOR_REPORT_BYTES,
         )
         .unwrap();
     assert_eq!(
