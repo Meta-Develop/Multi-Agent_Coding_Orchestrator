@@ -3402,6 +3402,120 @@ fn systemd_unit_fixture(runtime: &Path, helper_search_path: Option<OsString>) ->
 
 #[cfg(target_os = "linux")]
 #[test]
+fn systemd_withheld_attach_stages_retain_observed_evidence_after_rollback() {
+    for stage in 0..=8 {
+        let _guard = AttachTestGuard;
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = temp.path().join("runtime");
+        fs::create_dir(&runtime).unwrap();
+        let mut unit = systemd_unit_fixture(&runtime, None);
+        unit.cgroup_path = temp.path().join("absent-cgroup");
+        // This fixture has no service. A stop of unknown ownership is a no-op;
+        // rollback must still verify the absent cgroup and remove the real files.
+        unit.systemctl = PathBuf::from("/bin/true");
+        unit.observed_owned = stage >= 1;
+        unit.fifos_prepared = stage >= 2;
+        if stage >= 2 {
+            fs::write(&unit.fifo_waiting_path, b"").unwrap();
+        }
+        if stage >= 3 {
+            unit.owner_channel = Some(tempfile::tempfile().unwrap());
+        }
+        if stage >= 4 {
+            fs::write(&unit.waiting_path, b"").unwrap();
+        }
+        unit.environment_published = stage >= 5;
+        unit.environment_released = stage >= 6;
+        if stage >= 7 {
+            fs::write(&unit.ready_path, b"").unwrap();
+        }
+        unit.sandbox_verified = stage >= 8;
+        if stage == 8 {
+            // Later established flags cannot stand in for currently missing markers.
+            fs::remove_file(&unit.fifo_waiting_path).unwrap();
+            fs::remove_file(&unit.waiting_path).unwrap();
+            fs::remove_file(&unit.ready_path).unwrap();
+        }
+        let private_file = runtime.join("private-input");
+        fs::write(&private_file, b"SECRET").unwrap();
+        unit.runtime_file_paths.push(private_file);
+
+        let now = Instant::now();
+        let operation_deadline = now + Duration::from_secs(40);
+        let attach_deadline = systemd_attach_deadline(now, Some(operation_deadline)).unwrap();
+        ATTACH_TEST_NOW.with(|clock| clock.set(Some(now)));
+        ATTACH_TEST_HOOK.with(|hook| {
+            *hook.borrow_mut() = Some(Box::new(move |phase| {
+                if phase == "before_attach_budget_check" {
+                    // Hold the fixture at precisely this observed transition until
+                    // the selected attachment deadline expires, without a wall-clock wait.
+                    ATTACH_TEST_NOW.with(|clock| clock.set(Some(attach_deadline)));
+                }
+            }));
+        });
+        let prepared = PreparedProcessTree {
+            backend: PreparedContainmentBackend::Systemd(Box::new(unit)),
+            side_effects: SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+            ),
+        };
+        let mut child = Command::new("/bin/sleep")
+            .arg("30")
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut timings = PhaseTimings::new(
+            now,
+            Some(operation_deadline),
+            Duration::from_secs(40),
+            Duration::ZERO,
+            "attachment",
+        );
+        let error = prepared
+            .attach(
+                &mut child,
+                "withheld stage fixture",
+                "redacted command",
+                Some(operation_deadline),
+                &ProcessCancellation::new(),
+                &mut timings,
+            )
+            .err()
+            .expect("a withheld stage must time out");
+        child.kill().unwrap();
+        child.wait().unwrap();
+        assert!(
+            matches!(error, ProcessRunError::ProcessOwnership { ref source, .. }
+            if source.kind() == io::ErrorKind::TimedOut)
+        );
+        assert!(!runtime.exists(), "stage {stage}: rollback left files");
+        let message = error.to_string();
+        assert!(
+            message.contains("did not reach its start gate"),
+            "{message}"
+        );
+        let expected = format!(
+            "pre-cleanup gate: owned={} fifo_waiting={} fifos_prepared={} owner_channel={} guardian_waiting={} environment_published={} environment_released={} ready={} sandbox_verified={}",
+            stage >= 1, (2..8).contains(&stage), stage >= 2, stage >= 3, (4..8).contains(&stage),
+            stage >= 5, stage >= 6, stage == 7, stage >= 8,
+        );
+        assert!(message.contains(&expected), "stage {stage}: {message}");
+        assert!(message.contains("attach_allowance_ms=10000"), "{message}");
+        assert!(
+            message.contains("operation_remaining_ms=30000"),
+            "{message}"
+        );
+        assert!(
+            message.contains("attachment rollback: elapsed_ms="),
+            "{message}"
+        );
+        assert!(message.contains("completed=true"), "{message}");
+        assert!(!message.contains("SECRET"), "{message}");
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn systemd_start_gate_timeout_preserves_bounded_redacted_diagnostics_before_cleanup() {
     let temp = tempfile::tempdir().unwrap();
     let runtime = temp.path().join("runtime");
@@ -6051,6 +6165,11 @@ fn systemd_attach_cancellation_redacts_launcher_failure_and_rolls_back() {
         message.contains("phase=") && message.contains("pre-cleanup gate:"),
         "{message}"
     );
+    assert!(
+        message.contains("attachment rollback: elapsed_ms="),
+        "{message}"
+    );
+    assert!(message.contains("completed=true"), "{message}");
     assert!(
         !message.contains("SECRET") && !message.contains("/private"),
         "{message}"
