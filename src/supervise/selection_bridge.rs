@@ -45,6 +45,9 @@ use coding_agent_manager_lib::account_authority::{
 };
 use std::path::Path;
 
+#[path = "selection_preflight.rs"]
+pub(super) mod selection_preflight;
+
 /// Account observation is a Linux-only CAM type. Non-Linux keeps
 /// `account_observation=None` and the advertised-catalog path.
 #[cfg(target_os = "linux")]
@@ -1024,6 +1027,20 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
             .unwrap_or(
                 "verified Cursor runtime model catalog observation is missing without recorded failure evidence",
             );
+        let report = selection_preflight::evaluate_supervisor_selection_preflight(
+            plan,
+            runtime,
+            selection_preflight::FrozenSupervisorSelectionInputs {
+                schema_version: 1,
+                plan_sha256: selection_preflight::plan_digest(plan)?,
+                roles: BTreeMap::new(),
+                unavailable: roles
+                    .iter()
+                    .map(|role| (*role, detail.to_string()))
+                    .collect(),
+            },
+        )?;
+        let aggregate = selection_preflight::refusal_message(&report)?;
         return Ok(SupervisorSelectionResolution {
             mode: if automatic {
                 SupervisorSelectionMode::Automatic
@@ -1036,121 +1053,172 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
                 role,
                 kind: SupervisorSelectionPreflightFailureKind::FailClosed,
                 message: format!(
-                    "selected Cursor runtime requires a verified runtime-advertised model catalog before role '{}': {detail}",
+                    "selected Cursor runtime requires a verified runtime-advertised model catalog before role '{}': {detail}; {aggregate}",
                     role.as_str()
                 ),
             }),
         });
     }
-    let mut resolved = BTreeMap::new();
-    let mut decisions = Vec::with_capacity(roles.len());
+    let mut frozen_inputs = selection_preflight::FrozenSupervisorSelectionInputs {
+        schema_version: 1,
+        plan_sha256: selection_preflight::plan_digest(plan)?,
+        roles: BTreeMap::new(),
+        unavailable: BTreeMap::new(),
+    };
+    let frozen_quota_ledger =
+        selection_preflight::freeze_quota_ledger(quota_context, quota_ledger)?;
     for role in roles.iter().copied() {
-        let configured = plan.role_models.get(&role);
-        let debug_override = configured
-            .map(|selection| {
-                debug_override_for_role(
+        let result = (|| -> Result<_> {
+            let debug_override = plan
+                .role_models
+                .get(&role)
+                .map(|selection| {
+                    debug_override_for_role(
+                        role,
+                        authored_override_runtime(plan, role, runtime)?,
+                        selection,
+                    )
+                })
+                .transpose()?;
+            let mut input = selection_input_for_role_with_assessment_and_accounts(
+                SelectionInputForRoleArgs {
                     role,
-                    authored_override_runtime(plan, role, runtime)?,
-                    selection,
-                )
-            })
-            .transpose()?;
-        let input = selection_input_for_role_with_assessment_and_accounts(
-            SelectionInputForRoleArgs {
-                role,
-                runtime,
-                catalog,
-                advertised,
-                admission,
-                resolved_objective_profile: &resolved_objective_profile,
-                quota_context,
-                quota_ledger,
-                account_observation,
-                signals: DynamicSignals {
-                    retry_count: 0,
-                    budget_signal: BudgetSignal::Continue,
-                    previous_choice: None,
-                    previous_catalog_digest: None,
-                    environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
-                },
-                debug_override,
-                history,
-            },
-            account_observations,
-            assessment,
-            Some(&routing_features),
-            frozen_policy.as_ref(),
-        )?;
-        let routing_policy = frozen_policy.as_ref().map(|frozen| {
-            crate::selection::routing_policy::RoutingPolicyReceipt {
-                frozen: frozen.clone(),
-                role: role.as_str().to_string(),
-                features: routing_features.clone(),
-            }
-        });
-        let mut decision = select_with_live_switch_cost_for_policy(&input, routing_policy.as_ref())
-            .map_err(|error| {
-                anyhow!(
-                    "automatic selector rejected role '{}': {error}",
-                    role.as_str()
-                )
-            })?;
-        decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
-        decision.operator_prior_data = super::prior_input::current_provenance();
-        let primary_cause = if configured.is_some() {
-            SupervisorSelectionEventCause::DebugOverride
-        } else {
-            SupervisorSelectionEventCause::Initial
-        };
-        let event = SupervisorSelectionEvent {
-            assignment_id: None,
-            attempt: 0,
-            role,
-            primary_cause,
-            provenance: decision,
-        };
-        let choice = match executable_choice(&event.provenance, runtime, role)? {
-            ExecutableChoiceResolution::Executable(choice) => choice,
-            ExecutableChoiceResolution::PreflightFailure(failure) => {
-                decisions.push(event);
-                return Ok(SupervisorSelectionResolution {
-                    mode: if automatic {
-                        SupervisorSelectionMode::Automatic
-                    } else {
-                        SupervisorSelectionMode::DebugOverride
+                    runtime,
+                    catalog,
+                    advertised,
+                    admission,
+                    resolved_objective_profile: &resolved_objective_profile,
+                    quota_context: None,
+                    quota_ledger: None,
+                    account_observation,
+                    signals: DynamicSignals {
+                        retry_count: 0,
+                        budget_signal: BudgetSignal::Continue,
+                        previous_choice: None,
+                        previous_catalog_digest: None,
+                        environment_rejections: Vec::new(),
+                        observed_cost_per_accepted_task_microunits: None,
                     },
-                    decisions,
-                    automatic_state: None,
-                    selection_preflight_failure: Some(failure),
-                });
+                    debug_override,
+                    history,
+                },
+                account_observations,
+                assessment,
+                Some(&routing_features),
+                frozen_policy.as_ref(),
+            )?;
+            selection_preflight::apply_frozen_quota(
+                &mut input,
+                runtime,
+                quota_context,
+                frozen_quota_ledger.as_ref(),
+            )?;
+            let routing_policy = frozen_policy.as_ref().map(|frozen| {
+                crate::selection::routing_policy::RoutingPolicyReceipt {
+                    frozen: frozen.clone(),
+                    role: role.as_str().to_string(),
+                    features: routing_features.clone(),
+                }
+            });
+            Ok(selection_preflight::freeze_role_input(
+                input,
+                routing_policy,
+            ))
+        })();
+        match result {
+            Ok(input) => {
+                frozen_inputs.roles.insert(role, input);
             }
-        };
-        crate::selection::routing_policy::seal_selected_candidate(
-            role.as_str(),
-            &event.provenance,
-        )?;
-        if configured.is_some() {
-            let requested = &input
-                .debug_override
-                .as_ref()
-                .context("explicit role_models entry lost its selector debug override")?
-                .candidate;
-            if requested != &choice.candidate {
-                bail!(
-                    "debug runtime/model/effort override for role '{}' was not applied exactly by the selector: requested '{}:{}:{:?}', selected '{}:{}:{:?}'",
-                    role.as_str(),
-                    requested.runtime,
-                    requested.model,
-                    requested.effort,
-                    choice.candidate.runtime,
-                    choice.candidate.model,
-                    choice.candidate.effort,
-                );
+            Err(error) => {
+                frozen_inputs.unavailable.insert(role, format!("{error:#}"));
             }
         }
-        resolved.insert(role, role_selection_from_choice(choice));
-        decisions.push(event);
+    }
+    let report =
+        selection_preflight::evaluate_supervisor_selection_preflight(plan, runtime, frozen_inputs)?;
+    let mut decisions = Vec::with_capacity(roles.len());
+    for diagnostic in &report.diagnostics {
+        if diagnostic.lens_id.is_some() {
+            continue;
+        }
+        let Some(mut decision) = diagnostic.decision.clone() else {
+            continue;
+        };
+        decision.outcome_history = history.map(|snapshot| snapshot.provenance.clone());
+        decision.operator_prior_data = super::prior_input::current_provenance();
+        decisions.push(SupervisorSelectionEvent {
+            assignment_id: None,
+            attempt: 0,
+            role: diagnostic.role,
+            primary_cause: if plan.role_models.contains_key(&diagnostic.role) {
+                SupervisorSelectionEventCause::DebugOverride
+            } else {
+                SupervisorSelectionEventCause::Initial
+            },
+            provenance: decision,
+        });
+    }
+    // An unavailable authored lens is refused by the existing review dispatch
+    // path, which records its procedural verdict and journal entry. The pure
+    // preflight report still includes that diagnostic without granting a lens
+    // launch authorization here.
+    let first_failure = report.diagnostics.iter().find(|entry| {
+        entry.status != selection_preflight::SelectionPreflightStatus::Compatible
+            && !(entry.lens_id.is_some()
+                && entry.rejection
+                    == Some(selection_preflight::SelectionPreflightRejection::ModelUnavailable))
+    });
+    if let Some(first) = first_failure {
+        let message = selection_preflight::refusal_message(&report)?;
+        // Preserve malformed-input errors while reporting every reachable failure.
+        if !report.frozen_inputs.unavailable.is_empty() {
+            bail!("{message}");
+        }
+        if let Some(invalid) = report.diagnostics.iter().find(|entry| {
+            entry.rejection == Some(selection_preflight::SelectionPreflightRejection::InvalidInput)
+        }) {
+            bail!(
+                "automatic selector rejected role '{}': {}; {message}",
+                invalid.role.as_str(),
+                invalid.message
+            );
+        }
+        return Ok(SupervisorSelectionResolution {
+            mode: if automatic {
+                SupervisorSelectionMode::Automatic
+            } else {
+                SupervisorSelectionMode::DebugOverride
+            },
+            decisions,
+            automatic_state: None,
+            selection_preflight_failure: Some(SupervisorSelectionPreflightFailure {
+                role: first.role,
+                kind: if first.rejection
+                    == Some(selection_preflight::SelectionPreflightRejection::UnexecutableRuntime)
+                {
+                    SupervisorSelectionPreflightFailureKind::ActiveRuntimeMismatch
+                } else {
+                    SupervisorSelectionPreflightFailureKind::FailClosed
+                },
+                message,
+            }),
+        });
+    }
+    // All role and nonprocedural lens gates passed. Only now bind role authority.
+    let mut resolved = BTreeMap::new();
+    for event in &decisions {
+        let choice = match executable_choice(&event.provenance, runtime, event.role)? {
+            ExecutableChoiceResolution::Executable(choice) => choice,
+            ExecutableChoiceResolution::PreflightFailure(failure) => bail!("{}", failure.message),
+        };
+        route_live_four_arm_comparison(&event.provenance.normalized_input)?;
+        resolved.insert(event.role, role_selection_from_choice(choice));
+    }
+    for event in &decisions {
+        crate::selection::routing_policy::seal_selected_candidate(
+            event.role.as_str(),
+            &event.provenance,
+        )?;
     }
 
     plan.role_models = resolved;
@@ -4800,7 +4868,7 @@ pub(super) fn selector_effort_as_str(effort: SelectorEffort) -> &'static str {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     #[cfg(target_os = "linux")]
     use super::super::environment_observation::environment_cost_microunits_from_account_observe;
     use super::*;
@@ -4818,8 +4886,8 @@ mod tests {
         }
     }
 
-    fn bind_fixture_routing_policy() -> Result<crate::selection::routing_policy::RoutingPolicyGuard>
-    {
+    pub(in crate::supervise) fn bind_fixture_routing_policy(
+    ) -> Result<crate::selection::routing_policy::RoutingPolicyGuard> {
         use crate::selection::routing_policy::{
             bind_routing_policy, FrozenRoutingPolicy, LoadedRoutingPolicy,
         };
@@ -4846,6 +4914,75 @@ mod tests {
         )?;
         let (assessment, features) = fixture_task_assessment_for_policy(plan, &frozen)?;
         Ok((assessment, features, frozen))
+    }
+
+    pub(in crate::supervise) fn frozen_preflight_fixture(
+        plan: &SupervisorPlan,
+    ) -> Result<selection_preflight::FrozenSupervisorSelectionInputs> {
+        let (assessment, features, policy) = fixture_task_assessment(plan)?;
+        let mut roles = BTreeMap::new();
+        for role in required_selector_roles(plan) {
+            let input = selection_input_for_role_with_assessment_and_accounts(
+                SelectionInputForRoleArgs {
+                    role,
+                    runtime: SupervisorRuntime::Codex,
+                    catalog: &codex_catalog()?,
+                    advertised: &AdvertisedCatalogSet::empty(),
+                    admission: &test_admission(),
+                    resolved_objective_profile: &default_resolved_profile(),
+                    quota_context: None,
+                    quota_ledger: None,
+                    account_observation: None,
+                    history: None,
+                    debug_override: plan
+                        .role_models
+                        .get(&role)
+                        .map(|value| debug_override_for_role(role, SupervisorRuntime::Codex, value))
+                        .transpose()?,
+                    signals: DynamicSignals {
+                        retry_count: 0,
+                        budget_signal: BudgetSignal::Continue,
+                        previous_choice: None,
+                        previous_catalog_digest: None,
+                        environment_rejections: Vec::new(),
+                        observed_cost_per_accepted_task_microunits: None,
+                    },
+                },
+                &[],
+                Some(&assessment),
+                Some(&features),
+                Some(&policy),
+            )?;
+            roles.insert(
+                role,
+                selection_preflight::freeze_role_input(
+                    input,
+                    Some(crate::selection::routing_policy::RoutingPolicyReceipt {
+                        frozen: policy.clone(),
+                        role: role.as_str().to_string(),
+                        features: features.clone(),
+                    }),
+                ),
+            );
+        }
+        Ok(selection_preflight::FrozenSupervisorSelectionInputs {
+            schema_version: 1,
+            plan_sha256: selection_preflight::plan_digest(plan)?,
+            roles,
+            unavailable: BTreeMap::new(),
+        })
+    }
+
+    pub(in crate::supervise) fn initialize_preflight_fixture(
+        plan: &mut SupervisorPlan,
+    ) -> Result<SupervisorSelectionResolution> {
+        initialize_supervisor_selection(
+            plan,
+            SupervisorRuntime::Codex,
+            &codex_catalog()?,
+            &test_admission(),
+            &AdvertisedCatalogSet::empty(),
+        )
     }
 
     fn fixture_task_assessment_for_policy(
@@ -6670,8 +6807,7 @@ mod tests {
     }
 
     #[test]
-    fn custom_review_lens_keeps_its_authored_triple_for_independent_dispatch_selection(
-    ) -> Result<()> {
+    fn custom_review_lens_refuses_its_incompatible_triple_before_dispatch() -> Result<()> {
         let _fixture_policy = bind_fixture_routing_policy()?;
         let catalog = codex_catalog()?;
         let auditor_prior = codex_prior_for(|prior| {
@@ -6703,7 +6839,10 @@ mod tests {
             &test_admission(),
             &AdvertisedCatalogSet::empty(),
         )?;
-        assert!(resolution.selection_preflight_failure.is_none());
+        let failure = resolution
+            .selection_preflight_failure
+            .context("custom lens preflight refusal")?;
+        assert!(failure.message.contains("custom-auditor"));
         assert_eq!(plan.review_lenses, authored);
         let mut precomputed = plan.clone();
         precomputed.review_lenses[0].backend = ReviewLensBackendConfig::Precomputed {
@@ -11614,7 +11753,14 @@ mod tests {
         assert!(failure.message.contains("--runtime codex"));
         assert!(failure.message.contains("docs/OPERATOR_QUICKSTART.md"));
         assert!(plan.role_models.is_empty());
-        assert_eq!(resolution.decisions.len(), 1);
+        assert_eq!(
+            resolution.decisions.len(),
+            required_selector_roles(&plan).len()
+        );
+        assert!(resolution
+            .decisions
+            .iter()
+            .all(|event| event.provenance.status == DecisionStatus::FailClosed));
         let decision = &resolution.decisions[0].provenance;
         assert_eq!(decision.status, DecisionStatus::FailClosed);
         assert_eq!(

@@ -7014,6 +7014,23 @@ fn persist_supervisor_predispatch_failure(
     )
 }
 
+pub(super) fn seal_successful_preflight_decisions(
+    decisions: &[SupervisorSelectionEvent],
+    failure: Option<&SupervisorSelectionPreflightFailure>,
+) -> Result<()> {
+    if failure.is_none() {
+        for decision in decisions {
+            if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+                crate::selection::routing_policy::seal_selected_candidate(
+                    decision.role.as_str(),
+                    &decision.provenance,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run_supervisor_plan_with_runner_and_creation(
     loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
@@ -7059,14 +7076,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let _routing_policy_guard = crate::selection::routing_policy::bind_routing_policy(
         plan_metadata.resolved_routing_policy.clone(),
     )?;
-    for decision in &selection_decisions {
-        if decision.provenance.status == crate::selection::DecisionStatus::Selected {
-            crate::selection::routing_policy::seal_selected_candidate(
-                decision.role.as_str(),
-                &decision.provenance,
-            )?;
-        }
-    }
+    seal_successful_preflight_decisions(
+        &selection_decisions,
+        selection_preflight_failure.as_ref(),
+    )?;
     let preclaim_parked_assignment_ids = preclaim_decisions
         .iter()
         .filter(|decision| !decision.allows_path_claim())
