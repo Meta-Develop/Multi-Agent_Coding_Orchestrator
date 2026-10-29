@@ -46,6 +46,8 @@ use std::{
 
 const OUTPUT_CHAR_LIMIT: usize = 32 * 1024;
 const OUTPUT_CAPTURE_LIMIT_BYTES: usize = OUTPUT_CHAR_LIMIT * 4;
+const ASSIGNMENT_CLEANLINESS_CONTEXT: &str =
+    "orchestration assignment creation requires a capability-bound repository cleanliness input";
 const CHECKPOINT_STATE_VERSION: u32 = 3;
 const GIT_COMMAND_CAPTURE_LIMIT_BYTES: usize = 64 * 1024 * 1024;
 const GIT_COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
@@ -2938,11 +2940,9 @@ fn select_worktrees(
         manager.create_for_test(create_options)?;
         #[cfg(not(test))]
         {
-            let cleanliness = manager.acquire_repository_cleanliness().context(
-                "orchestration assignment creation requires a capability-bound \
-                 repository cleanliness input; commit, stash, or remove pending \
-                 changes in the primary repository, then rerun the orchestration",
-            )?;
+            let cleanliness = manager
+                .acquire_repository_cleanliness()
+                .context(ASSIGNMENT_CLEANLINESS_CONTEXT)?;
             manager.create_with_repository_cleanliness(create_options, &cleanliness)?;
         }
         let lease = manager
