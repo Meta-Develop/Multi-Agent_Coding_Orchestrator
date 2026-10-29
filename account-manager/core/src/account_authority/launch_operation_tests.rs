@@ -402,9 +402,13 @@ fn unknown_outcome_stops_reaper_without_releasing_custody() {
         .unwrap()
         .unwrap();
     let status = operations
-        .start("authority", "uid:1", &binding, "unknown-wait", || {
-            spawn_fixture_child(&fixture)
-        })
+        .start(
+            "authority",
+            "uid:1",
+            &binding,
+            "unknown-wait",
+            |lifecycle| spawn_fixture_child(&fixture, lifecycle),
+        )
         .unwrap();
     until(|| fixture.root.join("ready").exists());
     let row = Arc::clone(&operations.inner.lock().unwrap().by_handle[&status.handle]);
@@ -446,6 +450,10 @@ fn unknown_outcome_stops_reaper_without_releasing_custody() {
     reaper.join().unwrap();
     stopped.expect("unknown-outcome reaper kept polling");
     assert!(row.lock().unwrap().child.is_some());
+    assert_eq!(
+        row.lock().unwrap().lifecycle.snapshot().phase,
+        LaunchPhase::ExitUnknown
+    );
     assert_busy(&fixture.registry);
     assert_eq!(
         operations
@@ -456,21 +464,15 @@ fn unknown_outcome_stops_reaper_without_releasing_custody() {
     );
 }
 
-fn spawn_fixture_child(fixture: &Fixture) -> std::result::Result<LeasedChild, ErrorCode> {
-    let binding = fixture
-        .registry
-        .selected_binding(PROVIDER)
-        .unwrap()
-        .unwrap();
-    let adapter = Adapter {
-        directory: fixture.root.clone(),
-        declarations: Arc::clone(&fixture.declarations),
-        missing_program: false,
-    };
+fn spawn_fixture_child(
+    fixture: &Fixture,
+    lifecycle: LaunchLifecycle,
+) -> std::result::Result<LeasedChild, ErrorCode> {
+    let adapter = fixture.context.adapters.get(PROVIDER).unwrap();
     crate::providers::leased_launch::spawn_service_launch(
         &fixture.registry,
-        &adapter,
-        &binding,
+        adapter.as_ref(),
+        lifecycle,
         || {
             Ok(Box::new(Store {
                 registry: StoredAccountRegistry::new(fixture.registry.metadata_path()),
@@ -493,8 +495,8 @@ fn stalled_start_and_retry_do_not_block_other_status_or_cancel() {
         .unwrap()
         .unwrap();
     let live = operations
-        .start("authority", "uid:1", &binding, "live", || {
-            spawn_fixture_child(&fixture)
+        .start("authority", "uid:1", &binding, "live", |lifecycle| {
+            spawn_fixture_child(&fixture, lifecycle)
         })
         .unwrap();
     until(|| fixture.root.join("ready").exists());
@@ -504,11 +506,17 @@ fn stalled_start_and_retry_do_not_block_other_status_or_cancel() {
     let blocked_operations = Arc::clone(&operations);
     let blocked_binding = binding.clone();
     let blocked = std::thread::spawn(move || {
-        blocked_operations.start("authority", "uid:1", &blocked_binding, "stalled", || {
-            entered_tx.send(()).unwrap();
-            let _ = release_rx.recv_timeout(Duration::from_secs(30));
-            Err(ErrorCode::Unavailable)
-        })
+        blocked_operations.start(
+            "authority",
+            "uid:1",
+            &blocked_binding,
+            "stalled",
+            |_lifecycle| {
+                entered_tx.send(()).unwrap();
+                let _ = release_rx.recv_timeout(Duration::from_secs(30));
+                Err(ErrorCode::Unavailable)
+            },
+        )
     });
     entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
 
@@ -516,7 +524,7 @@ fn stalled_start_and_retry_do_not_block_other_status_or_cancel() {
     let retry_operations = Arc::clone(&operations);
     let retry = std::thread::spawn(move || {
         retry_entered_tx.send(()).unwrap();
-        retry_operations.start("authority", "uid:1", &binding, "stalled", || {
+        retry_operations.start("authority", "uid:1", &binding, "stalled", |_lifecycle| {
             panic!("a retry must not invoke the provider twice")
         })
     });
@@ -555,7 +563,124 @@ fn stalled_start_and_retry_do_not_block_other_status_or_cancel() {
             .state
             == LaunchOperationState::Cancelled
     });
+    let lifecycle = operations.inner.lock().unwrap().by_handle[&live.handle]
+        .lock()
+        .unwrap()
+        .lifecycle
+        .clone();
+    let finalized = lifecycle.snapshot();
+    assert_eq!(
+        finalized.phase,
+        LaunchPhase::Finalized(LaunchFinalization::Cancelled)
+    );
+    operations
+        .status("authority", "uid:1", &live.handle, true)
+        .unwrap();
+    assert_eq!(lifecycle.snapshot(), finalized);
     fixture.registry.select_complete(PROVIDER, "other").unwrap();
+}
+
+#[test]
+fn service_operation_consumes_one_exact_lifecycle_and_preserves_finalization() {
+    for nonzero in [false, true] {
+        let fixture = Fixture::new(false, false);
+        let operations = LaunchOperationStore::new();
+        let binding = fixture
+            .registry
+            .selected_binding(PROVIDER)
+            .unwrap()
+            .unwrap();
+        let live = operations
+            .start("authority", "uid:1", &binding, "one-guard", |lifecycle| {
+                spawn_fixture_child(&fixture, lifecycle)
+            })
+            .unwrap();
+        until(|| fixture.root.join("ready").exists());
+        let lifecycle = operations.inner.lock().unwrap().by_handle[&live.handle]
+            .lock()
+            .unwrap()
+            .lifecycle
+            .clone();
+        let view = lifecycle.snapshot();
+        assert_eq!(view.run_id, operations.service_id);
+        assert_eq!(view.operation_id, live.handle.as_str());
+        assert_eq!(view.binding, binding);
+        assert_eq!(view.phase, LaunchPhase::Running);
+        assert_eq!(
+            view.credential,
+            Some(SecretRef::for_account(PROVIDER, "work"))
+        );
+        assert_eq!(
+            operations
+                .start("authority", "uid:1", &binding, "one-guard", |_| {
+                    panic!("retry must not allocate or spawn another lifecycle")
+                })
+                .unwrap(),
+            live
+        );
+        assert_eq!(lifecycle.snapshot(), view);
+        assert_eq!(fixture.declarations.load(Ordering::SeqCst), 1);
+        release(&fixture.root, nonzero);
+        until(|| {
+            operations
+                .status("authority", "uid:1", &live.handle, false)
+                .unwrap()
+                .state
+                == LaunchOperationState::Exited
+        });
+        let finalized = lifecycle.snapshot();
+        assert_eq!(
+            finalized.phase,
+            LaunchPhase::Finalized(if nonzero {
+                LaunchFinalization::AbnormalExit
+            } else {
+                LaunchFinalization::Exited
+            })
+        );
+        operations
+            .status("authority", "uid:1", &live.handle, true)
+            .unwrap();
+        assert_eq!(lifecycle.snapshot(), finalized);
+        fixture.registry.begin_delete(PROVIDER, "work").unwrap();
+    }
+
+    let fixture = Fixture::new(true, false);
+    let operations = LaunchOperationStore::new();
+    let binding = fixture
+        .registry
+        .selected_binding(PROVIDER)
+        .unwrap()
+        .unwrap();
+    let failed = operations
+        .start(
+            "authority",
+            "uid:1",
+            &binding,
+            "failed-guard",
+            |lifecycle| spawn_fixture_child(&fixture, lifecycle),
+        )
+        .unwrap();
+    assert_eq!(failed.state, LaunchOperationState::Failed);
+    let lifecycle = operations.inner.lock().unwrap().by_handle[&failed.handle]
+        .lock()
+        .unwrap()
+        .lifecycle
+        .clone();
+    let finalized = lifecycle.snapshot();
+    assert_eq!(
+        finalized.phase,
+        LaunchPhase::Finalized(LaunchFinalization::SpawnFailed)
+    );
+    assert_eq!(
+        operations
+            .start("authority", "uid:1", &binding, "failed-guard", |_| {
+                panic!("failed operation retries must keep their original guard")
+            })
+            .unwrap(),
+        failed
+    );
+    assert_eq!(lifecycle.snapshot(), finalized);
+    fixture.registry.begin_delete(PROVIDER, "work").unwrap();
 }
 
 #[test]

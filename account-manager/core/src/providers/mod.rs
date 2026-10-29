@@ -11,7 +11,7 @@
 //! `[unknown]` not yet established. Never upgrade a marker without evidence.
 
 use std::collections::{BTreeSet, HashSet};
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
@@ -30,6 +30,7 @@ pub use crate::account_authority::{
 
 pub mod leased_launch;
 pub use leased_launch::{spawn_selected_launch, LeasedChild};
+pub mod launch_lifecycle;
 pub mod observe;
 pub use observe::observe_selected_account;
 
@@ -95,7 +96,7 @@ pub struct LaunchSpec {
     args: Vec<OsString>,
     environment: Vec<LaunchEnvironment>,
     working_directory: Option<PathBuf>,
-    detached_stdio: bool,
+    credential_inputs: Vec<String>,
 }
 
 impl LaunchSpec {
@@ -105,17 +106,12 @@ impl LaunchSpec {
             args: Vec::new(),
             environment: Vec::new(),
             working_directory: None,
-            detached_stdio: false,
+            credential_inputs: Vec::new(),
         }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
-        self
-    }
-
-    pub(crate) fn detach_stdio(mut self) -> Self {
-        self.detached_stdio = true;
         self
     }
 
@@ -152,6 +148,17 @@ impl LaunchSpec {
         self.environment
             .iter()
             .any(|entry| matches!(entry, LaunchEnvironment::SetSecret { .. }))
+    }
+
+    /// Declare inherited credential inputs that must be removed or replaced
+    /// from the selected store. Values are never read from the parent process.
+    pub fn credential_environment_inputs(
+        mut self,
+        names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.credential_inputs
+            .extend(names.into_iter().map(Into::into));
+        self
     }
 
     /// Non-secret `SetPlain` environment mutations declared for a launch.
@@ -392,6 +399,18 @@ pub fn spawn_launch(
     account: &StoredAccountMetadata,
     credential_store: Option<&dyn CredentialStore>,
 ) -> Result<Child> {
+    spawn_launch_with(spec, account, credential_store, |command| {
+        spawn_command(command, &account.provider_id)
+    })
+}
+
+// The lifecycle supplies the final admission check at the actual spawn edge.
+fn spawn_launch_with(
+    spec: LaunchSpec,
+    account: &StoredAccountMetadata,
+    credential_store: Option<&dyn CredentialStore>,
+    spawn: impl FnOnce(&mut Command) -> Result<Child>,
+) -> Result<Child> {
     if account.state != StoredAccountState::Complete || !account.is_selected {
         return Err(Error::ConfigWrite {
             provider: account.provider_id.clone(),
@@ -415,13 +434,6 @@ pub fn spawn_launch(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
-
-    if spec.detached_stdio {
-        command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null());
-    }
 
     for entry in spec.environment {
         match entry {
@@ -451,15 +463,13 @@ pub fn spawn_launch(
         }
     }
 
+    spawn(&mut command)
+}
+
+fn spawn_command(command: &mut Command, provider: &str) -> Result<Child> {
     command.spawn().map_err(|error| Error::ConfigWrite {
-        provider: account.provider_id.clone(),
-        reason: format!(
-            "could not start {}: {error}",
-            spec.program
-                .file_name()
-                .unwrap_or_else(|| OsStr::new("provider tool"))
-                .to_string_lossy()
-        ),
+        provider: provider.to_string(),
+        reason: format!("could not start provider tool ({})", error.kind()),
     })
 }
 
@@ -655,7 +665,7 @@ fn validate_launch_environment(spec: &LaunchSpec, account: &StoredAccountMetadat
             | LaunchEnvironment::SetSecret { name }
             | LaunchEnvironment::Remove { name } => name,
         };
-        if !environment_name_is_safe(name) || !names.insert(name) {
+        if !environment_name_is_safe(name) || !names.insert(name.to_ascii_uppercase()) {
             return Err(metadata_write_error(
                 &account.provider_id,
                 "adapter declared an invalid or duplicate environment variable",
@@ -663,6 +673,20 @@ fn validate_launch_environment(spec: &LaunchSpec, account: &StoredAccountMetadat
         }
     }
     let expects_credential = account.material == StoredAccountMaterial::CredentialStore;
+    for name in &spec.credential_inputs {
+        if !environment_name_is_safe(name)
+            || !spec.environment.iter().any(|entry| match entry {
+                LaunchEnvironment::SetSecret { name: controlled }
+                | LaunchEnvironment::Remove { name: controlled } => controlled == name,
+                LaunchEnvironment::SetPlain { .. } => false,
+            })
+        {
+            return Err(metadata_write_error(
+                &account.provider_id,
+                "inherited credential input was not removed or replaced from the selected store",
+            ));
+        }
+    }
     if spec.requires_credential() != expects_credential {
         return Err(metadata_write_error(
             &account.provider_id,

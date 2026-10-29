@@ -196,6 +196,40 @@ revocation. Reauthentication failure leaves a truthful recoverable state.
 
 ## 6. Frozen operation lifecycle
 
+The in-process selected-launch path uses a one-shot
+`providers::launch_lifecycle::LaunchLifecycle` operation. Its immutable public
+view binds a run ID, operation ID, and exact `SelectedAccountBinding`; credential
+references and environment input names contain no material. Callers with run
+identity construct the guard explicitly. The compatibility
+`spawn_selected_launch` entry assigns a fresh operation ID within its local
+process run. This identity is not a durable remote operation handle.
+
+Service `launch.*` operations consume the same guard, with `launchServiceId` as
+the run ID and the opaque operation handle as the operation ID. The guard is
+created once before provider resolution and reused by idempotent retries;
+its reference-only view remains internal to the service. Service stdio is
+detached at the guarded spawn edge.
+
+The guard acquires the selected-use lease before adapter declaration or store
+resolution. Optional monotonic expiry and pre-spawn revocation are checked
+before resolution and again at the spawn edge. Revocation and spawn share an
+admission lock. Expiry governs admission, not an already-running child's
+lifetime. Adapters declare inherited credential input names; each must be
+removed or replaced from the selected store. Their existing home confinement,
+authentication clearing, and child-only environment actions remain in force.
+This is an explicit adapter contract, not a scan of all ambient credentials.
+
+Refusal, spawn failure, confirmed normal/nonzero exit, and confirmed cancellation
+finalize once. `LeasedChild::cancel` kills only its owned child and waits for
+exit. Wait failure or abandoned custody with unknown exit retains the use lease
+and reports `ExitUnknown`, without claiming cancellation or finalization. The
+existing account mutation barrier continues to refuse replacement during use.
+Coordinated credential rotation/revocation, durable recovery, work-proposal
+operation dispatch, and the root external executor bridge remain separate
+integration work. The closed service launch path uses asynchronous cancellation
+requests through the same child custody; a successful signal alone cannot
+release the lease or finalize the guard.
+
 The initial operation kind is `work-proposal`: one fresh proposal turn, with no
 provider-owned workspace mutation, nested orchestration, or independent review.
 The adapter must establish the provider's tool restrictions before advertising

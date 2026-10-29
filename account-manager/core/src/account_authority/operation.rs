@@ -79,6 +79,12 @@ pub struct OperationPrepareIdentity {
 #[serde(transparent)]
 pub struct OperationHandle(String);
 
+impl OperationHandle {
+    pub(super) fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Recorded operation state for this in-library slice.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

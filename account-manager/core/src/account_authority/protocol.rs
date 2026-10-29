@@ -861,15 +861,19 @@ pub(crate) fn dispatch_for_peer(
             idempotency_key,
         } => launch_response(&request.request_id, || {
             let caller = launch_caller(ctx, caller, authority_id, service_id)?;
-            ctx.launches
-                .start(authority_id, caller, binding, idempotency_key, || {
+            ctx.launches.start(
+                authority_id,
+                caller,
+                binding,
+                idempotency_key,
+                |lifecycle| {
                     let adapter = ctx
                         .adapter(&binding.provider_id)
                         .map_err(|error| closed_core_message(&error).0)?;
                     crate::providers::leased_launch::spawn_service_launch(
                         &ctx.registry,
                         adapter.as_ref(),
-                        binding,
+                        lifecycle,
                         || match &ctx.credential_store {
                             Some(store) => Ok(Box::new(SharedLaunchStore(Arc::clone(store)))
                                 as Box<dyn CredentialStore>),
@@ -877,7 +881,8 @@ pub(crate) fn dispatch_for_peer(
                         },
                     )
                     .map_err(|error| closed_core_message(&error).0)
-                })
+                },
+            )
         }),
         DecodedOperation::LaunchStatus {
             authority_id,

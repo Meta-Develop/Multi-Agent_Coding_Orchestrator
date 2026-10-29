@@ -9,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 use super::operation::new_operation_handle;
 use super::{ErrorCode, OperationHandle, SelectedAccountBinding};
+use crate::providers::launch_lifecycle::{
+    LaunchFinalization, LaunchLifecycle, LaunchLifecycleHandle, LaunchPhase,
+};
 use crate::providers::LeasedChild;
 
 // Keep terminal rows for the listener's lifetime: evicting a key could turn an
@@ -56,7 +59,7 @@ struct Row {
     binding: SelectedAccountBinding,
     status: LaunchOperationStatus,
     child: Option<LeasedChild>,
-    cancel_requested: bool,
+    lifecycle: LaunchLifecycleHandle,
 }
 
 impl LaunchOperationStore {
@@ -73,7 +76,7 @@ impl LaunchOperationStore {
         caller: &str,
         binding: &SelectedAccountBinding,
         idempotency_key: &str,
-        spawn: impl FnOnce() -> Result<LeasedChild, ErrorCode>,
+        spawn: impl FnOnce(LaunchLifecycle) -> Result<LeasedChild, ErrorCode>,
     ) -> Result<LaunchOperationStatus, ErrorCode> {
         let key = (
             authority_id.to_string(),
@@ -94,6 +97,13 @@ impl LaunchOperationStore {
             return Err(ErrorCode::Busy);
         }
         let handle = new_operation_handle().map_err(|_| ErrorCode::Unavailable)?;
+        let lifecycle = LaunchLifecycle::new(
+            self.service_id.clone(),
+            handle.as_str(),
+            binding.clone(),
+            None,
+        )
+        .map_err(|_| ErrorCode::Unavailable)?;
         let row = Arc::new(Mutex::new(Row {
             authority_id: authority_id.to_string(),
             caller: caller.to_string(),
@@ -106,7 +116,7 @@ impl LaunchOperationStore {
                 failure_code: None,
             },
             child: None,
-            cancel_requested: false,
+            lifecycle: lifecycle.handle(),
         }));
         let mut custody = row.lock().map_err(|_| ErrorCode::StateUnavailable)?;
         store.by_key.insert(key, handle.clone());
@@ -124,7 +134,7 @@ impl LaunchOperationStore {
             custody.status.state = LaunchOperationState::Failed;
             custody.status.failure_code = Some(ErrorCode::Unavailable);
         } else {
-            match spawn() {
+            match spawn(lifecycle) {
                 Ok(child) => {
                     custody.status.process_id = Some(child.id());
                     custody.status.state = LaunchOperationState::Running;
@@ -160,15 +170,18 @@ impl LaunchOperationStore {
         }
         let running = poll(&mut row);
         if cancel && running {
-            row.cancel_requested = true;
             // Child::kill targets only the child still owned by this custody.
             // Neither a successful signal nor a failed signal releases a lease.
-            if row.child.as_mut().expect("owned child").kill().is_err() {
-                row.status.state = LaunchOperationState::OutcomeUnknown;
-                row.status.failure_code = Some(ErrorCode::OutcomeUnknown);
-            } else {
-                row.status.state = LaunchOperationState::Cancelling;
-                row.status.failure_code = None;
+            match row.child.as_mut().expect("owned child").request_cancel() {
+                Ok(true) => {
+                    row.status.state = LaunchOperationState::Cancelling;
+                    row.status.failure_code = None;
+                }
+                Ok(false) => {}
+                Err(_) => {
+                    row.status.state = LaunchOperationState::OutcomeUnknown;
+                    row.status.failure_code = Some(ErrorCode::OutcomeUnknown);
+                }
             }
             poll(&mut row);
         }
@@ -184,7 +197,9 @@ fn poll(row: &mut Row) -> bool {
     };
     match child.try_wait() {
         Ok(Some(exit)) => {
-            row.status.state = if row.cancel_requested {
+            row.status.state = if row.lifecycle.snapshot().phase
+                == LaunchPhase::Finalized(LaunchFinalization::Cancelled)
+            {
                 LaunchOperationState::Cancelled
             } else {
                 LaunchOperationState::Exited

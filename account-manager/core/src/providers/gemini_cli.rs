@@ -668,6 +668,7 @@ impl ProviderAdapter for GeminiCliAdapter {
                     .unwrap_or_else(|| PathBuf::from("gemini")),
             )
             .current_dir(cwd)
+            .credential_environment_inputs(OAUTH_REMOVED_AUTH_ENVIRONMENT.iter().copied())
             .set_plain_env(HOME_ENV, home.as_os_str())
             .set_plain_env(GCA_ENV, "true");
             for name in OAUTH_REMOVED_AUTH_ENVIRONMENT {
@@ -684,6 +685,9 @@ impl ProviderAdapter for GeminiCliAdapter {
                 .unwrap_or_else(|| PathBuf::from("gemini")),
         )
         .current_dir(cwd)
+        .credential_environment_inputs(
+            std::iter::once(API_KEY_ENV).chain(REMOVED_AUTH_ENVIRONMENT.iter().copied()),
+        )
         .set_secret_env(API_KEY_ENV);
         for name in REMOVED_AUTH_ENVIRONMENT {
             spec = spec.remove_env(*name);
