@@ -672,8 +672,48 @@ pub struct AgentStopEntry {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentStopFailureReason {
+    Termination,
+    RegistryUpdate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct AgentStopFailure {
+    pub process: AgentProcessRecord,
+    pub reason: AgentStopFailureReason,
+    /// Present when exit was confirmed but registry removal failed.
+    pub outcome: Option<AgentStopOutcome>,
+    pub error: String,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub struct AgentStopReport {
     pub stopped: Vec<AgentStopEntry>,
+    pub failures: Vec<AgentStopFailure>,
+}
+
+impl AgentStopReport {
+    pub fn ensure_complete(&self) -> Result<()> {
+        if !self.failures.is_empty() {
+            let details = self
+                .failures
+                .iter()
+                .map(|failure| {
+                    format!(
+                        "PID {} ({:?}): {}",
+                        failure.process.pid, failure.reason, failure.error
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join("; ");
+            bail!(
+                "agent stop left {} unresolved target(s): {details}",
+                self.failures.len()
+            );
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -909,8 +949,8 @@ impl AgentRegistry {
 
     pub fn stop_selector(&self, selector: &str, wait: Duration) -> Result<AgentStopReport> {
         validate_text_field("agent selector", selector, MAX_IDENTIFIER_BYTES)?;
-        let live = self.list(&AgentListFilter::default())?;
-        let matches = live
+        let matches = self
+            .snapshot_records()?
             .into_iter()
             .filter(|process| {
                 process.pid.to_string() == selector
@@ -919,17 +959,18 @@ impl AgentRegistry {
             })
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            bail!("no live MACO agent matches selector '{selector}'");
+            bail!("no registered MACO agent matches selector '{selector}'");
         }
-        if matches.len() > 1 {
-            let details = matches
+        let competing = competing_stop_records(&matches);
+        if competing.len() > 1 {
+            let details = competing
                 .iter()
-                .map(AgentProcessRecord::summary)
+                .map(|process| process.summary())
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
                 "agent selector '{selector}' is ambiguous; {} matches: {details}",
-                matches.len()
+                competing.len()
             );
         }
         self.stop_records(matches, wait)
@@ -937,9 +978,11 @@ impl AgentRegistry {
 
     pub fn stop_run(&self, run_id: &str, wait: Duration) -> Result<AgentStopReport> {
         validate_text_field("run id", run_id, MAX_IDENTIFIER_BYTES)?;
-        let matches = self.list(&AgentListFilter {
-            run_id: Some(run_id.to_string()),
-        })?;
+        let matches = self
+            .snapshot_records()?
+            .into_iter()
+            .filter(|process| process.run_id == run_id)
+            .collect();
         self.stop_records(matches, wait)
     }
 
@@ -951,30 +994,29 @@ impl AgentRegistry {
     ) -> Result<AgentStopReport> {
         validate_text_field("run id", run_id, MAX_IDENTIFIER_BYTES)?;
         validate_text_field("task id", task_id, MAX_IDENTIFIER_BYTES)?;
-        let live = self.list(&AgentListFilter {
-            run_id: Some(run_id.to_string()),
-        })?;
-        let matches = live
+        let matches = self
+            .snapshot_records()?
             .into_iter()
-            .filter(|process| process.task_id == task_id)
+            .filter(|process| process.run_id == run_id && process.task_id == task_id)
             .collect::<Vec<_>>();
         if matches.is_empty() {
-            return Ok(AgentStopReport {
-                stopped: Vec::new(),
-            });
+            return Ok(AgentStopReport::default());
         }
-        if matches.len() > 1 {
-            let details = matches
+        let competing = competing_stop_records(&matches);
+        if competing.len() > 1 {
+            let details = competing
                 .iter()
-                .map(AgentProcessRecord::summary)
+                .map(|process| process.summary())
                 .collect::<Vec<_>>()
                 .join(", ");
             bail!(
                 "agent assignment ({run_id}, {task_id}) is ambiguous; {} matches: {details}",
-                matches.len()
+                competing.len()
             );
         }
-        self.stop_records(matches, wait)
+        let report = self.stop_records(matches, wait)?;
+        report.ensure_complete()?;
+        Ok(report)
     }
 
     fn stop_records(
@@ -982,20 +1024,49 @@ impl AgentRegistry {
         records: Vec<AgentProcessRecord>,
         wait: Duration,
     ) -> Result<AgentStopReport> {
+        self.stop_records_with_operations(records, wait, terminate_process, |process| {
+            self.remove_identity(process.pid, &process.process_start_time)
+        })
+    }
+
+    fn stop_records_with_operations(
+        &self,
+        records: Vec<AgentProcessRecord>,
+        wait: Duration,
+        mut terminate: impl FnMut(&AgentProcessRecord, Duration) -> Result<AgentStopOutcome>,
+        mut remove: impl FnMut(&AgentProcessRecord) -> Result<()>,
+    ) -> Result<AgentStopReport> {
         if wait > MAX_STOP_WAIT {
             bail!(
                 "agent stop wait exceeds the maximum {} seconds",
                 MAX_STOP_WAIT.as_secs()
             );
         }
-        let mut stopped = Vec::with_capacity(records.len());
+        let mut report = AgentStopReport::default();
         for process in records {
-            let outcome = terminate_process(&process, wait)
-                .with_context(|| format!("failed to stop {}", process.summary()))?;
-            self.remove_identity(process.pid, &process.process_start_time)?;
-            stopped.push(AgentStopEntry { process, outcome });
+            let outcome = match terminate(&process, wait) {
+                Ok(outcome) => outcome,
+                Err(error) => {
+                    report.failures.push(AgentStopFailure {
+                        process,
+                        reason: AgentStopFailureReason::Termination,
+                        outcome: None,
+                        error: format!("{error:#}"),
+                    });
+                    continue;
+                }
+            };
+            match remove(&process) {
+                Ok(()) => report.stopped.push(AgentStopEntry { process, outcome }),
+                Err(error) => report.failures.push(AgentStopFailure {
+                    process,
+                    reason: AgentStopFailureReason::RegistryUpdate,
+                    outcome: Some(outcome),
+                    error: format!("{error:#}"),
+                }),
+            }
         }
-        Ok(AgentStopReport { stopped })
+        Ok(report)
     }
 
     fn remove_identity(&self, pid: u32, start_time: &str) -> Result<()> {
@@ -1047,6 +1118,18 @@ impl AgentRegistry {
     fn snapshot_all(&self) -> Result<Vec<AgentProcessRecord>> {
         self.snapshot_records()
     }
+}
+
+fn competing_stop_records(records: &[AgentProcessRecord]) -> Vec<&AgentProcessRecord> {
+    records
+        .iter()
+        .filter(|process| {
+            !matches!(
+                process_state(process.pid, &process.process_start_time),
+                Ok(ProcessIdentityState::Gone | ProcessIdentityState::Reused)
+            )
+        })
+        .collect()
 }
 
 fn read_state(root: &SafeRoot, repo: &Path) -> Result<RegistryState> {
@@ -1857,6 +1940,9 @@ mod tests {
         assert_eq!(inspections[0].identity, AgentIdentityLiveness::Uncertain);
         assert!(registry.list(&AgentListFilter::default()).is_err());
         assert!(terminate_process(&record, Duration::from_millis(10)).is_err());
+        assert!(registry
+            .stop_assignment(&record.run_id, &record.task_id, Duration::from_millis(10))
+            .is_err());
         assert_eq!(std::fs::read(&registry_path)?, before);
         assert_eq!(registry.snapshot_all()?, vec![record]);
         Ok(())
@@ -1986,6 +2072,289 @@ mod tests {
         let status = child.0.wait().context("wait stopped child")?;
         assert!(!status.success());
         assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_target_stop_ignores_stale_siblings_and_removes_both_records() -> Result<()> {
+        for assignment in [false, true] {
+            for reused in [false, true] {
+                let (_temp, registry) = registry()?;
+                let mut stale_child = SleepChild::spawn()?;
+                let mut live_child = SleepChild::spawn()?;
+                let mut stale = registry.register(
+                    &metadata(&registry, "restarted-run", "restarted-task")?,
+                    stale_child.pid(),
+                    vec!["sleep".into()],
+                )?;
+                let live = registry.register(
+                    &metadata(&registry, "restarted-run", "restarted-task")?,
+                    live_child.pid(),
+                    vec!["sleep".into()],
+                )?;
+                if reused {
+                    let (incarnation, ticks) = stale
+                        .process_start_time
+                        .rsplit_once(':')
+                        .context("fixture incarnation")?;
+                    stale.process_start_time =
+                        format!("{incarnation}:{}", ticks.parse::<u64>()? ^ 1);
+                    registry.replace_records(vec![stale.clone(), live.clone()])?;
+                } else {
+                    stale_child.0.kill()?;
+                    stale_child.0.wait()?;
+                }
+
+                let report = if assignment {
+                    registry.stop_assignment(
+                        "restarted-run",
+                        "restarted-task",
+                        Duration::from_secs(1),
+                    )?
+                } else {
+                    registry.stop_selector("restarted-task", Duration::from_secs(1))?
+                };
+                report.ensure_complete()?;
+                assert_eq!(report.stopped.len(), 2);
+                assert!(report.stopped.iter().any(|entry| {
+                    entry.process == stale && entry.outcome == AgentStopOutcome::AlreadyExited
+                }));
+                assert!(report.stopped.iter().any(|entry| {
+                    entry.process == live && entry.outcome == AgentStopOutcome::Terminated
+                }));
+                assert!(!live_child.0.wait()?.success());
+                if reused {
+                    assert!(stale_child.0.try_wait()?.is_none());
+                }
+                assert!(registry.snapshot_all()?.is_empty());
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn single_target_stop_keeps_uncertain_siblings_competing() -> Result<()> {
+        for assignment in [false, true] {
+            let (_temp, registry) = registry()?;
+            let mut uncertain_child = SleepChild::spawn()?;
+            let mut live_child = SleepChild::spawn()?;
+            let mut uncertain = registry.register(
+                &metadata(&registry, "uncertain-run", "uncertain-task")?,
+                uncertain_child.pid(),
+                vec!["sleep".into()],
+            )?;
+            let live = registry.register(
+                &metadata(&registry, "uncertain-run", "uncertain-task")?,
+                live_child.pid(),
+                vec!["sleep".into()],
+            )?;
+            uncertain.process_start_time = "123:456".into();
+            let records = vec![uncertain, live];
+            registry.replace_records(records.clone())?;
+
+            let result = if assignment {
+                registry.stop_assignment("uncertain-run", "uncertain-task", Duration::from_secs(1))
+            } else {
+                registry.stop_selector("uncertain-task", Duration::from_secs(1))
+            };
+            let error = result.expect_err("uncertain and live rows must compete");
+            let message = error.to_string();
+            assert!(message.contains("ambiguous; 2 matches"));
+            assert!(message.contains(&uncertain_child.pid().to_string()));
+            assert!(message.contains(&live_child.pid().to_string()));
+            assert!(uncertain_child.0.try_wait()?.is_none());
+            assert!(live_child.0.try_wait()?.is_none());
+            assert_eq!(registry.snapshot_all()?, records);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_stop_continues_after_target_and_bookkeeping_failures() -> Result<()> {
+        for failed_index in [0, 1] {
+            let (_temp, registry) = registry()?;
+            let children = (0..4)
+                .map(|_| SleepChild::spawn())
+                .collect::<Result<Vec<_>>>()?;
+            let records = children
+                .iter()
+                .enumerate()
+                .map(|(index, child)| {
+                    registry.register(
+                        &metadata(&registry, "run-batch", &format!("task-{index}"))?,
+                        child.pid(),
+                        vec!["sleep".into()],
+                    )
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut attempted = Vec::new();
+            let mut removals = Vec::new();
+            let report = registry.stop_records_with_operations(
+                records.clone(),
+                Duration::from_millis(10),
+                |process, _| {
+                    attempted.push(process.pid);
+                    if process == &records[failed_index] {
+                        bail!("termination fixture refusal");
+                    }
+                    Ok(AgentStopOutcome::AlreadyExited)
+                },
+                |process| {
+                    removals.push(process.pid);
+                    if process == &records[2] {
+                        bail!("registry fixture refusal");
+                    }
+                    registry.remove_identity(process.pid, &process.process_start_time)
+                },
+            )?;
+            assert_eq!(attempted, records.iter().map(|p| p.pid).collect::<Vec<_>>());
+            assert_eq!(removals.len(), 3);
+            assert!(!removals.contains(&records[failed_index].pid));
+            assert_eq!(report.stopped.len(), 2);
+            assert_eq!(report.stopped.last().unwrap().process, records[3]);
+            assert_eq!(report.failures.len(), 2);
+            assert_eq!(report.failures[0].process, records[failed_index]);
+            assert_eq!(
+                report.failures[0].reason,
+                AgentStopFailureReason::Termination
+            );
+            assert_eq!(report.failures[0].outcome, None);
+            assert_eq!(report.failures[1].process, records[2]);
+            assert_eq!(
+                report.failures[1].reason,
+                AgentStopFailureReason::RegistryUpdate
+            );
+            assert_eq!(
+                report.failures[1].outcome,
+                Some(AgentStopOutcome::AlreadyExited)
+            );
+            let error = report.ensure_complete().unwrap_err().to_string();
+            assert!(error.contains(&format!("PID {} (Termination)", records[failed_index].pid)));
+            assert!(error.contains("termination fixture refusal"));
+            assert!(error.contains(&format!("PID {} (RegistryUpdate)", records[2].pid)));
+            assert!(error.contains("registry fixture refusal"));
+            let remaining = registry.snapshot_all()?;
+            assert_eq!(remaining.len(), 2);
+            assert!(remaining.contains(&records[failed_index]));
+            assert!(remaining.contains(&records[2]));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn batch_stop_retry_preserves_unresolved_identity() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let mut children = (0..3)
+            .map(|_| SleepChild::spawn())
+            .collect::<Result<Vec<_>>>()?;
+        let records = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                registry.register(
+                    &metadata(&registry, "run-retry", &format!("task-{index}"))?,
+                    child.pid(),
+                    vec!["sleep".into()],
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let report = registry.stop_records_with_operations(
+            records.clone(),
+            Duration::from_secs(1),
+            |process, wait| {
+                if process == &records[0] {
+                    bail!("termination fixture refusal");
+                }
+                terminate_process(process, wait)
+            },
+            |process| {
+                if process == &records[1] {
+                    bail!("registry fixture refusal");
+                }
+                registry.remove_identity(process.pid, &process.process_start_time)
+            },
+        )?;
+        assert_eq!(report.stopped.len(), 1);
+        assert_eq!(report.failures.len(), 2);
+        assert_eq!(registry.snapshot_all()?, records[..2]);
+        assert!(children[0].0.try_wait()?.is_none());
+        children[1].0.wait()?;
+        children[2].0.wait()?;
+
+        let retry = registry.stop_run("run-retry", Duration::from_secs(1))?;
+        retry.ensure_complete()?;
+        assert_eq!(retry.stopped.len(), 2);
+        assert!(retry.stopped.iter().any(|entry| {
+            entry.process == records[0] && entry.outcome == AgentStopOutcome::Terminated
+        }));
+        assert!(retry.stopped.iter().any(|entry| {
+            entry.process == records[1] && entry.outcome == AgentStopOutcome::AlreadyExited
+        }));
+        children[0].0.wait()?;
+        assert!(registry.snapshot_all()?.is_empty());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn batch_stop_reports_absent_reused_and_uncertain_identities() -> Result<()> {
+        let (_temp, registry) = registry()?;
+        let mut children = (0..5)
+            .map(|_| SleepChild::spawn())
+            .collect::<Result<Vec<_>>>()?;
+        let mut records = children
+            .iter()
+            .enumerate()
+            .map(|(index, child)| {
+                registry.register(
+                    &metadata(&registry, "run-mixed", &format!("task-{index}"))?,
+                    child.pid(),
+                    vec!["sleep".into()],
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+        records[0].process_start_time = "123:456".into();
+        children[1].0.kill()?;
+        children[1].0.wait()?;
+        let (incarnation, ticks) = records[2]
+            .process_start_time
+            .rsplit_once(':')
+            .context("fixture incarnation")?;
+        records[2].process_start_time = format!("{incarnation}:{}", ticks.parse::<u64>()? ^ 1);
+        records[4].run_id = "other-run".into();
+        records[4].process_start_time = "123:456".into();
+        registry.replace_records(records.clone())?;
+
+        let report = registry.stop_run("run-mixed", Duration::from_secs(1))?;
+        assert_eq!(report.failures.len(), 1);
+        assert_eq!(report.failures[0].process, records[0]);
+        assert_eq!(
+            report.failures[0].reason,
+            AgentStopFailureReason::Termination
+        );
+        assert_eq!(report.stopped.len(), 3);
+        for index in [1, 2] {
+            assert!(report.stopped.iter().any(|entry| {
+                entry.process == records[index] && entry.outcome == AgentStopOutcome::AlreadyExited
+            }));
+        }
+        assert!(report.stopped.iter().any(|entry| {
+            entry.process == records[3] && entry.outcome == AgentStopOutcome::Terminated
+        }));
+        children[3].0.wait()?;
+        for index in [0, 2, 4] {
+            assert!(children[index].0.try_wait()?.is_none());
+        }
+        let remaining = registry.snapshot_all()?;
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining.contains(&records[0]));
+        assert!(remaining.contains(&records[4]));
+        let retry = registry.stop_run("run-mixed", Duration::from_secs(1))?;
+        assert!(retry.stopped.is_empty());
+        assert_eq!(retry.failures, report.failures);
+        assert_eq!(registry.snapshot_all()?, remaining);
         Ok(())
     }
 
