@@ -9,6 +9,13 @@ pub(super) fn write_plan_snapshot(
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<()> {
     let value = supervisor_plan_value(plan, consultant, assignment_metadata, plan_metadata)?;
+    if plan_metadata.operator_pricing.is_some() {
+        write_schema(
+            writer,
+            Path::new("schemas/operator-pricing-plan-v1.schema.json"),
+            operator_pricing_plan_schema_value(),
+        )?;
+    }
     write_artifact_json(
         writer,
         relative,
@@ -17,6 +24,73 @@ pub(super) fn write_plan_snapshot(
         ArtifactFileDisposition::PrivateEvidence,
     )
     .with_context(|| format!("failed to write plan snapshot {}", relative.display()))
+}
+
+pub(super) fn operator_pricing_plan_schema_value() -> serde_json::Value {
+    json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/operator-pricing-plan-v1.schema.json",
+        "title": "Optional operator pricing fields for supervisor plans",
+        "description": "Contract for the optional pricing-field envelope extracted from a supervisor plan; other plan fields are outside this schema.",
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+            "pricing_contract": {"$ref": "#/$defs/contract"},
+            "pricing_plan_id": {"type": "string", "minLength": 1},
+            "model_pricing": {
+                "type": "object", "additionalProperties": model_pricing_schema_value()
+            },
+            "pricing_binding": {
+                "type": "object", "additionalProperties": false,
+                "required": ["contract_json", "price_map_json", "plan_id", "normalized_sha256"],
+                "properties": {
+                    "contract_json": {"type": "string", "minLength": 1},
+                    "price_map_json": {"type": "string", "minLength": 1},
+                    "plan_id": {"type": "string", "minLength": 1},
+                    "normalized_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                }
+            }
+        },
+        "dependentRequired": {
+            "pricing_contract": ["model_pricing", "pricing_plan_id"],
+            "pricing_plan_id": ["pricing_contract"],
+            "pricing_binding": ["pricing_contract"]
+        },
+        "$defs": {"contract": operator_pricing_contract_schema_value()}
+    })
+}
+
+fn operator_pricing_contract_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["schema_version", "contract_id", "revision", "effective_date", "valid_through", "source_reference", "source_attribution", "currency", "unit", "billing", "scopes", "price_map_sha256"],
+        "properties": {
+            "schema_version": {"const": 1},
+            "contract_id": {"type": "string", "minLength": 1},
+            "revision": {"type": "string", "minLength": 1},
+            "effective_date": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "valid_through": {"type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
+            "source_reference": {"type": "string", "minLength": 1},
+            "source_attribution": {"type": "string", "minLength": 1},
+            "currency": {"const": "USD"},
+            "unit": {"const": "per_million_tokens"},
+            "billing": {"const": "flat_input_output"},
+            "price_map_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "scopes": {
+                "type": "array", "minItems": 1, "uniqueItems": true,
+                "items": {
+                    "type": "object", "additionalProperties": false,
+                    "required": ["runtime", "model", "account_id", "plan_id"],
+                    "properties": {
+                        "runtime": {"enum": ["fake", "codex", "grok", "cursor", "claude-code", "gemini-cli"]},
+                        "model": {"type": "string", "minLength": 1},
+                        "account_id": {"type": "string", "minLength": 1},
+                        "plan_id": {"type": "string", "minLength": 1}
+                    }
+                }
+            }
+        }
+    })
 }
 
 pub(super) fn write_orchestrator_schema(
@@ -1193,6 +1267,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "accepted_task_cost": accepted_task_cost_schema_value(),
+                    "accepted_task_cost_cohorts": accepted_task_cost_cohorts_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
             }
@@ -1765,11 +1840,38 @@ fn accepted_task_cost_schema_value() -> serde_json::Value {
                 "type": "integer", "minimum": 0,
                 "description": "Known complete-cost subtotal; partial when costs or terminal results remain unresolved."
             },
+            "known_incomplete_cost_microunits": {
+                "type": "integer", "minimum": 0, "default": 0,
+                "description": "Known buckets on incomplete-cost rows; evidence only, excluded from CPO."
+            },
             "cost_per_accepted_task_microunits": {
                 "type": ["integer", "null"],
                 "minimum": 0,
                 "description": "Numeric only when all attempt costs and terminal results are complete and at least one task is accepted."
             }
+        }
+    })
+}
+
+fn accepted_task_cost_cohorts_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lanes", "unattributed"],
+        "properties": {
+            "lanes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["lane", "costs"],
+                    "properties": {
+                        "lane": crate::selection::accepted_task_cost_lane_schema_value(agent_role_schema_value()),
+                        "costs": accepted_task_cost_schema_value()
+                    }
+                }
+            },
+            "unattributed": accepted_task_cost_schema_value()
         }
     })
 }
@@ -1787,6 +1889,53 @@ fn accepted_task_cost_schema_preserves_optional_legacy_result_count() {
         .as_array()
         .expect("required field list")
         .contains(&json!("unknown_terminal_result_count")));
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_task_cost_cohorts_schema_validates_lane_and_partial_evidence() -> Result<()> {
+    let costs = json!({
+        "incomplete_attempt_count": 1,
+        "complete_attempt_count": 1,
+        "complete_accepted_count": 1,
+        "complete_total_cycle_cost_microunits": 12,
+        "known_incomplete_cost_microunits": 550,
+        "cost_per_accepted_task_microunits": null
+    });
+    let instance = json!({
+        "lanes": [{
+            "lane": {
+                "role": "worker",
+                "task": crate::selection::selection_test_base_input().task,
+                "assignment_shape_identity": {"version": 1, "sha256": "a".repeat(64)},
+                "candidate": {"runtime": "codex", "model": "fixture", "effort": "high"}
+            },
+            "costs": costs.clone()
+        }],
+        "unattributed": costs
+    });
+    let typed: AcceptedTaskCostCohorts = serde_json::from_value(instance.clone())?;
+    assert_eq!(serde_json::to_value(typed)?, instance);
+    let schema_id = "urn:accepted-task-cost-cohorts";
+    let mut compiler = boon::Compiler::new();
+    compiler.set_default_draft(boon::Draft::V2020_12);
+    compiler
+        .add_resource(schema_id, accepted_task_cost_cohorts_schema_value())
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let mut schemas = boon::Schemas::new();
+    let index = compiler
+        .compile(schema_id, &mut schemas)
+        .map_err(|error| anyhow!("{error:#}"))?;
+    schemas
+        .validate(&instance, index)
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let mut invalid = instance.clone();
+    invalid["lanes"][0]["lane"]["assignment_shape_identity"] = serde_json::Value::Null;
+    assert!(schemas.validate(&invalid, index).is_err());
+    let mut invalid = instance;
+    invalid["lanes"][0]["lane"]["candidate"]["extra"] = json!(true);
+    assert!(schemas.validate(&invalid, index).is_err());
+    Ok(())
 }
 
 fn execution_usage_schema_value() -> serde_json::Value {
@@ -2008,6 +2157,9 @@ fn run_budget_report_schema_value() -> serde_json::Value {
             "new_dispatch_allowed"
         ],
         "properties": {
+            "pricing_contract": {"oneOf": [{"type": "null"}, pricing_provenance::contract_schema_value()]},
+            "charges": {"type": "array", "items": pricing_provenance::charge_schema_value(agent_role_schema_value())},
+            "cost_complete": {"type": "boolean"},
             "limits": {
                 "type": "object",
                 "additionalProperties": false,

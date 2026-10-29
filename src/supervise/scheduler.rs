@@ -1,7 +1,9 @@
 use std::path::Path;
 
+#[cfg(test)]
+use super::accepted_task_cost::observed_cost_per_accepted_task_microunits;
 use super::accepted_task_cost::{
-    attempt_cost_record, observed_cost_per_accepted_task_microunits, rollup_cost_per_accepted_task,
+    attempt_cost_record, rollup_cost_per_accepted_task, rollup_selection_cost_cohorts,
     AttemptCostRecord,
 };
 use super::environment_observation::AccountObserveOutcomeKind;
@@ -692,12 +694,14 @@ impl AssignmentBudgetPolicy {
         reports: &[OrchestratorReviewReport],
     ) {
         self.this_run_run_dir = Some(run_dir.to_path_buf());
-        let rollup =
-            this_run_accepted_task_cost(&load_this_run_attempt_cost_rows(run_dir), reports);
+        let cohorts =
+            this_run_accepted_task_cost_cohorts(&load_this_run_attempt_cost_rows(run_dir), reports);
         if let Some(state) = self.selector_state.as_mut() {
-            state.set_observed_accepted_task_cost(observed_cost_per_accepted_task_microunits(
-                rollup.as_ref(),
-            ));
+            state.set_observed_accepted_task_cost(
+                cohorts
+                    .map(|cohorts| cohorts.observations())
+                    .unwrap_or_default(),
+            );
         }
     }
 
@@ -2709,6 +2713,7 @@ const THIS_RUN_ATTEMPT_EVIDENCE_MAX_BYTES: usize = 64 * 1024;
 struct ThisRunAttemptCostRow {
     assignment_id: String,
     attempt: usize,
+    selection: Option<AttemptSelectionBinding>,
     parent_result: Option<OutcomeResult>,
     costs: AttemptAttributableCosts,
 }
@@ -2754,6 +2759,7 @@ fn load_this_run_attempt_cost_rows(run_dir: &Path) -> Vec<ThisRunAttemptCostRow>
         rows.push(ThisRunAttemptCostRow {
             assignment_id: evidence.assignment_id,
             attempt: evidence.attempt,
+            selection: evidence.selection,
             parent_result: evidence.parent_result,
             costs: evidence.costs,
         });
@@ -2807,6 +2813,7 @@ fn this_run_attempt_cost_records(
     rows.iter()
         .map(|row| {
             attempt_cost_record(
+                row.selection.clone(),
                 row.costs.clone(),
                 resolve_this_run_terminal_result(
                     row,
@@ -2823,6 +2830,13 @@ fn this_run_accepted_task_cost(
     reports: &[OrchestratorReviewReport],
 ) -> Option<AcceptedTaskCostRollup> {
     rollup_cost_per_accepted_task(&this_run_attempt_cost_records(rows, reports)).ok()
+}
+
+fn this_run_accepted_task_cost_cohorts(
+    rows: &[ThisRunAttemptCostRow],
+    reports: &[OrchestratorReviewReport],
+) -> Option<AcceptedTaskCostCohorts> {
+    rollup_selection_cost_cohorts(&this_run_attempt_cost_records(rows, reports)).ok()
 }
 
 fn build_supervisor_final_report(
@@ -2998,6 +3012,10 @@ fn build_supervisor_final_report(
         selection_decisions: selection_decisions.clone(),
         assignment_selection_ledger,
         accepted_task_cost: this_run_accepted_task_cost(
+            &this_run_attempt_rows,
+            &collected.orchestrator_reports,
+        ),
+        accepted_task_cost_cohorts: this_run_accepted_task_cost_cohorts(
             &this_run_attempt_rows,
             &collected.orchestrator_reports,
         ),
@@ -3931,6 +3949,11 @@ fn prepare_supervisor_run(
         options.budget_max_duration_seconds,
     )
     .context("failed to initialize the supervise run budget ledger")?;
+    budget_ledger.operator_pricing = plan_metadata
+        .operator_pricing
+        .as_ref()
+        .map(|pricing| pricing.bind(options.run_id.as_str()))
+        .transpose()?;
     plan_metadata.run_budget.limits = budget_ledger.effective_limits();
     let quota_context = live_quota_context_for_run(&repo)?;
     if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
@@ -4127,6 +4150,19 @@ fn activate_cam_observe_test_harness(harness: CamObserveTestHarness) -> CamObser
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn captured_cam_observe_test_harness() -> Option<Arc<CamObserveTestHarness>> {
     CAM_OBSERVE_TEST_OVERRIDE.with(|cell| cell.borrow().clone())
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn pricing_fixture_account() -> Result<Option<String>> {
+    let binding = captured_cam_observe_test_harness()
+        .map(|fixture| {
+            fixture
+                .registry
+                .selected_binding("codex-cli")
+                .map(|binding| binding.map(|binding| binding.account_id))
+        })
+        .transpose()?;
+    Ok(binding.flatten())
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -8879,10 +8915,100 @@ mod selection_policy_tests {
     }
 
     #[test]
+    fn same_run_cost_rows_preserve_selection_lane_identity() -> Result<()> {
+        let (catalog, mut state, events, _, frozen) = automatic_selection_fixture()?;
+        let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
+        let provenance = &events
+            .iter()
+            .find(|event| event.role == AgentRole::Worker)
+            .context("worker selection")?
+            .provenance;
+        let candidate = provenance
+            .choice
+            .as_ref()
+            .context("worker choice")?
+            .candidate
+            .clone();
+        let binding = AttemptSelectionBinding {
+            role: AgentRole::Worker,
+            event_assignment_id: None,
+            event_attempt: 0,
+            normalized_input_sha256: provenance.input_digests.normalized_input.value.clone(),
+            task: provenance.normalized_task.clone(),
+            assignment_shape_identity: Some(
+                crate::selection::AssignmentShapeIdentity::v1("a".repeat(64))
+                    .expect("validated shape fixture"),
+            ),
+            requested_candidate: candidate.clone(),
+        };
+        let run_dir = tempfile::TempDir::new()?;
+        let attempts = run_dir.path().join("selection-attempts");
+        std::fs::create_dir_all(&attempts)?;
+        for (id, selection) in [
+            ("bound", Some(binding.clone())),
+            (
+                "unbound",
+                Some(AttemptSelectionBinding {
+                    assignment_shape_identity: None,
+                    ..binding.clone()
+                }),
+            ),
+            ("legacy", None),
+        ] {
+            let evidence = AttemptOutcomeEvidence {
+                version: 1,
+                run_id: "cost-cohorts".to_string(),
+                assignment_id: id.to_string(),
+                attempt: 1,
+                verified_execution: false,
+                selection,
+                requested_runtime: candidate.runtime.clone(),
+                requested_model: Some(candidate.model.clone()),
+                requested_effort: Some(candidate.effort.as_str().to_string()),
+                observed_candidate: None,
+                parent_result: Some(OutcomeResult::Accepted),
+                parent_cause: None,
+                failure_class: None,
+                costs: complete_attempt_costs(),
+                parent_phase_continuation: None,
+            };
+            std::fs::write(
+                attempts.join(format!("{id}.attempt-1.json")),
+                serde_json::to_vec(&evidence)?,
+            )?;
+        }
+        let rows = load_this_run_attempt_cost_rows(run_dir.path());
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].selection.as_ref(), Some(&binding));
+        let records = this_run_attempt_cost_records(&rows, &[]);
+        assert_eq!(records[0].selection.as_ref(), Some(&binding));
+        let cohorts = this_run_accepted_task_cost_cohorts(&rows, &[]).context("cohorts")?;
+        assert_eq!(cohorts.lanes.len(), 1);
+        assert_eq!(cohorts.lanes[0].lane.candidate, candidate);
+        assert_eq!(cohorts.unattributed.complete_attempt_count, 2);
+        let observations = cohorts.observations();
+        state.set_observed_accepted_task_cost(observations.clone());
+        let replay = reselect_roles_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &catalog,
+            &[AgentRole::Worker],
+            0,
+            crate::selection::BudgetSignal::Continue,
+            &[],
+        )?;
+        let signals = &replay.decisions[0].1.normalized_input.signals;
+        assert_eq!(signals.accepted_task_cost_observations, observations);
+        assert!(signals.accepted_task_cost_context.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn this_run_cpo_infers_accepted_from_report_when_parent_result_is_absent() {
         let rows = [ThisRunAttemptCostRow {
             assignment_id: "assignment-1".to_string(),
             attempt: 1,
+            selection: None,
             parent_result: None,
             costs: complete_attempt_costs(),
         }];
@@ -8908,12 +9034,14 @@ mod selection_policy_tests {
             ThisRunAttemptCostRow {
                 assignment_id: "assignment-1".to_string(),
                 attempt: 1,
+                selection: None,
                 parent_result: None,
                 costs: complete_attempt_costs(),
             },
             ThisRunAttemptCostRow {
                 assignment_id: "assignment-1".to_string(),
                 attempt: 2,
+                selection: None,
                 parent_result: None,
                 costs: complete_attempt_costs(),
             },
@@ -8943,12 +9071,14 @@ mod selection_policy_tests {
             ThisRunAttemptCostRow {
                 assignment_id: "accepted".to_string(),
                 attempt: 1,
+                selection: None,
                 parent_result: Some(OutcomeResult::Accepted),
                 costs: complete_attempt_costs(),
             },
             ThisRunAttemptCostRow {
                 assignment_id: "blocked".to_string(),
                 attempt: 1,
+                selection: None,
                 parent_result: Some(OutcomeResult::Blocked),
                 costs: incomplete_costs,
             },
@@ -8968,7 +9098,7 @@ mod selection_policy_tests {
     }
 
     #[test]
-    fn commit_prefix_feeds_complete_cpo_into_shared_policy_reselect() -> Result<()> {
+    fn commit_prefix_keeps_unbound_cpo_out_of_shared_policy_reselect() -> Result<()> {
         let (catalog, state, _, _, frozen) = automatic_selection_fixture()?;
         let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
         let mut controller = BudgetDegradationController::new_with_selection_state(
@@ -9024,14 +9154,9 @@ mod selection_policy_tests {
                 environment_rejections: &[],
             },
         )?;
-        assert_eq!(
-            later_events[0]
-                .provenance
-                .normalized_input
-                .signals
-                .observed_cost_per_accepted_task_microunits,
-            Some(12)
-        );
+        let signals = &later_events[0].provenance.normalized_input.signals;
+        assert!(signals.accepted_task_cost_context.is_none());
+        assert!(signals.accepted_task_cost_observations.is_empty());
         Ok(())
     }
 
