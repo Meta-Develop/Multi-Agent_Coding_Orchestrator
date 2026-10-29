@@ -79,6 +79,8 @@ jobs:
           version="$(nix --version)"
           printf '%s\n' "$version"
           test "$version" = 'nix (Nix) 2.35.2'
+          /usr/bin/python3 -I -B .github/scripts/test_nix_package_fileset_checks.py
+          /usr/bin/python3 -I -B .github/scripts/test_nix_package_fileset.py
           for system in x86_64-linux x86_64-darwin aarch64-darwin; do
             nix eval --no-update-lock-file --no-write-lock-file --raw ".#packages.$system.maco.drvPath"
             printf '\n'
