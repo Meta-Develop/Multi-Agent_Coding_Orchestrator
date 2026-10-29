@@ -433,6 +433,7 @@ use acceptance::*;
 use researcher::*;
 
 mod reporting;
+mod target_containment;
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use reporting::append_precreated_worker_execution_journal;
 #[cfg(target_os = "linux")]
