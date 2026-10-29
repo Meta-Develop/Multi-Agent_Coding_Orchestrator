@@ -3775,6 +3775,7 @@ fn prepare_supervisor_run(
     worktree_creation: SupervisorWorktreeCreation<'_>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
 ) -> Result<PreparedSupervisorRun> {
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
     let LoadedSupervisorPlan {
         mut plan,
         consultant,
