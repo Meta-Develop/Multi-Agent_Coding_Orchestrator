@@ -3134,6 +3134,15 @@ fn dominates(candidate: &ProfileSummary, other: &ProfileSummary) -> bool {
     let latency_order = candidate
         .mean_wall_time_ms
         .cmp_value(&other.mean_wall_time_ms);
+    let churn_order = candidate
+        .mean_churn_count
+        .cmp_value(&other.mean_churn_count);
+    let (Some(candidate_review), Some(other_review)) =
+        (candidate.mean_review_findings, other.mean_review_findings)
+    else {
+        return false;
+    };
+    let review_order = candidate_review.cmp_value(&other_review);
     let held_out_order = candidate
         .mean_quality
         .held_out_basis_points
@@ -3153,10 +3162,18 @@ fn dominates(candidate: &ProfileSummary, other: &ProfileSummary) -> bool {
     let strictly_better = candidate.mean_cost_usd < other.mean_cost_usd
         || quota_order.is_lt()
         || latency_order.is_lt()
+        || churn_order.is_lt()
+        || review_order.is_lt()
         || held_out_order.is_gt()
         || breadth_order.is_gt()
         || anti_shortcut_order.is_gt();
-    no_more_expensive && no_more_quota && no_slower && no_lower_raw_quality && strictly_better
+    no_more_expensive
+        && no_more_quota
+        && no_slower
+        && churn_order.is_le()
+        && review_order.is_le()
+        && no_lower_raw_quality
+        && strictly_better
 }
 
 fn compare_usage_means(
