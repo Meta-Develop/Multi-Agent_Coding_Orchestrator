@@ -19,13 +19,14 @@ use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 #[cfg(target_os = "linux")]
 use coding_agent_manager_lib::providers::observe_selected_account;
 
+mod authored_check_admission;
 mod preclaim;
 pub(super) use preclaim::assignment_requires_file_change;
 #[cfg(test)]
 use preclaim::evaluate_preclaim_viability;
 use preclaim::{
-    evaluate_preclaim_with_metadata, parked_preclaim_outcome, persist_preclaim_decision,
-    preclaim_assignment, PreclaimDecision, PreclaimRunEvidence,
+    parked_preclaim_outcome, persist_preclaim_decision, preclaim_assignment, PreclaimDecision,
+    PreclaimRunEvidence,
 };
 
 /// Admission policy for concurrently runnable supervisor children.
@@ -445,6 +446,7 @@ struct AssignmentSchedulerContext<'context, 'writer> {
 struct SchedulerProgress {
     indexed_outcomes: Vec<Option<AssignmentExecutionOutcome>>,
     prepared_preclaim_decisions: Option<Vec<PreclaimDecision>>,
+    prepared_preclaim_evidence: Option<PreclaimRunEvidence>,
     health_breaker: SwarmHealthCircuitBreaker,
     budget_prevented_dispatch: bool,
     budget_denied_assignment_indices: BTreeSet<usize>,
@@ -474,6 +476,7 @@ impl SchedulerProgress {
         Ok(Self {
             indexed_outcomes: (0..assignment_count).map(|_| None).collect(),
             prepared_preclaim_decisions: None,
+            prepared_preclaim_evidence: None,
             health_breaker: SwarmHealthCircuitBreaker::default(),
             budget_prevented_dispatch: false,
             budget_denied_assignment_indices: BTreeSet::new(),
@@ -1687,6 +1690,25 @@ fn schedule_preclaim_decision(
     index: usize,
 ) -> Result<PreclaimDecision> {
     if let Some(decision) = progress.prepared_preclaim_decision(index)? {
+        if decision.assignment_id != context.plan.assignments[index].id {
+            bail!("prepared pre-claim decision assignment binding changed");
+        }
+        if decision.allows_path_claim() {
+            if let Some(evidence) = progress.prepared_preclaim_evidence.as_ref() {
+                evidence.revalidate_authored(
+                    context.repo,
+                    &context.plan.assignments[index],
+                    &context.requested_plan.assignments,
+                    context.assignment_metadata,
+                )?;
+            } else if context
+                .assignment_metadata
+                .authored_independent_checks
+                .contains_key(&context.plan.assignments[index].id)
+            {
+                bail!("authored check receipts were not retained for scheduler admission");
+            }
+        }
         return Ok(decision);
     }
     let evidence = fallback_evidence.context(
@@ -3573,27 +3595,41 @@ fn initialize_scheduler_evidence(
 fn evaluate_supervisor_preclaims(
     plan: &SupervisorPlan,
     requested_plan: &SupervisorPlan,
-    repo: &Path,
-    assignment_metadata: &AssignmentMetadata,
-    runtime: SupervisorRuntime,
-    execution_runtime: SupervisorExecutionRuntime,
+    evidence: &PreclaimRunEvidence,
 ) -> Vec<PreclaimDecision> {
-    let evidence = supervisor_preclaim_run_evidence(repo, runtime, execution_runtime);
     plan.assignments
         .iter()
-        .map(|assignment| {
-            let risk = evidence.risk_for(&assignment.assigned_paths);
-            evaluate_preclaim_with_metadata(
-                assignment,
-                &requested_plan.assignments,
-                evidence.repo_map.as_ref(),
-                risk.as_ref(),
-                evidence.runtime,
-                execution_runtime,
-                assignment_metadata,
-            )
-        })
+        .map(|assignment| evidence.evaluate(assignment, &requested_plan.assignments))
         .collect()
+}
+
+fn acquire_supervisor_preclaim_evidence(
+    repo: &Path,
+    runtime: SupervisorRuntime,
+    execution_runtime: SupervisorExecutionRuntime,
+    requested_plan: &SupervisorPlan,
+    consultant: &SupervisorConsultantPlan,
+    assignment_metadata: &AssignmentMetadata,
+    plan_metadata: &SupervisorPlanMetadata,
+) -> Result<PreclaimRunEvidence> {
+    let mut evidence = supervisor_preclaim_run_evidence(repo, runtime, execution_runtime)
+        .with_assignment_metadata(assignment_metadata);
+    if !assignment_metadata.authored_independent_checks.is_empty() {
+        let document = super::plan_api::supervisor_plan_value(
+            requested_plan,
+            consultant,
+            assignment_metadata,
+            plan_metadata,
+        )?
+        .to_string();
+        evidence = evidence.with_authored_checks(
+            repo,
+            document,
+            &requested_plan.assignments,
+            assignment_metadata,
+        );
+    }
+    Ok(evidence)
 }
 
 fn supervisor_preclaim_run_evidence(
@@ -3735,6 +3771,7 @@ struct PreparedSupervisorRun {
     selection_preflight_failure: Option<SupervisorSelectionPreflightFailure>,
     automatic_selection_state: Option<SupervisorAutomaticSelectionState>,
     preclaim_decisions: Vec<PreclaimDecision>,
+    preclaim_evidence: PreclaimRunEvidence,
     budget_ledger: RunBudgetLedger,
     runtime: SupervisorRuntime,
     repo: PathBuf,
@@ -3756,6 +3793,7 @@ fn prepare_supervisor_run(
     worktree_creation: SupervisorWorktreeCreation<'_>,
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
 ) -> Result<PreparedSupervisorRun> {
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
     let LoadedSupervisorPlan {
         mut plan,
         consultant,
@@ -3883,14 +3921,17 @@ fn prepare_supervisor_run(
     // later preparation failure still leaves durable gate evidence.
     let preclaim_runtime =
         preclaim_assessment_runtime(runtime, execution_runtime, worktree_creation);
-    let preclaim_decisions = evaluate_supervisor_preclaims(
-        &plan,
-        &requested_plan,
+    let preclaim_evidence = acquire_supervisor_preclaim_evidence(
         &repo,
-        &assignment_metadata,
         runtime,
         preclaim_runtime,
-    );
+        &requested_plan,
+        &consultant,
+        &assignment_metadata,
+        &plan_metadata,
+    )?;
+    let preclaim_decisions =
+        evaluate_supervisor_preclaims(&plan, &requested_plan, &preclaim_evidence);
     persist_prepared_preclaim_decisions(
         &repo,
         &options.run_id,
@@ -4035,6 +4076,7 @@ fn prepare_supervisor_run(
         selection_preflight_failure: selection.selection_preflight_failure,
         automatic_selection_state: selection.automatic_state,
         preclaim_decisions,
+        preclaim_evidence,
         budget_ledger,
         runtime,
         repo,
@@ -7032,6 +7074,23 @@ fn persist_supervisor_predispatch_failure(
     )
 }
 
+pub(super) fn seal_successful_preflight_decisions(
+    decisions: &[SupervisorSelectionEvent],
+    failure: Option<&SupervisorSelectionPreflightFailure>,
+) -> Result<()> {
+    if failure.is_none() {
+        for decision in decisions {
+            if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+                crate::selection::routing_policy::seal_selected_candidate(
+                    decision.role.as_str(),
+                    &decision.provenance,
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn run_supervisor_plan_with_runner_and_creation(
     loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
@@ -7055,6 +7114,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         selection_preflight_failure,
         automatic_selection_state,
         preclaim_decisions,
+        preclaim_evidence,
         budget_ledger,
         runtime,
         repo,
@@ -7077,14 +7137,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let _routing_policy_guard = crate::selection::routing_policy::bind_routing_policy(
         plan_metadata.resolved_routing_policy.clone(),
     )?;
-    for decision in &selection_decisions {
-        if decision.provenance.status == crate::selection::DecisionStatus::Selected {
-            crate::selection::routing_policy::seal_selected_candidate(
-                decision.role.as_str(),
-                &decision.provenance,
-            )?;
-        }
-    }
+    seal_successful_preflight_decisions(
+        &selection_decisions,
+        selection_preflight_failure.as_ref(),
+    )?;
     let preclaim_parked_assignment_ids = preclaim_decisions
         .iter()
         .filter(|decision| !decision.allows_path_claim())
@@ -7241,6 +7297,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
                 .initial_selector_decisions = collected.selection_decisions.clone();
             progress.budget_degradation.policy.this_run_run_dir = Some(run_dir.clone());
             progress.install_preclaim_decisions(preclaim_decisions)?;
+            progress.prepared_preclaim_evidence = Some(preclaim_evidence);
             let scheduler_context = AssignmentSchedulerContext {
                 plan: &plan,
                 requested_plan: &requested_plan,

@@ -70,14 +70,12 @@ jobs:
   linux-library:
     name: Linux library tests (${{ matrix.shard }})
     needs: nix-package
-    # Ubuntu 26.04 shards exceeded the 45-minute job timeout mid-test; keep
-    # 24.04 (last within budget) until 26.04 test runtime fits the timeout.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise-core, supervise-fixtures, rest]
+        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested, supervise-fixtures, external-agent, worktree, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -258,6 +256,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libdbus-1-dev
+          # Package installation can replace systemd and its sandbox executor.
+          # Re-exec the existing user manager before starting confined tests.
+          if systemctl is-active --quiet "user@$(id -u).service"; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+            systemctl --version
+            echo 'systemd user manager before re-exec:'
+            systemctl --user show --property=Version
+            systemctl --user daemon-reexec
+            echo 'systemd user manager after re-exec:'
+            systemctl --user show --property=Version
+          fi
 
       - name: Verify delegated Linux process startup
         run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
@@ -319,12 +329,14 @@ jobs:
         run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"
 
   linux-integration:
-    name: Linux integration tests
+    name: Linux integration tests (${{ matrix.shard }})
     needs: nix-package
-    # Ubuntu 26.04 hits the candidate-validation readiness timeout; keep the
-    # last verified image until its sandbox startup behavior is qualified.
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-latest
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [merge, other]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -505,6 +517,18 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y pkg-config libdbus-1-dev
+          # Package installation can replace systemd and its sandbox executor.
+          # Re-exec the existing user manager before starting confined tests.
+          if systemctl is-active --quiet "user@$(id -u).service"; then
+            export XDG_RUNTIME_DIR="/run/user/$(id -u)"
+            export DBUS_SESSION_BUS_ADDRESS="unix:path=${XDG_RUNTIME_DIR}/bus"
+            systemctl --version
+            echo 'systemd user manager before re-exec:'
+            systemctl --user show --property=Version
+            systemctl --user daemon-reexec
+            echo 'systemd user manager after re-exec:'
+            systemctl --user show --property=Version
+          fi
 
       - name: Verify delegated Linux process startup
         run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh /usr/bin/true
@@ -520,7 +544,7 @@ jobs:
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
       - name: Run integration and binary tests
-        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh non-lib "${{ matrix.shard }}"
 
   linux-gate:
     name: Linux fmt, check, clippy, and test

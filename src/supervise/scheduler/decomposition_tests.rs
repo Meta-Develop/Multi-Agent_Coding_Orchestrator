@@ -4422,3 +4422,7 @@ fn finalize_does_not_coerce_environment_none_to_zero() {
         "environment None must not become a zero bucket in the average"
     );
 }
+
+#[cfg(unix)]
+#[path = "authored_check_tests.rs"]
+mod authored_check_tests;

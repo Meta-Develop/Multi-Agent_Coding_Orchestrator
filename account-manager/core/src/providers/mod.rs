@@ -28,6 +28,8 @@ pub use crate::account_authority::{
     SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
 
+pub mod leased_launch;
+pub use leased_launch::{spawn_selected_launch, LeasedChild};
 pub mod observe;
 pub use observe::observe_selected_account;
 
@@ -376,6 +378,8 @@ pub trait ProviderAdapter: Send + Sync {
 /// Stdio is inherited and never captured. Secret values are retrieved only for
 /// `SetSecret` entries immediately before `spawn`, applied only to this
 /// `Command`, and never included in an error or return value.
+/// Stored-account callers should use [`spawn_selected_launch`] to retain the
+/// exact selected-use lease throughout child custody.
 pub fn spawn_launch(
     spec: LaunchSpec,
     account: &StoredAccountMetadata,

@@ -79,6 +79,5 @@ criterion = "0.8.2"
 debug = "line-tables-only"
 
 [profile.test]
-# Test binaries are self-sealed and re-executed under the production 256MiB bound.
-# Omit test debuginfo instead of raising MAX_EXECUTABLE_BYTES.
+# Keep test artifacts small; native-exec tests pin a standalone target image.
 debug = 0

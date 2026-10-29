@@ -419,6 +419,7 @@ fn exercise_retained_failure(
     use crate::external_agent::{
         CapturedOutput, CodexParentEvidence, CodexParentResolvedField, CodexParentTurnUsage,
     };
+    use std::os::unix::fs::PermissionsExt;
     let checkpoint_failure = case == "managed-cycle-retained-checkpoint-error";
     let continuation_failure = case == "managed-cycle-retained-continuation" || checkpoint_failure;
     let import_failure = case == "managed-cycle-retained-import-error";
@@ -427,7 +428,9 @@ fn exercise_retained_failure(
         .run_dir
         .join(&prepared.attempt_artifacts.raw_stdout_relative);
     if import_failure {
-        fs::create_dir_all(blocked_raw.parent().unwrap())?;
+        let logs = blocked_raw.parent().unwrap();
+        fs::create_dir_all(logs)?;
+        fs::set_permissions(logs, fs::Permissions::from_mode(0o700))?;
         fs::create_dir(&blocked_raw)?;
     }
     let retained = Mutex::new(Vec::<(PathBuf, Vec<u8>)>::new());
@@ -617,6 +620,41 @@ fn exercise_retained_failure(
         Ok(())
     })?;
     assert!(!initial_scratch.exists());
+    for (relative, _) in retained.lock().unwrap().iter() {
+        let summary = relative.with_extension("summary.json");
+        let receipt = relative.with_extension("summary.target-containment.json");
+        with_supervisor_artifacts(context.artifacts, |writer, _| {
+            let summary_bytes = writer.read_authenticated(&summary, MAX_SUPERVISOR_REPORT_BYTES)?;
+            let bytes = writer.read_authenticated(&receipt, 16 * 1024)?;
+            let receipt: serde_json::Value = serde_json::from_slice(&bytes)?;
+            assert_eq!(receipt["version"], 1);
+            assert_eq!(
+                receipt["binding"]["run_id"],
+                context.options.run_id.as_str()
+            );
+            assert_eq!(receipt["binding"]["task_id"], "parent");
+            assert_eq!(receipt["binding"]["runtime"], "codex");
+            assert_eq!(
+                receipt["binding"]["command_summary"],
+                serde_json::to_value(&summary)?
+            );
+            assert_eq!(
+                receipt["command_summary_sha256"],
+                crate::artifacts::state_auth::sha256_hex(&summary_bytes)
+            );
+            assert_eq!(receipt["target_process_tree"]["status"], "observed");
+            assert_eq!(
+                receipt["target_process_tree"]["evidence"]["status"],
+                "verified_empty"
+            );
+            assert_eq!(receipt["target_side_effects"]["status"], "observed");
+            assert_eq!(
+                receipt["target_side_effects"]["evidence"]["status"],
+                "verified"
+            );
+            Ok(())
+        })?;
+    }
     if !import_failure {
         for (relative, raw) in retained.lock().unwrap().iter() {
             let imported = fs::read(context.run_dir.join(relative))?;

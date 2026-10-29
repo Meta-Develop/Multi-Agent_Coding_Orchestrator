@@ -34,8 +34,8 @@ pub use operation::{
 pub use protocol::{
     authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
     AuthorityResponse, DecodedRequest, ErrorCode, LoginPort, ProtocolBounds, ProtocolFailure,
-    ADVERTISED_OPERATIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION,
-    REQUEST_IO_DEADLINE,
+    ResponseValidationError, ADVERTISED_OPERATIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    PROTOCOL_VERSION, REQUEST_IO_DEADLINE,
 };
 pub use registry::StoredAccountRegistry;
 pub use server::{

@@ -610,14 +610,9 @@ fn decode_response(bytes: &[u8], request_id: &str) -> Result<AuthorityResponse> 
             .transpose()
             .map_err(|_| authority_decode_error("invalid authority error envelope"))?,
     };
-    if response.protocol_version != PROTOCOL_VERSION
-        || response.request_id != request_id
-        || response.result.is_some() == response.error.is_some()
-    {
-        return Err(authority_decode_error(
-            "authority response envelope mismatch",
-        ));
-    }
+    response
+        .validate_for_request(request_id)
+        .map_err(|error| authority_decode_error(&error.to_string()))?;
     Ok(response)
 }
 
@@ -1456,9 +1451,20 @@ mod tests {
     fn response_refuses_uncorrelated_ambiguous_unknown_and_secret_decode_errors() {
         let valid = json!({"protocolVersion":1,"requestId":"rpc","result":{}});
         assert!(decode_response(&serde_json::to_vec(&valid).unwrap(), "rpc").is_ok());
+        assert!(decode_response(
+            br#"{"protocolVersion":1,"requestId":"rpc","error":{"code":"busy","message":"busy"}}"#,
+            "rpc"
+        )
+        .is_ok());
+        assert!(decode_response(&serde_json::to_vec(&valid).unwrap(), "").is_err());
+        assert!(
+            decode_response(br#"{"protocolVersion":1,"requestId":"","result":{}}"#, "").is_err()
+        );
         for invalid in [
             json!({"protocolVersion":2,"requestId":"rpc","result":{}}),
             json!({"protocolVersion":1,"requestId":"other","result":{}}),
+            json!({"protocolVersion":1,"result":{}}),
+            json!({"protocolVersion":1,"requestId":"","result":{}}),
             json!({"protocolVersion":1,"requestId":"rpc"}),
             json!({"protocolVersion":1,"requestId":"rpc","result":{},"error":{"code":"busy","message":"busy"}}),
             json!({"protocolVersion":1,"requestId":"rpc","result":{},"command":"arbitrary"}),
@@ -1545,6 +1551,65 @@ mod tests {
             let authority = account_authority().expect("authority");
             assert!(matches!(authority, AccountAuthority::Remote(_)));
             std::env::remove_var(CAM_ACCOUNT_AUTHORITY_SOCKET_ENV);
+        }
+
+        #[test]
+        fn exchange_refuses_invalid_envelopes_without_changing_local_selection() {
+            let (_registry_dir, registry) = isolated_registry();
+            registry
+                .begin_add(
+                    "codex-cli",
+                    "work",
+                    "Work",
+                    AuthKind::OAuth,
+                    StoredAccountMaterial::VendorHome,
+                )
+                .unwrap();
+            registry.complete_add("codex-cli", "work").unwrap();
+            registry
+                .select_complete_revision("codex-cli", "work", None)
+                .unwrap();
+            let original = registry.selected_binding("codex-cli").unwrap();
+            for case in 0..6 {
+                let (_guard, root) = private_tempdir();
+                let socket = root.join("authority.sock");
+                let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+                let client = AuthorityClient::connect(&socket).unwrap();
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
+                    let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
+                    let request: Value = serde_json::from_slice(&request).unwrap();
+                    assert_eq!(request["operation"], "selection.get");
+                    let mut response = json!({"protocolVersion": PROTOCOL_VERSION,
+                        "requestId": request["requestId"], "result": {"selected": false}});
+                    match case {
+                        0 => response["requestId"] = json!("secret-sentinel"),
+                        1 => {
+                            response.as_object_mut().unwrap().remove("requestId");
+                        }
+                        2 => response["requestId"] = json!(""),
+                        3 => {
+                            response["error"] =
+                                json!({"code": "busy", "message": "secret-sentinel"});
+                        }
+                        4 => {
+                            response.as_object_mut().unwrap().remove("result");
+                        }
+                        _ => response["protocolVersion"] = json!(2),
+                    }
+                    write_framed(
+                        &mut stream,
+                        &serde_json::to_vec(&response).unwrap(),
+                        deadline,
+                    )
+                    .unwrap();
+                });
+                let error = client.selected_binding("codex-cli").unwrap_err();
+                assert!(!error.to_string().contains("secret-sentinel"));
+                assert_eq!(registry.selected_binding("codex-cli").unwrap(), original);
+                server.join().unwrap();
+            }
         }
 
         #[test]

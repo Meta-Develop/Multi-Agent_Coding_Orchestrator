@@ -256,6 +256,7 @@ pub struct HeldOutRealProviderExperimentRequest {
     pub runtime: SupervisorRuntime,
     pub runtime_executable: PathBuf,
     pub additional_runtime_executables: Vec<HeldOutAdditionalRuntimeBinding>,
+    pub prior_data: Option<super::HeldOutPriorDataInput>,
     pub machine_global_retention: MachineGlobalRetentionBinding,
 }
 

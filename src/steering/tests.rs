@@ -312,6 +312,416 @@ fn fake_cancel_is_provider_neutral() {
     assert!(decision.ack().steered);
 }
 
+fn operator_cancel(now: u64) -> SteeringRequest {
+    let mut request = operator_inject("run-1", "task-1", "act-cancel", now);
+    request.action = SteeringAction::CancelAssignment {
+        reason: "operator abort".to_string(),
+    };
+    request
+}
+
+#[cfg(unix)]
+struct CancellationChild(std::process::Child);
+
+#[cfg(unix)]
+impl CancellationChild {
+    fn registered(path: &std::path::Path, run_id: &str) -> Self {
+        let program = [
+            "/run/current-system/sw/bin/sleep",
+            "/usr/bin/sleep",
+            "/bin/sleep",
+        ]
+        .into_iter()
+        .find(|path| std::path::Path::new(path).is_file())
+        .expect("sleep executable");
+        let child = Self(
+            std::process::Command::new(program)
+                .arg("60")
+                .spawn()
+                .expect("spawn"),
+        );
+        let registry = crate::agent_lifecycle::AgentRegistry::open(path).expect("registry");
+        registry
+            .register(
+                &crate::agent_lifecycle::AgentLaunchMetadata::new(path, "worker", run_id, "task-1")
+                    .expect("metadata"),
+                child.0.id(),
+                vec!["sleep".to_string(), "60".to_string()],
+            )
+            .expect("register child");
+        child
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CancellationChild {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_cancel_delivery_resumes_after_restart() {
+    use super::plane::CancelFailurePoint;
+
+    let (_temp, path) = repo();
+    let plane = SteeringPlane::open(&path).expect("open plane");
+    plane
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let mut child = CancellationChild::registered(&path, "run-1");
+    let mut other_run = CancellationChild::registered(&path, "run-other");
+    let now = plane.current_unix_ms().expect("clock");
+    let request = operator_cancel(now);
+    plane.inject_cancel_failure(&request, CancelFailurePoint::BeforeInspection);
+    assert!(plane.submit(request.clone(), now).is_err());
+    assert!(child.0.try_wait().expect("poll child").is_none());
+    drop(plane);
+
+    let reopened = SteeringPlane::open(&path).expect("reopen plane");
+    assert_eq!(
+        reopened.inbox("run-1", "task-1").expect("inbox")[0].outcome,
+        SteeringOutcome::Pending
+    );
+    let mut changed = request.clone();
+    changed.action = SteeringAction::CancelAssignment {
+        reason: "different".to_string(),
+    };
+    assert_eq!(
+        reopened.submit(changed, now).expect("duplicate").refused(),
+        Some(SteeringRefusal::DuplicateAction)
+    );
+    reopened.inject_cancel_failure(&request, CancelFailurePoint::BeforeInspection);
+    assert!(reopened.submit(request.clone(), now).is_err());
+    assert!(child.0.try_wait().expect("poll child").is_none());
+    drop(reopened);
+
+    let recovered = SteeringPlane::open(&path).expect("reopen after second failure");
+    assert_eq!(
+        recovered
+            .submit(request.clone(), now)
+            .expect("recover")
+            .ack()
+            .outcome,
+        SteeringOutcome::Acknowledged
+    );
+    assert!(!child.0.wait().expect("stopped child").success());
+    assert!(other_run.0.try_wait().expect("other run").is_none());
+    let mut replacement = CancellationChild::registered(&path, "run-1");
+    assert_eq!(
+        recovered
+            .submit(request, now)
+            .expect("terminal retry")
+            .ack()
+            .outcome,
+        SteeringOutcome::Acknowledged
+    );
+    assert!(replacement.0.try_wait().expect("replacement").is_none());
+    let events = recovered.evidence("run-1").expect("evidence");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        ["bind", "submit", "deliver", "ack"]
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_cancel_uncertain_stop_is_idempotent() {
+    assert_uncertain_cancel_retry(
+        false,
+        SteeringOutcome::Delivered,
+        &["bind", "submit", "deliver"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn pending_cancel_reused_pid_is_lost_without_signalling() {
+    assert_uncertain_cancel_retry(
+        true,
+        SteeringOutcome::LostChild,
+        &["bind", "submit", "lost_child"],
+    );
+}
+
+#[cfg(unix)]
+fn assert_uncertain_cancel_retry(
+    reused_pid: bool,
+    expected: SteeringOutcome,
+    expected_events: &[&str],
+) {
+    use super::plane::CancelFailurePoint;
+
+    let (_temp, path) = repo();
+    let plane = SteeringPlane::open(&path).expect("open plane");
+    plane
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let mut child = CancellationChild::registered(&path, "run-1");
+    let now = plane.current_unix_ms().expect("clock");
+    let request = operator_cancel(now);
+    plane.inject_cancel_failure(&request, CancelFailurePoint::AfterDelivery);
+    assert!(plane.submit(request.clone(), now).is_err());
+    assert!(!child.0.wait().expect("child already stopped").success());
+    drop(plane);
+
+    let mut sentinel = CancellationChild::registered(&path, "run-other");
+    if reused_pid {
+        // Model a reused PID by retaining the live PID with a different
+        // recorded start time; the retry must never signal that process.
+        let registry = crate::agent_lifecycle::AgentRegistry::open(&path).expect("registry");
+        let registry_path = registry.registry_path();
+        let mut state: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&registry_path).expect("read registry"))
+                .expect("registry JSON");
+        let record = &mut state["processes"][0];
+        record["run_id"] = json!("run-1");
+        let (incarnation, ticks) = record["process_start_time"]
+            .as_str()
+            .expect("start time")
+            .rsplit_once(':')
+            .expect("identity ticks");
+        record["process_start_time"] = json!(format!(
+            "{incarnation}:{}",
+            ticks.parse::<u64>().expect("ticks") ^ 1
+        ));
+        std::fs::write(
+            &registry_path,
+            serde_json::to_vec(&state).expect("encode registry"),
+        )
+        .expect("write stale identity");
+    }
+    let reopened = SteeringPlane::open(&path).expect("reopen plane");
+    assert_eq!(
+        reopened.inbox("run-1", "task-1").expect("inbox")[0].outcome,
+        SteeringOutcome::Pending
+    );
+    let decision = reopened
+        .submit(request.clone(), now)
+        .expect("recover uncertain stop");
+    assert_eq!(decision.ack().outcome, expected);
+    assert!(!decision.ack().steered);
+    assert!(sentinel.0.try_wait().expect("sentinel").is_none());
+    let mut replacement = CancellationChild::registered(&path, "run-1");
+    assert_eq!(
+        reopened
+            .submit(request, now)
+            .expect("duplicate retry")
+            .ack()
+            .outcome,
+        expected
+    );
+    assert!(replacement.0.try_wait().expect("replacement").is_none());
+    let events = reopened.evidence("run-1").expect("evidence");
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        expected_events
+    );
+}
+
+#[test]
+fn pending_cancel_without_registered_child_recovers_to_mailbox() {
+    use super::plane::CancelFailurePoint;
+
+    let (_temp, path) = repo();
+    let plane = SteeringPlane::open(&path).expect("open plane");
+    plane
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let now = plane.current_unix_ms().expect("clock");
+    let request = operator_cancel(now);
+    plane.inject_cancel_failure(&request, CancelFailurePoint::BeforeInspection);
+    assert!(plane.submit(request.clone(), now).is_err());
+    drop(plane);
+
+    let reopened = SteeringPlane::open(&path).expect("reopen plane");
+    assert_eq!(
+        reopened.inbox("run-1", "task-1").expect("pending inbox")[0].outcome,
+        SteeringOutcome::Pending
+    );
+    let decision = reopened.submit(request, now).expect("recover to mailbox");
+    assert_eq!(decision.ack().outcome, SteeringOutcome::Delivered);
+    assert!(!decision.ack().steered);
+    let inbox = reopened.inbox("run-1", "task-1").expect("delivered inbox");
+    assert_eq!(inbox.len(), 1);
+    assert_eq!(inbox[0].outcome, SteeringOutcome::Delivered);
+    assert!(matches!(
+        inbox[0].action,
+        SteeringAction::CancelAssignment { .. }
+    ));
+    assert_eq!(
+        reopened
+            .evidence("run-1")
+            .expect("evidence")
+            .iter()
+            .map(|event| event.event.as_str())
+            .collect::<Vec<_>>(),
+        ["bind", "submit", "deliver"]
+    );
+}
+
+#[test]
+fn pending_cancel_recovery_revalidates_authentication_deadline_and_authority() {
+    use super::plane::CancelFailurePoint;
+
+    let (_temp, path) = repo();
+    let plane = SteeringPlane::open(&path).expect("open plane");
+    plane
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let now = plane.current_unix_ms().expect("clock");
+    let request = operator_cancel(now);
+    plane.inject_cancel_failure(&request, CancelFailurePoint::BeforeInspection);
+    assert!(plane.submit(request.clone(), now).is_err());
+    drop(plane);
+
+    let reopened = SteeringPlane::open(&path).expect("reopen plane");
+    let cancellation = ProcessCancellation::new();
+    reopened
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    reopened
+        .register_live_cancellation("run-1", "task-1", cancellation.clone())
+        .expect("live cancellation");
+    let mut signed = reopened.sign(&request).expect("sign");
+    signed.mac = "ab".repeat(32);
+    assert_eq!(
+        reopened
+            .submit_signed(signed, now)
+            .expect("bad MAC")
+            .refused(),
+        Some(SteeringRefusal::Unauthenticated)
+    );
+    assert_eq!(
+        reopened
+            .submit(request.clone(), request.deadline_unix_ms + 1)
+            .expect("expired")
+            .refused(),
+        Some(SteeringRefusal::DeadlineExpired)
+    );
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(
+        reopened.inbox("run-1", "task-1").expect("still pending")[0].outcome,
+        SteeringOutcome::Pending
+    );
+
+    let mut binding = worker_binding("run-1", "task-1");
+    binding.kind = AssignmentKind::ReviewGate;
+    reopened
+        .register_assignment(binding)
+        .expect("review binding");
+    reopened
+        .register_live_cancellation("run-1", "task-1", cancellation.clone())
+        .expect("live cancellation");
+    drop(reopened);
+    let reopened = SteeringPlane::open(&path).expect("reopen changed authority");
+    assert_eq!(
+        reopened
+            .submit(request, now)
+            .expect("authority refusal")
+            .refused(),
+        Some(SteeringRefusal::MergeBypass)
+    );
+    assert!(!cancellation.is_cancelled());
+    let events = reopened.evidence("run-1").expect("evidence");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.event == "submit")
+            .count(),
+        1
+    );
+    assert!(events.iter().all(|event| event.event != "deliver"));
+}
+
+#[test]
+fn pending_mailbox_and_delivered_cancellation_are_not_redelivered() {
+    use super::{
+        evidence::{append_event, payload_for_request, with_run_journal},
+        plane::CancelFailurePoint,
+    };
+
+    let (_temp, path) = repo();
+    let plane = SteeringPlane::open(&path).expect("open plane");
+    plane
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let now = plane.current_unix_ms().expect("clock");
+    let mailbox = operator_inject("run-1", "task-1", "act-mailbox", now);
+    with_run_journal(&path, "run-1", |journal| {
+        append_event(
+            journal,
+            "submit",
+            &payload_for_request(
+                "submit",
+                &mailbox,
+                SteeringOutcome::Pending,
+                None,
+                None,
+                now,
+            ),
+        )
+    })
+    .expect("persist interrupted mailbox submit");
+    assert_eq!(
+        plane
+            .submit(mailbox, now)
+            .expect("mailbox retry")
+            .ack()
+            .outcome,
+        SteeringOutcome::Pending
+    );
+
+    let cancellation = ProcessCancellation::new();
+    plane
+        .register_live_cancellation("run-1", "task-1", cancellation.clone())
+        .expect("live cancellation");
+    let request = operator_cancel(now);
+    plane.inject_cancel_failure(&request, CancelFailurePoint::BeforeAck);
+    assert!(plane.submit(request.clone(), now).is_err());
+    assert!(cancellation.is_cancelled());
+    drop(plane);
+    let reopened = SteeringPlane::open(&path).expect("reopen plane");
+    reopened
+        .register_assignment(worker_binding("run-1", "task-1"))
+        .expect("bind");
+    let replacement = ProcessCancellation::new();
+    reopened
+        .register_live_cancellation("run-1", "task-1", replacement.clone())
+        .expect("replacement");
+    let before = reopened.evidence("run-1").expect("evidence");
+    assert_eq!(
+        reopened
+            .submit(request.clone(), now)
+            .expect("delivered retry")
+            .ack()
+            .outcome,
+        SteeringOutcome::Delivered
+    );
+    assert!(!replacement.is_cancelled());
+    assert_eq!(reopened.evidence("run-1").expect("evidence"), before);
+    reopened
+        .acknowledge("run-1", "task-1", &request.action_id, now)
+        .expect("acknowledge");
+    assert_eq!(
+        reopened
+            .submit(request, now)
+            .expect("acknowledged retry")
+            .ack()
+            .outcome,
+        SteeringOutcome::Acknowledged
+    );
+    assert!(!replacement.is_cancelled());
+}
+
 #[test]
 fn cursor_adapter_launch_is_cancelled_through_the_neutral_handle() {
     let (_temp, path) = repo();

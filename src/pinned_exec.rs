@@ -3386,46 +3386,6 @@ mod tests {
     #[test]
     fn mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds() {
         const TEST: &str = "pinned_exec::tests::mechanical_native_exec_preserves_argv_env_null_stdin_and_closes_relay_fds";
-        let target_argv0 = env::args_os().next() == Some(OsString::from("/native-contract-argv0"));
-        if target_argv0 || env::var_os("MACO_NATIVE_CONTRACT_TARGET").is_some() {
-            // Either target discriminator enters mandatory assertions, not a
-            // success fallback. Lost environment must fail rather than recurse.
-            assert!(env::var_os("MACO_NATIVE_CONTRACT_TARGET").is_some());
-            assert_eq!(
-                env::args_os().collect::<Vec<_>>(),
-                [
-                    OsString::from("/native-contract-argv0"),
-                    OsString::from("--exact"),
-                    OsString::from(TEST),
-                    OsString::from("--nocapture")
-                ]
-            );
-            assert_eq!(
-                env::var("MACO_NATIVE_CONTRACT_VALUE").expect("explicit value"),
-                "bounded value"
-            );
-            assert!(env::var_os("MACO_NATIVE_CONTRACT_CHILD").is_none());
-            assert!(env::var_os("HOME").is_none());
-            let mut byte = [0];
-            assert_eq!(io::stdin().read(&mut byte).expect("null stdin"), 0);
-            let relay = env::var("MACO_NATIVE_CONTRACT_RELAY").expect("test image identity");
-            for fd in [4, 51] {
-                // SAFETY: plain stat storage is initialized by fstat for the
-                // numeric FD; failure must be EBADF, never an ignored error.
-                let mut metadata: libc::stat = unsafe { std::mem::zeroed() };
-                if unsafe { libc::fstat(fd, &mut metadata) } == 0 {
-                    assert_ne!(
-                        format!("{}:{}", metadata.st_dev, metadata.st_ino),
-                        relay,
-                        "an inherited native image copy survived exec"
-                    );
-                } else {
-                    assert_eq!(io::Error::last_os_error().raw_os_error(), Some(libc::EBADF));
-                }
-            }
-            println!("mechanical-native-contract-ok");
-            return;
-        }
         if let Some(path) = env::var_os("MACO_NATIVE_CONTRACT_CHILD") {
             // Reproduce the guardian's non-CLOEXEC stdin copy and an extra
             // relayed copy. Both must disappear in the final native image.
@@ -3441,14 +3401,34 @@ mod tests {
             panic!("mechanical native exec returned");
         }
         let temp = tempfile::tempdir().expect("held request owner");
-        let executable = env::current_exe().expect("libtest executable");
+        // Pin only this standalone target, so libtest growth cannot exceed the
+        // production executable bound. The libtest child still runs the exec path.
+        let source = temp.path().join("native_contract.rs");
+        fs::write(
+            &source,
+            include_str!("../tests/fixtures/pinned_exec/native_contract.rs"),
+        )
+        .expect("standalone native contract source");
+        let executable = temp.path().join("native_contract");
+        let compiler = env::var_os("RUSTC").unwrap_or_else(|| OsString::from("rustc"));
+        let build = std::process::Command::new(compiler)
+            .args(["--edition=2021", "-C", "debuginfo=0", "-o"])
+            .arg(&executable)
+            .arg(&source)
+            .output()
+            .expect("build standalone native contract target");
+        assert!(
+            build.status.success(),
+            "native contract build failed: {}",
+            String::from_utf8_lossy(&build.stderr)
+        );
         let pinned = PinnedDirectExecutable::capture_for_test(&executable).expect("native image");
         let args = [
             OsString::from("--exact"),
             OsString::from(TEST),
             OsString::from("--nocapture"),
         ];
-        let image = materialize_sealed(&pinned.source).expect("sealed libtest image");
+        let image = materialize_sealed(&pinned.source).expect("sealed native contract image");
         let relay_metadata = image.file.metadata().expect("test image metadata");
         let environment = [
             (
@@ -3480,7 +3460,7 @@ mod tests {
         let path = temp.path().join(PINNED_EXEC_DESCRIPTOR_NAME);
         fs::write(&path, encoded.bytes()).expect("owned descriptor");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).expect("private mode");
-        let result = std::process::Command::new(&executable)
+        let result = std::process::Command::new(env::current_exe().expect("libtest executable"))
             .args(["--exact", TEST, "--nocapture"])
             .env_clear()
             .env("MACO_NATIVE_CONTRACT_CHILD", &path)
@@ -3492,7 +3472,8 @@ mod tests {
             .expect("owned provider-free child");
         assert!(
             result.status.success(),
-            "provider-free mechanical native contract failed"
+            "provider-free mechanical native contract failed: {}",
+            String::from_utf8_lossy(&result.stderr)
         );
         assert!(String::from_utf8_lossy(&result.stdout).contains("mechanical-native-contract-ok"));
         assert!(!path.exists(), "request was consumed by identity");
