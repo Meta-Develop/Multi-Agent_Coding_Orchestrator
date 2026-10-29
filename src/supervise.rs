@@ -293,6 +293,15 @@ mod scheduler;
 pub use scheduler::*;
 
 mod selection_bridge;
+#[cfg(test)]
+#[path = "supervise/selection_preflight_tests.rs"]
+mod selection_preflight_tests;
+pub use selection_bridge::selection_preflight::{
+    evaluate_supervisor_selection_preflight, supervisor_selection_preflight_file,
+    FrozenRoleSelectionInput, FrozenSupervisorSelectionInputs, SelectionPreflightDiagnostic,
+    SelectionPreflightRejection, SelectionPreflightRequested, SelectionPreflightStatus,
+    SupervisorSelectionPreflightReport,
+};
 use selection_bridge::*;
 #[cfg(target_os = "linux")]
 pub(crate) use selection_bridge::{

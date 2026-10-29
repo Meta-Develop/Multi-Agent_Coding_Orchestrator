@@ -1073,6 +1073,18 @@ fn emit_supervisor_plan_error(error: anyhow::Error, json: bool) -> Result<()> {
 
 fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
     match command {
+        SuperviseSubcommand::SelectionPreflight(args) => {
+            let report = supervise::supervisor_selection_preflight_file(
+                &args.plan_file,
+                args.runtime,
+                args.frozen_inputs.as_deref(),
+            )?;
+            print_query_report(&report, args.json)?;
+            if !report.compatible {
+                bail!("selection preflight refused: incompatible or unknown frozen inputs");
+            }
+            Ok(())
+        }
         SuperviseSubcommand::JournalAppend(args) => {
             supervise::run_worker_execution_journal_command_with_clock(
                 &args.journal,
@@ -1499,6 +1511,8 @@ enum SuperviseSubcommand {
     JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
+    /// Evaluate all reachable roles and custom lenses using frozen inputs, without dispatch.
+    SelectionPreflight(SelectionPreflightArgs),
     /// Run a supervisor plan with child orchestrators for a selected runtime.
     Run(RunSuperviseArgs),
     /// Re-run only evidence/report and parent audit stages for a preserved assignment diff.
@@ -1564,6 +1578,20 @@ struct PlanSuperviseArgs {
     #[arg(long, value_name = "NAME")]
     objective_profile: Option<String>,
     /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct SelectionPreflightArgs {
+    /// Supervisor plan to evaluate.
+    plan_file: PathBuf,
+    #[arg(long, value_enum, default_value = "codex")]
+    runtime: supervise::SupervisorRuntime,
+    /// FrozenSupervisorSelectionInputs JSON from a preflight report's frozen_inputs.
+    /// Omission reports unknown live inputs without fetching them.
+    #[arg(long, value_name = "FILE")]
+    frozen_inputs: Option<PathBuf>,
     #[arg(long)]
     json: bool,
 }
