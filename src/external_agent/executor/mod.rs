@@ -24,6 +24,7 @@
 //! this executor-owned foundation.
 
 mod checksum;
+#[cfg(target_os = "linux")]
 pub(crate) mod launch_lifecycle;
 mod local;
 mod selection;

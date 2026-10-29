@@ -9,7 +9,7 @@
 //! equivalent closed operation: an exact incarnation/use lease and run-bound admission.
 //! Codex, Claude, Cursor, Gemini and Grok open their selected credential capability during guarded
 //! construction and settles custody only from live process-tree evidence.
-//! [`ProviderLaunchMetadata`] is reference-only descriptive evidence.
+//! On Linux, `ProviderLaunchMetadata` is reference-only descriptive evidence.
 //! Admission deadlines and pre-spawn revocation refuse pending construction.
 //! Once a child starts, cancellation and verified tree exit govern finalization;
 //! expiry or revocation cannot assert that a running child has stopped. The
@@ -55,12 +55,14 @@
 mod audit;
 mod injection;
 mod material;
+#[cfg(target_os = "linux")]
 mod provider_dispatch;
 mod types;
 mod vault;
 
 pub use audit::{SecretAuditAction, SecretAuditEvent, SecretAuditOutcome, SecretAuditTrail};
 pub use injection::{SecretEnvironment, SecretLease};
+#[cfg(target_os = "linux")]
 pub use provider_dispatch::ProviderLaunchMetadata;
 pub use types::{
     DelegationPolicy, PersistencePolicy, SecretDeclaration, SecretLifecycleError,
