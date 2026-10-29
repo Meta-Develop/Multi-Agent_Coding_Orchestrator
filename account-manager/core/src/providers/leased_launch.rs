@@ -22,6 +22,11 @@ pub struct LeasedChild {
 }
 
 impl LeasedChild {
+    /// Request termination of this exact child without releasing its use lease.
+    pub(crate) fn kill(&mut self) -> io::Result<()> {
+        self.child.kill()
+    }
+
     pub fn id(&self) -> u32 {
         self.child.id()
     }
@@ -70,12 +75,33 @@ pub fn spawn_selected_launch(
     binding: &SelectedAccountBinding,
     credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
 ) -> Result<LeasedChild> {
+    spawn_selected_launch_inner(registry, adapter, binding, credential_store, false)
+}
+
+/// Service-owned launches have no connection to a requesting client's stdio.
+pub(crate) fn spawn_service_launch(
+    registry: &StoredAccountRegistry,
+    adapter: &dyn ProviderAdapter,
+    binding: &SelectedAccountBinding,
+    credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
+) -> Result<LeasedChild> {
+    spawn_selected_launch_inner(registry, adapter, binding, credential_store, true)
+}
+
+fn spawn_selected_launch_inner(
+    registry: &StoredAccountRegistry,
+    adapter: &dyn ProviderAdapter,
+    binding: &SelectedAccountBinding,
+    credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
+    detached: bool,
+) -> Result<LeasedChild> {
     if binding.provider_id != adapter.id() {
         return Err(Error::UnknownProvider(binding.provider_id.clone()));
     }
     let lease = registry.acquire_selected_use(binding)?;
     let account = registry.complete(adapter.id(), &binding.account_id)?;
     let spec = launch_spec_for(adapter, &account)?;
+    let spec = if detached { spec.detach_stdio() } else { spec };
     let store = spec
         .requires_credential()
         .then(credential_store)

@@ -95,6 +95,7 @@ pub struct LaunchSpec {
     args: Vec<OsString>,
     environment: Vec<LaunchEnvironment>,
     working_directory: Option<PathBuf>,
+    detached_stdio: bool,
 }
 
 impl LaunchSpec {
@@ -104,11 +105,17 @@ impl LaunchSpec {
             args: Vec::new(),
             environment: Vec::new(),
             working_directory: None,
+            detached_stdio: false,
         }
     }
 
     pub fn arg(mut self, arg: impl Into<OsString>) -> Self {
         self.args.push(arg.into());
+        self
+    }
+
+    pub(crate) fn detach_stdio(mut self) -> Self {
+        self.detached_stdio = true;
         self
     }
 
@@ -408,6 +415,13 @@ pub fn spawn_launch(
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit());
+
+    if spec.detached_stdio {
+        command
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+    }
 
     for entry in spec.environment {
         match entry {

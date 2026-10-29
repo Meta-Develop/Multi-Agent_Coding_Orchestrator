@@ -294,6 +294,46 @@ copied under [CONTRIBUTING.md](../CONTRIBUTING.md).
 
 ## 9. Implementation acceptance
 
+### Closed service-owned launches
+
+The authority advertises `launch.start`, `launch.status`, and `launch.cancel`
+separately from the unadvertised work-proposal `operation.*` lifecycle. A start
+request contains only `authorityId`, `serviceId`, an exact selected `binding`
+(provider, account, incarnation, selection revision), and `idempotencyKey` in
+addition to the versioned envelope. `serviceId` is the `launchServiceId` from
+`authority.describe`. Status and cancel require the same authority/service and
+the opaque returned handle. The caller is the socket's authorized OS user;
+requests cannot supply caller identity, programs, arguments, environment, or
+credential references.
+
+The service atomically acquires the selected-use lease before resolving the
+adapter-declared command or material. It owns the child and lease independently
+of every client connection. Stdio is detached; responses contain only the
+handle, state, PID, exit code, and a closed failure code. Cancel signals the
+owned child and remains `cancelling` (or `outcome-unknown` on an uncertain wait
+or signal) until exit is confirmed. Only confirmed exit releases the lease.
+Deletion, replacement, and selection changes retain the registry's existing
+barriers.
+
+The accept loop dispatches connections to at most 16 workers. When that cap is
+full, additional connections close without dispatch or a response. A blocked
+lookup occupies its worker while other admitted connections can status/cancel
+existing operations. Uncertain waits stop background polling but retain child
+and lease custody in the operation row for later status/reconciliation.
+
+Identical start retries return the original operation, including terminal spawn
+failure, exit, and cancellation. Reusing a key with a different binding refuses.
+Terminal records are retained for the listener's lifetime; at 1,024 records the
+service refuses new operations instead of evicting retry protection. A lost
+response or disconnect never cancels or launches again. A service restart
+changes `launchServiceId`: an old start cannot be replayed against the new
+instance, and lost operations require reconciliation rather than a new key or
+automatic replay. These records are in memory, not durable recovery evidence.
+
+The desktop remote-launch command remains disabled pending its typed client
+integration and corresponding desktop transport/status/cancellation tests.
+The existing in-process desktop path continues to use leased child custody.
+
 Before enabling a client, review the complete wire schema and its closed
 provider-specific projections, transport bounds, identifier encoding, and
 idempotency/recovery rules. The native service must be shared with desktop
