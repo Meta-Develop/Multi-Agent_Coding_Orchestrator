@@ -237,6 +237,8 @@ pub(super) struct PreclaimRunEvidence {
     pub(super) runtime: Option<SupervisorRuntime>,
     execution_runtime: SupervisorExecutionRuntime,
     assignment_metadata: AssignmentMetadata,
+    authored_checks: Option<super::authored_check_admission::AcquiredAuthoredChecks>,
+    repository: Option<PathBuf>,
 }
 
 impl PreclaimRunEvidence {
@@ -252,6 +254,8 @@ impl PreclaimRunEvidence {
                 runtime: Some(runtime),
                 execution_runtime,
                 assignment_metadata: AssignmentMetadata::default(),
+                authored_checks: None,
+                repository: Some(repo.to_path_buf()),
             };
         }
         Self {
@@ -260,6 +264,8 @@ impl PreclaimRunEvidence {
             runtime: Some(runtime),
             execution_runtime,
             assignment_metadata: AssignmentMetadata::default(),
+            authored_checks: None,
+            repository: Some(repo.to_path_buf()),
         }
     }
 
@@ -275,6 +281,8 @@ impl PreclaimRunEvidence {
             runtime: Some(runtime),
             execution_runtime: SupervisorExecutionRuntime::Verified,
             assignment_metadata: AssignmentMetadata::default(),
+            authored_checks: None,
+            repository: None,
         }
     }
 
@@ -286,6 +294,8 @@ impl PreclaimRunEvidence {
             runtime: None,
             execution_runtime: SupervisorExecutionRuntime::Verified,
             assignment_metadata: AssignmentMetadata::default(),
+            authored_checks: None,
+            repository: None,
         }
     }
 
@@ -294,13 +304,98 @@ impl PreclaimRunEvidence {
         self
     }
 
+    pub(super) fn with_authored_checks(
+        mut self,
+        repo: &Path,
+        document: String,
+        requested_assignments: &[OrchestratorAssignment],
+        metadata: &AssignmentMetadata,
+    ) -> Self {
+        self.authored_checks = Some(
+            super::authored_check_admission::AcquiredAuthoredChecks::acquire(
+                repo,
+                document,
+                requested_assignments,
+                metadata,
+                &self,
+            ),
+        );
+        self.repository = Some(repo.to_path_buf());
+        self.assignment_metadata = metadata.clone();
+        self
+    }
+
+    pub(super) fn has_authored_checks(&self, id: &str) -> bool {
+        self.assignment_metadata
+            .authored_independent_checks
+            .contains_key(id)
+            || self
+                .authored_checks
+                .as_ref()
+                .is_some_and(|checks| checks.declares(id))
+    }
+
+    pub(super) fn revalidate_authored(
+        &self,
+        repo: &Path,
+        assignment: &OrchestratorAssignment,
+        requested_assignments: &[OrchestratorAssignment],
+        metadata: &AssignmentMetadata,
+    ) -> Result<()> {
+        if !self.has_authored_checks(&assignment.id)
+            && !metadata
+                .authored_independent_checks
+                .contains_key(&assignment.id)
+        {
+            return Ok(());
+        }
+        let map = crate::repo_semantic::scan_repository(repo)?;
+        let risk = risk_report_for_paths(&map, assignment.assigned_paths.iter());
+        self.authored_checks
+            .as_ref()
+            .context("authored check receipts were not acquired")?
+            .admission(
+                repo,
+                assignment,
+                requested_assignments,
+                metadata,
+                Some(&risk),
+            )?;
+        Ok(())
+    }
+
     pub(super) fn evaluate(
         &self,
         assignment: &OrchestratorAssignment,
         requested_assignments: &[OrchestratorAssignment],
     ) -> PreclaimDecision {
         let risk = self.risk_for(&assignment.assigned_paths);
-        evaluate_preclaim_with_metadata(
+        if !self.has_authored_checks(&assignment.id) {
+            return evaluate_preclaim_with_metadata(
+                assignment,
+                requested_assignments,
+                self.repo_map.as_ref(),
+                risk.as_ref(),
+                self.runtime,
+                self.execution_runtime,
+                &self.assignment_metadata,
+            );
+        }
+        let admission = (|| {
+            self.authored_checks
+                .as_ref()
+                .context("authored check receipts were not acquired")?
+                .admission(
+                    self.repository
+                        .as_deref()
+                        .context("authored check repository is missing")?,
+                    assignment,
+                    requested_assignments,
+                    &self.assignment_metadata,
+                    risk.as_ref(),
+                )
+        })();
+        let mut decision = evaluate_preclaim_with_admission(
             assignment,
             requested_assignments,
             self.repo_map.as_ref(),
@@ -308,7 +403,12 @@ impl PreclaimRunEvidence {
             self.runtime,
             self.execution_runtime,
             &self.assignment_metadata,
-        )
+            admission.as_ref().ok(),
+        );
+        if let Err(error) = admission {
+            refuse_authored_checks(&mut decision, &error);
+        }
+        decision
     }
 
     pub(super) fn risk_for(&self, paths: &[PathBuf]) -> Option<SemanticRiskReport> {
@@ -340,6 +440,8 @@ trait PreclaimAssessmentProvider {
 struct DeterministicPreclaimProvider<'a> {
     assignment_metadata: &'a AssignmentMetadata,
     runtime: Option<SupervisorRuntime>,
+    authored_check_admission:
+        Option<&'a super::authored_check_admission::AuthoredCheckAdmission<'a>>,
 }
 
 struct SyntheticSimulationPreclaimProvider;
@@ -399,6 +501,7 @@ impl PreclaimAssessmentProvider for DeterministicPreclaimProvider<'_> {
                 requested_assignments,
                 repo_map,
                 risk_report,
+                self.authored_check_admission,
             )
         };
         let autonomously_completable = deterministic_autonomous_completion(assignment);
@@ -541,7 +644,11 @@ fn deterministic_verification_path(
     requested_assignments: &[OrchestratorAssignment],
     repo_map: Option<&RepoMap>,
     risk_report: Option<&SemanticRiskReport>,
+    authored_check_admission: Option<&super::authored_check_admission::AuthoredCheckAdmission<'_>>,
 ) -> ViabilityFinding {
+    if authored_check_admission.is_some_and(|admission| admission.matches(assignment)) {
+        return ViabilityFinding::Yes;
+    }
     // Production callers supply the already validated requested plan. Require
     // the typed declaration to remain uniquely and exactly bound to that plan;
     // current assignment input alone cannot manufacture this verification path.
@@ -1919,6 +2026,50 @@ pub(super) fn evaluate_preclaim_with_metadata(
     execution_runtime: SupervisorExecutionRuntime,
     assignment_metadata: &AssignmentMetadata,
 ) -> PreclaimDecision {
+    let mut decision = evaluate_preclaim_with_admission(
+        assignment,
+        requested_assignments,
+        repo_map,
+        risk_report,
+        runtime,
+        execution_runtime,
+        assignment_metadata,
+        None,
+    );
+    if assignment_metadata
+        .authored_independent_checks
+        .contains_key(&assignment.id)
+    {
+        refuse_authored_checks(
+            &mut decision,
+            &anyhow!("authored check receipts were not acquired"),
+        );
+    }
+    decision
+}
+
+fn refuse_authored_checks(decision: &mut PreclaimDecision, error: &anyhow::Error) {
+    decision.disposition = PreclaimDisposition::Park;
+    decision.triage_outcome = PreclaimTriageOutcome::Rejected;
+    decision.rejection_bucket = Some(PreclaimRejectionBucket::Invalid);
+    decision.confidence = PreclaimConfidence::High;
+    decision.dimensions.clear_verification_path = ViabilityFinding::No;
+    decision.authority = PreclaimDecisionAuthority::DeterministicPolicy;
+    decision.operator_override = None;
+    decision.reason = format!("authored independent checks refused before path claim: {error:#}");
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evaluate_preclaim_with_admission(
+    assignment: &OrchestratorAssignment,
+    requested_assignments: &[OrchestratorAssignment],
+    repo_map: Option<&RepoMap>,
+    risk_report: Option<&SemanticRiskReport>,
+    runtime: Option<SupervisorRuntime>,
+    execution_runtime: SupervisorExecutionRuntime,
+    assignment_metadata: &AssignmentMetadata,
+    authored_check_admission: Option<&super::authored_check_admission::AuthoredCheckAdmission<'_>>,
+) -> PreclaimDecision {
     match execution_runtime {
         SupervisorExecutionRuntime::NonpublishableSimulation => evaluate_with_provider(
             assignment,
@@ -1939,6 +2090,7 @@ pub(super) fn evaluate_preclaim_with_metadata(
             &DeterministicPreclaimProvider {
                 assignment_metadata,
                 runtime,
+                authored_check_admission,
             },
         ),
     }
@@ -2362,14 +2514,17 @@ mod tests {
     fn researcher_source_preclaim_initial_fallback_and_recheck_are_verified() {
         let (_temp, map, loaded) = researcher_source_plan();
         let assignment = &loaded.plan.assignments[0];
-        let initial = evaluate_supervisor_preclaims(
-            &loaded.plan,
-            &loaded.plan,
+        let initial_evidence = acquire_supervisor_preclaim_evidence(
             &map.root,
-            &loaded.assignment_metadata,
             SupervisorRuntime::Codex,
             SupervisorExecutionRuntime::Verified,
-        );
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .expect("acquire initial researcher pre-claim evidence");
+        let initial = evaluate_supervisor_preclaims(&loaded.plan, &loaded.plan, &initial_evidence);
         assert_eq!(initial.len(), 1);
         assert!(initial[0].allows_path_claim(), "{}", initial[0].reason);
         assert!(initial[0].dimensions.all_positive());
