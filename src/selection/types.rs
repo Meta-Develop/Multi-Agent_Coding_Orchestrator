@@ -590,6 +590,29 @@ pub struct EnvironmentRejectionState {
     pub fallback_transition_used: bool,
 }
 
+/// Exact attribution for a complete accepted-task cost cohort.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AcceptedTaskCostLane {
+    pub role: crate::supervise::AgentRole,
+    pub task: TaskProfile,
+    pub assignment_shape_identity: AssignmentShapeIdentity,
+    pub candidate: CandidateKey,
+}
+
+/// Parent-validated target of an in-process cost feedback decision.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedTaskCostContext {
+    pub role: crate::supervise::AgentRole,
+    pub assignment_shape_identity: AssignmentShapeIdentity,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AcceptedTaskCostObservation {
+    pub lane: AcceptedTaskCostLane,
+    pub cost_per_accepted_task_microunits: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DynamicSignals {
@@ -598,9 +621,12 @@ pub struct DynamicSignals {
     pub previous_choice: Option<CandidateKey>,
     pub previous_catalog_digest: Option<String>,
     pub environment_rejections: Vec<EnvironmentRejectionState>,
-    /// In-process observed CPO from a complete rollup. Absent on the wire.
+    /// A missing target shape never matches an observation. Absent on the wire.
     #[serde(skip)]
-    pub observed_cost_per_accepted_task_microunits: Option<u64>,
+    pub accepted_task_cost_context: Option<AcceptedTaskCostContext>,
+    /// In-process complete cohorts, each bound to its exact selection lane.
+    #[serde(skip)]
+    pub accepted_task_cost_observations: Vec<AcceptedTaskCostObservation>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]

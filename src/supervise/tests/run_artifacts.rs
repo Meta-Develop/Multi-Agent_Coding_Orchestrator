@@ -529,6 +529,7 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         selection_decisions: vec![event],
         assignment_selection_ledger,
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,
@@ -772,6 +773,7 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
             SupervisorRuntime::Codex,
         ),
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,

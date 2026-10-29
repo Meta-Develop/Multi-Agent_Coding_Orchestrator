@@ -26,6 +26,26 @@ pub fn built_in_prior_dataset() -> Result<PriorDataset, SelectionError> {
     serde_json::from_str(BUILT_IN_PRIORS).map_err(|error| SelectionError::Data(error.to_string()))
 }
 
+fn observed_accepted_task_cost(input: &SelectionInput, candidate: &CandidateKey) -> Option<u64> {
+    let context = input.signals.accepted_task_cost_context.as_ref()?;
+    let mut matches = input
+        .signals
+        .accepted_task_cost_observations
+        .iter()
+        .filter(|observation| {
+            observation.lane.candidate == *candidate
+                && observation.lane.task == input.task
+                && observation.lane.role == context.role
+                && observation.lane.assignment_shape_identity == context.assignment_shape_identity
+        });
+    let observed = matches.next()?;
+    // Ambiguous observations cannot establish one complete cohort.
+    matches
+        .next()
+        .is_none()
+        .then_some(observed.cost_per_accepted_task_microunits)
+}
+
 /// Operator declarations can narrow bundled bounds. Wider qualification needs
 /// a separately reviewed update of the bundled capability evidence.
 pub fn effective_task_shape_ceiling(
@@ -1208,12 +1228,8 @@ fn evaluate_candidate(
                         );
                     }
                     expected_cost = expected_cost_per_accepted(class_fit, &ledger)?;
-                    if input.signals.previous_choice.as_ref() == Some(&candidate) {
-                        if let Some(observed) =
-                            input.signals.observed_cost_per_accepted_task_microunits
-                        {
-                            expected_cost = observed;
-                        }
+                    if let Some(observed) = observed_accepted_task_cost(input, &candidate) {
+                        expected_cost = observed;
                     }
                     expected_retry_rework_cost = expected_cost_component_per_accepted(
                         class_fit.rework_cost_microunits,

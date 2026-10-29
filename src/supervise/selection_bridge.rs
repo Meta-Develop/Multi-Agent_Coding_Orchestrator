@@ -660,7 +660,7 @@ pub(super) struct SupervisorAutomaticSelectionState {
     quota_ledger: Option<RunBudgetLedger>,
     account_observation: Option<AccountObserveResult>,
     account_observations: Vec<(SupervisorRuntime, AccountObserveResult)>,
-    observed_cost_per_accepted_task_microunits: Option<u64>,
+    accepted_task_cost_observations: Vec<selection::AcceptedTaskCostObservation>,
     this_run_outcomes: Vec<OutcomeRecord>,
     this_run_exclusions: Vec<String>,
 }
@@ -670,8 +670,7 @@ impl PartialEq for SupervisorAutomaticSelectionState {
         self.decisions == other.decisions
             && self.advertised == other.advertised
             && self.quota_context == other.quota_context
-            && self.observed_cost_per_accepted_task_microunits
-                == other.observed_cost_per_accepted_task_microunits
+            && self.accepted_task_cost_observations == other.accepted_task_cost_observations
             && self.this_run_outcomes == other.this_run_outcomes
             && self.this_run_exclusions == other.this_run_exclusions
     }
@@ -796,7 +795,8 @@ pub(crate) fn select_executable_review_auditor(
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_context: None,
+            accepted_task_cost_observations: Vec::new(),
         },
         debug_override: None,
         operational_observations: None,
@@ -1072,7 +1072,8 @@ pub(super) fn initialize_supervisor_selection_with_assessment(
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override,
                 history,
@@ -1238,14 +1239,17 @@ impl SupervisorAutomaticSelectionState {
             quota_ledger,
             account_observation,
             account_observations,
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_observations: Vec::new(),
             this_run_outcomes: Vec::new(),
             this_run_exclusions: Vec::new(),
         })
     }
 
-    pub(super) fn set_observed_accepted_task_cost(&mut self, cost: Option<u64>) {
-        self.observed_cost_per_accepted_task_microunits = cost;
+    pub(super) fn set_observed_accepted_task_cost(
+        &mut self,
+        observations: Vec<selection::AcceptedTaskCostObservation>,
+    ) {
+        self.accepted_task_cost_observations = observations;
     }
 
     pub(super) fn set_this_run_outcomes(
@@ -1469,8 +1473,10 @@ pub(super) fn reselect_roles_from_supplied_catalog_snapshot(
             .filter(|rejection| rejection.role == role)
             .map(|rejection| rejection.rejection.clone())
             .collect();
-        input.signals.observed_cost_per_accepted_task_microunits =
-            state.observed_cost_per_accepted_task_microunits;
+        // Role-level replay has no parent-validated target assignment shape.
+        input.signals.accepted_task_cost_context = None;
+        input.signals.accepted_task_cost_observations =
+            state.accepted_task_cost_observations.clone();
         if let Some(quota_context) = &state.quota_context {
             let source_runtime = input
                 .signals
@@ -2470,7 +2476,8 @@ fn select_account_intake_for_role_with_assessment(
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: vec![],
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history,
@@ -5248,7 +5255,8 @@ mod tests {
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history: None,
@@ -6012,7 +6020,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -8468,7 +8477,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: Some(DebugOverride {
                 candidate: CandidateKey {
@@ -8531,7 +8541,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -10743,7 +10754,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -11561,7 +11573,8 @@ mod tests {
                     previous_choice: None,
                     previous_catalog_digest: None,
                     environment_rejections: Vec::new(),
-                    observed_cost_per_accepted_task_microunits: None,
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
                 },
                 debug_override: None,
                 history: None,
@@ -12022,7 +12035,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
@@ -12080,7 +12094,8 @@ mod tests {
                 previous_choice: None,
                 previous_catalog_digest: None,
                 environment_rejections: Vec::new(),
-                observed_cost_per_accepted_task_microunits: None,
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
             },
             debug_override: None,
             history: None,
