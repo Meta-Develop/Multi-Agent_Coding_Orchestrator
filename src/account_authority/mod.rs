@@ -18,6 +18,8 @@ pub(crate) mod gemini;
 #[cfg(target_os = "linux")]
 pub(crate) mod grok;
 #[cfg(target_os = "linux")]
+pub(crate) mod selected_launch;
+#[cfg(target_os = "linux")]
 pub(crate) mod socket_client;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
@@ -845,13 +847,13 @@ mod run_binding_tests {
             grok::acquire_grok_launch_authority(Some(&grok))
                 .err()
                 .unwrap(),
-            gemini::acquire_gemini_launch_authority(Some(&gemini))
+            gemini::acquire_gemini_launch_authority(Some(&gemini), None)
                 .err()
                 .unwrap(),
-            claude::acquire_claude_launch_authority(Some(&claude), u64::MAX)
+            claude::acquire_claude_launch_authority(Some(&claude), u64::MAX, None)
                 .err()
                 .unwrap(),
-            cursor::acquire_cursor_launch_authority(Some(&cursor))
+            cursor::acquire_cursor_launch_authority(Some(&cursor), None)
                 .err()
                 .unwrap(),
         ];

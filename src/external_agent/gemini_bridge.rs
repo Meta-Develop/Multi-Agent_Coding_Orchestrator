@@ -1159,7 +1159,15 @@ pub(super) fn run(
         "Gemini managed Worker did not complete".into(),
     );
     #[cfg(target_os = "linux")]
-    if let Err(error) = run_linux(spec, cancellation, started, &mut report) {
+    let mut selected_authority = None;
+    #[cfg(target_os = "linux")]
+    if let Err(error) = run_linux(
+        spec,
+        cancellation,
+        started,
+        &mut report,
+        &mut selected_authority,
+    ) {
         record_external_error(&mut report, format!("Gemini bootstrap refused: {error:#}"));
     }
     #[cfg(not(target_os = "linux"))]
@@ -1201,8 +1209,9 @@ fn run_linux(
     cancellation: &ProcessCancellation,
     started: Instant,
     report: &mut ExternalAgentRun,
+    selected_authority: &mut Option<crate::account_authority::gemini::GeminiLaunchAuthority>,
 ) -> Result<()> {
-    run_linux_online(spec, cancellation, started, report)
+    run_linux_online(spec, cancellation, started, report, selected_authority)
 }
 
 #[cfg(all(target_os = "linux", test))]
@@ -1434,7 +1443,14 @@ fn run_linux_offline(
                 record_external_error(report, error);
             }
         }
-        Err(error) => record_external_error(report, error.to_string()),
+        Err(error) => {
+            retain_pre_release_refusal_evidence(
+                report,
+                &error,
+                SideEffectConfinementProfileKind::GeminiOfflineBridge,
+            );
+            record_external_error(report, error.to_string());
+        }
     }
     report.stdout.run_metadata.gemini_bridge = Some(protocol.evidence);
     if report.scratch_quiescence_verified() {
@@ -1473,6 +1489,7 @@ fn run_linux_online(
     cancellation: &ProcessCancellation,
     started: Instant,
     report: &mut ExternalAgentRun,
+    selected_authority: &mut Option<crate::account_authority::gemini::GeminiLaunchAuthority>,
 ) -> Result<()> {
     use crate::process_runner::GeminiOnlineBridgeProfile;
     use std::io::Write;
@@ -1530,12 +1547,25 @@ fn run_linux_online(
     if read_only && grant.is_none() {
         bail!("managed read-only Gemini requires its existing finite live token reservation");
     }
-    let authority = crate::account_authority::gemini::acquire_gemini_launch_authority(frozen)?;
+    let authority = with_provider_launch_admission(
+        spec,
+        started.checked_add(spec.timeout).unwrap_or(started),
+        &mut report.stdout.run_metadata.launch_lifecycle_handle,
+        |admission| {
+            crate::account_authority::gemini::acquire_gemini_launch_authority(
+                frozen,
+                Some(admission),
+            )
+        },
+    )?;
+    let authority = selected_authority.insert(authority);
     let selection = authority.selection_evidence();
     if frozen.is_some_and(|binding| !binding.matches_selection_evidence(&selection)) {
         bail!("managed Gemini selection does not match its frozen launch binding");
     }
-    let credential = read_selected_personal_oauth(authority.managed_gemini_home())?;
+    let credential = authority
+        .launch
+        .construct(|| read_selected_personal_oauth(authority.managed_gemini_home()))?;
     report.stdout.run_metadata.managed_gemini_selection = Some(selection);
     let prompt = read_bounded_regular_file_nofollow(&spec.prompt, MAX_PROMPT_BYTES)?;
     let controls = protected_worktree_controls(spec)?;
@@ -1647,6 +1677,10 @@ fn run_linux_online(
         ("LANG".into(), "C.UTF-8".into()),
     ]);
     authority.apply_launch_environment(&mut environment);
+    authority
+        .launch
+        .custody()
+        .declare_inherited_environment(environment.keys());
     for required in [
         "HOME",
         "GEMINI_CLI_HOME",
@@ -1707,78 +1741,87 @@ fn run_linux_online(
     protocol.native_journal = native_journal;
     report.error = None;
     report.stdout.target_launch_attempted = true;
-    let output = run_process_interactive(process, &child_cancel, |session| {
-        let result = (|| -> Result<(), String> {
-            let mut stream = loop {
-                session.check_private_channel_live()?;
-                match listener.accept() {
-                    Ok((stream, _)) => break stream,
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(_) => return Err("Gemini private listener failed".into()),
-                }
-            };
-            session.verify_private_peer(&stream)?;
-            protocol.evidence.read_only_launch = read_only_launch.clone();
-            stream
-                .set_nonblocking(true)
-                .map_err(|_| "Gemini private socket setup failed")?;
-            let mut buffer = Vec::new();
-            while !protocol.terminal {
-                session.check_private_channel_live()?;
-                session.verify_private_peer(&stream)?;
-                let mut byte = [0u8; 1];
-                match stream.read(&mut byte) {
-                    Ok(0) => return Err("Gemini private channel lost".into()),
-                    Ok(_) if byte[0] != b'\n' => {
-                        buffer.push(byte[0]);
-                        if buffer.len() > 16384 {
-                            return Err("Gemini private frame exceeded bound".into());
-                        }
-                    }
-                    Ok(_) => {
-                        protocol
-                            .receive(&buffer)
-                            .map_err(|error| error.to_string())?;
-                        buffer.clear();
-                        if protocol.take_release_revalidation() {
-                            authority.verify_binding_unchanged().map_err(|_| {
-                                "Gemini launch authority changed before release".to_string()
-                            })?;
-                        }
-                        // Conservative release state is committed before this write.
-                        let reply = format!(
-                            "{{\"nonce\":\"{}\",\"sequence\":{},\"ok\":true}}\n",
-                            nonce, protocol.sequence
-                        );
-                        let mut sent = 0;
-                        while sent < reply.len() {
-                            session.check_private_channel_live()?;
-                            match stream.write(&reply.as_bytes()[sent..]) {
-                                Ok(0) => return Err("Gemini ACK lost".into()),
-                                Ok(n) => sent += n,
-                                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                                    std::thread::sleep(Duration::from_millis(2))
-                                }
-                                Err(_) => return Err("Gemini ACK lost".into()),
+    let output = executor::launch_lifecycle::execute(
+        Some(&mut authority.launch.custody()),
+        &child_cancel,
+        || {
+            run_process_interactive(process, &child_cancel, |session| {
+                let result = (|| -> Result<(), String> {
+                    let mut stream = loop {
+                        session.check_private_channel_live()?;
+                        match listener.accept() {
+                            Ok((stream, _)) => break stream,
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2))
                             }
+                            Err(_) => return Err("Gemini private listener failed".into()),
+                        }
+                    };
+                    session.verify_private_peer(&stream)?;
+                    protocol.evidence.read_only_launch = read_only_launch.clone();
+                    stream
+                        .set_nonblocking(true)
+                        .map_err(|_| "Gemini private socket setup failed")?;
+                    let mut buffer = Vec::new();
+                    while !protocol.terminal {
+                        session.check_private_channel_live()?;
+                        session.verify_private_peer(&stream)?;
+                        let mut byte = [0u8; 1];
+                        match stream.read(&mut byte) {
+                            Ok(0) => return Err("Gemini private channel lost".into()),
+                            Ok(_) if byte[0] != b'\n' => {
+                                buffer.push(byte[0]);
+                                if buffer.len() > 16384 {
+                                    return Err("Gemini private frame exceeded bound".into());
+                                }
+                            }
+                            Ok(_) => {
+                                protocol
+                                    .receive(&buffer)
+                                    .map_err(|error| error.to_string())?;
+                                buffer.clear();
+                                if protocol.take_release_revalidation() {
+                                    authority.verify_binding_unchanged().map_err(|_| {
+                                        "Gemini launch authority changed before release".to_string()
+                                    })?;
+                                }
+                                // Conservative release state is committed before this write.
+                                let reply = format!(
+                                    "{{\"nonce\":\"{}\",\"sequence\":{},\"ok\":true}}\n",
+                                    nonce, protocol.sequence
+                                );
+                                let mut sent = 0;
+                                while sent < reply.len() {
+                                    session.check_private_channel_live()?;
+                                    match stream.write(&reply.as_bytes()[sent..]) {
+                                        Ok(0) => return Err("Gemini ACK lost".into()),
+                                        Ok(n) => sent += n,
+                                        Err(error)
+                                            if error.kind() == std::io::ErrorKind::WouldBlock =>
+                                        {
+                                            std::thread::sleep(Duration::from_millis(2))
+                                        }
+                                        Err(_) => return Err("Gemini ACK lost".into()),
+                                    }
+                                }
+                            }
+                            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                                std::thread::sleep(Duration::from_millis(2))
+                            }
+                            Err(_) => return Err("Gemini private receive failed".into()),
                         }
                     }
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
-                        std::thread::sleep(Duration::from_millis(2))
-                    }
-                    Err(_) => return Err("Gemini private receive failed".into()),
+                    Ok(())
+                })();
+                if result.is_err() {
+                    protocol.stopped = true;
+                    child_cancel.cancel();
                 }
-            }
-            Ok(())
-        })();
-        if result.is_err() {
-            protocol.stopped = true;
-            child_cancel.cancel();
-        }
-        result
-    });
+                result
+            })
+        },
+        |interactive| &interactive.process,
+    );
     match output {
         Ok(output) => {
             report.exit_code = output.process.status.and_then(|status| status.code());
@@ -1798,7 +1841,14 @@ fn run_linux_online(
                 record_external_error(report, "Gemini managed Worker exited unsuccessfully".into());
             }
         }
-        Err(error) => record_external_error(report, error.to_string()),
+        Err(error) => {
+            retain_pre_release_refusal_evidence(
+                report,
+                &error,
+                SideEffectConfinementProfileKind::GeminiOnlineBridge,
+            );
+            record_external_error(report, error.to_string());
+        }
     }
     // Capture before fallible result/cleanup I/O, using the original held file.
     let captures = protocol.native_journal.as_ref().map_or_else(

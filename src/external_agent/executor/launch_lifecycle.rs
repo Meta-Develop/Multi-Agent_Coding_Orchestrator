@@ -72,7 +72,7 @@ pub(crate) fn observe_error(custody: Option<&mut ExternalLaunchCustody>, error: 
         }
         return;
     }
-    if let Some(evidence) = error.registration_rollback_evidence() {
+    if let Some(evidence) = error.pre_release_rollback_evidence() {
         if evidence.process_tree.is_verified_empty() {
             custody.finalize(LaunchFinalization::Refused);
         } else {
@@ -107,3 +107,6 @@ pub(crate) fn observe_error(custody: Option<&mut ExternalLaunchCustody>, error: 
 
 #[cfg(all(test, target_os = "linux"))]
 mod tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod gate_tests;

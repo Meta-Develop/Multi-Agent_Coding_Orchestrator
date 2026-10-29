@@ -42,6 +42,7 @@ pub enum LaunchPhase {
 /// Names and sources only; no inherited or resolved environment values.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum CredentialEnvironmentInput {
+    Inherited(String),
     SelectedCredential(String),
     Removed(String),
 }

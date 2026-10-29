@@ -1370,7 +1370,14 @@ mod catalog_effort_tests {
         for effort in ["low", "medium", "high", "xhigh", "max", "ultra"] {
             assert!(catalog.supports_effort("gpt-6.1-sol", effort));
         }
-        assert_eq!(catalog.effort_metadata("gpt-6.1-sol").unwrap().default.as_deref(), Some("low"));
+        assert_eq!(
+            catalog
+                .effort_metadata("gpt-6.1-sol")
+                .unwrap()
+                .default
+                .as_deref(),
+            Some("low")
+        );
         Ok(())
     }
 
@@ -5992,7 +5999,23 @@ struct ValidatedCodexAuth {
 }
 
 impl ValidatedCodexAuth {
+    #[cfg(all(test, target_os = "linux"))]
     fn load_for_command(spec: &ExternalAgentCommand) -> Result<Option<Self>> {
+        Self::load_for_command_with_admission(
+            spec,
+            Instant::now() + Duration::from_secs(120),
+            #[cfg(target_os = "linux")]
+            &mut None,
+        )
+    }
+
+    fn load_for_command_with_admission(
+        spec: &ExternalAgentCommand,
+        deadline: Instant,
+        #[cfg(target_os = "linux")] lifecycle: &mut Option<LaunchLifecycleHandle>,
+    ) -> Result<Option<Self>> {
+        #[cfg(not(target_os = "linux"))]
+        let _ = deadline;
         let observed = spec.agent_lifecycle.as_ref().and_then(|identity| {
             crate::account_authority::codex_run_account_binding(&identity.run_id)
         });
@@ -6007,10 +6030,13 @@ impl ValidatedCodexAuth {
                 #[cfg(target_os = "linux")]
                 {
                     let authority =
-                        crate::account_authority::codex::acquire_codex_launch_authority(frozen)
-                            .context(
-                                CodexAuthValidationFailureCause::ManagedAuthorityUnavailable,
-                            )?;
+                        with_provider_launch_admission(spec, deadline, lifecycle, |admission| {
+                            crate::account_authority::codex::acquire_codex_launch_authority(
+                                frozen,
+                                Some(admission),
+                            )
+                        })
+                        .context(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable)?;
                     Self::load_for_managed_authority(authority).map(Some)
                 }
                 #[cfg(not(target_os = "linux"))]
@@ -6037,9 +6063,11 @@ impl ValidatedCodexAuth {
             .context(CodexAuthValidationFailureCause::ManagedAuthorityUnavailable)?;
         // Unlike legacy canonical-home behavior, a selected managed declaration
         // must retain its exact no-symlink ancestry before reading any credential.
-        ensure_trusted_codex_auth_home(authority.managed_codex_home())?;
-        let mut auth = Self::load_from_home(authority.managed_codex_home())?
-            .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
+        let mut auth = authority.launch.construct(|| {
+            ensure_trusted_codex_auth_home(authority.managed_codex_home())?;
+            Self::load_from_home(authority.managed_codex_home())?
+                .context(CodexAuthValidationFailureCause::AuthFileMissing)
+        })?;
         auth.managed_authority = Some(authority);
         auth.verify_source_unchanged()?;
         Ok(auth)
@@ -7425,10 +7453,19 @@ mod selected_codex_auth_tests {
         let _socket = CamAuthoritySocketTestGuard::install(None);
         let run = "r10-local-auth-managed-parent";
         record_observed_codex_selection_from_source(
-            Some(run), CODEX_CLI_PROVIDER_ID, None, None, None,
+            Some(run),
+            CODEX_CLI_PROVIDER_ID,
+            None,
+            None,
+            None,
         );
         let parent = ExternalAgentCommand::codex(
-            "codex", "/workspace", "/prompt", "/events", "/report", Duration::from_secs(1),
+            "codex",
+            "/workspace",
+            "/prompt",
+            "/events",
+            "/report",
+            Duration::from_secs(1),
         )
         .with_agent_lifecycle("/workspace", "child_orchestrator", run, "parent")
         .with_workspace_access(WorkspaceAccess::ReadOnly)
@@ -7441,17 +7478,25 @@ mod selected_codex_auth_tests {
         let socket = root.path().join("missing.sock");
         {
             let _configured = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
-            assert!(parent.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+            assert!(parent
+                .managed_parent_control_transport(SupervisorRuntime::Codex)
+                .is_err());
         }
         let mut changed = parent.clone();
         changed.codex_run_account_binding = Some(CodexRunAccountBinding::Missing);
-        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        assert!(changed
+            .managed_parent_control_transport(SupervisorRuntime::Codex)
+            .is_err());
         let mut changed = parent.clone();
         changed.agent_lifecycle.as_mut().unwrap().run_id = "r10-unadmitted-parent".into();
-        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        assert!(changed
+            .managed_parent_control_transport(SupervisorRuntime::Codex)
+            .is_err());
         let mut changed = parent.clone();
         changed.codex_native_delegation_disabled = false;
-        assert!(changed.managed_parent_control_transport(SupervisorRuntime::Codex).is_err());
+        assert!(changed
+            .managed_parent_control_transport(SupervisorRuntime::Codex)
+            .is_err());
         // Initial parents still need their sealed inbox endpoint; local auth
         // grants no transport, delegation, or worktree capability of its own.
         assert!(parent
@@ -7493,7 +7538,11 @@ mod selected_codex_auth_tests {
             let _endpoint = CamAuthoritySocketTestGuard::install_default(socket.clone());
             if observed {
                 record_observed_codex_selection_from_source(
-                    Some(run_id), CODEX_CLI_PROVIDER_ID, None, None, None,
+                    Some(run_id),
+                    CODEX_CLI_PROVIDER_ID,
+                    None,
+                    None,
+                    None,
                 );
             }
             let auth = ValidatedCodexAuth::load_for_command(&command(run_id))?
@@ -7574,23 +7623,39 @@ mod selected_codex_auth_tests {
         let _home = RestoreHome(previous);
         assert!(ValidatedCodexAuth::load_for_command(&command("r9-legacy-unobserved"))?.is_none());
         record_observed_codex_selection_from_source(
-            Some("r9-legacy-admitted"), CODEX_CLI_PROVIDER_ID, None, None, None,
+            Some("r9-legacy-admitted"),
+            CODEX_CLI_PROVIDER_ID,
+            None,
+            None,
+            None,
         );
         let admitted = command("r9-legacy-admitted");
-        assert_eq!(admitted.codex_run_account_binding, Some(CodexRunAccountBinding::LocalAuth));
+        assert_eq!(
+            admitted.codex_run_account_binding,
+            Some(CodexRunAccountBinding::LocalAuth)
+        );
         assert!(ValidatedCodexAuth::load_for_command(&admitted)?.is_none());
         set_injected_codex_auth_home_for_test(Some(PathBuf::from("synthetic-relative-home")));
         let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
-        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::HomeNotAbsolute));
+        assert_eq!(
+            error.downcast_ref::<CodexAuthValidationFailureCause>(),
+            Some(&CodexAuthValidationFailureCause::HomeNotAbsolute)
+        );
         {
             let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
             let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
-            assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+            assert_eq!(
+                error.downcast_ref::<CodexAuthValidationFailureCause>(),
+                Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+            );
         }
         fs::create_dir(socket.parent().unwrap())?;
         fs::write(&socket, b"not a Unix socket")?;
         let error = ValidatedCodexAuth::load_for_command(&admitted).unwrap_err();
-        assert_eq!(error.downcast_ref::<CodexAuthValidationFailureCause>(), Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried));
+        assert_eq!(
+            error.downcast_ref::<CodexAuthValidationFailureCause>(),
+            Some(&CodexAuthValidationFailureCause::ManagedSelectionNotCarried)
+        );
         Ok(())
     }
 

@@ -75,6 +75,7 @@ impl GrokLaunchAuthority {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn managed_grok_home(&self) -> &Path {
         &self.managed_grok_home
     }
@@ -129,18 +130,14 @@ impl GrokLaunchAuthority {
 ///
 /// The frozen binding must be the immutable contract carried for this run. Ambient
 /// process observation state is not consulted at launch.
+#[cfg(test)]
 pub(crate) fn acquire_grok_launch_authority(
     carried: Option<&FrozenGrokSelectedBinding>,
 ) -> Result<GrokLaunchAuthority> {
     acquire_grok_launch_authority_inner(carried, None)
 }
 
-struct GrokLaunchAdmission<'a> {
-    run_id: &'a str,
-    operation_id: &'a str,
-    deadline: std::time::Instant,
-    handle: &'a mut Option<LaunchLifecycleHandle>,
-}
+use super::selected_launch::LaunchAdmission as GrokLaunchAdmission;
 
 pub(crate) fn acquire_guarded_grok_launch_authority(
     carried: Option<&FrozenGrokSelectedBinding>,
@@ -182,7 +179,14 @@ fn acquire_grok_launch_authority_inner(
 
 /// Acquire a selected CAM account for optional live catalog discovery.
 /// An absent selection is optional only to the caller; drift and registry errors fail closed.
+#[cfg(test)]
 pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLaunchAuthority>> {
+    acquire_optional_grok_catalog_authority_with_admission(None)
+}
+
+pub(crate) fn acquire_optional_grok_catalog_authority_with_admission(
+    admission: Option<&mut GrokLaunchAdmission<'_>>,
+) -> Result<Option<GrokLaunchAuthority>> {
     let socket_path = configured_cam_authority_socket();
     if let Some(socket_path) = socket_path {
         let selected =
@@ -196,7 +200,7 @@ pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLau
         let mut frozen =
             FrozenGrokSelectedBinding::from_selected_binding(Some(authority_id), &binding);
         frozen.authority_socket = Some(socket_path);
-        return acquire_grok_launch_authority(Some(&frozen)).map(Some);
+        return acquire_grok_launch_authority_inner(Some(&frozen), admission).map(Some);
     }
     let data_dir = project_dirs().map(|dirs| dirs.data_dir().to_path_buf());
     #[cfg(test)]
@@ -221,7 +225,7 @@ pub(crate) fn acquire_optional_grok_catalog_authority() -> Result<Option<GrokLau
         Some(authority_id_for(registry.metadata_path())),
         &binding,
     );
-    acquire_grok_launch_authority(Some(&frozen)).map(Some)
+    acquire_grok_launch_authority_inner(Some(&frozen), admission).map(Some)
 }
 
 fn revalidate_frozen_selection_via_socket(
@@ -709,6 +713,172 @@ mod tests {
         assert!(authority.socket_path.is_none());
         assert!(authority.selection_evidence().authority_id.is_some());
         authority.verify_binding_unchanged()?;
+        Ok(())
+    }
+
+    #[test]
+    fn optional_catalog_lifecycle_guards_material_and_finalizes_local_refusal() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use crate::runtime_adapter::grok::{
+            BoundGrokCatalogCommandRunner, GrokCatalogCommandRunner, GrokCatalogCommandSpec,
+        };
+        use coding_agent_manager_lib::providers::launch_lifecycle::{
+            LaunchFinalization, LaunchPhase,
+        };
+        let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+        let registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+        let _registry = activate_cam_grok_test_harness(harness);
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        let mut handle = None;
+        let authority = acquire_optional_grok_catalog_authority_with_admission(Some(
+            &mut GrokLaunchAdmission {
+                run_id: "synthetic-catalog-run",
+                operation_id: "synthetic-catalog-operation",
+                deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                handle: &mut handle,
+            },
+        ))?
+        .context("selected catalog authority")?;
+        let runner = BoundGrokCatalogCommandRunner::with_authority(&authority)?;
+        assert!(registry
+            .begin_delete(GROK_CLI_PROVIDER_ID, "account-a")
+            .is_err());
+        assert!(runner
+            .run(&GrokCatalogCommandSpec::new("/").with_program("/missing-synthetic-catalog"))
+            .is_err());
+        let handle = handle.context("catalog lifecycle handle")?;
+        assert_eq!(handle.snapshot().phase, LaunchPhase::Constructing);
+        handle.revoke_before_spawn()?;
+        assert!(BoundGrokCatalogCommandRunner::with_authority(&authority).is_err());
+        drop(runner);
+        drop(authority);
+        assert_eq!(
+            handle.snapshot().phase,
+            LaunchPhase::Finalized(LaunchFinalization::Refused)
+        );
+        registry.select_complete(GROK_CLI_PROVIDER_ID, "account-b")?;
+        Ok(())
+    }
+
+    #[test]
+    fn optional_catalog_run_settles_spawn_failure_and_retains_unknown_custody() -> Result<()> {
+        use super::super::authority_socket_config::CamAuthoritySocketTestGuard;
+        use crate::process_runner::{
+            ContainmentBackend, ProcessOutput, ProcessRunError, ProcessTreeEvidence,
+            SideEffectConfinementEvidence, SideEffectConfinementProfileKind,
+        };
+        use crate::runtime_adapter::grok::{
+            with_catalog_process_result_for_test, BoundGrokCatalogCommandRunner,
+            GrokCatalogCommandRunner, GrokCatalogCommandSpec,
+        };
+        use coding_agent_manager_lib::providers::launch_lifecycle::{
+            LaunchFinalization, LaunchPhase,
+        };
+        let _socket = CamAuthoritySocketTestGuard::install(None);
+        for scenario in ["spawn", "unknown", "setup-timeout", "tee-conflict"] {
+            let unknown = scenario == "unknown";
+            let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
+            let registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+            let _registry = activate_cam_grok_test_harness(harness);
+            let program_directory = tempfile::tempdir()?;
+            let program = program_directory.path().join("synthetic-catalog");
+            fs::write(
+                &program,
+                b"synthetic fixture; process result supplied by the test",
+            )?;
+            let mut handle = None;
+            let authority = acquire_optional_grok_catalog_authority_with_admission(Some(
+                &mut GrokLaunchAdmission {
+                    run_id: "synthetic-catalog-result-run",
+                    operation_id: "synthetic-catalog-result-operation",
+                    deadline: std::time::Instant::now() + std::time::Duration::from_secs(30),
+                    handle: &mut handle,
+                },
+            ))?
+            .context("selected catalog authority")?;
+            let runner = BoundGrokCatalogCommandRunner::with_authority(&authority)?;
+            let process_result = if unknown {
+                Ok(ProcessOutput {
+                    status: None,
+                    duration: std::time::Duration::ZERO,
+                    timed_out: false,
+                    stdout: Default::default(),
+                    stderr: Default::default(),
+                    process_error: None,
+                    stdin_error: None,
+                    process_tree: ProcessTreeEvidence::Unverified(ContainmentBackend::DirectChild),
+                    side_effects: SideEffectConfinementEvidence::Unverified(
+                        SideEffectConfinementProfileKind::ExternalGrok,
+                    ),
+                })
+            } else if scenario == "setup-timeout" {
+                Err(ProcessRunError::SetupTimeout {
+                    label: "synthetic catalog".into(),
+                    command: "synthetic catalog".into(),
+                    phase: "pre-release setup",
+                    source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                })
+            } else if scenario == "tee-conflict" {
+                Err(ProcessRunError::TeeConflict {
+                    label: "synthetic catalog".into(),
+                    stdout: "synthetic-tee".into(),
+                    stderr: "synthetic-tee".into(),
+                })
+            } else {
+                Err(ProcessRunError::Spawn {
+                    label: "synthetic catalog".into(),
+                    command: "synthetic catalog".into(),
+                    current_dir: program_directory.path().to_path_buf(),
+                    source: std::io::Error::from(std::io::ErrorKind::NotFound),
+                })
+            };
+            registry.select_complete(GROK_CLI_PROVIDER_ID, "account-b")?;
+            authority.verify_binding_unchanged()?;
+            let result = with_catalog_process_result_for_test(process_result, || {
+                runner.run(
+                    &GrokCatalogCommandSpec::new(program_directory.path()).with_program(&program),
+                )
+            });
+            assert_eq!(result.is_ok(), unknown);
+            if matches!(scenario, "setup-timeout" | "tee-conflict") {
+                let error = result.as_ref().unwrap_err();
+                let evidence = error
+                    .downcast_ref::<crate::process_runner::ProcessFailureEvidence>()
+                    .context("catalog refusal lost its typed containment evidence")?;
+                assert_eq!(
+                    evidence.process_tree,
+                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                );
+                assert_eq!(
+                    evidence.side_effects,
+                    SideEffectConfinementEvidence::Unverified(
+                        SideEffectConfinementProfileKind::ExternalGrok
+                    )
+                );
+                assert!(error.downcast_ref::<ProcessRunError>().is_some());
+            }
+            let handle = handle.context("catalog lifecycle handle")?;
+            assert_eq!(
+                handle.snapshot().phase,
+                if unknown {
+                    LaunchPhase::ExitUnknown
+                } else if scenario == "spawn" {
+                    LaunchPhase::Finalized(LaunchFinalization::SpawnFailed)
+                } else {
+                    LaunchPhase::Finalized(LaunchFinalization::Refused)
+                }
+            );
+            assert!(registry
+                .begin_delete(GROK_CLI_PROVIDER_ID, "account-a")
+                .is_err());
+            drop(runner);
+            drop(authority);
+            let replacement = registry.begin_delete(GROK_CLI_PROVIDER_ID, "account-a");
+            assert_eq!(replacement.is_err(), unknown);
+            if unknown {
+                assert_eq!(handle.snapshot().phase, LaunchPhase::ExitUnknown);
+            }
+        }
         Ok(())
     }
 

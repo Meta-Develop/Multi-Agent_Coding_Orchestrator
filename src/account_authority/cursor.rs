@@ -5,6 +5,7 @@ use std::fs::{self, File, OpenOptions};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use super::selected_launch::{LaunchAdmission, SelectedLaunch};
 use anyhow::{anyhow, Context, Result};
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
@@ -12,7 +13,6 @@ use coding_agent_manager_lib::account_authority::{
 use coding_agent_manager_lib::error::Error as CamError;
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::cursor::CursorAdapter;
-use coding_agent_manager_lib::providers::launch_spec_for;
 
 use super::{
     FrozenCursorSelectedBinding, ManagedCursorAccountSelectionEvidence, CURSOR_PROVIDER_ID,
@@ -33,6 +33,7 @@ pub(crate) struct CursorLaunchAuthority {
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
+    pub(crate) launch: SelectedLaunch,
     managed_home: PathBuf,
     auth_path: PathBuf,
     auth_file: Arc<File>,
@@ -110,6 +111,7 @@ impl CursorLaunchAuthority {
 
 pub(crate) fn acquire_cursor_launch_authority(
     carried: Option<&FrozenCursorSelectedBinding>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<CursorLaunchAuthority> {
     let socket = super::cam_socket_for_frozen_selection(
         carried.and_then(|frozen| frozen.authority_socket.as_deref()),
@@ -137,7 +139,13 @@ pub(crate) fn acquire_cursor_launch_authority(
         .map(|dirs| dirs.data_dir().to_path_buf())
         .context("Coding Agent Manager data directory is unavailable")?;
     let registry = StoredAccountRegistry::new(stored_accounts_path(&data_dir));
-    acquire_from_registry(&registry, &CursorAdapter::default(), carried, socket)
+    acquire_from_registry(
+        &registry,
+        &CursorAdapter::default(),
+        carried,
+        socket,
+        admission,
+    )
 }
 
 fn acquire_from_registry(
@@ -145,6 +153,7 @@ fn acquire_from_registry(
     adapter: &CursorAdapter,
     frozen: Option<&FrozenCursorSelectedBinding>,
     socket_path: Option<PathBuf>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<CursorLaunchAuthority> {
     let current = registry
         .selected_binding(CURSOR_PROVIDER_ID)
@@ -169,25 +178,40 @@ fn acquire_from_registry(
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
         .map_err(map_cam_error)?;
-    let account = registry
-        .complete(CURSOR_PROVIDER_ID, &binding.account_id)
-        .map_err(map_cam_error)?;
-    let launch = launch_spec_for(adapter, &account).map_err(map_cam_error)?;
-    let managed_home = cursor_home_from_launch_spec(&launch)?;
-    let auth_path = managed_home.join(".cursor").join("auth.json");
-    let (auth_file, auth_identity) = open_auth_read_only(&auth_path)?;
+    let (launch, (managed_home, auth_path, auth_file, auth_identity, launch_env_removals)) =
+        SelectedLaunch::prepare(registry, adapter, &binding, admission, |spec| {
+            let managed_home = cursor_home_from_launch_spec(spec)?;
+            let auth_path = managed_home.join(".cursor").join("auth.json");
+            let (auth_file, auth_identity) = open_auth_read_only(&auth_path)?;
+            Ok((
+                managed_home,
+                auth_path,
+                auth_file,
+                auth_identity,
+                spec.environment_removals(),
+            ))
+        })?;
     Ok(CursorLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
         socket_path,
         _selected_use_lease: selected_use_lease,
+        launch,
         managed_home,
         auth_path,
         auth_file: Arc::new(auth_file),
         auth_identity,
-        launch_env_removals: launch.environment_removals(),
+        launch_env_removals,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_from_registry_for_test(
+    registry: &StoredAccountRegistry,
+    adapter: &CursorAdapter,
+) -> Result<CursorLaunchAuthority> {
+    acquire_from_registry(registry, adapter, None, None, None)
 }
 
 fn cursor_home_from_launch_spec(
@@ -286,6 +310,55 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     #[test]
+    fn cursor_selected_lifecycle_covers_production_construction_and_exit() -> Result<()> {
+        use super::super::selected_launch::tests::{exercise, SCENARIOS};
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+        for scenario in SCENARIOS {
+            let root = tempfile::tempdir()?;
+            let data = root.path().join("data");
+            fs::create_dir(&data)?;
+            let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+            registry.begin_add(
+                CURSOR_PROVIDER_ID,
+                "work",
+                "Work",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )?;
+            registry.complete_add(CURSOR_PROVIDER_ID, "work")?;
+            registry.select_complete_revision(CURSOR_PROVIDER_ID, "work", None)?;
+            let home = data.join("accounts").join(CURSOR_PROVIDER_ID).join("work");
+            let config = home.join(".cursor");
+            fs::create_dir_all(&config)?;
+            for directory in [&home, &config] {
+                fs::set_permissions(directory, fs::Permissions::from_mode(0o700))?;
+            }
+            let auth = config.join("auth.json");
+            fs::write(&auth, b"synthetic-lifecycle-material")?;
+            fs::set_permissions(&auth, fs::Permissions::from_mode(0o600))?;
+            let adapter = CursorAdapter::with_home(root.path())
+                .with_data_dir(&data)
+                .with_working_directory(root.path());
+            exercise(
+                &registry,
+                CURSOR_PROVIDER_ID,
+                scenario,
+                |admission| {
+                    let authority =
+                        acquire_from_registry(&registry, &adapter, None, None, Some(admission))?;
+                    let material = authority
+                        .launch
+                        .construct(|| Ok(fs::read_to_string(authority.auth_path())?))?;
+                    Ok((authority, material))
+                },
+                |authority| &authority.launch,
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
     fn cursor_launch_endpoint_changes_after_acquire_are_refused() -> Result<()> {
         let root = tempfile::tempdir()?;
         let data = root.path().join("data");
@@ -313,12 +386,12 @@ mod tests {
             .with_data_dir(&data)
             .with_working_directory(root.path());
         super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
-            |socket_path| acquire_from_registry(&registry, &adapter, None, socket_path),
+            |socket_path| acquire_from_registry(&registry, &adapter, None, socket_path, None),
             |authority| authority.verify_binding_unchanged(),
         )?;
         let _socket =
             super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
-        let authority = acquire_from_registry(&registry, &adapter, None, None)?;
+        let authority = acquire_from_registry(&registry, &adapter, None, None, None)?;
         registry.begin_add(
             CURSOR_PROVIDER_ID,
             "personal",

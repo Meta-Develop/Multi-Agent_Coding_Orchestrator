@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 
+use super::selected_launch::{LaunchAdmission, SelectedLaunch};
 use anyhow::{anyhow, Context, Result};
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
@@ -11,7 +12,7 @@ use coding_agent_manager_lib::account_authority::{
 use coding_agent_manager_lib::error::Error as CamError;
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::gemini_cli::GeminiCliAdapter;
-use coding_agent_manager_lib::providers::{launch_spec_for, LaunchSpec};
+use coding_agent_manager_lib::providers::LaunchSpec;
 
 pub(crate) use super::GEMINI_CLI_PROVIDER_ID;
 use super::{
@@ -28,6 +29,7 @@ pub(crate) struct GeminiLaunchAuthority {
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
+    pub(crate) launch: SelectedLaunch,
     managed_gemini_home: PathBuf,
     launch_env_removals: Vec<String>,
 }
@@ -97,6 +99,7 @@ impl GeminiLaunchAuthority {
 
 pub(crate) fn acquire_gemini_launch_authority(
     carried: Option<&FrozenGeminiSelectedBinding>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<GeminiLaunchAuthority> {
     let socket_path = super::cam_socket_for_frozen_selection(
         carried.and_then(|frozen| frozen.authority_socket.as_deref()),
@@ -107,9 +110,9 @@ pub(crate) fn acquire_gemini_launch_authority(
             "no frozen Gemini selection binding from Coding Agent Manager authority socket observation",
         )?;
         revalidate_frozen_selection_via_socket(socket_path, frozen)?;
-        return acquire_from_execution_registry(Some(frozen), Some(socket_path.clone()));
+        return acquire_from_execution_registry(Some(frozen), Some(socket_path.clone()), admission);
     }
-    acquire_from_execution_registry(frozen, socket_path)
+    acquire_from_execution_registry(frozen, socket_path, admission)
 }
 
 fn revalidate_frozen_selection_via_socket(
@@ -142,6 +145,7 @@ fn revalidate_frozen_selection_via_socket(
 fn acquire_from_execution_registry(
     frozen: Option<&FrozenGeminiSelectedBinding>,
     socket_path: Option<PathBuf>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<GeminiLaunchAuthority> {
     let data_dir = project_dirs()
         .map(|dirs| dirs.data_dir().to_path_buf())
@@ -169,6 +173,7 @@ fn acquire_from_execution_registry(
         binding,
         authority_id,
         socket_path,
+        admission,
     )
 }
 
@@ -196,16 +201,18 @@ fn finish_gemini_launch_authority(
     binding: SelectedAccountBinding,
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<GeminiLaunchAuthority> {
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
         .map_err(map_cam_error)?;
-    let account = registry
-        .complete(GEMINI_CLI_PROVIDER_ID, &binding.account_id)
-        .map_err(map_cam_error)?;
-    let launch_spec = launch_spec_for(adapter, &account).map_err(map_cam_error)?;
-    let managed_gemini_home = gemini_home_from_launch_spec(&launch_spec)?;
-    let launch_env_removals = launch_spec.environment_removals();
+    let (launch, (managed_gemini_home, launch_env_removals)) =
+        SelectedLaunch::prepare(registry, adapter, &binding, admission, |spec| {
+            Ok((
+                gemini_home_from_launch_spec(spec)?,
+                spec.environment_removals(),
+            ))
+        })?;
     if launch_env_removals
         .iter()
         .any(|name| name == GOOGLE_GENAI_USE_GCA)
@@ -220,6 +227,7 @@ fn finish_gemini_launch_authority(
         authority_id,
         socket_path,
         _selected_use_lease: selected_use_lease,
+        launch,
         managed_gemini_home,
         launch_env_removals,
     })
@@ -313,6 +321,67 @@ mod tests {
     use super::*;
     use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
 
+    #[test]
+    fn gemini_selected_lifecycle_covers_production_construction_and_exit() -> Result<()> {
+        use super::super::selected_launch::tests::{exercise, SCENARIOS};
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+        for scenario in SCENARIOS {
+            let root = tempfile::tempdir()?;
+            let registry = StoredAccountRegistry::new(stored_accounts_path(root.path()));
+            add_complete(&registry, "work");
+            let binding =
+                registry.select_complete_revision(GEMINI_CLI_PROVIDER_ID, "work", None)?;
+            let config = root
+                .path()
+                .join("accounts")
+                .join(GEMINI_CLI_PROVIDER_ID)
+                .join("work/.gemini");
+            std::fs::create_dir_all(&config)?;
+            std::fs::write(
+                config.join("oauth_creds.json"),
+                b"synthetic-lifecycle-material",
+            )?;
+            std::fs::write(
+                config.join("settings.json"),
+                r#"{"security":{"auth":{"selectedType":"oauth-personal"}}}"#,
+            )?;
+            let adapter = GeminiCliAdapter::with_test_context(
+                root.path().join("user-home"),
+                root.path().to_path_buf(),
+                root.path().to_path_buf(),
+                root.path().join("system-settings.json"),
+                root.path().join("system-defaults.json"),
+                None,
+            );
+            exercise(
+                &registry,
+                GEMINI_CLI_PROVIDER_ID,
+                scenario,
+                |admission| {
+                    let authority = finish_gemini_launch_authority(
+                        &registry,
+                        &adapter,
+                        binding.clone(),
+                        None,
+                        None,
+                        Some(admission),
+                    )?;
+                    let material = authority.launch.construct(|| {
+                        Ok(std::fs::read_to_string(
+                            authority
+                                .managed_gemini_home()
+                                .join(".gemini/oauth_creds.json"),
+                        )?)
+                    })?;
+                    Ok((authority, material))
+                },
+                |authority| &authority.launch,
+            );
+        }
+        Ok(())
+    }
+
     fn add_complete(registry: &StoredAccountRegistry, account_id: &str) {
         registry
             .begin_add(
@@ -362,6 +431,7 @@ mod tests {
                     binding.clone(),
                     None,
                     socket_path,
+                    None,
                 )
             },
             |authority| authority.verify_binding_unchanged(),
@@ -383,12 +453,17 @@ mod tests {
         let lease = registry
             .acquire_selected_use(&binding)
             .expect("selected-use lease");
+        let launch =
+            SelectedLaunch::prepare_material(&registry, &binding, None, |_| Ok(((), Vec::new())))
+                .unwrap()
+                .0;
         let authority = GeminiLaunchAuthority {
             registry: StoredAccountRegistry::new(&metadata),
             binding,
             authority_id: None,
             socket_path: None,
             _selected_use_lease: lease,
+            launch,
             managed_gemini_home: temp.path().join("managed-home"),
             launch_env_removals: vec!["GOOGLE_APPLICATION_CREDENTIALS".to_string()],
         };
