@@ -55,10 +55,7 @@ fn assert_busy(registry: &StoredAccountRegistry) {
         registry.begin_delete("grok-cli", "account-a"),
         Err(CamError::AccountAuthorityBusy { .. })
     ));
-    assert!(matches!(
-        registry.select_complete("grok-cli", "account-b"),
-        Err(CamError::AccountAuthorityBusy { .. })
-    ));
+    registry.select_complete("grok-cli", "account-b").unwrap();
 }
 
 fn assert_released(registry: &StoredAccountRegistry) {

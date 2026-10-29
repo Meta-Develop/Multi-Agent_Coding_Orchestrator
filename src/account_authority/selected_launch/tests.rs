@@ -78,11 +78,20 @@ pub(crate) fn exercise<A: Send + 'static>(
             handle.snapshot().phase,
             LaunchPhase::Finalized(LaunchFinalization::Refused)
         );
-        registry.select_complete(provider, "work").unwrap();
+        registry.begin_delete(provider, "work").unwrap();
         return;
     }
     let (authority, material) = result.unwrap_or_else(|error| panic!("{error:#}"));
     assert_eq!(material, "synthetic-lifecycle-material");
+    registry.select_complete(provider, "work").unwrap();
+    assert!(
+        registry
+            .selected_binding(provider)
+            .unwrap()
+            .unwrap()
+            .selection_revision
+            > handle.snapshot().binding.selection_revision
+    );
     let busy = || {
         assert!(matches!(
             registry.begin_delete(provider, "work"),
@@ -181,7 +190,7 @@ pub(crate) fn exercise<A: Send + 'static>(
             LaunchFinalization::Refused
         };
         assert_eq!(handle.snapshot().phase, LaunchPhase::Finalized(reason));
-        registry.select_complete(provider, "work").unwrap();
+        registry.begin_delete(provider, "work").unwrap();
         return;
     }
     let directory = tempfile::tempdir().unwrap();
@@ -280,5 +289,5 @@ pub(crate) fn exercise<A: Send + 'static>(
     assert!(!encoded.contains("synthetic-inherited-value"));
     assert!(!encoded.contains("synthetic-lifecycle-material"));
     drop(authority);
-    registry.select_complete(provider, "work").unwrap();
+    registry.begin_delete(provider, "work").unwrap();
 }

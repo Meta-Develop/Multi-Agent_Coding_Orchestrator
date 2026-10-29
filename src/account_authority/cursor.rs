@@ -81,28 +81,22 @@ impl CursorLaunchAuthority {
             ));
         }
         if let Some(socket) = &self.socket_path {
-            let live = super::selected_binding_via_authority_socket(socket, CURSOR_PROVIDER_ID)
-                .context("failed to revalidate Cursor selection via authority socket")?;
-            let Some((authority_id, binding)) = live else {
-                return Err(anyhow!(
-                    "no complete account is selected for Coding Agent Manager provider `{CURSOR_PROVIDER_ID}`"
-                ));
-            };
-            if self.authority_id.as_deref() != Some(authority_id.as_str())
-                || binding != self.binding
-            {
+            let authority_id = super::socket_client::authority_id_via_authority_socket(socket)
+                .context("failed to revalidate Cursor authority socket")?;
+            if self.authority_id.as_deref() != Some(authority_id.as_str()) {
                 return Err(anyhow!(
                     "Coding Agent Manager Cursor authority binding changed"
                 ));
             }
         }
-        let current = self
+        let account = self
             .registry
-            .selected_binding(CURSOR_PROVIDER_ID)
-            .context("failed to read Coding Agent Manager Cursor selection")?
-            .ok_or_else(|| anyhow!("no complete Cursor account is selected"))?;
-        if current != self.binding {
-            return Err(anyhow!("Coding Agent Manager Cursor selection is stale"));
+            .complete(CURSOR_PROVIDER_ID, &self.binding.account_id)
+            .context("leased Coding Agent Manager Cursor account is no longer complete")?;
+        if account.account_incarnation != self.binding.account_incarnation {
+            return Err(anyhow!(
+                "leased Coding Agent Manager Cursor account was replaced"
+            ));
         }
         if let Some(expected) = &self.authority_id {
             if authority_id_for(self.registry.metadata_path()) != *expected {
@@ -394,6 +388,38 @@ mod tests {
         super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
             |socket_path| acquire_from_registry(&registry, &adapter, None, socket_path, None),
             |authority| authority.verify_binding_unchanged(),
-        )
+        )?;
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+        let authority = acquire_from_registry(&registry, &adapter, None, None, None)?;
+        registry.begin_add(
+            CURSOR_PROVIDER_ID,
+            "personal",
+            "Personal",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        registry.complete_add(CURSOR_PROVIDER_ID, "personal")?;
+        registry.select_complete_revision(CURSOR_PROVIDER_ID, "personal", None)?;
+        authority.verify_binding_unchanged()?;
+        registry.begin_delete(CURSOR_PROVIDER_ID, "personal")?;
+        registry.finish_delete(CURSOR_PROVIDER_ID, "personal")?;
+        authority.verify_binding_unchanged()?;
+        assert!(registry.begin_delete(CURSOR_PROVIDER_ID, "work").is_err());
+        let original = fs::read(registry.metadata_path())?;
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_slice(&original)?;
+            document["accounts"][0][field] = value.into();
+            fs::write(registry.metadata_path(), serde_json::to_vec(&document)?)?;
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
+        fs::write(registry.metadata_path(), original)?;
+        authority.verify_binding_unchanged()?;
+        drop(authority);
+        registry.begin_delete(CURSOR_PROVIDER_ID, "work")?;
+        Ok(())
     }
 }

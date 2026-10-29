@@ -1,6 +1,5 @@
 //! Durable stored-account registry with cross-process coordination.
 
-use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
@@ -16,7 +15,9 @@ use super::document::{
 };
 use super::incarnation::new_account_incarnation;
 use super::lock::RegistryFileLock;
-use super::use_lease::{refuse_provider_authority_mutations, SelectedUseLease};
+use super::use_lease::{
+    refuse_account_authority_mutations, validate_provider_use_leases, SelectedUseLease,
+};
 
 static STORED_ACCOUNTS_IN_PROCESS_LOCK: Mutex<()> = Mutex::new(());
 
@@ -227,12 +228,6 @@ impl StoredAccountRegistry {
             AuthKind::OAuth,
             StoredAccountMaterial::VendorHome,
         )?;
-        // Check other use/login leases before acquiring our own shared lease.
-        // The registry lock prevents another CAM lease acquisition in between.
-        refuse_provider_authority_mutations(&self.path, &binding.provider_id)?;
-        let _login = super::use_lease::PendingLoginLease::acquire_while_registry_files_held(
-            &self.path, binding,
-        )?;
         let target = document
             .accounts
             .iter()
@@ -240,6 +235,12 @@ impl StoredAccountRegistry {
                 account.provider_id == binding.provider_id && account.id == binding.account_id
             })
             .ok_or_else(|| Error::UnknownAccount(binding.account_id.clone()))?;
+        // Only this pending incarnation's material changes. Other accounts may
+        // remain in use while the future selection changes to this account.
+        refuse_account_authority_mutations(&self.path, target)?;
+        let _login = super::use_lease::PendingLoginLease::acquire_while_registry_files_held(
+            &self.path, binding,
+        )?;
         let previous = document
             .accounts
             .iter()
@@ -293,7 +294,7 @@ impl StoredAccountRegistry {
         expected_revision: Option<u64>,
     ) -> Result<SelectedAccountBinding> {
         self.with_locked_mut(|document| {
-            refuse_provider_authority_mutations(&self.path, provider_id)?;
+            validate_provider_use_leases(&self.path, provider_id)?;
             if let Some(expected) = expected_revision {
                 if selection_revision_for(document, provider_id) != expected {
                     return Err(Error::StaleSelection {
@@ -357,12 +358,12 @@ impl StoredAccountRegistry {
 
     pub fn begin_delete(&self, provider_id: &str, account_id: &str) -> Result<()> {
         self.with_locked_mut(|document| {
-            refuse_provider_authority_mutations(&self.path, provider_id)?;
             let account = document
                 .accounts
                 .iter_mut()
                 .find(|account| account.provider_id == provider_id && account.id == account_id)
                 .ok_or_else(|| Error::UnknownAccount(account_id.to_string()))?;
+            refuse_account_authority_mutations(&self.path, account)?;
             let was_selected = account.is_selected;
             account.state = StoredAccountState::Deleting;
             account.is_selected = false;
@@ -375,7 +376,12 @@ impl StoredAccountRegistry {
 
     pub fn finish_delete(&self, provider_id: &str, account_id: &str) -> Result<()> {
         self.with_locked_mut(|document| {
-            refuse_provider_authority_mutations(&self.path, provider_id)?;
+            let account = document
+                .accounts
+                .iter()
+                .find(|account| account.provider_id == provider_id && account.id == account_id)
+                .ok_or_else(|| Error::UnknownAccount(account_id.to_string()))?;
+            refuse_account_authority_mutations(&self.path, account)?;
             let before = document.accounts.len();
             document.accounts.retain(|account| {
                 !(account.provider_id == provider_id
@@ -414,7 +420,6 @@ impl StoredAccountRegistry {
 
     pub fn recover(&self, credential_store: Option<&dyn CredentialStore>) -> Result<()> {
         self.with_locked_mut(|document| {
-            let mut affected_providers = HashSet::new();
             for account in document
                 .accounts
                 .iter()
@@ -425,10 +430,7 @@ impl StoredAccountRegistry {
                 {
                     continue;
                 }
-                affected_providers.insert(account.provider_id.clone());
-            }
-            for provider_id in affected_providers {
-                refuse_provider_authority_mutations(&self.path, &provider_id)?;
+                refuse_account_authority_mutations(&self.path, account)?;
             }
 
             let mut changed = false;
@@ -467,6 +469,15 @@ impl StoredAccountRegistry {
         &self,
         expected: &SelectedAccountBinding,
     ) -> Result<SelectedUseLease> {
+        self.acquire_selected_use_snapshot(expected)
+            .map(|(lease, _account)| lease)
+    }
+
+    /// Freeze launch metadata with the selection validation and lease acquisition.
+    pub(crate) fn acquire_selected_use_snapshot(
+        &self,
+        expected: &SelectedAccountBinding,
+    ) -> Result<(SelectedUseLease, StoredAccountMetadata)> {
         let _process = in_process_guard()?;
         let _registry = RegistryFileLock::acquire(&self.path)?;
         let document = self.read_document_under_lock()?;
@@ -505,7 +516,8 @@ impl StoredAccountRegistry {
                 account_id: expected.account_id.clone(),
             });
         }
-        SelectedUseLease::acquire_while_registry_held(&self.path, expected)
+        let lease = SelectedUseLease::acquire_while_registry_held(&self.path, expected)?;
+        Ok((lease, account.clone()))
     }
 
     fn update_account(
@@ -696,6 +708,10 @@ fn verify_pending_login_target(
 }
 
 #[cfg(test)]
+#[path = "registry_lease_tests.rs"]
+mod lease_tests;
+
+#[cfg(test)]
 mod pending_login_tests {
     use super::*;
     use crate::model::AuthKind;
@@ -731,7 +747,7 @@ mod pending_login_tests {
                 assert!(previous.is_none());
                 // This inspects the real lease files without reentering the registry.
                 assert!(matches!(
-                    refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli"),
+                    refuse_account_authority_mutations(registry.metadata_path(), pending),
                     Err(Error::AccountAuthorityBusy { .. })
                 ));
                 Err(metadata_write_error("grok-cli", "FAKE-validator-refusal"))
@@ -739,7 +755,7 @@ mod pending_login_tests {
         );
         assert!(result.is_err());
         assert_eq!(fs::read(registry.metadata_path()).unwrap(), before);
-        refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli").unwrap();
+        refuse_account_authority_mutations(registry.metadata_path(), &account).unwrap();
     }
 
     #[test]
@@ -785,7 +801,7 @@ mod pending_login_tests {
             });
         assert!(result.is_err());
         assert!(!registry.metadata_path().exists());
-        refuse_provider_authority_mutations(registry.metadata_path(), "grok-cli").unwrap();
+        validate_provider_use_leases(registry.metadata_path(), "grok-cli").unwrap();
     }
 
     #[test]

@@ -8,7 +8,6 @@ use crate::account_authority::StoredAccountRegistry;
 use crate::error::{Error, Result};
 use crate::providers::{self, ProviderAdapter};
 
-use super::login_commands::LoginIpcStatus;
 #[cfg(unix)]
 use crate::account_authority::resolve_socket_path;
 use crate::account_authority::{
@@ -16,7 +15,9 @@ use crate::account_authority::{
     AuthorityResponse, ErrorCode, SelectedAccountBinding, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
     PROTOCOL_VERSION, REQUEST_IO_DEADLINE,
 };
+use crate::account_authority::{LaunchOperationStatus, OperationHandle};
 use crate::login::{LoginAccountBinding, LoginHandle, LoginStartRequest};
+use crate::login_ipc::LoginIpcStatus;
 use crate::model::{StoredAccountMetadata, StoredAccountState};
 use serde_json::{json, Value};
 #[cfg(unix)]
@@ -124,7 +125,101 @@ pub struct AuthorityClient {
     authority_id: Arc<Mutex<Option<String>>>,
 }
 
+pub(crate) enum LaunchRpcError {
+    Wire(ErrorCode),
+    Unconfirmed(Error),
+}
+
+impl LaunchRpcError {
+    pub(crate) fn into_error(self) -> Error {
+        match self {
+            Self::Wire(code) => {
+                map_wire_error("launch", code, "authority launch operation refused")
+            }
+            Self::Unconfirmed(error) => error,
+        }
+    }
+}
+
 impl AuthorityClient {
+    pub(crate) fn launch_identity(&self) -> Result<(String, String)> {
+        let response = self.exchange(json!({
+            "protocolVersion": PROTOCOL_VERSION,
+            "requestId": next_request_id(),
+            "operation": "authority.describe",
+        }))?;
+        let result = wire_result(response, "authority.describe")?;
+        let authority_id = required_string_field(&result, "authorityId")?;
+        let service_id = required_string_field(&result, "launchServiceId")?;
+        for operation in ["launch.start", "launch.status", "launch.cancel"] {
+            if !result["operations"]
+                .as_array()
+                .is_some_and(|operations| operations.iter().any(|value| value == operation))
+            {
+                return Err(Error::NotImplemented("authority launch operations"));
+            }
+        }
+        Ok((authority_id, service_id))
+    }
+
+    pub(crate) fn launch_start(
+        &self,
+        authority_id: &str,
+        service_id: &str,
+        binding: &SelectedAccountBinding,
+        key: &str,
+    ) -> std::result::Result<LaunchOperationStatus, LaunchRpcError> {
+        self.launch_exchange(
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "requestId": next_request_id(),
+                "operation": "launch.start",
+                "authorityId": authority_id,
+                "serviceId": service_id,
+                "binding": binding,
+                "idempotencyKey": key,
+            }),
+            None,
+        )
+    }
+
+    pub(crate) fn launch_status(
+        &self,
+        authority_id: &str,
+        service_id: &str,
+        handle: &OperationHandle,
+        cancel: bool,
+    ) -> Result<LaunchOperationStatus> {
+        self.launch_exchange(
+            json!({
+                "protocolVersion": PROTOCOL_VERSION,
+                "requestId": next_request_id(),
+                "operation": if cancel { "launch.cancel" } else { "launch.status" },
+                "authorityId": authority_id,
+                "serviceId": service_id,
+                "handle": handle,
+            }),
+            Some(handle),
+        )
+        .map_err(LaunchRpcError::into_error)
+    }
+
+    fn launch_exchange(
+        &self,
+        request: Value,
+        expected_handle: Option<&OperationHandle>,
+    ) -> std::result::Result<LaunchOperationStatus, LaunchRpcError> {
+        // exchange validates the shared correlated/exclusive response envelope.
+        let response = self.exchange(request).map_err(|_| {
+            LaunchRpcError::Unconfirmed(authority_io_error("launch reply unconfirmed; retry Launch to recover a pending start, or Check launch status for a known handle"))
+        })?;
+        if let Some(error) = response.error {
+            return Err(LaunchRpcError::Wire(error.code));
+        }
+        decode_launch_status(response.result.unwrap_or(Value::Null), expected_handle)
+            .map_err(LaunchRpcError::Unconfirmed)
+    }
+
     #[cfg(unix)]
     pub fn connect(configured: impl AsRef<Path>) -> Result<Self> {
         let path = resolve_socket_path(configured.as_ref()).map_err(map_socket_path_error)?;
@@ -444,6 +539,30 @@ fn decode_account_observation(
             .map_err(|_| authority_decode_error("invalid account.observe model evidence"))?;
     }
     Ok(observation)
+}
+
+fn decode_launch_status(
+    value: Value,
+    expected_handle: Option<&OperationHandle>,
+) -> Result<LaunchOperationStatus> {
+    // A handle is 24 random bytes encoded as unpadded base64url. Refuse remote
+    // strings that could smuggle paths, output, or secret-bearing diagnostics.
+    let handle = value.get("handle").and_then(Value::as_str).unwrap_or("");
+    if handle.len() != 32
+        || !handle
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_')
+    {
+        return Err(authority_decode_error("invalid launch handle"));
+    }
+    let status: LaunchOperationStatus = serde_json::from_value(value)
+        .map_err(|_| authority_decode_error("invalid launch status"))?;
+    if expected_handle.is_some_and(|handle| handle != &status.handle)
+        || status.process_id == Some(0)
+    {
+        return Err(authority_decode_error("launch status binding mismatch"));
+    }
+    Ok(status)
 }
 
 fn parse_selection_binding(result: &Value) -> Result<SelectedAccountBinding> {
@@ -1373,6 +1492,29 @@ mod connection {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn launch_status_decoding_is_closed_and_bound() {
+        let value = json!({
+            "handle": "a".repeat(32), "state": "running", "processId": 42,
+            "exitCode": null, "failureCode": null,
+        });
+        let status = decode_launch_status(value.clone(), None).unwrap();
+        assert!(decode_launch_status(value.clone(), Some(&status.handle)).is_ok());
+        for (field, invalid) in [
+            ("handle", json!("b".repeat(32))),
+            ("handle", json!("https://secret-sentinel.invalid")),
+            ("state", json!("secret-sentinel")),
+            ("processId", json!(0)),
+            ("failureCode", json!("secret-sentinel")),
+            ("output", json!("secret-sentinel")),
+        ] {
+            let mut invalid_status = value.clone();
+            invalid_status[field] = invalid;
+            let error = decode_launch_status(invalid_status, Some(&status.handle)).unwrap_err();
+            assert!(!error.to_string().contains("secret-sentinel"));
+        }
+    }
 
     #[test]
     fn account_observation_refuses_foreign_selection_and_catalog_principal() {

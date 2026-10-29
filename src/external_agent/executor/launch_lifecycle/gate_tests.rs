@@ -125,10 +125,11 @@ fn codex_gate(interactive: bool) -> Result<()> {
                 LaunchPhase::Finalized(LaunchFinalization::Refused)
             }
         );
-        assert!(registry.select_complete("codex-cli", "personal").is_err());
+        registry.select_complete("codex-cli", "personal")?;
+        assert!(registry.begin_delete("codex-cli", "work").is_err());
         drop(auth); // Confirmed refusal releases only after the outer authority drains.
         assert_eq!(
-            registry.select_complete("codex-cli", "personal").is_err(),
+            registry.begin_delete("codex-cli", "work").is_err(),
             unproven
         );
     }
@@ -216,12 +217,10 @@ fn cursor_parent_gate_refusal_releases_reaped_custody_and_retains_unproven_wait(
                 LaunchPhase::Finalized(LaunchFinalization::Refused)
             }
         );
-        assert!(registry.select_complete("cursor", "personal").is_err());
+        registry.select_complete("cursor", "personal")?;
+        assert!(registry.begin_delete("cursor", "work").is_err());
         drop(authority);
-        assert_eq!(
-            registry.select_complete("cursor", "personal").is_err(),
-            unproven
-        );
+        assert_eq!(registry.begin_delete("cursor", "work").is_err(), unproven);
     }
     Ok(())
 }

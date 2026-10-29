@@ -144,25 +144,18 @@ impl ClaudeLaunchAuthority {
             ));
         }
         if let Some(socket_path) = &self.socket_path {
-            let live =
-                super::selected_binding_via_authority_socket(socket_path, CLAUDE_CODE_PROVIDER_ID)
-                    .context("failed to revalidate Coding Agent Manager Claude selection")?;
-            let Some((authority_id, binding)) = live else {
-                bail!("no complete selected Coding Agent Manager Claude account");
-            };
-            if self.authority_id.as_deref() != Some(authority_id.as_str())
-                || binding != self.binding
-            {
-                bail!("Coding Agent Manager Claude selection changed after reservation");
+            let authority_id = super::socket_client::authority_id_via_authority_socket(socket_path)
+                .context("failed to revalidate Coding Agent Manager Claude authority socket")?;
+            if self.authority_id.as_deref() != Some(authority_id.as_str()) {
+                bail!("Coding Agent Manager Claude authority changed after reservation");
             }
         }
-        let current = self
+        let account = self
             .registry
-            .selected_binding(CLAUDE_CODE_PROVIDER_ID)
-            .context("failed to read Coding Agent Manager Claude selection")?
-            .context("no complete selected Coding Agent Manager Claude account")?;
-        if current != self.binding {
-            bail!("Coding Agent Manager Claude selection changed after reservation");
+            .complete(CLAUDE_CODE_PROVIDER_ID, &self.binding.account_id)
+            .context("leased Coding Agent Manager Claude account is no longer complete")?;
+        if account.account_incarnation != self.binding.account_incarnation {
+            bail!("leased Coding Agent Manager Claude account was replaced");
         }
         if let Some(expected) = &self.authority_id {
             if authority_id_for(self.registry.metadata_path()) != *expected {
@@ -841,6 +834,33 @@ mod tests {
             child_json["claudeAiOauth"]["scopes"],
             serde_json::json!(["user:inference"])
         );
+        registry.begin_add(
+            CLAUDE_CODE_PROVIDER_ID,
+            "personal",
+            "Personal",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        registry.complete_add(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        registry.select_complete_revision(CLAUDE_CODE_PROVIDER_ID, "personal", None)?;
+        authority.verify_binding_unchanged()?;
+        registry.begin_delete(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        registry.finish_delete(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        authority.verify_binding_unchanged()?;
+        assert!(registry
+            .begin_delete(CLAUDE_CODE_PROVIDER_ID, "work")
+            .is_err());
+        let original = fs::read(registry.metadata_path())?;
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: Value = serde_json::from_slice(&original)?;
+            document["accounts"][0][field] = value.into();
+            fs::write(registry.metadata_path(), serde_json::to_vec(&document)?)?;
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
+        fs::write(registry.metadata_path(), original)?;
         authority.verify_binding_unchanged()?;
         authority.oauth_expires_at_unix_millis = now_unix_millis()?.saturating_sub(1);
         assert!(authority.verify_binding_unchanged().is_err());

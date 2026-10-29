@@ -31,8 +31,7 @@ impl LaunchLifecycle {
             view.phase = LaunchPhase::Constructing;
             view.binding.clone()
         };
-        let lease = registry.acquire_selected_use(&binding)?;
-        let account = registry.complete(&binding.provider_id, &binding.account_id)?;
+        let (lease, account) = registry.acquire_selected_use_snapshot(&binding)?;
         let (material, environment) = construct(&account)?;
         {
             let mut view = self.handle.0.lock().expect("launch lifecycle lock");
@@ -66,8 +65,7 @@ impl LaunchLifecycle {
         if binding.provider_id != adapter.id() {
             return Err(Error::UnknownProvider(binding.provider_id).into());
         }
-        let lease = registry.acquire_selected_use(&binding)?;
-        let account = registry.complete(&binding.provider_id, &binding.account_id)?;
+        let (lease, account) = registry.acquire_selected_use_snapshot(&binding)?;
         let spec = launch_spec_for(adapter, &account)?;
         if spec.requires_credential() {
             return Err(refused("external runner requires a vendor-home declaration").into());

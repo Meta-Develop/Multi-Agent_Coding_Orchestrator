@@ -35,6 +35,7 @@ import {
 } from '@/lib/tauri'
 import type {
   AuthKind,
+  LaunchOperationStatus,
   LoginState,
   LoginStatus,
   ProviderDescriptor,
@@ -67,6 +68,8 @@ export interface Notice {
 
 interface AccountMutationValue {
   busy: boolean
+  remoteLaunches: LaunchOperationStatus[]
+  updateRemoteLaunch: (status: LaunchOperationStatus) => void
   notice: Notice | null
   pending: PendingConfirmation | null
   oauth: OAuthLoginSession | null
@@ -100,6 +103,15 @@ const AccountMutationContext = createContext<AccountMutationValue | null>(null)
  * bounded status polling instead of blocking `add_account`.
  */
 export function AccountMutationProvider({ children }: { children: ReactNode }) {
+  const [remoteLaunches, setRemoteLaunches] = useState<LaunchOperationStatus[]>(
+    [],
+  )
+  const updateRemoteLaunch = useCallback((status: LaunchOperationStatus) => {
+    setRemoteLaunches((current) => [
+      ...current.filter((item) => item.handle !== status.handle),
+      status,
+    ])
+  }, [])
   const [busy, setBusy] = useState(false)
   const [notice, setNotice] = useState<Notice | null>(null)
   const [pending, setPending] = useState<PendingConfirmation | null>(null)
@@ -667,14 +679,27 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
       try {
         try {
           const process = await launchProvider(provider.id)
-          setNotice({
-            tone: 'success',
-            message: `Launched an app-owned ${provider.displayName} child for ${process.accountId} (PID ${process.processId}). External launches and already-running sessions are unchanged.`,
-          })
+          if ('handle' in process) {
+            updateRemoteLaunch(process)
+            setNotice({
+              tone: process.state === 'failed' ? 'failure' : 'progress',
+              message: `Authority launch ${process.handle}: ${process.state}.`,
+            })
+          } else
+            setNotice({
+              tone: 'success',
+              message: `Launched an app-owned ${provider.displayName} child for ${process.accountId} (PID ${process.processId}). External launches and already-running sessions are unchanged.`,
+            })
         } catch (cause: unknown) {
+          const reason = commandErrorMessage(cause)
+          const lead = reason.startsWith(
+            'configuration for `account-authority` could not be read: launch reply unconfirmed;',
+          )
+            ? `Could not confirm launch of ${provider.displayName} for ${accountName}`
+            : `Could not launch ${provider.displayName} for ${accountName}`
           setNotice({
             tone: 'failure',
-            message: `Could not launch ${provider.displayName} for ${accountName}: ${commandErrorMessage(cause)}`,
+            message: `${lead}: ${reason}`,
           })
           return false
         }
@@ -684,11 +709,13 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
         setBusy(false)
       }
     },
-    [],
+    [updateRemoteLaunch],
   )
 
   const value = useMemo<AccountMutationValue>(
     () => ({
+      remoteLaunches,
+      updateRemoteLaunch,
       busy,
       notice,
       pending,
@@ -704,6 +731,8 @@ export function AccountMutationProvider({ children }: { children: ReactNode }) {
       openingAuthorization,
     }),
     [
+      remoteLaunches,
+      updateRemoteLaunch,
       busy,
       notice,
       pending,
