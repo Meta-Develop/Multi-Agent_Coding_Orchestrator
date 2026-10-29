@@ -514,7 +514,14 @@ pub(super) fn execute_nested_worker_attempt(
             parent: Some(&preflight.assignment.id),
         };
         let run = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            (context.external_runner)(
+            assignment_executor::dispatch_assignment_external(
+                context.assignment_metadata,
+                context.repo,
+                &context.options.run_id,
+                &preflight.assignment.id,
+                Some(worker_id),
+                parent_attempt,
+                &subject.assigned_paths,
                 &command,
                 cancellation,
                 requires_hosted_pre_action_review(&command).then_some(
@@ -523,9 +530,16 @@ pub(super) fn execute_nested_worker_attempt(
                         journal: &mut review_journal,
                     },
                 ),
+                context.external_runner,
             )
         })) {
-            Ok(run) => run,
+            Ok(Err(error)) if !remote_execution::launch_may_have_started(&error) => {
+                invoked = false;
+                reservation.state = DispatchBudgetReservationState::Reserved(runtime);
+                reservation.settle_not_started()?;
+                return Err(error);
+            }
+            Ok(run) => run?,
             Err(_) => bail!(
                 "nested worker runner panicked; scratches retained because quiescence is unknown"
             ),
@@ -1027,6 +1041,15 @@ mod tests {
         };
         let ledger = RunBudgetLedger::new(limits)?;
         let mut metadata = AssignmentMetadata::new();
+        if case == "ssh-untrusted" {
+            metadata.executors.insert(
+                ("parent".into(), Some("worker".into())),
+                serde_json::from_value(json!({"kind":"ssh", "target":{
+                    "host_id":"untrusted", "endpoint":"test.invalid", "user":"runner", "port":2222,
+                    "helper":"/opt/maco/helper", "root":"/srv/maco/workspaces"
+                }}))?,
+            );
+        }
         if case.starts_with("live-") {
             let validation_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
                 &repo,
@@ -1318,6 +1341,13 @@ mod tests {
             assert_eq!(calls.load(Ordering::SeqCst), 1);
         } else {
             assert!(result.is_err(), "unexpected success for {case}");
+            if case == "ssh-untrusted" {
+                assert!(format!("{:#}", result.as_ref().err().unwrap())
+                    .contains("no trusted supervised dispatch"));
+                assert!(!outcome.external_containment_failed);
+                assert_eq!(ledger.report()?.consumed.tokens, 0);
+                assert!(ledger.report()?.usage_complete);
+            }
             if matches!(case, "foreign-permit" | "wrong-permit-attempt") {
                 assert!(result
                     .as_ref()
@@ -1483,6 +1513,15 @@ mod tests {
     )]
     fn nested_executor_happy_path_reuses_parent_and_rejects_replay() -> Result<()> {
         execution_fixture("happy")
+    }
+
+    #[test]
+    #[cfg_attr(
+        not(target_os = "linux"),
+        ignore = "requires Linux authenticated managed resources"
+    )]
+    fn nested_ssh_without_trust_refuses_without_local_runner() -> Result<()> {
+        execution_fixture("ssh-untrusted")
     }
 
     #[test]
