@@ -9134,6 +9134,7 @@ fn run_external_agent_runtime(
     let mut retained_review_metrics = None;
     let mut failed_claude_broker_witness: Option<(ClaudeWholeCallWitness, ClaudeBrokerBinding)> =
         None;
+    let target_profile_kind = process_spec.side_effects.kind();
     #[cfg(target_os = "linux")]
     let mut grok_launch_custody = grok_session
         .as_ref()
@@ -9710,6 +9711,7 @@ fn run_external_agent_runtime(
     match process_result {
         Ok(()) => {}
         Err(error) => {
+            retain_pre_release_refusal_evidence(&mut report, &error, target_profile_kind);
             report.timed_out = matches!(&error, ProcessRunError::SetupTimeout { .. });
             let preparation_failure =
                 target_process_environment_failure(&error, target_spec.invocation);
@@ -12441,6 +12443,19 @@ fn target_process_environment_failure(
         | ProcessRunError::Wait { .. }
         | ProcessRunError::IoSetup { .. }
         | ProcessRunError::StdinTooLarge { .. } => None,
+    }
+}
+
+fn retain_pre_release_refusal_evidence(
+    report: &mut ExternalAgentRun,
+    error: &ProcessRunError,
+    profile: SideEffectConfinementProfileKind,
+) {
+    if let Some(evidence) = error.pre_release_refusal_evidence(profile) {
+        report.process_tree = Some(evidence.process_tree);
+        report.side_effects = Some(evidence.side_effects);
+        report.timed_out = matches!(error, ProcessRunError::SetupTimeout { .. });
+        report.stdout.target_launch_attempted = false;
     }
 }
 

@@ -15426,3 +15426,76 @@ fn grok_native_auth_failure_is_environment_and_fails_closed() -> Result<()> {
     }
     Ok(())
 }
+
+#[test]
+fn provider_setup_refusals_retain_requested_containment_without_granting_custody() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let spec = ExternalAgentCommand::codex(
+        "synthetic-provider",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("events"),
+        temp.path().join("result"),
+        Duration::from_secs(1),
+    );
+    for profile in [
+        SideEffectConfinementProfileKind::ExternalCodex,
+        SideEffectConfinementProfileKind::ExternalClaude,
+        SideEffectConfinementProfileKind::ExternalCursor,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        SideEffectConfinementProfileKind::ExternalGrok,
+    ] {
+        for timeout in [false, true] {
+            let error = if timeout {
+                ProcessRunError::SetupTimeout {
+                    label: "synthetic provider".into(),
+                    command: "synthetic target".into(),
+                    phase: "pre-release setup",
+                    source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                }
+            } else {
+                ProcessRunError::TeeConflict {
+                    label: "synthetic provider".into(),
+                    stdout: "synthetic-tee".into(),
+                    stderr: "synthetic-tee".into(),
+                }
+            };
+            let mut report =
+                failed_external_run(&spec, Instant::now(), vec![], false, "refused".into());
+            report.stdout.target_launch_attempted = true;
+            retain_pre_release_refusal_evidence(&mut report, &error, profile);
+            assert_eq!(report.timed_out, timeout);
+            assert_eq!(
+                report.process_tree,
+                Some(ProcessTreeEvidence::Unverified(
+                    ContainmentBackend::SystemdUserService
+                ))
+            );
+            assert_eq!(
+                report.side_effects,
+                Some(SideEffectConfinementEvidence::Unverified(profile))
+            );
+            assert!(!report.stdout.target_launch_attempted);
+            assert!(!report.publishable);
+            // Never-started target proof permits cleanup, but a previous uncertain
+            // preflight child still prevents it after this target refusal.
+            assert!(report.scratch_quiescence_verified());
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started = true;
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified = false;
+            assert!(!report.scratch_quiescence_verified());
+            let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+            assert_eq!(restored.process_tree, report.process_tree);
+            assert_eq!(restored.side_effects, report.side_effects);
+            assert!(!restored.publishable);
+            assert!(!restored.scratch_quiescence_verified());
+        }
+    }
+    Ok(())
+}

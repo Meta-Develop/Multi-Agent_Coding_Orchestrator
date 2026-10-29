@@ -13,7 +13,7 @@ use crate::process_runner::{
 use coding_agent_manager_lib::error::Error as CamError;
 use coding_agent_manager_lib::providers::launch_lifecycle::{LaunchFinalization, LaunchPhase};
 
-pub(crate) const SCENARIOS: [&str; 9] = [
+pub(crate) const SCENARIOS: [&str; 11] = [
     "normal",
     "nonzero",
     "cancel",
@@ -22,6 +22,8 @@ pub(crate) const SCENARIOS: [&str; 9] = [
     "construction",
     "drop",
     "spawn",
+    "setup-timeout",
+    "tee-conflict",
     "unknown",
 ];
 
@@ -90,7 +92,13 @@ pub(crate) fn exercise<A: Send + 'static>(
     busy();
     if matches!(
         scenario,
-        "drop" | "construction" | "revoked" | "unknown" | "spawn"
+        "drop"
+            | "construction"
+            | "revoked"
+            | "unknown"
+            | "spawn"
+            | "setup-timeout"
+            | "tee-conflict"
     ) {
         match scenario {
             "construction" => {
@@ -110,6 +118,34 @@ pub(crate) fn exercise<A: Send + 'static>(
                     |output| output,
                 );
                 assert!(result.is_err());
+            }
+            "setup-timeout" | "tee-conflict" => {
+                let result: std::result::Result<ProcessOutput, _> = execute(
+                    Some(&mut launch(&authority).custody()),
+                    &ProcessCancellation::new(),
+                    || {
+                        Err(if scenario == "setup-timeout" {
+                            ProcessRunError::SetupTimeout {
+                                label: "synthetic selected provider".into(),
+                                command: "synthetic target".into(),
+                                phase: "pre-release setup",
+                                source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                            }
+                        } else {
+                            ProcessRunError::TeeConflict {
+                                label: "synthetic selected provider".into(),
+                                stdout: "synthetic-tee".into(),
+                                stderr: "synthetic-tee".into(),
+                            }
+                        })
+                    },
+                    |output| output,
+                );
+                assert!(result.is_err());
+                assert_eq!(
+                    handle.snapshot().phase,
+                    LaunchPhase::Finalized(LaunchFinalization::Refused)
+                );
             }
             "unknown" => {
                 launch(&authority).custody().begin_spawn().unwrap();

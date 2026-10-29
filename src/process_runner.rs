@@ -2997,6 +2997,26 @@ pub enum ProcessRunError {
 }
 
 impl ProcessRunError {
+    /// Containment was attempted before this refusal, without evidence of a live
+    /// target. Keep it descriptive; it cannot confirm cleanup or grant custody.
+    pub(crate) fn pre_release_refusal_evidence(
+        &self,
+        profile: SideEffectConfinementProfileKind,
+    ) -> Option<ProcessFailureEvidence> {
+        matches!(self, Self::SetupTimeout { .. } | Self::TeeConflict { .. }).then(|| {
+            ProcessFailureEvidence {
+                stdout: CapturedBytes::default(),
+                stderr: CapturedBytes::default(),
+                process_tree: ProcessTreeEvidence::Unverified(
+                    ContainmentBackend::SystemdUserService,
+                ),
+                side_effects: SideEffectConfinementEvidence::Unverified(profile),
+                process_error: None,
+                stdin_error: None,
+            }
+        })
+    }
+
     pub(crate) fn agent_registration_failed(
         label: String,
         command: String,

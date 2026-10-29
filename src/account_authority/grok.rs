@@ -789,7 +789,8 @@ mod tests {
             LaunchFinalization, LaunchPhase,
         };
         let _socket = CamAuthoritySocketTestGuard::install(None);
-        for unknown in [false, true] {
+        for scenario in ["spawn", "unknown", "setup-timeout", "tee-conflict"] {
+            let unknown = scenario == "unknown";
             let (harness, _, _) = build_cam_grok_test_harness("account-a")?;
             let registry = StoredAccountRegistry::new(harness.registry.metadata_path());
             let _registry = activate_cam_grok_test_harness(harness);
@@ -824,6 +825,19 @@ mod tests {
                         SideEffectConfinementProfileKind::ExternalGrok,
                     ),
                 })
+            } else if scenario == "setup-timeout" {
+                Err(ProcessRunError::SetupTimeout {
+                    label: "synthetic catalog".into(),
+                    command: "synthetic catalog".into(),
+                    phase: "pre-release setup",
+                    source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                })
+            } else if scenario == "tee-conflict" {
+                Err(ProcessRunError::TeeConflict {
+                    label: "synthetic catalog".into(),
+                    stdout: "synthetic-tee".into(),
+                    stderr: "synthetic-tee".into(),
+                })
             } else {
                 Err(ProcessRunError::Spawn {
                     label: "synthetic catalog".into(),
@@ -838,13 +852,32 @@ mod tests {
                 )
             });
             assert_eq!(result.is_ok(), unknown);
+            if matches!(scenario, "setup-timeout" | "tee-conflict") {
+                let error = result.as_ref().unwrap_err();
+                let evidence = error
+                    .downcast_ref::<crate::process_runner::ProcessFailureEvidence>()
+                    .context("catalog refusal lost its typed containment evidence")?;
+                assert_eq!(
+                    evidence.process_tree,
+                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                );
+                assert_eq!(
+                    evidence.side_effects,
+                    SideEffectConfinementEvidence::Unverified(
+                        SideEffectConfinementProfileKind::ExternalGrok
+                    )
+                );
+                assert!(error.downcast_ref::<ProcessRunError>().is_some());
+            }
             let handle = handle.context("catalog lifecycle handle")?;
             assert_eq!(
                 handle.snapshot().phase,
                 if unknown {
                     LaunchPhase::ExitUnknown
-                } else {
+                } else if scenario == "spawn" {
                     LaunchPhase::Finalized(LaunchFinalization::SpawnFailed)
+                } else {
+                    LaunchPhase::Finalized(LaunchFinalization::Refused)
                 }
             );
             assert!(registry

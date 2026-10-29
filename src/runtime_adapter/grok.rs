@@ -1934,12 +1934,17 @@ fn run_screened_grok_catalog_process_with_custody(
         &mut coding_agent_manager_lib::providers::launch_lifecycle::ExternalLaunchCustody,
     >,
 ) -> Result<GrokCatalogCommandOutput> {
+    let profile = process_spec.side_effects.kind();
     let output = crate::external_agent::executor::launch_lifecycle::execute(
         custody,
         &crate::process_runner::ProcessCancellation::new(),
         || run_grok_catalog_process(process_spec),
         |output| output,
     )
+    .map_err(|error| match error.pre_release_refusal_evidence(profile) {
+        Some(evidence) => anyhow::Error::new(error).context(evidence),
+        None => error.into(),
+    })
     .context("Grok runtime model catalog command failed before a verified result was available")?;
     if output.process_error.is_some() || output.stdin_error.is_some() {
         bail!("Grok runtime model catalog process ownership cleanup was incomplete");

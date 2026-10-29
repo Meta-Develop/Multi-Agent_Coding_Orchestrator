@@ -1443,7 +1443,14 @@ fn run_linux_offline(
                 record_external_error(report, error);
             }
         }
-        Err(error) => record_external_error(report, error.to_string()),
+        Err(error) => {
+            retain_pre_release_refusal_evidence(
+                report,
+                &error,
+                SideEffectConfinementProfileKind::GeminiOfflineBridge,
+            );
+            record_external_error(report, error.to_string());
+        }
     }
     report.stdout.run_metadata.gemini_bridge = Some(protocol.evidence);
     if report.scratch_quiescence_verified() {
@@ -1834,7 +1841,14 @@ fn run_linux_online(
                 record_external_error(report, "Gemini managed Worker exited unsuccessfully".into());
             }
         }
-        Err(error) => record_external_error(report, error.to_string()),
+        Err(error) => {
+            retain_pre_release_refusal_evidence(
+                report,
+                &error,
+                SideEffectConfinementProfileKind::GeminiOnlineBridge,
+            );
+            record_external_error(report, error.to_string());
+        }
     }
     // Capture before fallible result/cleanup I/O, using the original held file.
     let captures = protocol.native_journal.as_ref().map_or_else(
