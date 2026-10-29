@@ -317,7 +317,9 @@ pub(crate) use task_routing::assess_task_routing;
 pub use task_routing::TaskRoutingAssessment;
 
 mod accepted_task_cost;
-pub use accepted_task_cost::AcceptedTaskCostRollup;
+pub use accepted_task_cost::{
+    AcceptedTaskCostCohort, AcceptedTaskCostCohorts, AcceptedTaskCostRollup,
+};
 mod environment_observation;
 mod outcome_history;
 mod prior_input;
@@ -1587,6 +1589,9 @@ pub struct SupervisorExecutionMetadata {
     /// this field and deserialize to `None`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub accepted_task_cost: Option<AcceptedTaskCostRollup>,
+    /// Complete per-lane cohorts and explicitly unattributed cost evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub accepted_task_cost_cohorts: Option<AcceptedTaskCostCohorts>,
     pub usage: SupervisorExecutionUsageReport,
 }
 

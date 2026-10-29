@@ -15852,6 +15852,12 @@
                   "minimum": 0,
                   "type": "integer"
                 },
+                "known_incomplete_cost_microunits": {
+                  "default": 0,
+                  "description": "Known buckets on incomplete-cost rows; evidence only, excluded from CPO.",
+                  "minimum": 0,
+                  "type": "integer"
+                },
                 "unknown_terminal_result_count": {
                   "default": 0,
                   "minimum": 0,
@@ -15864,6 +15870,269 @@
                 "complete_accepted_count",
                 "complete_total_cycle_cost_microunits",
                 "cost_per_accepted_task_microunits"
+              ],
+              "type": "object"
+            },
+            "accepted_task_cost_cohorts": {
+              "additionalProperties": false,
+              "properties": {
+                "lanes": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "costs": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "complete_accepted_count": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "complete_attempt_count": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "complete_total_cycle_cost_microunits": {
+                            "description": "Known complete-cost subtotal; partial when costs or terminal results remain unresolved.",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "cost_per_accepted_task_microunits": {
+                            "description": "Numeric only when all attempt costs and terminal results are complete and at least one task is accepted.",
+                            "minimum": 0,
+                            "type": [
+                              "integer",
+                              "null"
+                            ]
+                          },
+                          "incomplete_attempt_count": {
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "known_incomplete_cost_microunits": {
+                            "default": 0,
+                            "description": "Known buckets on incomplete-cost rows; evidence only, excluded from CPO.",
+                            "minimum": 0,
+                            "type": "integer"
+                          },
+                          "unknown_terminal_result_count": {
+                            "default": 0,
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "incomplete_attempt_count",
+                          "complete_attempt_count",
+                          "complete_accepted_count",
+                          "complete_total_cycle_cost_microunits",
+                          "cost_per_accepted_task_microunits"
+                        ],
+                        "type": "object"
+                      },
+                      "lane": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "assignment_shape_identity": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "sha256": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "version": {
+                                "const": 1
+                              }
+                            },
+                            "required": [
+                              "version",
+                              "sha256"
+                            ],
+                            "type": "object"
+                          },
+                          "candidate": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "effort": {
+                                "enum": [
+                                  "none",
+                                  "minimal",
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "xhigh",
+                                  "max",
+                                  "ultra"
+                                ],
+                                "type": "string"
+                              },
+                              "model": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "runtime": {
+                                "minLength": 1,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "runtime",
+                              "model",
+                              "effort"
+                            ],
+                            "type": "object"
+                          },
+                          "role": {
+                            "enum": [
+                              "supervisor",
+                              "child_orchestrator",
+                              "worker",
+                              "researcher",
+                              "gate_classifier",
+                              "auditor"
+                            ],
+                            "type": "string"
+                          },
+                          "task": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "authority_role": {
+                                "enum": [
+                                  "terminal_leaf",
+                                  "delegating",
+                                  "acceptance_gate",
+                                  "review_auditor",
+                                  "audit",
+                                  "conflict_resolution",
+                                  "failure_classification",
+                                  "git_publication",
+                                  "unknown_judgment"
+                                ],
+                                "type": "string"
+                              },
+                              "boundedness": {
+                                "enum": [
+                                  "tightly_bounded",
+                                  "bounded",
+                                  "cross_cutting",
+                                  "unknown"
+                                ],
+                                "type": "string"
+                              },
+                              "context": {
+                                "enum": [
+                                  "small",
+                                  "medium",
+                                  "large",
+                                  "long",
+                                  "unknown"
+                                ],
+                                "type": "string"
+                              },
+                              "horizon": {
+                                "enum": [
+                                  "short",
+                                  "medium",
+                                  "long",
+                                  "unknown"
+                                ],
+                                "type": "string"
+                              },
+                              "risk": {
+                                "enum": [
+                                  "low",
+                                  "medium",
+                                  "high",
+                                  "critical",
+                                  "unknown"
+                                ],
+                                "type": "string"
+                              },
+                              "task_class": {
+                                "minLength": 1,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "task_class",
+                              "risk",
+                              "boundedness",
+                              "context",
+                              "horizon",
+                              "authority_role"
+                            ],
+                            "type": "object"
+                          }
+                        },
+                        "required": [
+                          "role",
+                          "task",
+                          "assignment_shape_identity",
+                          "candidate"
+                        ],
+                        "type": "object"
+                      }
+                    },
+                    "required": [
+                      "lane",
+                      "costs"
+                    ],
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                "unattributed": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "complete_accepted_count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "complete_attempt_count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "complete_total_cycle_cost_microunits": {
+                      "description": "Known complete-cost subtotal; partial when costs or terminal results remain unresolved.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "cost_per_accepted_task_microunits": {
+                      "description": "Numeric only when all attempt costs and terminal results are complete and at least one task is accepted.",
+                      "minimum": 0,
+                      "type": [
+                        "integer",
+                        "null"
+                      ]
+                    },
+                    "incomplete_attempt_count": {
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "known_incomplete_cost_microunits": {
+                      "default": 0,
+                      "description": "Known buckets on incomplete-cost rows; evidence only, excluded from CPO.",
+                      "minimum": 0,
+                      "type": "integer"
+                    },
+                    "unknown_terminal_result_count": {
+                      "default": 0,
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "incomplete_attempt_count",
+                    "complete_attempt_count",
+                    "complete_accepted_count",
+                    "complete_total_cycle_cost_microunits",
+                    "cost_per_accepted_task_microunits"
+                  ],
+                  "type": "object"
+                }
+              },
+              "required": [
+                "lanes",
+                "unattributed"
               ],
               "type": "object"
             },

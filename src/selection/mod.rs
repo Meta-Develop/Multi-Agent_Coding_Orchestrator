@@ -15,7 +15,7 @@ mod types;
 pub use quota_input::{
     apply_fail_closed_quota_pools, fail_closed_quota_selector_input, runtime_pool_states,
 };
-pub(crate) use schema::selection_event_schema_value;
+pub(crate) use schema::{accepted_task_cost_lane_schema_value, selection_event_schema_value};
 pub use selector::{
     built_in_prior_dataset, effective_task_shape_ceiling, measured_authority_eligibility, select,
     select_with_loaded_routing_policy, select_with_switch_cost_estimates, validate_prior_dataset,

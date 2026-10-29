@@ -191,7 +191,8 @@ pub(crate) fn base_input() -> SelectionInput {
             previous_choice: None,
             previous_catalog_digest: None,
             environment_rejections: Vec::new(),
-            observed_cost_per_accepted_task_microunits: None,
+            accepted_task_cost_context: None,
+            accepted_task_cost_observations: Vec::new(),
         },
         debug_override: None,
         operational_observations: None,
@@ -2707,57 +2708,123 @@ fn retry_degrade_and_catalog_change_are_provenance_triggers() {
 }
 
 #[test]
-fn complete_observed_cpo_overrides_only_previous_choice_expected_cost() {
+fn observed_cost_feedback_requires_exact_lane_match() {
+    use crate::supervise::AgentRole;
+
     let initial = select(&base_input()).expect("initial decision");
-    let previous = initial
+    let candidate = initial
         .choice
         .as_ref()
-        .map(|choice| choice.candidate.clone())
-        .expect("initial choice");
-    let catalog_expected = initial
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
-        .expect("catalog expected cost");
-
-    let mut unchanged = base_input();
-    unchanged.signals.previous_choice = Some(previous.clone());
-    unchanged.signals.previous_catalog_digest = Some(initial.input_digests.catalogs.value.clone());
-    let none_decision = select(&unchanged).expect("none observed CPO");
-    let none_expected = none_decision
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .map(|score| score.expected_total_cost_per_accepted_task_microunits)
-        .expect("none observed expected cost");
-    assert_eq!(none_expected, catalog_expected);
-
-    let mut observed = unchanged;
-    observed.signals.observed_cost_per_accepted_task_microunits = Some(9_000_001);
-    let observed_decision = select(&observed).expect("observed CPO");
-    let previous_score = observed_decision
-        .candidate_set
-        .iter()
-        .find(|evaluation| evaluation.candidate == previous)
-        .and_then(|evaluation| evaluation.score.as_ref())
-        .expect("previous choice score");
-    assert_eq!(
-        previous_score.expected_total_cost_per_accepted_task_microunits,
-        9_000_001
-    );
-    for evaluation in &observed_decision.candidate_set {
-        if evaluation.candidate == previous {
-            continue;
+        .expect("initial choice")
+        .candidate
+        .clone();
+    let shape = AssignmentShapeIdentity::v1("a".repeat(64)).expect("shape");
+    let context = AcceptedTaskCostContext {
+        role: AgentRole::Worker,
+        assignment_shape_identity: shape.clone(),
+    };
+    let observation = AcceptedTaskCostObservation {
+        lane: AcceptedTaskCostLane {
+            role: AgentRole::Worker,
+            task: base_input().task,
+            assignment_shape_identity: shape,
+            candidate: candidate.clone(),
+        },
+        cost_per_accepted_task_microunits: 9_000_001,
+    };
+    let expected_cost = |input: &SelectionInput| {
+        select(input)
+            .expect("cost feedback decision")
+            .candidate_set
+            .iter()
+            .find(|evaluation| evaluation.candidate == candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("candidate score")
+            .expected_total_cost_per_accepted_task_microunits
+    };
+    let baseline = expected_cost(&base_input());
+    let mut exact = base_input();
+    exact.signals.accepted_task_cost_context = Some(context);
+    exact.signals.accepted_task_cost_observations = vec![observation.clone()];
+    // Candidate identity, rather than the previous choice, determines attribution.
+    assert!(exact.signals.previous_choice.is_none());
+    assert_eq!(expected_cost(&exact), 9_000_001);
+    for mismatch in 0..8 {
+        let mut input = exact.clone();
+        let lane = &mut input.signals.accepted_task_cost_observations[0].lane;
+        match mismatch {
+            0 => lane.candidate.runtime = "other-runtime".to_string(),
+            1 => lane.candidate.model = "other-model".to_string(),
+            2 => lane.candidate.effort = ReasoningEffort::Ultra,
+            3 => lane.role = AgentRole::Researcher,
+            4 => {
+                lane.assignment_shape_identity =
+                    AssignmentShapeIdentity::v1("b".repeat(64)).expect("different shape");
+            }
+            5 => lane.task.context = ContextSize::Long,
+            6 => input.signals.accepted_task_cost_context = None,
+            7 => input
+                .signals
+                .accepted_task_cost_observations
+                .push(observation.clone()),
+            _ => unreachable!(),
         }
-        if let Some(score) = evaluation.score.as_ref() {
-            assert_ne!(
-                score.expected_total_cost_per_accepted_task_microunits,
-                9_000_001
-            );
-        }
+        assert_eq!(expected_cost(&input), baseline, "mismatch {mismatch}");
+    }
+    let wire = serde_json::to_value(&exact).expect("serialize selection input");
+    assert!(wire["signals"].get("accepted_task_cost_context").is_none());
+    assert!(wire["signals"]
+        .get("accepted_task_cost_observations")
+        .is_none());
+    let decoded: SelectionInput = serde_json::from_value(wire).expect("wire selection input");
+    assert!(decoded.signals.accepted_task_cost_context.is_none());
+    assert!(decoded.signals.accepted_task_cost_observations.is_empty());
+    assert_eq!(expected_cost(&decoded), baseline);
+}
+
+#[test]
+fn observed_cost_feedback_keeps_two_candidate_costs_separate() {
+    use crate::supervise::AgentRole;
+
+    let mut input = base_input();
+    let decision = select(&input).expect("initial decision");
+    let candidates = decision
+        .candidate_set
+        .iter()
+        .filter(|evaluation| evaluation.score.is_some())
+        .take(2)
+        .map(|evaluation| evaluation.candidate.clone())
+        .collect::<Vec<_>>();
+    assert_eq!(candidates.len(), 2);
+    let shape = AssignmentShapeIdentity::v1("a".repeat(64)).expect("shape");
+    input.signals.accepted_task_cost_context = Some(AcceptedTaskCostContext {
+        role: AgentRole::Worker,
+        assignment_shape_identity: shape.clone(),
+    });
+    input.signals.accepted_task_cost_observations = candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| AcceptedTaskCostObservation {
+            lane: AcceptedTaskCostLane {
+                role: AgentRole::Worker,
+                task: input.task.clone(),
+                assignment_shape_identity: shape.clone(),
+                candidate: candidate.clone(),
+            },
+            cost_per_accepted_task_microunits: 9_000_001 + index as u64,
+        })
+        .collect();
+    input.signals.previous_choice = Some(candidates[1].clone());
+    let decision = select(&input).expect("lane-bound decision");
+    for (index, candidate) in candidates.iter().enumerate() {
+        let cost = decision
+            .candidate_set
+            .iter()
+            .find(|evaluation| &evaluation.candidate == candidate)
+            .and_then(|evaluation| evaluation.score.as_ref())
+            .expect("candidate score")
+            .expected_total_cost_per_accepted_task_microunits;
+        assert_eq!(cost, 9_000_001 + index as u64);
     }
 }
 

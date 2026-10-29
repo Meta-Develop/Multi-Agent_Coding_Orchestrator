@@ -1260,6 +1260,7 @@ fn role_economics_profile_schema_value() -> serde_json::Value {
                     "assignment_selection_ledger": assignment_selection_ledger_schema_value(),
                     "selection_decisions": selection_decisions_schema_value(),
                     "accepted_task_cost": accepted_task_cost_schema_value(),
+                    "accepted_task_cost_cohorts": accepted_task_cost_cohorts_schema_value(),
                     "usage": execution_usage_schema_value()
                 }
             }
@@ -1832,11 +1833,38 @@ fn accepted_task_cost_schema_value() -> serde_json::Value {
                 "type": "integer", "minimum": 0,
                 "description": "Known complete-cost subtotal; partial when costs or terminal results remain unresolved."
             },
+            "known_incomplete_cost_microunits": {
+                "type": "integer", "minimum": 0, "default": 0,
+                "description": "Known buckets on incomplete-cost rows; evidence only, excluded from CPO."
+            },
             "cost_per_accepted_task_microunits": {
                 "type": ["integer", "null"],
                 "minimum": 0,
                 "description": "Numeric only when all attempt costs and terminal results are complete and at least one task is accepted."
             }
+        }
+    })
+}
+
+fn accepted_task_cost_cohorts_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["lanes", "unattributed"],
+        "properties": {
+            "lanes": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": ["lane", "costs"],
+                    "properties": {
+                        "lane": crate::selection::accepted_task_cost_lane_schema_value(agent_role_schema_value()),
+                        "costs": accepted_task_cost_schema_value()
+                    }
+                }
+            },
+            "unattributed": accepted_task_cost_schema_value()
         }
     })
 }
@@ -1854,6 +1882,53 @@ fn accepted_task_cost_schema_preserves_optional_legacy_result_count() {
         .as_array()
         .expect("required field list")
         .contains(&json!("unknown_terminal_result_count")));
+}
+
+#[cfg(test)]
+#[test]
+fn accepted_task_cost_cohorts_schema_validates_lane_and_partial_evidence() -> Result<()> {
+    let costs = json!({
+        "incomplete_attempt_count": 1,
+        "complete_attempt_count": 1,
+        "complete_accepted_count": 1,
+        "complete_total_cycle_cost_microunits": 12,
+        "known_incomplete_cost_microunits": 550,
+        "cost_per_accepted_task_microunits": null
+    });
+    let instance = json!({
+        "lanes": [{
+            "lane": {
+                "role": "worker",
+                "task": crate::selection::selection_test_base_input().task,
+                "assignment_shape_identity": {"version": 1, "sha256": "a".repeat(64)},
+                "candidate": {"runtime": "codex", "model": "fixture", "effort": "high"}
+            },
+            "costs": costs.clone()
+        }],
+        "unattributed": costs
+    });
+    let typed: AcceptedTaskCostCohorts = serde_json::from_value(instance.clone())?;
+    assert_eq!(serde_json::to_value(typed)?, instance);
+    let schema_id = "urn:accepted-task-cost-cohorts";
+    let mut compiler = boon::Compiler::new();
+    compiler.set_default_draft(boon::Draft::V2020_12);
+    compiler
+        .add_resource(schema_id, accepted_task_cost_cohorts_schema_value())
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let mut schemas = boon::Schemas::new();
+    let index = compiler
+        .compile(schema_id, &mut schemas)
+        .map_err(|error| anyhow!("{error:#}"))?;
+    schemas
+        .validate(&instance, index)
+        .map_err(|error| anyhow!("{error:#}"))?;
+    let mut invalid = instance.clone();
+    invalid["lanes"][0]["lane"]["assignment_shape_identity"] = serde_json::Value::Null;
+    assert!(schemas.validate(&invalid, index).is_err());
+    let mut invalid = instance;
+    invalid["lanes"][0]["lane"]["candidate"]["extra"] = json!(true);
+    assert!(schemas.validate(&invalid, index).is_err());
+    Ok(())
 }
 
 fn execution_usage_schema_value() -> serde_json::Value {
