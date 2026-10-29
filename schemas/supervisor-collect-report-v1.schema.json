@@ -21082,6 +21082,7 @@
                                     "prohibition_reason",
                                     "prohibited_authority_roles",
                                     "long_context_eligible",
+                                    "task_shape_ceiling",
                                     "strong_gate_fallback_efforts",
                                     "strength_rank",
                                     "class_fit",

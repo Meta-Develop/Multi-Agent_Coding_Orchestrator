@@ -5452,7 +5452,7 @@ mod selection_schema_tests {
     }
 
     #[test]
-    fn published_selection_prior_ceiling_is_optional_nullable_and_closed() -> Result<()> {
+    fn published_selection_prior_ceiling_is_required_nullable_and_closed() -> Result<()> {
         let decision = crate::selection::select(&crate::selection::selection_test_base_input())?;
         let event = json!({
             "assignment_id": null,
@@ -5490,7 +5490,7 @@ mod selection_schema_tests {
                     .context("prior object")?
                     .remove("task_shape_ceiling");
             }
-            assert!(schemas.validate(&legacy, index).is_ok());
+            assert!(schemas.validate(&legacy, index).is_err());
             let mut nullable = event.clone();
             nullable["provenance"]["normalized_input"]["priors"]["models"][0]
                 ["task_shape_ceiling"] = serde_json::Value::Null;
