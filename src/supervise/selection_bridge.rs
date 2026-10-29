@@ -2673,6 +2673,7 @@ pub(super) fn base_selector_priors_with_terminal_worker_economics(
         .into_iter()
         .collect(),
         long_context_eligible: false,
+        task_shape_ceiling: Some(selection::TaskShapeCeiling::bounded_terminal()),
         strong_gate_fallback_efforts: BTreeSet::new(),
         strength_rank: 40,
         class_fit: vec![selection::ClassFitPrior {
@@ -3038,7 +3039,7 @@ fn constructed_selection_catalogs(
         } else if let Some(gap) = &advertised.cursor_evidence_gap {
             catalogs.push(runtime_catalog_from_unavailable_priors(
                 "cursor", gap, task, priors,
-            ));
+            )?);
         }
     }
     if runtime != SupervisorRuntime::Grok {
@@ -3160,7 +3161,7 @@ fn runtime_catalog_from_observed_models(
     let mut models = Vec::new();
     for observed_model in &observed.models {
         if let Some(catalog_model) =
-            catalog_model_from_observed(runtime, observed_model, task, priors)
+            catalog_model_from_observed(runtime, observed_model, task, priors)?
         {
             models.push(catalog_model);
         }
@@ -3199,23 +3200,28 @@ fn catalog_model_from_observed(
     observed: &ObservedModel,
     task: &TaskProfile,
     priors: &selection::PriorDataset,
-) -> Option<CatalogModel> {
+) -> Result<Option<CatalogModel>> {
     let mut supported_efforts = Vec::new();
     if let Some(raw_efforts) = &observed.supported_efforts {
         for effort in raw_efforts {
-            supported_efforts.push(selector_effort_from_str(effort)?);
+            let Some(effort) = selector_effort_from_str(effort) else {
+                return Ok(None);
+            };
+            supported_efforts.push(effort);
         }
     }
     supported_efforts.sort();
     supported_efforts.dedup();
     if supported_efforts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let capabilities = priors
+    let prior = priors
         .models
         .iter()
-        .find(|prior| prior.runtime == runtime && prior.model == observed.model_id)
+        .find(|prior| prior.runtime == runtime && prior.model == observed.model_id);
+    let mut capabilities = prior
         .map(|prior| capabilities_from_prior(prior, task))
+        .transpose()?
         .unwrap_or_else(|| CandidateCapabilities {
             task_classes: BTreeSet::new(),
             authority_roles: BTreeSet::new(),
@@ -3231,7 +3237,11 @@ fn catalog_model_from_observed(
             maximum_horizon: TaskHorizon::Long,
             long_context: false,
         });
-    Some(CatalogModel {
+    if prior.is_none() {
+        selection::effective_task_shape_ceiling(runtime, &observed.model_id, None)?
+            .constrain(&mut capabilities);
+    }
+    Ok(Some(CatalogModel {
         model: observed.model_id.clone(),
         access: Some(observed.access),
         available: match observed.access {
@@ -3244,14 +3254,13 @@ fn catalog_model_from_observed(
         },
         supported_efforts,
         capabilities,
-    })
+    }))
 }
 
-#[cfg(target_os = "linux")]
 fn capabilities_from_prior(
     prior: &selection::ModelPrior,
     task: &TaskProfile,
-) -> CandidateCapabilities {
+) -> Result<CandidateCapabilities> {
     let mut authority_roles = prior
         .authority_evidence
         .iter()
@@ -3267,7 +3276,7 @@ fn capabilities_from_prior(
     {
         authority_roles.insert(task.authority_role);
     }
-    CandidateCapabilities {
+    let mut capabilities = CandidateCapabilities {
         task_classes: prior
             .class_fit
             .iter()
@@ -3285,7 +3294,14 @@ fn capabilities_from_prior(
         maximum_context: ContextSize::Long,
         maximum_horizon: TaskHorizon::Long,
         long_context: prior.long_context_eligible,
-    }
+    };
+    selection::effective_task_shape_ceiling(
+        &prior.runtime,
+        &prior.model,
+        prior.task_shape_ceiling.as_ref(),
+    )?
+    .constrain(&mut capabilities);
+    Ok(capabilities)
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(unused_variables))]
@@ -3401,15 +3417,15 @@ fn runtime_catalog_from_unavailable_priors(
     gap: &CursorCatalogEvidenceGap,
     task: &TaskProfile,
     priors: &selection::PriorDataset,
-) -> RuntimeCatalog {
+) -> Result<RuntimeCatalog> {
     let mut models = priors
         .models
         .iter()
         .filter(|prior| prior.runtime == runtime_name)
-        .filter_map(|prior| catalog_model_from_prior(prior, task, false))
-        .collect::<Vec<_>>();
+        .filter_map(|prior| catalog_model_from_prior(prior, task, false).transpose())
+        .collect::<Result<Vec<_>>>()?;
     models.sort_by(|left, right| left.model.cmp(&right.model));
-    RuntimeCatalog {
+    Ok(RuntimeCatalog {
         runtime: runtime_name.to_string(),
         revision: format!(
             "cursor-unavailable-sha256:{}",
@@ -3417,7 +3433,7 @@ fn runtime_catalog_from_unavailable_priors(
         ),
         advertised_at: gap.observed_at_unix_millis.to_string(),
         models,
-    }
+    })
 }
 
 fn pools_for_constructed_catalogs(
@@ -3473,7 +3489,7 @@ fn runtime_catalog_from_advertised_slugs<'a>(
         if !advertised.contains(&prior.model) {
             continue;
         }
-        if let Some(model) = catalog_model_from_prior(prior, task, true) {
+        if let Some(model) = catalog_model_from_prior(prior, task, true)? {
             models.push(model);
         }
     }
@@ -3490,7 +3506,7 @@ fn catalog_model_from_prior(
     prior: &selection::ModelPrior,
     task: &TaskProfile,
     available: bool,
-) -> Option<CatalogModel> {
+) -> Result<Option<CatalogModel>> {
     let mut supported_efforts = prior
         .class_fit
         .iter()
@@ -3511,48 +3527,15 @@ fn catalog_model_from_prior(
         .collect::<Vec<_>>();
     supported_efforts.sort();
     if supported_efforts.is_empty() {
-        return None;
+        return Ok(None);
     }
-    let mut authority_roles = prior
-        .authority_evidence
-        .iter()
-        .map(|evidence| evidence.role)
-        .collect::<BTreeSet<_>>();
-    if !prior.class_fit.is_empty() {
-        authority_roles.insert(AuthorityRole::TerminalLeaf);
-    }
-    if !prior.strong_gate_fallback_efforts.is_empty()
-        && !prior
-            .prohibited_authority_roles
-            .contains(&task.authority_role)
-    {
-        authority_roles.insert(task.authority_role);
-    }
-    Some(CatalogModel {
+    Ok(Some(CatalogModel {
         model: prior.model.clone(),
         available,
         access: None,
         supported_efforts,
-        capabilities: CandidateCapabilities {
-            task_classes: prior
-                .class_fit
-                .iter()
-                .map(|class_fit| class_fit.task_class.clone())
-                .collect(),
-            authority_roles,
-            boundedness: [
-                Boundedness::TightlyBounded,
-                Boundedness::Bounded,
-                Boundedness::CrossCutting,
-            ]
-            .into_iter()
-            .collect(),
-            maximum_risk: RiskLevel::Critical,
-            maximum_context: ContextSize::Long,
-            maximum_horizon: TaskHorizon::Long,
-            long_context: prior.long_context_eligible,
-        },
-    })
+        capabilities: capabilities_from_prior(prior, task)?,
+    }))
 }
 
 pub(super) fn runtime_catalog_from_priors(
@@ -3570,69 +3553,9 @@ pub(super) fn runtime_catalog_from_priors(
         let available = catalog
             .availability(Some(&prior.model), runtime_from_name(runtime_name)?)?
             == RoleModelAvailability::Available;
-        let mut supported_efforts = prior
-            .class_fit
-            .iter()
-            .filter(|class_fit| class_fit.task_class == task.task_class)
-            .map(|class_fit| class_fit.effort)
-            .chain(
-                prior
-                    .authority_evidence
-                    .iter()
-                    .filter(|evidence| {
-                        evidence.task_class == task.task_class
-                            && evidence.role == task.authority_role
-                    })
-                    .map(|evidence| evidence.effort),
-            )
-            .chain(prior.strong_gate_fallback_efforts.iter().copied())
-            .collect::<BTreeSet<_>>()
-            .into_iter()
-            .collect::<Vec<_>>();
-        supported_efforts.sort();
-        if supported_efforts.is_empty() {
-            continue;
+        if let Some(model) = catalog_model_from_prior(prior, task, available)? {
+            models.push(model);
         }
-        let mut authority_roles = prior
-            .authority_evidence
-            .iter()
-            .map(|evidence| evidence.role)
-            .collect::<BTreeSet<_>>();
-        if !prior.class_fit.is_empty() {
-            authority_roles.insert(AuthorityRole::TerminalLeaf);
-        }
-        if !prior.strong_gate_fallback_efforts.is_empty()
-            && !prior
-                .prohibited_authority_roles
-                .contains(&task.authority_role)
-        {
-            authority_roles.insert(task.authority_role);
-        }
-        models.push(CatalogModel {
-            model: prior.model.clone(),
-            available,
-            access: None,
-            supported_efforts,
-            capabilities: CandidateCapabilities {
-                task_classes: prior
-                    .class_fit
-                    .iter()
-                    .map(|class_fit| class_fit.task_class.clone())
-                    .collect(),
-                authority_roles,
-                boundedness: [
-                    Boundedness::TightlyBounded,
-                    Boundedness::Bounded,
-                    Boundedness::CrossCutting,
-                ]
-                .into_iter()
-                .collect(),
-                maximum_risk: RiskLevel::Critical,
-                maximum_context: ContextSize::Long,
-                maximum_horizon: TaskHorizon::Long,
-                long_context: prior.long_context_eligible,
-            },
-        });
     }
     models.sort_by(|left, right| left.model.cmp(&right.model));
     let revision_material =
@@ -5208,6 +5131,186 @@ pub(super) mod tests {
             advertised,
             Some(&resolved),
         )
+    }
+
+    #[test]
+    fn cheap_lane_capabilities_cannot_be_widened_by_operator_priors() -> Result<()> {
+        let task = task_profile_for_role(AgentRole::Worker);
+        let mut priors = selector_priors_with_terminal_worker_economics()?;
+        let wide = selection::TaskShapeCeiling {
+            boundedness: [
+                Boundedness::TightlyBounded,
+                Boundedness::Bounded,
+                Boundedness::CrossCutting,
+            ]
+            .into_iter()
+            .collect(),
+            maximum_risk: RiskLevel::Critical,
+            maximum_context: ContextSize::Long,
+            maximum_horizon: TaskHorizon::Long,
+        };
+        for prior in &mut priors.models {
+            prior.task_shape_ceiling = Some(wide.clone());
+            prior.long_context_eligible = true;
+        }
+        let advertised = runtime_catalog_from_advertised_slugs(
+            "codex",
+            ["gpt-5.6-luna"],
+            "fixture".into(),
+            "2026-10-29".into(),
+            &task,
+            &priors,
+        )?;
+        let membership = runtime_catalog_from_priors("codex", &codex_catalog()?, &task, &priors)?;
+        let unavailable = runtime_catalog_from_unavailable_priors(
+            "codex",
+            &CursorCatalogEvidenceGap {
+                message: "fixture".into(),
+                observed_at_unix_millis: 1,
+            },
+            &task,
+            &priors,
+        )?;
+        for catalog in [advertised, membership, unavailable] {
+            let model = catalog
+                .models
+                .iter()
+                .find(|model| model.model == "gpt-5.6-luna")
+                .context("bounded prior catalog model")?;
+            assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+            assert_eq!(model.capabilities.maximum_context, ContextSize::Medium);
+            assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+            assert!(!model
+                .capabilities
+                .boundedness
+                .contains(&Boundedness::CrossCutting));
+            assert!(!model.capabilities.long_context);
+        }
+        let terminal = priors
+            .models
+            .iter()
+            .find(|prior| prior.model == "grok-4.6")
+            .context("terminal economics prior")?;
+        assert_eq!(
+            capabilities_from_prior(terminal, &task)?.maximum_risk,
+            RiskLevel::Medium
+        );
+        #[cfg(target_os = "linux")]
+        {
+            let observed = ObservedModel {
+                model_id: "gpt-5.6-luna".into(),
+                access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::Available,
+                supported_efforts: Some(vec!["high".into()]),
+                default_effort: Some("high".into()),
+            };
+            let model = catalog_model_from_observed("codex", &observed, &task, &priors)?
+                .context("observed bounded model")?;
+            assert_eq!(model.capabilities.maximum_risk, RiskLevel::Medium);
+            assert_eq!(model.capabilities.maximum_context, ContextSize::Medium);
+            assert_eq!(model.capabilities.maximum_horizon, TaskHorizon::Medium);
+            assert!(!model
+                .capabilities
+                .boundedness
+                .contains(&Boundedness::CrossCutting));
+            assert!(!model.capabilities.long_context);
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn account_observed_unbundled_prior_preserves_explicit_shape_ceiling() -> Result<()> {
+        let task = task_profile_for_role(AgentRole::Worker);
+        let mut priors = selector_priors_with_terminal_worker_economics()?;
+        let mut prior = priors
+            .models
+            .iter()
+            .find(|prior| prior.model == FRONTIER_PROFILE_MODEL)
+            .context("qualified prior fixture")?
+            .clone();
+        prior.model = "qualified-unbundled-fixture".into();
+        prior.long_context_eligible = true;
+        let model_id = prior.model.clone();
+        priors.models.push(prior);
+        let observed = ObservedModel {
+            model_id: model_id.clone(),
+            access: coding_agent_manager_lib::account_authority::ModelAccessOutcome::Available,
+            supported_efforts: Some(vec!["high".into()]),
+            default_effort: Some("high".into()),
+        };
+        let gap = CursorCatalogEvidenceGap {
+            message: "fixture".into(),
+            observed_at_unix_millis: 1,
+        };
+        for explicit in [true, false] {
+            if !explicit {
+                priors.models.last_mut().unwrap().task_shape_ceiling = None;
+            }
+            let account = catalog_model_from_observed("codex", &observed, &task, &priors)?
+                .context("observed qualified model")?;
+            let advertised = runtime_catalog_from_advertised_slugs(
+                "codex",
+                [model_id.as_str()],
+                "fixture".into(),
+                "2026-10-29".into(),
+                &task,
+                &priors,
+            )?;
+            let membership =
+                runtime_catalog_from_priors("codex", &codex_catalog()?, &task, &priors)?;
+            let unavailable =
+                runtime_catalog_from_unavailable_priors("codex", &gap, &task, &priors)?;
+            for catalog in [advertised, membership, unavailable] {
+                let model = catalog
+                    .models
+                    .iter()
+                    .find(|model| model.model == model_id)
+                    .context("qualified catalog model")?;
+                assert_eq!(account.capabilities, model.capabilities);
+            }
+            assert_eq!(
+                account.capabilities.maximum_risk,
+                if explicit {
+                    RiskLevel::Critical
+                } else {
+                    RiskLevel::Medium
+                }
+            );
+            assert_eq!(
+                account.capabilities.maximum_context,
+                if explicit {
+                    ContextSize::Long
+                } else {
+                    ContextSize::Medium
+                }
+            );
+            assert_eq!(
+                account.capabilities.maximum_horizon,
+                if explicit {
+                    TaskHorizon::Long
+                } else {
+                    TaskHorizon::Medium
+                }
+            );
+            assert_eq!(
+                account
+                    .capabilities
+                    .boundedness
+                    .contains(&Boundedness::CrossCutting),
+                explicit
+            );
+            assert_eq!(account.capabilities.long_context, explicit);
+        }
+        priors.models.retain(|prior| prior.model != model_id);
+        let unknown = catalog_model_from_observed("codex", &observed, &task, &priors)?
+            .context("unattributed observed model")?;
+        assert_eq!(unknown.capabilities.maximum_risk, RiskLevel::Medium);
+        assert_eq!(unknown.capabilities.maximum_context, ContextSize::Medium);
+        assert_eq!(unknown.capabilities.maximum_horizon, TaskHorizon::Medium);
+        assert!(!unknown.capabilities.long_context);
+        assert!(unknown.capabilities.task_classes.is_empty());
+        assert!(unknown.capabilities.authority_roles.is_empty());
+        Ok(())
     }
 
     fn codex_catalog() -> Result<RuntimeModelCatalog> {
@@ -7164,6 +7267,7 @@ pub(super) mod tests {
                 event_attempt: 0,
                 normalized_input_sha256: "this-run-digest".to_string(),
                 task: task.clone(),
+                assignment_shape_identity: None,
                 requested_candidate: candidate.clone(),
             }),
             requested_runtime: candidate.runtime.clone(),
@@ -11081,7 +11185,9 @@ pub(super) mod tests {
             .models
             .iter()
             .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Grok))
-            .filter_map(|prior| catalog_model_from_prior(prior, &task, false))
+            .filter_map(|prior| catalog_model_from_prior(prior, &task, false).transpose())
+            .collect::<Result<Vec<_>>>()?
+            .into_iter()
             .filter_map(|mut model| {
                 model
                     .supported_efforts

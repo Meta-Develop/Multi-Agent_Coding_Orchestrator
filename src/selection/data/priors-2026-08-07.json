@@ -1,8 +1,8 @@
 {
   "schema_version": 2,
   "dataset_id": "maco-runtime-model-effort-priors",
-  "revision": "2026-10-22.1",
-  "published_on": "2026-10-22",
+  "revision": "2026-10-29.1",
+  "published_on": "2026-10-29",
   "objective_profiles": [
     {
       "name": "accepted-task-total-cost",
@@ -30,6 +30,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": [],
       "long_context_eligible": true,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded", "cross_cutting"], "maximum_risk": "critical", "maximum_context": "long", "maximum_horizon": "long"},
       "strong_gate_fallback_efforts": ["xhigh"],
       "strength_rank": 100,
       "class_fit": [
@@ -51,6 +52,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 20,
       "class_fit": [
@@ -72,6 +74,7 @@
       "prohibition_reason": "project policy prohibits this model for every role",
       "prohibited_authority_roles": ["terminal_leaf","delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 0,
       "class_fit": [
@@ -91,6 +94,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 30,
       "class_fit": [
@@ -110,6 +114,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 25,
       "class_fit": [
@@ -129,6 +134,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 25,
       "class_fit": [
@@ -148,6 +154,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": ["delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 25,
       "class_fit": [
@@ -167,6 +174,7 @@
       "prohibition_reason": null,
       "prohibited_authority_roles": [],
       "long_context_eligible": true,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded", "cross_cutting"], "maximum_risk": "critical", "maximum_context": "long", "maximum_horizon": "long"},
       "strong_gate_fallback_efforts": ["xhigh"],
       "strength_rank": 110,
       "class_fit": [
@@ -188,6 +196,7 @@
       "prohibition_reason": "standing owner policy prohibits GPT-6 Astra (gpt-6-astra and equivalent aliases) for every role, including delegation, review, acceptance, escalation, fallback, and terminal work; no automatic expiry",
       "prohibited_authority_roles": ["terminal_leaf","delegating","acceptance_gate","review_auditor","audit","conflict_resolution","failure_classification","git_publication","unknown_judgment"],
       "long_context_eligible": false,
+      "task_shape_ceiling": {"boundedness": ["tightly_bounded", "bounded"], "maximum_risk": "medium", "maximum_context": "medium", "maximum_horizon": "medium"},
       "strong_gate_fallback_efforts": [],
       "strength_rank": 0,
       "class_fit": [],
