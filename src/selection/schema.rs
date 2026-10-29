@@ -336,6 +336,12 @@ fn model_prior() -> Value {
         "prohibition_reason" => nullable(nonempty_string()),
         "prohibited_authority_roles" => set(authority_role()),
         "long_context_eligible" => json!({"type": "boolean"}),
+        "task_shape_ceiling" => nullable(strict_object!(
+            "boundedness" => set(boundedness(false)),
+            "maximum_risk" => risk(false),
+            "maximum_context" => context_size(false),
+            "maximum_horizon" => task_horizon(false),
+        )),
         "strong_gate_fallback_efforts" => set(reasoning_effort()),
         "strength_rank" => nonnegative_integer(),
         "class_fit" => array(class_fit_prior()),
@@ -890,6 +896,28 @@ fn routing_policy_receipt() -> Value {
             "independent_groups" => nonnegative_integer(), "evidence" => array(nonempty_string()),
         ),
     )
+}
+
+pub(crate) fn accepted_task_cost_lane_schema_value(role: Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["role", "task", "assignment_shape_identity", "candidate"],
+        "properties": {
+            "role": role,
+            "task": task_profile(true),
+            "assignment_shape_identity": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["version", "sha256"],
+                "properties": {
+                    "version": {"const": 1},
+                    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+                }
+            },
+            "candidate": candidate_key()
+        }
+    })
 }
 
 pub(crate) fn selection_event_schema_value() -> Value {

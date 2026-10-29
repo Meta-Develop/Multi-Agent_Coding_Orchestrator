@@ -26,6 +26,62 @@ pub fn built_in_prior_dataset() -> Result<PriorDataset, SelectionError> {
     serde_json::from_str(BUILT_IN_PRIORS).map_err(|error| SelectionError::Data(error.to_string()))
 }
 
+fn observed_accepted_task_cost(input: &SelectionInput, candidate: &CandidateKey) -> Option<u64> {
+    let context = input.signals.accepted_task_cost_context.as_ref()?;
+    let mut matches = input
+        .signals
+        .accepted_task_cost_observations
+        .iter()
+        .filter(|observation| {
+            observation.lane.candidate == *candidate
+                && observation.lane.task == input.task
+                && observation.lane.role == context.role
+                && observation.lane.assignment_shape_identity == context.assignment_shape_identity
+        });
+    let observed = matches.next()?;
+    // Ambiguous observations cannot establish one complete cohort.
+    matches
+        .next()
+        .is_none()
+        .then_some(observed.cost_per_accepted_task_microunits)
+}
+
+/// Operator declarations can narrow bundled bounds. Wider qualification needs
+/// a separately reviewed update of the bundled capability evidence.
+pub fn effective_task_shape_ceiling(
+    runtime: &str,
+    model: &str,
+    declared: Option<&TaskShapeCeiling>,
+) -> Result<TaskShapeCeiling, SelectionError> {
+    let bundled = built_in_prior_dataset()?
+        .models
+        .into_iter()
+        .find(|prior| prior.runtime == runtime && prior.model == model)
+        .and_then(|prior| prior.task_shape_ceiling)
+        .or_else(|| {
+            (runtime == crate::optimizer::objective::DEFAULT_TERMINAL_RUNTIME
+                && model == crate::optimizer::objective::DEFAULT_TERMINAL_MODEL)
+                .then(TaskShapeCeiling::bounded_terminal)
+        });
+    Ok(match (declared, bundled) {
+        (Some(declared), Some(bundled)) => declared.intersect(&bundled),
+        (Some(declared), None) => declared.clone(),
+        (None, Some(bundled)) => bundled,
+        (None, None) => TaskShapeCeiling::bounded_terminal(),
+    })
+}
+
+fn validate_task_shape_ceiling(ceiling: &TaskShapeCeiling) -> Result<(), SelectionError> {
+    if ceiling.boundedness.contains(&Boundedness::Unknown)
+        || ceiling.maximum_risk == RiskLevel::Unknown
+        || ceiling.maximum_context == ContextSize::Unknown
+        || ceiling.maximum_horizon == TaskHorizon::Unknown
+    {
+        return invalid("task_shape_ceiling must contain only known task bounds");
+    }
+    Ok(())
+}
+
 /// Validate an operator-provided prior snapshot before it can enter a run.
 /// The selector validates the same fields again on each normalized decision.
 pub fn validate_prior_dataset(priors: &PriorDataset) -> Result<(), SelectionError> {
@@ -59,6 +115,9 @@ pub fn validate_prior_dataset(priors: &PriorDataset) -> Result<(), SelectionErro
         }
     }
     for prior in &priors.models {
+        if let Some(ceiling) = &prior.task_shape_ceiling {
+            validate_task_shape_ceiling(ceiling)?;
+        }
         validate_identifier("prior.runtime", &prior.runtime)?;
         validate_identifier("prior.model", &prior.model)?;
         validate_calendar_date("prior.observed_on", &prior.observed_on)?;
@@ -160,6 +219,23 @@ pub fn select_with_loaded_routing_policy(
     let mut normalized = input.clone();
     normalize_input(&mut normalized);
     validate_input(&normalized)?;
+    // Record the enforced bounds in replay input after rejecting malformed raw
+    // capabilities. A replay cannot widen a previously intersected catalog.
+    for catalog in &mut normalized.catalogs {
+        for model in &mut catalog.models {
+            let declared = normalized
+                .priors
+                .models
+                .iter()
+                .find(|prior| prior.runtime == catalog.runtime && prior.model == model.model);
+            effective_task_shape_ceiling(
+                &catalog.runtime,
+                &model.model,
+                declared.and_then(|prior| prior.task_shape_ceiling.as_ref()),
+            )?
+            .constrain(&mut model.capabilities);
+        }
+    }
     let mut normalized_switch_cost_evidence = switch_cost_evidence.to_vec();
     normalized_switch_cost_evidence.sort_by(|left, right| left.candidate.cmp(&right.candidate));
     validate_switch_cost_evidence(&normalized, &normalized_switch_cost_evidence)?;
@@ -734,6 +810,9 @@ fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
         }
     }
     for prior in &input.priors.models {
+        if let Some(ceiling) = &prior.task_shape_ceiling {
+            validate_task_shape_ceiling(ceiling)?;
+        }
         validate_identifier("prior.runtime", &prior.runtime)?;
         validate_identifier("prior.model", &prior.model)?;
         validate_calendar_date("prior.observed_on", &prior.observed_on)?;
@@ -1026,6 +1105,30 @@ fn evaluate_candidate(
             );
         }
     }
+    if !model
+        .capabilities
+        .boundedness
+        .contains(&input.task.boundedness)
+        || input.task.risk > model.capabilities.maximum_risk
+        || input.task.context > model.capabilities.maximum_context
+        || input.task.horizon > model.capabilities.maximum_horizon
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::TaskShapeNotAdvertised,
+            "task shape exceeds the intersected capability ceiling",
+        );
+    }
+    if input.task.context == ContextSize::Long
+        && (!model.capabilities.long_context
+            || prior.is_some_and(|prior| !prior.long_context_eligible))
+    {
+        reject(
+            &mut reasons,
+            IneligibilityCode::LongContextProhibited,
+            "candidate lacks long-context qualification",
+        );
+    }
     if let Some(receipt) = routing_policy {
         return evaluate_loaded_policy_candidate(
             input,
@@ -1057,27 +1160,6 @@ fn evaluate_candidate(
             &mut reasons,
             IneligibilityCode::UnknownJudgmentAuthority,
             "unknown judgment authority is never eligible for evidence fallback",
-        );
-    }
-    if !model
-        .capabilities
-        .boundedness
-        .contains(&input.task.boundedness)
-        || input.task.risk > model.capabilities.maximum_risk
-        || input.task.context > model.capabilities.maximum_context
-        || input.task.horizon > model.capabilities.maximum_horizon
-    {
-        reject(
-            &mut reasons,
-            IneligibilityCode::TaskShapeNotAdvertised,
-            "task shape exceeds advertised capability bounds",
-        );
-    }
-    if input.task.context == ContextSize::Long && !model.capabilities.long_context {
-        reject(
-            &mut reasons,
-            IneligibilityCode::LongContextProhibited,
-            "candidate is not eligible for long context",
         );
     }
     if !model
@@ -1119,13 +1201,6 @@ fn evaluate_candidate(
         ),
         Some(prior) => {
             strength_rank = prior.strength_rank;
-            if input.task.context == ContextSize::Long && !prior.long_context_eligible {
-                reject(
-                    &mut reasons,
-                    IneligibilityCode::LongContextProhibited,
-                    "dated prior does not establish long-context eligibility",
-                );
-            }
             let class_fit = prior.class_fit.iter().find(|class_fit| {
                 class_fit.task_class == input.task.task_class
                     && class_fit.effort == candidate.effort
@@ -1153,12 +1228,8 @@ fn evaluate_candidate(
                         );
                     }
                     expected_cost = expected_cost_per_accepted(class_fit, &ledger)?;
-                    if input.signals.previous_choice.as_ref() == Some(&candidate) {
-                        if let Some(observed) =
-                            input.signals.observed_cost_per_accepted_task_microunits
-                        {
-                            expected_cost = observed;
-                        }
+                    if let Some(observed) = observed_accepted_task_cost(input, &candidate) {
+                        expected_cost = observed;
                     }
                     expected_retry_rework_cost = expected_cost_component_per_accepted(
                         class_fit.rework_cost_microunits,

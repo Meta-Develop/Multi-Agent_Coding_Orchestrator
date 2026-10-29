@@ -322,11 +322,36 @@ pub fn run_held_out_real_provider_experiment(
     request: HeldOutRealProviderExperimentRequest,
     artifact_repo: &Path,
 ) -> Result<ExecutedExperimentResults> {
+    run_held_out_real_provider_experiment_with_dispatch(
+        manifest,
+        request,
+        artifact_repo,
+        supervise::run_held_out_production_experiment,
+    )
+}
+
+pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
+    manifest: &ExperimentManifest,
+    request: HeldOutRealProviderExperimentRequest,
+    artifact_repo: &Path,
+    mut dispatch: impl FnMut(
+        supervise::SupervisorRunOptions,
+        ParentValidationAuthority,
+        supervise::FrozenHeldOutRuntimeAllowlist,
+    ) -> Result<supervise::HeldOutProductionExperimentOutcome>,
+) -> Result<ExecutedExperimentResults> {
     manifest.validate_for_observation()?;
     refuse_incomplete_real_provider_request(&request)?;
     if manifest.held_out_validation.is_empty() {
         bail!("--execute-held-out requires at least one declared validation");
     }
+    if let Some(prior) = &request.prior_data {
+        prior.verify_source(&request.source.source_repo)?;
+    }
+    let _source_prior = super::HeldOutPriorDataInput::bind_for_repo(
+        request.prior_data.as_ref(),
+        &request.source.source_repo,
+    )?;
     refuse_caller_plan_inside_evaluated_source(
         &request.provider_plan,
         &request.source.source_repo,
@@ -336,6 +361,27 @@ pub fn run_held_out_real_provider_experiment(
         Some(&request.source.source_repo),
     )
     .map_err(|error| anyhow!("held-out production caller plan is invalid: {error}"))?;
+    if request.prior_data.is_some() {
+        for profile in &manifest.profiles {
+            for (role, selection) in &profile.role_models {
+                if let Some(model) = selection.model.as_deref() {
+                    supervise::validate_known_judgment_role_model(*role, Some(model))
+                        .with_context(|| {
+                            format!(
+                                "profile '{}' prior-data capability is invalid for {}: {model}",
+                                profile.id,
+                                role.as_str()
+                            )
+                        })?;
+                }
+            }
+            supervise::materialize_held_out_profile_effective_caller_plan_in_repo(
+                &frozen,
+                &profile.role_models,
+                Some(&request.source.source_repo),
+            )?;
+        }
+    }
     let resolved_commit = experiment::resolve_held_out_explicit_source_baseline(&request.source)
         .map_err(|error| anyhow!("held-out explicit source baseline is invalid: {error}"))?;
     let runtime_allowlist = freeze_runtime_bindings_before_reservation(&request)?;
@@ -345,6 +391,9 @@ pub fn run_held_out_real_provider_experiment(
     let run_id = artifacts::generate_run_id(&repo, family)?;
     let mut writer =
         ArtifactRunWriter::reserve(&repo, family, run_id.clone(), "evaluation-held-out")?;
+    if let Some(prior) = &request.prior_data {
+        prior.archive(&mut writer, Path::new("held-out"))?;
+    }
     writer.write_json(
         "held-out/manifest.json",
         manifest,
@@ -396,6 +445,10 @@ pub fn run_held_out_real_provider_experiment(
                 "{}-p{profile_index}-r{repetition}",
                 run_id.as_str()
             ))?;
+            let _profile_prior = super::HeldOutPriorDataInput::bind_for_repo(
+                request.prior_data.as_ref(),
+                &isolated.repo,
+            )?;
             let git = crate::git_repository::open(&isolated.repo)?;
             let baseline = git.head()?.peel_to_commit()?;
             let baseline_pair = (baseline.id().to_string(), baseline.tree_id().to_string());
@@ -422,18 +475,25 @@ pub fn run_held_out_real_provider_experiment(
                     &effective_plan_bytes,
                     ArtifactFileDisposition::PrivateEvidence,
                 )?;
+                let mut profile_binding = json!({
+                    "profile_id": profile.id,
+                    "profile_sha256": sha256_hex(&serde_json::to_vec(profile)?),
+                    "requested_role_models": profile.role_models,
+                    "caller_plan_sha256": frozen.caller_plan_sha256,
+                    "effective_plan_sha256": effective_plan_sha256,
+                    "assignment_id": frozen.assignment_id,
+                    "assigned_paths": frozen.assigned_paths,
+                    "observation": "requested",
+                });
+                if let Some(prior) = &request.prior_data {
+                    prior.archive(&mut retained, &prefix.join("requested-input"))?;
+                    profile_binding["operator_prior_data"] = json!(prior.provenance());
+                    profile_binding["supervisor_run_id"] = json!(isolated.run_id.as_str());
+                    profile_binding["repetition"] = json!(repetition);
+                }
                 retained.write_json(
                     prefix.join("requested-profile-binding.json"),
-                    &json!({
-                        "profile_id": profile.id,
-                        "profile_sha256": sha256_hex(&serde_json::to_vec(profile)?),
-                        "requested_role_models": profile.role_models,
-                        "caller_plan_sha256": frozen.caller_plan_sha256,
-                        "effective_plan_sha256": effective_plan_sha256,
-                        "assignment_id": frozen.assignment_id,
-                        "assigned_paths": frozen.assigned_paths,
-                        "observation": "requested",
-                    }),
+                    &profile_binding,
                     ArtifactFileDisposition::PrivateEvidence,
                 )?;
             }
@@ -469,11 +529,7 @@ pub fn run_held_out_real_provider_experiment(
                 request.machine_global_retention.clone(),
             );
             options.budget_max_duration_seconds = Some(manifest.limits.wall_time_seconds);
-            let outcome = supervise::run_held_out_production_experiment(
-                options,
-                authority.clone(),
-                runtime_allowlist.clone(),
-            );
+            let outcome = dispatch(options, authority.clone(), runtime_allowlist.clone());
             let (report, launch) = match outcome {
                 Ok(outcome) => (outcome.report, outcome.launch),
                 Err(error) => {

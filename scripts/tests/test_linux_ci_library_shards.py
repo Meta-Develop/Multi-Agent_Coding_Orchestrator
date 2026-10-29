@@ -684,7 +684,11 @@ class LibraryShardTests(unittest.TestCase):
                 "    marker.touch()\n"
                 "else:\n"
                 "    assert marker.exists()\n"
-                "    print('--lib' if sys.argv[2] == 'lib' else '--bin\\nmaco')\n",
+                "    if '--shard' in sys.argv:\n"
+                "        shard = sys.argv[sys.argv.index('--shard') + 1]\n"
+                "        print('--test\\nmerge_cli' if shard == 'merge' else '--bench\\ncoordination')\n"
+                "    else:\n"
+                "        print('--lib' if sys.argv[2] == 'lib' else '--bin\\nmaco')\n",
                 encoding="utf-8",
             )
             (scripts / "run-linux-all-tests-in-delegated-user-scope.sh").write_text(
@@ -703,6 +707,12 @@ class LibraryShardTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["cargo", "test", "--locked", "--bin", "maco"])
+            for shard, flags in (("merge", ["--test", "merge_cli"]), ("other", ["--bench", "coordination"])):
+                result = subprocess.run(
+                    ["bash", str(wrapper), "non-lib", shard], capture_output=True, text=True
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertEqual(result.stdout.splitlines(), ["cargo", "test", "--locked", *flags])
             for args in [["lib"], ["lib", "unknown"], ["non-lib", "rest"]]:
                 result = subprocess.run(["bash", str(wrapper), *args], capture_output=True)
                 self.assertNotEqual(result.returncode, 0)
@@ -748,15 +758,19 @@ mod supervise {
     mod assignment_execution {
         mod decomposition_tests {
             #[test] fn auditor_runtime_override_preserves_active_heterogeneous_lens_contract() {}
+            #[test] fn new_decomposition_body() {}
         }
         mod bound_parent_turn_tests {
             // Empty body verifies wrapper selection only, not evidence semantics.
             #[test] fn bound_nested_evidence_rejects_forged_widened_failed_and_cancelled_results() {}
+            #[test] fn new_bound_parent_body() {}
         }
         mod managed_parent_controller_tests {
             // Empty body verifies wrapper selection only, not worker cleanup semantics.
             #[test] fn managed_cycle_isolated_workers_overlap_and_import_exact_union() {}
+            #[test] fn new_managed_parent_body() {}
         }
+        mod nested_driver_tests { #[test] fn new_nested_body() {} }
         mod attached_parent_capture_tests {
             // Empty body verifies wrapper selection only, not real ownership semantics.
             #[test] fn attached_capture_bookkeeping_and_shutdown_errors_retain_owners() {}
@@ -767,6 +781,8 @@ mod future {
     mod autopilot { #[test] fn nested() {} }
     #[test] fn supervise_lookalike() {}
 }
+mod external_agent { #[test] fn new_external_body() {} }
+mod worktree { #[test] fn new_worktree_body() {} }
 mod process_runner {
     mod tests {
         #[test] fn gemini_online_profile_projects_only_the_trusted_resolver_file() {}
@@ -787,7 +803,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 20)
+            self.assertEqual(len(inventory), 26)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -813,7 +829,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 20', result.stdout)
+                self.assertIn('"total": 26', result.stdout)
 
 
 if __name__ == "__main__":

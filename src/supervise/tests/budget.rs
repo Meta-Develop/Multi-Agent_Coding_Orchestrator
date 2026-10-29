@@ -1026,6 +1026,167 @@ fn budget_integration_concurrent_scheduler_cannot_oversubscribe_and_drains_admit
 
 #[cfg(target_os = "linux")]
 #[test]
+fn researcher_rejected_host_evidence_never_dispatches_parent_review() {
+    for case in ["absent", "forged", "exit", "duplicate", "unfinished"] {
+        exercise_researcher_parent_review_evidence_gate(case);
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn researcher_observed_failure_still_dispatches_parent_review() {
+    exercise_researcher_parent_review_evidence_gate("advisory-failure");
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_researcher_parent_review_evidence_gate(case: &str) {
+    use crate::external_agent::codex_app_server::{
+        CommandExecutionEvidence, CommandExecutionObservation as Observation,
+        CommandExecutionObservationIssue, CommandExecutionSnapshot, CommandExecutionStatus,
+        TurnTerminalStatus,
+    };
+    use crate::mutation_taxonomy::AssignmentProcessLaunchKind as LaunchKind;
+
+    let _capability = install_budget_fixture_models();
+    let (temp, repo_path) = injected_repository();
+    let mut assignment = injected_named_assignment("research-evidence", "README.md");
+    assignment.role = AgentRole::Researcher;
+    assignment.role_category = Some(RoleCategory::ReadOnlyResearcher);
+    let mut plan = injected_plan(assignment.clone(), 1);
+    inject_priced_process_roles(&mut plan, FRONTIER_PROFILE_MODEL, 1.0);
+    plan.role_models.insert(
+        AgentRole::Researcher,
+        plan.role_models[&AgentRole::ChildOrchestrator].clone(),
+    );
+    let options = injected_options(&repo_path, temp.path(), "research-evidence-gate");
+    let _prior = bind_priced_budget_fixture_prior(&repo_path).expect("bind fixture prior");
+    let _selection = crate::supervise::scheduler::install_selected_researcher_budget_fixture(
+        &plan,
+        &options,
+        &temp,
+        priced_budget_fixture_profile().expect("authored fixture profile"),
+        1,
+    )
+    .expect("select Researcher and Auditor fixture");
+    let child_invocations = AtomicUsize::new(0);
+    let audit_invocations = AtomicUsize::new(0);
+    let runner = |command: &ExternalAgentCommand| {
+        let mut child = injected_child_report(&assignment);
+        child.role = AgentRole::Researcher;
+        let mut inspection = injected_command_record();
+        inspection.command = vec!["git status".to_string()];
+        inspection.cwd = command.cwd.clone();
+        inspection.timeout_seconds = 0;
+        inspection.duration_ms = 0;
+        child.commands_run.push(inspection);
+        child.validation_results = vec![ValidationResult {
+            name: "read-only inspection".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: vec!["git status".to_string()],
+            message: None,
+        }];
+        if case == "advisory-failure" {
+            child.status = ReviewStatus::Failed;
+            child.accepted = false;
+            child.rejected = true;
+            child.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: "inspection found an unresolved problem".to_string(),
+                paths: assignment.assigned_paths.clone(),
+            });
+        }
+        if command.assignment_process_launch_kind == Some(LaunchKind::ParentAuditor) {
+            audit_invocations.fetch_add(1, Ordering::SeqCst);
+            let mut audit = injected_auditor_report(&assignment, &child);
+            audit.id = command
+                .output_last_message
+                .file_stem()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .to_string();
+            write_injected_json(&command.output_last_message, &audit);
+            return injected_verified_run(command);
+        }
+        child_invocations.fetch_add(1, Ordering::SeqCst);
+        let mut wire = serde_json::to_value(&child).unwrap();
+        wire["read_only"] = json!(true);
+        wire["no_further_delegation"] = json!(true);
+        write_injected_json(&command.output_last_message, &wire);
+        let mut run = injected_verified_run(command);
+        let started = CommandExecutionSnapshot {
+            command: if case == "forged" {
+                "true"
+            } else {
+                "git status"
+            }
+            .to_string(),
+            cwd: command.cwd.to_string_lossy().into_owned(),
+            status: CommandExecutionStatus::InProgress,
+            exit_code: None,
+        };
+        let observation = Observation::Complete {
+            item_id: "inspection".to_string(),
+            completed: CommandExecutionSnapshot {
+                status: if case == "exit" {
+                    CommandExecutionStatus::Failed
+                } else {
+                    CommandExecutionStatus::Completed
+                },
+                exit_code: Some(i32::from(case == "exit")),
+                ..started.clone()
+            },
+            started: started.clone(),
+        };
+        let observations = match case {
+            "duplicate" => vec![observation.clone(), observation],
+            "unfinished" => vec![Observation::Incomplete {
+                item_id: "inspection".to_string(),
+                started: Some(started),
+                reason: CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
+            }],
+            _ => vec![observation],
+        };
+        if case != "absent" {
+            run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+                thread_id: assignment.id.clone(),
+                turn_id: "turn".to_string(),
+                turn_status: TurnTerminalStatus::Completed,
+                observations,
+            });
+        }
+        run
+    };
+    let report = run_supervisor_plan_with_budget_and_concurrent_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        SupervisorBudgetConfig::default(),
+        options,
+        1,
+        &runner,
+    )
+    .expect("complete Researcher evidence gate fixture");
+    assert_eq!(report.orchestrator_reports.len(), 1, "{case}: {report:#?}");
+    let child = &report.orchestrator_reports[0];
+    assert!(child.files_changed.is_empty(), "{case}: {child:#?}");
+    assert!(child_invocations.load(Ordering::SeqCst) > 0, "{case}");
+    if case == "advisory-failure" {
+        assert_eq!(audit_invocations.load(Ordering::SeqCst), 1, "{case}");
+        assert_eq!(child.audit_reports.len(), 1, "{case}: {child:#?}");
+        assert!(!report.success, "{case}: {report:#?}");
+    } else {
+        assert_eq!(audit_invocations.load(Ordering::SeqCst), 0, "{case}");
+        assert!(!report.success && child.rejected && report_failed(child));
+        assert!(child.audit_reports.is_empty(), "{case}: {child:#?}");
+        assert!(child.review_lens_aggregate.is_none(), "{case}: {child:#?}");
+        assert!(child.findings.iter().any(|finding| finding
+            .message
+            .contains("researcher host command evidence rejected")));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn budget_integration_concurrent_scheduler_waits_for_full_live_grant_and_resumes() {
     exercise_live_grant_scheduler(false);
 }

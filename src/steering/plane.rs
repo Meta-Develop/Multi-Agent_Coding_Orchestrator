@@ -43,6 +43,16 @@ struct LiveSlot {
 pub struct SteeringPlane {
     repo: PathBuf,
     live: Arc<Mutex<BTreeMap<LiveKey, LiveSlot>>>,
+    #[cfg(test)]
+    cancel_failure: Arc<Mutex<Option<(String, String, CancelFailurePoint)>>>,
+}
+
+#[cfg(test)]
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum CancelFailurePoint {
+    BeforeInspection,
+    AfterDelivery,
+    BeforeAck,
 }
 
 impl SteeringPlane {
@@ -58,6 +68,8 @@ impl SteeringPlane {
         Ok(Self {
             repo,
             live: Arc::new(Mutex::new(BTreeMap::new())),
+            #[cfg(test)]
+            cancel_failure: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -530,6 +542,12 @@ impl SteeringPlane {
                 if existing.request != request {
                     return Ok(refused_ack(&request, SteeringRefusal::DuplicateAction));
                 }
+                if existing.refusal.is_none()
+                    && existing.outcome == SteeringOutcome::Pending
+                    && matches!(request.action, SteeringAction::CancelAssignment { .. })
+                {
+                    return self.deliver_and_record(journal, &request, now_unix_ms);
+                }
                 return Ok(match existing.refusal {
                     Some(refusal) => refused_ack(&request, refusal),
                     None => accepted_ack(&request, existing.outcome),
@@ -549,67 +567,82 @@ impl SteeringPlane {
                 ),
             )?;
 
-            let delivery = self.deliver_locked(&request)?;
-            match delivery {
-                DeliveryResult::LostChild => {
-                    append_event(
-                        journal,
-                        "lost_child",
-                        &payload_for_request(
-                            "lost_child",
-                            &request,
-                            SteeringOutcome::LostChild,
-                            None,
-                            None,
-                            now_unix_ms,
-                        ),
-                    )?;
-                    Ok(accepted_ack(&request, SteeringOutcome::LostChild))
-                }
-                DeliveryResult::CancelledAndAcked => {
-                    append_event(
-                        journal,
-                        "deliver",
-                        &payload_for_request(
-                            "deliver",
-                            &request,
-                            SteeringOutcome::Delivered,
-                            None,
-                            None,
-                            now_unix_ms,
-                        ),
-                    )?;
-                    append_event(
-                        journal,
-                        "ack",
-                        &payload_for_request(
-                            "ack",
-                            &request,
-                            SteeringOutcome::Acknowledged,
-                            None,
-                            None,
-                            now_unix_ms,
-                        ),
-                    )?;
-                    Ok(accepted_ack(&request, SteeringOutcome::Acknowledged))
-                }
-                DeliveryResult::Mailbox => {
-                    append_event(
-                        journal,
-                        "deliver",
-                        &payload_for_request(
-                            "deliver",
-                            &request,
-                            SteeringOutcome::Delivered,
-                            None,
-                            None,
-                            now_unix_ms,
-                        ),
-                    )?;
-                    Ok(accepted_ack(&request, SteeringOutcome::Delivered))
-                }
-            }
+            self.deliver_and_record(journal, &request, now_unix_ms)
         })
+    }
+
+    fn deliver_and_record(
+        &self,
+        journal: &mut crate::state_journal::AuthenticatedStateJournal<
+            crate::steering::evidence::SteeringJournalSpec,
+        >,
+        request: &SteeringRequest,
+        now_unix_ms: u64,
+    ) -> Result<SteeringDecision> {
+        let delivery = self.deliver_locked(request)?;
+        #[cfg(test)]
+        self.fail_cancel_at(request, CancelFailurePoint::AfterDelivery)?;
+        match delivery {
+            DeliveryResult::LostChild => {
+                append_event(
+                    journal,
+                    "lost_child",
+                    &payload_for_request(
+                        "lost_child",
+                        request,
+                        SteeringOutcome::LostChild,
+                        None,
+                        None,
+                        now_unix_ms,
+                    ),
+                )?;
+                Ok(accepted_ack(request, SteeringOutcome::LostChild))
+            }
+            DeliveryResult::CancelledAndAcked => {
+                append_event(
+                    journal,
+                    "deliver",
+                    &payload_for_request(
+                        "deliver",
+                        request,
+                        SteeringOutcome::Delivered,
+                        None,
+                        None,
+                        now_unix_ms,
+                    ),
+                )?;
+                #[cfg(test)]
+                self.fail_cancel_at(request, CancelFailurePoint::BeforeAck)?;
+                append_event(
+                    journal,
+                    "ack",
+                    &payload_for_request(
+                        "ack",
+                        request,
+                        SteeringOutcome::Acknowledged,
+                        None,
+                        None,
+                        now_unix_ms,
+                    ),
+                )?;
+                Ok(accepted_ack(request, SteeringOutcome::Acknowledged))
+            }
+            DeliveryResult::Mailbox => {
+                append_event(
+                    journal,
+                    "deliver",
+                    &payload_for_request(
+                        "deliver",
+                        request,
+                        SteeringOutcome::Delivered,
+                        None,
+                        None,
+                        now_unix_ms,
+                    ),
+                )?;
+                Ok(accepted_ack(request, SteeringOutcome::Delivered))
+            }
+        }
     }
 
     fn record_refusal(
@@ -654,6 +687,8 @@ impl SteeringPlane {
 
     fn deliver_locked(&self, request: &SteeringRequest) -> Result<DeliveryResult> {
         if matches!(request.action, SteeringAction::CancelAssignment { .. }) {
+            #[cfg(test)]
+            self.fail_cancel_at(request, CancelFailurePoint::BeforeInspection)?;
             if let Some(cancellation) =
                 self.live_cancellation(&request.run_id, &request.assignment_id)?
             {
@@ -673,6 +708,28 @@ impl SteeringPlane {
             }
         }
         Ok(DeliveryResult::Mailbox)
+    }
+
+    #[cfg(test)]
+    pub(super) fn inject_cancel_failure(
+        &self,
+        request: &SteeringRequest,
+        point: CancelFailurePoint,
+    ) {
+        *self.cancel_failure.lock().expect("cancel failure lock") =
+            Some((request.run_id.clone(), request.action_id.clone(), point));
+    }
+
+    #[cfg(test)]
+    fn fail_cancel_at(&self, request: &SteeringRequest, point: CancelFailurePoint) -> Result<()> {
+        let mut failure = self.cancel_failure.lock().expect("cancel failure lock");
+        if failure.as_ref() == Some(&(request.run_id.clone(), request.action_id.clone(), point))
+            && matches!(request.action, SteeringAction::CancelAssignment { .. })
+        {
+            *failure = None;
+            bail!("injected cancellation delivery failure");
+        }
+        Ok(())
     }
 
     fn live_cancellation(

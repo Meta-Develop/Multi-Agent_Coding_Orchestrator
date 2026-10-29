@@ -3742,6 +3742,7 @@ mod executed_experiment;
 mod executed_measurements;
 mod executed_summary;
 mod experiment;
+mod prior_input;
 pub use crate::merge::held_out::{CommandObservation, CommandObservationStatus};
 pub use crate::supervise::held_out::{
     HeldOutCandidateEvidence, HeldOutCommandEvidence, HeldOutRunBinding,
@@ -3766,6 +3767,7 @@ pub use executed_summary::{
     EXECUTED_SUMMARY_SCHEMA_VERSION, MISSING_PARENT_REVIEW_PRODUCER_NOTICE,
     QUALIFIED_ACCEPTED_TASK_FRACTION_LABEL,
 };
+pub use prior_input::HeldOutPriorDataInput;
 pub mod rescore;
 pub use experiment::{
     parse_canonical_full_commit_oid, parse_experiment_manifest,

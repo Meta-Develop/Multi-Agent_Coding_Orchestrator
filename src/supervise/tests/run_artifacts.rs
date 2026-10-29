@@ -529,6 +529,7 @@ fn finalized_artifacts_round_trip_typed_context_switch_selection_evidence() {
         selection_decisions: vec![event],
         assignment_selection_ledger,
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,
@@ -772,6 +773,7 @@ fn finalized_artifacts_round_trip_live_four_arm_router_and_oscillation_alarm() {
             SupervisorRuntime::Codex,
         ),
         accepted_task_cost: None,
+        accepted_task_cost_cohorts: None,
         usage: SupervisorExecutionUsageReport {
             total_usage: None,
             total_cost_usd: None,
@@ -2001,6 +2003,9 @@ fn supervise_writer_discards_reusable_invocation_scratches_and_finalizes_private
         &artifacts.report_path,
         Duration::from_secs(1),
     );
+    let mut command =
+        command.with_agent_lifecycle(&repo_path, "child_orchestrator", run_id.as_str(), "child-a");
+    command.assignment_process_launch_attempt = Some(1);
     let external_run = deterministic_fake_run(&command, child_bytes.clone());
     import_external_attempt_evidence(
         &mut writer,
@@ -2077,6 +2082,13 @@ fn attempted_unverified_target_preserves_both_scratches_and_has_no_marker() {
         serde_json::to_vec(&injected_child_report(&assignment)).expect("serialize report");
     fs::write(&artifacts.report_path, &child_bytes).expect("write incoming report");
     fs::write(&artifacts.log_path, b"unverified capture\n").expect("write capture");
+    let mut command = command.with_agent_lifecycle(
+        &repo_path,
+        "child_orchestrator",
+        "artifact-unverified-target",
+        "child-unverified",
+    );
+    command.assignment_process_launch_attempt = Some(1);
     let mut run = deterministic_fake_run(&command, child_bytes);
     run.program_trust = ExternalProgramTrust::TrustedSystemCodex;
     run.process_tree = Some(ProcessTreeEvidence::Unverified(

@@ -4,6 +4,7 @@
 mod binding;
 mod document;
 mod incarnation;
+mod launch_operation;
 mod lock;
 mod observe;
 mod operation;
@@ -20,6 +21,7 @@ pub mod test_worker;
 
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
+pub use launch_operation::{LaunchOperationState, LaunchOperationStatus};
 pub use observe::{
     validate_observed_models, validate_observed_models_for_binding, AccountObserveRequest,
     AccountObserveResult, AuthObservation, CategoryObservation, ModelAccessBasis,
@@ -34,8 +36,8 @@ pub use operation::{
 pub use protocol::{
     authority_id_for, decode_request, dispatch, map_core_error, AuthorityContext,
     AuthorityResponse, DecodedRequest, ErrorCode, LoginPort, ProtocolBounds, ProtocolFailure,
-    ADVERTISED_OPERATIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES, PROTOCOL_VERSION,
-    REQUEST_IO_DEADLINE,
+    ResponseValidationError, ADVERTISED_OPERATIONS, MAX_REQUEST_BYTES, MAX_RESPONSE_BYTES,
+    PROTOCOL_VERSION, REQUEST_IO_DEADLINE,
 };
 pub use registry::StoredAccountRegistry;
 pub use server::{

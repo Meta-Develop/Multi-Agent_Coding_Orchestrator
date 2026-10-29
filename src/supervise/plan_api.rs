@@ -133,6 +133,7 @@ fn validate_execution_target_pre_dispatch(
     loaded: &LoadedSupervisorPlan,
     allow_primary_worktree: bool,
 ) -> Result<()> {
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
     validate_execution_target_opt_in(
         loaded.plan_metadata.execution_target.as_ref(),
         allow_primary_worktree,
@@ -143,7 +144,9 @@ pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<SupervisorPlan> {
-    Ok(supervisor_plan_and_consultant_from_task_file(repo, task_file)?.plan)
+    let loaded = supervisor_plan_and_consultant_from_task_file(repo, task_file)?;
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
+    Ok(loaded.plan)
 }
 
 pub fn supervisor_plan_from_goal_spec(
@@ -3638,14 +3641,18 @@ fn normalized_report_fragment_ids(
 }
 
 pub fn load_supervisor_plan_file(path: impl AsRef<Path>) -> Result<SupervisorPlan> {
-    Ok(load_supervisor_plan_file_with_consultant(path, None)?.plan)
+    let loaded = load_supervisor_plan_file_with_consultant(path, None)?;
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
+    Ok(loaded.plan)
 }
 
 pub(crate) fn load_supervisor_plan_file_in_repo(
     path: impl AsRef<Path>,
     repo: impl AsRef<Path>,
 ) -> Result<SupervisorPlan> {
-    Ok(load_supervisor_plan_file_with_consultant(path, Some(repo.as_ref()))?.plan)
+    let loaded = load_supervisor_plan_file_with_consultant(path, Some(repo.as_ref()))?;
+    assignment_executor::validate_assignment_executors_pre_dispatch(&loaded.assignment_metadata)?;
+    Ok(loaded.plan)
 }
 
 pub(super) fn load_supervisor_plan_file_with_consultant(
@@ -3697,6 +3704,7 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
     bind_assignment_role_categories(&mut plan);
     validate_task_routing_assessment_binding(&plan, &plan_metadata)?;
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
+    validate_authored_check_metadata(&plan, &assignment_metadata)?;
     validate_consultant_plan(&consultant)?;
     Ok(LoadedSupervisorPlan {
         plan,
@@ -4377,6 +4385,19 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        assignment_executor::parse_assignment_executor(
+            raw_assignment,
+            &assignment.id,
+            None,
+            metadata_by_worker,
+        )?;
+        if let Some(raw_checks) = raw_assignment.get("authored_independent_checks") {
+            let checks = serde_json::from_value(raw_checks.clone())
+                .context("invalid authored_independent_checks")?;
+            metadata_by_worker
+                .authored_independent_checks
+                .insert(assignment.id.clone(), checks);
+        }
         if let Some(raw_inputs) = raw_assignment.get("source_inputs") {
             use crate::external_agent::researcher_inputs::{
                 validate_declarations, ResearcherSourceInput,
@@ -4420,6 +4441,9 @@ fn collect_assignment_metadata(
             .map(Vec::as_slice)
             .unwrap_or_default();
         for raw_worker in raw_workers {
+            if raw_worker.get("authored_independent_checks").is_some() {
+                bail!("authored_independent_checks must be declared on the parent assignment");
+            }
             if raw_worker.get("source_inputs").is_some() {
                 bail!("source_inputs cannot be delegated to nested Workers");
             }
@@ -4431,6 +4455,12 @@ fn collect_assignment_metadata(
             let Some(worker) = workers_by_id.get(raw_worker_id).copied() else {
                 continue;
             };
+            assignment_executor::parse_assignment_executor(
+                raw_worker,
+                &assignment.id,
+                Some(&worker.id),
+                metadata_by_worker,
+            )?;
             let mut metadata: WorkerAssignmentMetadata = serde_json::from_value(raw_worker.clone())
                 .with_context(|| {
                     format!(
@@ -4501,6 +4531,7 @@ pub(super) fn supervisor_plan_value(
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<Value> {
     validate_task_routing_assessment_binding(plan, plan_metadata)?;
+    validate_authored_check_metadata(plan, assignment_metadata)?;
     let mut value =
         serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
     operator_pricing::write_plan_value(&mut value, plan, plan_metadata)?;
@@ -4509,6 +4540,24 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        assignment_executor::serialize_assignment_executor(
+            assignment_value,
+            &assignment.id,
+            None,
+            assignment_metadata,
+        )?;
+        if let Some(checks) = assignment_metadata
+            .authored_independent_checks
+            .get(&assignment.id)
+        {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment is not an object")?
+                .insert(
+                    "authored_independent_checks".into(),
+                    serde_json::to_value(checks)?,
+                );
+        }
         if let Some(inputs) = assignment_metadata.source_inputs.get(&assignment.id) {
             assignment_value
                 .as_object_mut()
@@ -4540,6 +4589,12 @@ pub(super) fn supervisor_plan_value(
             .and_then(Value::as_array_mut)
             .context("normalized worker_assignments did not serialize to an array")?;
         for (worker_value, worker) in workers.iter_mut().zip(&assignment.worker_assignments) {
+            assignment_executor::serialize_assignment_executor(
+                worker_value,
+                &assignment.id,
+                Some(&worker.id),
+                assignment_metadata,
+            )?;
             if let Some(fragments) = plan_metadata
                 .spec_fragment_ids_by_assignment
                 .get(&worker.id)

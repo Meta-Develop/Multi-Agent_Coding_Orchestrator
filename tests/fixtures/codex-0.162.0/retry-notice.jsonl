@@ -1,0 +1,1 @@
+{"method":"error","params":{"error":{"message":"Reconnecting... 2/5","codexErrorInfo":{"responseStreamDisconnected":{"httpStatusCode":null}},"additionalDetails":"workspace routing discovery unauthorized (401)","misalignment":null},"willRetry":true,"threadId":"thread-1","turnId":"turn-1"},"emittedAtMs":1793253072850}

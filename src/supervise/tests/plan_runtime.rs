@@ -1,5 +1,23 @@
 use super::*;
 
+fn operator_pricing_fields(value: &Value) -> Value {
+    Value::Object(
+        [
+            "pricing_contract",
+            "pricing_plan_id",
+            "model_pricing",
+            "pricing_binding",
+        ]
+        .into_iter()
+        .filter_map(|field| {
+            value
+                .get(field)
+                .map(|value| (field.to_owned(), value.clone()))
+        })
+        .collect(),
+    )
+}
+
 #[test]
 fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
     let mut plan = injected_plan(injected_assignment(false), 0);
@@ -31,11 +49,30 @@ fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
     compiler.add_resource(url, schema).unwrap();
     let mut schemas = boon::Schemas::new();
     let index = compiler.compile(url, &mut schemas).unwrap();
-    schemas.validate(&document, index).unwrap();
-    schemas.validate(&normalized, index).unwrap();
+    schemas
+        .validate(&operator_pricing_fields(&document), index)
+        .unwrap();
+    schemas
+        .validate(&operator_pricing_fields(&normalized), index)
+        .unwrap();
+    schemas.validate(&json!({}), index).unwrap();
+    let mut unknown_field = operator_pricing_fields(&document);
+    unknown_field["unexpected"] = json!(true);
+    assert!(schemas.validate(&unknown_field, index).is_err());
+    for fixture in [
+        include_str!("../../../fixtures/schemas/operator-pricing-plan-v1.valid.json"),
+        include_str!("../../../fixtures/schemas/operator-pricing-plan-zero-v1.valid.json"),
+    ] {
+        let mut fixture_plan: SupervisorPlan = serde_json::from_str(fixture).unwrap();
+        assert!(operator_pricing::load(fixture, &mut fixture_plan)
+            .unwrap()
+            .is_some());
+    }
     let mut invalid = document.clone();
     invalid["pricing_contract"]["unexpected"] = json!(true);
-    assert!(schemas.validate(&invalid, index).is_err());
+    assert!(schemas
+        .validate(&operator_pricing_fields(&invalid), index)
+        .is_err());
     assert!(parse_supervisor_plan_with_consultant(&invalid.to_string()).is_err());
 
     for duplicate in [
@@ -91,7 +128,7 @@ fn operator_contract_frozen_bytes_and_resume_reject_mutation_expiry_and_scope() 
     let archived_schema = writer
         .read_authenticated(
             Path::new("schemas/operator-pricing-plan-v1.schema.json"),
-            MAX_SUPERVISOR_REPORT_BYTES as usize,
+            MAX_SUPERVISOR_REPORT_BYTES,
         )
         .unwrap();
     assert_eq!(
@@ -1393,6 +1430,251 @@ fn assignment_reasoning_effort_round_trips_and_rejects_unknown_values() {
         format!("{error:#}").contains("reasoning_effort is invalid"),
         "unexpected rejection: {error:#}"
     );
+}
+
+fn ssh_executor_selection_json() -> Value {
+    json!({
+        "kind": "ssh",
+        "target": {
+            "host_id": "build-host",
+            "endpoint": "build.example.invalid",
+            "user": "runner",
+            "port": 22,
+            "helper": "/usr/libexec/maco-helper",
+            "root": "/srv/maco"
+        }
+    })
+}
+
+fn executor_plan_digest(loaded: &LoadedSupervisorPlan) -> String {
+    normalized_supervisor_plan_sha256(
+        &loaded.plan,
+        &loaded.consultant,
+        &loaded.assignment_metadata,
+        &loaded.plan_metadata,
+    )
+    .expect("bind executor plan")
+}
+
+#[test]
+fn assignment_executor_omission_and_explicit_local_preserve_plan_binding() {
+    let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
+    let omitted = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+    assert_eq!(
+        omitted.assignment_metadata.executor("child-a", None),
+        ExecutorSelection::Local
+    );
+    let normalized = supervisor_plan_value(
+        &omitted.plan,
+        &omitted.consultant,
+        &omitted.assignment_metadata,
+        &omitted.plan_metadata,
+    )
+    .unwrap();
+    assert!(normalized["assignments"][0].get("executor").is_none());
+    document["assignments"][0]["executor"] = json!({"kind": "local"});
+    let explicit = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+    assert_eq!(explicit, omitted);
+    assert_eq!(
+        executor_plan_digest(&explicit),
+        executor_plan_digest(&omitted)
+    );
+    assignment_executor::validate_assignment_executors_pre_dispatch(&explicit.assignment_metadata)
+        .expect("Local remains admitted");
+}
+
+#[test]
+fn explicit_ssh_selection_roundtrips_and_never_falls_back() {
+    let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
+    let local = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+    document["assignments"][0]["executor"] = ssh_executor_selection_json();
+    let remote = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+    let normalized = supervisor_plan_value(
+        &remote.plan,
+        &remote.consultant,
+        &remote.assignment_metadata,
+        &remote.plan_metadata,
+    )
+    .unwrap();
+    assert_eq!(
+        normalized["assignments"][0]["executor"],
+        ssh_executor_selection_json()
+    );
+    assert_eq!(
+        parse_supervisor_plan_with_consultant(&normalized.to_string()).unwrap(),
+        remote
+    );
+    let digest = executor_plan_digest(&remote);
+    assert_ne!(digest, executor_plan_digest(&local));
+    for (field, replacement) in [
+        ("host_id", json!("other-host")),
+        ("endpoint", json!("other.example.invalid")),
+        ("user", json!("other-runner")),
+        ("port", json!(2222)),
+        ("helper", json!("/opt/maco-helper")),
+        ("root", json!("/srv/other")),
+    ] {
+        let mut changed = document.clone();
+        changed["assignments"][0]["executor"]["target"][field] = replacement;
+        let loaded = parse_supervisor_plan_with_consultant(&changed.to_string()).unwrap();
+        assert_ne!(digest, executor_plan_digest(&loaded), "unbound {field}");
+    }
+
+    let temp = tempfile::tempdir().unwrap();
+    let repo = temp.path().join("uncreated-repository");
+    let options = injected_options(&repo, temp.path(), "ssh-must-not-launch");
+    let error = run_supervisor_plan_with_runner_and_creation(
+        remote,
+        options,
+        1,
+        SupervisorExecutionRuntime::Verified,
+        SupervisorWorktreeCreation::ExistingOnly,
+        Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        &|_, _, _| panic!("SSH selection must never reach the local runner"),
+    )
+    .expect_err("SSH must refuse before repository preparation or launch");
+    let diagnostic = format!("{error:#}");
+    for expected in [
+        "child-a",
+        "build-host",
+        "unknown or untrusted",
+        "production executor bridge",
+        "without Local fallback",
+    ] {
+        assert!(diagnostic.contains(expected), "{diagnostic}");
+    }
+    assert!(
+        !repo.exists(),
+        "refusal must precede worktree/artifact creation"
+    );
+}
+
+#[test]
+fn assignment_executor_rejects_unknown_kinds_and_invalid_ssh_targets() {
+    let mut invalid = vec![
+        Value::Null,
+        json!("ssh"),
+        json!({"kind": "unknown"}),
+        json!({"kind": "local", "target": {}}),
+        json!({"kind": "ssh"}),
+        json!({"kind": "ssh", "target": "unknown-host"}),
+    ];
+    for (field, replacement) in [
+        ("host_id", json!("")),
+        ("endpoint", json!("-option")),
+        ("endpoint", json!("host;command")),
+        ("user", json!("-option")),
+        ("port", json!(0)),
+        ("root", json!("/srv/../other")),
+        ("helper", json!("relative/helper")),
+        ("identity_file", json!("/private/key")),
+        ("known_hosts_file", json!("/private/hosts")),
+    ] {
+        let mut selection = ssh_executor_selection_json();
+        selection["target"][field] = replacement;
+        invalid.push(selection);
+    }
+    for selection in invalid {
+        let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
+        document["assignments"][0]["executor"] = selection.clone();
+        parse_supervisor_plan_with_consultant(&document.to_string())
+            .expect_err(&format!("invalid executor accepted: {selection}"));
+    }
+}
+
+#[test]
+fn ssh_executor_cannot_be_erased_by_plan_only_loaders() {
+    let temp = tempfile::tempdir().unwrap();
+    Repository::init(temp.path()).unwrap();
+    let plan_file = temp.path().join("plan.json");
+    let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
+    document["assignments"][0]["executor"] = ssh_executor_selection_json();
+    fs::write(&plan_file, document.to_string()).unwrap();
+    for result in [
+        load_supervisor_plan_file(&plan_file),
+        load_supervisor_plan_file_in_repo(&plan_file, temp.path()),
+        supervisor_plan_from_task_file(temp.path(), &plan_file),
+    ] {
+        let error = result.expect_err("plan-only API must not discard SSH selection");
+        assert!(format!("{error:#}").contains("without Local fallback"));
+    }
+    let normalized = supervisor_plan_document_from_task_file(temp.path(), &plan_file)
+        .expect("document API preserves selection without granting launch authority");
+    assert_eq!(
+        normalized["assignments"][0]["executor"],
+        ssh_executor_selection_json()
+    );
+}
+
+#[test]
+fn recursive_and_nested_worker_executors_remain_bound_and_fail_closed() {
+    let source = json!({
+        "version": 1, "task": "recursive executor selection", "max_depth": 3,
+        "max_child_assignments": 2,
+        "assignments": [{
+            "id": "parent", "phase": "execution", "assigned_paths": ["src/root.rs"],
+            "worker_assignments": [{"id": "worker", "assigned_paths": ["src/root.rs"]}],
+            "authored_independent_checks": [{
+                "worker_id": "worker", "assigned_paths": ["src/root.rs"],
+                "check_path": "checks/check_root.py",
+                "argv": ["/usr/bin/python3", "-I", "-B", "checks/check_root.py"]
+            }],
+            "child_assignments": [{
+                "id": "child", "phase": "execution", "assigned_paths": ["src/child.rs"],
+                "worker_assignments": []
+            }]
+        }]
+    });
+    let local = parse_supervisor_plan_with_consultant(&source.to_string()).unwrap();
+    for nested_worker in [false, true] {
+        let mut document = source.clone();
+        let (owner, worker) = if nested_worker {
+            document["assignments"][0]["worker_assignments"][0]["executor"] =
+                ssh_executor_selection_json();
+            ("parent", Some("worker"))
+        } else {
+            document["assignments"][0]["child_assignments"][0]["executor"] =
+                ssh_executor_selection_json();
+            ("child", None)
+        };
+        let loaded = parse_supervisor_plan_with_consultant(&document.to_string()).unwrap();
+        assert!(loaded
+            .assignment_metadata
+            .executor(owner, worker)
+            .ssh_target()
+            .is_some());
+        assert_eq!(
+            loaded.assignment_metadata.executor("parent", None),
+            ExecutorSelection::Local
+        );
+        assert_ne!(executor_plan_digest(&loaded), executor_plan_digest(&local));
+        let normalized = supervisor_plan_value(
+            &loaded.plan,
+            &loaded.consultant,
+            &loaded.assignment_metadata,
+            &loaded.plan_metadata,
+        )
+        .unwrap();
+        assert_eq!(
+            normalized["assignments"][0]["authored_independent_checks"],
+            source["assignments"][0]["authored_independent_checks"]
+        );
+        let reparsed = parse_supervisor_plan_with_consultant(&normalized.to_string()).unwrap();
+        assert_eq!(reparsed, loaded);
+        assert_eq!(
+            executor_plan_digest(&reparsed),
+            executor_plan_digest(&loaded)
+        );
+        assignment_executor::validate_assignment_executors_pre_dispatch(
+            &reparsed.assignment_metadata,
+        )
+        .expect_err("nested SSH must also refuse");
+        let mut retained = loaded.assignment_metadata.clone();
+        retained.retain_assignment(owner);
+        assert_eq!(retained.executors, loaded.assignment_metadata.executors);
+        retained.retain_assignment("unrelated");
+        assert!(retained.executors.is_empty());
+    }
 }
 
 #[test]
