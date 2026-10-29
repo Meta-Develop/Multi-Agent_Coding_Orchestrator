@@ -7822,6 +7822,7 @@ fn run_external_agent_runtime(
         match ValidatedCodexAuth::load_for_command_with_admission(
             spec,
             started.checked_add(spec.timeout).unwrap_or(started),
+            #[cfg(target_os = "linux")]
             &mut report.stdout.run_metadata.launch_lifecycle_handle,
         ) {
             Ok(auth) => auth,

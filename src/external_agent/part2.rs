@@ -5999,11 +5999,12 @@ struct ValidatedCodexAuth {
 }
 
 impl ValidatedCodexAuth {
-    #[cfg(test)]
+    #[cfg(all(test, target_os = "linux"))]
     fn load_for_command(spec: &ExternalAgentCommand) -> Result<Option<Self>> {
         Self::load_for_command_with_admission(
             spec,
             Instant::now() + Duration::from_secs(120),
+            #[cfg(target_os = "linux")]
             &mut None,
         )
     }
@@ -6011,10 +6012,10 @@ impl ValidatedCodexAuth {
     fn load_for_command_with_admission(
         spec: &ExternalAgentCommand,
         deadline: Instant,
-        lifecycle: &mut Option<LaunchLifecycleHandle>,
+        #[cfg(target_os = "linux")] lifecycle: &mut Option<LaunchLifecycleHandle>,
     ) -> Result<Option<Self>> {
         #[cfg(not(target_os = "linux"))]
-        let _ = (deadline, &lifecycle);
+        let _ = deadline;
         let observed = spec.agent_lifecycle.as_ref().and_then(|identity| {
             crate::account_authority::codex_run_account_binding(&identity.run_id)
         });

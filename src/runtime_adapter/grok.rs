@@ -9,10 +9,12 @@
 //! list or infer authority from a model name.
 
 use super::AdapterId;
+#[cfg(target_os = "linux")]
+use crate::process_runner::run_process;
 use crate::{
     artifacts::state_auth::sha256_hex,
     process_runner::{
-        run_process, EnvironmentMode, ExternalGrokProfile, ProcessSpec, ProcessTreeEvidence,
+        EnvironmentMode, ExternalGrokProfile, ProcessSpec, ProcessTreeEvidence,
         SideEffectConfinementEvidence, SideEffectConfinementProfile,
         SideEffectConfinementProfileKind, StdinMode,
     },
@@ -1914,9 +1916,18 @@ fn run_screened_grok_catalog_command(
 fn run_screened_grok_catalog_process(
     process_spec: ProcessSpec,
 ) -> Result<GrokCatalogCommandOutput> {
-    run_screened_grok_catalog_process_with_custody(process_spec, None)
+    #[cfg(target_os = "linux")]
+    {
+        run_screened_grok_catalog_process_with_custody(process_spec, None)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = process_spec;
+        bail!("Grok catalog confinement requires Linux");
+    }
 }
 
+#[cfg(target_os = "linux")]
 fn run_screened_grok_catalog_process_with_custody(
     process_spec: ProcessSpec,
     custody: Option<
@@ -1969,6 +1980,7 @@ pub(crate) fn with_catalog_process_result_for_test<T>(
     run()
 }
 
+#[cfg(target_os = "linux")]
 fn run_grok_catalog_process(
     spec: ProcessSpec,
 ) -> Result<crate::process_runner::ProcessOutput, crate::process_runner::ProcessRunError> {
