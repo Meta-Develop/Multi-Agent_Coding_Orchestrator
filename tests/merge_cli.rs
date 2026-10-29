@@ -1282,6 +1282,7 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
         .context("edit worktree")?;
     let runtime_root = candidate_validation_runtime_root()?;
     let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
+    let preview_started = Instant::now();
     let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
         "merge",
         "apply",
@@ -1295,14 +1296,19 @@ fn merge_apply_revalidates_clean_committed_primary_after_candidate_validation() 
         "--force-stale-base",
         "--json",
     ])?;
+    let readiness_budget = candidate_validation_readiness_budget(preview_started.elapsed());
     let mut apply = Command::new(BIN)
         .args(apply_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("start merge apply")?;
-    let validation_sandbox =
-        wait_for_candidate_validation_ready(&mut apply, &runtime_root, &existing_runtime_entries)?;
+    let validation_sandbox = wait_for_candidate_validation_ready(
+        &mut apply,
+        &runtime_root,
+        &existing_runtime_entries,
+        readiness_budget,
+    )?;
 
     fs::write(
         repo_path.join("src/lib.rs"),
@@ -1424,6 +1430,7 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
     let runtime_root = candidate_validation_runtime_root()?;
     let existing_runtime_entries = candidate_validation_runtime_entries(&runtime_root)?;
 
+    let preview_started = Instant::now();
     let (apply_args, _review_directory) = bind_reviewed_preview_if_needed(&[
         "merge",
         "apply",
@@ -1436,14 +1443,19 @@ fn pr_publish_cannot_run_while_merge_apply_validates_candidate() -> Result<()> {
         PAUSED_CANDIDATE_VALIDATION_COMMAND,
         "--json",
     ])?;
+    let readiness_budget = candidate_validation_readiness_budget(preview_started.elapsed());
     let mut apply = Command::new(BIN)
         .args(apply_args)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .context("start merge apply")?;
-    let validation_sandbox =
-        wait_for_candidate_validation_ready(&mut apply, &runtime_root, &existing_runtime_entries)?;
+    let validation_sandbox = wait_for_candidate_validation_ready(
+        &mut apply,
+        &runtime_root,
+        &existing_runtime_entries,
+        readiness_budget,
+    )?;
 
     let publish = Command::new(BIN)
         .args([
@@ -2771,15 +2783,31 @@ fn candidate_validation_runtime_entries(runtime_root: &Path) -> Result<BTreeSet<
         .collect()
 }
 
+fn candidate_validation_readiness_budget(preview_elapsed: Duration) -> Duration {
+    // Apply repeats two preview captures, then materializes and captures matching sandbox
+    // integrity snapshots before dispatching validation. Use four observed preview durations
+    // to cover that work on slow runners, retaining the fast-host floor and a finite ceiling
+    // equal to the validation command's own ten-minute timeout. Production budgets are unchanged.
+    preview_elapsed
+        .saturating_mul(4)
+        .clamp(Duration::from_secs(30), Duration::from_secs(600))
+}
+
 fn wait_for_candidate_validation_ready(
     apply: &mut Child,
     runtime_root: &Path,
     existing_runtime_entries: &BTreeSet<OsString>,
+    budget: Duration,
 ) -> Result<PathBuf> {
-    let result = (|| {
-        let prefix = format!("maco-candidate-validation-{}-", apply.id());
-        let deadline = Instant::now() + Duration::from_secs(30);
-        loop {
+    let apply_pid = apply.id();
+    let prefix = format!("maco-candidate-validation-{apply_pid}-");
+    let result = wait_for_candidate_validation_ready_with_clock(
+        apply_pid,
+        budget,
+        || {
+            if let Some(status) = apply.try_wait().context("poll merge apply")? {
+                bail!("merge apply exited with {status} before candidate validation became ready");
+            }
             let mut matches = Vec::new();
             for name in candidate_validation_runtime_entries(runtime_root)? {
                 if existing_runtime_entries.contains(&name)
@@ -2802,30 +2830,122 @@ fn wait_for_candidate_validation_ready(
             if matches.len() > 1 {
                 anyhow::bail!(
                     "found multiple fresh candidate validation sandboxes for apply pid {}",
-                    apply.id()
+                    apply_pid
                 );
             }
             if let Some(sandbox) = matches.pop() {
                 if fs::symlink_metadata(sandbox.join("validation-ready"))
                     .is_ok_and(|metadata| metadata.file_type().is_file())
                 {
-                    return Ok(sandbox);
+                    return Ok(Some(sandbox));
                 }
             }
-            if Instant::now() >= deadline {
-                anyhow::bail!(
-                    "candidate validation sandbox for apply pid {} did not become ready before timeout",
-                    apply.id()
-                );
-            }
-            thread::sleep(Duration::from_millis(20));
-        }
-    })();
+            Ok(None)
+        },
+        Instant::now,
+        thread::sleep,
+    );
     if result.is_err() {
         let _ = apply.kill();
         let _ = apply.wait();
     }
     result
+}
+
+fn wait_for_candidate_validation_ready_with_clock(
+    apply_pid: u32,
+    budget: Duration,
+    mut probe: impl FnMut() -> Result<Option<PathBuf>>,
+    mut now: impl FnMut() -> Instant,
+    mut pause: impl FnMut(Duration),
+) -> Result<PathBuf> {
+    let deadline = now() + budget;
+    loop {
+        if now() >= deadline {
+            bail!(
+                "candidate validation sandbox for apply pid {apply_pid} did not become ready before timeout (budget {budget:?})"
+            );
+        }
+        let ready = probe()?;
+        let observed = now();
+        if observed >= deadline {
+            bail!(
+                "candidate validation sandbox for apply pid {apply_pid} did not become ready before timeout (budget {budget:?})"
+            );
+        }
+        if let Some(sandbox) = ready {
+            return Ok(sandbox);
+        }
+        pause(Duration::from_millis(20).min(deadline - observed));
+    }
+}
+
+#[test]
+fn candidate_validation_readiness_budget_scales_with_preview_latency() {
+    for (preview_seconds, budget_seconds) in [(0, 30), (5, 30), (20, 80), (150, 600)] {
+        assert_eq!(
+            candidate_validation_readiness_budget(Duration::from_secs(preview_seconds)),
+            Duration::from_secs(budget_seconds)
+        );
+    }
+    assert_eq!(
+        candidate_validation_readiness_budget(Duration::MAX),
+        Duration::from_secs(600)
+    );
+}
+
+#[test]
+fn candidate_validation_readiness_wait_obeys_absolute_adaptive_deadline() -> Result<()> {
+    use std::cell::Cell;
+
+    let start = Instant::now();
+    // A real marker after 35 seconds must outlive the old fixed wait on a slow host.
+    // A missing marker, even with repeated successful probes, must still time out.
+    for (preview_seconds, ready_at, expected_ready) in [
+        (20, Some(35), true),
+        (0, Some(35), false),
+        (20, Some(80), false),
+        (20, None, false),
+        (200, None, false),
+    ] {
+        let elapsed = Cell::new(Duration::ZERO);
+        let budget = candidate_validation_readiness_budget(Duration::from_secs(preview_seconds));
+        let result = wait_for_candidate_validation_ready_with_clock(
+            42,
+            budget,
+            || {
+                Ok(ready_at
+                    .filter(|seconds| elapsed.get() >= Duration::from_secs(*seconds))
+                    .map(|_| PathBuf::from("sandbox")))
+            },
+            || start + elapsed.get(),
+            |duration| elapsed.set(elapsed.get() + duration),
+        );
+        assert_eq!(result.is_ok(), expected_ready);
+        if expected_ready {
+            assert_eq!(result?, PathBuf::from("sandbox"));
+            assert_eq!(elapsed.get(), Duration::from_secs(35));
+        } else {
+            assert!(result.unwrap_err().to_string().contains("before timeout"));
+            assert_eq!(elapsed.get(), budget);
+        }
+    }
+
+    // A probe that returns a marker only after using up the budget is also too late.
+    let elapsed = Cell::new(Duration::ZERO);
+    let budget = candidate_validation_readiness_budget(Duration::ZERO);
+    let result = wait_for_candidate_validation_ready_with_clock(
+        42,
+        budget,
+        || {
+            elapsed.set(budget);
+            Ok(Some(PathBuf::from("sandbox")))
+        },
+        || start + elapsed.get(),
+        |_| panic!("a late probe must not renew the deadline"),
+    );
+    assert!(result.unwrap_err().to_string().contains("before timeout"));
+    Ok(())
 }
 
 fn run_success_json(args: &[&str]) -> Result<Value> {

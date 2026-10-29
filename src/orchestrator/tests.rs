@@ -10,6 +10,33 @@ use std::os::unix::fs::PermissionsExt;
 use std::sync::mpsc;
 use tempfile::TempDir;
 
+#[test]
+fn assignment_cleanliness_context_preserves_failure_without_pending_changes_advice() {
+    for cause in [
+        "repository inventory exceeded its time limit before directory stream open; \
+         failure_class=inventory_timeout relative_directory=\"vendor/sdk\" \
+         elapsed_ms=50 entries_inspected=0",
+        "primary repository is dirty; managed worktree creation requires clean repository state",
+        "failed to bind primary repository cleanliness",
+    ] {
+        let result: Result<()> = Err(anyhow::anyhow!(cause));
+        let error = result
+            .context(ASSIGNMENT_CLEANLINESS_CONTEXT)
+            .expect_err("cleanliness failure must remain an error");
+        let message = format!("{error:#}");
+        assert!(
+            message.starts_with("orchestration assignment creation requires a capability-bound")
+        );
+        assert!(
+            message.ends_with(cause),
+            "cause must be preserved: {message}"
+        );
+        for advice in ["commit", "stash", "remove pending changes"] {
+            assert!(!message.contains(advice), "unsupported advice: {message}");
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn collect_status_paths_fails_closed_on_non_utf8_path() -> Result<()> {

@@ -34,6 +34,9 @@ pub(super) struct AttemptSelectionBinding {
     pub event_attempt: usize,
     pub normalized_input_sha256: String,
     pub task: TaskProfile,
+    /// Remains absent until the parent validates an assignment-specific shape.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_shape_identity: Option<crate::selection::AssignmentShapeIdentity>,
     pub requested_candidate: CandidateKey,
 }
 
@@ -890,6 +893,7 @@ fn selection_binding_for_attempt(
                     .value
                     .clone(),
                 task: event.provenance.normalized_task.clone(),
+                assignment_shape_identity: None,
                 requested_candidate: choice.candidate.clone(),
             })
         },
@@ -1444,6 +1448,7 @@ mod tests {
                     horizon: TaskHorizon::Medium,
                     authority_role: AuthorityRole::TerminalLeaf,
                 },
+                assignment_shape_identity: None,
                 requested_candidate: candidate.clone(),
             }),
             requested_runtime: "codex".to_string(),
@@ -1462,6 +1467,29 @@ mod tests {
             },
             parent_phase_continuation: None,
         }
+    }
+
+    #[test]
+    fn assignment_shape_identity_is_optional_and_preserved_without_inference() -> Result<()> {
+        let legacy = fixture();
+        let wire = serde_json::to_value(&legacy)?;
+        assert!(wire["selection"].get("assignment_shape_identity").is_none());
+        let decoded: AttemptOutcomeEvidence = serde_json::from_value(wire)?;
+        assert!(decoded
+            .selection
+            .unwrap()
+            .assignment_shape_identity
+            .is_none());
+        let mut bound = legacy;
+        bound.selection.as_mut().unwrap().assignment_shape_identity =
+            Some(crate::selection::AssignmentShapeIdentity::v1("a".repeat(64)).unwrap());
+        let decoded: AttemptOutcomeEvidence = serde_json::from_slice(&serde_json::to_vec(&bound)?)?;
+        assert_eq!(decoded, bound);
+        let mut wire = serde_json::to_value(&bound)?;
+        wire["selection"]["assignment_shape_identity"]["version"] = serde_json::json!(2);
+        assert!(serde_json::from_value::<AttemptOutcomeEvidence>(wire).is_err());
+        assert!(crate::selection::AssignmentShapeIdentity::v1("not-a-digest".into()).is_err());
+        Ok(())
     }
 
     #[derive(Clone, Copy, PartialEq, Eq)]
@@ -1497,6 +1525,7 @@ mod tests {
             event_attempt: 0,
             normalized_input_sha256: decision.input_digests.normalized_input.value.clone(),
             task: decision.normalized_task.clone(),
+            assignment_shape_identity: None,
             requested_candidate: selected.candidate.clone(),
         });
         evidence.requested_runtime = selected.candidate.runtime.clone();
@@ -2359,6 +2388,7 @@ mod tests {
             event_attempt: 0,
             normalized_input_sha256: "this-run-digest".to_string(),
             task,
+            assignment_shape_identity: None,
             requested_candidate: candidate.clone(),
         });
         evidence.requested_runtime = candidate.runtime.clone();
@@ -2431,6 +2461,7 @@ mod tests {
             event_attempt: 0,
             normalized_input_sha256: "this-run-digest".to_string(),
             task,
+            assignment_shape_identity: None,
             requested_candidate: candidate.clone(),
         });
         evidence.requested_runtime = candidate.runtime.clone();

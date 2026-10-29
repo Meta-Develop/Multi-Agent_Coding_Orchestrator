@@ -4041,10 +4041,10 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             state.store(1, Ordering::Release);
         }
     }
-    // Retain returned continuation bytes before checkpoints, settlement diagnostics,
+    // Retain returned target observations before checkpoints, settlement diagnostics,
     // or envelope validation can return early. This does not authorize or clean scratch.
     let returned_evidence = match &external_run_result {
-        Ok(run) if command.codex_managed_readonly_continuation_enabled() => {
+        Ok(run) => {
             let imported = preserve_returned_parent_evidence(
                 context,
                 &attempt_artifacts,
@@ -4052,7 +4052,9 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
                 launch_runtime,
                 run,
             );
-            if !run.scratch_quiescence_verified() {
+            if command.codex_managed_readonly_continuation_enabled()
+                && !run.scratch_quiescence_verified()
+            {
                 if release_state.is_some() {
                     // Isolated continuation owns a separate failure disposition.
                     // Keep every real returned resource alive; its controller must
@@ -4213,6 +4215,7 @@ fn preserve_returned_parent_evidence(
     run: &ExternalAgentRun,
 ) -> Result<()> {
     with_supervisor_artifacts(context.artifacts, |writer, _| {
+        super::target_containment::persist(writer, artifacts, command, runtime, run)?;
         let bytes = run.stdout_bytes();
         if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
             bail!("descriptor-held parent stdout exceeds its configured byte limit");
@@ -4220,13 +4223,6 @@ fn preserve_returned_parent_evidence(
         writer.write_bytes(
             &artifacts.raw_stdout_relative,
             bytes,
-            ArtifactFileDisposition::PrivateEvidence,
-        )?;
-        write_artifact_json(
-            writer,
-            &artifacts.command_record_relative,
-            &command_record_from_external_for_runtime(run, command, runtime),
-            MAX_SUPERVISOR_REPORT_BYTES,
             ArtifactFileDisposition::PrivateEvidence,
         )?;
         Ok(())
@@ -6228,7 +6224,9 @@ fn decide_child_attempt(
     Ok(ChildAttemptDisposition::Finish {
         report: attempt_report,
         containment_verified: true,
-        gate_terminal: false,
+        // Parent review cannot authenticate rejected research execution evidence.
+        gate_terminal: assignment.role == AgentRole::Researcher
+            && !report_shape_problems.is_empty(),
     })
 }
 
@@ -8590,7 +8588,7 @@ mod decomposition_tests {
                 ledger: &ledger,
                 reservation,
                 pricing: None,
-                model_pricing: BTreeMap::new(),
+                pricing_model: None,
                 state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex),
             };
             let authority = held_out::ParentValidationAuthority::new(
@@ -8678,7 +8676,7 @@ mod decomposition_tests {
                 ledger: &ledger,
                 reservation,
                 pricing: None,
-                model_pricing: BTreeMap::new(),
+                pricing_model: None,
                 state: DispatchBudgetReservationState::Reserved(runtime),
             };
             // Fake uses a Codex-shaped command. The selected reservation runtime, not its

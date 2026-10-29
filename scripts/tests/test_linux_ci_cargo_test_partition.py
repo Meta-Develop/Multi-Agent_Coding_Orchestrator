@@ -57,6 +57,42 @@ class LinuxCiCargoTestPartitionTests(unittest.TestCase):
         targets = partition.collect_testable_targets(package)
         self.assertEqual([target.kind for target in targets], ["lib"])
 
+    def test_non_lib_shards_cover_original_targets_once_including_future_targets(self) -> None:
+        package = sample_package()
+        package["targets"].extend([
+            {"kind": ["test"], "name": "pr_issue_cli"},
+            {"kind": ["test"], "name": "future_integration"},
+            {"kind": ["example"], "name": "merge_cli"},
+        ])
+        targets = partition.collect_testable_targets(package)
+        partition.verify_partition(targets)
+        old = partition.argv_to_keys(partition.partition_argv(targets, "non-lib"))
+        groups = {
+            shard: partition.argv_to_keys(partition.partition_argv(targets, "non-lib", shard))
+            for shard in partition.NON_LIB_SHARDS
+        }
+        self.assertEqual(groups["merge"], [("test", "merge_cli"), ("test", "pr_issue_cli")])
+        self.assertIn(("example", "merge_cli"), groups["other"])
+        self.assertIn(("test", "future_integration"), groups["other"])
+        flattened = [key for group in groups.values() for key in group]
+        self.assertCountEqual(flattened, old)
+        self.assertEqual(len(flattened), len(set(flattened)))
+
+    def test_invalid_non_lib_shard_refused(self) -> None:
+        targets = partition.collect_testable_targets(sample_package())
+        for group, shard in (("non-lib", "unknown"), ("lib", "merge")):
+            with self.subTest(group=group, shard=shard), self.assertRaises(ValueError):
+                partition.partition_argv(targets, group, shard)
+
+    def test_integration_matrix_requires_every_target_shard(self) -> None:
+        source = WORKFLOW.read_text(encoding="utf-8")
+        job = source.split("  linux-integration:", 1)[1].split("  linux-gate:", 1)[0]
+        self.assertIn("shard: [merge, other]", job)
+        self.assertIn("fail-fast: false", job)
+        self.assertIn("timeout-minutes: 45", job)
+        self.assertNotIn("continue-on-error", job)
+        self.assertIn('non-lib "${{ matrix.shard }}"', job)
+
     def test_unsupported_target_kind_fails_closed(self) -> None:
         package = {
             "targets": [

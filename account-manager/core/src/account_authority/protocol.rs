@@ -27,6 +27,8 @@ use crate::model::{AuthKind, StoredAccountState};
 use crate::providers::{observe_selected_account, ProviderAdapter};
 use crate::storage::CredentialStore;
 
+use super::launch_operation::LaunchOperationStore;
+
 /// Wire protocol version advertised and accepted by this slice.
 pub const PROTOCOL_VERSION: u32 = 1;
 /// Maximum UTF-8 JSON request object size, excluding the length prefix.
@@ -37,7 +39,7 @@ pub const MAX_RESPONSE_BYTES: usize = 262144;
 pub const REQUEST_IO_DEADLINE: Duration = Duration::from_secs(5);
 
 /// Closed operations this version promises to implement.
-pub const ADVERTISED_OPERATIONS: [&str; 8] = [
+pub const ADVERTISED_OPERATIONS: [&str; 11] = [
     "authority.describe",
     "accounts.list",
     "selection.get",
@@ -46,6 +48,9 @@ pub const ADVERTISED_OPERATIONS: [&str; 8] = [
     "login.start",
     "login.status",
     "login.cancel",
+    "launch.start",
+    "launch.status",
+    "launch.cancel",
 ];
 
 /// Closed error codes from the version 1 account-authority contract.
@@ -254,6 +259,7 @@ pub struct AuthorityContext {
     pub credential_store: Option<Arc<dyn CredentialStore>>,
     pub bounds: ProtocolBounds,
     pub fallback_find: bool,
+    launches: LaunchOperationStore,
 }
 
 impl AuthorityContext {
@@ -267,6 +273,7 @@ impl AuthorityContext {
             credential_store: None,
             bounds: ProtocolBounds::compiled(),
             fallback_find: true,
+            launches: LaunchOperationStore::new(),
         }
     }
 
@@ -307,6 +314,18 @@ pub struct DecodedRequest {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DecodedOperation {
+    LaunchStart {
+        authority_id: String,
+        service_id: String,
+        binding: SelectedAccountBinding,
+        idempotency_key: String,
+    },
+    LaunchStatus {
+        authority_id: String,
+        service_id: String,
+        handle: OperationHandle,
+        cancel: bool,
+    },
     AuthorityDescribe,
     AccountsList {
         provider_id: String,
@@ -431,6 +450,23 @@ struct OperationPrepareParams {
 struct OperationHandleDigestParams {
     handle: OperationHandle,
     digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchStartParams {
+    authority_id: String,
+    service_id: String,
+    binding: SelectedAccountBinding,
+    idempotency_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct LaunchHandleParams {
+    authority_id: String,
+    service_id: String,
+    handle: OperationHandle,
 }
 
 /// Opaque hex SHA-256 of the canonical `stored-accounts.json` path.
@@ -585,6 +621,34 @@ fn decode_operation(
     params: Value,
 ) -> Result<DecodedRequest, ProtocolFailure> {
     let decoded = match operation.as_str() {
+        "launch.start" => {
+            let parsed: LaunchStartParams = parse_params(&request_id, params)?;
+            require_nonempty_field(&request_id, "authorityId", &parsed.authority_id)?;
+            require_nonempty_field(&request_id, "serviceId", &parsed.service_id)?;
+            require_nonempty_field(&request_id, "idempotencyKey", &parsed.idempotency_key)?;
+            if parsed.idempotency_key.len() > 128 {
+                return Err(ProtocolFailure::new(
+                    &request_id,
+                    ErrorCode::InvalidRequest,
+                    "idempotencyKey is too long",
+                ));
+            }
+            DecodedOperation::LaunchStart {
+                authority_id: parsed.authority_id,
+                service_id: parsed.service_id,
+                binding: parsed.binding,
+                idempotency_key: parsed.idempotency_key,
+            }
+        }
+        "launch.status" | "launch.cancel" => {
+            let parsed: LaunchHandleParams = parse_params(&request_id, params)?;
+            DecodedOperation::LaunchStatus {
+                authority_id: parsed.authority_id,
+                service_id: parsed.service_id,
+                handle: parsed.handle,
+                cancel: operation == "launch.cancel",
+            }
+        }
         "authority.describe" => {
             require_empty_params(&request_id, &params)?;
             DecodedOperation::AuthorityDescribe
@@ -779,7 +843,56 @@ fn parse_params<T: for<'de> Deserialize<'de>>(
 
 /// Dispatch one already-decoded request. Peer authorization happens before this.
 pub fn dispatch(ctx: &AuthorityContext, request: &DecodedRequest) -> AuthorityResponse {
+    dispatch_for_peer(ctx, request, None)
+}
+
+/// Launch callers are derived by the transport after peer authorization, never
+/// from request fields. Library-only dispatch cannot assert a socket identity.
+pub(crate) fn dispatch_for_peer(
+    ctx: &AuthorityContext,
+    request: &DecodedRequest,
+    caller: Option<&str>,
+) -> AuthorityResponse {
     match &request.operation {
+        DecodedOperation::LaunchStart {
+            authority_id,
+            service_id,
+            binding,
+            idempotency_key,
+        } => launch_response(&request.request_id, || {
+            let caller = launch_caller(ctx, caller, authority_id, service_id)?;
+            ctx.launches.start(
+                authority_id,
+                caller,
+                binding,
+                idempotency_key,
+                |lifecycle| {
+                    let adapter = ctx
+                        .adapter(&binding.provider_id)
+                        .map_err(|error| closed_core_message(&error).0)?;
+                    crate::providers::leased_launch::spawn_service_launch(
+                        &ctx.registry,
+                        adapter.as_ref(),
+                        lifecycle,
+                        || match &ctx.credential_store {
+                            Some(store) => Ok(Box::new(SharedLaunchStore(Arc::clone(store)))
+                                as Box<dyn CredentialStore>),
+                            None => crate::storage::default_store(),
+                        },
+                    )
+                    .map_err(|error| closed_core_message(&error).0)
+                },
+            )
+        }),
+        DecodedOperation::LaunchStatus {
+            authority_id,
+            service_id,
+            handle,
+            cancel,
+        } => launch_response(&request.request_id, || {
+            let caller = launch_caller(ctx, caller, authority_id, service_id)?;
+            ctx.launches.status(authority_id, caller, handle, *cancel)
+        }),
         DecodedOperation::AuthorityDescribe => describe(ctx, &request.request_id),
         DecodedOperation::AccountsList { provider_id } => {
             accounts_list(ctx, &request.request_id, provider_id)
@@ -849,6 +962,57 @@ pub fn dispatch(ctx: &AuthorityContext, request: &DecodedRequest) -> AuthorityRe
     }
 }
 
+fn launch_caller<'a>(
+    ctx: &AuthorityContext,
+    caller: Option<&'a str>,
+    authority_id: &str,
+    service_id: &str,
+) -> Result<&'a str, ErrorCode> {
+    if authority_id != ctx.authority_id || service_id != ctx.launches.service_id {
+        return Err(ErrorCode::AccessDenied);
+    }
+    caller
+        .filter(|value| !value.is_empty())
+        .ok_or(ErrorCode::AccessDenied)
+}
+
+fn launch_response(
+    request_id: &str,
+    action: impl FnOnce() -> Result<super::LaunchOperationStatus, ErrorCode>,
+) -> AuthorityResponse {
+    match action() {
+        Ok(status) => AuthorityResponse::result(request_id, serde_json::json!(status)),
+        Err(code) => AuthorityResponse::error(request_id, code, "launch operation was refused"),
+    }
+}
+
+struct SharedLaunchStore(Arc<dyn CredentialStore>);
+
+impl CredentialStore for SharedLaunchStore {
+    fn id(&self) -> &'static str {
+        self.0.id()
+    }
+    fn is_available(&self) -> bool {
+        self.0.is_available()
+    }
+    fn get(
+        &self,
+        key: &crate::storage::SecretRef,
+    ) -> crate::error::Result<Option<crate::storage::Secret>> {
+        self.0.get(key)
+    }
+    fn put(
+        &self,
+        key: &crate::storage::SecretRef,
+        secret: &crate::storage::Secret,
+    ) -> crate::error::Result<()> {
+        self.0.put(key, secret)
+    }
+    fn delete(&self, key: &crate::storage::SecretRef) -> crate::error::Result<()> {
+        self.0.delete(key)
+    }
+}
+
 fn refuse_unadvertised_operation_lifecycle(request_id: &str, operation: &str) -> AuthorityResponse {
     AuthorityResponse::error(
         request_id,
@@ -872,6 +1036,7 @@ fn describe(ctx: &AuthorityContext, request_id: &str) -> AuthorityResponse {
         serde_json::json!({
             "protocolVersion": PROTOCOL_VERSION,
             "authorityId": ctx.authority_id,
+            "launchServiceId": ctx.launches.service_id,
             "operations": ADVERTISED_OPERATIONS,
             "transport": transport,
         }),

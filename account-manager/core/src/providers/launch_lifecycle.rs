@@ -1,10 +1,10 @@
 //! One-shot launch admission and reference-only finalization evidence.
 //!
-//! This is an in-process operation, not a remote authority operation or a
-//! credential rotation service. Account incarnations are its material generation
-//! tokens. The selected-use lease protects that generation through child exit.
+//! This guard owns native child construction and custody. Remote caller identity
+//! is established by the authority protocol. Account incarnations are its material
+//! generation tokens, protected by the selected-use lease through child exit.
 
-use std::process::ExitStatus;
+use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
@@ -145,6 +145,27 @@ impl LaunchLifecycle {
         adapter: &dyn ProviderAdapter,
         credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
     ) -> Result<LeasedChild> {
+        self.spawn_inner(registry, adapter, credential_store, false)
+    }
+
+    /// Service children cannot inherit a client connection's stdio or emit
+    /// provider output into the authority's protocol or diagnostics.
+    pub(crate) fn spawn_detached(
+        self,
+        registry: &StoredAccountRegistry,
+        adapter: &dyn ProviderAdapter,
+        credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
+    ) -> Result<LeasedChild> {
+        self.spawn_inner(registry, adapter, credential_store, true)
+    }
+
+    fn spawn_inner(
+        self,
+        registry: &StoredAccountRegistry,
+        adapter: &dyn ProviderAdapter,
+        credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
+        detached: bool,
+    ) -> Result<LeasedChild> {
         let binding = {
             let mut view = self.handle.0.lock().expect("launch lifecycle lock");
             self.check_admission(&view)?;
@@ -181,6 +202,12 @@ impl LaunchLifecycle {
             .then(credential_store)
             .transpose()?;
         let child = spawn_launch_with(spec, &account, store.as_deref(), |command| {
+            if detached {
+                command
+                    .stdin(Stdio::null())
+                    .stdout(Stdio::null())
+                    .stderr(Stdio::null());
+            }
             let mut view = self.handle.0.lock().expect("launch lifecycle lock");
             self.check_admission(&view)?;
             match spawn_command(command, &binding.provider_id) {

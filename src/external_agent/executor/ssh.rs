@@ -632,7 +632,7 @@ fn validate_launch_manifest(request: &LaunchRequest) -> ExecutorResult<()> {
     validate_manifest_launch_spec(&request.staged.manifest, &request.staged.launch_spec)
 }
 
-fn validate_manifest_launch_spec(
+pub(super) fn validate_manifest_launch_spec(
     manifest: &InputManifest,
     launch_spec: &LaunchSpec,
 ) -> ExecutorResult<()> {

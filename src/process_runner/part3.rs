@@ -3083,6 +3083,8 @@ impl PreparedChildIo {
         Ok(ContainedProcessSession {
             #[cfg(target_os = "linux")]
             peer_binding: None,
+            #[cfg(target_os = "linux")]
+            private_target: None,
             label: label.to_string(),
             cancellation,
             operation_deadline,
@@ -3129,6 +3131,8 @@ impl ContainedProcessStartGate<'_> {
 pub(crate) struct ContainedProcessSession<'a> {
     #[cfg(target_os = "linux")]
     peer_binding: Option<(u32, String, PathBuf)>,
+    #[cfg(target_os = "linux")]
+    private_target: Option<PrivateTargetExitWatch>,
     label: String,
     cancellation: &'a ProcessCancellation,
     operation_deadline: Option<Instant>,
@@ -3139,6 +3143,62 @@ pub(crate) struct ContainedProcessSession<'a> {
     stdout_eof: bool,
     io_error: Option<String>,
     output_drainers: OutputDrainers,
+}
+
+#[cfg(target_os = "linux")]
+#[derive(Debug, PartialEq, Eq)]
+enum PrivateTargetState {
+    Alive,
+    Exited,
+    Unknown,
+}
+
+#[cfg(target_os = "linux")]
+struct PrivateTargetExitWatch(std::os::fd::OwnedFd);
+
+#[cfg(target_os = "linux")]
+impl PrivateTargetExitWatch {
+    // Called while the guardian still holds its authenticated target at the start gate.
+    // Failure to pin that incarnation leaves exit evidence unknown, never confirmed.
+    fn capture(pid: u32, start: &str, cgroup: &Path) -> Option<Self> {
+        use std::os::fd::FromRawFd;
+
+        let pid = libc::pid_t::try_from(pid).ok().filter(|pid| *pid > 0)?;
+        // SAFETY: pidfd_open consumes a positive PID and zero flags, without pointers.
+        let descriptor = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0_u32) };
+        if descriptor < 0 {
+            return None;
+        }
+        // SAFETY: a successful pidfd_open returns a fresh owned descriptor.
+        let descriptor = unsafe { std::os::fd::OwnedFd::from_raw_fd(descriptor as i32) };
+        let same_start = crate::agent_lifecycle::process_start_time(pid as u32)
+            .is_ok_and(|observed| observed == start);
+        let member = fs::read_to_string(cgroup.join("cgroup.procs"))
+            .is_ok_and(|members| members.lines().any(|line| line.trim() == pid.to_string()));
+        (same_start && member).then_some(Self(descriptor))
+    }
+
+    fn observe(&self) -> PrivateTargetState {
+        use std::os::fd::AsRawFd;
+
+        let mut descriptor = libc::pollfd {
+            fd: self.0.as_raw_fd(),
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: poll borrows one initialized descriptor; timeout zero never waits.
+        let result = unsafe { libc::poll(&mut descriptor, 1, 0) };
+        if result < 0 || descriptor.revents & (libc::POLLERR | libc::POLLNVAL) != 0 {
+            PrivateTargetState::Unknown
+        } else if descriptor.revents & libc::POLLIN != 0 {
+            // This handle stays bound to the captured incarnation even after PID reuse.
+            PrivateTargetState::Exited
+        } else if result == 0 {
+            PrivateTargetState::Alive
+        } else {
+            PrivateTargetState::Unknown
+        }
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -3221,7 +3281,18 @@ impl ContainedProcessSession<'_> {
     pub(crate) fn check_private_channel_live(&mut self) -> Result<(), String> {
         self.ensure_interactive_live()?;
         self.output_drainers.drain_ready();
+        #[cfg(target_os = "linux")]
+        if self.private_target_state() == PrivateTargetState::Exited {
+            return self.fail_io("contained private-channel target exited before protocol completion");
+        }
         Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn private_target_state(&self) -> PrivateTargetState {
+        self.private_target
+            .as_ref()
+            .map_or(PrivateTargetState::Unknown, PrivateTargetExitWatch::observe)
     }
 
     pub(crate) fn receive_line(

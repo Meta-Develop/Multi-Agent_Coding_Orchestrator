@@ -3755,7 +3755,11 @@ fn run_process_cancellable_with_interaction(
                 .target_pid(&mut child, operation_deadline, cancellation)
                 .and_then(|pid| {
                     crate::agent_lifecycle::process_start_time(pid)
-                        .map(|start| (pid, start, unit.cgroup_path.clone()))
+                        .map(|start| {
+                            let watch =
+                                PrivateTargetExitWatch::capture(pid, &start, &unit.cgroup_path);
+                            ((pid, start, unit.cgroup_path.clone()), watch)
+                        })
                         .map_err(|error| std::io::Error::other(error.to_string()))
                 }),
             _ => Err(std::io::Error::other(
@@ -3828,7 +3832,10 @@ fn run_process_cancellable_with_interaction(
                 // Capture the guardian-published target identity while the target is still held
                 // at the start gate. Waiting after release can consume the operation deadline
                 // before the private-channel handler starts.
-                session.peer_binding = private_peer_binding;
+                if let Some((binding, watch)) = private_peer_binding {
+                    session.peer_binding = Some(binding);
+                    session.private_target = watch;
+                }
             }
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&mut session)))
                 .is_err()

@@ -5,6 +5,7 @@
 //! worktrees and path claims. Nothing in this boundary edits repository files.
 
 pub mod fake;
+pub mod pricing_contract;
 pub mod prompt;
 pub mod provider;
 pub mod transcript;

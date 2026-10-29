@@ -81,12 +81,22 @@ impl LeasedChild {
     /// Request termination of this exact child and finalize cancellation only
     /// after wait confirms exit. A failed kill or wait retains the lease.
     pub fn cancel(&mut self) -> io::Result<ExitStatus> {
-        if let Some(status) = self.try_wait()? {
-            return Ok(status);
-        }
-        self.child.kill()?;
-        self.cancellation_requested = true;
+        self.request_cancel()?;
         self.wait()
+    }
+
+    /// Request cancellation without waiting or releasing custody. A confirmed
+    /// earlier exit keeps its original finalization; only a sent signal marks
+    /// cancellation for the lifecycle's eventual confirmed-exit outcome.
+    pub(crate) fn request_cancel(&mut self) -> io::Result<bool> {
+        if self.try_wait()?.is_some() {
+            return Ok(false);
+        }
+        self.child
+            .kill()
+            .inspect_err(|_| self.lifecycle.exit_unknown())?;
+        self.cancellation_requested = true;
+        Ok(true)
     }
 }
 
@@ -130,6 +140,16 @@ pub fn spawn_selected_launch(
         None,
     )?
     .spawn(registry, adapter, credential_store)
+}
+
+/// Consume the authority operation's guard, retaining its identity and custody.
+pub(crate) fn spawn_service_launch(
+    registry: &StoredAccountRegistry,
+    adapter: &dyn ProviderAdapter,
+    lifecycle: LaunchLifecycle,
+    credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
+) -> Result<LeasedChild> {
+    lifecycle.spawn_detached(registry, adapter, credential_store)
 }
 
 #[cfg(test)]

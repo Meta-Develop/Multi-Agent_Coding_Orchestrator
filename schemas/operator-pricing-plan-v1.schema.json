@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/operator-pricing-plan-v1.schema.json",
+  "title": "Optional operator pricing fields for supervisor plans",
+  "description": "Contract for the optional pricing-field envelope extracted from a supervisor plan; other plan fields are outside this schema.",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "pricing_contract": { "$ref": "#/$defs/contract" },
+    "pricing_plan_id": { "type": "string", "minLength": 1 },
+    "model_pricing": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["input_usd_per_million_tokens", "output_usd_per_million_tokens"],
+        "properties": {
+          "input_usd_per_million_tokens": { "type": "number", "minimum": 0 },
+          "output_usd_per_million_tokens": { "type": "number", "minimum": 0 }
+        }
+      }
+    },
+    "pricing_binding": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["contract_json", "price_map_json", "plan_id", "normalized_sha256"],
+      "properties": {
+        "contract_json": { "type": "string", "minLength": 1 },
+        "price_map_json": { "type": "string", "minLength": 1 },
+        "plan_id": { "type": "string", "minLength": 1 },
+        "normalized_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    }
+  },
+  "dependentRequired": {
+    "pricing_contract": ["model_pricing", "pricing_plan_id"],
+    "pricing_plan_id": ["pricing_contract"],
+    "pricing_binding": ["pricing_contract"]
+  },
+  "$defs": {
+    "contract": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "contract_id", "revision", "effective_date", "valid_through", "source_reference", "source_attribution", "currency", "unit", "billing", "scopes", "price_map_sha256"],
+      "properties": {
+        "schema_version": { "const": 1 },
+        "contract_id": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1 },
+        "effective_date": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "valid_through": { "type": "string", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$" },
+        "source_reference": { "type": "string", "minLength": 1 },
+        "source_attribution": { "type": "string", "minLength": 1 },
+        "currency": { "const": "USD" },
+        "unit": { "const": "per_million_tokens" },
+        "billing": { "const": "flat_input_output" },
+        "price_map_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "scopes": {
+          "type": "array",
+          "minItems": 1,
+          "uniqueItems": true,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["runtime", "model", "account_id", "plan_id"],
+            "properties": {
+              "runtime": { "enum": ["fake", "codex", "grok", "cursor", "claude-code", "gemini-cli"] },
+              "model": { "type": "string", "minLength": 1 },
+              "account_id": { "type": "string", "minLength": 1 },
+              "plan_id": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

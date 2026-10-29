@@ -1,18 +1,14 @@
 use super::*;
 
-/// Placeholder catalog rates describe simulations, not real-provider prices.
-/// Keep explicit valid plan prices, including zero, distinct from those defaults.
+/// Catalog rates and unbound tables are usable only for simulations.
 pub(super) fn pricing_for_runtime(
     plan: &SupervisorPlan,
     model: &str,
     runtime: SupervisorRuntime,
 ) -> Option<ModelPricing> {
-    use crate::llm::provider::{resolve_model_pricing, ModelPricingProvenance};
-    resolve_model_pricing(&plan.model_pricing, model)
-        .filter(|resolved| {
-            runtime == SupervisorRuntime::Fake
-                || resolved.provenance == ModelPricingProvenance::PlanOverride
-        })
+    (runtime == SupervisorRuntime::Fake)
+        .then(|| crate::llm::provider::resolve_model_pricing(&plan.model_pricing, model))
+        .flatten()
         .map(|resolved| resolved.pricing)
 }
 
@@ -51,7 +47,17 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
     let pricing = command
         .model
         .as_ref()
-        .and_then(|model| pricing_for_runtime(plan, model, runtime))
+        .and_then(|model| {
+            if runtime == SupervisorRuntime::Fake {
+                pricing_for_runtime(plan, model, runtime)
+            } else {
+                ledger
+                    .operator_pricing
+                    .as_ref()
+                    .filter(|view| view.matches_prices(&plan.model_pricing))
+                    .and_then(|view| view.price_for(runtime, model))
+            }
+        })
         .filter(|_| runtime != SupervisorRuntime::GeminiCli || !command.uses_gemini_bridge());
     let cost_usd = pricing
         .map(|pricing| {
@@ -96,7 +102,7 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
                 ledger,
                 reservation,
                 pricing,
-                model_pricing: plan.model_pricing.clone(),
+                pricing_model: command.model.clone(),
                 state: DispatchBudgetReservationState::Reserved(runtime),
             },
         )),

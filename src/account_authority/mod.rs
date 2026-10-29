@@ -192,6 +192,21 @@ pub(crate) fn codex_run_account_binding(run_id: &str) -> Option<CodexRunAccountB
         .cloned()
 }
 
+#[cfg(test)]
+pub(crate) fn install_pricing_account_fixture(run_id: &str, account_id: &str) {
+    CODEX_RUN_ACCOUNT_BINDINGS.lock().unwrap().insert(
+        run_id.to_string(),
+        CodexRunAccountBinding::Selected(FrozenCodexSelectedBinding {
+            authority_socket: None,
+            authority_id: "synthetic-pricing-authority".to_string(),
+            provider_id: "codex-cli".to_string(),
+            account_id: account_id.to_string(),
+            account_incarnation: "synthetic-pricing-incarnation".to_string(),
+            selection_revision: 1,
+        }),
+    );
+}
+
 /// Non-secret selected binding recorded on MACO execution evidence.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]

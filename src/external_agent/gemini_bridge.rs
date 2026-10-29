@@ -1176,7 +1176,7 @@ pub(super) fn run(
     report
 }
 
-#[cfg(all(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn bootstrap_startup_category(stderr: &CapturedBytes) -> Option<&'static str> {
     if stderr.is_truncated() {
         return None;
@@ -1192,7 +1192,7 @@ fn bootstrap_startup_category(stderr: &CapturedBytes) -> Option<&'static str> {
     }
 }
 
-#[cfg(all(target_os = "linux", test))]
+#[cfg(target_os = "linux")]
 fn bootstrap_startup_error(error: Option<String>, stderr: &CapturedBytes) -> Option<String> {
     let Some(category) = bootstrap_startup_category(stderr) else {
         return error;
@@ -1823,7 +1823,9 @@ fn run_linux_online(
             report.side_effects = Some(output.process.side_effects);
             protocol.evidence.no_release_quiescent =
                 !protocol.evidence.provider_released && output.process.safety_evidence_verified();
-            if let Err(error) = output.interaction {
+            if let Some(error) =
+                bootstrap_startup_error(output.interaction.err(), &output.process.stderr)
+            {
                 record_external_error(report, error);
             }
             if output.process.timed_out {
@@ -2976,14 +2978,31 @@ mod tests {
         let held = run
             .gemini_bridge_evidence()
             .with_context(|| format!("no held bridge evidence: {:?}", run.error))?;
-        assert!(held.ready, "{:?}", run.error);
         assert!(held.no_release_quiescent, "{:?}", run.error);
         assert!(!held.provider_released);
         assert_eq!(held.tokens, None);
         assert!(run.scratch_quiescence_verified());
         assert!(!run.succeeded());
         assert!(!run.publishable);
-        assert_eq!(run.exit_code, Some(0));
+        if held.ready {
+            assert_eq!(run.exit_code, Some(0));
+        } else {
+            // An installed bootstrap may reject its profile before hello. That is a
+            // prompt, quiescent startup failure, never a runtime qualification.
+            assert!(!run.timed_out);
+            assert!(started.elapsed() < command.timeout);
+            assert!(run.exit_code.is_some_and(|code| code != 0));
+            let error = run.error.as_deref().context("missing startup failure")?;
+            assert!(
+                error
+                    .contains("contained private-channel target exited before protocol completion"),
+                "{error}"
+            );
+            assert!(
+                error.contains("Gemini bootstrap startup: pre_handshake_"),
+                "{error}"
+            );
+        }
         let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
         assert!(restored.gemini_bridge_evidence().is_none());
         Ok(())

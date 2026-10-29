@@ -6,7 +6,7 @@ use crate::{
 };
 use serde_json::{json, Map, Value};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     fmt,
     io::{BufRead, BufReader, Read, Write},
     sync::mpsc,
@@ -31,6 +31,8 @@ const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
 const ACCOUNT_UPDATE_MAX_MESSAGES: usize = 64;
 const MODERATION_METADATA_MAX_MESSAGES: usize = 64;
+const RETRY_NOTICE_MAX_MESSAGES: usize = 16;
+const RETRY_NOTICE_MAX_BYTES: usize = 16 * 1024;
 const WORKER_REQUEST_TOOL: &str = "maco_worker_request";
 const WORKER_REQUEST_ID_MAX_BYTES: usize = 128;
 const WORKER_REQUEST_RESULT_MAX_BYTES: usize = 64 * 1024;
@@ -211,6 +213,119 @@ struct ThreadLifecycleNotices {
     started: bool,
     status_count: usize,
     pending_turn_started: Option<Value>,
+    pending_retry_notices: VecDeque<Value>,
+}
+
+// The v2 ErrorNotification marks transient stream errors with willRetry=true.
+// Validate original bytes before admitting that exception to terminal errors.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryNotice {
+    method: String,
+    params: RetryNoticeParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryNoticeParams {
+    error: RetryTurnError,
+    will_retry: bool,
+    thread_id: String,
+    turn_id: String,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryTurnError {
+    message: String,
+    codex_error_info: Option<RetryErrorInfo>,
+    additional_details: Option<String>,
+    misalignment: Option<RetryMisalignment>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+enum RetryErrorInfo {
+    ContextWindowExceeded,
+    SessionBudgetExceeded,
+    UsageLimitExceeded,
+    RateLimitExceeded,
+    FlexUnavailable,
+    ServerOverloaded,
+    CyberPolicy,
+    MisalignmentPolicyViolation,
+    TooManyDenials,
+    HttpConnectionFailed {
+        #[serde(rename = "httpStatusCode")]
+        http_status_code: Option<u16>,
+    },
+    ResponseStreamConnectionFailed {
+        #[serde(rename = "httpStatusCode")]
+        http_status_code: Option<u16>,
+    },
+    InternalServerError,
+    Unauthorized,
+    BadRequest,
+    ThreadRollbackFailed,
+    SandboxError,
+    ResponseStreamDisconnected {
+        #[serde(rename = "httpStatusCode")]
+        http_status_code: Option<u16>,
+    },
+    ResponseTooManyFailedAttempts {
+        #[serde(rename = "httpStatusCode")]
+        http_status_code: Option<u16>,
+    },
+    ActiveTurnNotSteerable {
+        #[serde(rename = "turnKind")]
+        turn_kind: RetryTurnKind,
+    },
+    Other,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+enum RetryTurnKind {
+    Review,
+    Compact,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct RetryMisalignment {
+    error_type: Option<String>,
+    detailed_explanation: Option<String>,
+    steer: Option<RetryMisalignmentSteer>,
+    review_target: Option<String>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RetryMisalignmentSteer {
+    message: String,
+}
+
+fn is_retry_notice(message: &Value) -> bool {
+    message.get("method").and_then(Value::as_str) == Some("error")
+        && message
+            .pointer("/params/willRetry")
+            .and_then(Value::as_bool)
+            == Some(true)
+}
+
+fn valid_retry_notice(line: &[u8]) -> bool {
+    if line.len() > RETRY_NOTICE_MAX_BYTES {
+        return false;
+    }
+    matches!(
+        serde_json::from_slice::<RetryNotice>(line),
+        Ok(notice) if notice.method == "error"
+            && notice.params.will_retry
+            && !notice.params.thread_id.is_empty()
+            && !notice.params.turn_id.is_empty()
+    )
 }
 
 // Account telemetry is asynchronous: 0.162.0 emits it while waiting for either
@@ -1412,6 +1527,15 @@ impl ProtocolState {
                     phase,
                     message: format!("invalid JSON: {error}"),
                 })?;
+            if matches!(phase, "turn/start" | "turn")
+                && is_retry_notice(&message)
+                && !valid_retry_notice(&line)
+            {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "retry notification is malformed or oversized".to_string(),
+                });
+            }
             if matches!(phase, "thread/start" | "turn/start" | "turn")
                 && message.get("method").and_then(Value::as_str) == Some("account/updated")
             {
@@ -1945,6 +2069,25 @@ where
             }
             continue;
         }
+        if phase == "turn/start" && is_retry_notice(&message) {
+            let Some((thread_id, lifecycle)) = thread_started.as_mut() else {
+                return Err(AppServerError::Unexpected {
+                    phase,
+                    message: "retry notification arrived without a pending thread".to_string(),
+                });
+            };
+            require_exact_text(&message, &["params", "threadId"], thread_id, phase)?;
+            if lifecycle.pending_retry_notices.len() >= RETRY_NOTICE_MAX_MESSAGES {
+                return Err(AppServerError::Malformed {
+                    phase,
+                    message: "retry notifications exceeded their per-turn bound".to_string(),
+                });
+            }
+            // No turn ID is acknowledged yet. Hold only bounded, schema-valid
+            // notices; drive_turn correlates them before logging or continuing.
+            lifecycle.pending_retry_notices.push_back(message);
+            continue;
+        }
         if phase == "turn/start"
             && message.get("method").and_then(Value::as_str) == Some("turn/started")
         {
@@ -2251,10 +2394,15 @@ where
     let mut token_usage = None;
     let mut cache_write_tokens = 0;
     let mut reroute_message = None;
+    let mut retry_notice_count = 0usize;
 
     let mut budget_failure = None;
     let result = (|| loop {
-        let message = match lifecycle.pending_turn_started.take() {
+        let message = match lifecycle
+            .pending_turn_started
+            .take()
+            .or_else(|| lifecycle.pending_retry_notices.pop_front())
+        {
             Some(message) => message,
             None => state.receive(transport, "turn", &|| {
                 budget_failure.is_none() && cancelled()
@@ -2262,6 +2410,7 @@ where
         };
         // Drain observations only; no further approval, correction or steering calls.
         if budget_failure.is_some()
+            && !is_retry_notice(&message)
             && !matches!(
                 message.get("method").and_then(Value::as_str),
                 Some(
@@ -3123,6 +3272,25 @@ where
                 });
             }
             "error" => {
+                if is_retry_notice(&message) {
+                    validate_turn_correlation(params, thread_id, turn_id, "retry notification")?;
+                    retry_notice_count += 1;
+                    if retry_notice_count > RETRY_NOTICE_MAX_MESSAGES {
+                        return Err(AppServerError::Malformed {
+                            phase: "retry notification",
+                            message: "retry notifications exceeded their per-turn bound"
+                                .to_string(),
+                        });
+                    }
+                    // Diagnostics only: no deadline extension, progress, usage,
+                    // approval, item evidence or terminal status is inferred.
+                    tracing::info!(
+                        retry_notice_count,
+                        summary = %bounded_json_summary(&params["error"]),
+                        "app-server retry notification"
+                    );
+                    continue;
+                }
                 return Err(AppServerError::Remote {
                     phase: "turn",
                     message: bounded_json_summary(&Value::Object(params.clone())),
@@ -4436,6 +4604,284 @@ mod tests {
 
     const THREAD_SYSTEM_ERROR_CAPTURE: &str =
         include_str!("../tests/fixtures/codex-0.162.0/thread-system-error.jsonl");
+    const RETRY_NOTICE_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.162.0/retry-notice.jsonl");
+
+    fn captured_retry_transport(notices: Vec<String>, early: bool) -> FakeTransport {
+        let mut lines: Vec<String> = CODEX_0162_AUDITOR_TURN
+            .lines()
+            .map(str::to_string)
+            .collect();
+        let position = lines
+            .iter()
+            .position(|line| {
+                let message: Value = serde_json::from_str(line).unwrap();
+                if early {
+                    message["id"] == 3
+                } else {
+                    message["method"] == "item/started"
+                        && message["params"]["item"]["type"] == "reasoning"
+                }
+            })
+            .unwrap();
+        lines.splice(position..position, notices);
+        FakeTransport {
+            incoming: lines
+                .into_iter()
+                .rev()
+                .map(|line| ReaderEvent::Line(line.into_bytes()))
+                .collect(),
+            ..FakeTransport::default()
+        }
+    }
+
+    #[test]
+    fn captured_retry_notices_preserve_terminal_success_and_real_usage() {
+        let mut baseline_transport = captured_retry_transport(Vec::new(), false);
+        let baseline = run_captured_0162_transport(&mut baseline_transport).unwrap();
+        assert!(baseline
+            .token_usage
+            .is_some_and(|usage| usage.input_tokens > 0));
+        for early in [false, true] {
+            for count in [1, RETRY_NOTICE_MAX_MESSAGES] {
+                let notices = vec![RETRY_NOTICE_CAPTURE.trim().to_string(); count];
+                let mut transport = captured_retry_transport(notices, early);
+                let mut outcome = run_captured_0162_transport(&mut transport).unwrap();
+                assert!(transport.incoming.is_empty());
+                assert_eq!(transport.sent, baseline_transport.sent);
+                assert_eq!(
+                    outcome.messages_received,
+                    baseline.messages_received + count
+                );
+                assert_eq!(
+                    outcome.bytes_received,
+                    baseline.bytes_received + count * RETRY_NOTICE_CAPTURE.trim().len()
+                );
+                outcome.messages_received = baseline.messages_received;
+                outcome.bytes_received = baseline.bytes_received;
+                // Every outcome field, including real cumulative usage and item
+                // evidence, comes from the original successful continuation.
+                assert_eq!(outcome, baseline);
+            }
+        }
+    }
+
+    #[test]
+    fn retry_notices_do_not_hide_terminal_remote_errors() {
+        let mut messages = base_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        messages.push(serde_json::from_str(RETRY_NOTICE_CAPTURE).unwrap());
+        messages.extend(captured_0162_values(THREAD_SYSTEM_ERROR_CAPTURE));
+        let mut transport = FakeTransport::from_values(messages);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("no approval authority"),
+            || false,
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppServerError::Remote { phase: "turn", ref message }
+                if message.contains("serverOverloaded") && message.contains("at capacity")
+        ));
+        assert!(sent_interrupt(&transport));
+        assert_eq!(
+            transport.incoming.len(),
+            1,
+            "failed completion remains unread"
+        );
+    }
+
+    #[test]
+    fn retry_notice_cap_spans_turn_start_and_active_turn() {
+        for early in [false, true] {
+            let notices =
+                vec![RETRY_NOTICE_CAPTURE.trim().to_string(); RETRY_NOTICE_MAX_MESSAGES + 1];
+            let mut transport = captured_retry_transport(notices, early);
+            assert!(matches!(
+                run_captured_0162_transport(&mut transport),
+                Err(AppServerError::Malformed { message, .. })
+                    if message.contains("per-turn bound")
+            ));
+        }
+        let notices = vec![RETRY_NOTICE_CAPTURE.trim().to_string(); RETRY_NOTICE_MAX_MESSAGES];
+        let mut transport = captured_retry_transport(notices, true);
+        let position = transport
+            .incoming
+            .iter()
+            .position(|event| match event {
+                ReaderEvent::Line(line) => {
+                    line == CODEX_0162_AUDITOR_TURN.lines().last().unwrap().as_bytes()
+                }
+                _ => false,
+            })
+            .unwrap();
+        transport.incoming.insert(
+            position + 1,
+            ReaderEvent::Line(RETRY_NOTICE_CAPTURE.trim().as_bytes().to_vec()),
+        );
+        assert!(matches!(
+            run_captured_0162_transport(&mut transport),
+            Err(AppServerError::Malformed {
+                phase: "retry notification",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn retry_notices_require_correlated_thread_and_turn() {
+        for early in [false, true] {
+            for field in ["threadId", "turnId"] {
+                let mut notice: Value = serde_json::from_str(RETRY_NOTICE_CAPTURE).unwrap();
+                notice["params"][field] = json!("foreign");
+                let mut transport = captured_retry_transport(vec![notice.to_string()], early);
+                assert!(matches!(
+                    run_captured_0162_transport(&mut transport),
+                    Err(AppServerError::Unexpected { .. })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn retry_notices_require_boolean_retry_and_strict_original_schema() {
+        let notice = RETRY_NOTICE_CAPTURE.trim();
+        let mut invalid = Vec::new();
+        for value in [
+            json!(false),
+            json!(null),
+            json!("true"),
+            json!(1),
+            json!({}),
+        ] {
+            let mut malformed: Value = serde_json::from_str(notice).unwrap();
+            malformed["params"]["willRetry"] = value;
+            invalid.push(malformed.to_string());
+        }
+        invalid.push(notice.replace("\"willRetry\":true,", ""));
+        invalid.push(notice.replace("\"method\":", "\"id\":8,\"method\":"));
+        invalid.push(notice.replace("\"method\":", "\"extra\":true,\"method\":"));
+        invalid.push(notice.replace("\"willRetry\":", "\"extra\":true,\"willRetry\":"));
+        invalid.push(notice.replace("\"message\":", "\"extra\":true,\"message\":"));
+        invalid.push(notice.replace("\"httpStatusCode\":", "\"extra\":true,\"httpStatusCode\":"));
+        invalid.push(notice.replace("\"misalignment\":null", "\"misalignment\":{\"extra\":true}"));
+        invalid.push(notice.replace("\"message\":\"Reconnecting... 2/5\"", "\"message\":false"));
+        invalid.push(notice.replace(
+            "\"additionalDetails\":",
+            "\"additionalDetails\":false,\"additionalDetails\":",
+        ));
+        invalid.push(notice.replace("\"threadId\":", "\"threadId\":\"foreign\",\"threadId\":"));
+        invalid.push(notice.replace("\"turnId\":", "\"turnId\":\"foreign\",\"turnId\":"));
+        invalid.push(notice.replace("\"willRetry\":", "\"willRetry\":false,\"willRetry\":"));
+        invalid.push(notice.replace(
+            "\"httpStatusCode\":",
+            "\"httpStatusCode\":400,\"httpStatusCode\":",
+        ));
+        invalid.push(notice.replace("1793253072850", "\"invalid\""));
+        for early in [false, true] {
+            for malformed in &invalid {
+                let mut transport = captured_retry_transport(vec![malformed.clone()], early);
+                assert!(
+                    run_captured_0162_transport(&mut transport).is_err(),
+                    "accepted {malformed}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn retry_notices_preserve_message_aggregate_and_deadline_bounds() {
+        let mut padded = RETRY_NOTICE_CAPTURE.trim().as_bytes().to_vec();
+        padded.resize(RETRY_NOTICE_MAX_BYTES, b' ');
+        assert!(valid_retry_notice(&padded));
+        padded.push(b' ');
+        assert!(!valid_retry_notice(&padded));
+        for early in [false, true] {
+            let mut transport =
+                captured_retry_transport(vec![String::from_utf8(padded.clone()).unwrap()], early);
+            assert!(matches!(
+                run_captured_0162_transport(&mut transport),
+                Err(AppServerError::Malformed { .. })
+            ));
+        }
+        let notice: Value = serde_json::from_str(RETRY_NOTICE_CAPTURE).unwrap();
+        let line_bytes = notice.to_string().len();
+        for (max_line_bytes, max_total_bytes, max_messages) in [
+            (line_bytes - 1, 4096, 10),
+            (line_bytes, line_bytes * 2 - 1, 10),
+            (line_bytes, 4096, 1),
+        ] {
+            let mut state = ProtocolState::new(AppServerLimits {
+                max_line_bytes,
+                max_total_bytes,
+                max_messages,
+                ..AppServerLimits::default()
+            })
+            .unwrap();
+            let deadline = state.deadline;
+            let mut transport = FakeTransport::from_values(vec![notice.clone(), notice.clone()]);
+            if max_line_bytes == line_bytes {
+                state.receive(&mut transport, "turn", &|| false).unwrap();
+            }
+            assert!(state.receive(&mut transport, "turn", &|| false).is_err());
+            assert_eq!(state.deadline, deadline);
+        }
+    }
+
+    #[test]
+    fn retry_notice_alone_never_completes_or_supplies_usage() {
+        let mut messages = base_messages();
+        messages.push(serde_json::from_str(RETRY_NOTICE_CAPTURE).unwrap());
+        let mut transport = FakeTransport::from_values(messages);
+        let mut partial = None;
+        let error = run_app_server_turn_observed(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("no approval authority"),
+            || false,
+            &mut partial,
+            &mut || panic!("no usage inferred"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppServerError::ProtocolLoss { phase: "turn" }
+        ));
+        let partial = partial.unwrap();
+        assert_eq!(partial.status, TurnTerminalStatus::Failed);
+        assert!(partial.token_usage.is_none());
+        assert!(partial.final_message.is_none());
+        assert_eq!(partial.completed_items, 0);
+        assert!(partial.item_outcomes.is_empty());
+        assert!(partial.auto_reviews.is_empty());
+        assert!(partial.command_execution_evidence.observations.is_empty());
+        assert!(sent_interrupt(&transport));
+    }
+
+    #[test]
+    fn retry_notices_remain_unexpected_before_turn_start() {
+        for position in [0, 1] {
+            let mut messages = base_messages();
+            messages.insert(
+                position,
+                serde_json::from_str(RETRY_NOTICE_CAPTURE).unwrap(),
+            );
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Unexpected {
+                    phase: "initialize" | "thread/start",
+                    ..
+                })
+            ));
+        }
+    }
 
     #[test]
     fn captured_thread_system_error_surfaces_capacity_failure_without_success_or_usage() {

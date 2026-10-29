@@ -45,13 +45,23 @@ pub struct SshConfig {
 }
 
 impl SshConfig {
-    pub fn new(input: SshConfigInput) -> Result<Self> {
-        super::validate_opaque_id("host_id", &input.host_id)?;
-        validate_host(&input.host)?;
-        validate_user(&input.user)?;
-        if input.port == 0 {
+    pub(crate) fn validate_target_identity(
+        host_id: &str,
+        host: &str,
+        user: &str,
+        port: u16,
+    ) -> Result<()> {
+        super::validate_opaque_id("host_id", host_id)?;
+        validate_host(host)?;
+        validate_user(user)?;
+        if port == 0 {
             bail!("SSH port must be greater than zero");
         }
+        Ok(())
+    }
+
+    pub fn new(input: SshConfigInput) -> Result<Self> {
+        Self::validate_target_identity(&input.host_id, &input.host, &input.user, input.port)?;
         validate_trust_file("identity_file", &input.identity_file, true)?;
         validate_trust_file("known_hosts_file", &input.known_hosts_file, false)?;
         validate_remote_absolute_path("remote_root", &input.remote_root)?;

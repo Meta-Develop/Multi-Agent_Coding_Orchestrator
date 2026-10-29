@@ -920,7 +920,8 @@ impl PreparedProcessTree {
                     }
                     let rollback_elapsed = rollback_started.elapsed();
                     tracing::debug!(elapsed_ms = rollback_elapsed.as_millis(), "systemd attachment rollback verified empty");
-                    let source = with_phase_diagnostics(source, format!("attachment rollback: elapsed_ms={} completed=true", rollback_elapsed.as_millis()));
+                    let rollback_diagnostics = format!("attachment rollback: elapsed_ms={} completed=true", rollback_elapsed.as_millis());
+                    let source = with_phase_diagnostics(source, rollback_diagnostics.clone());
                     return if cancellation.is_cancelled() {
                         Err(ProcessRunError::Cancelled {
                             label: label.to_string(),
@@ -934,7 +935,7 @@ impl PreparedProcessTree {
                                 ),
                                 side_effects: self.side_effects,
                                 process_error: Some(format!(
-                                    "process was cancelled by its run supervisor; {cancellation_diagnostics}"
+                                    "process was cancelled by its run supervisor; {cancellation_diagnostics}; {rollback_diagnostics}"
                                 )),
                                 stdin_error: None,
                             })),

@@ -2858,8 +2858,8 @@ fn print_agent_processes(processes: &[AgentProcessRecord], json: bool) -> Result
 fn print_agent_stop_report(report: &AgentStopReport, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(report)?);
-    } else if report.stopped.is_empty() {
-        println!("No live MACO agents matched the selected run.");
+    } else if report.stopped.is_empty() && report.failures.is_empty() {
+        println!("No registered MACO agents matched the selected run.");
     } else {
         for stopped in &report.stopped {
             println!(
@@ -2870,8 +2870,19 @@ fn print_agent_stop_report(report: &AgentStopReport, json: bool) -> Result<()> {
                 stopped.process.task_id
             );
         }
+        for failure in &report.failures {
+            println!(
+                "Failed({:?}, {:?})\t{}\t{}\t{}\t{}",
+                failure.reason,
+                failure.outcome,
+                failure.process.pid,
+                failure.process.run_id,
+                failure.process.task_id,
+                failure.error
+            );
+        }
     }
-    Ok(())
+    report.ensure_complete()
 }
 
 fn print_worktree_lifecycle_report(report: &WorktreeLifecycleReport, json: bool) -> Result<()> {
