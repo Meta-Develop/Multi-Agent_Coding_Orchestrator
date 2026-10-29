@@ -3386,7 +3386,7 @@ struct ListAgentsArgs {
 struct StopAgentsArgs {
     /// Run id, task/assignment id, or decimal PID. The selector must match exactly one process.
     selector: Option<String>,
-    /// Stop every live process in the run selected by --run-id.
+    /// Stop every registered process in the run selected by --run-id.
     #[arg(long)]
     all: bool,
     /// Run id used with --all.
