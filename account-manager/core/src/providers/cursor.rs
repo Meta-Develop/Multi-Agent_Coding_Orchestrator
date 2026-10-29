@@ -806,6 +806,7 @@ impl ProviderAdapter for CursorAdapter {
         validate_managed_cursor_home(&home, true)?;
         Ok(LaunchSpec::new(self.program())
             .current_dir(self.resolved_working_directory()?)
+            .credential_environment_inputs(["CURSOR_API_KEY"])
             .set_plain_env("HOME", home.as_os_str())
             .set_plain_env("CURSOR_CONFIG_DIR", home.join(".cursor").as_os_str())
             .set_plain_env("AGENT_CLI_CREDENTIAL_STORE", "file")
@@ -866,10 +867,47 @@ impl ProviderAdapter for CursorAdapter {
 
 #[cfg(test)]
 mod tests {
+    use super::super::{launch_spec_for, LaunchEnvironment};
     use super::ProviderAdapter;
     use super::*;
     use std::fs;
     use std::path::Path;
+
+    struct DeclaredLaunch(LaunchSpec);
+
+    impl ProviderAdapter for DeclaredLaunch {
+        fn id(&self) -> &'static str {
+            PROVIDER_ID
+        }
+
+        fn descriptor(&self) -> ProviderDescriptor {
+            unreachable!("only launch declaration is exercised")
+        }
+
+        fn config_paths(&self) -> Vec<PathBuf> {
+            Vec::new()
+        }
+
+        fn detect(&self) -> InstallState {
+            InstallState::Unknown
+        }
+
+        fn list_accounts(&self) -> Result<Vec<Account>> {
+            Ok(Vec::new())
+        }
+
+        fn activation_mechanism(&self) -> ActivationMechanism {
+            ActivationMechanism::LaunchEnvironment
+        }
+
+        fn launch_spec(&self, _account: &StoredAccountMetadata) -> Result<LaunchSpec> {
+            Ok(self.0.clone())
+        }
+
+        fn activate_account(&self, _account_id: &str) -> Result<()> {
+            Err(Error::NotImplemented("fixture activation"))
+        }
+    }
 
     fn metadata(id: &str, state: StoredAccountState, selected: bool) -> StoredAccountMetadata {
         StoredAccountMetadata {
@@ -991,7 +1029,7 @@ mod tests {
             .is_none());
 
         let complete = metadata("work", StoredAccountState::Complete, true);
-        let launch = adapter.launch_spec(&complete).expect("launch spec");
+        let launch = launch_spec_for(&adapter, &complete).expect("launch spec");
         let environment = launch.plain_environment();
         let managed_home = data.path().join("accounts").join("cursor").join("work");
         assert_eq!(
@@ -1007,6 +1045,19 @@ mod tests {
         );
         assert_eq!(launch.environment_removals(), vec!["CURSOR_API_KEY"]);
         assert!(file_store_auth_json(&managed_home).is_file());
+
+        let mut unconfined = launch;
+        unconfined.environment.retain(|entry| {
+            !matches!(entry, LaunchEnvironment::Remove { name } if name == "CURSOR_API_KEY")
+        });
+        let error = launch_spec_for(&DeclaredLaunch(unconfined), &complete)
+            .err()
+            .expect("inherited credential input must be cleared");
+        assert!(matches!(
+            error,
+            Error::ConfigWrite { reason, .. }
+                if reason == "inherited credential input was not removed or replaced from the selected store"
+        ));
     }
 
     #[test]

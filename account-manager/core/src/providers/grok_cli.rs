@@ -1304,6 +1304,7 @@ impl ProviderAdapter for GrokCliAdapter {
         Ok(LaunchSpec::new(self.program())
             .arg("--no-auto-update")
             .current_dir(self.resolved_working_directory()?)
+            .credential_environment_inputs(["GROK_AUTH_PATH", "XAI_API_KEY"])
             .set_plain_env("GROK_HOME", home.as_os_str())
             .remove_env("GROK_AUTH_PATH")
             .remove_env("XAI_API_KEY"))

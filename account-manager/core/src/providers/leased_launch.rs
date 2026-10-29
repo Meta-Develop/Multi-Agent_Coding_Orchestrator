@@ -7,7 +7,8 @@ use crate::account_authority::{SelectedAccountBinding, SelectedUseLease, StoredA
 use crate::error::{Error, Result};
 use crate::storage::CredentialStore;
 
-use super::{launch_spec_for, spawn_launch, ProviderAdapter};
+use super::launch_lifecycle::{LaunchLifecycle, LaunchLifecycleHandle};
+use super::ProviderAdapter;
 
 /// A child and its selected-account use lease, transferred together to a reaper.
 ///
@@ -19,9 +20,30 @@ pub struct LeasedChild {
     child: Child,
     binding: SelectedAccountBinding,
     lease: Option<SelectedUseLease>,
+    lifecycle: LaunchLifecycle,
+    cancellation_requested: bool,
 }
 
 impl LeasedChild {
+    pub(super) fn new(
+        child: Child,
+        binding: SelectedAccountBinding,
+        lease: SelectedUseLease,
+        lifecycle: LaunchLifecycle,
+    ) -> Self {
+        Self {
+            child,
+            binding,
+            lease: Some(lease),
+            lifecycle,
+            cancellation_requested: false,
+        }
+    }
+
+    pub fn lifecycle(&self) -> LaunchLifecycleHandle {
+        self.lifecycle.handle()
+    }
+
     pub fn id(&self) -> u32 {
         self.child.id()
     }
@@ -32,28 +54,53 @@ impl LeasedChild {
 
     /// Wait for exit, retaining the lease if the wait fails.
     pub fn wait(&mut self) -> io::Result<ExitStatus> {
-        let status = self.child.wait()?;
+        let status = self
+            .child
+            .wait()
+            .inspect_err(|_| self.lifecycle.exit_unknown())?;
+        self.lifecycle
+            .confirmed_exit(status, self.cancellation_requested);
         self.lease.take();
         Ok(status)
     }
 
     /// Poll for exit, retaining the lease while alive or if the poll fails.
     pub fn try_wait(&mut self) -> io::Result<Option<ExitStatus>> {
-        let status = self.child.try_wait()?;
-        if status.is_some() {
+        let status = self
+            .child
+            .try_wait()
+            .inspect_err(|_| self.lifecycle.exit_unknown())?;
+        if let Some(status) = status {
+            self.lifecycle
+                .confirmed_exit(status, self.cancellation_requested);
             self.lease.take();
         }
         Ok(status)
+    }
+
+    /// Request termination of this exact child and finalize cancellation only
+    /// after wait confirms exit. A failed kill or wait retains the lease.
+    pub fn cancel(&mut self) -> io::Result<ExitStatus> {
+        if let Some(status) = self.try_wait()? {
+            return Ok(status);
+        }
+        self.child.kill()?;
+        self.cancellation_requested = true;
+        self.wait()
     }
 }
 
 impl Drop for LeasedChild {
     fn drop(&mut self) {
         if let Some(lease) = self.lease.take() {
-            if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            if let Ok(Some(status)) = self.child.try_wait() {
+                self.lifecycle
+                    .confirmed_exit(status, self.cancellation_requested);
+            } else {
                 // Child::drop does not wait. Keep the active-use barrier even
                 // if custody is abandoned or a reaper cannot confirm exit.
                 std::mem::forget(lease);
+                self.lifecycle.exit_unknown();
             }
         }
     }
@@ -70,22 +117,19 @@ pub fn spawn_selected_launch(
     binding: &SelectedAccountBinding,
     credential_store: impl FnOnce() -> Result<Box<dyn CredentialStore>>,
 ) -> Result<LeasedChild> {
-    if binding.provider_id != adapter.id() {
-        return Err(Error::UnknownProvider(binding.provider_id.clone()));
-    }
-    let lease = registry.acquire_selected_use(binding)?;
-    let account = registry.complete(adapter.id(), &binding.account_id)?;
-    let spec = launch_spec_for(adapter, &account)?;
-    let store = spec
-        .requires_credential()
-        .then(credential_store)
-        .transpose()?;
-    let child = spawn_launch(spec, &account, store.as_deref())?;
-    Ok(LeasedChild {
-        child,
-        binding: binding.clone(),
-        lease: Some(lease),
-    })
+    let mut bytes = [0u8; 16];
+    getrandom::getrandom(&mut bytes).map_err(|_| Error::ConfigWrite {
+        provider: binding.provider_id.clone(),
+        reason: "could not allocate launch operation identity".into(),
+    })?;
+    let operation_id: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+    LaunchLifecycle::new(
+        format!("local-process-{}", std::process::id()),
+        operation_id,
+        binding.clone(),
+        None,
+    )?
+    .spawn(registry, adapter, credential_store)
 }
 
 #[cfg(test)]
