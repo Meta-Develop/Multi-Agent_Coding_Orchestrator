@@ -1,5 +1,23 @@
 use super::*;
 
+fn operator_pricing_fields(value: &Value) -> Value {
+    Value::Object(
+        [
+            "pricing_contract",
+            "pricing_plan_id",
+            "model_pricing",
+            "pricing_binding",
+        ]
+        .into_iter()
+        .filter_map(|field| {
+            value
+                .get(field)
+                .map(|value| (field.to_owned(), value.clone()))
+        })
+        .collect(),
+    )
+}
+
 #[test]
 fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
     let mut plan = injected_plan(injected_assignment(false), 0);
@@ -31,11 +49,30 @@ fn operator_contract_plan_loader_is_strict_bounded_and_schema_visible() {
     compiler.add_resource(url, schema).unwrap();
     let mut schemas = boon::Schemas::new();
     let index = compiler.compile(url, &mut schemas).unwrap();
-    schemas.validate(&document, index).unwrap();
-    schemas.validate(&normalized, index).unwrap();
+    schemas
+        .validate(&operator_pricing_fields(&document), index)
+        .unwrap();
+    schemas
+        .validate(&operator_pricing_fields(&normalized), index)
+        .unwrap();
+    schemas.validate(&json!({}), index).unwrap();
+    let mut unknown_field = operator_pricing_fields(&document);
+    unknown_field["unexpected"] = json!(true);
+    assert!(schemas.validate(&unknown_field, index).is_err());
+    for fixture in [
+        include_str!("../../../fixtures/schemas/operator-pricing-plan-v1.valid.json"),
+        include_str!("../../../fixtures/schemas/operator-pricing-plan-zero-v1.valid.json"),
+    ] {
+        let mut fixture_plan: SupervisorPlan = serde_json::from_str(fixture).unwrap();
+        assert!(operator_pricing::load(fixture, &mut fixture_plan)
+            .unwrap()
+            .is_some());
+    }
     let mut invalid = document.clone();
     invalid["pricing_contract"]["unexpected"] = json!(true);
-    assert!(schemas.validate(&invalid, index).is_err());
+    assert!(schemas
+        .validate(&operator_pricing_fields(&invalid), index)
+        .is_err());
     assert!(parse_supervisor_plan_with_consultant(&invalid.to_string()).is_err());
 
     for duplicate in [

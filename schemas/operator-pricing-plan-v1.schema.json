@@ -1,7 +1,10 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/operator-pricing-plan-v1.schema.json",
   "title": "Optional operator pricing fields for supervisor plans",
+  "description": "Contract for the optional pricing-field envelope extracted from a supervisor plan; other plan fields are outside this schema.",
   "type": "object",
+  "additionalProperties": false,
   "properties": {
     "pricing_contract": { "$ref": "#/$defs/contract" },
     "pricing_plan_id": { "type": "string", "minLength": 1 },
