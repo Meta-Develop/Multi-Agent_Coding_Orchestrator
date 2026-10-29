@@ -1254,6 +1254,12 @@ fn task_shape_ceiling_prior_compatibility_and_validation() -> anyhow::Result<()>
     legacy.as_object_mut().unwrap().remove("task_shape_ceiling");
     let legacy: ModelPrior = serde_json::from_value(legacy)?;
     assert!(legacy.task_shape_ceiling.is_none());
+    let legacy_wire = serde_json::to_value(&legacy)?;
+    assert_eq!(
+        legacy_wire.get("task_shape_ceiling"),
+        Some(&serde_json::Value::Null)
+    );
+    assert_eq!(serde_json::from_value::<ModelPrior>(legacy_wire)?, legacy);
     assert_eq!(
         effective_task_shape_ceiling(&legacy.runtime, &legacy.model, None)?,
         TaskShapeCeiling::bounded_terminal()
@@ -1298,7 +1304,7 @@ fn task_shape_ceiling_prior_compatibility_and_validation() -> anyhow::Result<()>
     let model_schema = &schema["properties"]["provenance"]["properties"]["normalized_input"]
         ["properties"]["priors"]["properties"]["models"]["items"];
     assert!(model_schema["properties"]["task_shape_ceiling"].is_object());
-    assert!(!model_schema["required"]
+    assert!(model_schema["required"]
         .as_array()
         .unwrap()
         .iter()
@@ -1620,6 +1626,24 @@ fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_overrid
                 .priors
                 .models
                 .retain(|prior| prior.model != target.model);
+            if authority != AuthorityRole::TerminalLeaf {
+                let broad = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
+                assert!(broad.environment_fallback.is_none());
+                assert!(broad
+                    .candidate_set
+                    .iter()
+                    .filter(|evaluation| evaluation.candidate.model == target.model)
+                    .all(|evaluation| !evaluation.eligible
+                        && evaluation.ineligibility_reasons.iter().any(|reason| {
+                            reason.code == IneligibilityCode::TaskShapeNotAdvertised
+                        })));
+            }
+            // Isolate authority from the independent bundled shape ceiling.
+            input.task.risk = RiskLevel::Medium;
+            input.task.boundedness = Boundedness::Bounded;
+            input.task.context = ContextSize::Medium;
+            input.task.horizon = TaskHorizon::Medium;
+            no_prior.task = input.task.clone();
             let control = select_with_loaded_routing_policy(&no_prior, &[], Some(&receipt))?;
             assert_eq!(
                 control
@@ -1689,6 +1713,16 @@ fn astra_prohibition_cannot_be_bypassed_by_environment_fallback_or_debug_overrid
         for routing in [None, Some(&receipt)] {
             let decision = select_with_loaded_routing_policy(&input, &[], routing)?;
             assert!(decision.environment_fallback.is_none());
+            assert!(decision
+                .candidate_set
+                .iter()
+                .filter(|evaluation| evaluation.candidate.model == target.model)
+                .all(|evaluation| !evaluation.eligible
+                    && evaluation.score.is_none()
+                    && evaluation
+                        .ineligibility_reasons
+                        .iter()
+                        .any(|reason| { reason.code == IneligibilityCode::PolicyProhibited })));
             assert!(decision
                 .choice
                 .is_none_or(|choice| choice.candidate.model == "gpt-6.1-sol"));

@@ -373,8 +373,9 @@ pub struct ModelPrior {
     pub prohibition_reason: Option<String>,
     pub prohibited_authority_roles: BTreeSet<AuthorityRole>,
     pub long_context_eligible: bool,
-    /// Optional qualified task bounds. Omission cannot widen bundled bounds.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Optional qualified task bounds, serialized as null when absent.
+    /// Legacy omission cannot widen bundled bounds.
+    #[serde(default)]
     pub task_shape_ceiling: Option<TaskShapeCeiling>,
     pub strong_gate_fallback_efforts: BTreeSet<ReasoningEffort>,
     pub strength_rank: u16,
