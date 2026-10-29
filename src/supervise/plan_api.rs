@@ -3691,6 +3691,7 @@ pub(super) fn parse_supervisor_plan_with_consultant_in_repo(
     bind_assignment_role_categories(&mut plan);
     validate_task_routing_assessment_binding(&plan, &plan_metadata)?;
     let assignment_metadata = assignment_metadata_from_plan_value(&value, &plan)?;
+    validate_authored_check_metadata(&plan, &assignment_metadata)?;
     validate_consultant_plan(&consultant)?;
     Ok(LoadedSupervisorPlan {
         plan,
@@ -4371,6 +4372,13 @@ fn collect_assignment_metadata(
         .trim();
     let assignment = assignments_by_id.get(raw_id).copied();
     if let Some(assignment) = assignment {
+        if let Some(raw_checks) = raw_assignment.get("authored_independent_checks") {
+            let checks = serde_json::from_value(raw_checks.clone())
+                .context("invalid authored_independent_checks")?;
+            metadata_by_worker
+                .authored_independent_checks
+                .insert(assignment.id.clone(), checks);
+        }
         if let Some(raw_inputs) = raw_assignment.get("source_inputs") {
             use crate::external_agent::researcher_inputs::{
                 validate_declarations, ResearcherSourceInput,
@@ -4414,6 +4422,9 @@ fn collect_assignment_metadata(
             .map(Vec::as_slice)
             .unwrap_or_default();
         for raw_worker in raw_workers {
+            if raw_worker.get("authored_independent_checks").is_some() {
+                bail!("authored_independent_checks must be declared on the parent assignment");
+            }
             if raw_worker.get("source_inputs").is_some() {
                 bail!("source_inputs cannot be delegated to nested Workers");
             }
@@ -4495,6 +4506,7 @@ pub(super) fn supervisor_plan_value(
     plan_metadata: &SupervisorPlanMetadata,
 ) -> Result<Value> {
     validate_task_routing_assessment_binding(plan, plan_metadata)?;
+    validate_authored_check_metadata(plan, assignment_metadata)?;
     let mut value =
         serde_json::to_value(plan).context("failed to serialize normalized supervisor plan")?;
     let assignments = value
@@ -4502,6 +4514,18 @@ pub(super) fn supervisor_plan_value(
         .and_then(Value::as_array_mut)
         .context("normalized supervisor plan assignments did not serialize to an array")?;
     for (assignment_value, assignment) in assignments.iter_mut().zip(&plan.assignments) {
+        if let Some(checks) = assignment_metadata
+            .authored_independent_checks
+            .get(&assignment.id)
+        {
+            assignment_value
+                .as_object_mut()
+                .context("normalized assignment is not an object")?
+                .insert(
+                    "authored_independent_checks".into(),
+                    serde_json::to_value(checks)?,
+                );
+        }
         if let Some(inputs) = assignment_metadata.source_inputs.get(&assignment.id) {
             assignment_value
                 .as_object_mut()
