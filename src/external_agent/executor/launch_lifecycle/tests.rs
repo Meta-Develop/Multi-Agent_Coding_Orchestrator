@@ -322,21 +322,41 @@ fn production_launch_lifecycle_preflight_refusals_preserve_live_child_evidence()
 
     let _socket = CamAuthoritySocketTestGuard::install(None);
     for kind in ["setup-timeout", "tee-conflict"] {
-        for earlier_live_child in [false, true] {
+        for earlier_verified in [None, Some(true), Some(false)] {
+            let earlier_live_child = earlier_verified == Some(false);
             let (_guard, mut authority, registry) = fixture();
             let (credentials, handle) = construct(&mut authority);
             let mut evidence = EnvironmentPreflightProcessEvidence::default();
-            if earlier_live_child {
+            if let Some(verified) = earlier_verified {
                 evidence.record(
-                    ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService),
-                    SideEffectConfinementEvidence::Unverified(
-                        SideEffectConfinementProfileKind::ExternalGrok,
-                    ),
-                    false,
+                    if verified {
+                        ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+                    } else {
+                        ProcessTreeEvidence::Unverified(ContainmentBackend::SystemdUserService)
+                    },
+                    if verified {
+                        SideEffectConfinementEvidence::Verified(
+                            SideEffectConfinementProfileKind::ExternalGrok,
+                        )
+                    } else {
+                        SideEffectConfinementEvidence::Unverified(
+                            SideEffectConfinementProfileKind::ExternalGrok,
+                        )
+                    },
+                    verified,
                 );
             }
             evidence.record_error(&pre_release_error(kind));
-            assert_eq!(evidence.started, earlier_live_child);
+            assert!(evidence.started);
+            assert_eq!(
+                evidence.process_tree,
+                Some(ProcessTreeEvidence::Unverified(
+                    ContainmentBackend::SystemdUserService
+                ))
+            );
+            assert!(evidence
+                .side_effects
+                .is_some_and(|effects| !effects.is_verified()));
             assert_eq!(evidence.may_have_live_child(), earlier_live_child);
             if evidence.may_have_live_child() {
                 authority.launch_custody().unwrap().exit_unknown();
