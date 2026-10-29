@@ -2323,6 +2323,7 @@ fn real_provider_request(
         runtime: crate::supervise::SupervisorRuntime::Grok,
         runtime_executable: std::path::PathBuf::from("/usr/bin/true"),
         additional_runtime_executables: Vec::new(),
+        prior_data: None,
         machine_global_retention: dummy_retention(),
     }
 }
@@ -2341,6 +2342,343 @@ fn no_reserved_runs(artifact_repo: &std::path::Path) {
         "opt-in refusal reserved artifacts at {}",
         runs.display()
     );
+}
+
+#[cfg(unix)]
+fn held_out_prior_fixture() -> Vec<u8> {
+    let base = crate::selection::built_in_prior_dataset().expect("bundled priors");
+    let template = base
+        .models
+        .iter()
+        .find(|row| row.model == "gpt-5.6-sol")
+        .expect("bundled model");
+    let models: Vec<_> = [("codex", "held-out-codex"), ("grok", "held-out-grok")]
+        .into_iter()
+        .map(|(runtime, model)| {
+            let mut row = template.clone();
+            row.runtime = runtime.into();
+            row.model = model.into();
+            row.observed_on = base.published_on.clone();
+            row.source_id = "held-out-technical-fixture".into();
+            row.prior_scope = "technical fixture only; no production qualification".into();
+            row
+        })
+        .collect();
+    let capabilities = ["held-out-codex", "held-out-grok"].map(|model| {
+        json!({
+            "model": model,
+            "capability": "critical_judgment",
+            "eligible": true,
+            "evidence": "technical fixture only",
+            "as_of": base.published_on,
+        })
+    });
+    serde_json::to_vec_pretty(&json!({
+        "schema_version": 1,
+        "dataset_id": "held-out-technical-fixture",
+        "revision": format!("{}+held-out", base.revision),
+        "published_on": base.published_on,
+        "models": models,
+        "capability_policy": {
+            "id": "held-out-technical-fixture",
+            "version": 1,
+            "source": "technical fixture; no production qualification",
+            "models": capabilities
+        }
+    }))
+    .expect("prior fixture")
+}
+
+#[cfg(unix)]
+#[test]
+fn held_out_prior_input_rejects_escape_mutation_and_missing_capability_before_reservation() {
+    use std::path::Path;
+    let mut manifest = observation_manifest_one_profile();
+    manifest.profiles[0] = profile("mixed", "held-out-codex", "held-out-grok");
+    let (_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let source = HeldOutExplicitSourceBaseline {
+        source_repo: source_repo.clone(),
+        base_commit,
+    };
+    let (_artifact, artifact_repo) = artifact_owner();
+    let plan_workspace = tempfile::TempDir::new().expect("plans");
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let raw = held_out_prior_fixture();
+    fs::write(source_repo.join("prior.json"), &raw).unwrap();
+    for path in [Path::new("../prior.json"), &source_repo.join("prior.json")] {
+        assert!(HeldOutPriorDataInput::freeze(&source_repo, path).is_err());
+        no_reserved_runs(&artifact_repo);
+    }
+    std::os::unix::fs::symlink(
+        source_repo.join("prior.json"),
+        source_repo.join("link.json"),
+    )
+    .unwrap();
+    assert!(HeldOutPriorDataInput::freeze(&source_repo, Path::new("link.json")).is_err());
+    let input = HeldOutPriorDataInput::freeze(&source_repo, Path::new("prior.json")).unwrap();
+    fs::write(source_repo.join("prior.json"), b"{}").unwrap();
+    let mut request = real_provider_request(source.clone(), provider_plan.clone());
+    request.prior_data = Some(input.clone());
+    let error = run_held_out_real_provider_experiment(&manifest, request, &artifact_repo)
+        .expect_err("changed prior before reservation");
+    assert!(
+        error.to_string().contains("changed from the frozen"),
+        "{error:#}"
+    );
+    no_reserved_runs(&artifact_repo);
+
+    fs::write(source_repo.join("prior.json"), &raw).unwrap();
+    let (_foreign_workspace, foreign_repo, foreign_commit) = init_committed_source_repo("other");
+    let mut request = real_provider_request(
+        HeldOutExplicitSourceBaseline {
+            source_repo: foreign_repo,
+            base_commit: foreign_commit,
+        },
+        provider_plan.clone(),
+    );
+    request.prior_data = Some(input);
+    let error = run_held_out_real_provider_experiment(&manifest, request, &artifact_repo)
+        .expect_err("foreign source");
+    assert!(
+        error.to_string().contains("different source repository"),
+        "{error:#}"
+    );
+    no_reserved_runs(&artifact_repo);
+
+    for invalid in [b"{}".to_vec(), vec![b' '; 256 * 1024 + 1]] {
+        fs::write(source_repo.join("prior.json"), invalid).unwrap();
+        assert!(HeldOutPriorDataInput::freeze(&source_repo, Path::new("prior.json")).is_err());
+        no_reserved_runs(&artifact_repo);
+    }
+    let mut value: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+    value["capability_policy"]["models"] = json!([]);
+    fs::write(
+        source_repo.join("prior.json"),
+        serde_json::to_vec(&value).unwrap(),
+    )
+    .unwrap();
+    let mut request = real_provider_request(source, provider_plan);
+    request.prior_data =
+        Some(HeldOutPriorDataInput::freeze(&source_repo, Path::new("prior.json")).unwrap());
+    let error = run_held_out_real_provider_experiment(&manifest, request, &artifact_repo)
+        .expect_err("missing capability before reservation");
+    assert!(
+        format!("{error:#}").contains("no trusted capability policy"),
+        "{error:#}"
+    );
+    no_reserved_runs(&artifact_repo);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn held_out_prior_snapshot_is_identical_across_mixed_runtime_profiles() {
+    use crate::artifacts::{ArtifactRunReader, RunArtifactFamily};
+    use crate::supervise::{trusted_model_capability, SupervisorPlan, SupervisorRuntime};
+    use std::path::Path;
+    let mut manifest = experiment_manifest();
+    manifest.profiles = vec![
+        profile("mixed-a", "held-out-codex", "held-out-grok"),
+        profile("mixed-b", "held-out-codex", "held-out-grok"),
+    ];
+    let (_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let raw = held_out_prior_fixture();
+    fs::write(source_repo.join("prior.json"), &raw).unwrap();
+    let input = HeldOutPriorDataInput::freeze(&source_repo, Path::new("prior.json")).unwrap();
+    let provenance = input.provenance().clone();
+    let (_artifact, artifact_repo) = artifact_owner();
+    // The artifact repository deliberately contains an invalid same-named file.
+    fs::write(artifact_repo.join("prior.json"), b"{}").unwrap();
+    let plan_workspace = tempfile::TempDir::new().unwrap();
+    let provider_plan = write_caller_plan(plan_workspace.path(), "docs-child", false, false);
+    let mut plan: serde_json::Value =
+        serde_json::from_slice(&fs::read(&provider_plan).unwrap()).unwrap();
+    plan["assignments"][0]["role"] = json!("worker");
+    plan["assignments"][0]["role_category"] = json!("non_delegating_terminal_worker");
+    plan["assignments"][0]["runtime"] = json!("grok");
+    plan["assignments"][0]["worker_assignments"] = json!([]);
+    fs::write(&provider_plan, serde_json::to_vec(&plan).unwrap()).unwrap();
+    let mut request = real_provider_request(
+        HeldOutExplicitSourceBaseline {
+            source_repo: source_repo.clone(),
+            base_commit,
+        },
+        provider_plan,
+    );
+    request.runtime = SupervisorRuntime::Codex;
+    request
+        .additional_runtime_executables
+        .push(HeldOutAdditionalRuntimeBinding {
+            runtime: SupervisorRuntime::Grok,
+            executable: "/usr/bin/true".into(),
+        });
+    let _runtime_bindings = crate::supervise::bind_explicit_runtime_executables(
+        &source_repo,
+        &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
+        SupervisorRuntime::Codex,
+        Path::new("/usr/bin/true"),
+        &[(SupervisorRuntime::Grok, "/usr/bin/true".into())],
+    )
+    .unwrap();
+    request.prior_data = Some(input);
+    let mut dispatches = 0;
+    let results = super::executed_experiment::run_held_out_real_provider_experiment_with_dispatch(
+        &manifest,
+        request,
+        &artifact_repo,
+        |options, _authority, _allowlist| {
+            dispatches += 1;
+            assert_eq!(options.runtime, SupervisorRuntime::Codex);
+            assert!(trusted_model_capability("held-out-grok").is_some());
+            let plan: SupervisorPlan =
+                serde_json::from_slice(&fs::read(&options.plan_file).unwrap()).unwrap();
+            assert_eq!(plan.assignments[0].runtime, Some(SupervisorRuntime::Grok));
+            assert_eq!(
+                plan.role_models[&AgentRole::Worker].model.as_deref(),
+                Some("held-out-grok")
+            );
+            assert!(!options.repo.join("prior.json").exists());
+            // A later profile must use frozen bytes even after the supplied file changes.
+            fs::write(source_repo.join("prior.json"), b"{}").unwrap();
+            anyhow::bail!("bounded fixture refusal before any provider launch")
+        },
+    )
+    .expect("retained refusal observations");
+    assert_eq!(dispatches, 2);
+    assert!(trusted_model_capability("held-out-grok").is_none());
+    assert!(!results.real_provider_executed);
+    assert!(!results.production_eligible);
+    assert!(!results.eligible_for_production_economics);
+    assert!(results.runs.iter().all(|run| run.failure.is_some()));
+    let reader = ArtifactRunReader::open(
+        &artifact_repo,
+        RunArtifactFamily::Supervise,
+        &crate::orchestrator::RunId::new(&results.artifact_run_id).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        reader
+            .read("held-out/operator_prior_data/input.json")
+            .unwrap(),
+        raw
+    );
+    let effective = reader
+        .read("held-out/operator_prior_data/effective.json")
+        .unwrap();
+    let effective_value: serde_json::Value = serde_json::from_slice(&effective).unwrap();
+    for (runtime, model) in [("codex", "held-out-codex"), ("grok", "held-out-grok")] {
+        let mut selection = crate::selection::selection_test_base_input();
+        selection.priors = serde_json::from_value(effective_value["priors"].clone()).unwrap();
+        selection
+            .catalogs
+            .retain(|catalog| catalog.runtime == runtime);
+        selection.catalogs[0].models.truncate(1);
+        selection.catalogs[0].models[0].model = model.into();
+        selection.pools.retain(|pool| pool.runtime == runtime);
+        let choice = crate::selection::select(&selection)
+            .unwrap()
+            .choice
+            .expect("dated fixture choice");
+        assert_eq!(choice.candidate.runtime, runtime);
+        assert_eq!(choice.candidate.model, model);
+    }
+    for index in 0..2 {
+        let prefix = format!("held-out/p{index}-r0");
+        assert_eq!(
+            reader
+                .read(format!(
+                    "{prefix}/requested-input/operator_prior_data/input.json"
+                ))
+                .unwrap(),
+            raw
+        );
+        assert_eq!(
+            reader
+                .read(format!(
+                    "{prefix}/requested-input/operator_prior_data/effective.json"
+                ))
+                .unwrap(),
+            effective
+        );
+        let binding: serde_json::Value = serde_json::from_slice(
+            &reader
+                .read(format!("{prefix}/requested-profile-binding.json"))
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(binding["operator_prior_data"], json!(provenance));
+        assert_eq!(
+            binding["supervisor_run_id"],
+            results.runs[index].held_out.run.supervisor_run_id
+        );
+    }
+}
+
+#[test]
+fn held_out_prior_absence_preserves_fake_and_legacy_manifests() {
+    let manifest = experiment_manifest();
+    let bytes = serde_json::to_vec(&manifest).unwrap();
+    let parsed = parse_experiment_manifest(&bytes).unwrap();
+    assert_eq!(serde_json::to_vec(&parsed).unwrap(), bytes);
+    assert!(!serde_json::from_slice::<serde_json::Value>(&bytes)
+        .unwrap()
+        .as_object()
+        .unwrap()
+        .contains_key("prior_data"));
+    let results = run_fake_supervise_experiment(&parsed, ExperimentRunRequest::default()).unwrap();
+    assert!(!results.evidence.real_provider_executed);
+    assert!(!results.evidence.production_eligible);
+}
+
+#[cfg(unix)]
+#[test]
+fn held_out_prior_absence_clears_inherited_scope_and_omits_prior_artifacts() {
+    use crate::artifacts::{ArtifactRunReader, RunArtifactFamily};
+    use crate::supervise::trusted_model_capability;
+    use std::path::Path;
+    let manifest = observation_manifest_one_profile();
+    let (_workspace, source_repo, base_commit) = init_committed_source_repo("baseline");
+    fs::write(source_repo.join("prior.json"), held_out_prior_fixture()).unwrap();
+    let input = HeldOutPriorDataInput::freeze(&source_repo, Path::new("prior.json")).unwrap();
+    let _outer = HeldOutPriorDataInput::bind_for_repo(Some(&input), &source_repo).unwrap();
+    assert!(trusted_model_capability("held-out-grok").is_some());
+    let (_artifact, artifact_repo) = artifact_owner();
+    let plan_workspace = tempfile::TempDir::new().unwrap();
+    let mut request = real_provider_request(
+        HeldOutExplicitSourceBaseline {
+            source_repo,
+            base_commit,
+        },
+        write_caller_plan(plan_workspace.path(), "docs-child", false, false),
+    );
+    request.runtime = crate::supervise::SupervisorRuntime::Codex;
+    let results = super::executed_experiment::run_held_out_real_provider_experiment_with_dispatch(
+        &manifest,
+        request,
+        &artifact_repo,
+        |_options, _authority, _allowlist| {
+            assert!(trusted_model_capability("held-out-grok").is_none());
+            anyhow::bail!("bounded fixture refusal")
+        },
+    )
+    .unwrap();
+    assert!(trusted_model_capability("held-out-grok").is_some());
+    let reader = ArtifactRunReader::open(
+        &artifact_repo,
+        RunArtifactFamily::Supervise,
+        &crate::orchestrator::RunId::new(&results.artifact_run_id).unwrap(),
+    )
+    .unwrap();
+    assert!(reader.finalization().files.iter().all(|record| !record
+        .path
+        .to_string_lossy()
+        .contains("operator_prior_data")));
+    let binding: serde_json::Value = serde_json::from_slice(
+        &reader
+            .read("held-out/p0-r0/requested-profile-binding.json")
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(binding.get("operator_prior_data").is_none());
 }
 
 #[test]
