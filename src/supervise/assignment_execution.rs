@@ -6228,7 +6228,9 @@ fn decide_child_attempt(
     Ok(ChildAttemptDisposition::Finish {
         report: attempt_report,
         containment_verified: true,
-        gate_terminal: false,
+        // Parent review cannot authenticate rejected research execution evidence.
+        gate_terminal: assignment.role == AgentRole::Researcher
+            && !report_shape_problems.is_empty(),
     })
 }
 
