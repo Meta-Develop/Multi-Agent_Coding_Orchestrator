@@ -369,6 +369,7 @@
               [
                 rustToolchain
                 pkgs.python3
+                pkgs.nodejs_22
                 pkgs.git
                 cargo-audit
                 cargo-deny

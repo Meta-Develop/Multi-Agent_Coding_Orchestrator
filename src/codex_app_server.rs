@@ -175,7 +175,9 @@ enum ThreadProgressStatus {
         #[serde(rename = "activeFlags")]
         active_flags: Vec<ThreadActiveFlag>,
     },
-    Idle,
+    // Empty struct variants enforce deny_unknown_fields on fieldless statuses.
+    Idle {},
+    SystemError {},
 }
 
 #[derive(serde::Deserialize, PartialEq, Eq)]
@@ -200,7 +202,7 @@ fn valid_thread_status_changed(line: &[u8]) -> bool {
             active_flags.len() <= 2
                 && (active_flags.len() < 2 || active_flags[0] != active_flags[1])
         }
-        ThreadProgressStatus::Idle => true,
+        ThreadProgressStatus::Idle {} | ThreadProgressStatus::SystemError {} => true,
     }
 }
 
@@ -4430,6 +4432,132 @@ mod tests {
         assert!(!valid_thread_status_changed(
             br#"{"method":"thread/status/changed","params":{"threadId":"thread-1","threadId":"other-thread","status":{"type":"active","activeFlags":[]}}}"#
         ));
+    }
+
+    const THREAD_SYSTEM_ERROR_CAPTURE: &str =
+        include_str!("../tests/fixtures/codex-0.162.0/thread-system-error.jsonl");
+
+    #[test]
+    fn captured_thread_system_error_surfaces_capacity_failure_without_success_or_usage() {
+        let mut messages = base_messages();
+        messages.insert(
+            2,
+            json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+        );
+        let mut transport = FakeTransport::from_values(messages);
+        // Replay the observed suffix as original bytes, after a synthetic correlated startup.
+        transport.incoming.splice(
+            0..0,
+            THREAD_SYSTEM_ERROR_CAPTURE
+                .lines()
+                .rev()
+                .map(|line| ReaderEvent::Line(line.as_bytes().to_vec())),
+        );
+        let mut partial = None;
+        let error = run_app_server_turn_observed(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("no approval authority"),
+            || false,
+            &mut partial,
+            &mut || panic!("no budget exhaustion"),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            AppServerError::Remote { phase: "turn", ref message }
+                if message.contains("serverOverloaded") && message.contains("at capacity")
+        ));
+        let partial = partial.expect("correlated failed-turn evidence");
+        assert_eq!(partial.thread_id, "thread-1");
+        assert_eq!(partial.turn_id, "turn-1");
+        assert_eq!(partial.resolved_model, "gpt-5.6-sol");
+        assert_eq!(partial.resolved_effort.as_deref(), Some("xhigh"));
+        assert_eq!(partial.status, TurnTerminalStatus::Failed);
+        assert!(partial.final_message.is_none());
+        assert!(partial.token_usage.is_none());
+        assert!(partial.command_execution_evidence.observations.is_empty());
+        assert_eq!(
+            partial.command_execution_evidence.turn_status,
+            TurnTerminalStatus::Failed
+        );
+    }
+
+    #[test]
+    fn thread_system_error_requires_strict_schema_and_existing_byte_bound() {
+        let line = THREAD_SYSTEM_ERROR_CAPTURE.lines().next().unwrap();
+        assert!(valid_thread_status_changed(line.as_bytes()));
+        let notice: Value = serde_json::from_str(line).unwrap();
+        for (pointer, value) in [
+            (
+                "/params/status",
+                json!({"type":"systemError","activeFlags":[]}),
+            ),
+            ("/params/status", json!({"type":"systemError","extra":true})),
+            ("/params/status", json!({"type":"unknown"})),
+            ("/params/threadId", json!("")),
+            ("/emittedAtMs", json!("invalid")),
+        ] {
+            let mut invalid = notice.clone();
+            *invalid.pointer_mut(pointer).unwrap() = value;
+            assert!(
+                !valid_thread_status_changed(invalid.to_string().as_bytes()),
+                "accepted invalid status: {invalid}"
+            );
+        }
+        for invalid in [
+            line.replacen("\"method\":", "\"id\":77,\"method\":", 1),
+            line.replace("\"threadId\":", "\"extra\":true,\"threadId\":"),
+            line.replace(
+                "\"threadId\":",
+                "\"threadId\":\"other-thread\",\"threadId\":",
+            ),
+            line.replace("\"type\":", "\"type\":\"idle\",\"type\":"),
+        ] {
+            assert!(!valid_thread_status_changed(invalid.as_bytes()));
+        }
+        let mut padded = line.as_bytes().to_vec();
+        padded.resize(STARTUP_INFORMATION_MAX_BYTES, b' ');
+        assert!(valid_thread_status_changed(&padded));
+        padded.push(b' ');
+        assert!(!valid_thread_status_changed(&padded));
+    }
+
+    #[test]
+    fn thread_system_error_preserves_lifecycle_correlation_and_count_bound() {
+        let notice: Value =
+            serde_json::from_str(THREAD_SYSTEM_ERROR_CAPTURE.lines().next().unwrap()).unwrap();
+        for (thread_started, position, thread_id, count, allowed) in [
+            (true, 5, "thread-1", THREAD_STATUS_MAX_MESSAGES, true),
+            (true, 5, "thread-1", THREAD_STATUS_MAX_MESSAGES + 1, false),
+            (true, 5, "other-thread", 1, false),
+            (false, 4, "thread-1", 1, false),
+            (true, 3, "thread-1", 1, false),
+            (true, 4, "thread-1", 1, false),
+        ] {
+            let mut messages = base_messages();
+            if thread_started {
+                messages.insert(
+                    2,
+                    json!({"method":"thread/started","params":{"thread":{"id":"thread-1"}}}),
+                );
+            }
+            let mut status = notice.clone();
+            status["params"]["threadId"] = json!(thread_id);
+            messages.splice(position..position, std::iter::repeat_n(status, count));
+            messages.push(
+                serde_json::from_str(THREAD_SYSTEM_ERROR_CAPTURE.lines().last().unwrap()).unwrap(),
+            );
+            let result = run_command_observation_messages(messages);
+            assert_eq!(result.is_ok(), allowed);
+            if let Ok(outcome) = result {
+                assert_eq!(outcome.status, TurnTerminalStatus::Failed);
+                assert!(outcome.final_message.is_none());
+                assert!(outcome.token_usage.is_none());
+                assert!(outcome.command_execution_evidence.observations.is_empty());
+            }
+        }
     }
 
     fn captured_rate_limit_notice() -> Value {
