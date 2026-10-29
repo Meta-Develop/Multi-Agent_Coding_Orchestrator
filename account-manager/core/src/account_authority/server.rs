@@ -495,40 +495,83 @@ fn encode_response_bytes(
 #[cfg(unix)]
 fn read_exact_deadline(
     stream: &mut std::os::unix::net::UnixStream,
-    buf: &mut [u8],
+    mut buf: &mut [u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     use std::io::Read;
-    apply_timeouts(stream, deadline)?;
-    stream.read_exact(buf)
+    stream.set_nonblocking(true)?;
+    while !buf.is_empty() {
+        let read = io_before_deadline(stream, libc::POLLIN, deadline, |stream| stream.read(buf))?;
+        if read == 0 {
+            return Err(io::Error::from(io::ErrorKind::UnexpectedEof));
+        }
+        buf = &mut buf[read..];
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
 fn write_all_deadline(
     stream: &mut std::os::unix::net::UnixStream,
-    buf: &[u8],
+    mut buf: &[u8],
     deadline: std::time::Instant,
 ) -> io::Result<()> {
     use std::io::Write;
-    apply_timeouts(stream, deadline)?;
-    stream.write_all(buf)
+    stream.set_nonblocking(true)?;
+    while !buf.is_empty() {
+        let written =
+            io_before_deadline(stream, libc::POLLOUT, deadline, |stream| stream.write(buf))?;
+        if written == 0 {
+            return Err(io::Error::from(io::ErrorKind::WriteZero));
+        }
+        buf = &buf[written..];
+    }
+    Ok(())
 }
 
 #[cfg(unix)]
-fn apply_timeouts(
-    stream: &std::os::unix::net::UnixStream,
+fn io_before_deadline<T>(
+    stream: &mut std::os::unix::net::UnixStream,
+    events: libc::c_short,
     deadline: std::time::Instant,
-) -> io::Result<()> {
-    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-    if remaining.is_zero() {
-        return Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "request I/O deadline elapsed",
-        ));
+    mut operation: impl FnMut(&mut std::os::unix::net::UnixStream) -> io::Result<T>,
+) -> io::Result<T> {
+    use std::os::unix::io::AsRawFd;
+
+    // Darwin rejects SO_RCVTIMEO/SO_SNDTIMEO after a peer closes, even with
+    // buffered request bytes. Nonblocking I/O can still drain those bytes;
+    // poll bounds waits without changing socket options on a closed connection.
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "request I/O deadline elapsed",
+            ));
+        }
+        match operation(stream) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
+            result => return result,
+        }
+        let mut descriptor = libc::pollfd {
+            fd: stream.as_raw_fd(),
+            events,
+            revents: 0,
+        };
+        let timeout = remaining
+            .as_millis()
+            .saturating_add(1)
+            .min(i32::MAX as u128) as i32;
+        // SAFETY: descriptor is valid for one entry and stream owns its fd for
+        // the whole call. Read/write retries handle readiness, EOF and errors.
+        if unsafe { libc::poll(&mut descriptor, 1, timeout) } < 0 {
+            let error = io::Error::last_os_error();
+            if error.kind() != io::ErrorKind::Interrupted {
+                return Err(error);
+            }
+        }
     }
-    stream.set_read_timeout(Some(remaining))?;
-    stream.set_write_timeout(Some(remaining))?;
-    Ok(())
 }
 
 #[cfg(all(test, unix))]

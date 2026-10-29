@@ -8,6 +8,81 @@ use super::*;
 use crate::account_authority::{resolve_socket_path, StoredAccountRegistry};
 
 #[test]
+fn disconnected_peer_preserves_authenticated_buffered_request() {
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixListener;
+
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("peer.sock");
+    let listener = UnixListener::bind(&path).unwrap();
+    let request =
+        br#"{"protocolVersion":1,"requestId":"lost-reply","operation":"authority.describe"}"#;
+    let mut client = UnixStream::connect(&path).unwrap();
+    client
+        .write_all(&(request.len() as u32).to_be_bytes())
+        .unwrap();
+    client.write_all(request).unwrap();
+    drop(client);
+    let (mut server, _) = listener.accept().unwrap();
+
+    // Exercise SO_PEERCRED on Linux and getpeereid on BSD/Darwin after close;
+    // buffered bytes must never substitute for an authenticated requester.
+    let peer = super::super::peer::peer_credentials(server.as_raw_fd()).unwrap();
+    assert!(super::super::peer::authorize_peer(
+        peer,
+        super::super::peer::effective_uid()
+    ));
+    let deadline = Instant::now() + Duration::from_secs(3);
+    let received = read_request(&mut server, MAX_REQUEST_BYTES, deadline)
+        .unwrap_or_else(|_| panic!("authenticated buffered request was discarded"));
+    assert_eq!(received, request);
+    assert_eq!(
+        read_exact_deadline(&mut server, &mut [0; 1], deadline)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::UnexpectedEof
+    );
+}
+
+#[test]
+fn partial_request_cannot_extend_io_deadline() {
+    let (mut server, mut client) = UnixStream::pair().unwrap();
+    client.write_all(b"x").unwrap();
+    let deadline = Instant::now() + Duration::from_millis(50);
+    let mut body = [0; 2];
+    assert_eq!(
+        read_exact_deadline(&mut server, &mut body, deadline)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert_eq!(body[0], b'x');
+    assert!(Instant::now() >= deadline);
+}
+
+#[test]
+fn backpressured_response_cannot_extend_io_deadline() {
+    let (mut server, _client) = UnixStream::pair().unwrap();
+    server.set_nonblocking(true).unwrap();
+    loop {
+        match server.write(&[0; 8192]) {
+            Ok(written) => assert!(written > 0),
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) => panic!("could not fill response buffer: {error}"),
+        }
+    }
+    let deadline = Instant::now() + Duration::from_millis(50);
+    assert_eq!(
+        write_all_deadline(&mut server, b"x", deadline)
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::TimedOut
+    );
+    assert!(Instant::now() >= deadline);
+}
+
+#[test]
 fn connection_limit_refuses_excess_and_recovers_after_disconnect() {
     let directory = tempfile::tempdir().unwrap();
     fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();

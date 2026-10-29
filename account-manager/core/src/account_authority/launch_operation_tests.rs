@@ -213,6 +213,13 @@ impl Fixture {
 }
 
 fn rpc(listener: &Arc<AuthorityListener>, request: &Value, disconnect: bool) -> Value {
+    if disconnect {
+        // Close before accept so dispatch must survive a fully disconnected
+        // peer with buffered bytes, rather than depend on worker scheduling.
+        let response = exchange(listener.path(), request, true);
+        listener.accept_once().unwrap();
+        return response;
+    }
     let server = Arc::clone(listener);
     let serve = std::thread::spawn(move || server.accept_once().unwrap());
     let response = exchange(listener.path(), request, disconnect);
