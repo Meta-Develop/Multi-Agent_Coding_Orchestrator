@@ -15,6 +15,8 @@ from typing import Mapping, Sequence
 TESTABLE_KINDS = frozenset({"lib", "bin", "test", "bench", "example"})
 SKIPPED_ONLY_KINDS = frozenset({"custom-build"})
 TARGET_NAME_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+NON_LIB_SHARDS = ("merge", "other")
+MERGE_TEST_TARGETS = frozenset({"merge_cli", "pr_issue_cli"})
 
 
 @dataclass(frozen=True)
@@ -117,7 +119,11 @@ def load_root_package(manifest_dir: Path) -> Mapping[str, object]:
     raise SystemExit(f"no metadata package for {manifest_path}")
 
 
-def partition_argv(targets: Sequence[TestableTarget], partition: str) -> list[str]:
+def partition_argv(
+    targets: Sequence[TestableTarget], partition: str, shard: str | None = None
+) -> list[str]:
+    if shard is not None and (partition != "non-lib" or shard not in NON_LIB_SHARDS):
+        raise ValueError(f"invalid {partition} shard: {shard}")
     if partition == "lib":
         lib_targets = [target for target in targets if target.kind == "lib"]
         if len(lib_targets) != 1:
@@ -127,6 +133,9 @@ def partition_argv(targets: Sequence[TestableTarget], partition: str) -> list[st
         argv: list[str] = []
         for target in targets:
             if target.kind == "lib":
+                continue
+            owner = "merge" if target.kind == "test" and target.name in MERGE_TEST_TARGETS else "other"
+            if shard is not None and owner != shard:
                 continue
             argv.extend(target.argv_tokens())
         return argv
@@ -183,6 +192,12 @@ def verify_partition(targets: Sequence[TestableTarget]) -> None:
             "partition argv does not cover metadata targets "
             f"(missing={missing!r}, extra={extra!r})"
         )
+    sharded_keys = [
+        key for shard in NON_LIB_SHARDS
+        for key in argv_to_keys(partition_argv(targets, "non-lib", shard))
+    ]
+    if len(sharded_keys) != len(set(sharded_keys)) or set(sharded_keys) != non_lib_set:
+        raise ValueError("non-lib shards do not form a disjoint complete partition")
 
 
 def emit_argv(argv: Sequence[str]) -> None:
@@ -202,6 +217,10 @@ def build_parser() -> argparse.ArgumentParser:
         nargs="?",
         choices=("lib", "non-lib"),
         help="required for argv",
+    )
+    parser.add_argument(
+        "--shard", choices=NON_LIB_SHARDS,
+        help="optional non-lib target shard; omission retains the complete non-lib partition",
     )
     parser.add_argument(
         "--manifest-dir",
@@ -225,7 +244,7 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.partition is None:
         parser.error("argv requires a partition")
-    partition_argv_tokens = partition_argv(targets, args.partition)
+    partition_argv_tokens = partition_argv(targets, args.partition, args.shard)
     if args.partition == "non-lib" and not partition_argv_tokens:
         sys.stderr.write("non-lib partition is empty\n")
         return 1

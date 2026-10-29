@@ -5377,6 +5377,65 @@ mod selection_schema_tests {
     }
 
     #[test]
+    fn published_selection_prior_ceiling_is_required_nullable_and_closed() -> Result<()> {
+        let decision = crate::selection::select(&crate::selection::selection_test_base_input())?;
+        let event = json!({
+            "assignment_id": null,
+            "attempt": 0,
+            "role": "worker",
+            "primary_cause": "initial",
+            "provenance": decision,
+        });
+        for tracked in [
+            include_str!("../../schemas/supervisor-final-report-v1.schema.json"),
+            include_str!("../../schemas/supervisor-collect-report-v1.schema.json"),
+        ] {
+            let tracked: serde_json::Value = serde_json::from_str(tracked)?;
+            let schema = tracked["properties"]["role_economics_profile"]["properties"]["execution"]
+                ["properties"]["selection_decisions"]["items"]
+                .clone();
+            let schema_id = "https://example.invalid/selection-prior-ceiling";
+            let mut compiler = boon::Compiler::new();
+            compiler.set_default_draft(boon::Draft::V2020_12);
+            compiler
+                .add_resource(schema_id, schema)
+                .expect("register event schema");
+            let mut schemas = boon::Schemas::new();
+            let index = compiler
+                .compile(schema_id, &mut schemas)
+                .expect("compile event schema");
+            assert!(schemas.validate(&event, index).is_ok());
+            let mut legacy = event.clone();
+            for prior in legacy["provenance"]["normalized_input"]["priors"]["models"]
+                .as_array_mut()
+                .context("prior rows")?
+            {
+                prior
+                    .as_object_mut()
+                    .context("prior object")?
+                    .remove("task_shape_ceiling");
+            }
+            assert!(schemas.validate(&legacy, index).is_err());
+            let mut nullable = event.clone();
+            nullable["provenance"]["normalized_input"]["priors"]["models"][0]
+                ["task_shape_ceiling"] = serde_json::Value::Null;
+            assert!(schemas.validate(&nullable, index).is_ok());
+            for malformed in [
+                json!({"boundedness":["bounded"],"maximum_risk":"high", "maximum_context":"long"}),
+                json!({"boundedness":["unknown"],"maximum_risk":"high", "maximum_context":"long","maximum_horizon":"long"}),
+                json!({"boundedness":["bounded"],"maximum_risk":"unknown", "maximum_context":"long","maximum_horizon":"long"}),
+                json!({"boundedness":["bounded"],"maximum_risk":"high", "maximum_context":"long","maximum_horizon":"long","extra_grant":true}),
+            ] {
+                let mut invalid = event.clone();
+                invalid["provenance"]["normalized_input"]["priors"]["models"][0]
+                    ["task_shape_ceiling"] = malformed;
+                assert!(schemas.validate(&invalid, index).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn command_run_record_grok_stream_usage_evidence_schema_regression() -> Result<()> {
         use crate::runtime_adapter::grok::{
             GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence,

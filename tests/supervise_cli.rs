@@ -35,6 +35,137 @@ use tempfile::TempDir;
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
 #[test]
+fn selection_only_reports_all_override_failures_without_dispatch() -> Result<()> {
+    let temp = TempDir::new()?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let plan_path = temp.path().join("selection-only.json");
+    fs::write(
+        &plan_path,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "task": "inspect bounded source",
+        "assignments": [{"id": "inspect", "phase": "execution", "role": "researcher", "role_category": "read_only_researcher",
+                "assigned_paths": ["README.md"], "worker_assignments": []}],
+            "role_models": {
+                "researcher": {"model": "gpt-6.1-sol", "reasoning_effort": "high"},
+                "auditor": {"model": "gpt-6.1-sol", "reasoning_effort": "high"}
+            },
+            "review_lenses": [{"id": "custom", "information_scope": "full_child_transcript",
+                "backend": {"kind": "model", "backend_id": "codex", "model": "gpt-6.1-sol", "reasoning_effort": "high"}}]
+        }))?,
+    )?;
+    let repo = Repository::open(&repo_path)?;
+    let index_before = fs::read(repo.path().join("index"))?;
+    let head_before = repo.head()?.target();
+    let output = Command::new(BIN)
+        .current_dir(&repo_path)
+        .args([
+            "supervise",
+            "selection-preflight",
+            path_str(&plan_path)?,
+            "--runtime",
+            "codex",
+            "--json",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())?;
+    assert_eq!(report["compatible"], false);
+    let diagnostics = report["diagnostics"].as_array().context("diagnostics")?;
+    for role in ["researcher", "auditor"] {
+        assert!(diagnostics
+            .iter()
+            .any(|entry| entry["role"] == role && entry["lens_id"].is_null()));
+    }
+    assert!(diagnostics.iter().any(|entry| entry["lens_id"] == "custom"));
+    assert!(diagnostics
+        .iter()
+        .all(|entry| entry["status"] == "unknown" && entry["eligible_efforts"].is_null()));
+    // Supply the exact frozen capability/quality inputs without any live probe.
+    let priors = multi_agent_coding_orchestrator::selection::built_in_prior_dataset()?;
+    let objective = multi_agent_coding_orchestrator::objective_profile::ResolvedObjectiveProfile {
+        profile: multi_agent_coding_orchestrator::objective_profile::default_objective_profile()
+            .binding()?,
+        source: multi_agent_coding_orchestrator::objective_profile::ObjectiveProfileSource::BuiltIn,
+    };
+    let mut inputs = report["frozen_inputs"].clone();
+    for (role, authority) in [
+        ("researcher", "terminal_leaf"),
+        ("auditor", "review_auditor"),
+    ] {
+        inputs["roles"][role] = serde_json::json!({
+            "routing_policy": null, "switch_cost_evidence": [],
+            "input": {
+                "task": {"task_class": "review_gate", "risk": "critical", "boundedness": "bounded",
+                    "context": "medium", "horizon": "short", "authority_role": authority},
+                "catalogs": [{"runtime": "codex", "revision": "frozen-cli-fixture", "advertised_at": "2026-10-29",
+                    "models": [{"model": "gpt-6.1-sol", "available": true, "supported_efforts": ["xhigh"],
+                        "capabilities": {"task_classes": ["review_gate"], "authority_roles": [authority],
+                            "boundedness": ["bounded"], "maximum_risk": "critical", "maximum_context": "long",
+                            "maximum_horizon": "long", "long_context": true}}]}],
+                "pools": [{"runtime": "codex", "admission_open": true, "entitlement_capacity_units": 100,
+                    "entitlement_remaining_units": 100, "pool_pressure_basis_points": 0, "observed_consumption_units": 0,
+                    "marginal_cost_microunits": 0, "observation_revision": "frozen-cli-fixture",
+                    "admission_provenance": "frozen fixture", "failover_provenance": null}],
+                "constraints": {"allowed_runtimes": ["codex"], "allowed_models": [], "forbidden_runtimes": [],
+                    "forbidden_models": [], "forbidden_candidates": [], "allow_debug_override": true},
+                "priors": priors, "objective_profile": {"name": priors.objective_profiles[0].name,
+                    "version": priors.objective_profiles[0].version, "expected_digest": null},
+                "resolved_objective_profile": objective, "outcomes": [],
+                "signals": {"retry_count": 0, "budget_signal": "continue", "previous_choice": null,
+                    "previous_catalog_digest": null, "environment_rejections": []}, "debug_override": null
+            }
+        });
+    }
+    let inputs_path = temp.path().join("frozen-inputs.json");
+    fs::write(&inputs_path, serde_json::to_vec(&inputs)?)?;
+    let output = Command::new(BIN)
+        .current_dir(&repo_path)
+        .args([
+            "supervise",
+            "selection-preflight",
+            path_str(&plan_path)?,
+            "--runtime",
+            "codex",
+            "--frozen-inputs",
+            path_str(&inputs_path)?,
+            "--json",
+        ])
+        .output()?;
+    assert!(!output.status.success());
+    let report: Value = serde_json::from_slice(&output.stdout)
+        .with_context(|| String::from_utf8_lossy(&output.stderr).into_owned())?;
+    let diagnostics = report["diagnostics"]
+        .as_array()
+        .context("frozen diagnostics")?;
+    for (role, lens) in [
+        ("researcher", None),
+        ("auditor", None),
+        ("auditor", Some("custom")),
+    ] {
+        let entry = diagnostics
+            .iter()
+            .find(|entry| entry["role"] == role && entry["lens_id"].as_str() == lens)
+            .context("rejected triple")?;
+        assert_eq!(entry["status"], "rejected");
+        assert_eq!(entry["rejection"], "effort_incompatible");
+        assert_eq!(entry["eligible_efforts"], serde_json::json!(["xhigh"]));
+        assert!(entry["decision"]["input_digests"]["priors"]["value"].is_string());
+    }
+    assert!(
+        !repo_path.join(".maco").exists(),
+        "selection-only must not create checkpoints, reservations, or dispatch artifacts"
+    );
+    assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+    assert_eq!(repo.head()?.target(), head_before);
+    assert_eq!(
+        fs::read_to_string(repo_path.join("README.md"))?,
+        "# Smoke\n"
+    );
+    Ok(())
+}
+
+#[test]
 fn field_guide_suggestion_public_contract_accepts_content_only_and_rejects_provenance() -> Result<()>
 {
     let suggestion: FieldGuideEntrySuggestion = serde_json::from_value(serde_json::json!({

@@ -87,6 +87,23 @@ pub struct AuthorityResponse {
 }
 
 impl AuthorityResponse {
+    /// Validate correlation and the exclusive result/error shape before consuming a response.
+    pub fn validate_for_request(&self, request_id: &str) -> Result<(), ResponseValidationError> {
+        if request_id.is_empty() || self.request_id.is_empty() {
+            return Err(ResponseValidationError::EmptyRequestId);
+        }
+        if self.request_id != request_id {
+            return Err(ResponseValidationError::RequestIdMismatch);
+        }
+        if self.protocol_version != PROTOCOL_VERSION {
+            return Err(ResponseValidationError::UnsupportedVersion);
+        }
+        if self.result.is_some() == self.error.is_some() {
+            return Err(ResponseValidationError::InvalidResultShape);
+        }
+        Ok(())
+    }
+
     pub fn result(request_id: impl Into<String>, result: Value) -> Self {
         Self {
             protocol_version: PROTOCOL_VERSION,
@@ -115,6 +132,19 @@ impl AuthorityResponse {
     pub fn from_failure(failure: ProtocolFailure) -> Self {
         Self::error(failure.request_id, failure.code, failure.message)
     }
+}
+
+/// Closed response failures whose diagnostics never include remote values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+pub enum ResponseValidationError {
+    #[error("authority response requires nonempty request IDs")]
+    EmptyRequestId,
+    #[error("authority response request ID mismatch")]
+    RequestIdMismatch,
+    #[error("authority response protocol version is unsupported")]
+    UnsupportedVersion,
+    #[error("authority response requires exactly one result or error")]
+    InvalidResultShape,
 }
 
 /// Decode or dispatch failure that still has a closed wire shape.
@@ -1306,4 +1336,67 @@ fn hex_lower(bytes: &[u8]) -> String {
         out.push(HEX[(byte & 0x0f) as usize] as char);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn response_validation_requires_correlated_exclusive_envelope() {
+        let valid = AuthorityResponse::result("rpc", json!({}));
+        assert_eq!(valid.validate_for_request("rpc"), Ok(()));
+        assert_eq!(
+            AuthorityResponse::error("rpc", ErrorCode::Busy, "busy").validate_for_request("rpc"),
+            Ok(())
+        );
+        assert_eq!(
+            valid.validate_for_request(""),
+            Err(ResponseValidationError::EmptyRequestId)
+        );
+        for (response, expected) in [
+            (
+                AuthorityResponse::result("", json!({})),
+                ResponseValidationError::EmptyRequestId,
+            ),
+            (
+                AuthorityResponse::result("secret-sentinel", json!({})),
+                ResponseValidationError::RequestIdMismatch,
+            ),
+            (
+                AuthorityResponse {
+                    protocol_version: 2,
+                    ..valid.clone()
+                },
+                ResponseValidationError::UnsupportedVersion,
+            ),
+            (
+                AuthorityResponse {
+                    result: None,
+                    ..valid.clone()
+                },
+                ResponseValidationError::InvalidResultShape,
+            ),
+            (
+                AuthorityResponse {
+                    result: Some(json!({})),
+                    ..AuthorityResponse::error("rpc", ErrorCode::Busy, "secret-sentinel")
+                },
+                ResponseValidationError::InvalidResultShape,
+            ),
+        ] {
+            let error = response.validate_for_request("rpc").unwrap_err();
+            assert_eq!(error, expected);
+            assert!(!error.to_string().contains("secret-sentinel"));
+        }
+        assert!(serde_json::from_value::<AuthorityResponse>(json!({
+            "protocolVersion": PROTOCOL_VERSION, "result": {}
+        }))
+        .is_err());
+        assert_eq!(
+            AuthorityResponse::result("", json!({})).validate_for_request(""),
+            Err(ResponseValidationError::EmptyRequestId)
+        );
+    }
 }

@@ -2330,6 +2330,106 @@ fn assert_orchestration_failed_closed(summary: &Value) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn cli_agents_stop_emits_partial_report_before_failure() -> Result<()> {
+    use multi_agent_coding_orchestrator::agent_lifecycle::{AgentLaunchMetadata, AgentRegistry};
+
+    struct StopFixture(std::process::Child);
+    impl Drop for StopFixture {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    let sleep = [
+        "/run/current-system/sw/bin/sleep",
+        "/usr/bin/sleep",
+        "/bin/sleep",
+    ]
+    .into_iter()
+    .map(Path::new)
+    .find(|path| path.is_file())
+    .context("sleep executable")?;
+    for failed_index in [0, 1] {
+        let temp = TempDir::new()?;
+        Repository::init(temp.path())?;
+        let registry = AgentRegistry::open(temp.path())?;
+        let mut children = Vec::new();
+        let mut records = Vec::new();
+        for index in 0..3 {
+            let child = StopFixture(Command::new(sleep).arg("60").spawn()?);
+            records.push(registry.register(
+                &AgentLaunchMetadata::new(
+                    registry.repo(),
+                    "worker",
+                    "run-partial",
+                    format!("task-{index}"),
+                )?,
+                child.0.id(),
+                vec!["sleep".into()],
+            )?);
+            children.push(child);
+        }
+        // A legacy identity cannot authorize signalling even a live fixture PID.
+        records[failed_index].process_start_time = "123:456".into();
+        fs::write(
+            registry.registry_path(),
+            serde_json::to_vec(&serde_json::json!({ "version": 1, "processes": records }))?,
+        )?;
+        let output = Command::new(BIN)
+            .args([
+                "agents",
+                "stop",
+                "--all",
+                "--run-id",
+                "run-partial",
+                "--repo",
+            ])
+            .arg(temp.path())
+            .args(["--wait-seconds", "1", "--json"])
+            .output()?;
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout)
+            .context("partial stop must emit a complete JSON document")?;
+        assert_eq!(report["stopped"].as_array().unwrap().len(), 2);
+        assert_eq!(report["failures"].as_array().unwrap().len(), 1);
+        assert_eq!(report["failures"][0]["reason"], "termination");
+        assert!(report["failures"][0]["outcome"].is_null());
+        assert_eq!(
+            report["failures"][0]["process"],
+            serde_json::to_value(&records[failed_index])?
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("unresolved target"));
+        for (index, child) in children.iter_mut().enumerate() {
+            if index == failed_index {
+                assert!(child.0.try_wait()?.is_none());
+            } else {
+                assert!(!child.0.wait()?.success());
+                assert!(report["stopped"].as_array().unwrap().iter().any(|entry| {
+                    entry["process"]["pid"] == child.0.id() && entry["outcome"] == "terminated"
+                }));
+            }
+        }
+        let retained: Value = serde_json::from_slice(&fs::read(registry.registry_path())?)?;
+        assert_eq!(retained["processes"].as_array().unwrap().len(), 1);
+        assert_eq!(retained["processes"][0], report["failures"][0]["process"]);
+
+        let retry = Command::new(BIN)
+            .args(["agents", "stop", &format!("task-{failed_index}"), "--repo"])
+            .arg(temp.path())
+            .args(["--wait-seconds", "1", "--json"])
+            .output()?;
+        assert!(!retry.status.success());
+        let retry_report: Value = serde_json::from_slice(&retry.stdout)?;
+        assert!(retry_report["stopped"].as_array().unwrap().is_empty());
+        assert_eq!(retry_report["failures"], report["failures"]);
+        assert!(children[failed_index].0.try_wait()?.is_none());
+    }
+    Ok(())
+}
+
 fn create_committed_repo(root: &Path) -> Result<std::path::PathBuf> {
     let repo_path = root.join("repo");
     let output = Command::new(BIN)
