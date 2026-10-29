@@ -24793,6 +24793,210 @@
           "minimum": 0,
           "type": "integer"
         },
+        "charges": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "cost_usd": {
+                "minimum": 0,
+                "type": [
+                  "number",
+                  "null"
+                ]
+              },
+              "pricing": {
+                "additionalProperties": false,
+                "properties": {
+                  "basis": {
+                    "enum": [
+                      "unattributed",
+                      "operator_contract_estimate",
+                      "synthetic",
+                      "unpriced",
+                      "conservative_reservation"
+                    ]
+                  },
+                  "contract": {
+                    "oneOf": [
+                      {
+                        "type": "null"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "contract": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "billing": {
+                                "const": "flat_input_output"
+                              },
+                              "contract_id": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "currency": {
+                                "const": "USD"
+                              },
+                              "effective_date": {
+                                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                                "type": "string"
+                              },
+                              "price_map_sha256": {
+                                "pattern": "^[0-9a-f]{64}$",
+                                "type": "string"
+                              },
+                              "revision": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "schema_version": {
+                                "const": 1
+                              },
+                              "scopes": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "account_id": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "model": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "plan_id": {
+                                      "minLength": 1,
+                                      "type": "string"
+                                    },
+                                    "runtime": {
+                                      "enum": [
+                                        "fake",
+                                        "codex",
+                                        "grok",
+                                        "cursor",
+                                        "claude-code",
+                                        "gemini-cli"
+                                      ]
+                                    }
+                                  },
+                                  "required": [
+                                    "runtime",
+                                    "model",
+                                    "account_id",
+                                    "plan_id"
+                                  ],
+                                  "type": "object"
+                                },
+                                "minItems": 1,
+                                "type": "array",
+                                "uniqueItems": true
+                              },
+                              "source_attribution": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "source_reference": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "unit": {
+                                "const": "per_million_tokens"
+                              },
+                              "valid_through": {
+                                "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "schema_version",
+                              "contract_id",
+                              "revision",
+                              "effective_date",
+                              "valid_through",
+                              "source_reference",
+                              "source_attribution",
+                              "currency",
+                              "unit",
+                              "billing",
+                              "scopes",
+                              "price_map_sha256"
+                            ],
+                            "type": "object"
+                          },
+                          "normalized_sha256": {
+                            "pattern": "^[0-9a-f]{64}$",
+                            "type": "string"
+                          },
+                          "plan_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          }
+                        },
+                        "required": [
+                          "contract",
+                          "normalized_sha256",
+                          "plan_id"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "runtime": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "basis",
+                  "contract",
+                  "runtime",
+                  "model"
+                ],
+                "type": "object"
+              },
+              "reservation_id": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "role": {
+                "enum": [
+                  "supervisor",
+                  "child_orchestrator",
+                  "worker",
+                  "researcher",
+                  "gate_classifier",
+                  "auditor"
+                ],
+                "type": "string"
+              },
+              "tokens": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "usage_complete": {
+                "type": "boolean"
+              }
+            },
+            "required": [
+              "reservation_id",
+              "role",
+              "tokens",
+              "cost_usd",
+              "usage_complete",
+              "pricing"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "committed": {
           "additionalProperties": false,
           "properties": {
@@ -24827,6 +25031,9 @@
           ],
           "type": "object"
         },
+        "cost_complete": {
+          "type": "boolean"
+        },
         "elapsed_seconds": {
           "minimum": 0,
           "type": "integer"
@@ -24859,6 +25066,131 @@
         },
         "new_dispatch_allowed": {
           "type": "boolean"
+        },
+        "pricing_contract": {
+          "oneOf": [
+            {
+              "type": "null"
+            },
+            {
+              "additionalProperties": false,
+              "properties": {
+                "contract": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "billing": {
+                      "const": "flat_input_output"
+                    },
+                    "contract_id": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "currency": {
+                      "const": "USD"
+                    },
+                    "effective_date": {
+                      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                      "type": "string"
+                    },
+                    "price_map_sha256": {
+                      "pattern": "^[0-9a-f]{64}$",
+                      "type": "string"
+                    },
+                    "revision": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "schema_version": {
+                      "const": 1
+                    },
+                    "scopes": {
+                      "items": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "account_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "model": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "plan_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "runtime": {
+                            "enum": [
+                              "fake",
+                              "codex",
+                              "grok",
+                              "cursor",
+                              "claude-code",
+                              "gemini-cli"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "runtime",
+                          "model",
+                          "account_id",
+                          "plan_id"
+                        ],
+                        "type": "object"
+                      },
+                      "minItems": 1,
+                      "type": "array",
+                      "uniqueItems": true
+                    },
+                    "source_attribution": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "source_reference": {
+                      "minLength": 1,
+                      "type": "string"
+                    },
+                    "unit": {
+                      "const": "per_million_tokens"
+                    },
+                    "valid_through": {
+                      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "schema_version",
+                    "contract_id",
+                    "revision",
+                    "effective_date",
+                    "valid_through",
+                    "source_reference",
+                    "source_attribution",
+                    "currency",
+                    "unit",
+                    "billing",
+                    "scopes",
+                    "price_map_sha256"
+                  ],
+                  "type": "object"
+                },
+                "normalized_sha256": {
+                  "pattern": "^[0-9a-f]{64}$",
+                  "type": "string"
+                },
+                "plan_id": {
+                  "minLength": 1,
+                  "type": "string"
+                }
+              },
+              "required": [
+                "contract",
+                "normalized_sha256",
+                "plan_id"
+              ],
+              "type": "object"
+            }
+          ]
         },
         "reasons": {
           "items": {

@@ -5,8 +5,8 @@ use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 #[cfg(test)]
 use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
-    BudgetAction, BudgetAmount, BudgetReason, BudgetRemaining, RoleBudgetReport, RunBudgetLimits,
-    RunBudgetReport, RunBudgetSource, RunBudgetSources,
+    BudgetAction, BudgetAmount, BudgetChargeReport, BudgetReason, BudgetRemaining,
+    RoleBudgetReport, RunBudgetLimits, RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -416,7 +416,9 @@ use plan_validation::*;
 
 mod dispatch;
 pub(crate) mod operator_pricing;
+mod pricing_provenance;
 use dispatch::*;
+pub use pricing_provenance::{ChargePricing, ChargePricingBasis, PricingContractProvenance};
 
 mod gate_health;
 pub use gate_health::*;

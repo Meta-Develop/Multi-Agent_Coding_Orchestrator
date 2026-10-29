@@ -23,6 +23,26 @@ pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport)
         "## Assignments".to_string(),
         String::new(),
     ];
+    if let Some(budget) = &report.run_budget {
+        let pricing = budget.pricing_contract.as_ref().map_or_else(
+            || "No operator pricing contract is bound".to_string(),
+            |provenance| {
+                format!(
+                    "Retained operator contract for estimates: {} revision {} ({} through {}; binding {})",
+                    provenance.contract.contract_id,
+                    provenance.contract.revision,
+                    provenance.contract.effective_date,
+                    provenance.contract.valid_through,
+                    provenance.normalized_sha256
+                )
+            },
+        );
+        lines.insert(7, format!("- Pricing: {pricing}"));
+        lines.insert(
+            8,
+            format!("- Priced-cost complete: {}", budget.cost_complete),
+        );
+    }
     if report.orchestrator_reports.is_empty() {
         lines.push("No assignment reports were persisted.".to_string());
     } else {
@@ -3095,6 +3115,20 @@ mod cursor_managed_usage_evidence {
             assert_eq!(settled.cost_usd, expected_cost);
             let report = ledger.report().unwrap();
             assert_eq!(report.consumed.cost_usd, expected_cost);
+            assert_eq!(report.cost_complete, !expired_at_settlement);
+            assert_eq!(report.pricing_contract, Some(view.provenance()));
+            let pricing = report.charges[0].pricing.clone();
+            assert_eq!(pricing.contract, report.pricing_contract);
+            assert_eq!(pricing.runtime.as_deref(), Some("cursor"));
+            assert_eq!(pricing.model.as_deref(), Some("synthetic-cursor-model"));
+            assert_eq!(
+                pricing.basis,
+                if expired_at_settlement {
+                    ChargePricingBasis::Unpriced
+                } else {
+                    ChargePricingBasis::OperatorContractEstimate
+                }
+            );
             assert_eq!(report.new_dispatch_allowed, !expired_at_settlement);
             assert_eq!(
                 report.reasons.contains(&BudgetReason::MissingActualCost),
@@ -3103,6 +3137,7 @@ mod cursor_managed_usage_evidence {
             drop(held);
             drop(ledger);
             let history = WorkspaceBudgetLedger::open_or_create(temp.path()).unwrap();
+            assert_eq!(history.settled_pricing(), vec![&pricing]);
             let now = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

@@ -2075,6 +2075,9 @@ fn run_budget_report_schema_value() -> serde_json::Value {
             "new_dispatch_allowed"
         ],
         "properties": {
+            "pricing_contract": {"oneOf": [{"type": "null"}, pricing_provenance::contract_schema_value()]},
+            "charges": {"type": "array", "items": pricing_provenance::charge_schema_value(agent_role_schema_value())},
+            "cost_complete": {"type": "boolean"},
             "limits": {
                 "type": "object",
                 "additionalProperties": false,
