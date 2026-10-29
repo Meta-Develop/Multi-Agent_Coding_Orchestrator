@@ -104,3 +104,14 @@ worker session masks /tmp/codex-daemon-1000 as a read-only mode-000 tmpfs.
 Codex fails before execution with "app-server socket directory must be a
 user-owned directory with mode 0700". That session boundary was not bypassed.
 The parent must verify actual sandboxed execution outside this session.
+
+2026-10-29 capacity failure:
+thread-system-error.jsonl preserves lines 14-16 of assignment-001.jsonl from
+e2e-codex-main-284a-c29a, captured with 0.162.0. Thread/turn IDs are replaced;
+all other fields, timestamps and order are preserved. Lens 0 emitted the same
+systemError shape followed by serverOverloaded. Each original status frame
+was 155 bytes excluding its newline, well below the existing 16 KiB bound.
+These are legitimate systemError notifications, not evidence of a protocol
+version change. Tests supply a synthetic correlated startup. The variant
+without the error notification tests failed terminal handling separately;
+it does not claim that the live run succeeded or supplied token usage.

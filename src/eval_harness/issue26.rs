@@ -417,6 +417,41 @@ fn execute_validated(
     for summary in &mut summaries {
         summary.pareto_optimal = frontier.contains(&summary.profile_id);
     }
+    let objective_selection = select_objective(&manifest.objective_profile, &summaries, &frontier)?;
+    Ok(EvalHarnessV2ExecutionResults {
+        version: RESULT_VERSION,
+        schema: RESULT_SCHEMA.to_string(),
+        experiment_id: manifest.experiment_id.clone(),
+        manifest_schema: EVAL_HARNESS_MANIFEST_V2_SCHEMA.to_string(),
+        manifest_digest: binding.input_binding.digest.clone(),
+        fixture: fixture_provenance,
+        provider: EvalHarnessProviderClaim {
+            kind: EvalHarnessProviderKind::LocalFake,
+            network_providers: false,
+        },
+        objective_profile: manifest.objective_profile.clone(),
+        objective_citation: citation,
+        runs,
+        profile_summaries: summaries,
+        pareto_frontier: frontier,
+        objective_selection,
+        comparability: V2Comparability {
+            status: V2ComparabilityStatus::Comparable,
+            equivalent_initial_state_fingerprint: initial,
+            expected_run_count: manifest.profiles.len() * manifest.repetition_count as usize,
+            validated_run_count: manifest.profiles.len() * manifest.repetition_count as usize,
+            replay_verified: true,
+        },
+        production_eligible: false,
+        production_default_claim: PRODUCTION_DEFAULT_REFUSAL.to_string(),
+    })
+}
+
+pub(super) fn select_objective(
+    objective_profile: &ResolvedObjectiveProfile,
+    summaries: &[V2ProfileSummary],
+    frontier: &[String],
+) -> Result<ObjectiveSelection, EvalHarnessV2ExecutionError> {
     let max_cost = summaries
         .iter()
         .map(|item| item.mean_cost_microusd)
@@ -461,36 +496,10 @@ fn execute_validated(
             )
         })
         .collect::<Vec<_>>();
-    let objective_selection = select_from_frontier(&manifest.objective_profile, &points)
+    let objective_selection = select_from_frontier(objective_profile, &points)
         .map_err(|error| incomparable("objective_selection", error.to_string()))?
         .ok_or_else(|| incomparable("pareto_frontier", "frontier unexpectedly empty"))?;
-    Ok(EvalHarnessV2ExecutionResults {
-        version: RESULT_VERSION,
-        schema: RESULT_SCHEMA.to_string(),
-        experiment_id: manifest.experiment_id.clone(),
-        manifest_schema: EVAL_HARNESS_MANIFEST_V2_SCHEMA.to_string(),
-        manifest_digest: binding.input_binding.digest.clone(),
-        fixture: fixture_provenance,
-        provider: EvalHarnessProviderClaim {
-            kind: EvalHarnessProviderKind::LocalFake,
-            network_providers: false,
-        },
-        objective_profile: manifest.objective_profile.clone(),
-        objective_citation: citation,
-        runs,
-        profile_summaries: summaries,
-        pareto_frontier: frontier,
-        objective_selection,
-        comparability: V2Comparability {
-            status: V2ComparabilityStatus::Comparable,
-            equivalent_initial_state_fingerprint: initial,
-            expected_run_count: manifest.profiles.len() * manifest.repetition_count as usize,
-            validated_run_count: manifest.profiles.len() * manifest.repetition_count as usize,
-            replay_verified: true,
-        },
-        production_eligible: false,
-        production_default_claim: PRODUCTION_DEFAULT_REFUSAL.to_string(),
-    })
+    Ok(objective_selection)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -749,20 +758,33 @@ fn summarize(
         .collect()
 }
 
-fn pareto_frontier(summaries: &[V2ProfileSummary]) -> Vec<String> {
+pub(super) fn pareto_frontier(summaries: &[V2ProfileSummary]) -> Vec<String> {
     summaries
         .iter()
         .filter(|candidate| {
             !summaries.iter().any(|other| {
                 other.profile_id != candidate.profile_id
                     && other.mean_cost_microusd <= candidate.mean_cost_microusd
+                    && other.mean_tokens <= candidate.mean_tokens
+                    && other.mean_wall_time_ms <= candidate.mean_wall_time_ms
+                    && other.mean_churn_count <= candidate.mean_churn_count
+                    && other.mean_review_findings <= candidate.mean_review_findings
                     && other.quality.held_out_basis_points
                         >= candidate.quality.held_out_basis_points
                     && other.quality.breadth_basis_points >= candidate.quality.breadth_basis_points
                     && other.quality.anti_shortcut_basis_points
                         >= candidate.quality.anti_shortcut_basis_points
                     && (other.mean_cost_microusd < candidate.mean_cost_microusd
-                        || other.quality != candidate.quality)
+                        || other.mean_tokens < candidate.mean_tokens
+                        || other.mean_wall_time_ms < candidate.mean_wall_time_ms
+                        || other.mean_churn_count < candidate.mean_churn_count
+                        || other.mean_review_findings < candidate.mean_review_findings
+                        || other.quality.held_out_basis_points
+                            > candidate.quality.held_out_basis_points
+                        || other.quality.breadth_basis_points
+                            > candidate.quality.breadth_basis_points
+                        || other.quality.anti_shortcut_basis_points
+                            > candidate.quality.anti_shortcut_basis_points)
             })
         })
         .map(|summary| summary.profile_id.clone())
