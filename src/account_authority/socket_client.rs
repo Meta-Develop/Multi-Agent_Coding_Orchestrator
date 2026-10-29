@@ -149,14 +149,14 @@ impl AuthoritySocketClient {
         let deadline = Instant::now() + REQUEST_IO_DEADLINE;
         write_framed(&mut stream, &body, deadline)?;
         let response_bytes = read_framed(&mut stream, MAX_RESPONSE_BYTES, deadline)?;
-        let response: AuthorityResponse =
-            serde_json::from_slice(&response_bytes).context("decode CAM authority response")?;
-        if response.protocol_version != PROTOCOL_VERSION {
-            return Err(anyhow!(
-                "CAM authority response protocolVersion {} is not supported",
-                response.protocol_version
-            ));
-        }
+        let response: AuthorityResponse = serde_json::from_slice(&response_bytes)
+            .map_err(|_| anyhow!("invalid CAM authority response envelope"))?;
+        response.validate_for_request(
+            request
+                .get("requestId")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+        )?;
         Ok(response)
     }
 }
@@ -395,6 +395,62 @@ mod tests {
         let listener =
             listen(path, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
         (dir, listener)
+    }
+
+    #[test]
+    fn exchange_refuses_uncorrelated_or_ambiguous_response() {
+        use std::os::unix::net::UnixListener;
+
+        let (_registry_dir, registry) = isolated_registry();
+        seed_selected_account(&registry);
+        let original = registry.selected_binding("codex-cli").unwrap();
+        for case in 0..7 {
+            let (_guard, root) = private_tempdir();
+            let socket = root.join("account.sock");
+            let listener = UnixListener::bind(&socket).unwrap();
+            let client = connect_authority_socket(&socket).unwrap();
+            let server = thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let deadline = Instant::now() + REQUEST_IO_DEADLINE;
+                let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
+                let request: Value = serde_json::from_slice(&request).unwrap();
+                assert_eq!(request["operation"], "selection.get");
+                let mut response = json!({
+                    "protocolVersion": PROTOCOL_VERSION,
+                    "requestId": request["requestId"],
+                    "result": {"selected": false},
+                });
+                match case {
+                    0 => response["requestId"] = json!("secret-sentinel"),
+                    1 => {
+                        response.as_object_mut().unwrap().remove("requestId");
+                    }
+                    2 => response["requestId"] = json!(""),
+                    3 => response["error"] = json!({"code": "busy", "message": "secret-sentinel"}),
+                    4 => {
+                        response.as_object_mut().unwrap().remove("result");
+                    }
+                    5 => response["protocolVersion"] = json!(2),
+                    _ => {
+                        response.as_object_mut().unwrap().remove("result");
+                        response["error"] = json!({"code": "busy", "message": "busy"});
+                    }
+                }
+                write_framed(
+                    &mut stream,
+                    &serde_json::to_vec(&response).unwrap(),
+                    deadline,
+                )
+                .unwrap();
+            });
+            let error = client.selection_get("codex-cli").unwrap_err();
+            assert!(!format!("{error:#}").contains("secret-sentinel"));
+            if case == 6 {
+                assert!(error.to_string().contains("busy"));
+            }
+            assert_eq!(registry.selected_binding("codex-cli").unwrap(), original);
+            server.join().unwrap();
+        }
     }
 
     #[test]
