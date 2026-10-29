@@ -123,6 +123,9 @@ const RETIRED_AUTOPILOT_EXECUTION_MESSAGE: &str =
 #[derive(Debug, Parser)]
 #[command(name = "maco")]
 #[command(about = "Multi-Agent Coding Orchestrator")]
+#[command(
+    after_help = "Literal instructions: maco <instruction>\nUse maco -- <instruction> when the first word matches a subcommand or starts with '-'.\nExample: maco -- review the parser\nLiteral routing starts a live supervised run with normal account, model, and admission requirements."
+)]
 #[command(version = crate::build_identity::LONG_VERSION)]
 #[command(long_version = crate::build_identity::LONG_VERSION)]
 pub struct Cli {
