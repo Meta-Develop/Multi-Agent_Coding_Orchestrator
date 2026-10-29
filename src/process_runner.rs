@@ -98,6 +98,9 @@ const TERMINATE_GRACE: Duration = Duration::from_millis(100);
 const EXIT_AND_DRAIN_GRACE: Duration = Duration::from_millis(500);
 #[cfg(target_os = "linux")]
 const SYSTEMD_OPERATION_GRACE: Duration = Duration::from_secs(3);
+// Attachment alone may use this ceiling, always inside the original operation deadline.
+#[cfg(target_os = "linux")]
+const SYSTEMD_ATTACH_CEILING: Duration = Duration::from_secs(10);
 #[cfg(target_os = "linux")]
 const SYSTEMD_SLOT_WAIT: Duration = Duration::from_secs(30);
 // Keep both supervise admission and strict containment deterministic in the unit-test binary.

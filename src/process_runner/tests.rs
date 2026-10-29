@@ -3248,13 +3248,14 @@ fn systemd_withheld_attach_stages_retain_observed_evidence_after_rollback() {
 
         let now = Instant::now();
         let operation_deadline = now + Duration::from_secs(40);
+        let attach_deadline = systemd_attach_deadline(now, Some(operation_deadline)).unwrap();
         ATTACH_TEST_NOW.with(|clock| clock.set(Some(now)));
         ATTACH_TEST_HOOK.with(|hook| {
             *hook.borrow_mut() = Some(Box::new(move |phase| {
                 if phase == "before_attach_budget_check" {
                     // Hold the fixture at precisely this observed transition until
-                    // the original setup grace expires, without a wall-clock wait.
-                    ATTACH_TEST_NOW.with(|clock| clock.set(Some(now + Duration::from_secs(3))));
+                    // the selected attachment deadline expires, without a wall-clock wait.
+                    ATTACH_TEST_NOW.with(|clock| clock.set(Some(attach_deadline)));
                 }
             }));
         });
@@ -3305,9 +3306,9 @@ fn systemd_withheld_attach_stages_retain_observed_evidence_after_rollback() {
             stage >= 5, stage >= 6, stage == 7, stage >= 8,
         );
         assert!(message.contains(&expected), "stage {stage}: {message}");
-        assert!(message.contains("attach_allowance_ms=3000"), "{message}");
+        assert!(message.contains("attach_allowance_ms=10000"), "{message}");
         assert!(
-            message.contains("operation_remaining_ms=37000"),
+            message.contains("operation_remaining_ms=30000"),
             "{message}"
         );
         assert!(
@@ -6169,7 +6170,7 @@ fn systemd_attach_delayed_ready_retains_full_ownership_and_sandbox_proof() {
             } else if phase == "after_sandbox_verification" {
                 observed.set(true);
                 let base = selected_at.expect("capture the deadline-selection clock");
-                ATTACH_TEST_NOW.with(|clock| clock.set(Some(base + Duration::from_secs(2))));
+                ATTACH_TEST_NOW.with(|clock| clock.set(Some(base + Duration::from_secs(4))));
             }
         }))
     });
@@ -6184,7 +6185,7 @@ fn systemd_attach_delayed_ready_retains_full_ownership_and_sandbox_proof() {
         )
         .with_timeout(Some(Duration::from_secs(12))),
     )
-    .expect("strict production path must pass with two-second injected readiness");
+    .expect("strict production path must pass with four-second injected readiness");
     assert!(advanced.get(), "must reach real sandbox verification");
     assert!(output.status.unwrap().success() && !output.timed_out);
     assert!(output.safety_evidence_verified(), "{output:?}");

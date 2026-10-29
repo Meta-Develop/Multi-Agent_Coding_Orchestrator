@@ -2375,7 +2375,7 @@ fn systemd_attach_deadline(now: Instant, operation_deadline: Option<Instant>) ->
     let allowance = match operation_deadline {
         Some(deadline) => {
             let remaining = deadline.checked_duration_since(now).filter(|r| !r.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "systemd attachment operation deadline is exhausted"))?;
-            remaining.min(SYSTEMD_OPERATION_GRACE)
+            remaining.min(SYSTEMD_OPERATION_GRACE.max(SYSTEMD_ATTACH_CEILING.min(remaining / 2)))
         }
         None => SYSTEMD_OPERATION_GRACE,
     };
@@ -4153,9 +4153,9 @@ mod start_gate_deadline_phase_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn attach_budget_preserves_three_second_grace_and_clips_without_renewal() {
+    fn adaptive_attach_budget_scales_and_clips_without_renewal() {
         let now = Instant::now();
-        for (remaining, expected) in [(40, 3), (12, 3), (6, 3), (3, 3), (1, 1)] {
+        for (remaining, expected) in [(40, 10), (12, 6), (6, 3), (1, 1)] {
             let operation = now + Duration::from_secs(remaining);
             let deadline = systemd_attach_deadline(now, Some(operation)).unwrap();
             assert_eq!(deadline, now + Duration::from_secs(expected));
@@ -4170,7 +4170,7 @@ mod start_gate_deadline_phase_tests {
         }
         assert_eq!(systemd_attach_deadline(now, None).unwrap(), now + SYSTEMD_OPERATION_GRACE);
         if let Some(large) = now.checked_add(Duration::from_secs(u32::MAX as u64)) {
-            assert_eq!(systemd_attach_deadline(large, Some(large + Duration::from_secs(12))).unwrap(), large + Duration::from_secs(3));
+            assert_eq!(systemd_attach_deadline(large, Some(large + Duration::from_secs(12))).unwrap(), large + Duration::from_secs(6));
         }
     }
 
