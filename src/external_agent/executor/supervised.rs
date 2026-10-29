@@ -3,7 +3,7 @@
 //! This seam does not create local run evidence from remote bytes. Its events
 //! must be persisted by the coordinator before advancing across effects. Durable
 //! resume, candidate import/recapture, and cleanup authorization belong to that
-//! coordinator; cleanup is deliberately absent from this adapter.
+//! coordinator. Advancing an attempt never authorizes cleanup.
 
 use super::*;
 use crate::executor::{SshConfig, SshConfigInput};
@@ -14,7 +14,8 @@ use std::{
 };
 
 /// Coordinator-owned identity. Reuse the nonce only when resuming this attempt.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SupervisedAttemptId {
     pub run_id: RunId,
     pub assignment_id: AssignmentId,
@@ -102,6 +103,13 @@ pub struct SupervisedSshExecutor<T> {
 }
 
 impl<T: SshTransport> SupervisedSshExecutor<T> {
+    pub(crate) fn cancellation_grace_millis(&self) -> u64 {
+        self.trust.limits().cancellation_grace_millis
+    }
+    pub(crate) fn validate_trust(&self) -> ExecutorResult<()> {
+        revalidate_trust(&self.trust)
+    }
+
     pub fn configure(
         selection: &ExecutorSelection,
         trust: Option<SshConfig>,
@@ -198,7 +206,7 @@ pub enum SupervisedEvent {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum State {
+pub(super) enum State {
     Prepared,
     Staged(StagedAssignment),
     StageUncertain(Box<UncertainEffect>),
@@ -214,15 +222,33 @@ enum State {
 /// Dropping it does not establish remote quiescence. The coordinator must retain
 /// custody on errors/uncertain effects and persist bindings before dispatch.
 pub struct SupervisedSshAttempt<'a, T> {
-    owner: &'a SupervisedSshExecutor<T>,
-    binding: SupervisedAttemptId,
-    request: StageRequest,
+    pub(super) owner: &'a SupervisedSshExecutor<T>,
+    pub(super) binding: SupervisedAttemptId,
+    pub(super) request: StageRequest,
     cancellation: ProcessCancellation,
     termination: TerminationPolicy,
-    state: State,
+    pub(super) state: State,
 }
 
 impl<T: SshTransport> SupervisedSshAttempt<'_, T> {
+    pub(crate) fn observe_prelaunch_cancellation(&mut self) {
+        if matches!(self.state, State::Prepared | State::Staged(_))
+            && self.cancellation.is_cancelled()
+        {
+            self.state = State::CancelledBeforeLaunch;
+        }
+    }
+    /// Only the coordinator may authorize this after its durable import barrier.
+    pub(crate) fn cleanup_collected(&self) -> ExecutorResult<Effect<CleanupReceipt>> {
+        let State::Collected(result) = &self.state else {
+            return Err(invalid("cleanup requires a collected attempt"));
+        };
+        revalidate_trust(&self.owner.trust)?;
+        self.owner
+            .executor
+            .cleanup(CleanupRequest::new(result.identity().clone()))
+    }
+
     pub fn binding(&self) -> &SupervisedAttemptId {
         &self.binding
     }
@@ -252,11 +278,7 @@ impl<T: SshTransport> SupervisedSshAttempt<'_, T> {
     /// inherited cancellation is observed between bounded transport operations.
     /// Transport implementations must also bound their own connection/read time.
     pub fn advance(&mut self) -> ExecutorResult<SupervisedEvent> {
-        if matches!(self.state, State::Prepared | State::Staged(_))
-            && self.cancellation.is_cancelled()
-        {
-            self.state = State::CancelledBeforeLaunch;
-        }
+        self.observe_prelaunch_cancellation();
         if matches!(self.state, State::CancelledBeforeLaunch) {
             return Ok(SupervisedEvent::CancelledBeforeLaunch);
         }

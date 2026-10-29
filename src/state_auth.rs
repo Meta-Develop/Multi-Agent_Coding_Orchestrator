@@ -94,6 +94,11 @@ const AUTHENTICATED_STATE_CONSUMERS: &[AuthenticatedStateConsumerSource] = &[
         state_root_lock_names: &[".supervisor-messaging.lock"],
         description: "authenticated supervisor messaging journals",
     },
+    AuthenticatedStateConsumerSource {
+        root_name: "supervised-ssh-v1",
+        state_root_lock_names: &[".supervised-ssh.lock"],
+        description: "authenticated supervised SSH receipts and collections",
+    },
 ];
 
 pub(crate) fn authenticated_state_consumers() -> &'static [AuthenticatedStateConsumerSource] {
@@ -1105,6 +1110,20 @@ mod tests {
         assert!(error
             .to_string()
             .contains("authenticated field guide state"));
+        assert!(!state.path().join(AUTH_KEY_FILE).exists());
+    }
+
+    #[test]
+    fn supervised_ssh_receipts_refuse_replacement_key() {
+        let (_temp, common_dir) = repository();
+        let state = SafeRoot::open_or_create(common_dir.join("maco/state")).expect("state root");
+        SafeRoot::open_or_create(state.path().join("supervised-ssh-v1")).expect("SSH receipt root");
+        let error = RepositoryAuthWriter::open_or_create(&common_dir, |_| Ok(()))
+            .err()
+            .expect("must preserve orphaned SSH execution custody");
+        assert!(error
+            .to_string()
+            .contains("authenticated supervised SSH receipts"));
         assert!(!state.path().join(AUTH_KEY_FILE).exists());
     }
 

@@ -260,6 +260,7 @@ pub use assignment_shape::{
 };
 mod assignment_executor;
 pub mod authored_checks;
+pub mod remote_execution;
 pub(crate) use plan_api::{
     load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,
     validate_generated_follow_up_plan_document_in_repo,
@@ -2017,6 +2018,8 @@ struct AssignmentMetadata {
     authored_independent_checks: BTreeMap<String, Vec<authored_checks::AuthoredIndependentCheck>>,
     /// Parent assignment and optional nested Worker id; omission selects Local.
     executors: BTreeMap<(String, Option<String>), ExecutorSelection>,
+    /// Explicit embedding configuration, captured before scheduler threads start.
+    ssh_hosts: Vec<remote_execution::SupervisedSshHost>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -2086,6 +2089,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             source_inputs: BTreeMap::new(),
             authored_independent_checks: BTreeMap::new(),
             executors: BTreeMap::new(),
+            ssh_hosts: Vec::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }

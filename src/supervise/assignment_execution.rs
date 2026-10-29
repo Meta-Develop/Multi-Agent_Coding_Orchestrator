@@ -3899,8 +3899,89 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         })?;
         return Err(error);
     }
-    let external_run_result = match launch_runtime {
-        SupervisorRuntime::Codex => {
+    #[cfg(test)]
+    if assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local {
+        SSH_DISPATCH_ENDPOINT.with(|slot| {
+            *slot.borrow_mut() = command
+                .assignment_messaging_launch()
+                .map(|launch| launch.endpoint().to_string());
+        });
+    }
+    let external_run_result = match (
+        assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local,
+        launch_runtime,
+    ) {
+        (true, _) => {
+            if let Some(state) = release_state {
+                state.store(2, Ordering::Release);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if requires_hosted_pre_action_review(&command) {
+                    bail!("SSH dispatch requires an equivalent hosted pre-action review route");
+                }
+                assignment_executor::dispatch_assignment_external(
+                    assignment_metadata,
+                    context.repo,
+                    &options.run_id,
+                    &assignment.id,
+                    None,
+                    attempt,
+                    &assignment.assigned_paths,
+                    &command,
+                    cancellation,
+                    None,
+                    *external_runner,
+                )
+            }));
+            match result {
+                Ok(Ok(run)) => Ok(run),
+                Ok(Err(error)) if !remote_execution::launch_may_have_started(&error) => {
+                    // No remote provider can write these local resources. Close
+                    // the bearer endpoint and use ordinary not-started cleanup.
+                    drop(messaging_server);
+                    budget_reservation.state =
+                        DispatchBudgetReservationState::Reserved(launch_runtime);
+                    if let Some(state) = release_state {
+                        state.store(1, Ordering::Release);
+                    }
+                    Err(error)
+                }
+                failure => {
+                    outcome.external_containment_failed = true;
+                    outcome.usage_incomplete = true;
+                    cancellation.cancel();
+                    let settlement = budget_reservation
+                        .ledger
+                        .reconcile_for_runtime_if_configured(
+                            budget_reservation.reservation.id,
+                            UsageMeasurement::Missing,
+                            Some(runtime_name(launch_runtime)),
+                        );
+                    if settlement.is_ok() {
+                        budget_reservation.state = DispatchBudgetReservationState::Settled;
+                    }
+                    let detail = match failure {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(_) => "SSH coordinator panicked".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    // Remote custody is unresolved. Do not let local deterministic
+                    // failure cleanup discard capture roots or mark this unstarted.
+                    std::mem::forget((
+                        incoming_output_root,
+                        capture_output_root,
+                        incoming_scratch,
+                        capture_scratch,
+                        command,
+                        messaging_server,
+                    ));
+                    // Keep reservation Drop armed if the explicit Missing
+                    // reconciliation failed; it must still attempt settlement.
+                    bail!("SSH attempt retained for checkpoint reconciliation: {detail}; missing usage settlement: {settlement:?}");
+                }
+            }
+        }
+        (false, SupervisorRuntime::Codex) => {
             let review_context = if requires_hosted_pre_action_review(&command) {
                 pre_action_review_context.as_ref()
             } else {
@@ -3971,10 +4052,13 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             drop(messaging_server);
             external_run_result
         }
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
-        | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => {
+        (
+            false,
+            SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli,
+        ) => {
             if let Some(state) = release_state {
                 state.store(2, Ordering::Release);
             }
@@ -4016,7 +4100,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             drop(messaging_server);
             Ok(external_run)
         }
-        SupervisorRuntime::Fake => deterministic_fake_child_run(
+        (false, SupervisorRuntime::Fake) => deterministic_fake_child_run(
             &command,
             assignment,
             assignment_metadata,
@@ -4204,6 +4288,11 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             "managed parent returned evidence import also failed: {import_error:#}"
         )),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SSH_DISPATCH_ENDPOINT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 // Copy only descriptor-held observations into private artifacts. Do not read the
@@ -4521,6 +4610,10 @@ fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
     }
     let cancellation = preflight.managed_process_cancellation.cancellation();
     let assignment = &preflight.assignment;
+    if context.assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        bail!("SSH dispatch cannot use the coordinator-local attached parent messaging endpoint");
+    }
     if let Some(admission) = &prepared.command_admission {
         let result = AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)
             .and_then(|authority| {
@@ -8723,7 +8816,8 @@ mod decomposition_tests {
         with_source_inputs: bool,
         dispatch_case: Option<&str>,
     ) -> Result<()> {
-        let runtime = if dispatch_case.is_some_and(|case| case != "codex") {
+        let runtime = if dispatch_case.is_some_and(|case| !matches!(case, "codex" | "ssh-refusal"))
+        {
             SupervisorRuntime::GeminiCli
         } else {
             SupervisorRuntime::Codex
@@ -8824,6 +8918,15 @@ mod decomposition_tests {
             ..Default::default()
         })?;
         let mut assignment_metadata = loaded.assignment_metadata.clone();
+        if dispatch_case == Some("ssh-refusal") {
+            assignment_metadata.executors.insert(
+                (assignment.id.clone(), None),
+                serde_json::from_value(json!({"kind":"ssh", "target":{
+                    "host_id":"untrusted", "endpoint":"test.invalid", "user":"runner", "port":2222,
+                    "helper":"/opt/maco/helper", "root":"/srv/maco/workspaces"
+                }}))?,
+            );
+        }
         if dispatch_case.is_some() {
             let authority_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
                 &repo,
@@ -9008,6 +9111,10 @@ mod decomposition_tests {
             } else if case == "released" {
                 budget_ledger.release(prepared.budget_reservation.reservation.id)?;
             }
+            let scratches = [
+                prepared.incoming_scratch.path().to_path_buf(),
+                prepared.capture_scratch.path().to_path_buf(),
+            ];
             let dispatched = dispatch_and_capture_child_attempt(
                 &context,
                 &mut outcome,
@@ -9016,6 +9123,29 @@ mod decomposition_tests {
                 1,
                 prepared,
             );
+            if case == "ssh-refusal" {
+                assert!(dispatched.is_err());
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(!outcome.external_containment_failed);
+                assert!(!outcome.usage_incomplete);
+                let report = budget_ledger.report()?;
+                assert_eq!(report.active_reservations, 0);
+                assert_eq!(report.consumed.tokens, 0);
+                assert!(report.usage_complete);
+                assert!(scratches.iter().all(|path| !path.exists()));
+                let endpoint = SSH_DISPATCH_ENDPOINT
+                    .with(|slot| slot.borrow_mut().take())
+                    .context("SSH fixture did not bind messaging")?;
+                assert!(
+                    std::net::TcpStream::connect_timeout(
+                        &endpoint.parse()?,
+                        Duration::from_millis(100)
+                    )
+                    .is_err(),
+                    "refused SSH dispatch leaked its loopback listener"
+                );
+                return Ok(());
+            }
             if matches!(case, "stopped" | "released") {
                 assert!(dispatched.is_err());
                 assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -9060,6 +9190,12 @@ mod decomposition_tests {
     #[test]
     fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
         verify_prepared_researcher_messaging_prompt(true, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ssh_prelaunch_refusal_closes_messaging_scratches_and_budget() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(false, Some("ssh-refusal"))
     }
 
     #[cfg(target_os = "linux")]
