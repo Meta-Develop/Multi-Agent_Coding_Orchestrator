@@ -22,10 +22,11 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
     def setUpClass(cls) -> None:
         cls.shards = load_library_shards()
 
-    def test_four_shard_names(self) -> None:
+    def test_shard_names(self) -> None:
         self.assertEqual(
             self.shards.SHARDS,
-            ("autopilot", "supervise-core", "supervise-fixtures", "rest"),
+            ("autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
+             "supervise-nested", "supervise-fixtures", "external-agent", "worktree", "rest"),
         )
 
     def test_mixed_inventory_disjoint_complete_union(self) -> None:
@@ -38,13 +39,46 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
         parts = self.shards.partition_inventory(inventory)
         self.assertEqual(parts["autopilot"], ["autopilot::alpha"])
         self.assertEqual(
-            parts["supervise-core"], ["supervise::assignment_execution::beta"]
+            parts["supervise-nested"], ["supervise::assignment_execution::beta"]
         )
         self.assertEqual(parts["supervise-fixtures"], ["supervise::tests::gamma"])
         self.assertEqual(parts["rest"], ["runtime_adapter::delta"])
         flattened = [name for group in parts.values() for name in group]
         self.assertEqual(sorted(flattened), sorted(inventory))
         self.assertEqual(len(flattened), len(set(flattened)))
+
+    def test_new_shards_refine_the_old_partition_without_loss_or_overlap(self) -> None:
+        inventory = [
+            *self.shards.SUPERVISE_DIAGNOSTICS,
+            *self.shards.SUPERVISE_CAUSAL_DIAGNOSTICS,
+            *self.shards.SAFETY_PREFLIGHTS["supervise-core"],
+            *self.shards.REST_SAFETY_PREFLIGHTS,
+            "autopilot::new", "supervise::tests::new", "supervise::future::new",
+            "supervise::assignment_execution::decomposition_tests::new",
+            "supervise::assignment_execution::managed_parent_controller_tests::new",
+            "supervise::assignment_execution::nested_worker::new",
+            "supervise::assignment_execution::attached_parent_capture_tests::new",
+            "supervise::assignment_execution::bound_parent_turn_tests::new",
+            "external_agent::new", "worktree::new", "future_module::new",
+            "future::external_agent::lookalike", "worktree_extra::lookalike",
+        ]
+        inventory = sorted(set(inventory))
+        parts = self.shards.partition_inventory(inventory)
+        self.assertEqual(parts, self.shards.partition_inventory(list(reversed(inventory))))
+        old_core = sorted(n for n in inventory if n.startswith("supervise::")
+                          and not n.startswith("supervise::tests::"))
+        old_rest = sorted(n for n in inventory if not n.startswith(("autopilot::", "supervise::")))
+        self.assertEqual(sorted(n for key in ("supervise-core", "supervise-bound", "supervise-decomposition",
+                                              "supervise-parent", "supervise-nested")
+                                for n in parts[key]), old_core)
+        self.assertEqual(sorted(n for key in ("external-agent", "worktree", "rest")
+                                for n in parts[key]), old_rest)
+        flattened = [n for group in parts.values() for n in group]
+        self.assertEqual(sorted(flattened), inventory)
+        self.assertEqual(len(flattened), len(set(flattened)))
+        for shard, names in self.shards.SAFETY_PREFLIGHTS.items():
+            self.assertTrue(set(names) <= set(parts[shard]))
+        self.shards.validate_mandatory_supervise_ownership(inventory, parts)
 
     def test_lookalike_substrings_go_to_rest(self) -> None:
         inventory = [

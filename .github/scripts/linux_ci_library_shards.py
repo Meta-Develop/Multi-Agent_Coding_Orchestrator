@@ -14,7 +14,10 @@ import sys
 from pathlib import Path
 from typing import Sequence
 
-SHARDS = ("autopilot", "supervise-core", "supervise-fixtures", "rest")
+SHARDS = (
+    "autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
+    "supervise-nested", "supervise-fixtures", "external-agent", "worktree", "rest",
+)
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
     "runtime_adapter::cursor_managed_parent::tests::offline_check_failure_diagnostic_keeps_untrusted_output_private",
@@ -95,6 +98,10 @@ def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
     if not names or len(names) != len(set(names)):
         raise ValueError("library inventory must be nonempty and unique")
     partitions: dict[str, list[str]] = {shard: [] for shard in SHARDS}
+    standalone = {
+        *SAFETY_PREFLIGHTS["supervise-core"],
+        *SUPERVISE_DIAGNOSTICS, *SUPERVISE_CAUSAL_DIAGNOSTICS,
+    }
     for name in sorted(names):
         # Match the root module, not an arbitrary substring in a test name.
         if name.startswith("autopilot::"):
@@ -103,6 +110,23 @@ def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
             owner = "supervise-fixtures"
         elif name.startswith("supervise::"):
             owner = "supervise-core"
+            # Keep the existing standalone preflights/diagnostics with their
+            # original owners; split the remaining slow assignment bodies.
+            if name not in standalone:
+                if name.startswith("supervise::assignment_execution::bound_parent_turn"):
+                    owner = "supervise-bound"
+                elif name.startswith("supervise::assignment_execution::decomposition_tests::"):
+                    owner = "supervise-decomposition"
+                elif name.startswith("supervise::assignment_execution::managed_parent_controller_tests::"):
+                    owner = "supervise-parent"
+                elif name.startswith("supervise::assignment_execution::") and not name.startswith(
+                    "supervise::assignment_execution::attached_parent_capture_tests::"
+                ):
+                    owner = "supervise-nested"
+        elif name.startswith("external_agent::"):
+            owner = "external-agent"
+        elif name.startswith("worktree::"):
+            owner = "worktree"
         else:
             owner = "rest"
         partitions[owner].append(name)
