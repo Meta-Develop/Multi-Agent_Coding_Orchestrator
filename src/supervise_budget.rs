@@ -14,7 +14,7 @@ use crate::{
     },
     llm::ProviderError,
     optimizer::quota_pools::{ConsumptionLedger, PoolKey, QuotaConfig},
-    supervise::AgentRole,
+    supervise::{AgentRole, ChargePricing, ChargePricingBasis, PricingContractProvenance},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -216,6 +216,14 @@ pub struct RunBudgetSources {
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunBudgetReport {
+    /// None explicitly identifies execution without an operator pricing contract.
+    #[serde(default)]
+    pub pricing_contract: Option<PricingContractProvenance>,
+    #[serde(default)]
+    pub charges: Vec<BudgetChargeReport>,
+    /// Separate from token completeness: an unpriced charge makes this false.
+    #[serde(default)]
+    pub cost_complete: bool,
     pub limits: RunBudgetLimits,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_duration_seconds: Option<u64>,
@@ -237,6 +245,17 @@ pub struct RunBudgetReport {
     pub new_dispatch_allowed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<BudgetReason>,
+}
+
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetChargeReport {
+    pub reservation_id: u64,
+    pub role: AgentRole,
+    pub tokens: usize,
+    pub cost_usd: Option<f64>,
+    pub usage_complete: bool,
+    pub pricing: ChargePricing,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -421,6 +440,7 @@ struct AttachedRollingBudget {
 
 #[derive(Debug, Clone)]
 struct LedgerState {
+    charges: Vec<BudgetChargeReport>,
     next_reservation_id: u64,
     active: BTreeMap<BudgetReservationId, BudgetReservation>,
     live_grants: BTreeMap<BudgetReservationId, usize>,
@@ -439,6 +459,7 @@ struct LedgerState {
 impl Default for LedgerState {
     fn default() -> Self {
         Self {
+            charges: Vec::new(),
             next_reservation_id: 1,
             active: BTreeMap::new(),
             live_grants: BTreeMap::new(),
@@ -938,7 +959,7 @@ impl RunBudgetLedger {
         id: BudgetReservationId,
         measurement: UsageMeasurement,
     ) -> Result<BudgetReconciliation> {
-        self.reconcile_with_pool(id, measurement, None, None)
+        self.reconcile_with_pool(id, measurement, None, None, None)
     }
 
     /// Reconcile a completed dispatch into both the run budget and the unique
@@ -948,6 +969,7 @@ impl RunBudgetLedger {
         id: BudgetReservationId,
         measurement: UsageMeasurement,
         runtime: &str,
+        pricing: Option<ChargePricing>,
     ) -> Result<BudgetReconciliation> {
         let pool = {
             let rolling = self
@@ -959,7 +981,7 @@ impl RunBudgetLedger {
                 .cloned()
                 .ok_or_else(|| BudgetError::QuotaPoolUnavailable(runtime.to_string()))?
         };
-        self.reconcile_with_pool(id, measurement, Some(pool), Some(runtime))
+        self.reconcile_with_pool(id, measurement, Some(pool), Some(runtime), pricing)
     }
 
     /// Reconcile through the configured per-runtime pool when a quota config
@@ -970,6 +992,16 @@ impl RunBudgetLedger {
         measurement: UsageMeasurement,
         runtime: Option<&str>,
     ) -> Result<BudgetReconciliation> {
+        self.reconcile_priced_dispatch(id, measurement, runtime, None)
+    }
+
+    pub(super) fn reconcile_priced_dispatch(
+        &self,
+        id: BudgetReservationId,
+        measurement: UsageMeasurement,
+        runtime: Option<&str>,
+        pricing: Option<ChargePricing>,
+    ) -> Result<BudgetReconciliation> {
         let quota_configured = self
             .lock_rolling()?
             .is_some_and(|rolling| !rolling.quota_pools.is_empty());
@@ -977,11 +1009,9 @@ impl RunBudgetLedger {
             let runtime = runtime.ok_or_else(|| {
                 BudgetError::QuotaPoolUnavailable("<missing-runtime>".to_string())
             })?;
-            self.reconcile_quota_runtime(id, measurement, runtime)
-        } else if runtime.is_some() {
-            self.reconcile_with_pool(id, measurement, None, runtime)
+            self.reconcile_quota_runtime(id, measurement, runtime, pricing)
         } else {
-            self.reconcile(id, measurement)
+            self.reconcile_with_pool(id, measurement, None, runtime, pricing)
         }
     }
 
@@ -1014,6 +1044,7 @@ impl RunBudgetLedger {
         measurement: UsageMeasurement,
         pool: Option<PoolKey>,
         runtime: Option<&str>,
+        pricing: Option<ChargePricing>,
     ) -> Result<BudgetReconciliation> {
         validate_measurement(&measurement)?;
         let mut state = self.lock_state()?;
@@ -1026,7 +1057,42 @@ impl RunBudgetLedger {
         let mut next = state.clone();
         remove_reservation(&mut next, id)?;
         apply_charge(&mut next, reservation.role, &charge, self.limits)?;
-        let rolling_reasons = self.persist_rolling_consumption(id, &charge, pool.as_ref())?;
+        let mut pricing = pricing.unwrap_or_else(|| ChargePricing {
+            basis: if charge.cost_complete && is_fake_backed_runtime(runtime) {
+                ChargePricingBasis::Synthetic
+            } else if charge.cost_complete {
+                ChargePricingBasis::Unattributed
+            } else {
+                ChargePricingBasis::Unpriced
+            },
+            contract: self.operator_pricing.as_ref().map(|view| view.provenance()),
+            runtime: runtime.map(str::to_string),
+            model: None,
+        });
+        if charge.cost_complete && is_fake_backed_runtime(runtime) {
+            pricing.basis = ChargePricingBasis::Synthetic;
+        } else if !charge.usage_complete {
+            let observed_cost = match &measurement {
+                UsageMeasurement::Reliable { cost_usd, .. }
+                | UsageMeasurement::Estimated { cost_usd, .. } => *cost_usd,
+                UsageMeasurement::Missing => None,
+            };
+            pricing.basis = if reservation.cost_usd.or(observed_cost).is_some() {
+                ChargePricingBasis::ConservativeReservation
+            } else {
+                ChargePricingBasis::Unpriced
+            };
+        }
+        let rolling_reasons =
+            self.persist_rolling_consumption(id, &charge, pool.as_ref(), &pricing)?;
+        next.charges.push(BudgetChargeReport {
+            reservation_id: id.get(),
+            role: reservation.role,
+            tokens: charge.tokens,
+            cost_usd: charge.cost_complete.then_some(charge.cost_usd),
+            usage_complete: charge.usage_complete,
+            pricing,
+        });
         if !rolling_reasons.is_empty() {
             next.persistent_reasons.extend(rolling_reasons);
             next.force_stop = true;
@@ -1112,13 +1178,15 @@ impl RunBudgetLedger {
     }
 
     fn report_for_state(&self, state: &LedgerState) -> Result<RunBudgetReport> {
-        report_for(
+        let mut report = report_for(
             self.limits,
             self.max_duration_seconds,
             self.sources.clone(),
             state,
             self.started_at.elapsed(),
-        )
+        )?;
+        report.pricing_contract = self.operator_pricing.as_ref().map(|view| view.provenance());
+        Ok(report)
     }
 
     fn lock_state(&self) -> Result<MutexGuard<'_, LedgerState>> {
@@ -1196,6 +1264,7 @@ impl RunBudgetLedger {
         reservation_id: BudgetReservationId,
         charge: &ReconciliationCharge,
         pool: Option<&PoolKey>,
+        pricing: &ChargePricing,
     ) -> Result<Vec<BudgetReason>> {
         let Some(mut rolling) = self.lock_rolling()? else {
             return Ok(Vec::new());
@@ -1206,31 +1275,37 @@ impl RunBudgetLedger {
         if rolling.quota.is_some() {
             rolling
                 .ledger
-                .reconcile_reservation(DurableBudgetReconciliation {
-                    reservation_id: durable_id,
-                    tokens: charge.tokens,
-                    requests: if pool.is_some() { 1 } else { 0 },
-                    cost_usd: charge.cost_complete.then_some(charge.cost_usd),
-                    pool: pool.cloned(),
-                    unix_seconds: now,
-                })
+                .reconcile_reservation_with_pricing(
+                    DurableBudgetReconciliation {
+                        reservation_id: durable_id,
+                        tokens: charge.tokens,
+                        requests: if pool.is_some() { 1 } else { 0 },
+                        cost_usd: charge.cost_complete.then_some(charge.cost_usd),
+                        pool: pool.cloned(),
+                        unix_seconds: now,
+                    },
+                    Some(pricing.clone()),
+                )
                 .map_err(rolling_ledger_error)?;
         } else if let Some(pool) = pool {
             let tokens = u64::try_from(charge.tokens).map_err(|_| BudgetError::TokenOverflow)?;
             rolling
                 .ledger
-                .record_completed_pool_consumption(CompletedPoolConsumption {
-                    completion_id: format!(
-                        "{run_id}/session/{}/reservation/{}",
-                        self.session_id,
-                        reservation_id.get()
-                    ),
-                    pool: pool.clone(),
-                    tokens,
-                    requests: 1,
-                    cost_usd: charge.cost_complete.then_some(charge.cost_usd),
-                    unix_seconds: now,
-                })
+                .record_completed_pool_consumption_with_pricing(
+                    CompletedPoolConsumption {
+                        completion_id: format!(
+                            "{run_id}/session/{}/reservation/{}",
+                            self.session_id,
+                            reservation_id.get()
+                        ),
+                        pool: pool.clone(),
+                        tokens,
+                        requests: 1,
+                        cost_usd: charge.cost_complete.then_some(charge.cost_usd),
+                        unix_seconds: now,
+                    },
+                    Some(pricing.clone()),
+                )
                 .map_err(rolling_ledger_error)?;
         }
         Ok(rolling.admission_block_reasons(now)?.unwrap_or_default())
@@ -1253,14 +1328,17 @@ impl RunBudgetLedger {
         };
         rolling
             .ledger
-            .record_reservation(DurableBudgetReservation {
-                reservation_id,
-                tokens: reservation.tokens,
-                requests,
-                cost_usd: reservation.cost_usd,
-                pool,
-                unix_seconds: now,
-            })
+            .record_reservation_with_pricing(
+                DurableBudgetReservation {
+                    reservation_id,
+                    tokens: reservation.tokens,
+                    requests,
+                    cost_usd: reservation.cost_usd,
+                    pool,
+                    unix_seconds: now,
+                },
+                Some(self.reservation_pricing(reservation)),
+            )
             .map_err(rolling_ledger_error)?;
         Ok(())
     }
@@ -1280,16 +1358,32 @@ impl RunBudgetLedger {
             durable_reservation_id(&rolling.run_id, &self.session_id, reservation.id);
         rolling
             .ledger
-            .reconcile_reservation(DurableBudgetReconciliation {
-                reservation_id,
-                tokens: reservation.tokens,
-                requests: 0,
-                cost_usd: reservation.cost_usd,
-                pool: None,
-                unix_seconds: now,
-            })
+            .reconcile_reservation_with_pricing(
+                DurableBudgetReconciliation {
+                    reservation_id,
+                    tokens: reservation.tokens,
+                    requests: 0,
+                    cost_usd: reservation.cost_usd,
+                    pool: None,
+                    unix_seconds: now,
+                },
+                Some(self.reservation_pricing(reservation)),
+            )
             .map_err(rolling_ledger_error)?;
         Ok(rolling.admission_block_reasons(now)?.unwrap_or_default())
+    }
+
+    fn reservation_pricing(&self, reservation: &BudgetReservation) -> ChargePricing {
+        ChargePricing {
+            basis: if reservation.cost_usd.is_some() {
+                ChargePricingBasis::ConservativeReservation
+            } else {
+                ChargePricingBasis::Unpriced
+            },
+            contract: self.operator_pricing.as_ref().map(|view| view.provenance()),
+            runtime: None,
+            model: None,
+        }
     }
 
     /// Records a runtime provider error on the workspace rolling ledger.
@@ -1729,6 +1823,9 @@ fn report_for(
         .collect();
 
     Ok(RunBudgetReport {
+        pricing_contract: None,
+        charges: state.charges.clone(),
+        cost_complete: state.cost_complete,
         limits,
         max_duration_seconds,
         sources,
@@ -2566,6 +2663,74 @@ mod tests {
         assert_eq!(auditor.reserved.tokens, 200);
         assert_eq!(auditor.active_reservations, 1);
         assert_eq!(report.reserved.tokens, 300);
+    }
+
+    #[test]
+    fn incomplete_unpriced_usage_keeps_unpriced_basis_in_reports_and_rolling_records() {
+        for reserved_cost in [None, Some(0.0), Some(2.0)] {
+            for measurement in [
+                UsageMeasurement::Estimated {
+                    tokens: 10,
+                    cost_usd: None,
+                },
+                UsageMeasurement::Estimated {
+                    tokens: 10,
+                    cost_usd: Some(0.0),
+                },
+                UsageMeasurement::Estimated {
+                    tokens: 10,
+                    cost_usd: Some(1.0),
+                },
+                UsageMeasurement::Missing,
+            ] {
+                let observed_cost = match &measurement {
+                    UsageMeasurement::Estimated { cost_usd, .. } => *cost_usd,
+                    _ => None,
+                };
+                let expected_basis = if reserved_cost.or(observed_cost).is_some() {
+                    ChargePricingBasis::ConservativeReservation
+                } else {
+                    ChargePricingBasis::Unpriced
+                };
+                let runtime = if expected_basis == ChargePricingBasis::Unpriced {
+                    "gemini-cli"
+                } else {
+                    "codex"
+                };
+                let (_temp, repo) = rolling_repo();
+                let _binding =
+                    crate::budget_ledger::bind_rolling_budget(&repo, rolling_quota(1000), "basis")
+                        .unwrap();
+                let ledger = RunBudgetLedger::new(token_limits(500, 1000)).unwrap();
+                let reservation =
+                    admitted_reservation(ledger.reserve(request(100, reserved_cost)).unwrap());
+                let reconciliation = ledger
+                    .reconcile_priced_dispatch(
+                        reservation.id,
+                        measurement,
+                        Some(runtime),
+                        Some(ChargePricing {
+                            basis: ChargePricingBasis::Unpriced,
+                            runtime: Some(runtime.to_string()),
+                            ..Default::default()
+                        }),
+                    )
+                    .unwrap();
+                let charge = &reconciliation.report.charges[0];
+                assert_eq!(charge.pricing.basis, expected_basis);
+                assert_eq!(charge.cost_usd, None);
+                assert_eq!(reconciliation.charged.cost_usd, None);
+                assert_eq!(reconciliation.report.consumed.cost_usd, None);
+                assert!(!reconciliation.report.cost_complete);
+                assert!(!charge.usage_complete);
+                let encoded = serde_json::to_value(&reconciliation.report).unwrap();
+                assert!(encoded["charges"][0]["cost_usd"].is_null());
+                assert_eq!(encoded["cost_complete"], false);
+                drop(ledger);
+                let history = WorkspaceBudgetLedger::open_or_create(&repo).unwrap();
+                assert_eq!(history.settled_pricing(), vec![&charge.pricing]);
+            }
+        }
     }
 
     #[test]

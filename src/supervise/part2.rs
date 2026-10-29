@@ -278,10 +278,20 @@ impl DispatchBudgetReservation<'_> {
                         cost_usd: None,
                     },
                 );
-                self.ledger.reconcile_for_runtime_if_configured(
+                self.ledger.reconcile_priced_dispatch(
                     self.reservation.id,
                     measurement,
                     Some(runtime_name(launch_runtime)),
+                    Some(ChargePricing {
+                        basis: ChargePricingBasis::Unpriced,
+                        contract: self
+                            .ledger
+                            .operator_pricing
+                            .as_ref()
+                            .map(|view| view.provenance()),
+                        runtime: Some(runtime_name(launch_runtime).to_string()),
+                        model: None,
+                    }),
                 )?;
                 if held.and_then(|evidence| evidence.tokens).is_some() {
                     DispatchUsageReliability::Estimated
@@ -370,10 +380,26 @@ impl DispatchBudgetReservation<'_> {
                 None => (UsageMeasurement::Missing, DispatchUsageReliability::Missing),
             };
             self.ledger
-                .reconcile_for_runtime_if_configured(
+                .reconcile_priced_dispatch(
                     self.reservation.id,
                     measurement,
                     Some(runtime_name(launch_runtime)),
+                    Some(ChargePricing {
+                        basis: if cost_usd.is_none() {
+                            ChargePricingBasis::Unpriced
+                        } else if launch_runtime == SupervisorRuntime::Fake {
+                            ChargePricingBasis::Synthetic
+                        } else {
+                            ChargePricingBasis::OperatorContractEstimate
+                        },
+                        contract: self
+                            .ledger
+                            .operator_pricing
+                            .as_ref()
+                            .map(|view| view.provenance()),
+                        runtime: Some(runtime_name(launch_runtime).to_string()),
+                        model: model.clone(),
+                    }),
                 )
                 .context("failed to reconcile started dispatch budget reservation")?;
             DispatchUsageSettlement {

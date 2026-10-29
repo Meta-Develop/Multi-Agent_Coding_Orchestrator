@@ -14,6 +14,101 @@ pub(super) fn operator_pricing_document(plan: &SupervisorPlan) -> Value {
 }
 
 #[test]
+fn operator_contract_binding_rejects_oversized_rolling_provenance() {
+    use crate::budget_ledger::{
+        bind_rolling_budget, RollingBudgetQuota, MAX_PRICING_PROVENANCE_BYTES,
+    };
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+    let document = operator_pricing_document(&plan);
+    let bind = |document: &Value| {
+        parse_supervisor_plan_with_consultant(&document.to_string())
+            .unwrap()
+            .plan_metadata
+            .operator_pricing
+            .unwrap()
+            .bind("bounded-pricing")
+    };
+    let original_size = serde_json::to_vec(&bind(&document).unwrap().provenance())
+        .unwrap()
+        .len();
+    let attribution = document["pricing_contract"]["source_attribution"]
+        .as_str()
+        .unwrap();
+    let mut boundary = document.clone();
+    boundary["pricing_contract"]["source_attribution"] = json!(format!(
+        "{attribution}{}",
+        "x".repeat(MAX_PRICING_PROVENANCE_BYTES - original_size)
+    ));
+    let bounded = bind(&boundary).unwrap();
+    assert_eq!(
+        serde_json::to_vec(&bounded.provenance()).unwrap().len(),
+        MAX_PRICING_PROVENANCE_BYTES
+    );
+    let mut oversized = boundary.clone();
+    oversized["pricing_contract"]["source_attribution"] = json!(format!(
+        "{}x",
+        boundary["pricing_contract"]["source_attribution"]
+            .as_str()
+            .unwrap()
+    ));
+    let mut long_source = document.clone();
+    long_source["pricing_contract"]["source_reference"] =
+        json!("x".repeat(MAX_PRICING_PROVENANCE_BYTES * 5));
+    let mut escaped_source = document.clone();
+    escaped_source["pricing_contract"]["source_attribution"] =
+        json!("\"".repeat(MAX_PRICING_PROVENANCE_BYTES));
+    let mut many_scopes = document.clone();
+    many_scopes["pricing_contract"]["scopes"] = json!((0..1024)
+        .map(|index| {
+            let mut scope = document["pricing_contract"]["scopes"][0].clone();
+            scope["account_id"] = json!(format!("synthetic-account-{index}"));
+            scope
+        })
+        .collect::<Vec<_>>());
+    for valid_but_oversized in [oversized, long_source, escaped_source, many_scopes] {
+        let error = bind(&valid_but_oversized).unwrap_err();
+        assert!(error.to_string().contains("rolling journal binding limit"));
+    }
+
+    // The largest accepted provenance must fit actual reservation and terminal records.
+    let (_temp, repo) = injected_repository();
+    let _binding = bind_rolling_budget(
+        &repo,
+        RollingBudgetQuota {
+            max_tokens: Some(1000),
+            max_cost_usd: None,
+            window_seconds: 3600,
+        },
+        "bounded-pricing",
+    )
+    .unwrap();
+    let mut ledger = RunBudgetLedger::new(RunBudgetLimits::default()).unwrap();
+    ledger.operator_pricing = Some(bounded);
+    let reservation = ledger
+        .reserve(BudgetReservationRequest {
+            role: AgentRole::ChildOrchestrator,
+            tokens: 10,
+            cost_usd: Some(0.0),
+        })
+        .unwrap()
+        .reservation()
+        .unwrap()
+        .clone();
+    ledger
+        .reconcile_for_runtime_if_configured(
+            reservation.id,
+            UsageMeasurement::Reliable {
+                tokens: 10,
+                cost_usd: Some(0.0),
+            },
+            Some("codex"),
+        )
+        .unwrap();
+    assert_eq!(ledger.report().unwrap().charges.len(), 1);
+}
+
+#[test]
 fn operator_contract_absent_or_mismatched_refuses_before_launch() {
     let mut plan = injected_plan(injected_assignment(false), 0);
     inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
@@ -2998,6 +3093,67 @@ fn pricing_guard_fake_placeholder_simulation_remains_usable() {
     assert_pricing_guard_settlement(SupervisorRuntime::Fake, None, Some(0.0));
 }
 
+#[test]
+fn fake_missing_usage_settlement_reports_synthetic_reserved_cost() {
+    for rate in [None, Some(0.0), Some(2.0)] {
+        let mut plan = injected_plan(injected_assignment(false), 0);
+        if let Some(rate) = rate {
+            plan.model_pricing.insert(
+                "fake".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: rate,
+                    output_usd_per_million_tokens: rate,
+                },
+            );
+        }
+        let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+        let ledger = RunBudgetLedger::new(budget.limits).unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let mut command = ExternalAgentCommand::codex(
+            "unused",
+            temp.path(),
+            temp.path().join("prompt.md"),
+            temp.path().join("missing-usage.jsonl"),
+            temp.path().join("report.json"),
+            Duration::from_secs(1),
+        );
+        command.model = Some("fake".to_string());
+        let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+            &plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Fake),
+            &command,
+        )
+        .unwrap() else {
+            panic!("fake reservation must be admitted")
+        };
+        let reserved = reservation.reservation.clone();
+        assert_eq!(
+            reserved.cost_usd,
+            Some(reserved.tokens as f64 * rate.unwrap_or(0.0) / 1_000_000.0)
+        );
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Fake)
+            .unwrap();
+        let run = deterministic_fake_run(&command, Vec::new());
+        let settlement = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settlement.reliability, DispatchUsageReliability::Missing);
+        assert_eq!(settlement.observed_usage, None);
+        let report = ledger.report().unwrap();
+        let charge = &report.charges[0];
+        assert_eq!(charge.pricing.basis, ChargePricingBasis::Synthetic);
+        assert_eq!(charge.tokens, reserved.tokens);
+        assert_eq!(charge.cost_usd, reserved.cost_usd);
+        assert_eq!(report.consumed.cost_usd, reserved.cost_usd);
+        assert!(charge.usage_complete);
+        assert!(report.usage_complete);
+        assert!(report.cost_complete);
+        assert_eq!(report.active_reservations, 0);
+        assert_pricing_report_contracts(&report);
+    }
+}
+
 fn assert_pricing_guard_settlement(
     runtime: SupervisorRuntime,
     rate: Option<f64>,
@@ -3082,6 +3238,40 @@ fn assert_pricing_guard_settlement(
     assert_eq!(report.consumed.tokens, 10);
     assert_eq!(report.consumed.cost_usd, expected_cost);
     assert_eq!(report.roles[0].consumed.cost_usd, expected_cost);
+    assert_eq!(report.cost_complete, expected_cost.is_some());
+    assert_eq!(report.charges.len(), 1);
+    let charge = &report.charges[0];
+    assert_eq!(charge.cost_usd, expected_cost);
+    assert_eq!(charge.tokens, 10);
+    assert!(charge.usage_complete);
+    assert_eq!(
+        charge.pricing.runtime.as_deref(),
+        Some(runtime_name(runtime))
+    );
+    assert_eq!(charge.pricing.model.as_deref(), Some(model));
+    assert_eq!(charge.pricing.contract, report.pricing_contract);
+    assert_eq!(
+        charge.pricing.basis,
+        if runtime == SupervisorRuntime::Fake {
+            ChargePricingBasis::Synthetic
+        } else if expected_cost.is_some() {
+            ChargePricingBasis::OperatorContractEstimate
+        } else {
+            ChargePricingBasis::Unpriced
+        }
+    );
+    assert_eq!(report.pricing_contract.is_some(), rate.is_some());
+    if let Some(provenance) = &report.pricing_contract {
+        let frozen = operator_pricing::synthetic_input(&plan, "synthetic-account")
+            .unwrap()
+            .bind("report-only")
+            .unwrap()
+            .provenance();
+        assert_eq!(*provenance, frozen);
+        assert_eq!(provenance.contract.price_map_sha256.len(), 64);
+        assert_eq!(provenance.normalized_sha256.len(), 64);
+    }
+    assert_pricing_report_contracts(&report);
     assert_eq!(report.active_reservations, 0);
     assert_eq!(report.reserved.tokens, 0);
     assert!(report.usage_complete);
@@ -3109,6 +3299,69 @@ fn assert_pricing_guard_settlement(
         aggregation.reports[&AgentRole::Supervisor].cost_usd,
         expected_cost
     );
+}
+
+fn assert_pricing_report_contracts(budget: &RunBudgetReport) {
+    let mut legacy = serde_json::to_value(budget).unwrap();
+    for field in ["pricing_contract", "charges", "cost_complete"] {
+        legacy.as_object_mut().unwrap().remove(field);
+    }
+    let legacy: RunBudgetReport = serde_json::from_value(legacy).unwrap();
+    assert!(legacy.pricing_contract.is_none());
+    assert!(legacy.charges.is_empty());
+    assert!(!legacy.cost_complete);
+    let mut report: Value = serde_json::from_str(include_str!(
+        "../../../fixtures/schemas/supervisor-final-report-v1.valid.json"
+    ))
+    .unwrap();
+    report["run_budget"] = serde_json::to_value(budget).unwrap();
+    let decoded: SupervisorFinalReport = serde_json::from_value(report.clone()).unwrap();
+    let summary = render_supervisor_operator_summary(&decoded);
+    assert!(summary.contains(&format!("Priced-cost complete: {}", budget.cost_complete)));
+    if let Some(provenance) = &budget.pricing_contract {
+        assert!(summary.contains(&provenance.contract.contract_id));
+        assert!(summary.contains(&provenance.normalized_sha256));
+    } else {
+        assert_eq!(
+            summary.lines().find(|line| line.starts_with("- Pricing: ")),
+            Some("- Pricing: No operator pricing contract is bound")
+        );
+    }
+    let encoded: Value = serde_json::from_slice(&encode_final_report(&decoded).unwrap()).unwrap();
+    assert_eq!(encoded["run_budget"], report["run_budget"]);
+    for (collect, schema) in [
+        (false, supervisor_final_report_schema_value()),
+        (true, supervisor_collect_report_schema_value()),
+    ] {
+        let id = schema["$id"].as_str().unwrap();
+        let mut compiler = boon::Compiler::new();
+        compiler.add_resource(id, schema.clone()).unwrap();
+        let mut schemas = boon::Schemas::new();
+        let index = compiler.compile(id, &mut schemas).unwrap();
+        let mut instance = report.clone();
+        if collect {
+            instance["artifact_kind"] = json!(SUPERVISOR_COLLECT_ARTIFACT_KIND);
+            instance["schema"] = json!(SUPERVISOR_COLLECT_SCHEMA_ID);
+            instance["schema_version"] = json!(SUPERVISOR_COLLECT_SCHEMA_VERSION);
+            instance["collection_state"] = json!("finalized");
+            instance["final_report_available"] = json!(true);
+        }
+        schemas.validate(&instance, index).unwrap();
+        let mut invalid = instance.clone();
+        invalid["run_budget"]["charges"][0]["pricing"]["basis"] = json!("invoice");
+        assert!(schemas.validate(&invalid, index).is_err());
+        let mut invalid = instance.clone();
+        invalid["run_budget"]["charges"][0]["cost_usd"] = json!(-1);
+        assert!(schemas.validate(&invalid, index).is_err());
+        if budget.pricing_contract.is_some() {
+            let mut invalid = instance;
+            invalid["run_budget"]["pricing_contract"]["normalized_sha256"] = json!("invalid");
+            assert!(schemas.validate(&invalid, index).is_err());
+        } else {
+            assert!(instance["run_budget"]["pricing_contract"].is_null());
+            assert!(instance["run_budget"]["charges"][0]["pricing"]["contract"].is_null());
+        }
+    }
 }
 
 #[test]
@@ -3300,6 +3553,19 @@ fn model_attribution_settlement_and_all_role_reports_share_verified_allocation()
                     let charged = ledger.report().unwrap();
                     assert_eq!(charged.consumed.tokens, 10);
                     assert_eq!(charged.consumed.cost_usd, expected_cost);
+                    assert_eq!(charged.cost_complete, expected_cost.is_some());
+                    let charge = charged.charges.last().unwrap();
+                    assert_eq!(charge.role, role);
+                    assert_eq!(charge.pricing.model.as_deref(), expected_model);
+                    assert_eq!(charge.pricing.contract, charged.pricing_contract);
+                    assert_eq!(
+                        charge.pricing.basis,
+                        if expected_cost.is_some() {
+                            ChargePricingBasis::OperatorContractEstimate
+                        } else {
+                            ChargePricingBasis::Unpriced
+                        }
+                    );
                     assert!(charged.usage_complete);
                     assert_eq!(
                         charged.new_dispatch_allowed,

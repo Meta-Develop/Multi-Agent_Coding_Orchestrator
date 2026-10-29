@@ -103,11 +103,13 @@ impl FrozenOperatorPricing {
     }
 
     pub(super) fn bind(&self, run_id: &str) -> Result<RunPricing> {
-        Ok(RunPricing {
+        let pricing = RunPricing {
             contract: Arc::new(self.validated()?),
             plan_id: self.plan_id.clone(),
             run_id: run_id.to_string(),
-        })
+        };
+        crate::budget_ledger::validate_pricing_provenance_size(&pricing.provenance())?;
+        Ok(pricing)
     }
 
     fn require_current(&self) -> Result<()> {
@@ -146,6 +148,14 @@ pub(crate) struct RunPricing {
 }
 
 impl RunPricing {
+    pub(crate) fn provenance(&self) -> PricingContractProvenance {
+        PricingContractProvenance {
+            contract: self.contract.contract().clone(),
+            normalized_sha256: self.contract.content_sha256().to_string(),
+            plan_id: self.plan_id.clone(),
+        }
+    }
+
     pub(super) fn matches_prices(&self, prices: &BTreeMap<String, ModelPricing>) -> bool {
         price_map_sha256(prices)
             .is_ok_and(|digest| digest == self.contract.contract().price_map_sha256)
