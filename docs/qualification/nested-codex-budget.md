@@ -4,8 +4,11 @@ Status: prepared; real within-turn exhaustion is unproven. Follow the
 [shared preparation and evidence contract](README.md) before running.
 The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
 has one execution parent and exactly two disjoint terminal Workers, requested
-serially, on `gpt-6.1-sol` / `medium`; independent control/review roles retain
-`xhigh`. Native runtime delegation is prohibited; nested dispatch goes through
+serially, on `gpt-6.1-sol` / `high` for both the delegating parent and terminal
+Workers; independent control/review roles retain `xhigh`.
+The bundled task/authority priors admit `high` and `xhigh` for these localized
+changes. The original `medium` requests failed selection before release.
+Native runtime delegation is prohibited; nested dispatch goes through
 the authenticated coordinator channel. No retries or gate corrections are
 authorized by the fixture.
 
@@ -16,6 +19,10 @@ consumption and the Worker live grant is the remaining admitted allowance,
 not its 1,000-token estimate. The meaningful task repairs two deliberately
 flawed Python test fixtures with disjoint ownership. It does not pad output
 or request unlimited turns to force usage.
+
+The effort correction leaves these bounds unchanged. It does not predict
+consumption at the corrected efforts; parent-only exhaustion or insufficient
+allowance still makes the attempt inconclusive.
 
 ```bash
 fixture=examples/supervise/nested-codex-budget-qualification.json

@@ -52,6 +52,17 @@ scope, policy or hash-bound notes requires regenerating the corresponding
 assessment/contract through accepted tooling and validating replay again.
 Changing an effort preference alone does not create selector eligibility.
 
+The Codex fixtures request efforts admitted by the bundled role/task priors:
+`high` for the delegating parent and terminal writable Workers, and `xhigh` for
+Researcher and control/review roles. A providerless regression runs the live
+selection bridge against every qualification plan with synthetic model
+membership and the bundled priors. It requires the Codex fixtures to pass and
+the deliberate `grok-4.6` / `low` fixture to refuse with `effort_incompatible`.
+Synthetic membership establishes no account access or live admission. Effort
+preferences are outside the routing declaration and task-bound verification
+contracts, so this correction preserves their hashes and validates replay
+through the ordinary plan loader.
+
 Keep the full private run directory `.maco/o2/runs/<run-id>` and any returned
 cascade/follow-up run ids, not just stdout. Capture collection independently of
 the launch status, including expected budget rejection. The final report is
