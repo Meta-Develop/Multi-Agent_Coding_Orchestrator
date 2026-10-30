@@ -1,0 +1,138 @@
+{
+  "version": 1,
+  "experiment_id": "model-mix-pilot-v1",
+  "goal": "Update `examples/supervise/qualification-data/test_grok_ledger.py`. Read the entire file before editing. Repair can_admit to include reserved usage, observed_floor to retain a monotonic cumulative maximum, and settle to reject unknown usage before effects and settle/release an exact reservation once, with safe identical replay and refused conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_grok_ledger.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
+  "spec": "Repair the ledger fixture without widening scope. Preserve all existing tests, pass the independent held-out ledger tests and all three default review information scopes. Fresh isolated source per cell; zero retries or corrections. Ordinary-task pilot only; production/default eligibility remains false. Operator contract, dated priors and live measurement are separate required inputs.",
+  "limits": {
+    "wall_time_seconds": 3600,
+    "max_dispatches": 8
+  },
+  "held_out_validation": [
+    {
+      "id": "ledger-contract",
+      "command": [
+        "python3",
+        "-B",
+        "-m",
+        "unittest",
+        "discover",
+        "-s",
+        "examples/supervise/qualification-data",
+        "-p",
+        "test_grok_ledger.py",
+        "-v"
+      ]
+    }
+  ],
+  "repetitions": 1,
+  "profiles": [
+    {
+      "id": "all-sol",
+      "worker_runtime": "codex",
+      "role_models": {
+        "supervisor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "child_orchestrator": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "worker": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "researcher": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "gate_classifier": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "auditor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        }
+      }
+    },
+    {
+      "id": "sol-grok-4.6",
+      "worker_runtime": "grok",
+      "role_models": {
+        "supervisor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "child_orchestrator": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "worker": {
+          "model": "grok-4.6",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "researcher": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "gate_classifier": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "auditor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        }
+      }
+    },
+    {
+      "id": "sol-grok-4.7",
+      "worker_runtime": "grok",
+      "role_models": {
+        "supervisor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "child_orchestrator": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "worker": {
+          "model": "grok-4.7",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "researcher": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "gate_classifier": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        },
+        "auditor": {
+          "model": "gpt-6.1-sol",
+          "reasoning_effort": "xhigh",
+          "unavailable_model_fallback": "fail_closed"
+        }
+      }
+    }
+  ]
+}

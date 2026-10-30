@@ -2,7 +2,8 @@
 
 These fixtures prepare separate acceptance gates for [nested token control](nested-codex-budget.md),
 [read-only source inspection](researcher-source-input.md), and a
-[lower-effort writable lane](grok-lower-effort.md). None records a passed live run.
+[lower-effort writable lane](grok-lower-effort.md), plus a
+[cross-runtime model-mix pilot](model-mix-pilot.md). None records a passed live run.
 Plan validation is offline and does not assert account access, selector
 eligibility, containment, provider identity, usage, or successful acceptance.
 

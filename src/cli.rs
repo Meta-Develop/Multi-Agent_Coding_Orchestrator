@@ -4777,6 +4777,9 @@ struct RescoreEvaluationArgs {
 struct RunExperimentArgs {
     /// Versioned experiment manifest binding goal/spec, profiles, and repetitions.
     manifest: PathBuf,
+    /// Validate manifest and caller-plan comparison bindings offline, without executing any cell.
+    #[arg(long)]
+    validate_only: bool,
     /// Owns retained artifacts with --execute-held-out; never the evaluated source repository.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
@@ -4871,6 +4874,33 @@ fn resolve_held_out_explicit_source_cli(
 }
 
 fn run_evaluation_experiment_command(args: RunExperimentArgs) -> Result<()> {
+    if args.validate_only {
+        if args.execute_held_out
+            || args.allow_real_provider
+            || args.execution != crate::evaluation::EvaluationExecution::DeterministicFake
+            || args.source_repo.is_some()
+            || args.base_commit.is_some()
+            || args.runtime.is_some()
+            || args.runtime_bin.is_some()
+            || !args.additional_runtime_bin.is_empty()
+            || args.prior_data.is_some()
+            || args.machine_global_config.is_some()
+            || args.machine_global_runtime_root_id.is_some()
+        {
+            bail!("--validate-only refuses execution, source, runtime, prior-data and retention options");
+        }
+        let plan = args
+            .provider_plan
+            .as_deref()
+            .context("--validate-only requires --provider-plan")?;
+        let bytes = BoundedRegularReader::read_tree_no_follow(
+            &args.manifest,
+            MAX_EVALUATION_MANIFEST_BYTES,
+        )?;
+        let manifest = crate::evaluation::parse_observation_experiment_manifest(&bytes)?;
+        let inputs = crate::evaluation::validate_held_out_comparison_inputs(&manifest, plan)?;
+        return print_query_report(&inputs, args.json);
+    }
     let held_out_explicit_source_baseline = resolve_held_out_explicit_source_cli(
         args.execute_held_out,
         args.source_repo.clone(),
