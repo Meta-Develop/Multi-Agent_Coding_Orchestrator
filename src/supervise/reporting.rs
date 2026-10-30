@@ -2178,6 +2178,7 @@ pub(super) fn external_process_completed(
             && run.error.is_none()
             && run.managed_gemini_selection_evidence().is_some()
             && evidence.provider_released
+            && evidence.identity_matches_launch()
             && ((evidence.managed_worker_completed
                 && evidence.tool_mutation_observed
                 && !evidence.managed_read_only_completed)
@@ -2267,9 +2268,7 @@ pub(super) fn external_usage_for_runtime(
         // per-attempt floors and completeness independently of writable logs.
         cursor_managed_usage(run).map(|(usage, _)| usage)
     } else if runtime == SupervisorRuntime::GeminiCli {
-        // Gemini retains only a held total-token lower bound for ledger settlement;
-        // it cannot supply complete input/output usage through the Codex parser.
-        None
+        run.gemini_bridge_evidence()?.usage_for_command(command)
     } else {
         complete_external_codex_usage(run, command)
     }
@@ -2280,6 +2279,35 @@ pub(super) fn external_usage_for_runtime(
 fn gemini_read_only_reporting_completion_requires_live_native_custody() -> Result<()> {
     crate::external_agent::gemini_bridge::test_read_only_completion_consumer(|run| {
         external_process_completed(run, SupervisorRuntime::GeminiCli)
+    })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn gemini_worker_reporting_requires_complete_private_usage_and_served_identity() -> Result<()> {
+    crate::external_agent::gemini_bridge::test_worker_usage_consumer(|run, command, case| {
+        assert_eq!(
+            external_process_completed(run, SupervisorRuntime::GeminiCli),
+            case == "complete",
+            "{case}"
+        );
+        let usage = external_usage_for_runtime(run, command, SupervisorRuntime::GeminiCli);
+        assert_eq!(
+            usage.is_some(),
+            matches!(case, "complete" | "mismatch" | "effort"),
+            "{case}"
+        );
+        if let Some(usage) = usage {
+            assert_eq!(
+                usage,
+                Usage {
+                    input_tokens: 10,
+                    output_tokens: 10,
+                    total_tokens: 20
+                }
+            );
+        }
+        Ok(())
     })
 }
 

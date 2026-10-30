@@ -6,6 +6,9 @@ use crate::autopilot::{
 use serde_json::json;
 use std::fs;
 
+#[path = "runtime_binding_tests.rs"]
+mod runtime_binding_tests;
+
 const FIXTURE_PLAN: &[u8] =
     include_bytes!("../../tests/fixtures/model_mix_evaluation/hand-authored-plan-v1.json");
 const FIXTURE_MANIFEST: &str =
@@ -30,6 +33,7 @@ fn model(model: &str, reasoning_effort: &str) -> RoleModelSelection {
 
 fn profile(id: &str, orchestrator_model: &str, worker_model: &str) -> EvaluationProfile {
     EvaluationProfile {
+        worker_runtime: None,
         id: id.to_string(),
         role_models: BTreeMap::from([
             (
