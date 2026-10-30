@@ -7205,11 +7205,45 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
     };
     assert_eq!(
         cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
-        Some("managed Cursor observed model or effort does not match the selected launch")
+        Some("managed Cursor served model or effort evidence is missing")
     );
     evidence.actual_provider_model = command.model.clone();
     evidence.actual_effort = command.reasoning_effort.clone();
     assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_none());
+    for (model, effort) in [
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+        (Some("another-model"), Some("high")),
+        (Some("cursor-selected-model"), Some("low")),
+    ] {
+        evidence.actual_provider_model = model.map(str::to_string);
+        evidence.actual_effort = effort.map(str::to_string);
+        assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_some());
+    }
+    evidence.actual_provider_model = command.model.clone();
+    evidence.actual_effort = command.reasoning_effort.clone();
+    for (model, effort) in [
+        (None, None),
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+    ] {
+        command.model = model.map(str::to_string);
+        command.reasoning_effort = effort.map(str::to_string);
+        assert_eq!(
+            cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+            Some("managed Cursor selected model or effort is missing")
+        );
+    }
+    evidence.actual_provider_model = None;
+    evidence.actual_effort = None;
+    assert_eq!(
+        cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+        Some("managed Cursor served model or effort evidence is missing")
+    );
     Ok(())
 }
 
