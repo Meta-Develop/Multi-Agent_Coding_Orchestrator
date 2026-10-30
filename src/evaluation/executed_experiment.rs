@@ -74,6 +74,8 @@ pub struct ExecutedExperimentResults {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObservedExperimentRun {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_binding: Option<super::ObservedProfileBinding>,
     pub held_out: HeldOutCandidateEvidence,
     pub admitted_dispatches: u32,
     pub wall_time_ms: u64,
@@ -265,6 +267,7 @@ pub fn run_experiment_with_held_out_and_source(
                 ),
             };
             let run = ObservedExperimentRun {
+                profile_binding: None,
                 required_validation_passed: held_out.passed(),
                 held_out,
                 admitted_dispatches,
@@ -361,6 +364,23 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
         Some(&request.source.source_repo),
     )
     .map_err(|error| anyhow!("held-out production caller plan is invalid: {error}"))?;
+    let comparison_inputs = super::runtime_binding::comparison_inputs(
+        manifest,
+        &frozen,
+        Some(&request.source.source_repo),
+    )?;
+    for profile in &manifest.profiles {
+        if let Some(runtime) = profile.worker_runtime {
+            if runtime != request.runtime
+                && !request
+                    .additional_runtime_executables
+                    .iter()
+                    .any(|binding| binding.runtime == runtime)
+            {
+                bail!("profile '{}' worker_runtime is absent from the explicit runtime executable allowlist", profile.id);
+            }
+        }
+    }
     if request.prior_data.is_some() {
         for profile in &manifest.profiles {
             for (role, selection) in &profile.role_models {
@@ -375,16 +395,22 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                         })?;
                 }
             }
-            supervise::materialize_held_out_profile_effective_caller_plan_in_repo(
-                &frozen,
-                &profile.role_models,
-                Some(&request.source.source_repo),
-            )?;
         }
     }
     let resolved_commit = experiment::resolve_held_out_explicit_source_baseline(&request.source)
         .map_err(|error| anyhow!("held-out explicit source baseline is invalid: {error}"))?;
     let runtime_allowlist = freeze_runtime_bindings_before_reservation(&request)?;
+    let source_git = crate::git_repository::open(&request.source.source_repo)?;
+    let source_tree = source_git
+        .find_commit(resolved_commit)?
+        .tree_id()
+        .to_string();
+    let comparison_sha256 = super::runtime_binding::comparison_digest(
+        &comparison_inputs,
+        &resolved_commit.to_string(),
+        &source_tree,
+        &runtime_allowlist.artifact_value(),
+    )?;
     crate::git_repository::configure_libgit2_repository_extensions()?;
     let repo = artifacts::discover_repo_root(artifact_repo)?;
     let family = RunArtifactFamily::Supervise;
@@ -394,6 +420,17 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
     if let Some(prior) = &request.prior_data {
         prior.archive(&mut writer, Path::new("held-out"))?;
     }
+    writer.write_json(
+        "held-out/comparison-binding.json",
+        &json!({
+            "comparison_sha256": comparison_sha256,
+            "inputs": comparison_inputs,
+            "source_commit": resolved_commit.to_string(),
+            "source_tree": source_tree,
+            "runtime_bindings": runtime_allowlist.artifact_value(),
+        }),
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
     writer.write_json(
         "held-out/manifest.json",
         manifest,
@@ -426,6 +463,7 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
     let mut common_baseline: Option<(String, String)> = None;
     let mut any_target_launch_attempted = false;
     let mut any_native_runtime_result = false;
+    let mut stop_reason: Option<String> = None;
     for (profile_index, profile) in manifest.profiles.iter().enumerate() {
         for repetition in 0..manifest.repetitions {
             let started = Instant::now();
@@ -460,6 +498,21 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
             }
             common_baseline.get_or_insert(baseline_pair.clone());
             let effective_plan_sha256 = sha256_hex(&effective_plan_bytes);
+            if comparison_inputs.effective_plan_sha256.get(&profile.id)
+                != Some(&effective_plan_sha256)
+            {
+                bail!("effective profile plan differs from the prevalidated comparison binding");
+            }
+            let profile_binding = super::ObservedProfileBinding::requested(
+                profile,
+                request.runtime,
+                &comparison_sha256,
+                &effective_plan_sha256,
+                serde_json::from_slice::<supervise::SupervisorPlan>(&effective_plan_bytes)?
+                    .assignments[0]
+                    .runtime
+                    .unwrap_or(request.runtime),
+            );
             let prefix = PathBuf::from("held-out").join(format!("p{profile_index}-r{repetition}"));
             {
                 let mut retained = writer
@@ -479,6 +532,8 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                     "profile_id": profile.id,
                     "profile_sha256": sha256_hex(&serde_json::to_vec(profile)?),
                     "requested_role_models": profile.role_models,
+                    "worker_runtime": profile.worker_runtime,
+                    "comparison_sha256": comparison_sha256,
                     "caller_plan_sha256": frozen.caller_plan_sha256,
                     "effective_plan_sha256": effective_plan_sha256,
                     "assignment_id": frozen.assignment_id,
@@ -529,7 +584,10 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                 request.machine_global_retention.clone(),
             );
             options.budget_max_duration_seconds = Some(manifest.limits.wall_time_seconds);
-            let outcome = dispatch(options, authority.clone(), runtime_allowlist.clone());
+            let outcome = match &stop_reason {
+                Some(reason) => Err(anyhow!("paid cell withheld: {reason}")),
+                None => dispatch(options, authority.clone(), runtime_allowlist.clone()),
+            };
             let (report, launch) = match outcome {
                 Ok(outcome) => (outcome.report, outcome.launch),
                 Err(error) => {
@@ -538,6 +596,7 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                     let measurements =
                         Some(observed_run_measurements_unavailable(&held_out, &reason));
                     let run = ObservedExperimentRun {
+                        profile_binding: Some(profile_binding),
                         required_validation_passed: held_out.passed(),
                         admitted_dispatches: authority.dispatches()?,
                         wall_time_ms: u64::try_from(started.elapsed().as_millis())
@@ -550,6 +609,9 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                         measurements,
                     };
                     retain_completed_run(&writer, &run)?;
+                    if profile.worker_runtime.is_some() {
+                        stop_reason.get_or_insert_with(|| "previous cell did not produce complete measurements and provider-resolved role identities".into());
+                    }
                     runs.push(run);
                     continue;
                 }
@@ -629,6 +691,7 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                 }
             };
             let run = ObservedExperimentRun {
+                profile_binding: Some(profile_binding),
                 required_validation_passed: held_out.passed(),
                 held_out,
                 admitted_dispatches,
@@ -640,6 +703,16 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                 measurements,
             };
             retain_completed_run(&writer, &run)?;
+            if profile.worker_runtime.is_some()
+                && run.profile_binding.as_ref().is_some_and(|binding| {
+                    binding
+                        .roles
+                        .values()
+                        .any(|role| role.observed_model.is_none() || role.observed_effort.is_none())
+                })
+            {
+                stop_reason.get_or_insert_with(|| "previous cell has unknown provider-resolved role model/effort; additional paid cells require complete measurement and independent acceptance".into());
+            }
             runs.push(run);
         }
     }

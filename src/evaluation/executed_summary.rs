@@ -163,6 +163,7 @@ fn validate_run_bindings(
     manifest_sha256: &str,
     runs: &[ObservedExperimentRun],
 ) -> Result<()> {
+    super::runtime_binding::validate_observed_bindings(manifest, runs)?;
     let mut seen = BTreeSet::new();
     let mut profile_baselines: BTreeMap<String, (String, String)> = BTreeMap::new();
     for run in runs {
@@ -1198,10 +1199,12 @@ mod tests {
             repetitions: 1,
             profiles: vec![
                 EvaluationProfile {
+                    worker_runtime: None,
                     id: "profile-low-cost".to_string(),
                     role_models: BTreeMap::new(),
                 },
                 EvaluationProfile {
+                    worker_runtime: None,
                     id: "profile-high-cost".to_string(),
                     role_models: BTreeMap::new(),
                 },
@@ -1238,6 +1241,7 @@ mod tests {
             ParentReviewCaptureObservation::ProvenAtCapture
         );
         ObservedExperimentRun {
+            profile_binding: None,
             held_out,
             admitted_dispatches: 1,
             wall_time_ms: 100,
@@ -1406,6 +1410,7 @@ mod tests {
                 "supervisor-final.json was not retained",
             );
         let run = ObservedExperimentRun {
+            profile_binding: None,
             held_out,
             admitted_dispatches: 1,
             wall_time_ms: 1,
@@ -1441,6 +1446,7 @@ mod tests {
         )
         .expect("measurements");
         let run = ObservedExperimentRun {
+            profile_binding: None,
             held_out,
             admitted_dispatches: 1,
             wall_time_ms: 1,

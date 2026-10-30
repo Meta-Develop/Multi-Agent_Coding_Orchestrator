@@ -109,6 +109,16 @@ pub struct ExperimentManifest {
 impl ExperimentManifest {
     pub fn validate(&self) -> Result<(), EvaluationError> {
         self.validate_shared()?;
+        if self
+            .profiles
+            .iter()
+            .any(|profile| profile.worker_runtime.is_some())
+        {
+            return Err(invalid_experiment(
+                "profiles.worker_runtime",
+                "runtime bindings require real-provider held-out observation or offline validation",
+            ));
+        }
         if self.profiles.len() < 2 {
             return Err(invalid_experiment(
                 "profiles",
@@ -129,6 +139,7 @@ impl ExperimentManifest {
             ));
         }
         validate_experiment_profiles_no_local_deterministic_fake(&self.profiles)?;
+        super::runtime_binding::validate_profile_runtime_bindings(self)?;
         Ok(())
     }
 
@@ -1588,9 +1599,10 @@ impl IsolatedSuperviseState {
 
         let run_id = isolated_run_id(manifest, profile, repetition)?;
         let plan_file = workspace.path().join(format!("{}.json", run_id.as_str()));
-        let bytes = supervise::materialize_held_out_profile_effective_caller_plan_in_repo(
+        let bytes = supervise::materialize_held_out_profile_runtime_caller_plan_in_repo(
             frozen,
             &profile.role_models,
+            profile.worker_runtime,
             Some(&source.source_repo),
         )
         .map_err(|error| EvaluationError::FakeSuperviseExperiment {
