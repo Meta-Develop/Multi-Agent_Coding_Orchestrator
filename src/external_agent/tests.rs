@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "tests/claude_identity.rs"]
+pub(crate) mod claude_identity;
+
 thread_local! {
     static GROK_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -8553,7 +8557,7 @@ fn writable_claude_qualification_is_invocation_bound_and_refuses_drift_and_prima
 }
 
 #[test]
-fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_does_not_deserialize(
+fn claude_native_capture_extracts_only_terminal_result_and_private_evidence_does_not_deserialize(
 ) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let _identity = inject_admitted_claude_identity_for_test();
@@ -8579,9 +8583,80 @@ fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_doe
     );
     run.stdout.run_metadata.claude_native_evidence = Some(evidence);
     assert_eq!(run.authenticated_claude_model(), Some("claude-sonnet-4-6"));
+    assert_eq!(run.authenticated_claude_effort(), None);
+    assert_eq!(
+        claude_native_identity_publication_refusal(
+            &command,
+            run.authenticated_claude_native_evidence()
+        ),
+        Some("Claude served effort is unknown in the pinned native stream")
+    );
     let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
     assert!(restored.authenticated_claude_native_evidence().is_none());
     assert!(restored.authenticated_claude_usage().is_none());
+    assert!(restored.authenticated_claude_effort().is_none());
+    Ok(())
+}
+
+#[test]
+fn claude_native_publication_refuses_missing_mismatched_and_unknown_identity() -> Result<()> {
+    let command = ExternalAgentCommand::codex(
+        "claude",
+        ".",
+        "prompt",
+        "events",
+        "output",
+        Duration::from_secs(30),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    );
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, None),
+        Some("Claude native served-identity evidence is missing")
+    );
+    let mut events = String::from_utf8(exact_claude_native_stream())?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Init/configuration claims cannot replace the API's response model.
+    events[0]["model"] = serde_json::json!("claude-sonnet-4-6");
+    events[1]["event"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model");
+    let missing_stream = events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let missing =
+        crate::runtime_adapter::claude::collect_native_stream(missing_stream.as_bytes(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&missing)),
+        Some("Claude served model is missing or conflicting")
+    );
+    let mismatch_stream = String::from_utf8(exact_claude_native_stream())?
+        .replace("claude-sonnet-4-6", "claude-sonnet-4-5");
+    let mismatch =
+        crate::runtime_adapter::claude::collect_native_stream(mismatch_stream.as_bytes(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&mismatch)),
+        Some("Claude served model does not match the requested model")
+    );
+    let mut evidence =
+        crate::runtime_adapter::claude::collect_native_stream(&exact_claude_native_stream(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&evidence)),
+        Some("Claude served effort is unknown in the pinned native stream")
+    );
+    // Synthetic matcher coverage; the pinned collector never produces observed effort.
+    evidence.observed_effort = Some("low".to_string());
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&evidence)),
+        Some("Claude served effort does not match the requested effort")
+    );
     Ok(())
 }
 

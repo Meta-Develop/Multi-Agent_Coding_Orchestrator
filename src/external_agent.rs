@@ -4988,6 +4988,17 @@ impl ExternalAgentRun {
             .and_then(ClaudeNativeEvidence::observed_model)
     }
 
+    pub(crate) fn authenticated_claude_effort(&self) -> Option<&str> {
+        self.authenticated_claude_native_evidence()
+            .and_then(|evidence| evidence.observed_effort.as_deref())
+            .filter(|effort| !effort.is_empty())
+    }
+
+    pub(crate) fn claude_managed_effort_qualified(&self) -> bool {
+        !self.stdout.run_metadata.claude_managed_identity_required
+            || self.authenticated_claude_effort().is_some()
+    }
+
     #[cfg(test)]
     pub(crate) fn set_claude_native_stream_for_test(
         &mut self,
@@ -5508,6 +5519,8 @@ struct ExternalAgentRunMetadata {
     /// Raw Claude stream-derived identity and usage held only by the parent
     /// that owned stdout. Serialization and public logs cannot restore it.
     claude_native_evidence: Option<ClaudeNativeEvidence>,
+    /// Parent launch shape only; never serialized or inferred from stream claims.
+    claude_managed_identity_required: bool,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
     managed_codex_selection: Option<FrozenCodexSelectedBinding>,
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
@@ -11553,6 +11566,8 @@ fn record_completed_target(
     );
     report.stdout.target_launch_attempted = true;
     report.stdout.run_metadata.claude_native_evidence = claude_native_evidence.clone();
+    report.stdout.run_metadata.claude_managed_identity_required =
+        context.spec.uses_live_claude_managed_worker_budget();
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
     if let Some(evidence) = context.grok_acp_parent_evidence {
@@ -11725,6 +11740,13 @@ fn record_completed_target(
             .grok_acp_parent_evidence
             .as_ref()
             .is_some_and(|evidence| evidence.permission_escalation_refused);
+    // Identity acceptance must not degrade complete usage or verified process safety.
+    if report.stdout.run_metadata.claude_managed_identity_required
+        && claude_native_identity_publication_refusal(context.spec, claude_native_evidence.as_ref())
+            .is_some()
+    {
+        report.publishable = false;
+    }
     report.stdout.run_metadata.codex_cli_usage_complete = report.publishable;
     if report.codex_command_execution_evidence().is_none()
         && report
@@ -11737,6 +11759,17 @@ fn record_completed_target(
             })
     {
         report.publishable = false;
+    }
+}
+
+fn claude_native_identity_publication_refusal(
+    spec: &ExternalAgentCommand,
+    evidence: Option<&ClaudeNativeEvidence>,
+) -> Option<&'static str> {
+    match evidence {
+        Some(evidence) => evidence
+            .identity_publication_refusal(spec.model.as_deref(), spec.reasoning_effort.as_deref()),
+        None => Some("Claude native served-identity evidence is missing"),
     }
 }
 
@@ -13308,3 +13341,6 @@ mod preflight_quiescence_regression {
 mod managed_readonly_route_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::claude_identity::record_claude_completion_for_test;

@@ -2240,6 +2240,9 @@ pub(crate) struct ClaudeNativeMessageEvidence {
 pub(crate) struct ClaudeNativeEvidence {
     pub(crate) session_id: Option<String>,
     pub(crate) observed_model: Option<String>,
+    /// None means unknown. The pinned stream has no served-effort observation;
+    /// argv, init configuration, hook effort and request output_config are not one.
+    pub(crate) observed_effort: Option<String>,
     pub(crate) messages: Vec<ClaudeNativeMessageEvidence>,
     pub(crate) failures: BTreeSet<ClaudeCoverageFailure>,
     pub(crate) result_text: Option<Vec<u8>>,
@@ -2250,8 +2253,33 @@ pub(crate) struct ClaudeNativeEvidence {
 }
 
 impl ClaudeNativeEvidence {
+    /// Whole-call usage coverage is independent of served-effort qualification.
     pub(crate) fn complete(&self) -> bool {
         self.complete
+    }
+
+    pub(crate) fn identity_publication_refusal(
+        &self,
+        requested_model: Option<&str>,
+        requested_effort: Option<&str>,
+    ) -> Option<&'static str> {
+        let Some(model) = self.observed_model() else {
+            return Some("Claude served model is missing or conflicting");
+        };
+        if requested_model != Some(model) {
+            return Some("Claude served model does not match the requested model");
+        }
+        let Some(effort) = self
+            .observed_effort
+            .as_deref()
+            .filter(|value| !value.is_empty())
+        else {
+            return Some("Claude served effort is unknown in the pinned native stream");
+        };
+        if requested_effort != Some(effort) {
+            return Some("Claude served effort does not match the requested effort");
+        }
+        None
     }
 
     pub(crate) fn complete_usage(&self) -> Option<Usage> {
@@ -2768,6 +2796,9 @@ impl NativeCollector {
         ClaudeNativeEvidence {
             session_id: self.session_id,
             observed_model: self.observed_model,
+            // 2.1.137 forwards API message events but exposes no served effort.
+            // Do not promote requested configuration or unknown wire fields.
+            observed_effort: None,
             messages,
             complete: self.failures.is_empty(),
             failures: self.failures,
@@ -2997,6 +3028,92 @@ mod tests {
         ]
     }
 
+    fn identity_stream(model: &str) -> Vec<Value> {
+        let mut events = message_events("msg-identity", model);
+        events.push(json!({"type":"result","subtype":"success","is_error":false,
+            "session_id":"session-1","num_turns":1,"result":"done",
+            "modelUsage":{(model):{"inputTokens":10,"cacheCreationInputTokens":5,
+                "cacheReadInputTokens":3,"outputTokens":7}}}));
+        events
+    }
+
+    #[test]
+    fn native_identity_refuses_missing_and_mismatched_served_model() {
+        let mut events = identity_stream(CLAUDE_MANAGED_PRIMARY_MODEL);
+        events[0]["event"]["message"]
+            .as_object_mut()
+            .unwrap()
+            .remove("model");
+        let missing = collect_native_stream(&exact_stream(events), false);
+        assert!(missing.observed_model().is_none());
+        assert_eq!(
+            missing.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("high")),
+            Some("Claude served model is missing or conflicting")
+        );
+
+        let mismatch =
+            collect_native_stream(&exact_stream(identity_stream("claude-sonnet-4-5")), false);
+        assert_eq!(mismatch.observed_model(), Some("claude-sonnet-4-5"));
+        assert_eq!(
+            mismatch.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("high")),
+            Some("Claude served model does not match the requested model")
+        );
+    }
+
+    #[test]
+    fn native_stream_effort_remains_unknown_despite_unrecognized_effort_fields() {
+        for claimed in [json!("high"), json!("low"), json!("unknown"), Value::Null] {
+            let mut events = identity_stream(CLAUDE_MANAGED_PRIMARY_MODEL);
+            for event in &mut events {
+                event["effort"] = claimed.clone();
+                event["observed_effort"] = claimed.clone();
+                event["output_config"] = json!({"effort":claimed});
+            }
+            events[0]["event"]["message"]["effort"] = claimed.clone();
+            let evidence = collect_native_stream(&exact_stream(events), false);
+            assert_eq!(
+                evidence.observed_model(),
+                Some(CLAUDE_MANAGED_PRIMARY_MODEL)
+            );
+            assert_eq!(evidence.observed_effort, None);
+            for requested in [Some("high"), Some("low"), None] {
+                assert_eq!(
+                    evidence.identity_publication_refusal(
+                        Some(CLAUDE_MANAGED_PRIMARY_MODEL),
+                        requested
+                    ),
+                    Some("Claude served effort is unknown in the pinned native stream")
+                );
+            }
+            assert!(evidence.usage_lower_bound().is_some());
+        }
+    }
+
+    #[test]
+    fn native_identity_refuses_mismatched_effort_independently_of_usage() {
+        let mut evidence = collect_native_stream(
+            &exact_stream(identity_stream(CLAUDE_MANAGED_PRIMARY_MODEL)),
+            false,
+        );
+        // Synthetic matcher coverage only: no event in this pin can supply this value.
+        evidence.observed_effort = Some("low".to_string());
+        assert_eq!(
+            evidence.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("high")),
+            Some("Claude served effort does not match the requested effort")
+        );
+        assert!(evidence
+            .identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), None)
+            .is_some());
+        assert!(evidence
+            .identity_publication_refusal(None, Some("low"))
+            .is_some());
+        assert_eq!(
+            evidence.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("low")),
+            None
+        );
+        assert!(!evidence.complete());
+    }
+
     #[test]
     fn exact_native_stream_retains_identity_ids_presence_and_disjoint_cache_totals() {
         let mut events = message_events("msg-1", "claude-sonnet-4-5");
@@ -3224,6 +3341,11 @@ mod tests {
             .contains(&ClaudeCoverageFailure::FallbackOrAuxiliaryModel));
         evidence.attach_whole_call_witness(&witness, &binding);
         assert!(evidence.complete(), "{:?}", evidence.failures);
+        assert_eq!(evidence.observed_effort, None);
+        assert_eq!(
+            evidence.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("high")),
+            Some("Claude served effort is unknown in the pinned native stream")
+        );
         assert_eq!(evidence.complete_usage().unwrap().input_tokens, 72);
         assert_eq!(evidence.complete_usage().unwrap().output_tokens, 28);
         assert_eq!(evidence.complete_usage().unwrap().total_tokens, 100);

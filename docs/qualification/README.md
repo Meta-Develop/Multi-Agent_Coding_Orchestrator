@@ -6,6 +6,10 @@ These fixtures prepare separate acceptance gates for [nested token control](nest
 Plan validation is offline and does not assert account access, selector
 eligibility, containment, provider identity, usage, or successful acceptance.
 
+The [Claude Code served-identity contract](claude-served-identity.md) documents
+the pinned stream's observed model, unknown served effort, and the resulting
+fail-closed publication and completion gates.
+
 Use an admitted Linux host, or an already configured WSL guest meeting the
 [operator prerequisites](../OPERATOR_QUICKSTART.md). Use the accepted executable
 and a clean disposable target repository containing the committed fixtures,
