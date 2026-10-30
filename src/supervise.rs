@@ -329,6 +329,7 @@ mod environment_observation;
 mod outcome_history;
 mod prior_input;
 pub(crate) use prior_input::{FrozenOperatorPriorData, OperatorPriorDataGuard};
+pub(crate) mod grok_acp_qualification;
 mod runtime_executables;
 use outcome_history::*;
 pub use prior_input::{bind_frozen_operator_prior_data_for_run, bind_operator_prior_data};

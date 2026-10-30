@@ -3905,6 +3905,21 @@ impl ExternalAgentCommand {
             output: &self.output_last_message,
         };
         let contract = if grok_acp_stdio_protocol_selected(self) {
+            if self.model.as_deref() == Some("grok-4.7") {
+                let admitted = self.reasoning_effort.as_deref() == Some("xhigh")
+                    && self.agent_lifecycle.as_ref().is_some_and(|identity| {
+                        crate::supervise::grok_acp_qualification::admits_worker(
+                            &identity.registry_repo,
+                            &identity.run_id,
+                            &selected.assignment_id,
+                        )
+                    });
+                if !admitted {
+                    return Err(
+                        crate::supervise::grok_acp_qualification::QualificationRequired.into(),
+                    );
+                }
+            }
             config.grok_acp_runtime_contract(
                 &context,
                 &crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.required_environment(),
