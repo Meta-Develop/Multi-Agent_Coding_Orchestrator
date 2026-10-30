@@ -10338,6 +10338,7 @@ pub(super) mod tests {
             repetitions: 1,
             profiles: vec![
                 crate::evaluation::EvaluationProfile {
+                    worker_runtime: None,
                     id: "mix-a".to_string(),
                     role_models: BTreeMap::from([
                         (AgentRole::ChildOrchestrator, model("frontier-v1", "high")),
@@ -10345,6 +10346,7 @@ pub(super) mod tests {
                     ]),
                 },
                 crate::evaluation::EvaluationProfile {
+                    worker_runtime: None,
                     id: "mix-b".to_string(),
                     role_models: BTreeMap::from([
                         (AgentRole::ChildOrchestrator, model("frontier-v1", "high")),

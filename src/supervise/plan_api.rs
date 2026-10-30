@@ -4936,12 +4936,37 @@ pub(crate) fn materialize_held_out_profile_effective_caller_plan(
     materialize_held_out_profile_effective_caller_plan_in_repo(frozen, role_models, None)
 }
 
+#[cfg(test)]
 pub(crate) fn materialize_held_out_profile_effective_caller_plan_in_repo(
     frozen: &FrozenHeldOutProductionCallerPlan,
     role_models: &BTreeMap<AgentRole, RoleModelSelection>,
     repo: Option<&Path>,
 ) -> Result<Vec<u8>> {
+    materialize_held_out_profile_runtime_caller_plan_in_repo(frozen, role_models, None, repo)
+}
+
+/// The only runtime intervention is a single direct, non-delegating Worker.
+pub(crate) fn materialize_held_out_profile_runtime_caller_plan_in_repo(
+    frozen: &FrozenHeldOutProductionCallerPlan,
+    role_models: &BTreeMap<AgentRole, RoleModelSelection>,
+    worker_runtime: Option<SupervisorRuntime>,
+    repo: Option<&Path>,
+) -> Result<Vec<u8>> {
     let mut loaded = frozen.loaded.clone();
+    if let Some(runtime) = worker_runtime {
+        if !matches!(runtime, SupervisorRuntime::Codex | SupervisorRuntime::Grok) {
+            bail!("held-out worker_runtime supports only codex or grok");
+        }
+        let assignment = &mut loaded.plan.assignments[0];
+        if assignment.role != AgentRole::Worker
+            || assignment.phase != AssignmentPhase::Execution
+            || !assignment.worker_assignments.is_empty()
+            || assignment.category_is_operator_override()
+        {
+            bail!("worker_runtime requires one direct non-delegating execution Worker");
+        }
+        assignment.runtime = Some(runtime);
+    }
     loaded.plan.role_models = role_models.clone();
     for (role, selection) in &loaded.plan.role_models {
         selection.validate_model_fallback().with_context(|| {

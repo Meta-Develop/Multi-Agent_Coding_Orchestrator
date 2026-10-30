@@ -10,6 +10,14 @@ Worker, Codex supervision/control/review, 160,000 hard tokens, a 1,200-second
 child timeout, and zero retries or gate corrections. The seed tests deliberately
 fail until the actual assigned implementation is repaired.
 
+Under bundled priors, selection preflight refuses this fixture before provider
+release with `model_unavailable` for Worker `grok` / `grok-4.7` / `xhigh`:
+there is no bundled prior row for that task profile, even if the catalog
+advertises the model. Offline plan parsing does not establish selection
+eligibility. A live run requires an accepted evidence-backed `--prior-data`
+snapshot admitting the exact lane; the ACP qualification flag does not supply
+that evidence or override selection.
+
 Before release, retain non-secret evidence for the selected CAM `work2`
 principal/incarnation and selection revision, valid Codex control account,
 exact Grok executable/version/digest, current 4.7/xhigh catalog and available
