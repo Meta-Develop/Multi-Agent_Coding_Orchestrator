@@ -35,6 +35,12 @@ reviewable and recoverable:
 
 Operator command sequence for that host, including Codex and Grok: [operator quickstart](docs/OPERATOR_QUICKSTART.md).
 
+[Bounded qualification plans](docs/qualification/README.md) cover nested token
+control and supplied-source review. They request bundled-prior-compatible
+Codex efforts (`high` for the delegating parent and writable Workers, `xhigh`
+for Researcher and control roles). Offline plan validation does not establish live
+selection eligibility or account access.
+
 That Linux host also needs:
 
 - an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
