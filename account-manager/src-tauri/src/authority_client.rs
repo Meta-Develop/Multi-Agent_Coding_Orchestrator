@@ -644,13 +644,30 @@ fn next_request_id() -> String {
     format!("cam-desktop-{id}")
 }
 
+#[cfg(any(unix, test))]
+trait AuthorityStream: std::io::Read + std::io::Write {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()>;
+}
+
 #[cfg(unix)]
+impl AuthorityStream for std::os::unix::net::UnixStream {
+    fn set_read_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        Self::set_read_timeout(self, timeout)
+    }
+
+    fn set_write_timeout(&self, timeout: Option<std::time::Duration>) -> std::io::Result<()> {
+        Self::set_write_timeout(self, timeout)
+    }
+}
+
+#[cfg(any(unix, test))]
 fn write_framed(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut impl AuthorityStream,
     body: &[u8],
     deadline: std::time::Instant,
 ) -> Result<()> {
-    use std::io::Write;
+    // Install both finite timeouts before the peer can reply and close.
     apply_io_deadline(stream, deadline)?;
     stream
         .write_all(&(body.len() as u32).to_be_bytes())
@@ -661,14 +678,24 @@ fn write_framed(
     Ok(())
 }
 
-#[cfg(unix)]
+#[cfg(any(unix, test))]
 fn read_framed(
-    stream: &mut std::os::unix::net::UnixStream,
+    stream: &mut impl AuthorityStream,
     max_response_bytes: usize,
     deadline: std::time::Instant,
 ) -> Result<Vec<u8>> {
-    use std::io::Read;
-    apply_io_deadline(stream, deadline)?;
+    let remaining = remaining_io_time(deadline)?;
+    if let Err(error) = stream.set_read_timeout(Some(remaining)) {
+        // A finite read timeout is already installed before the request. On
+        // macOS a closed peer can make this refresh return EINVAL, even with a
+        // complete reply buffered. Retain the earlier bound and let read report
+        // the buffered reply or EOF. Other setup errors still fail closed.
+        if error.kind() != std::io::ErrorKind::InvalidInput {
+            return Err(authority_io_error(&format!(
+                "set authority read timeout: {error}"
+            )));
+        }
+    }
     let mut length_bytes = [0u8; 4];
     stream
         .read_exact(&mut length_bytes)
@@ -686,16 +713,9 @@ fn read_framed(
     Ok(body)
 }
 
-#[cfg(unix)]
-fn apply_io_deadline(
-    stream: &std::os::unix::net::UnixStream,
-    deadline: std::time::Instant,
-) -> Result<()> {
-    use std::time::Instant;
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    if remaining.is_zero() {
-        return Err(authority_io_error("authority request I/O deadline elapsed"));
-    }
+#[cfg(any(unix, test))]
+fn apply_io_deadline(stream: &impl AuthorityStream, deadline: std::time::Instant) -> Result<()> {
+    let remaining = remaining_io_time(deadline)?;
     stream
         .set_read_timeout(Some(remaining))
         .map_err(|error| authority_io_error(&format!("set authority read timeout: {error}")))?;
@@ -704,6 +724,19 @@ fn apply_io_deadline(
         .map_err(|error| authority_io_error(&format!("set authority write timeout: {error}")))?;
     Ok(())
 }
+
+#[cfg(any(unix, test))]
+fn remaining_io_time(deadline: std::time::Instant) -> Result<std::time::Duration> {
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    if remaining.is_zero() {
+        return Err(authority_io_error("authority request I/O deadline elapsed"));
+    }
+    Ok(remaining)
+}
+
+#[cfg(test)]
+#[path = "authority_client_transport_tests.rs"]
+mod transport_tests;
 
 fn decode_response(bytes: &[u8], request_id: &str) -> Result<AuthorityResponse> {
     if bytes.is_empty() || bytes.len() > MAX_RESPONSE_BYTES {
@@ -1720,6 +1753,7 @@ mod tests {
                 let server = thread::spawn(move || {
                     let (mut stream, _) = listener.accept().unwrap();
                     let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
+                    apply_io_deadline(&stream, deadline).unwrap();
                     let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
                     let request: Value = serde_json::from_slice(&request).unwrap();
                     assert_eq!(request["operation"], "selection.get");
@@ -1862,6 +1896,7 @@ mod tests {
                 let server = thread::spawn(move || {
                     let (mut stream, _) = listener.accept().unwrap();
                     let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
+                    apply_io_deadline(&stream, deadline).unwrap();
                     let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
                     crate::account_authority::decode_request(&request)
                         .expect("existing strict protocol accepts browserMode");
