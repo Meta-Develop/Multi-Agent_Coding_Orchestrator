@@ -9,6 +9,7 @@
 //! list or infer authority from a model name.
 
 use super::AdapterId;
+pub mod identity;
 #[cfg(target_os = "linux")]
 use crate::process_runner::run_process;
 use crate::{
@@ -703,14 +704,20 @@ impl GrokNativeUsage {
 
 /// Parent-capture observation, deliberately not Serde. The native cache buckets
 /// remain distinct; only the allocation consumed by the generic ledger combines
-/// them into input tokens. This does not attest a provider model, effort or cost.
+/// them into input tokens. Identity is projected separately from terminal
+/// modelUsage keys; neither requested effort nor cost is attested by counters.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct GrokNativeUsageObservation {
     native: GrokNativeUsage,
     terminal_complete: bool,
+    served_identity: identity::GrokServedIdentityEvidence,
 }
 
 impl GrokNativeUsageObservation {
+    pub(crate) fn served_identity(&self) -> &identity::GrokServedIdentityEvidence {
+        &self.served_identity
+    }
+
     pub(crate) fn allocation(&self) -> (crate::llm::provider::Usage, bool) {
         let native = &self.native;
         // u128 accommodates all four disjoint u64 counters without overflow.
@@ -779,6 +786,8 @@ pub(crate) fn observe_grok_native_usage(
         // placement, terminal metadata and all prefix/line limits.
         parse_grok_event_stream(&bytes[..end]).ok()?;
         let usage = raw.usage?;
+        let terminal_complete =
+            !raw_truncated && end == bytes.len() && raw.usage_is_incomplete != Some(true);
         return Some(GrokNativeUsageObservation {
             native: GrokNativeUsage {
                 input_tokens: usage.input_tokens,
@@ -788,9 +797,11 @@ pub(crate) fn observe_grok_native_usage(
                 reasoning_tokens: usage.reasoning_tokens,
                 total_tokens: usage.total_tokens,
             },
-            terminal_complete: !raw_truncated
-                && end == bytes.len()
-                && raw.usage_is_incomplete != Some(true),
+            terminal_complete,
+            served_identity: identity::GrokServedIdentityEvidence::from_terminal(
+                line,
+                terminal_complete,
+            ),
         });
     }
     None
@@ -821,7 +832,8 @@ impl GrokUsageStatus {
 /// Persisted Grok streaming-json spend observation on external run reports.
 ///
 /// This is not Codex JSONL `Usage`, not priced role economics, and does not
-/// carry identity, effort, or total cost.
+/// attest total cost. Native evidence retains the exact terminal model labels
+/// and explicitly unknown effort separately from the token counters.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum GrokStreamUsageEvidence {
@@ -833,6 +845,8 @@ pub enum GrokStreamUsageEvidence {
 /// Exact token buckets from Grok's native terminal `end.usage` object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GrokStreamUsageNativeEvidence {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub served_identity: Option<identity::GrokServedIdentityEvidence>,
     pub input_tokens: u64,
     pub output_tokens: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -851,6 +865,7 @@ impl GrokStreamUsageEvidence {
             GrokUsageStatus::NotProcessObservable => Self::NotProcessObservable,
             GrokUsageStatus::Incomplete => Self::Incomplete,
             GrokUsageStatus::Native(usage) => Self::Native(GrokStreamUsageNativeEvidence {
+                served_identity: None,
                 input_tokens: usage.input_tokens(),
                 output_tokens: usage.output_tokens(),
                 cache_read_input_tokens: usage.cache_read_input_tokens(),
@@ -937,6 +952,8 @@ struct RawGrokStreamEvent {
     usage: Option<RawGrokUsage>,
     #[serde(default, rename = "usage_is_incomplete")]
     usage_is_incomplete: Option<bool>,
+    // Project modelUsage independently: malformed identity must not erase an
+    // otherwise valid native token snapshot held for settlement.
     #[serde(flatten)]
     _other: BTreeMap<String, Value>,
 }

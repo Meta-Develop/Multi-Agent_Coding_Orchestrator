@@ -2796,6 +2796,12 @@ mod grok_stream_usage_evidence {
             output_last_message: None,
             grok_stream_usage_evidence: Some(GrokStreamUsageEvidence::Native(
                 GrokStreamUsageNativeEvidence {
+                    served_identity: Some(
+                        crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                            br#"{"modelUsage":{"grok-4.6-build":{}}}"#,
+                            true,
+                        ),
+                    ),
                     input_tokens: 3,
                     output_tokens: 1,
                     cache_read_input_tokens: None,

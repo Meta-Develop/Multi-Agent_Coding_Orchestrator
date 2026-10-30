@@ -9371,10 +9371,14 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
 
     let report = run_external_agent(&command);
     assert!(
-        report.error.is_none(),
-        "writable Grok production path failed: {:?}",
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("served model identity is missing")),
+        "bounded effects without served identity must refuse publication: {:?}",
         report.error
     );
+    assert!(!report.publishable);
     assert_eq!(report.exit_code, Some(0));
     assert!(!report.timed_out);
     assert!(report.stdout.target_launch_attempted);
@@ -9549,6 +9553,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             stdin_error: None,
         };
         let protected_controls = protected_worktree_controls(command)?;
+        report.retain_grok_native_usage_for_test(command, &output.stdout, true);
         record_completed_target(
             &mut report,
             output,
@@ -9666,6 +9671,10 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     )?;
     assert_eq!(decoded.id, "readme-worker");
     assert_eq!(decoded.files_changed, [PathBuf::from("README.md")]);
+    assert!(
+        !held.publishable,
+        "a valid report does not supply served identity"
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(
             &worker_command.output_last_message
@@ -9677,6 +9686,66 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         restored.output_last_message().is_none(),
         "wire output cannot mint held custody"
     );
+    // Retained CLI 1.0.60 terminal shape: exact modelUsage label, no effort.
+    // Exercise the real publication decision for an already admitted Worker
+    // and the stricter lower-effort qualification through the same path.
+    for (id, label, effort, publishable) in [
+        ("served-46", Some("grok-4.6-build"), "xhigh", true),
+        ("served-47", Some("grok-4.7-build"), "xhigh", false),
+        (
+            "served-unknown",
+            Some("grok-4.6-build-fast"),
+            "xhigh",
+            false,
+        ),
+        ("served-missing", None, "xhigh", false),
+        ("served-low", Some("grok-4.6-build"), "low", false),
+    ] {
+        let mut command = grok_command(id)
+            .with_workspace_access(WorkspaceAccess::ReadWrite)
+            .with_model_selection(Some("grok-4.6".into()), Some(effort.into()))
+            .with_agent_lifecycle(temp.path(), "worker", "run", "readme-worker");
+        command.output_schema = worker_command.output_schema.clone();
+        let mut terminal = serde_json::json!({"type":"end", "stopReason":"end_turn",
+            "sessionId":"s", "requestId":"r", "structuredOutput":worker,
+            "usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}});
+        if let Some(label) = label {
+            terminal["modelUsage"] = serde_json::json!({label: {}});
+        }
+        let report = finish(
+            id,
+            &command,
+            CapturedBytes::from_bytes_for_test((terminal.to_string() + "\n").into_bytes()),
+        )?;
+        assert_eq!(report.publishable, publishable, "{id}: {:?}", report.error);
+        assert_eq!(
+            report
+                .authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            12
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                report
+                    .output_last_message()
+                    .expect("held structured Worker report")
+            )?,
+            worker
+        );
+        let evidence = serde_json::to_value(&report.grok_stream_usage_evidence)?;
+        assert_eq!(
+            evidence["served_identity"]["observed_effort"],
+            serde_json::Value::Null
+        );
+        if let Some(label) = label {
+            assert_eq!(
+                evidence["served_identity"]["observed_models"],
+                serde_json::json!([label])
+            );
+        }
+    }
     let native_report = finish(
         "native",
         &grok_command("native"),
@@ -9686,6 +9755,12 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         native_report.grok_stream_usage_evidence,
         Some(GrokStreamUsageEvidence::Native(
             GrokStreamUsageNativeEvidence {
+                served_identity: Some(
+                    crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                        native_stdout.as_bytes(),
+                        true,
+                    ),
+                ),
                 input_tokens: 9,
                 output_tokens: 3,
                 cache_read_input_tokens: None,

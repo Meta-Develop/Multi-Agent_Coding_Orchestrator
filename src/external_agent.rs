@@ -90,6 +90,7 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 pub(crate) mod gemini_bridge;
+mod grok_identity;
 mod grok_output;
 mod grok_progress;
 mod grok_steering;
@@ -11193,7 +11194,17 @@ fn grok_bounded_stdout_usage_evidence(stdout: &CapturedBytes) -> GrokStreamUsage
         return GrokStreamUsageEvidence::NotProcessObservable;
     }
     match crate::runtime_adapter::grok::parse_grok_event_stream(stdout.as_bytes()) {
-        Ok(stream) => GrokStreamUsageEvidence::from_usage_status(stream.usage_status()),
+        Ok(stream) => {
+            let mut evidence = GrokStreamUsageEvidence::from_usage_status(stream.usage_status());
+            if let GrokStreamUsageEvidence::Native(native) = &mut evidence {
+                native.served_identity = crate::runtime_adapter::grok::observe_grok_native_usage(
+                    stdout.as_bytes(),
+                    false,
+                )
+                .map(|observation| observation.served_identity().clone());
+            }
+            evidence
+        }
         Err(_) => GrokStreamUsageEvidence::NotProcessObservable,
     }
 }
@@ -11710,6 +11721,11 @@ fn record_completed_target(
             report.cursor_managed_parent_evidence.as_ref(),
         ) {
             report.error = append_external_error(report.error.take(), Some(message));
+        }
+    }
+    if context.runtime == ExternalExecutionRuntime::Verified {
+        if let Some(message) = grok_identity::publication_refusal(context.original_spec, report) {
+            report.error = append_external_error(report.error.take(), Some(message.to_string()));
         }
     }
     let adapter_runtime = context.spec.invocation.is_adapter_subprocess();
