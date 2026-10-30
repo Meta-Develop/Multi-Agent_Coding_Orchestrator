@@ -3905,6 +3905,21 @@ impl ExternalAgentCommand {
             output: &self.output_last_message,
         };
         let contract = if grok_acp_stdio_protocol_selected(self) {
+            if self.model.as_deref() == Some("grok-4.7") {
+                let admitted = self.reasoning_effort.as_deref() == Some("xhigh")
+                    && self.agent_lifecycle.as_ref().is_some_and(|identity| {
+                        crate::supervise::grok_acp_qualification::admits_worker(
+                            &identity.registry_repo,
+                            &identity.run_id,
+                            &selected.assignment_id,
+                        )
+                    });
+                if !admitted {
+                    return Err(
+                        crate::supervise::grok_acp_qualification::QualificationRequired.into(),
+                    );
+                }
+            }
             config.grok_acp_runtime_contract(
                 &context,
                 &crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.required_environment(),
@@ -11771,6 +11786,30 @@ fn cursor_managed_publication_refusal(
             "managed Cursor writable run did not prove an assigned write and parent-owned offline check"
                 .to_string(),
         );
+    }
+    // Identity is mandatory even when the caller omitted its selection. The
+    // pinned stream's token counters do not attest to a served model or effort.
+    if evidence
+        .actual_provider_model
+        .as_ref()
+        .is_none_or(|model| model.trim().is_empty())
+        || evidence
+            .actual_effort
+            .as_ref()
+            .is_none_or(|effort| effort.trim().is_empty())
+    {
+        return Some("managed Cursor served model or effort evidence is missing".to_string());
+    }
+    if spec
+        .model
+        .as_ref()
+        .is_none_or(|model| model.trim().is_empty())
+        || spec
+            .reasoning_effort
+            .as_ref()
+            .is_none_or(|effort| effort.trim().is_empty())
+    {
+        return Some("managed Cursor selected model or effort is missing".to_string());
     }
     if spec
         .model

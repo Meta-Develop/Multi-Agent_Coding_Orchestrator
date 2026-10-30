@@ -1326,6 +1326,26 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     .transpose()?
             };
             let supplied_runtime_bin = args.runtime_bin.clone();
+            let _grok_acp_qualification = if args.qualify_grok47_acp {
+                if resume_existing || goal_spec.is_some() || normal_document.is_some() {
+                    bail!("--qualify-grok47-acp requires a fresh explicit supervisor plan");
+                }
+                if crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(
+                    supervise::SupervisorRuntime::Grok,
+                )?
+                .grok_interaction_protocol()
+                    != crate::runtime_adapter::GrokInteractionProtocol::AcpStdio
+                {
+                    bail!("--qualify-grok47-acp requires MACO_GROK_INTERACTION_PROTOCOL=acp_stdio");
+                }
+                Some(supervise::grok_acp_qualification::bind_operator_run(
+                    &resolved_repo,
+                    resolved_run_id.as_str(),
+                    runtime,
+                )?)
+            } else {
+                None
+            };
             let mut options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -1867,6 +1887,10 @@ fn validate_supervise_only_runtime(
 
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
+    /// Qualification only: permit one bounded grok-4.7/xhigh ACP Worker under Codex control.
+    /// Recorded in run evidence; does not bypass account, prior, containment or publication gates.
+    #[arg(long, requires_all = ["runtime", "run_id"], conflicts_with_all = ["from_goal", "literal_goal", "allow_primary_worktree"])]
+    qualify_grok47_acp: bool,
     /// JSON supervisor plan file to run.
     #[arg(
         value_name = "SUPERVISOR_PLAN",
@@ -6007,6 +6031,30 @@ mod cli_integration_tests {
         "--machine-global-runtime-root-id",
         "runtime",
     ];
+
+    #[test]
+    fn supervise_grok47_acp_qualification_is_explicit_cli_only() {
+        let mut argv = vec![
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--runtime",
+            "codex",
+            "--run-id",
+            "qualification-01",
+        ];
+        argv.extend(LAUNCH_RETENTION);
+        assert!(!supervise_run_args(&argv).qualify_grok47_acp);
+        argv.push("--qualify-grok47-acp");
+        assert!(supervise_run_args(&argv).qualify_grok47_acp);
+        let no_run_id: Vec<_> = argv
+            .iter()
+            .copied()
+            .filter(|arg| !matches!(*arg, "--run-id" | "qualification-01"))
+            .collect();
+        assert!(Cli::try_parse_from(no_run_id).is_err());
+    }
 
     #[test]
     fn supervise_run_parses_explicit_runtime_overrides_for_literal_and_goal_sources() {

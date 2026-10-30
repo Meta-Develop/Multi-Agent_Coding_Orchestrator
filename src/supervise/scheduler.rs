@@ -3977,6 +3977,13 @@ fn prepare_supervisor_run(
         .map(|pricing| pricing.bind(options.run_id.as_str()))
         .transpose()?;
     plan_metadata.run_budget.limits = budget_ledger.effective_limits();
+    super::grok_acp_qualification::archive_and_admit(
+        &mut artifact_writer,
+        &repo,
+        options,
+        &plan,
+        &plan_metadata.run_budget,
+    )?;
     let quota_context = live_quota_context_for_run(&repo)?;
     if quota_context.is_some() && runtime == SupervisorRuntime::Fake {
         bail!("operator quota config is not valid for the nonpublishable Fake supervisor runtime");

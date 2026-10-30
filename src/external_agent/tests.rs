@@ -7205,11 +7205,45 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
     };
     assert_eq!(
         cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
-        Some("managed Cursor observed model or effort does not match the selected launch")
+        Some("managed Cursor served model or effort evidence is missing")
     );
     evidence.actual_provider_model = command.model.clone();
     evidence.actual_effort = command.reasoning_effort.clone();
     assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_none());
+    for (model, effort) in [
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+        (Some("another-model"), Some("high")),
+        (Some("cursor-selected-model"), Some("low")),
+    ] {
+        evidence.actual_provider_model = model.map(str::to_string);
+        evidence.actual_effort = effort.map(str::to_string);
+        assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_some());
+    }
+    evidence.actual_provider_model = command.model.clone();
+    evidence.actual_effort = command.reasoning_effort.clone();
+    for (model, effort) in [
+        (None, None),
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+    ] {
+        command.model = model.map(str::to_string);
+        command.reasoning_effort = effort.map(str::to_string);
+        assert_eq!(
+            cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+            Some("managed Cursor selected model or effort is missing")
+        );
+    }
+    evidence.actual_provider_model = None;
+    evidence.actual_effort = None;
+    assert_eq!(
+        cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+        Some("managed Cursor served model or effort evidence is missing")
+    );
     Ok(())
 }
 
@@ -8850,16 +8884,90 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
     .with_workspace_access(WorkspaceAccess::ReadWrite)
     .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
     acp.output_schema = Some(schema);
+    acp = acp.with_agent_lifecycle(temp.path(), "worker", "grok47-acp-gate", "grok-worker");
     let acp = acp
         .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
         .with_worktree_writable_confinement(writable_grok_confinement(
             SideEffectConfinement::Verified,
         ));
+    let refusal = acp.current_grok_writable_contract().unwrap_err();
+    assert!(refusal.is::<crate::supervise::grok_acp_qualification::QualificationRequired>());
+    assert!(refusal.to_string().contains("--qualify-grok47-acp"));
+    assert!(acp.verified_writable_capabilities(RuntimeId::Grok).is_err());
+    // The legacy 4.6 ACP contract does not require the 4.7 exception.
+    let legacy = acp
+        .clone()
+        .with_model_selection(Some("grok-4.6".into()), Some("xhigh".into()))
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?;
+    assert_eq!(
+        legacy.current_grok_writable_contract()?.runtime(),
+        TypedRuntime::GrokAcpStdio
+    );
+    let _qualification = crate::supervise::grok_acp_qualification::admit_for_test(
+        temp.path(),
+        "grok47-acp-gate",
+        "grok-worker",
+    );
     let acp_contract = acp.current_grok_writable_contract()?;
     assert_eq!(acp_contract.runtime(), TypedRuntime::GrokAcpStdio);
     assert!(acp
         .verified_writable_capabilities(RuntimeId::Grok)?
         .admits_worktree_writable());
+    assert!(acp
+        .verify_grok_run_account_binding("grok47-acp-gate")
+        .is_err());
+    let mut stale = acp.clone();
+    stale.model = Some("grok-4.6".into());
+    assert!(stale.current_grok_writable_contract().is_err());
+    let mut unbound = acp.clone();
+    unbound.worktree_writable_confinement = None;
+    assert!(unbound
+        .verified_writable_capabilities(RuntimeId::Grok)
+        .is_err());
+    let wrong_run =
+        acp.clone()
+            .with_agent_lifecycle(temp.path(), "worker", "other-run", "grok-worker");
+    assert!(wrong_run.current_grok_writable_contract().is_err());
+    let bound_schema = bind_grok_acp_launch_schema(&acp)?.expect("launch schema");
+    let valid = fixture_acp_parent_evidence(
+        "grok-4.7",
+        "xhigh",
+        Some("grok-4.7"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    assert!(grok_acp_staged_output_bytes(&acp, &valid, true, Some(&bound_schema)).is_ok());
+    assert!(grok_acp_staged_output_bytes(&acp, &valid, true, None).is_err());
+    let invalid_schema = fixture_acp_parent_evidence(
+        "grok-4.7",
+        "xhigh",
+        Some("grok-4.7"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": "wrong type"})),
+        None,
+    );
+    assert!(
+        grok_acp_staged_output_bytes(&acp, &invalid_schema, true, Some(&bound_schema)).is_err()
+    );
+    for (model, effort) in [
+        (Some("grok-4.6"), Some("xhigh")),
+        (Some("grok-4.7"), Some("low")),
+        (None, None),
+    ] {
+        let mismatched = fixture_acp_parent_evidence(
+            "grok-4.7",
+            "xhigh",
+            model,
+            effort,
+            "complete",
+            Some(serde_json::json!({"accepted": true})),
+            None,
+        );
+        assert!(grok_acp_parent_identity_publication_refusal(&acp, Some(&mismatched)).is_some());
+    }
     // Selected ACP admission never grants the generic headless proof.
     assert!(acp
         .runtime_adapter
