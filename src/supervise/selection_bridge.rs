@@ -4945,6 +4945,7 @@ pub(super) mod tests {
     use super::super::environment_observation::environment_cost_microunits_from_account_observe;
     use super::*;
     include!("assignment_selection_tests.rs");
+    include!("qualification_selection_tests.rs");
     #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,
