@@ -916,7 +916,11 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         semantic_block_gate: None,
         artifacts: &artifacts,
         budget_ledger: &ledger,
-        budget_policy: AssignmentBudgetPolicy::default(),
+        budget_policy: {
+            let mut policy = AssignmentBudgetPolicy::default();
+            policy.worker_dispatch_limit = if isolated { 2 } else { 1 };
+            policy
+        },
         admission_commit: None,
         runtime_model_catalog: &catalog,
         cancellation: cancellation.clone(),

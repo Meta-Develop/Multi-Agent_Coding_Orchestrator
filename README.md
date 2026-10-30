@@ -3948,6 +3948,10 @@ operator-supplied quota data. Host available/per-child inputs can likewise be
 specified in a plan's `concurrency` object or with the corresponding
 `--host-*-available-*` and `--host-*-per-child-*` flags. Missing host observations
 fall back conservatively to one child. Zero inputs are rejected before dispatch.
+Isolated nested Workers inherit the effective concurrency bound, including
+provider in-flight and host limits. At width one, they run in authored order
+through settlement. Observed budget exhaustion records typed admission refusals
+for queued Workers without another provider invocation.
 `max_child_assignments` separately bounds plan fan-out; it is not the concurrency
 limit.
 
