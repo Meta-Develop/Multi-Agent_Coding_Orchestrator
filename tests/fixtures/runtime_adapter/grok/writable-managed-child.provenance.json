@@ -25,5 +25,5 @@
     "--no-leader"
   ],
   "redactions": "none",
-  "scope_note": "Hermetic Grok-compatible streaming-json fixture for a schema-bound managed-child write. Not a live capture. Native end.usage fields are exact Grok spend keys, not Codex turn.completed events."
+  "scope_note": "Hermetic Grok-compatible streaming-json fixture for a schema-bound managed-child write. Not a live capture. Native end.usage fields are exact Grok spend keys, not Codex turn.completed events. The end.modelUsage label and field names follow headless-cli-1.0.60-identity.json; token counts are synthetic and served effort remains unobserved. No cost is asserted."
 }

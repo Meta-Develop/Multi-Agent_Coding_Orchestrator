@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(unix)]
+#[path = "tests/claude_identity.rs"]
+pub(crate) mod claude_identity;
+
 thread_local! {
     static GROK_PREFLIGHT_HOOK: std::cell::RefCell<Option<Box<dyn FnOnce()>>> = const { std::cell::RefCell::new(None) };
 }
@@ -8587,7 +8591,7 @@ fn writable_claude_qualification_is_invocation_bound_and_refuses_drift_and_prima
 }
 
 #[test]
-fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_does_not_deserialize(
+fn claude_native_capture_extracts_only_terminal_result_and_private_evidence_does_not_deserialize(
 ) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let _identity = inject_admitted_claude_identity_for_test();
@@ -8613,9 +8617,80 @@ fn claude_native_capture_publishes_only_terminal_result_and_private_evidence_doe
     );
     run.stdout.run_metadata.claude_native_evidence = Some(evidence);
     assert_eq!(run.authenticated_claude_model(), Some("claude-sonnet-4-6"));
+    assert_eq!(run.authenticated_claude_effort(), None);
+    assert_eq!(
+        claude_native_identity_publication_refusal(
+            &command,
+            run.authenticated_claude_native_evidence()
+        ),
+        Some("Claude served effort is unknown in the pinned native stream")
+    );
     let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
     assert!(restored.authenticated_claude_native_evidence().is_none());
     assert!(restored.authenticated_claude_usage().is_none());
+    assert!(restored.authenticated_claude_effort().is_none());
+    Ok(())
+}
+
+#[test]
+fn claude_native_publication_refuses_missing_mismatched_and_unknown_identity() -> Result<()> {
+    let command = ExternalAgentCommand::codex(
+        "claude",
+        ".",
+        "prompt",
+        "events",
+        "output",
+        Duration::from_secs(30),
+    )
+    .with_model_selection(
+        Some("claude-sonnet-4-6".to_string()),
+        Some("high".to_string()),
+    );
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, None),
+        Some("Claude native served-identity evidence is missing")
+    );
+    let mut events = String::from_utf8(exact_claude_native_stream())?
+        .lines()
+        .map(serde_json::from_str::<serde_json::Value>)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    // Init/configuration claims cannot replace the API's response model.
+    events[0]["model"] = serde_json::json!("claude-sonnet-4-6");
+    events[1]["event"]["message"]
+        .as_object_mut()
+        .unwrap()
+        .remove("model");
+    let missing_stream = events
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let missing =
+        crate::runtime_adapter::claude::collect_native_stream(missing_stream.as_bytes(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&missing)),
+        Some("Claude served model is missing or conflicting")
+    );
+    let mismatch_stream = String::from_utf8(exact_claude_native_stream())?
+        .replace("claude-sonnet-4-6", "claude-sonnet-4-5");
+    let mismatch =
+        crate::runtime_adapter::claude::collect_native_stream(mismatch_stream.as_bytes(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&mismatch)),
+        Some("Claude served model does not match the requested model")
+    );
+    let mut evidence =
+        crate::runtime_adapter::claude::collect_native_stream(&exact_claude_native_stream(), false);
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&evidence)),
+        Some("Claude served effort is unknown in the pinned native stream")
+    );
+    // Synthetic matcher coverage; the pinned collector never produces observed effort.
+    evidence.observed_effort = Some("low".to_string());
+    assert_eq!(
+        claude_native_identity_publication_refusal(&command, Some(&evidence)),
+        Some("Claude served effort does not match the requested effort")
+    );
     Ok(())
 }
 
@@ -9071,7 +9146,7 @@ fn writable_grok_selected_request_has_only_the_bounded_worktree_effect_and_resul
 printf '%s\n' "$@" > selected-request.txt
 printf 'bounded worktree effect\n' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"bounded result"}'
-printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","modelUsage":{"grok-4.6-build":{"inputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"outputTokens":4,"modelCalls":1}},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
 "#,
     )?;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
@@ -9342,7 +9417,7 @@ printf '%s\n' 'request-begin' "$no_auto_update" "$@" 'request-end' >&2
 printf '%s\n' 'approval-contract:inner-sandbox=off;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
-printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"modelUsage":{"grok-4.6-build":{"inputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"outputTokens":4,"modelCalls":1}},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
 "#,
     )?;
     let hidden_auth = grok_home
@@ -9478,11 +9553,8 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     expected_stderr.push(APPROVAL_RECORD.to_string());
 
     let report = run_external_agent(&command);
-    assert!(
-        report.error.is_none(),
-        "writable Grok production path failed: {:?}",
-        report.error
-    );
+    assert_eq!(report.error, None);
+    assert!(report.publishable);
     assert_eq!(report.exit_code, Some(0));
     assert!(!report.timed_out);
     assert!(report.stdout.target_launch_attempted);
@@ -9657,6 +9729,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             stdin_error: None,
         };
         let protected_controls = protected_worktree_controls(command)?;
+        report.retain_grok_native_usage_for_test(command, &output.stdout, true);
         record_completed_target(
             &mut report,
             output,
@@ -9774,6 +9847,10 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     )?;
     assert_eq!(decoded.id, "readme-worker");
     assert_eq!(decoded.files_changed, [PathBuf::from("README.md")]);
+    assert!(
+        !held.publishable,
+        "a valid report does not supply served identity"
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(
             &worker_command.output_last_message
@@ -9785,6 +9862,66 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         restored.output_last_message().is_none(),
         "wire output cannot mint held custody"
     );
+    // Retained CLI 1.0.60 terminal shape: exact modelUsage label, no effort.
+    // Exercise the real publication decision for an already admitted Worker
+    // and the stricter lower-effort qualification through the same path.
+    for (id, label, effort, publishable) in [
+        ("served-46", Some("grok-4.6-build"), "xhigh", true),
+        ("served-47", Some("grok-4.7-build"), "xhigh", false),
+        (
+            "served-unknown",
+            Some("grok-4.6-build-fast"),
+            "xhigh",
+            false,
+        ),
+        ("served-missing", None, "xhigh", false),
+        ("served-low", Some("grok-4.6-build"), "low", false),
+    ] {
+        let mut command = grok_command(id)
+            .with_workspace_access(WorkspaceAccess::ReadWrite)
+            .with_model_selection(Some("grok-4.6".into()), Some(effort.into()))
+            .with_agent_lifecycle(temp.path(), "worker", "run", "readme-worker");
+        command.output_schema = worker_command.output_schema.clone();
+        let mut terminal = serde_json::json!({"type":"end", "stopReason":"end_turn",
+            "sessionId":"s", "requestId":"r", "structuredOutput":worker,
+            "usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}});
+        if let Some(label) = label {
+            terminal["modelUsage"] = serde_json::json!({label: {}});
+        }
+        let report = finish(
+            id,
+            &command,
+            CapturedBytes::from_bytes_for_test((terminal.to_string() + "\n").into_bytes()),
+        )?;
+        assert_eq!(report.publishable, publishable, "{id}: {:?}", report.error);
+        assert_eq!(
+            report
+                .authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            12
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                report
+                    .output_last_message()
+                    .expect("held structured Worker report")
+            )?,
+            worker
+        );
+        let evidence = serde_json::to_value(&report.grok_stream_usage_evidence)?;
+        assert_eq!(
+            evidence["served_identity"]["observed_effort"],
+            serde_json::Value::Null
+        );
+        if let Some(label) = label {
+            assert_eq!(
+                evidence["served_identity"]["observed_models"],
+                serde_json::json!([label])
+            );
+        }
+    }
     let native_report = finish(
         "native",
         &grok_command("native"),
@@ -9794,6 +9931,12 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         native_report.grok_stream_usage_evidence,
         Some(GrokStreamUsageEvidence::Native(
             GrokStreamUsageNativeEvidence {
+                served_identity: Some(
+                    crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                        native_stdout.as_bytes(),
+                        true,
+                    ),
+                ),
                 input_tokens: 9,
                 output_tokens: 3,
                 cache_read_input_tokens: None,

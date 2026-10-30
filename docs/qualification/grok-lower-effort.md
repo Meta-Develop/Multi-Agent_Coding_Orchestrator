@@ -24,6 +24,43 @@ returns the typed refusal `effort_incompatible` for this Worker: `low` is
 absent from its prior-backed effort menu. The providerless qualification
 regression preserves this refusal; it supplies no account support evidence.
 
+The retained Grok CLI 1.0.60 streaming-json terminal exposes model labels as
+`end.modelUsage` object keys. Its label `grok-4.6-build` is preserved verbatim.
+The protocol exposes no served-effort field. Native usage evidence therefore records
+`served_identity.observed_effort: null` explicitly. Model suffixes, the requested
+`--reasoning-effort`, configuration and text/tool content cannot fill that gap.
+The field-name-only [receipt projection](../../tests/fixtures/runtime_adapter/grok/headless-cli-1.0.60-identity.json)
+pins this observation without retaining conversation content.
+
+Model matching uses only two explicit label pairs: `grok-4.6` / `grok-4.6-build`
+and `grok-4.7` / `grok-4.7-build`. The first is backed by the retained accepted
+`e2e-mixed-main-ba41-c30b` headless Worker log (SHA-256
+`ef06c217147682fb3e1d8e29bc4c511b8bd401fb29c916cde06c0f6af8d5a3a2`).
+The second is backed by the [#616 CLI 1.0.41 native headless receipt](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/616#issuecomment-5827977323):
+request `grok-4.7`, terminal `modelUsage` key `grok-4.7-build`.
+These mappings establish label compatibility only, without pricing, billing,
+effort or ACP qualification claims. Unknown labels never match; no suffix or
+prefix rule applies. Multiple labels, including both members of a known pair,
+remain ambiguous.
+
+Managed headless **writable publication** requires original parent-held complete
+native usage and one complete, valid model label matching the admitted command
+on every turn. Missing model labels refuse publication because the retained CLI
+normally emits them; this preserves the accepted c30b terminal shape. Duplicate,
+ambiguous, malformed or mismatched identity also refuses publication while native
+token charges remain available. Observed effort must be canonical and match.
+
+The existing standard `grok-4.6` / `xhigh` and `grok-4.7` / `xhigh` headless lanes
+keep publication when served effort is explicitly unknown. This preserves their
+existing admission; it does not claim that requested effort was observed. Every
+qualification-only model/effort lane, including #688 `low`, requires **both**
+matching observed model and effort. CLI 1.0.60 cannot pass that strict gate until
+a source-qualified served-effort observation is available. This identity policy
+adds no selection eligibility or priors. Public or restored identity fields cannot
+recreate the private capture. Prior admission and selected-account live acceptance
+remain separate gates; do not launch the lower-effort qualification while its
+served effort is unknown.
+
 Offline validation (does not evaluate those account/prior gates):
 
 ```bash

@@ -2420,6 +2420,40 @@
                       "null"
                     ]
                   },
+                  "served_identity": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "model_observation_complete": {
+                        "type": "boolean"
+                      },
+                      "observed_effort": {
+                        "type": [
+                          "string",
+                          "null"
+                        ]
+                      },
+                      "observed_models": {
+                        "items": {
+                          "type": "string"
+                        },
+                        "type": "array"
+                      },
+                      "source": {
+                        "const": "streaming_json_end_model_usage_keys",
+                        "type": "string"
+                      }
+                    },
+                    "required": [
+                      "source",
+                      "observed_models",
+                      "observed_effort",
+                      "model_observation_complete"
+                    ],
+                    "type": [
+                      "object",
+                      "null"
+                    ]
+                  },
                   "status": {
                     "const": "native",
                     "type": "string"
@@ -7669,6 +7703,40 @@
                                   "null"
                                 ]
                               },
+                              "served_identity": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "model_observation_complete": {
+                                    "type": "boolean"
+                                  },
+                                  "observed_effort": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "observed_models": {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "source": {
+                                    "const": "streaming_json_end_model_usage_keys",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "source",
+                                  "observed_models",
+                                  "observed_effort",
+                                  "model_observation_complete"
+                                ],
+                                "type": [
+                                  "object",
+                                  "null"
+                                ]
+                              },
                               "status": {
                                 "const": "native",
                                 "type": "string"
@@ -9464,6 +9532,40 @@
                           "minimum": 0,
                           "type": [
                             "integer",
+                            "null"
+                          ]
+                        },
+                        "served_identity": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "model_observation_complete": {
+                              "type": "boolean"
+                            },
+                            "observed_effort": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "observed_models": {
+                              "items": {
+                                "type": "string"
+                              },
+                              "type": "array"
+                            },
+                            "source": {
+                              "const": "streaming_json_end_model_usage_keys",
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "source",
+                            "observed_models",
+                            "observed_effort",
+                            "model_observation_complete"
+                          ],
+                          "type": [
+                            "object",
                             "null"
                           ]
                         },
@@ -14941,6 +15043,40 @@
                                 "minimum": 0,
                                 "type": [
                                   "integer",
+                                  "null"
+                                ]
+                              },
+                              "served_identity": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "model_observation_complete": {
+                                    "type": "boolean"
+                                  },
+                                  "observed_effort": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "observed_models": {
+                                    "items": {
+                                      "type": "string"
+                                    },
+                                    "type": "array"
+                                  },
+                                  "source": {
+                                    "const": "streaming_json_end_model_usage_keys",
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "source",
+                                  "observed_models",
+                                  "observed_effort",
+                                  "model_observation_complete"
+                                ],
+                                "type": [
+                                  "object",
                                   "null"
                                 ]
                               },

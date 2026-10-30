@@ -4166,6 +4166,17 @@ fn grok_stream_usage_evidence_schema_value() -> serde_json::Value {
                 "required": ["status", "input_tokens", "output_tokens"],
                 "properties": {
                     "status": {"const": "native", "type": "string"},
+                    "served_identity": {
+                        "type": ["object", "null"],
+                        "additionalProperties": false,
+                        "required": ["source", "observed_models", "observed_effort", "model_observation_complete"],
+                        "properties": {
+                            "source": {"const": "streaming_json_end_model_usage_keys", "type": "string"},
+                            "observed_models": {"type": "array", "items": {"type": "string"}},
+                            "observed_effort": {"type": ["string", "null"]},
+                            "model_observation_complete": {"type": "boolean"}
+                        }
+                    },
                     "input_tokens": {"type": "integer", "minimum": 0},
                     "output_tokens": {"type": "integer", "minimum": 0},
                     "cache_read_input_tokens": {"type": ["integer", "null"], "minimum": 0},
@@ -5785,6 +5796,12 @@ mod selection_schema_tests {
             (
                 "native",
                 GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+                    served_identity: Some(
+                        crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                            br#"{"modelUsage":{"grok-4.6-build":{}}}"#,
+                            true,
+                        ),
+                    ),
                     input_tokens: 4,
                     output_tokens: 2,
                     cache_read_input_tokens: Some(1),
@@ -5812,6 +5829,18 @@ mod selection_schema_tests {
         schemas
             .validate(&unknown_field, index)
             .expect_err("extra grok_stream_usage_evidence field must be rejected");
+
+        let mut unknown_identity_field = base.clone();
+        unknown_identity_field["grok_stream_usage_evidence"] = json!({
+            "status": "native", "input_tokens": 1, "output_tokens": 1,
+            "served_identity": {
+                "source": "streaming_json_end_model_usage_keys", "observed_models": ["grok-4.6-build"],
+                "observed_effort": null, "model_observation_complete": true, "forged_extra_field": true
+            }
+        });
+        schemas
+            .validate(&unknown_identity_field, index)
+            .expect_err("extra served identity field must be rejected");
 
         let mut negative_tokens = base.clone();
         negative_tokens["grok_stream_usage_evidence"] = json!({

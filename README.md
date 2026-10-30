@@ -1734,8 +1734,14 @@ parent session evidence after `session/set_model`, not backend attestation.
 Writable managed-child launch retains the legacy exact typed contract for
 `grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
 supported only with `headless_streaming_json`. The Issue #604 publication gate
-is implemented. Grok 4.7 ACP writable admission stays off pending Linux
-credential-confined, account-bound managed acceptance in Issue #616, returning
+is implemented. Headless writable publication retains exact `end.modelUsage`
+labels and checks them using receipt-backed 4.6/4.7 label mappings. CLI 1.0.60
+exposes no served effort: the existing standard `xhigh` lanes preserve publication
+with explicitly unknown effort, while observed contradictions refuse publication.
+The [#688 lower-effort identity gate](docs/qualification/grok-lower-effort.md)
+requires observed effort and remains closed. Grok 4.7 ACP writable admission
+stays off pending Linux credential-confined, account-bound managed acceptance
+in Issue #616, returning
 `writable_grok47_acp_qualification_required`. The sole exception is an explicit
 operator `supervise run --qualify-grok47-acp` on a fresh Codex-supervised run:
 one 4.7/xhigh terminal Worker, at most 160,000 hard tokens, a 1,200-second child

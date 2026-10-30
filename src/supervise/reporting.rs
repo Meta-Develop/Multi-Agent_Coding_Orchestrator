@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(all(test, unix))]
+#[path = "claude_identity_tests.rs"]
+mod claude_identity_tests;
+
 #[path = "journal_observation.rs"]
 mod journal_observation;
 #[cfg(test)]
@@ -2200,6 +2204,7 @@ pub(super) fn external_process_completed(
         && (runtime != SupervisorRuntime::ClaudeCode
             || (run.authenticated_claude_usage_complete()
                 && run.authenticated_claude_model().is_some()
+                && run.claude_managed_effort_qualified()
                 && !run.stdout.raw_capture_truncated()))
         && (runtime != SupervisorRuntime::Cursor
             || cursor_managed_usage(run).is_some_and(|(_, complete)| complete))
@@ -2824,6 +2829,12 @@ mod grok_stream_usage_evidence {
             output_last_message: None,
             grok_stream_usage_evidence: Some(GrokStreamUsageEvidence::Native(
                 GrokStreamUsageNativeEvidence {
+                    served_identity: Some(
+                        crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                            br#"{"modelUsage":{"grok-4.6-build":{}}}"#,
+                            true,
+                        ),
+                    ),
                     input_tokens: 3,
                     output_tokens: 1,
                     cache_read_input_tokens: None,
