@@ -3421,6 +3421,7 @@ fn forged_grok_native_command_record() -> CommandRunRecord {
     let mut record = injected_command_record();
     record.grok_stream_usage_evidence = Some(GrokStreamUsageEvidence::Native(
         GrokStreamUsageNativeEvidence {
+            served_identity: None,
             input_tokens: 99,
             output_tokens: 1,
             cache_read_input_tokens: None,
@@ -3725,6 +3726,7 @@ fn collect_child_report_preserves_parent_grok_evidence_when_child_report_missing
     use crate::runtime_adapter::grok::{GrokStreamUsageEvidence, GrokStreamUsageNativeEvidence};
 
     let parent_evidence = GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+        served_identity: None,
         input_tokens: 7,
         output_tokens: 2,
         cache_read_input_tokens: None,
@@ -3866,6 +3868,7 @@ fn collect_parent_auditor_report_rejects_self_asserted_grok_but_retains_parent_p
     write_injected_json(&command.output_last_message, &auditor);
     let mut external_run = injected_verified_run(&command);
     let parent_evidence = GrokStreamUsageEvidence::Native(GrokStreamUsageNativeEvidence {
+        served_identity: None,
         input_tokens: 7,
         output_tokens: 2,
         cache_read_input_tokens: None,

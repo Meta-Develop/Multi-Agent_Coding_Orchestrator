@@ -473,6 +473,17 @@ a clean target repository; the plan copy requires no target-repository change.
 
 ## Troubleshooting
 
+Managed headless Grok writable publication checks exact `end.modelUsage` keys
+against the admitted model using the explicit receipt-backed mappings
+`grok-4.6` / `grok-4.6-build` and `grok-4.7` / `grok-4.7-build`.
+Missing, ambiguous, malformed or mismatched model identity refuses publication.
+CLI 1.0.60 supplies no served effort; it stays explicitly unknown and preserves
+publication for the existing standard 4.6/4.7 `xhigh` lanes. An observed effort
+contradiction still refuses publication. Lower-effort and future qualification-only
+lanes require matching observed effort and remain closed with this CLI.
+Native token charges survive identity refusal. See the
+[identity qualification gate and mapping receipts](qualification/grok-lower-effort.md).
+
 If selection reports that required model `gpt-6.1-sol` is absent or unavailable,
 check `codex --version` at the canonical trusted executable, install at least
 0.162.0, validate the selected account, and rerun `codex debug models`.
