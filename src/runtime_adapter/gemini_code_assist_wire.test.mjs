@@ -11,7 +11,7 @@ const envelope = (total = 17, extra = {}) => ({
   response: {
     candidates: [{ content: { parts: [{ text: "Substantive fixture response" }] }, finishReason: "STOP" }],
     modelVersion: "gemini-2.5-pro",
-    usageMetadata: { promptTokenCount: 10, candidatesTokenCount: total - 12, thoughtsTokenCount: 2, totalTokenCount: total, cachedContentTokenCount: 4 },
+    usageMetadata: { promptTokenCount: 10, candidatesTokenCount: total - 12, thoughtsTokenCount: 2, totalTokenCount: total, cachedContentTokenCount: 4, toolUsePromptTokenCount: 0 },
     ...extra,
   },
 });
@@ -95,6 +95,7 @@ test("bounded SSE decodes split UTF-8 and CRLF; overlapping usage is not added",
   assert.equal(observed.usage.candidatesTokenCount, 11);
   assert.equal(observed.terminal, "eof");
   assert.equal(observed.usageCoverage, "observed_lower_bound_only");
+  assert.equal(observed.usageSnapshotComplete, true);
   assert.equal(h.sends(), 1);
 });
 
@@ -143,7 +144,24 @@ test("missing model or usage remains unknown and requested labels are never subs
     assert.equal(record.cost, null);
     assert.equal(record.actualEffort, null);
     assert.equal(record.qualified, false);
+    assert.equal(record.usageSnapshotComplete, false);
   }
+});
+
+test("complete snapshots require every explicit native counter in the final frame", async () => {
+  const full = envelope();
+  for (const key of Object.keys(full.response.usageMetadata)) {
+    const partial = structuredClone(full);
+    delete partial.response.usageMetadata[key];
+    const h = harness(async () => ({ status: 200, data: body(sse(full), sse(partial)) }));
+    await collect(await h.call("stream"));
+    const observed = h.unit.snapshot().attempts[0];
+    assert.equal(observed.usageSnapshotComplete, false, key);
+    assert.equal(observed.usageLowerBound, 17);
+  }
+  const missing = harness(async () => ({ status: 200, data: body(sse(full), sse(envelope(17, { usageMetadata: undefined }))) }));
+  await collect(await missing.call("stream"));
+  assert.equal(missing.unit.snapshot().attempts[0].usageSnapshotComplete, false);
 });
 
 test("invalid, unsafe, regressing, conflicting and subset counters never replace valid usage", async () => {

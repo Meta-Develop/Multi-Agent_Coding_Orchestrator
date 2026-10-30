@@ -1,98 +1,63 @@
-# Code Assist wire observation unit (not a launch route)
+# Code Assist wire observation unit
 
-`gemini_code_assist_wire.mjs` is an isolated, version-bound foundation for Gemini
-CLI **0.41.2**, Node **22.22.2**. No Rust adapter imports it. Existing Gemini
-`Unverified` confinement, `UsageReporting::None`, terminal JSON observation,
-acceptance and publication gates remain unchanged. Pure callback facts are not
-private parent custody, actual model/effort identity, whole-run usage, price or
-writable-execution proof.
+`gemini_code_assist_wire.mjs` observes raw Code Assist responses for Gemini CLI
+0.41.2 and Node 22.22.2. The managed bootstrap imports it into a source-bound,
+contained process with a private supervisor channel. Standalone callbacks and
+snapshots are structural observations, not authenticated custody or authority.
 
-## Bound public source
+## Pinned source
 
 The packaged `chunk-ZP3RCUP6.js` SHA256 is
 `2caaf0808ed644ec464f4ac8c3298dfaa48a0b094578f72a1193c31a19cd847c`.
-Relevant original line ranges:
+Relevant original source ranges are 273743–273831 (CodeAssist request methods),
+251829–251842 (raw response projection), 10745–10791 (OAuth request/replay),
+10106–10175 (DefaultTransporter), 8770–8840 and 8989–9013 (Gaxios), and
+8199–8288 (retry configuration). Supported finish reasons are pinned in
+`chunk-XRLFHCHC.js`, SHA256
+`212695ba37862c484ca6a0617e52715b5338754a6e9fbc3733facad82db411e4`,
+lines 26825–26842. Vendor files remain read-only.
 
-- 273743–273831: `CodeAssistServer.requestPost/requestStreamingPost` and the
-  permissive stock SSE decoder replaced at these instance method slots.
-- 251832–251845: raw `{response: {usageMetadata, modelVersion, candidates}}`
-  projection by `fromGenerateContentResponse`.
-- 10745–10791: OAuth `request/requestAsync`, including 401/403 replay through
-  `this.transporter.request` after refresh.
-- 10106–10175: `DefaultTransporter`, its `instance` Gaxios and original receiver.
-- 8770–8840, 8989–9013: Gaxios request, adapter, response parsing and defaults.
-- 8199–8288: retry configuration; **`retry: false` alone is insufficient when
-  `retryConfig` exists**. Every observed send replaces it with retry=0 and
-  noResponseRetries=0. Nonempty defaults/interceptors and changed known methods
-  refuse; HTTP redirects are disabled because they could resend below admission.
+## Capture contract
 
-`chunk-XRLFHCHC.js` SHA256 is
-`212695ba37862c484ca6a0617e52715b5338754a6e9fbc3733facad82db411e4`.
-Its lines 26825–26842 define the supported native candidate finish reasons.
+Every physical request needs fresh admission and release ACKs, including OAuth
+replays. Generation responses pass through strict bounded UTF-8/SSE/JSON parsing
+before CLI translation or logging. Duplicate keys, malformed/trailing frames,
+empty streams, missing terminal candidates, unsafe/regressing counters and
+conflicting model fields refuse. The original OAuth/Gaxios methods retain their
+receivers; redirects and hidden retries are disabled on every physical send.
+Unclassified sends refuse. Bootstrap account/startup traffic has its own bounded
+non-generation handling and never becomes generation usage.
 
-## Interface and limitations
+`usageSnapshotComplete` records whether the latest response envelope explicitly
+contained all six native usage counters. It is reset on a missing or partial
+later envelope, even when retained counters still contain every key. It does
+not independently assert invocation completeness. The Rust private receiver
+requires clean terminal attempts, complete final snapshots, observed model and
+bound launch identity before admitting complete accounting or publication.
+Missing counters are never defaulted to zero, and missing modelVersion is never
+replaced by request.model. No served effort field is exposed by the pinned
+response projection; `actualEffort` remains null.
 
-`createCodeAssistWireUnit({parent, limits})` exposes `request`, `wrapTransport`,
-`cancel` and `snapshot` for a future owned bootstrap and pure offline tests.
-The parent callbacks `admit(event)` and `record(event)` must return exactly
-`true`. Each physical generation send, including an OAuth replay, needs fresh
-admission and a release-record ACK. Every parsed envelope is captured and ACKed
-before downstream delivery. Terminals reconcile once per attempt. A failed ACK,
-malformed stream, cancellation or early consumer return latches refusal for
-queued/new calls. Already released generation may still consume unreported
-usage; ACK backpressure is not a provider spending guarantee.
+Retained snapshots are monotonic lower bounds and are not added within one
+attempt. Stream loss, failure, cancellation or early return preserves available
+facts but cannot prove complete usage. Standalone records retain
+`usageCoverage=observed_lower_bound_only`, `qualified=false`, unknown cost and
+unproven quiescence. Only the separate authenticated parent bridge can establish
+the whole-invocation contract described in `gemini_managed_bootstrap.md`.
 
-Owned-signal abort also finalizes a released **idle** stream before its first
-read or between reads, independently of later consumer `next`/`return` calls.
-The same idempotent terminal promise serves abort, iteration and return. Its
-bounded ACK completion unregisters the call even if the ACK fails; snapshots
-distinguish pending/acknowledged/failed terminal delivery and expose active call
-count. Source cleanup is requested without waiting on an uncooperative iterator.
-Retained usage, unknown cost and unproven quiescence are unchanged by this local
-terminal transition; it is not a provider stop or whole-run settlement proof.
+ACK failure latches cancellation, including queued calls. Idle stream aborts
+finalize a released attempt without waiting for another consumer operation;
+terminal delivery is bounded and idempotent. This does not prove a provider stop.
+No headers, credentials, prompts, candidate text, raw response bodies or raw
+exception messages cross the observation interface.
 
-`attachCodeAssist0412(server, unit, sourceBytes)` requires the exact public bundle
-bytes and known function-source fingerprints before modifying the supplied
-instance. It preserves original client/transporter receivers, uses the OAuth
-client normally and interposes every generation call through its transporter.
-Unary responses also request raw streams, avoiding Gaxios's prior JSON parsing
-and unbounded text buffering. Unknown clients/transports, custom defaults,
-interceptors, endpoints, extra credit enablement and non-generation sends refuse.
-In particular credential-refresh network requests are **not authorized here**:
-the offline replay tests model the OAuth control path, not a real refresh. Later
-bootstrap/profile work must explicitly own any allowed non-generation activity;
-it must not bypass this refusal or turn it into generation completeness.
-
-The future loader must bind the supplied source bytes to the actual imported
-module, cover every generator/auth-refresh instance before use, and isolate
-untrusted code. Fingerprints are compatibility checks, not a sandbox against
-arbitrary in-process JavaScript. This unit never imports vendor modules or main,
-loads credentials, creates a process/profile/pipe, or calls a provider itself.
-An unsupported installation is refused rather than replaced with a generic
-transport fallback. Actual installation into the packaged CLI remains untested.
-
-Strict UTF-8/SSE/JSON handling rejects duplicate keys, malformed/trailing frames,
-empty streams and streams missing a terminal candidate. It supports one candidate.
-A clean stream cannot prove absence of a lost intermediate frame: output is always
-`observed_lower_bound_only`, `qualified=false`, with unknown cost and actual effort.
-Native usage counters retain their names and are never translated into invented
-token sums. Repeated/cumulative snapshots are not added; distinct attempts stay
-separate. Missing counters/identity remain unknown, valid previous observations
-survive later failure, and unsafe or regressing counters refuse. `modelVersion`
-is an unverified response field, never a requested-label substitution. Evidence
-contains only bounded whitelisted fields and envelope hashes, not headers,
-credentials, prompts, candidate text, raw bodies or exception messages.
-
-Agent-chosen local bounds (not owner budgets): 64 calls, 128 physical attempts,
-4 MiB/response, 64 KiB/SSE frame, 4096 frames, 5 seconds/parent ACK. Overrides may
-only reduce these bounds. An in-flight or non-cooperative source can remain
-unquiesced after cancellation; records explicitly retain `quiescence=unproven`.
-No record permits refund, cleanup, settlement or acceptance in MACO.
+Bounds are 64 calls, 128 physical attempts, 4 MiB/response, 64 KiB/SSE frame,
+4096 frames and 5 seconds/ACK. Overrides may only reduce these bounds.
 
 ## Offline verification
 
-Use Node 22.22.2 and `node --test src/runtime_adapter/gemini_code_assist_wire.test.mjs`.
-Set `MACO_CODE_ASSIST_PUBLIC_SOURCE` to the already installed public bundle above.
-The binding test reads and hashes text only; it does not import/execute the CLI.
-Tests use synthetic streams and callbacks, no network, auth or live fixture.
-No Cargo build is needed because Rust sources and launch integration are untouched.
+Use Node 22.22.2 with
+`node --test src/runtime_adapter/gemini_code_assist_wire.test.mjs`.
+Set `MACO_CODE_ASSIST_PUBLIC_SOURCE` to the installed pinned bundle for the
+required source-binding test. Synthetic streams and callbacks require no
+network, credentials or provider calls and are not real route qualification.
