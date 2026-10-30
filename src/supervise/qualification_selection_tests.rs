@@ -21,7 +21,7 @@ fn qualification_selection(source: &str) -> Result<SupervisorSelectionResolution
     )?);
     let advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
         "grok-4.6",
-        &["  * grok-4.6 (default)"],
+        &["  * grok-4.6 (default)", "  - grok-4.7"],
     ))?);
     // Use the shipped assessment, not the selector unit-test wrapper that
     // synthesizes a different declaration. Parsing above validates its replay.
@@ -39,9 +39,15 @@ fn qualification_selection(source: &str) -> Result<SupervisorSelectionResolution
     )
 }
 
+type QualificationRefusal = (
+    AgentRole,
+    selection_preflight::SelectionPreflightRejection,
+    serde_json::Value,
+);
+
 fn qualification_refusals(
     resolution: &SupervisorSelectionResolution,
-) -> Result<Vec<(AgentRole, selection_preflight::SelectionPreflightRejection)>> {
+) -> Result<Vec<QualificationRefusal>> {
     let failure = resolution
         .selection_preflight_failure
         .as_ref()
@@ -58,13 +64,14 @@ fn qualification_refusals(
             Ok((
                 serde_json::from_value(entry["role"].clone())?,
                 serde_json::from_value(entry["rejection"].clone())?,
+                entry["requested"].clone(),
             ))
         })
         .collect()
 }
 
 #[test]
-fn qualification_fixtures_pass_live_selection_preflight_except_documented_grok_low() -> Result<()> {
+fn qualification_fixtures_match_documented_bundled_prior_preflight_outcomes() -> Result<()> {
     let directory = Path::new(env!("CARGO_MANIFEST_DIR")).join("examples/supervise");
     let mut fixtures = std::fs::read_dir(directory)?
         .map(|entry| entry.map(|entry| entry.path()))
@@ -79,19 +86,31 @@ fn qualification_fixtures_pass_live_selection_preflight_except_documented_grok_l
     });
     fixtures.sort();
     assert!(
-        fixtures.len() >= 3,
+        fixtures.len() >= 4,
         "qualification fixtures must be present"
     );
     for path in fixtures {
         let resolution = qualification_selection(&std::fs::read_to_string(&path)?)?;
-        if path.file_name().and_then(|name| name.to_str())
-            == Some("qualification-grok-lower-effort.json")
-        {
+        let expected_refusal = match path.file_name().and_then(|name| name.to_str()) {
+            Some("qualification-grok-lower-effort.json") => Some((
+                selection_preflight::SelectionPreflightRejection::EffortIncompatible,
+                "grok-4.6",
+                "low",
+            )),
+            Some("qualification-grok47-acp.json") => Some((
+                selection_preflight::SelectionPreflightRejection::ModelUnavailable,
+                "grok-4.7",
+                "xhigh",
+            )),
+            _ => None,
+        };
+        if let Some((rejection, model, effort)) = expected_refusal {
             assert_eq!(
                 qualification_refusals(&resolution)?,
                 vec![(
                     AgentRole::Worker,
-                    selection_preflight::SelectionPreflightRejection::EffortIncompatible,
+                    rejection,
+                    json!({"runtime": "grok", "model": model, "effort": effort}),
                 )],
                 "{}",
                 path.display()
@@ -141,6 +160,7 @@ fn qualification_original_medium_efforts_are_refused_before_release() -> Result<
                     (
                         role,
                         selection_preflight::SelectionPreflightRejection::EffortIncompatible,
+                        json!({"runtime": "codex", "model": "gpt-6.1-sol", "effort": "medium"}),
                     )
                 })
                 .collect::<Vec<_>>(),
