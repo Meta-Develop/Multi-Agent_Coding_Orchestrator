@@ -12,7 +12,7 @@ Native runtime delegation is prohibited; nested dispatch goes through
 the authenticated coordinator channel. No retries or gate corrections are
 authorized by the fixture.
 
-The finite ceiling is 32,000 run tokens, with admission estimates of 4,000 for
+The revised finite ceiling is 65,000 run tokens, with admission estimates of 4,000 for
 the parent/reviewer and 1,000 per Worker. Each child has a 1,200-second timeout;
 the outer command has a 3,600-second deadline. Estimates do not bound actual
 consumption and the Worker live grant is the remaining admitted allowance,
@@ -20,9 +20,35 @@ not its 1,000-token estimate. The meaningful task repairs two deliberately
 flawed Python test fixtures with disjoint ownership. It does not pad output
 or request unlimited turns to force usage.
 
-The effort correction leaves these bounds unchanged. It does not predict
-consumption at the corrected efforts; parent-only exhaustion or insufficient
-allowance still makes the attempt inconclusive.
+The retained `qualification-nested-budget-c31` attempt on
+`f16ed38fcab1eb37ac7ee6c1b7a3aeff4fc09fe2` is **inconclusive**. Its original
+32,000-token plan admitted the real parent on `gpt-6.1-sol` / `high`, which
+settled 41,684 tokens before either Worker launched: 41,495 input and 189
+output. The 27,264 cached input tokens are included in input, not added again.
+The parent exceeded that ceiling by 9,684; both Worker preparations were
+refused, so no within-turn Worker interruption or drain was exercised.
+Preserve that original checked plan, fixture, usage receipts and retained run
+alongside the revised checked plan and its evidence; do not rewrite c31's result.
+
+The revised ceiling budgets 1.5 times observed parent usage:
+`41,684 * 3 / 2 = 62,526`, plus a 2,474-token remaining grant, totaling 65,000.
+This leaves 23,316 tokens of headroom over the observed parent usage (20,842
+for setup variation plus 2,474 for Worker 1). With no other outstanding
+reservations, parent usage of 41,684 leaves Worker 1 a live grant of 23,316;
+usage of 62,526 leaves 2,474. Both admit its unchanged 1,000-token estimate.
+The parent estimate remains 4,000: it is an admission estimate, not a cap on
+the parent's turn. No task, effort, gate, timeout or retry setting changes.
+
+Even the larger 23,316-token grant is less than one eighth of the original
+incident Worker's 191,231-token usage. This makes Worker 1 reaching the grant
+during its native turn plausible with substantial margin, while allowing
+50% parent setup growth. It is not a usage prediction or guarantee: setup can
+vary, Worker 1 can finish cheaply, and cumulative usage notices can arrive
+late or overshoot. After Worker 1 reaches its actual grant, observed exhaustion
+must stop dispatch and Worker 2 must be refused; capture that refusal in the
+same run. Parent-first exhaustion or failure to reach Worker exhaustion remains
+inconclusive. This fixture revision prepares a separately reviewable plan;
+it does not authorize another live attempt or establish qualification.
 
 ```bash
 fixture=examples/supervise/nested-codex-budget-qualification.json

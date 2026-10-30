@@ -1,5 +1,80 @@
 use super::*;
 
+#[test]
+fn nested_budget_qualification_ceiling_preserves_observed_parent_headroom() {
+    let (_temporary, repo) = injected_repository();
+    let loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
+        include_str!("../../../examples/supervise/nested-codex-budget-qualification.json"),
+        Some(&repo),
+    )
+    .expect("load qualification fixture without regenerating hash-bound inputs");
+    let budget = loaded.plan_metadata.run_budget;
+    let ceiling = budget
+        .limits
+        .hard_tokens
+        .expect("finite qualification ceiling");
+    let observed_parent_tokens = 41_684;
+    let documented_headroom = 23_316;
+    let parent_planning_allowance = observed_parent_tokens * 3 / 2;
+    assert!(ceiling >= observed_parent_tokens + documented_headroom);
+    assert_eq!(
+        budget.role_token_reservations[&AgentRole::ChildOrchestrator],
+        4_000
+    );
+    let worker_estimate = budget.role_token_reservations[&AgentRole::Worker];
+    assert_eq!(worker_estimate, 1_000);
+
+    for parent_tokens in [observed_parent_tokens, parent_planning_allowance] {
+        let ledger = RunBudgetLedger::new(budget.limits).expect("qualification ledger");
+        let reserve = |role| {
+            ledger
+                .reserve(BudgetReservationRequest {
+                    role,
+                    tokens: budget.role_token_reservations[&role],
+                    cost_usd: None,
+                })
+                .expect("reserve qualification role")
+        };
+        let parent = reserve(AgentRole::ChildOrchestrator)
+            .reservation()
+            .expect("parent admitted")
+            .clone();
+        ledger
+            .reconcile(
+                parent.id,
+                UsageMeasurement::Reliable {
+                    tokens: parent_tokens,
+                    cost_usd: None,
+                },
+            )
+            .expect("settle parent before Worker 1");
+        let worker = reserve(AgentRole::Worker)
+            .reservation()
+            .expect("Worker 1 admitted after parent settlement")
+            .clone();
+        let grant = ledger.live_token_grant(worker.id).unwrap().unwrap();
+        let grant_tokens = usize::try_from(grant.tokens()).expect("fixture grant fits usize");
+        assert_eq!(grant_tokens, ceiling - parent_tokens);
+        assert!(grant_tokens >= 2_474);
+        assert!(grant_tokens < 191_231 / 8);
+        grant.exhaust();
+        ledger
+            .reconcile(
+                worker.id,
+                UsageMeasurement::Reliable {
+                    tokens: grant_tokens,
+                    cost_usd: None,
+                },
+            )
+            .expect("settle observed Worker 1 exhaustion");
+        assert!(matches!(
+            reserve(AgentRole::Worker),
+            BudgetAdmission::Refused { .. }
+        ));
+        assert_eq!(ledger.report().unwrap().reserved.tokens, 0);
+    }
+}
+
 pub(super) fn operator_pricing_document(plan: &SupervisorPlan) -> Value {
     let metadata = SupervisorPlanMetadata {
         operator_pricing: Some(

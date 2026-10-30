@@ -355,12 +355,9 @@ fn derive_launch_authority(
 
     let model = configured_model_from_argv(argv)?;
     let policy_role = lifecycle_policy_role(role);
-    match (role, policy_role, model.as_deref()) {
-        ("researcher", None, Some(model)) => {
-            validate_known_judgment_role_model(AgentRole::Worker, Some(model))?;
-        }
-        ("researcher", None, None) | (_, Some(AgentRole::Worker), None) => {}
-        (_, Some(policy_role), model) => {
+    match (policy_role, model.as_deref()) {
+        (Some(AgentRole::Worker), None) => {}
+        (Some(policy_role), model) => {
             validate_known_judgment_role_model(policy_role, model)?;
         }
         _ => bail!("agent lifecycle role {role:?} has no launch authority policy"),
@@ -574,6 +571,7 @@ fn lifecycle_policy_role(role: &str) -> Option<AgentRole> {
         "supervisor" => Some(AgentRole::Supervisor),
         "child_orchestrator" | "orchestrator" | "root" => Some(AgentRole::ChildOrchestrator),
         "worker" => Some(AgentRole::Worker),
+        "researcher" => Some(AgentRole::Researcher),
         "gate_classifier" => Some(AgentRole::GateClassifier),
         "auditor" => Some(AgentRole::Auditor),
         _ => None,
@@ -1521,6 +1519,9 @@ fn wait_until_identity_gone(record: &AgentProcessRecord, duration: Duration) -> 
         thread::sleep(STOP_POLL_INTERVAL);
     }
 }
+
+#[cfg(test)]
+mod selector_authority_tests;
 
 #[cfg(test)]
 mod tests {
