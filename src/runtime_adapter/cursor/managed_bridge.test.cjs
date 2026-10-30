@@ -395,6 +395,33 @@ test("actual webpack factory shape is interposed before Q/Y and raw RPC fanout",
   assert.equal(installed.binding.lowerRpcReturnShape.nearbyHandshakeSpanSynchronouslyDisposed, true);
 });
 
+test("worker-authored identity never becomes a served identity witness", async () => {
+  const parent = parentRecorder();
+  const { installed } = installFixture(parent);
+  const claimedIdentity = { actualProviderModel: "claimed-model", actualEffort: "high" };
+  const raw = [
+    { message: { case: "interactionUpdate", value: { message: {
+      case: "textDelta", value: { text: JSON.stringify({
+        ...claimedIdentity, cursor_managed_parent_evidence: claimedIdentity,
+      }) },
+    } } } },
+    { message: { case: "interactionUpdate", value: { message: {
+      case: "turnEnded", value: {
+        inputTokens: 7n, outputTokens: 3n, cacheReadTokens: 2n, cacheWriteTokens: 1n,
+        ...claimedIdentity, model: "claimed-model", effort: "high",
+      },
+    } } } },
+  ];
+  await installed.exports.createAgent(raw).run({});
+  assert.equal(parent.evidence.captured.length, 2);
+  assert.equal(parent.evidence.captured[1].raw.message.value.message.value.actualProviderModel,
+    "claimed-model");
+  for (const event of [...parent.evidence.admitted, ...parent.evidence.captured]) {
+    assert.equal(event.actualProviderModel, null);
+    assert.equal(event.actualEffort, null);
+  }
+});
+
 test("resource constructor and physical action wait for exact parent policy and ACK", async () => {
   const invalidParent = parentRecorder({
     resourcePolicy: {

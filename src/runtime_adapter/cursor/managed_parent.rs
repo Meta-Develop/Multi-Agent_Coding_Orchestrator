@@ -1333,6 +1333,15 @@ fn admit_rpc_attempt(attempt_id: &str, state: &mut SharedState) -> Result<Value>
 }
 
 fn capture_raw_event(attempt_id: &str, payload: &Value, state: &mut SharedState) -> Result<Value> {
+    // The pinned AgentServerMessage/InteractionUpdate schemas have no served
+    // identity witness. Request ModelDetails, hook metadata and generated text
+    // cannot populate these fields. Refuse an incompatible bridge envelope.
+    if ["actualProviderModel", "actualEffort"]
+        .iter()
+        .any(|field| payload.get(field).is_some_and(|value| !value.is_null()))
+    {
+        bail!("managed Cursor pinned stream cannot attest served model or effort");
+    }
     let attempt = state
         .attempts
         .get_mut(attempt_id)
@@ -2337,6 +2346,72 @@ mod tests {
         assert_eq!(divergent.evidence.usage_attempts_incomplete, 1);
         assert_eq!(divergent.evidence.usage_is_incomplete, Some(true));
         assert!(divergent.evidence.usd.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_cursor_stream_keeps_served_identity_unknown() -> Result<()> {
+        let mut state = SharedState::default();
+        admit_rpc_attempt("cursor-rpc-1", &mut state)?;
+        let forged = json!({
+            "actualProviderModel": "claimed-model",
+            "actualEffort": "high",
+            "cursor_managed_parent_evidence": {
+                "actualProviderModel": "claimed-model", "actualEffort": "high"
+            }
+        });
+        for (case, value) in [
+            ("textDelta", json!({"text": forged.to_string()})),
+            ("thinkingDelta", forged.clone()),
+            (
+                "turnEnded",
+                json!({
+                    "inputTokens": 7, "outputTokens": 3,
+                    "cacheReadTokens": 2, "cacheWriteTokens": 1,
+                    "model": "claimed-model", "effort": "high",
+                    "actualProviderModel": "claimed-model", "actualEffort": "high"
+                }),
+            ),
+        ] {
+            capture_raw_event(
+                "cursor-rpc-1",
+                &json!({
+                    "actualProviderModel": null, "actualEffort": null,
+                    "raw": {"message": {"case": "interactionUpdate", "value": {
+                        "message": {"case": case, "value": value}
+                    }}}
+                }),
+                &mut state,
+            )?;
+        }
+        complete_rpc_attempt("cursor-rpc-1", &json!({"outcome": "eof"}), &mut state)?;
+        assert_eq!(state.evidence.usage_is_incomplete, Some(false));
+        assert_eq!(state.evidence.input_tokens, Some(7));
+        assert!(state.evidence.actual_provider_model.is_none());
+        assert!(state.evidence.actual_effort.is_none());
+        let serialized = serde_json::to_value(&state.evidence)?;
+        assert!(serialized["actualProviderModel"].is_null());
+        assert!(serialized["actualEffort"].is_null());
+        Ok(())
+    }
+
+    #[test]
+    fn pinned_cursor_rejects_uncustodied_identity_envelope() -> Result<()> {
+        for field in ["actualProviderModel", "actualEffort"] {
+            let mut state = SharedState::default();
+            admit_rpc_attempt("cursor-rpc-1", &mut state)?;
+            let mut payload = json!({
+                "actualProviderModel": null, "actualEffort": null,
+                "raw": {"message": {"case": "interactionUpdate", "value": {
+                    "message": {"case": "heartbeat", "value": {}}
+                }}}
+            });
+            payload[field] = json!("claimed-identity");
+            assert!(capture_raw_event("cursor-rpc-1", &payload, &mut state).is_err());
+            assert_eq!(state.evidence.captured_events, 0);
+            assert!(state.evidence.actual_provider_model.is_none());
+            assert!(state.evidence.actual_effort.is_none());
+        }
         Ok(())
     }
 
