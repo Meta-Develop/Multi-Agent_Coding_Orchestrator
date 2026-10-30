@@ -133,6 +133,7 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
       terminalAck: attempt.terminalAck,
       frames: attempt.frames, wireBytes: attempt.bytes,
       usage: attempt.usage, observedModelVersion: attempt.model,
+      usageSnapshotComplete: attempt.usageSnapshotComplete === true,
       usageLowerBound: attempt.lowerBound,
       usageCoverage: "observed_lower_bound_only",
       identityAuthority: "unverified_response_field",
@@ -226,6 +227,10 @@ export function createCodeAssistWireUnit({ parent, limits = {} }) {
     }
     attempt.model = model;
     attempt.usage = usage;
+    // Completeness requires one explicit final snapshot, not a union of
+    // partial frames. Missing optional provider counters stay unknown.
+    attempt.usageSnapshotComplete = plain(response.usageMetadata)
+      && usageKeys.every((key) => Object.hasOwn(response.usageMetadata, key));
     attempt.sawFinish = sawFinish;
     if (usage?.totalTokenCount !== undefined) {
       attempt.lowerBound = Math.max(attempt.lowerBound ?? 0, usage.totalTokenCount);

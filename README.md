@@ -1218,13 +1218,22 @@ cargo run -- consult ask \
 
 Claude consultant mode is currently refused before launch because MACO cannot
 enforce an equivalent inner read-only permission contract. Supplying an
-executable does not weaken that refusal. Selecting `runtime: claude-code` or
-`runtime: gemini-cli` on a supervise assignment is accepted, but writable
+executable does not weaken that refusal. Selecting `runtime: claude-code`
+on a supervise assignment is accepted, but writable
 managed-worktree launch stays refused under their current capability values
 because release requires verified native side-effect confinement. Writable
 primary-worktree release uses the separate
 `blocking_pre_action_callback == All` gate. The command form below demonstrates
 the expected fail-closed consultant response; it does not launch Claude.
+
+For `runtime: gemini-cli`, the pinned 0.41.2 managed bridge can bind complete
+response usage and served model through private supervisor observations.
+Completion refuses missing/partial counters, missing model, model fallback or
+mismatch, and any requested effort because served effort is not exposed.
+Partial released runs retain known token lower bounds; worker logs and terminal
+JSON cannot establish usage or identity. Real substantive route qualification
+and independent acceptance remain required. See the
+[Gemini managed contract](src/runtime_adapter/gemini_managed_bootstrap.md).
 
 ```bash
 cargo run -- consult ask \
