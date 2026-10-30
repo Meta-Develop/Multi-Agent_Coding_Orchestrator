@@ -1,5 +1,9 @@
 use super::*;
 
+#[cfg(all(test, unix))]
+#[path = "claude_identity_tests.rs"]
+mod claude_identity_tests;
+
 #[path = "journal_observation.rs"]
 mod journal_observation;
 #[cfg(test)]
@@ -2200,6 +2204,7 @@ pub(super) fn external_process_completed(
         && (runtime != SupervisorRuntime::ClaudeCode
             || (run.authenticated_claude_usage_complete()
                 && run.authenticated_claude_model().is_some()
+                && run.claude_managed_effort_qualified()
                 && !run.stdout.raw_capture_truncated()))
         && (runtime != SupervisorRuntime::Cursor
             || cursor_managed_usage(run).is_some_and(|(_, complete)| complete))
