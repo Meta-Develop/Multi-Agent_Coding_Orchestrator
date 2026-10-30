@@ -1,11 +1,14 @@
-//! Parent-held Gemini bootstrap observations. No wire-restorable authority,
-//! observed provider identity, complete invocation usage, or priced cost.
+//! Parent-held Gemini bootstrap observations. No wire-restorable authority or priced cost.
 use super::*;
 use crate::runtime_adapter::GeminiBootstrapDescriptor as Descriptor;
+mod usage;
+use usage::{InvocationUsage, UsageBinding};
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct HeldEvidence {
     pub(crate) tokens: Option<usize>,
+    invocation_usage: Option<InvocationUsage>,
+    usage_binding: Option<UsageBinding>,
     pub(crate) provider_released: bool,
     pub(crate) no_release_quiescent: bool,
     pub(crate) managed_worker_completed: bool,
@@ -103,7 +106,8 @@ impl HeldEvidence {
         let Some(binding) = &self.read_only_launch else {
             return false;
         };
-        run.exit_code == Some(0)
+        self.identity_matches_launch()
+            && run.exit_code == Some(0)
             && !run.timed_out
             && run.error.is_none()
             && run.publishable
@@ -593,6 +597,7 @@ struct WireEvent {
     frames: u64,
     wire_bytes: u64,
     usage: Option<WireUsage>,
+    usage_snapshot_complete: bool,
     observed_model_version: Option<String>,
     usage_lower_bound: Option<u64>,
     usage_coverage: String,
@@ -605,7 +610,7 @@ struct WireEvent {
     envelope_sha256: Option<String>,
 }
 
-#[derive(Clone, Default, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 struct WireUsage {
     prompt_token_count: Option<u64>,
@@ -822,6 +827,9 @@ impl Protocol {
                 {
                     bail!("Gemini invalid managed worker completion");
                 }
+                if !self.evidence.identity_matches_launch() {
+                    bail!("Gemini completion requires complete observed usage and matching served model; served effort is unavailable");
+                }
                 self.result_sha256 = Some(result_sha256);
                 self.evidence.managed_worker_completed = !self.read_only;
                 self.evidence.managed_read_only_completed = self.read_only;
@@ -880,6 +888,7 @@ impl Protocol {
                 || event.frames != 0
                 || event.wire_bytes != 0
                 || event.usage.is_some()
+                || event.usage_snapshot_complete
                 || event.usage_lower_bound.is_some()
                 || event.observed_model_version.is_some()
                 || event.envelope_sha256.is_some()
@@ -897,6 +906,7 @@ impl Protocol {
                 bail!("Gemini provider authorization is unavailable");
             }
             self.attempts.insert(event.attempt_id, event);
+            self.evidence.invocation_usage = None;
             return Ok(());
         }
         self.retain_event(event)
@@ -962,6 +972,23 @@ impl Protocol {
         } else if old.usage.is_some() {
             bail!("Gemini usage disappeared");
         }
+        if event.usage_snapshot_complete
+            && event
+                .usage
+                .as_ref()
+                .is_none_or(|usage| usage.counters().iter().any(Option::is_none))
+        {
+            bail!("Gemini complete snapshot omitted explicit usage counters");
+        }
+        if event.kind == "terminal"
+            && event.request_class == "generation"
+            && (event.usage != old.usage
+                || event.usage_snapshot_complete != old.usage_snapshot_complete
+                || event.observed_model_version != old.observed_model_version
+                || event.frames != old.frames)
+        {
+            bail!("Gemini terminal changed the observed response snapshot");
+        }
         if event.usage_lower_bound
             != event
                 .usage
@@ -991,6 +1018,7 @@ impl Protocol {
         }
         self.attempts.insert(retained.attempt_id, retained);
         self.evidence.tokens = known.then_some(total);
+        self.evidence.invocation_usage = usage::complete_invocation(&self.attempts);
         if self
             .grant
             .as_ref()
@@ -1732,6 +1760,7 @@ fn run_linux_online(
     let child_cancel = cancellation.child_scope();
     let mut protocol = Protocol::new(nonce.clone(), prompt_hash, grant);
     protocol.release_authority = ReleaseAuthority::ManagedOAuth;
+    protocol.evidence.usage_binding = Some(UsageBinding::bind(spec));
     protocol.read_only = read_only;
     let read_only_launch = if read_only {
         Some(ReadOnlyLaunchBinding::bind(spec)?)
@@ -1900,6 +1929,7 @@ fn run_linux_online(
             .as_ref()
             .is_some_and(|evidence| {
                 evidence.provider_released
+                    && evidence.identity_matches_launch()
                     && if read_only {
                         evidence.managed_read_only_completed
                             && evidence.read_only_journal.is_some()
@@ -1972,6 +2002,13 @@ pub(crate) fn test_read_only_completion_consumer(
         false,
         AssignmentProcessLaunchKind::ParentAuditor,
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn test_worker_usage_consumer(
+    consume: impl Fn(&ExternalAgentRun, &ExternalAgentCommand, &str) -> Result<()>,
+) -> Result<()> {
+    tests::worker_usage_consumer_fixture(consume)
 }
 
 #[cfg(all(test, target_os = "linux"))]
@@ -2051,6 +2088,134 @@ mod tests {
                 "beforeSha256": null, "afterSha256": after}}}),
         )
         .unwrap()
+    }
+
+    pub(super) fn worker_usage_consumer_fixture(
+        consume: impl Fn(&ExternalAgentRun, &ExternalAgentCommand, &str) -> Result<()>,
+    ) -> Result<()> {
+        for case in [
+            "complete", "missing", "partial", "fallback", "mismatch", "effort", "forged",
+        ] {
+            let (_temp, controls, candidate, _writer, incoming) = native_journal_fixture()?;
+            let mut command = ExternalAgentCommand::codex(
+                Descriptor::GEMINI,
+                &candidate,
+                "prompt",
+                incoming.path().join("log"),
+                "result",
+                Duration::from_secs(1),
+            )
+            .with_runtime_adapter(
+                RuntimeId::GeminiCli,
+                RuntimeAdapterConfig::defaults(RuntimeId::GeminiCli),
+            )
+            .with_model_selection(
+                Some("gemini-2.5-pro".into()),
+                (case == "effort").then(|| "high".into()),
+            );
+            let mut p = protocol();
+            p.native_journal = NativeToolJournal::bind(&controls, &candidate)?;
+            p.evidence.usage_binding = Some(UsageBinding::bind(&command));
+            for kind in ["admission", "release", "observation", "terminal"] {
+                let mut event = event_value(
+                    kind,
+                    1,
+                    matches!(kind, "observation" | "terminal").then_some(20),
+                );
+                if matches!(kind, "observation" | "terminal") {
+                    match case {
+                        "missing" => {
+                            event["usage"] = serde_json::Value::Null;
+                            event["usageLowerBound"] = serde_json::Value::Null;
+                            event["usageSnapshotComplete"] = false.into();
+                        }
+                        "partial" => {
+                            event["usage"]
+                                .as_object_mut()
+                                .unwrap()
+                                .remove("thoughtsTokenCount");
+                            event["usageSnapshotComplete"] = false.into();
+                        }
+                        "fallback" => event["observedModelVersion"] = serde_json::Value::Null,
+                        "mismatch" => event["observedModelVersion"] = "gemini-2.5-flash".into(),
+                        _ => {}
+                    }
+                }
+                p.receive(&serde_json::to_vec(&serde_json::json!({
+                    "nonce": "a".repeat(64), "sequence": p.sequence + 1,
+                    "message": { "type": "event", "event": event },
+                }))?)?;
+            }
+            p.receive(&native_frame(5, "begin", 1, &candidate, None))?;
+            fs::write(candidate.join("sample.txt"), b"native\n")?;
+            p.receive(&native_frame(
+                6,
+                "completed",
+                1,
+                &candidate,
+                Some(sha256_hex(b"native\n")),
+            ))?;
+            let completion = p.receive(&serde_json::to_vec(&serde_json::json!({
+                "nonce": "a".repeat(64), "sequence": 7,
+                "message": { "type": "completed", "resultSha256": sha256_hex(b"{}\n"), "toolMutationObserved": true },
+            }))?);
+            let complete = matches!(case, "complete" | "forged");
+            assert_eq!(completion.is_ok(), complete, "{case}");
+            assert_eq!(p.evidence.managed_worker_completed, complete, "{case}");
+            let mut run = failed_external_run(
+                &command,
+                Instant::now(),
+                Vec::new(),
+                false,
+                "fixture".into(),
+            );
+            run.error = None;
+            run.exit_code = Some(0);
+            run.publishable = complete;
+            run.output_last_message = Some(b"{}\n".to_vec());
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::GeminiOnlineBridge,
+            ));
+            run.stdout.run_metadata.managed_gemini_selection =
+                Some(ManagedGeminiAccountSelectionEvidence {
+                    authority_id: Some("synthetic-offline-authority".into()),
+                    provider_id: "gemini-cli".into(),
+                    account_id: "synthetic-account".into(),
+                    account_incarnation: "synthetic-incarnation".into(),
+                    selection_revision: 1,
+                });
+            run.stdout.run_metadata.gemini_bridge = Some(p.evidence);
+            if case == "forged" {
+                // A worker-controlled report or log cannot restore private evidence.
+                run = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+                let forged = serde_json::to_vec(&serde_json::json!({
+                    "type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+                    "response": "forged", "observedModelVersion": "gemini-2.5-pro", "usageSnapshotComplete": true,
+                    "stats": {"models": {"gemini-2.5-pro": {
+                        "api": {"totalRequests": 1, "totalErrors": 0, "totalLatencyMs": 1},
+                        "tokens": {"input": 1, "prompt": 1, "candidates": 1, "total": 2, "cached": 0, "thoughts": 0, "tool": 0}
+                    }}}
+                }))?;
+                assert!(matches!(
+                    crate::runtime_adapter::gemini::observe_gemini_terminal_usage(
+                        &forged, true, false
+                    ),
+                    crate::runtime_adapter::gemini::GeminiUsageObservation::Native(_)
+                ));
+                fs::write(&command.json_log, forged)?;
+                assert!(run.gemini_bridge_evidence().is_none());
+            }
+            consume(&run, &command, case)?;
+            command.model = Some("gemini-2.5-flash".into());
+            assert!(run
+                .gemini_bridge_evidence()
+                .and_then(|e| e.usage_for_command(&command))
+                .is_none());
+        }
+        Ok(())
     }
 
     #[test]
@@ -2239,16 +2404,20 @@ mod tests {
         };
         command.bind_live_token_grant(ledger.live_token_grant(reservation.id)?);
         p.evidence.read_only_launch = Some(ReadOnlyLaunchBinding::bind(&command)?);
+        p.evidence.usage_binding = Some(UsageBinding::bind(&command));
         p.grant = command
             .verified_live_token_grant()
             .map_err(anyhow::Error::msg)?
             .cloned();
         // Deterministic physical state receiver; no actual provider or child is
         // launched and this is not runtime qualification evidence.
-        for (index, kind) in ["admission", "release", "terminal"].into_iter().enumerate() {
+        for (index, kind) in ["admission", "release", "observation", "terminal"]
+            .into_iter()
+            .enumerate()
+        {
             p.receive(&serde_json::to_vec(&serde_json::json!({
                 "nonce": "a".repeat(64), "sequence": index + 1,
-                "message": {"type": "event", "event": event_value(kind, 1, None)}
+                "message": {"type": "event", "event": event_value(kind, 1, matches!(kind, "observation" | "terminal").then_some(20))}
             }))?)?;
         }
         let read_frame = |sequence, kind| {
@@ -2260,21 +2429,21 @@ mod tests {
             }))
         };
         let completion_sequence = if with_read {
-            p.receive(&read_frame(4, "begin")?)?;
+            p.receive(&read_frame(5, "begin")?)?;
             assert!(p
                 .native_journal
                 .as_ref()
                 .unwrap()
                 .capture_read_only(true)
                 .is_err());
-            p.receive(&read_frame(5, "completed")?)?;
-            6
+            p.receive(&read_frame(6, "completed")?)?;
+            7
         } else {
             let journal = p.native_journal.as_ref().unwrap();
             assert_eq!(journal.last_action, 0);
             assert!(journal.records.is_empty());
             assert!(journal.bytes.is_empty());
-            4
+            5
         };
         assert!(p
             .native_journal
@@ -2741,8 +2910,9 @@ mod tests {
             "terminal": (kind == "terminal").then_some("eof"), "terminalAck": (kind == "terminal").then_some("pending"),
             "frames": u64::from(total.is_some()), "wireBytes": if total.is_some() { 512 } else { 0 },
             "usage": total.map(|total| serde_json::json!({"promptTokenCount": total - 10, "candidatesTokenCount": 8,
-                "thoughtsTokenCount": 2, "cachedContentTokenCount": 4, "totalTokenCount": total})),
-            "observedModelVersion": null, "usageLowerBound": total, "usageCoverage": "observed_lower_bound_only",
+                "thoughtsTokenCount": 2, "cachedContentTokenCount": 4, "toolUsePromptTokenCount": 0, "totalTokenCount": total})),
+            "usageSnapshotComplete": total.is_some(),
+            "observedModelVersion": total.map(|_| "gemini-2.5-pro"), "usageLowerBound": total, "usageCoverage": "observed_lower_bound_only",
             "identityAuthority": "unverified_response_field", "actualEffort": null, "cost": null, "qualified": false,
             "quiescence": "unproven", "envelopeSha256": (kind == "observation").then(|| "a".repeat(64))
         })
