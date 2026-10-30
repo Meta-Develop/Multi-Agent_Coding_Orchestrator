@@ -35,6 +35,12 @@ reviewable and recoverable:
 
 Operator command sequence for that host, including Codex and Grok: [operator quickstart](docs/OPERATOR_QUICKSTART.md).
 
+[Bounded qualification plans](docs/qualification/README.md) cover nested token
+control and supplied-source review. They request bundled-prior-compatible
+Codex efforts (`high` for the delegating parent and writable Workers, `xhigh`
+for Researcher and control roles). Offline plan validation does not establish live
+selection eligibility or account access.
+
 That Linux host also needs:
 
 - an owner-private `/run/user/<uid>` directory (current uid, mode `0700`)
@@ -1218,13 +1224,22 @@ cargo run -- consult ask \
 
 Claude consultant mode is currently refused before launch because MACO cannot
 enforce an equivalent inner read-only permission contract. Supplying an
-executable does not weaken that refusal. Selecting `runtime: claude-code` or
-`runtime: gemini-cli` on a supervise assignment is accepted, but writable
+executable does not weaken that refusal. Selecting `runtime: claude-code`
+on a supervise assignment is accepted, but writable
 managed-worktree launch stays refused under their current capability values
 because release requires verified native side-effect confinement. Writable
 primary-worktree release uses the separate
 `blocking_pre_action_callback == All` gate. The command form below demonstrates
 the expected fail-closed consultant response; it does not launch Claude.
+
+For `runtime: gemini-cli`, the pinned 0.41.2 managed bridge can bind complete
+response usage and served model through private supervisor observations.
+Completion refuses missing/partial counters, missing model, model fallback or
+mismatch, and any requested effort because served effort is not exposed.
+Partial released runs retain known token lower bounds; worker logs and terminal
+JSON cannot establish usage or identity. Real substantive route qualification
+and independent acceptance remain required. See the
+[Gemini managed contract](src/runtime_adapter/gemini_managed_bootstrap.md).
 
 ```bash
 cargo run -- consult ask \
@@ -1691,8 +1706,12 @@ maco evaluation experiment <manifest.json> \
 the evaluated source repository, declare exactly one assignment, and must not
 declare generated follow-ups, `execution_target`, or evidence-only re-audit
 controls. The frozen original plan bytes and full parsed document (consultant,
-plan metadata, assignment metadata) are retained; only profile `role_models` are
-overlaid per run and revalidated. Each manifest profile supplies those
+plan metadata, assignment metadata) are retained; profile `role_models` and an
+optional `worker_runtime` are overlaid per run and revalidated. `worker_runtime`
+supports `codex` or `grok` for one direct execution Worker only. When used, every
+arm must bind it explicitly and declare model/effort for all six roles. All other plan
+inputs, review lenses, validation, limits and source snapshot share a checked
+comparison hash; mismatches are refused before launch. Each manifest profile supplies those
 `role_models`; observation manifests accept one profile (comparison manifests
 still require two). Profile `unavailable_model_fallback` must not be
 `LocalDeterministicFake`. The parent still executes held-out argv against
@@ -1715,8 +1734,24 @@ parent session evidence after `session/set_model`, not backend attestation.
 Writable managed-child launch retains the legacy exact typed contract for
 `grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
 supported only with `headless_streaming_json`. The Issue #604 publication gate
-is implemented. Grok 4.7 ACP writable admission stays off pending Linux
-credential-confined, account-bound managed acceptance in Issue #616. Native
+is implemented. Headless writable publication retains exact `end.modelUsage`
+labels and checks them using receipt-backed 4.6/4.7 label mappings. CLI 1.0.60
+exposes no served effort: the existing standard `xhigh` lanes preserve publication
+with explicitly unknown effort, while observed contradictions refuse publication.
+The [#688 lower-effort identity gate](docs/qualification/grok-lower-effort.md)
+requires observed effort and remains closed. Grok 4.7 ACP writable admission
+stays off pending Linux credential-confined, account-bound managed acceptance
+in Issue #616, returning
+`writable_grok47_acp_qualification_required`. The sole exception is an explicit
+operator `supervise run --qualify-grok47-acp` on a fresh Codex-supervised run:
+one 4.7/xhigh terminal Worker, at most 160,000 hard tokens, a 1,200-second child
+timeout, and zero retries or gate corrections. The exception is process-local,
+bound to the repository/run/assignment, and becomes usable only after writing
+`qualification/grok47-acp.json` into authenticated run evidence. Plans, Worker
+text and environment variables cannot grant it; resumption cannot restore it.
+All existing selection, account, identity, schema, confinement and publication
+gates still apply. This does not change 4.6 ACP admission or qualify production
+4.7 ACP. See the [exact qualification command and evidence](docs/qualification/grok47-acp.md). Native
 Grok CLI 1.0.40's current ACP identity format can be parsed from the tagged
 set-model ack and from `currentValue` on the `session/set_config_option`
 response. The source wire contract is `_meta.outputSchema`. A corrected native
@@ -1746,7 +1781,9 @@ historical 4.6 terminal seed remains unchanged. This is not production economics
 It does not replace `--runtime` / `--runtime-bin`, which remain required and still
 select the parent supervisor. Each additional entry is an explicit launch
 allowlist binding for a distinct non-Fake runtime. The operator caller plan and
-`role_models` are not rewritten except for the existing per-profile overlay.
+`role_models` and the direct Worker runtime change only through the declared
+per-profile overlay. See the [bounded model-mix pilot](docs/qualification/model-mix-pilot.md)
+for a three-arm fixture, offline validation, pricing inputs and live gates.
 Unknown runtimes, Fake, empty or relative executables, duplicate additional
 runtimes, and a duplicate of the primary runtime are refused before artifact
 reservation. Declared executables are canonicalized and frozen before

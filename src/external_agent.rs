@@ -90,6 +90,7 @@ mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
 pub(crate) mod executor;
 pub(crate) mod gemini_bridge;
+mod grok_identity;
 mod grok_output;
 mod grok_progress;
 mod grok_steering;
@@ -3905,6 +3906,21 @@ impl ExternalAgentCommand {
             output: &self.output_last_message,
         };
         let contract = if grok_acp_stdio_protocol_selected(self) {
+            if self.model.as_deref() == Some("grok-4.7") {
+                let admitted = self.reasoning_effort.as_deref() == Some("xhigh")
+                    && self.agent_lifecycle.as_ref().is_some_and(|identity| {
+                        crate::supervise::grok_acp_qualification::admits_worker(
+                            &identity.registry_repo,
+                            &identity.run_id,
+                            &selected.assignment_id,
+                        )
+                    });
+                if !admitted {
+                    return Err(
+                        crate::supervise::grok_acp_qualification::QualificationRequired.into(),
+                    );
+                }
+            }
             config.grok_acp_runtime_contract(
                 &context,
                 &crate::runtime_adapter::grok::GROK_ACP_RUNTIME_DESCRIPTOR.required_environment(),
@@ -11206,7 +11222,17 @@ fn grok_bounded_stdout_usage_evidence(stdout: &CapturedBytes) -> GrokStreamUsage
         return GrokStreamUsageEvidence::NotProcessObservable;
     }
     match crate::runtime_adapter::grok::parse_grok_event_stream(stdout.as_bytes()) {
-        Ok(stream) => GrokStreamUsageEvidence::from_usage_status(stream.usage_status()),
+        Ok(stream) => {
+            let mut evidence = GrokStreamUsageEvidence::from_usage_status(stream.usage_status());
+            if let GrokStreamUsageEvidence::Native(native) = &mut evidence {
+                native.served_identity = crate::runtime_adapter::grok::observe_grok_native_usage(
+                    stdout.as_bytes(),
+                    false,
+                )
+                .map(|observation| observation.served_identity().clone());
+            }
+            evidence
+        }
         Err(_) => GrokStreamUsageEvidence::NotProcessObservable,
     }
 }
@@ -11727,6 +11753,11 @@ fn record_completed_target(
             report.error = append_external_error(report.error.take(), Some(message));
         }
     }
+    if context.runtime == ExternalExecutionRuntime::Verified {
+        if let Some(message) = grok_identity::publication_refusal(context.original_spec, report) {
+            report.error = append_external_error(report.error.take(), Some(message.to_string()));
+        }
+    }
     let adapter_runtime = context.spec.invocation.is_adapter_subprocess();
     report.publishable = context.runtime == ExternalExecutionRuntime::Verified
         && safety_verified
@@ -11804,6 +11835,30 @@ fn cursor_managed_publication_refusal(
             "managed Cursor writable run did not prove an assigned write and parent-owned offline check"
                 .to_string(),
         );
+    }
+    // Identity is mandatory even when the caller omitted its selection. The
+    // pinned stream's token counters do not attest to a served model or effort.
+    if evidence
+        .actual_provider_model
+        .as_ref()
+        .is_none_or(|model| model.trim().is_empty())
+        || evidence
+            .actual_effort
+            .as_ref()
+            .is_none_or(|effort| effort.trim().is_empty())
+    {
+        return Some("managed Cursor served model or effort evidence is missing".to_string());
+    }
+    if spec
+        .model
+        .as_ref()
+        .is_none_or(|model| model.trim().is_empty())
+        || spec
+            .reasoning_effort
+            .as_ref()
+            .is_none_or(|effort| effort.trim().is_empty())
+    {
+        return Some("managed Cursor selected model or effort is missing".to_string());
     }
     if spec
         .model

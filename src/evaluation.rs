@@ -82,6 +82,9 @@ pub struct EvaluationProfile {
     pub id: String,
     #[serde(deserialize_with = "deserialize_role_models")]
     pub role_models: BTreeMap<AgentRole, RoleModelSelection>,
+    /// Held-out real-provider only: bind the single direct Worker runtime.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub worker_runtime: Option<crate::supervise::SupervisorRuntime>,
 }
 
 /// Versioned input schema for a controlled model-mix experiment.
@@ -2405,6 +2408,12 @@ fn validate_profiles(profiles: &[EvaluationProfile]) -> Result<(), EvaluationErr
     let mut expected_roles: Option<BTreeSet<AgentRole>> = None;
 
     for (profile_index, profile) in profiles.iter().enumerate() {
+        if profile.worker_runtime.is_some() {
+            return Err(invalid_manifest(
+                "profiles.worker_runtime",
+                "runtime bindings require held-out real-provider observation",
+            ));
+        }
         require_nonempty(&format!("profiles[{profile_index}].id"), &profile.id)?;
         if !ids.insert(profile.id.as_str()) {
             return Err(invalid_manifest(
@@ -3743,6 +3752,7 @@ mod executed_measurements;
 mod executed_summary;
 mod experiment;
 mod prior_input;
+mod runtime_binding;
 pub use crate::merge::held_out::{CommandObservation, CommandObservationStatus};
 pub use crate::supervise::held_out::{
     HeldOutCandidateEvidence, HeldOutCommandEvidence, HeldOutRunBinding,
@@ -3768,6 +3778,10 @@ pub use executed_summary::{
     QUALIFIED_ACCEPTED_TASK_FRACTION_LABEL,
 };
 pub use prior_input::HeldOutPriorDataInput;
+pub use runtime_binding::{
+    validate_held_out_comparison_inputs, HeldOutComparisonInputs, ObservedProfileBinding,
+    ObservedRoleIdentity,
+};
 pub mod rescore;
 pub use experiment::{
     parse_canonical_full_commit_oid, parse_experiment_manifest,

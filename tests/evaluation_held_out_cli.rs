@@ -722,3 +722,31 @@ fn additional_runtime_bin_freeze_refuses_operator_program_mismatch_before_reserv
     assert_eq!(std::env::var_os("MACO_GROK_BIN"), parent_grok);
     Ok(())
 }
+#[test]
+fn model_mix_pilot_validate_only_is_offline_and_retains_no_run() -> anyhow::Result<()> {
+    let workspace = tempfile::TempDir::new()?;
+    let owner = workspace.path().join("owner");
+    git2::Repository::init(&owner)?;
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let output = std::process::Command::new(BIN)
+        .args(["evaluation", "experiment"])
+        .arg(root.join("examples/supervise/model-mix-pilot-manifest.json"))
+        .args(["--validate-only", "--provider-plan"])
+        .arg(root.join("examples/supervise/model-mix-pilot-plan.json"))
+        .args(["--json", "--repo"])
+        .arg(&owner)
+        .output()?;
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let inputs: serde_json::Value = serde_json::from_slice(&output.stdout)?;
+    assert_eq!(inputs["production_eligible"], false);
+    assert_eq!(
+        inputs["effective_plan_sha256"].as_object().unwrap().len(),
+        3
+    );
+    assert!(!owner.join(".maco/o2/runs").exists());
+    Ok(())
+}

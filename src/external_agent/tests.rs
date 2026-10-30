@@ -7209,11 +7209,45 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
     };
     assert_eq!(
         cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
-        Some("managed Cursor observed model or effort does not match the selected launch")
+        Some("managed Cursor served model or effort evidence is missing")
     );
     evidence.actual_provider_model = command.model.clone();
     evidence.actual_effort = command.reasoning_effort.clone();
     assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_none());
+    for (model, effort) in [
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+        (Some("another-model"), Some("high")),
+        (Some("cursor-selected-model"), Some("low")),
+    ] {
+        evidence.actual_provider_model = model.map(str::to_string);
+        evidence.actual_effort = effort.map(str::to_string);
+        assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_some());
+    }
+    evidence.actual_provider_model = command.model.clone();
+    evidence.actual_effort = command.reasoning_effort.clone();
+    for (model, effort) in [
+        (None, None),
+        (None, Some("high")),
+        (Some("cursor-selected-model"), None),
+        (Some(""), Some("high")),
+        (Some("cursor-selected-model"), Some(" ")),
+    ] {
+        command.model = model.map(str::to_string);
+        command.reasoning_effort = effort.map(str::to_string);
+        assert_eq!(
+            cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+            Some("managed Cursor selected model or effort is missing")
+        );
+    }
+    evidence.actual_provider_model = None;
+    evidence.actual_effort = None;
+    assert_eq!(
+        cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
+        Some("managed Cursor served model or effort evidence is missing")
+    );
     Ok(())
 }
 
@@ -8925,16 +8959,90 @@ fn writable_grok_47_binds_selection_schema_protocol_and_worktree_proof() -> Resu
     .with_workspace_access(WorkspaceAccess::ReadWrite)
     .with_writable_launch_target(WritableLaunchTarget::ManagedChildWorktree);
     acp.output_schema = Some(schema);
+    acp = acp.with_agent_lifecycle(temp.path(), "worker", "grok47-acp-gate", "grok-worker");
     let acp = acp
         .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?
         .with_worktree_writable_confinement(writable_grok_confinement(
             SideEffectConfinement::Verified,
         ));
+    let refusal = acp.current_grok_writable_contract().unwrap_err();
+    assert!(refusal.is::<crate::supervise::grok_acp_qualification::QualificationRequired>());
+    assert!(refusal.to_string().contains("--qualify-grok47-acp"));
+    assert!(acp.verified_writable_capabilities(RuntimeId::Grok).is_err());
+    // The legacy 4.6 ACP contract does not require the 4.7 exception.
+    let legacy = acp
+        .clone()
+        .with_model_selection(Some("grok-4.6".into()), Some("xhigh".into()))
+        .with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?;
+    assert_eq!(
+        legacy.current_grok_writable_contract()?.runtime(),
+        TypedRuntime::GrokAcpStdio
+    );
+    let _qualification = crate::supervise::grok_acp_qualification::admit_for_test(
+        temp.path(),
+        "grok47-acp-gate",
+        "grok-worker",
+    );
     let acp_contract = acp.current_grok_writable_contract()?;
     assert_eq!(acp_contract.runtime(), TypedRuntime::GrokAcpStdio);
     assert!(acp
         .verified_writable_capabilities(RuntimeId::Grok)?
         .admits_worktree_writable());
+    assert!(acp
+        .verify_grok_run_account_binding("grok47-acp-gate")
+        .is_err());
+    let mut stale = acp.clone();
+    stale.model = Some("grok-4.6".into());
+    assert!(stale.current_grok_writable_contract().is_err());
+    let mut unbound = acp.clone();
+    unbound.worktree_writable_confinement = None;
+    assert!(unbound
+        .verified_writable_capabilities(RuntimeId::Grok)
+        .is_err());
+    let wrong_run =
+        acp.clone()
+            .with_agent_lifecycle(temp.path(), "worker", "other-run", "grok-worker");
+    assert!(wrong_run.current_grok_writable_contract().is_err());
+    let bound_schema = bind_grok_acp_launch_schema(&acp)?.expect("launch schema");
+    let valid = fixture_acp_parent_evidence(
+        "grok-4.7",
+        "xhigh",
+        Some("grok-4.7"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": true})),
+        None,
+    );
+    assert!(grok_acp_staged_output_bytes(&acp, &valid, true, Some(&bound_schema)).is_ok());
+    assert!(grok_acp_staged_output_bytes(&acp, &valid, true, None).is_err());
+    let invalid_schema = fixture_acp_parent_evidence(
+        "grok-4.7",
+        "xhigh",
+        Some("grok-4.7"),
+        Some("xhigh"),
+        "complete",
+        Some(serde_json::json!({"accepted": "wrong type"})),
+        None,
+    );
+    assert!(
+        grok_acp_staged_output_bytes(&acp, &invalid_schema, true, Some(&bound_schema)).is_err()
+    );
+    for (model, effort) in [
+        (Some("grok-4.6"), Some("xhigh")),
+        (Some("grok-4.7"), Some("low")),
+        (None, None),
+    ] {
+        let mismatched = fixture_acp_parent_evidence(
+            "grok-4.7",
+            "xhigh",
+            model,
+            effort,
+            "complete",
+            Some(serde_json::json!({"accepted": true})),
+            None,
+        );
+        assert!(grok_acp_parent_identity_publication_refusal(&acp, Some(&mismatched)).is_some());
+    }
     // Selected ACP admission never grants the generic headless proof.
     assert!(acp
         .runtime_adapter
@@ -9446,10 +9554,14 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
 
     let report = run_external_agent(&command);
     assert!(
-        report.error.is_none(),
-        "writable Grok production path failed: {:?}",
+        report
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("served model identity is missing")),
+        "bounded effects without served identity must refuse publication: {:?}",
         report.error
     );
+    assert!(!report.publishable);
     assert_eq!(report.exit_code, Some(0));
     assert!(!report.timed_out);
     assert!(report.stdout.target_launch_attempted);
@@ -9624,6 +9736,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             stdin_error: None,
         };
         let protected_controls = protected_worktree_controls(command)?;
+        report.retain_grok_native_usage_for_test(command, &output.stdout, true);
         record_completed_target(
             &mut report,
             output,
@@ -9741,6 +9854,10 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     )?;
     assert_eq!(decoded.id, "readme-worker");
     assert_eq!(decoded.files_changed, [PathBuf::from("README.md")]);
+    assert!(
+        !held.publishable,
+        "a valid report does not supply served identity"
+    );
     assert_eq!(
         serde_json::from_slice::<serde_json::Value>(&fs::read(
             &worker_command.output_last_message
@@ -9752,6 +9869,66 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         restored.output_last_message().is_none(),
         "wire output cannot mint held custody"
     );
+    // Retained CLI 1.0.60 terminal shape: exact modelUsage label, no effort.
+    // Exercise the real publication decision for an already admitted Worker
+    // and the stricter lower-effort qualification through the same path.
+    for (id, label, effort, publishable) in [
+        ("served-46", Some("grok-4.6-build"), "xhigh", true),
+        ("served-47", Some("grok-4.7-build"), "xhigh", false),
+        (
+            "served-unknown",
+            Some("grok-4.6-build-fast"),
+            "xhigh",
+            false,
+        ),
+        ("served-missing", None, "xhigh", false),
+        ("served-low", Some("grok-4.6-build"), "low", false),
+    ] {
+        let mut command = grok_command(id)
+            .with_workspace_access(WorkspaceAccess::ReadWrite)
+            .with_model_selection(Some("grok-4.6".into()), Some(effort.into()))
+            .with_agent_lifecycle(temp.path(), "worker", "run", "readme-worker");
+        command.output_schema = worker_command.output_schema.clone();
+        let mut terminal = serde_json::json!({"type":"end", "stopReason":"end_turn",
+            "sessionId":"s", "requestId":"r", "structuredOutput":worker,
+            "usage":{"input_tokens":9,"output_tokens":3,"total_tokens":12}});
+        if let Some(label) = label {
+            terminal["modelUsage"] = serde_json::json!({label: {}});
+        }
+        let report = finish(
+            id,
+            &command,
+            CapturedBytes::from_bytes_for_test((terminal.to_string() + "\n").into_bytes()),
+        )?;
+        assert_eq!(report.publishable, publishable, "{id}: {:?}", report.error);
+        assert_eq!(
+            report
+                .authenticated_grok_usage(&command)
+                .unwrap()
+                .0
+                .total_tokens,
+            12
+        );
+        assert_eq!(
+            serde_json::from_slice::<serde_json::Value>(
+                report
+                    .output_last_message()
+                    .expect("held structured Worker report")
+            )?,
+            worker
+        );
+        let evidence = serde_json::to_value(&report.grok_stream_usage_evidence)?;
+        assert_eq!(
+            evidence["served_identity"]["observed_effort"],
+            serde_json::Value::Null
+        );
+        if let Some(label) = label {
+            assert_eq!(
+                evidence["served_identity"]["observed_models"],
+                serde_json::json!([label])
+            );
+        }
+    }
     let native_report = finish(
         "native",
         &grok_command("native"),
@@ -9761,6 +9938,12 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
         native_report.grok_stream_usage_evidence,
         Some(GrokStreamUsageEvidence::Native(
             GrokStreamUsageNativeEvidence {
+                served_identity: Some(
+                    crate::runtime_adapter::grok::identity::GrokServedIdentityEvidence::from_terminal(
+                        native_stdout.as_bytes(),
+                        true,
+                    ),
+                ),
                 input_tokens: 9,
                 output_tokens: 3,
                 cache_read_input_tokens: None,

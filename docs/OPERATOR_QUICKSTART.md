@@ -225,6 +225,14 @@ Prerequisites:
   match `MACO_GROK_BIN`, is outside this quickstart.
 - Unset `MACO_GROK_INTERACTION_PROTOCOL`. Unset, the protocol is
   headless streaming JSON. The only other accepted value is `acp_stdio`.
+  Grok 4.7 ACP writable launches are refused with
+  `writable_grok47_acp_qualification_required` until qualified. The operator-only
+  `supervise run --qualify-grok47-acp` exception is restricted to a fresh
+  Codex-supervised, bounded single-Worker qualification and is recorded in
+  `qualification/grok47-acp.json` under that run's authenticated artifacts.
+  It grants no account, prior, schema, identity or publication exemption.
+  4.6 ACP behavior is unchanged. Follow the
+  [4.7 ACP qualification command](qualification/grok47-acp.md) for this exception.
 Owner device login. `cam-grok-setup` is Linux-only and does not start login.
 The Nix `maco` package includes the binary. From a source checkout:
 ```bash
@@ -464,6 +472,17 @@ and returns maco's status through `systemd-run --scope`. Use a fresh run id and
 a clean target repository; the plan copy requires no target-repository change.
 
 ## Troubleshooting
+
+Managed headless Grok writable publication checks exact `end.modelUsage` keys
+against the admitted model using the explicit receipt-backed mappings
+`grok-4.6` / `grok-4.6-build` and `grok-4.7` / `grok-4.7-build`.
+Missing, ambiguous, malformed or mismatched model identity refuses publication.
+CLI 1.0.60 supplies no served effort; it stays explicitly unknown and preserves
+publication for the existing standard 4.6/4.7 `xhigh` lanes. An observed effort
+contradiction still refuses publication. Lower-effort and future qualification-only
+lanes require matching observed effort and remain closed with this CLI.
+Native token charges survive identity refusal. See the
+[identity qualification gate and mapping receipts](qualification/grok-lower-effort.md).
 
 If selection reports that required model `gpt-6.1-sol` is absent or unavailable,
 check `codex --version` at the canonical trusted executable, install at least

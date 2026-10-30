@@ -3,12 +3,17 @@
 Status: prepared; real supplied-source review is unproven. Follow the
 [shared preparation and evidence contract](README.md). The
 [fixture](../../examples/supervise/qualification-researcher-source-input.json)
-uses one non-delegating read-only Researcher on `gpt-6.1-sol` / `medium` and
+uses one non-delegating read-only Researcher on `gpt-6.1-sol` / `xhigh` and
 independent default review lenses. It declares exactly one nonempty snapshot
 file, [source-packet.md](../../examples/supervise/qualification-data/source-packet.md),
 SHA256 `1cfe51c5e96a38d3dabe431faf3b50e34b2512221c585e80d3b313cd3a87f53e`.
 Its flawed ledger proposal gives the review concrete source observations and
 counterexamples; it is not an empty diff or a receipt-only exercise.
+
+The bundled `review_gate` prior admits `xhigh` for the Researcher. The original
+`medium` preference passed plan parsing but was refused by live selection with
+`effort_incompatible`, before any provider assignment. This correction supplies
+no new account or quality evidence.
 
 The packet must already be committed in the selected managed snapshot. Do not
 stage an ambient parent file, infer mounts from task text, grant directory
@@ -40,6 +45,8 @@ The plan has a finite 160,000-token ceiling, 4,000-token parent/Researcher/revie
 estimates, no retries and a 1,200-second child timeout. These are admission
 estimates, not provider-call caps. A timeout or insufficient allowance is a
 retained failed/inconclusive attempt, not a reason to remove the bounds.
+The effort correction leaves the ceiling and estimates unchanged; actual
+consumption at `xhigh` remains unproven.
 
 Required acceptance evidence:
 

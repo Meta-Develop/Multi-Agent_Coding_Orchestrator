@@ -1,0 +1,14 @@
+{
+  "cli_version": "1.0.60",
+  "source_sha256": "ef06c217147682fb3e1d8e29bc4c511b8bd401fb29c916cde06c0f6af8d5a3a2",
+  "terminal_field_names": [
+    "cwd", "modelUsage", "num_turns", "requestId", "sessionId", "stopReason",
+    "structuredOutput", "total_cost_usd", "total_cost_usd_ticks", "type", "usage"
+  ],
+  "model_usage_keys": ["grok-4.6-build"],
+  "model_usage_entry_field_names": [
+    "cacheCreationInputTokens", "cacheReadInputTokens", "costUSD", "inputTokens",
+    "modelCalls", "outputTokens"
+  ],
+  "observed_effort_field": null
+}
