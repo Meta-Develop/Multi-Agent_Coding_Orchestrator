@@ -1706,8 +1706,12 @@ maco evaluation experiment <manifest.json> \
 the evaluated source repository, declare exactly one assignment, and must not
 declare generated follow-ups, `execution_target`, or evidence-only re-audit
 controls. The frozen original plan bytes and full parsed document (consultant,
-plan metadata, assignment metadata) are retained; only profile `role_models` are
-overlaid per run and revalidated. Each manifest profile supplies those
+plan metadata, assignment metadata) are retained; profile `role_models` and an
+optional `worker_runtime` are overlaid per run and revalidated. `worker_runtime`
+supports `codex` or `grok` for one direct execution Worker only. When used, every
+arm must bind it explicitly and declare model/effort for all six roles. All other plan
+inputs, review lenses, validation, limits and source snapshot share a checked
+comparison hash; mismatches are refused before launch. Each manifest profile supplies those
 `role_models`; observation manifests accept one profile (comparison manifests
 still require two). Profile `unavailable_model_fallback` must not be
 `LocalDeterministicFake`. The parent still executes held-out argv against
@@ -1771,7 +1775,9 @@ historical 4.6 terminal seed remains unchanged. This is not production economics
 It does not replace `--runtime` / `--runtime-bin`, which remain required and still
 select the parent supervisor. Each additional entry is an explicit launch
 allowlist binding for a distinct non-Fake runtime. The operator caller plan and
-`role_models` are not rewritten except for the existing per-profile overlay.
+`role_models` and the direct Worker runtime change only through the declared
+per-profile overlay. See the [bounded model-mix pilot](docs/qualification/model-mix-pilot.md)
+for a three-arm fixture, offline validation, pricing inputs and live gates.
 Unknown runtimes, Fake, empty or relative executables, duplicate additional
 runtimes, and a duplicate of the primary runtime are refused before artifact
 reservation. Declared executables are canonicalized and frozen before

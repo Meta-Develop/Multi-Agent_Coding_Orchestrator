@@ -1,9 +1,10 @@
 # Live qualification preparation
 
 These fixtures prepare separate acceptance gates for [nested token control](nested-codex-budget.md),
-[read-only source inspection](researcher-source-input.md), and a
-[lower-effort writable lane](grok-lower-effort.md), and
-[4.7 ACP managed-child execution](grok47-acp.md). None records a passed live run.
+[read-only source inspection](researcher-source-input.md), a
+[lower-effort writable lane](grok-lower-effort.md),
+[4.7 ACP managed-child execution](grok47-acp.md), and a
+[cross-runtime model-mix pilot](model-mix-pilot.md). None records a passed live run.
 Plan validation is offline and does not assert account access, selector
 eligibility, containment, provider identity, usage, or successful acceptance.
 
@@ -57,8 +58,13 @@ The Codex fixtures request efforts admitted by the bundled role/task priors:
 `high` for the delegating parent and terminal writable Workers, and `xhigh` for
 Researcher and control/review roles. A providerless regression runs the live
 selection bridge against every qualification plan with synthetic model
-membership and the bundled priors. It requires the Codex fixtures to pass and
-the deliberate `grok-4.6` / `low` fixture to refuse with `effort_incompatible`.
+membership and the bundled priors. It requires the Codex fixtures to pass,
+the deliberate `grok-4.6` / `low` fixture to refuse with `effort_incompatible`,
+and the `grok-4.7` / `xhigh` ACP fixture to refuse before provider release with
+`model_unavailable` for its Worker. The bundled priors have no row admitting
+that 4.7 task profile; a live ACP run requires an accepted evidence-backed
+`--prior-data` snapshot admitting the exact lane. The qualification flag does
+not supply a prior or override this refusal.
 Synthetic membership establishes no account access or live admission. Effort
 preferences are outside the routing declaration and task-bound verification
 contracts, so this correction preserves their hashes and validates replay
