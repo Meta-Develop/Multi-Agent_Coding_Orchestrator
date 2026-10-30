@@ -144,6 +144,10 @@ enum DispatchBudgetReservationState {
     Settled,
 }
 
+#[cfg(all(test, target_os = "linux"))]
+#[path = "gemini_usage_tests.rs"]
+mod gemini_usage_tests;
+
 struct DispatchBudgetReservation<'a> {
     ledger: &'a RunBudgetLedger,
     reservation: BudgetReservation,
@@ -260,24 +264,40 @@ impl DispatchBudgetReservation<'_> {
         let DispatchBudgetReservationState::Invoked(launch_runtime) = self.state else {
             bail!("budget reservation was settled before its dispatch was invoked")
         };
-        if launch_runtime == SupervisorRuntime::GeminiCli && command.uses_gemini_bridge() {
-            // Whole-invocation/model allocation remains unknown. Only the held
-            // total lower bound reaches the ledger; never manufacture input/
-            // output counters or restore requested-model pricing from reports.
+        if launch_runtime == SupervisorRuntime::GeminiCli {
+            // Complete allocation comes only from the private bridge. Failed or
+            // partial attempts retain their lower bound without becoming zero.
             let held = run.gemini_bridge_evidence();
+            let usage = held.and_then(|evidence| evidence.usage_for_command(command));
+            let model = usage.and_then(|_| held?.actual_model().map(str::to_owned));
             let reliability = if held.is_some_and(|evidence| evidence.no_release_quiescent)
                 || !external_dispatch_may_have_started(run, launch_runtime)
             {
                 self.ledger.release(self.reservation.id)?;
                 DispatchUsageReliability::NotStarted
             } else {
-                let measurement = held.and_then(|evidence| evidence.tokens).map_or(
-                    UsageMeasurement::Missing,
-                    |tokens| UsageMeasurement::Estimated {
-                        tokens,
-                        cost_usd: None,
-                    },
-                );
+                let (measurement, reliability) = if let Some(usage) = usage.filter(|_| {
+                    external_process_completed(run, launch_runtime)
+                        && external_safety_verified(run, launch_runtime)
+                }) {
+                    (
+                        UsageMeasurement::Reliable {
+                            tokens: usage.total_tokens,
+                            cost_usd: None,
+                        },
+                        DispatchUsageReliability::Reliable,
+                    )
+                } else if let Some(tokens) = held.and_then(|evidence| evidence.tokens) {
+                    (
+                        UsageMeasurement::Estimated {
+                            tokens,
+                            cost_usd: None,
+                        },
+                        DispatchUsageReliability::Estimated,
+                    )
+                } else {
+                    (UsageMeasurement::Missing, DispatchUsageReliability::Missing)
+                };
                 self.ledger.reconcile_priced_dispatch(
                     self.reservation.id,
                     measurement,
@@ -290,20 +310,16 @@ impl DispatchBudgetReservation<'_> {
                             .as_ref()
                             .map(|view| view.provenance()),
                         runtime: Some(runtime_name(launch_runtime).to_string()),
-                        model: None,
+                        model: model.clone(),
                     }),
                 )?;
-                if held.and_then(|evidence| evidence.tokens).is_some() {
-                    DispatchUsageReliability::Estimated
-                } else {
-                    DispatchUsageReliability::Missing
-                }
+                reliability
             };
             self.state = DispatchBudgetReservationState::Settled;
             return Ok(DispatchUsageSettlement {
-                observed_usage: None,
+                observed_usage: usage,
                 reliability,
-                model: None,
+                model,
                 cost_usd: None,
             });
         }
