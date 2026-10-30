@@ -9146,7 +9146,7 @@ fn writable_grok_selected_request_has_only_the_bounded_worktree_effect_and_resul
 printf '%s\n' "$@" > selected-request.txt
 printf 'bounded worktree effect\n' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"bounded result"}'
-printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request"}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","modelUsage":{"grok-4.6-build":{"inputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"outputTokens":4,"modelCalls":1}},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
 "#,
     )?;
     fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
@@ -9417,7 +9417,7 @@ printf '%s\n' 'request-begin' "$no_auto_update" "$@" 'request-end' >&2
 printf '%s\n' 'approval-contract:inner-sandbox=off;outer-containment=required;headless=always-approve;web-search=disabled;memory=disabled;subagents=disabled' >&2
 printf '%s\n' 'bounded managed child write' > bounded-result.txt
 printf '%s\n' '{"type":"text","data":"claimed path written"}'
-printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
+printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-session","requestId":"fixture-request","structuredOutput":{"accepted":true,"path":"bounded-result.txt"},"modelUsage":{"grok-4.6-build":{"inputTokens":12,"cacheReadInputTokens":0,"cacheCreationInputTokens":0,"outputTokens":4,"modelCalls":1}},"usage":{"input_tokens":12,"cache_read_input_tokens":0,"cache_creation_input_tokens":0,"output_tokens":4,"reasoning_tokens":0,"total_tokens":16}}'
 "#,
     )?;
     let hidden_auth = grok_home
@@ -9553,15 +9553,8 @@ printf '%s\n' '{"type":"end","stopReason":"end_turn","sessionId":"fixture-sessio
     expected_stderr.push(APPROVAL_RECORD.to_string());
 
     let report = run_external_agent(&command);
-    assert!(
-        report
-            .error
-            .as_deref()
-            .is_some_and(|error| error.contains("served model identity is missing")),
-        "bounded effects without served identity must refuse publication: {:?}",
-        report.error
-    );
-    assert!(!report.publishable);
+    assert_eq!(report.error, None);
+    assert!(report.publishable);
     assert_eq!(report.exit_code, Some(0));
     assert!(!report.timed_out);
     assert!(report.stdout.target_launch_attempted);
