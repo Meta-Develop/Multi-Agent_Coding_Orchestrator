@@ -1716,7 +1716,17 @@ Writable managed-child launch retains the legacy exact typed contract for
 `grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
 supported only with `headless_streaming_json`. The Issue #604 publication gate
 is implemented. Grok 4.7 ACP writable admission stays off pending Linux
-credential-confined, account-bound managed acceptance in Issue #616. Native
+credential-confined, account-bound managed acceptance in Issue #616, returning
+`writable_grok47_acp_qualification_required`. The sole exception is an explicit
+operator `supervise run --qualify-grok47-acp` on a fresh Codex-supervised run:
+one 4.7/xhigh terminal Worker, at most 160,000 hard tokens, a 1,200-second child
+timeout, and zero retries or gate corrections. The exception is process-local,
+bound to the repository/run/assignment, and becomes usable only after writing
+`qualification/grok47-acp.json` into authenticated run evidence. Plans, Worker
+text and environment variables cannot grant it; resumption cannot restore it.
+All existing selection, account, identity, schema, confinement and publication
+gates still apply. This does not change 4.6 ACP admission or qualify production
+4.7 ACP. See the [exact qualification command and evidence](docs/qualification/grok47-acp.md). Native
 Grok CLI 1.0.40's current ACP identity format can be parsed from the tagged
 set-model ack and from `currentValue` on the `session/set_config_option`
 response. The source wire contract is `_meta.outputSchema`. A corrected native

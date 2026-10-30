@@ -225,6 +225,14 @@ Prerequisites:
   match `MACO_GROK_BIN`, is outside this quickstart.
 - Unset `MACO_GROK_INTERACTION_PROTOCOL`. Unset, the protocol is
   headless streaming JSON. The only other accepted value is `acp_stdio`.
+  Grok 4.7 ACP writable launches are refused with
+  `writable_grok47_acp_qualification_required` until qualified. The operator-only
+  `supervise run --qualify-grok47-acp` exception is restricted to a fresh
+  Codex-supervised, bounded single-Worker qualification and is recorded in
+  `qualification/grok47-acp.json` under that run's authenticated artifacts.
+  It grants no account, prior, schema, identity or publication exemption.
+  4.6 ACP behavior is unchanged. Follow the
+  [4.7 ACP qualification command](qualification/grok47-acp.md) for this exception.
 Owner device login. `cam-grok-setup` is Linux-only and does not start login.
 The Nix `maco` package includes the binary. From a source checkout:
 ```bash
