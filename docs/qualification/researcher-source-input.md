@@ -29,7 +29,7 @@ printf '%s  %s\n' \
 git ls-files --error-unmatch examples/supervise/qualification-data/source-packet.md || exit 1
 sha256sum "$fixture" > "$OUT/fixture-sha256.txt"
 "$maco" supervise plan "$fixture" --repo "$repo" --json > "$OUT/checked-plan.json" || exit 1
-if timeout --signal=TERM --kill-after=30s 3600 systemd-run --user --scope --quiet -p Delegate=yes \
+if timeout --signal=TERM --kill-after=30s 5400 systemd-run --user --scope --quiet -p Delegate=yes \
   --working-directory="$repo" -- "$maco" supervise run "$fixture" \
   --runtime codex --repo "$repo" --run-id "$run_id" --codex-bin codex \
   --max-concurrent-children 1 --provider-inflight-limit 1 \
@@ -41,12 +41,21 @@ if "$maco" supervise collect "$run_id" --repo "$repo" --json \
 printf '%s\n' "$rc" > "$OUT/collect.exit"
 ```
 
-The plan has a finite 160,000-token ceiling, 4,000-token parent/Researcher/reviewer
-estimates, no retries and a 1,200-second child timeout. These are admission
-estimates, not provider-call caps. A timeout or insufficient allowance is a
+The plan has a finite 240,000-token ceiling, 4,000-token parent/Researcher/reviewer
+estimates, no retries and a 1,200-second child timeout. The ceiling adds roughly
+20% headroom to the historical supplied-source failure: 41,321 Researcher +
+154,651 Auditor = 195,972 tokens; 195,972 × 1.20 = 235,166.4, rounded up to
+240,000 (44,028 tokens, about 22.5% headroom). Historical positive routes used
+[130,507 tokens](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/680#issuecomment-5850136768)
+and [127,944 tokens](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/631#issuecomment-5868103079);
+neither qualifies this fixture or proves its current `xhigh` consumption.
+
+The outer command deadline is 5,400 seconds: four serial invocations (one
+Researcher and three review lenses) × at most 1,200 seconds = 4,800 seconds,
+plus 600 seconds for overhead and finalization. The 30-second kill grace remains
+separate. These bounds are admission limits, not provider spending caps; role
+estimates do not cap actual usage. A timeout or insufficient allowance is a
 retained failed/inconclusive attempt, not a reason to remove the bounds.
-The effort correction leaves the ceiling and estimates unchanged; actual
-consumption at `xhigh` remains unproven.
 
 Required acceptance evidence:
 
@@ -73,6 +82,9 @@ write-denial and actual-profile source-input regressions, the pinned providerles
 inner-sandbox case where installed, and the NotStarted versus unknown-helper
 accounting/late-refusal regressions. Do not mutate live input capabilities to
 conduct paid negative probes. Retain the historical missing-mount failures and
-the 195,972-token failed review (41,321 Researcher, 154,651 Auditor); none of its
-lenses inspected the packet. Incomplete historical evidence and prior 0/3 lens
+the [195,972-token failed review](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/680#issuecomment-5862565454)
+(41,321 Researcher, 154,651 Auditor); none of its lenses inspected the packet.
+The earlier bad-contract attempt consumed 212,868 tokens before the final lens;
+the new ceiling leaves only 27,132 tokens beyond that partial trajectory and
+does not guarantee completion. Incomplete historical evidence and prior 0/3 lens
 results remain failures. This qualification does not close #629 or #680.
