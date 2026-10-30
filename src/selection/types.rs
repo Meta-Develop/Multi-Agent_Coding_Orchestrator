@@ -552,8 +552,13 @@ pub struct FixedCauseRelaunchEvidence {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OutcomeRecord {
+    /// Settlement provenance for each attributable dispatch; empty on legacy rows.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pricing: Vec<crate::supervise::OutcomeChargePricing>,
     pub attempt_id: String,
     pub task: TaskProfile,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_shape_identity: Option<AssignmentShapeIdentity>,
     pub candidate: CandidateKey,
     pub result: OutcomeResult,
     pub failure_class: Option<FailureClass>,
@@ -634,6 +639,9 @@ pub struct DynamicSignals {
 #[serde(deny_unknown_fields)]
 pub struct SelectionInput {
     pub task: TaskProfile,
+    /// Exact parent-validated assignment; absent for legacy and role-only inputs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignment_shape_identity: Option<AssignmentShapeIdentity>,
     pub catalogs: Vec<RuntimeCatalog>,
     pub pools: Vec<RuntimePoolState>,
     /// Exact primary pool whose exhaustion policy governs this decision.

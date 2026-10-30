@@ -15,6 +15,7 @@ use crate::selection::{
     CandidateKey, FailureClass, OutcomeRecord, OutcomeResult, ReasoningEffort, RuntimeCatalog,
     TaskProfile,
 };
+use crate::supervise_budget::BudgetReservationId;
 use std::collections::BTreeMap;
 use std::sync::Mutex;
 
@@ -65,6 +66,8 @@ impl AttemptAttributableCosts {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct AttemptOutcomeEvidence {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pricing: Vec<OutcomeChargePricing>,
     pub version: u32,
     pub run_id: String,
     pub assignment_id: String,
@@ -223,6 +226,7 @@ pub(super) fn record_child_attempt_outcome(
         dated_plan_pricing,
         parent_phase_continuation,
         None,
+        None,
     )
 }
 
@@ -245,20 +249,42 @@ pub(super) fn record_child_attempt_outcome_with_account_observe(
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
     parent_phase_continuation: Option<AttemptParentPhaseContinuation>,
     account_observe: Option<(AccountObserveOutcomeKind, Option<u64>)>,
+    settlement: Option<(&RunBudgetLedger, BudgetReservationId)>,
 ) -> Result<AttemptOutcomeEvidence> {
     let selection =
         selection_binding_for_attempt(role, assignment_id, attempt, events, initial_events);
     let frozen_catalogs =
         selection_event_for_attempt(role, assignment_id, attempt, events, initial_events)
             .map(|event| event.provenance.normalized_input.catalogs.as_slice());
-    let (observed_candidate, worker_observed_microunits) =
+    let (observed_candidate, mut worker_observed_microunits) =
         parent_attempt_observation(external_run, frozen_catalogs, dated_plan_pricing);
+    let mut pricing = Vec::new();
+    if let Some((ledger, reservation_id)) = settlement {
+        let charge = settled_outcome_charge(ledger, reservation_id)?;
+        let native_cost = external_run.and_then(native_outcome_cost_microunits);
+        worker_observed_microunits =
+            native_cost.or_else(|| charge.as_ref().and_then(settled_charge_microunits));
+        if let Some(charge) = outcome_charge_pricing(
+            ledger,
+            reservation_id,
+            charge,
+            native_cost,
+            if attempt == 1 {
+                OutcomeCostPhase::Execution
+            } else {
+                OutcomeCostPhase::Rework
+            },
+        ) {
+            pricing.push(charge);
+        }
+    }
     let (execution_cost_microunits, rework_cost_microunits) =
         classify_worker_observed_spend(attempt, worker_observed_microunits);
     let environment_cost_microunits = account_observe.and_then(|(kind, microunits)| {
         environment_cost_microunits_from_account_observe(kind, microunits)
     });
     let mut evidence = AttemptOutcomeEvidence {
+        pricing,
         version: ATTEMPT_EVIDENCE_VERSION,
         run_id: run_id.as_str().to_string(),
         assignment_id: assignment_id.to_string(),
@@ -290,6 +316,55 @@ pub(super) fn record_child_attempt_outcome_with_account_observe(
         persist_proven_no_environment_attributable_cost(artifacts, &mut evidence)?;
     }
     Ok(evidence)
+}
+
+pub(super) fn settled_outcome_charge(
+    ledger: &RunBudgetLedger,
+    reservation_id: BudgetReservationId,
+) -> Result<Option<BudgetChargeReport>> {
+    Ok(ledger
+        .report()?
+        .charges
+        .into_iter()
+        .find(|charge| charge.reservation_id == reservation_id.get()))
+}
+
+fn settled_charge_microunits(charge: &BudgetChargeReport) -> Option<u64> {
+    if !charge.usage_complete {
+        return None;
+    }
+    let amount = charge.cost_usd? * DATED_PLAN_COST_MICROUNITS_PER_USD;
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    (amount.is_finite() && amount >= 0.0 && amount.round() < u64::MAX as f64)
+        .then(|| amount.round() as u64)
+}
+
+fn outcome_charge_pricing(
+    ledger: &RunBudgetLedger,
+    reservation_id: BudgetReservationId,
+    charge: Option<BudgetChargeReport>,
+    native_cost: Option<u64>,
+    phase: OutcomeCostPhase,
+) -> Option<OutcomeChargePricing> {
+    let mut pricing = charge.map(|charge| charge.pricing).or_else(|| {
+        native_cost.map(|_| ChargePricing {
+            basis: ChargePricingBasis::ProviderNativeCostEquivalent,
+            contract: ledger
+                .operator_pricing
+                .as_ref()
+                .map(|view| view.provenance()),
+            runtime: Some("grok".to_string()),
+            model: None,
+        })
+    })?;
+    if native_cost.is_some() {
+        pricing.basis = ChargePricingBasis::ProviderNativeCostEquivalent;
+    }
+    Some(OutcomeChargePricing {
+        reservation_id: reservation_id.get(),
+        phase,
+        pricing,
+    })
 }
 
 fn classify_worker_observed_spend(
@@ -435,6 +510,13 @@ fn attributable_execution_cost_microunits(evidence: &GrokAcpParentEvidence) -> O
     }
 }
 
+pub(super) fn native_outcome_cost_microunits(run: &ExternalAgentRun) -> Option<u64> {
+    if run.codex_parent_evidence.is_some() {
+        return None;
+    }
+    attributable_execution_cost_microunits(run.grok_acp_parent_evidence.as_ref()?)
+}
+
 fn attributable_codex_execution_cost_microunits(
     external_run: &ExternalAgentRun,
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
@@ -475,6 +557,7 @@ fn dated_plan_token_cost_microunits(
     Some(rounded as u64)
 }
 
+#[cfg(test)]
 fn attributable_parent_auditor_cost_microunits(
     external_run: &ExternalAgentRun,
     dated_plan_pricing: &BTreeMap<String, ModelPricing>,
@@ -505,6 +588,7 @@ fn attributable_parent_auditor_cost_microunits(
 /// at least one dispatch retain `None` rather than a partial sum.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct ParentWorkerAttemptReviewCostBinding {
+    pricing: Vec<OutcomeChargePricing>,
     assignment_id: String,
     worker_attempt: usize,
     review_cycle_slot: ParentDispatchedReviewCycleSlot,
@@ -522,6 +606,7 @@ impl ParentWorkerAttemptReviewCostBinding {
         review_cycle_slot: ParentDispatchedReviewCycleSlot,
     ) -> Self {
         Self {
+            pricing: Vec::new(),
             assignment_id: assignment_id.to_string(),
             worker_attempt,
             review_cycle_slot,
@@ -568,6 +653,7 @@ impl ParentWorkerAttemptReviewCostBinding {
             && self.parent_auditor_invocations == self.planned_lens_count
     }
 
+    #[cfg(test)]
     pub(super) fn observe_parent_auditor_external_run(
         &mut self,
         external_run: &ExternalAgentRun,
@@ -575,6 +661,42 @@ impl ParentWorkerAttemptReviewCostBinding {
     ) {
         self.parent_auditor_invocations += 1;
         let addend = attributable_parent_auditor_cost_microunits(external_run, dated_plan_pricing);
+        self.add_observed_cost(addend);
+    }
+
+    pub(super) fn observe_settled_parent_auditor(
+        &mut self,
+        ledger: &RunBudgetLedger,
+        reservation_id: BudgetReservationId,
+        native_cost: Option<u64>,
+    ) -> Result<()> {
+        self.parent_auditor_invocations += 1;
+        let charge = settled_outcome_charge(ledger, reservation_id);
+        let addend = native_cost.or_else(|| {
+            charge
+                .as_ref()
+                .ok()
+                .and_then(|charge| charge.as_ref())
+                .and_then(settled_charge_microunits)
+        });
+        self.add_observed_cost(addend);
+        if let Some(charge) = outcome_charge_pricing(
+            ledger,
+            reservation_id,
+            charge?,
+            native_cost,
+            match self.review_cycle_slot {
+                ParentDispatchedReviewCycleSlot::FirstCycle => OutcomeCostPhase::Review,
+                ParentDispatchedReviewCycleSlot::SubsequentCycle => OutcomeCostPhase::Rereview,
+                ParentDispatchedReviewCycleSlot::Unknown => OutcomeCostPhase::UnknownReview,
+            },
+        ) {
+            self.pricing.push(charge);
+        }
+        Ok(())
+    }
+
+    fn add_observed_cost(&mut self, addend: Option<u64>) {
         self.total_microunits = match (self.total_microunits, addend) {
             (_, None) => None,
             (None, Some(microunits)) if self.parent_auditor_invocations == 1 => Some(microunits),
@@ -629,8 +751,13 @@ pub(super) fn persist_worker_attempt_review_cost(
             attempt_record.attempt
         );
     }
+    for charge in &binding.pricing {
+        if !attempt_record.pricing.contains(charge) {
+            attempt_record.pricing.push(charge.clone());
+        }
+    }
     let Some(microunits) = binding.persistable_review_phase_cost_microunits() else {
-        return Ok(());
+        return write_attempt_evidence(artifacts, attempt_record);
     };
     match binding.review_cycle_slot() {
         ParentDispatchedReviewCycleSlot::FirstCycle => {
@@ -893,7 +1020,11 @@ fn selection_binding_for_attempt(
                     .value
                     .clone(),
                 task: event.provenance.normalized_task.clone(),
-                assignment_shape_identity: None,
+                assignment_shape_identity: event
+                    .provenance
+                    .normalized_input
+                    .assignment_shape_identity
+                    .clone(),
                 requested_candidate: choice.candidate.clone(),
             })
         },
@@ -983,9 +1114,17 @@ pub(super) struct FrozenOutcomeHistory {
 
 impl FrozenOutcomeHistory {
     pub fn outcomes_for(&self, task: &TaskProfile) -> Vec<OutcomeRecord> {
+        self.outcomes_for_shape(task, None)
+    }
+
+    pub(super) fn outcomes_for_shape(
+        &self,
+        task: &TaskProfile,
+        identity: Option<&crate::selection::AssignmentShapeIdentity>,
+    ) -> Vec<OutcomeRecord> {
         self.rows
             .iter()
-            .filter(|row| &row.task == task)
+            .filter(|row| &row.task == task && row.assignment_shape_identity.as_ref() == identity)
             .cloned()
             .collect()
     }
@@ -1138,6 +1277,9 @@ pub(super) fn load_frozen_outcome_history(
                         && event.provenance.input_digests.normalized_input.value
                             == binding.normalized_input_sha256
                         && event.provenance.normalized_task == binding.task
+                        && event.provenance.normalized_input.task == binding.task
+                        && event.provenance.normalized_input.assignment_shape_identity
+                            == binding.assignment_shape_identity
                         && event
                             .provenance
                             .choice
@@ -1252,8 +1394,10 @@ fn project_numeric_row(row: &AttemptOutcomeEvidence) -> Option<OutcomeRecord> {
     let [execution, review, rework, rereview, environment] = row.costs.complete()?;
     let attempt_id = format!("{}:{}:{}", row.run_id, row.assignment_id, row.attempt);
     Some(OutcomeRecord {
+        pricing: row.pricing.clone(),
         attempt_id,
         task: binding.task.clone(),
+        assignment_shape_identity: binding.assignment_shape_identity.clone(),
         candidate: observed.clone(),
         result,
         failure_class: row.failure_class,
@@ -1430,6 +1574,7 @@ mod tests {
             effort: ReasoningEffort::High,
         };
         AttemptOutcomeEvidence {
+            pricing: Vec::new(),
             version: ATTEMPT_EVIDENCE_VERSION,
             run_id: "run-1".to_string(),
             assignment_id: "assignment-1".to_string(),
@@ -1470,6 +1615,134 @@ mod tests {
     }
 
     #[test]
+    fn outcome_exports_retain_settled_contract_and_unpriced_costs() -> Result<()> {
+        for priced in [true, false] {
+            let (_temp, repo) = super::super::tests::injected_repository();
+            let run_id = RunId::new(if priced {
+                "priced-outcome"
+            } else {
+                "unpriced-outcome"
+            })?;
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                run_id.clone(),
+                "maco-supervise",
+            )?;
+            let mut journal = None;
+            let mut kpis = AutonomyKpiCollector::default();
+            let artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut writer,
+                journal: &mut journal,
+                autonomy_kpis: &mut kpis,
+                checkpoint: None,
+            });
+            let mut plan: SupervisorPlan = serde_json::from_value(json!({}))?;
+            plan.model_pricing.insert(
+                "fixture-model".to_string(),
+                ModelPricing {
+                    input_usd_per_million_tokens: 99.0,
+                    output_usd_per_million_tokens: 99.0,
+                },
+            );
+            let mut ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+            operator_pricing::synthetic_ledger(&plan, &mut ledger);
+            let provenance = ledger.report()?.pricing_contract;
+            let reserve_charge = |role| -> Result<BudgetReservation> {
+                let BudgetAdmission::Admitted { reservation, .. } =
+                    ledger.reserve(BudgetReservationRequest {
+                        role,
+                        tokens: 10,
+                        cost_usd: Some(0.5),
+                    })?
+                else {
+                    panic!("reservation")
+                };
+                ledger.reconcile_priced_dispatch(
+                    reservation.id,
+                    UsageMeasurement::Reliable {
+                        tokens: 10,
+                        cost_usd: priced.then_some(0.125),
+                    },
+                    Some("codex"),
+                    Some(ChargePricing {
+                        basis: if priced {
+                            ChargePricingBasis::OperatorContractEstimate
+                        } else {
+                            ChargePricingBasis::Unpriced
+                        },
+                        contract: provenance.clone(),
+                        runtime: Some("codex".to_string()),
+                        model: priced.then(|| "fixture-model".to_string()),
+                    }),
+                )?;
+                Ok(reservation)
+            };
+            let worker = reserve_charge(AgentRole::Worker)?;
+            let mut row = record_child_attempt_outcome_with_account_observe(
+                &artifacts,
+                &run_id,
+                "assignment-1",
+                1,
+                AgentRole::Worker,
+                &[],
+                &[],
+                "codex",
+                Some("fixture-model"),
+                Some("high"),
+                true,
+                false,
+                SupervisorExecutionRuntime::Verified,
+                None,
+                &plan.model_pricing,
+                None,
+                None,
+                Some((&ledger, worker.id)),
+            )?;
+            assert_eq!(
+                row.costs.execution_cost_microunits,
+                priced.then_some(12_500)
+            );
+            assert_eq!(row.pricing[0].pricing.contract, provenance);
+            assert_eq!(row.pricing[0].pricing.model.is_some(), priced);
+            let auditor = reserve_charge(AgentRole::Auditor)?;
+            let mut review = ParentWorkerAttemptReviewCostBinding::bind(
+                "assignment-1",
+                1,
+                ParentDispatchedReviewCycleSlot::FirstCycle,
+            );
+            review.begin_stacked_parent_review_lenses(1);
+            review.observe_settled_parent_auditor(&ledger, auditor.id, None)?;
+            persist_worker_attempt_review_cost(&artifacts, &review, &mut row)?;
+            assert_eq!(row.costs.review_cost_microunits, priced.then_some(12_500));
+            assert_eq!(row.pricing[1].phase, OutcomeCostPhase::Review);
+            let fixture = fixture();
+            row.selection = fixture.selection;
+            row.observed_candidate = fixture.observed_candidate;
+            row.parent_result = Some(OutcomeResult::Accepted);
+            row.costs.environment_cost_microunits = Some(0);
+            let projected = outcome_record_from_this_run_attempt(&row);
+            if priced {
+                let projected = projected.expect("complete numeric outcome");
+                assert_eq!(projected.pricing, row.pricing);
+                let mut json = serde_json::to_value(&projected)?;
+                let decoded: OutcomeRecord = serde_json::from_value(json.clone())?;
+                assert_eq!(decoded, projected);
+                json.as_object_mut().unwrap().remove("pricing");
+                assert!(serde_json::from_value::<OutcomeRecord>(json)?
+                    .pricing
+                    .is_empty());
+            } else {
+                assert!(
+                    projected.is_none(),
+                    "unknown cost cannot become numeric zero"
+                );
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn assignment_shape_identity_is_optional_and_preserved_without_inference() -> Result<()> {
         let legacy = fixture();
         let wire = serde_json::to_value(&legacy)?;
@@ -1489,6 +1762,69 @@ mod tests {
         wire["selection"]["assignment_shape_identity"]["version"] = serde_json::json!(2);
         assert!(serde_json::from_value::<AttemptOutcomeEvidence>(wire).is_err());
         assert!(crate::selection::AssignmentShapeIdentity::v1("not-a-digest".into()).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn assignment_identity_flows_from_dispatch_to_history_and_cost_cohorts() -> Result<()> {
+        let mut input = crate::selection::selection_test_base_input();
+        let identity = crate::selection::AssignmentShapeIdentity::v1("c".repeat(64)).unwrap();
+        input.assignment_shape_identity = Some(identity.clone());
+        let provenance = crate::selection::select(&input)?;
+        let event = SupervisorSelectionEvent {
+            assignment_id: Some("assignment-1".into()),
+            attempt: 0,
+            role: AgentRole::Worker,
+            primary_cause: SupervisorSelectionEventCause::Initial,
+            provenance,
+        };
+        let binding = selection_binding_for_attempt(
+            AgentRole::Worker,
+            "assignment-1",
+            1,
+            std::slice::from_ref(&event),
+            &[],
+        )
+        .context("assignment binding")?;
+        assert_eq!(binding.assignment_shape_identity, Some(identity.clone()));
+        let mut evidence = fixture();
+        evidence.requested_runtime = binding.requested_candidate.runtime.clone();
+        evidence.requested_model = Some(binding.requested_candidate.model.clone());
+        evidence.requested_effort = Some(binding.requested_candidate.effort.as_str().into());
+        evidence.observed_candidate = Some(binding.requested_candidate.clone());
+        evidence.selection = Some(binding);
+        let row = project_numeric_row(&evidence).context("projected history")?;
+        assert_eq!(row.assignment_shape_identity, Some(identity.clone()));
+        let frozen = FrozenOutcomeHistory {
+            provenance: crate::selection::AuthenticatedOutcomeHistoryProvenance {
+                snapshot_sha256: "d".repeat(64),
+                source_digests: Vec::new(),
+                exclusions: Vec::new(),
+                projected_attempt_count: 1,
+            },
+            rows: vec![row],
+        };
+        assert_eq!(
+            frozen
+                .outcomes_for_shape(&input.task, Some(&identity))
+                .len(),
+            1
+        );
+        assert!(frozen.outcomes_for(&input.task).is_empty());
+        assert!(frozen
+            .outcomes_for_shape(
+                &input.task,
+                Some(&crate::selection::AssignmentShapeIdentity::v1("e".repeat(64)).unwrap())
+            )
+            .is_empty());
+        let record = super::super::accepted_task_cost::attempt_cost_record(
+            evidence.selection,
+            evidence.costs,
+            evidence.parent_result,
+        );
+        let cohorts = super::super::accepted_task_cost::rollup_selection_cost_cohorts(&[record])?;
+        assert_eq!(cohorts.lanes.len(), 1);
+        assert_eq!(cohorts.lanes[0].lane.assignment_shape_identity, identity);
         Ok(())
     }
 
@@ -3827,6 +4163,7 @@ mod tests {
             &BTreeMap::new(),
             None,
             account_observe,
+            None,
         )
     }
 

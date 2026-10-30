@@ -378,7 +378,7 @@ fn fixed_cause_relaunch() -> Value {
 }
 
 fn outcome_record() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "attempt_id" => nonempty_string(),
         "task" => task_profile(true),
         "candidate" => candidate_key(),
@@ -391,7 +391,10 @@ fn outcome_record() -> Value {
         "environment_cost_microunits" => nonnegative_integer(),
         "environment_failures" => array(environment_failure()),
         "fixed_cause_relaunch" => nullable(fixed_cause_relaunch()),
-    )
+    );
+    schema["properties"]["assignment_shape_identity"] = assignment_shape_identity();
+    schema["properties"]["pricing"] = array(crate::supervise::outcome_charge_schema_value());
+    schema
 }
 
 fn debug_override() -> Value {
@@ -422,7 +425,7 @@ fn dynamic_signals() -> Value {
 }
 
 fn selection_input() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "task" => task_profile(false),
         "catalogs" => array(runtime_catalog()),
         "pools" => array(runtime_pool_state()),
@@ -434,7 +437,20 @@ fn selection_input() -> Value {
         "outcomes" => array(outcome_record()),
         "signals" => dynamic_signals(),
         "debug_override" => nullable(debug_override()),
-    )
+    );
+    schema["properties"]["assignment_shape_identity"] = assignment_shape_identity();
+    schema
+}
+
+fn assignment_shape_identity() -> Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["version", "sha256"],
+        "properties": {
+            "version": {"const": 1},
+            "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        }
+    })
 }
 
 fn digest_record() -> Value {
@@ -954,6 +970,10 @@ mod tests {
                         let required = object["required"].as_array().expect("object required");
                         let optional = if path == "$/properties/provenance" {
                         &["outcome_history", "operator_prior_data", "routing_policy"][..]
+                    } else if path == "$/properties/provenance/properties/normalized_input" {
+                        &["assignment_shape_identity"][..]
+                    } else if path == "$/properties/provenance/properties/normalized_input/properties/outcomes/items" {
+                        &["assignment_shape_identity", "pricing"][..]
                     } else if path
                         == "$/properties/provenance/properties/normalized_input/properties/catalogs/items/properties/models/items"
                     {

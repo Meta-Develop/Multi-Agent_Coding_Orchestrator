@@ -65,6 +65,17 @@ pub(crate) fn selected_binding_via_authority_socket(
     connect_authority_socket(configured)?.selection_get(provider_id)
 }
 
+/// Revalidate an admitted authority independently of its future selection.
+#[cfg(target_os = "linux")]
+pub(crate) fn authority_id_via_authority_socket(configured: &Path) -> Result<String> {
+    let response = connect_authority_socket(configured)?.exchange(json!({
+        "protocolVersion": PROTOCOL_VERSION,
+        "requestId": next_request_id(),
+        "operation": "authority.describe",
+    }))?;
+    required_string_field(&wire_result(response, "authority.describe")?, "authorityId")
+}
+
 #[cfg(target_os = "linux")]
 fn connect_authority_socket(configured: &Path) -> Result<AuthoritySocketClient> {
     let path = resolve_socket_path(configured).with_context(|| {
@@ -395,6 +406,53 @@ mod tests {
         let listener =
             listen(path, AuthorityServerConfig::new(ctx).expect("config")).expect("listen");
         (dir, listener)
+    }
+
+    #[test]
+    fn authority_identity_survives_future_selection_and_unrelated_delete() {
+        let (_root, registry) = isolated_registry();
+        seed_selected_account(&registry);
+        let binding = registry.selected_binding("codex-cli").unwrap().unwrap();
+        let lease = registry.acquire_selected_use(&binding).unwrap();
+        registry
+            .begin_add(
+                "codex-cli",
+                "personal",
+                "Personal",
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .unwrap();
+        registry.complete_add("codex-cli", "personal").unwrap();
+        let (_socket_root, listener) =
+            listen_fixture(StoredAccountRegistry::new(registry.metadata_path()));
+        let socket = listener.path().to_path_buf();
+        let server = std::thread::spawn(move || {
+            for _ in 0..3 {
+                listener.accept_once().unwrap();
+            }
+        });
+        let expected =
+            coding_agent_manager_lib::account_authority::authority_id_for(registry.metadata_path());
+        assert_eq!(
+            authority_id_via_authority_socket(&socket).unwrap(),
+            expected
+        );
+        registry.select_complete("codex-cli", "personal").unwrap();
+        assert_eq!(
+            authority_id_via_authority_socket(&socket).unwrap(),
+            expected
+        );
+        registry.begin_delete("codex-cli", "personal").unwrap();
+        registry.finish_delete("codex-cli", "personal").unwrap();
+        assert_eq!(
+            authority_id_via_authority_socket(&socket).unwrap(),
+            expected
+        );
+        assert!(registry.begin_delete("codex-cli", "work").is_err());
+        server.join().unwrap();
+        drop(lease);
+        registry.begin_delete("codex-cli", "work").unwrap();
     }
 
     #[test]

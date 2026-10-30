@@ -2971,6 +2971,7 @@ fn supervisor_plan_for_attempt(
         review_lens_correlation: Default::default(),
         review_aggregation_policy: profile.review_aggregation_policy,
         assignments: vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: agent_id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

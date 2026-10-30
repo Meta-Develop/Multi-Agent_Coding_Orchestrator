@@ -191,6 +191,7 @@ fn omitted_profile_preserves_legacy_supervisor_plan_bytes() {
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "agent-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -853,6 +854,7 @@ fn licensed_autopilot_supervisor_plan() -> (Value, LicensedBreakageDeclaration, 
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

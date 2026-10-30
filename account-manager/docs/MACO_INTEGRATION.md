@@ -224,11 +224,30 @@ finalize once. `LeasedChild::cancel` kills only its owned child and waits for
 exit. Wait failure or abandoned custody with unknown exit retains the use lease
 and reports `ExitUnknown`, without claiming cancellation or finalization. The
 existing account mutation barrier continues to refuse replacement during use.
-Coordinated credential rotation/revocation, durable recovery, work-proposal
-operation dispatch, and the root external executor bridge remain separate
-integration work. The closed service launch path uses asynchronous cancellation
+The root Grok external executor transfers that lease to the same closed operation
+without a gap. It opens the selected vendor-home capability during guarded
+construction, checks expiry/revocation before runner dispatch, and records only
+run/account identity, inherited-input names, and lifecycle state in public run
+metadata. A confirmed empty process tree is required to finalize normal/nonzero
+exit or cancellation; unconfirmed preflight or target cleanup retains custody.
+Setup deadline exhaustion and tee conflicts are confirmed pre-release refusals;
+they do not create unknown-child custody or erase an earlier uncertain child.
+The outer selected-use lease also remains held until launch-authority teardown,
+covering retained credential descriptors and later reporting after child exit.
+Restored metadata cannot recreate live custody or authorize finalization.
+
+Active-child rotation or revocation must use the existing cancellation path and
+wait for confirmed exit before replacing/deleting the account incarnation. An
+admission revoke cannot cancel an active child. The account mutation barrier
+refuses replacement while that child or an unknown-exit lease remains active.
+The closed service launch path uses asynchronous cancellation
 requests through the same child custody; a successful signal alone cannot
 release the lease or finalize the guard.
+This does not introduce a credential rotation service. Coordinated credential
+rotation/revocation, durable recovery, work-proposal operation dispatch, and
+equivalent root-executor lifecycle integration for the other provider-specific
+account paths remain separate work. Synthetic fixtures do not qualify a real
+provider account or replace provider-specific acceptance.
 
 The initial operation kind is `work-proposal`: one fresh proposal turn, with no
 provider-owned workspace mutation, nested orchestration, or independent review.
@@ -364,9 +383,25 @@ changes `launchServiceId`: an old start cannot be replayed against the new
 instance, and lost operations require reconciliation rather than a new key or
 automatic replay. These records are in memory, not durable recovery evidence.
 
-The desktop remote-launch command remains disabled pending its typed client
-integration and corresponding desktop transport/status/cancellation tests.
-The existing in-process desktop path continues to use leased child custody.
+The desktop uses these operations for socket-backed authorities. Its webview
+receives only the opaque handle and closed process status; status and cancel
+accept only handles retained by that desktop process. The native client keeps
+the original authority/service identity and freezes a pending start's binding
+and retry key until a reply is confirmed. A lost start reply can be recovered
+by retrying Launch without spawning again. Status/cancel disconnects preserve
+the last confirmed status and never imply exit or cancellation. References
+survive page navigation, but are not durable across desktop process restarts.
+The in-process desktop path continues to use leased child custody.
+
+Confirmed `access-denied`, `busy`, or `unavailable` start refusals occur before
+the retry key is recorded. They discard the pending desktop snapshot so a later
+Launch discovers the current service identity and uses a fresh key. Unconfirmed
+transport replies, invalid launch-status results, and `state-unavailable`
+errors retain the original binding and key because dispatch may have occurred.
+
+The existing provider-wide registry barrier still refuses future-selection
+changes while a launch uses that provider. Narrowing that barrier to permit
+selection-only changes without replacing active material remains separate.
 
 Before enabling a client, review the complete wire schema and its closed
 provider-specific projections, transport bounds, identifier encoding, and

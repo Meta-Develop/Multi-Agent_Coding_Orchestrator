@@ -273,10 +273,6 @@ fn assert_busy(registry: &StoredAccountRegistry) {
         registry.begin_delete(PROVIDER, "work"),
         Err(Error::AccountAuthorityBusy { .. })
     ));
-    assert!(matches!(
-        registry.select_complete(PROVIDER, "other"),
-        Err(Error::AccountAuthorityBusy { .. })
-    ));
 }
 
 fn release(root: &Path, nonzero: bool) {
@@ -321,6 +317,17 @@ fn remote_launch_holds_service_owned_lease() {
         rpc(&listener, &start, true);
         until(|| root.join("ready").exists());
         assert_busy(&registry);
+        let future = registry
+            .select_complete_revision(
+                PROVIDER,
+                "other",
+                start["binding"]["selectionRevision"].as_u64(),
+            )
+            .unwrap();
+        assert_eq!(future.account_id, "other");
+        registry.begin_delete(PROVIDER, "other").unwrap();
+        registry.finish_delete(PROVIDER, "other").unwrap();
+        assert_busy(&registry);
         let replay = rpc(&listener, &start, false);
         assert_eq!(replay["result"]["state"], "running");
         let status = status_request(&start, &replay["result"]["handle"], false);
@@ -335,7 +342,6 @@ fn remote_launch_holds_service_owned_lease() {
         });
         assert_eq!(exited["result"]["exitCode"] == 0, !nonzero);
         assert_eq!(rpc(&listener, &start, false)["result"], exited["result"]);
-        registry.select_complete(PROVIDER, "other").unwrap();
         registry.begin_delete(PROVIDER, "work").unwrap();
         registry.finish_delete(PROVIDER, "work").unwrap();
         registry
@@ -395,8 +401,7 @@ fn remote_launch_cancel_and_listener_drop_retain_custody() {
     drop(listener);
     assert_busy(&registry);
     release(&root2, false);
-    until(|| registry.select_complete(PROVIDER, "other").is_ok());
-    registry.begin_delete(PROVIDER, "work").unwrap();
+    until(|| registry.begin_delete(PROVIDER, "work").is_ok());
 }
 
 #[test]
@@ -751,8 +756,7 @@ fn listener_cancels_live_child_while_another_start_blocks_in_credentials() {
         Some("cancelling" | "cancelled")
     ));
     assert_eq!(failed_start["result"]["state"], "failed");
-    until(|| registry.select_complete(PROVIDER, "other").is_ok());
-    registry.begin_delete(PROVIDER, "work").unwrap();
+    until(|| registry.begin_delete(PROVIDER, "work").is_ok());
 }
 
 #[test]

@@ -406,6 +406,7 @@ fn assert_native_edit_journal_reporting_contract(prompt: &str) {
 
 fn injected_direct_worker_assignment() -> OrchestratorAssignment {
     OrchestratorAssignment {
+        assignment_shape: None,
         id: "direct-worker-a".to_string(),
         phase: AssignmentPhase::Execution,
         runtime: None,

@@ -1,5 +1,9 @@
 use super::*;
-use crate::model::StoredAccountMaterial;
+use crate::model::{
+    Account, AuthKind, ProviderDescriptor, StoredAccountMaterial, StoredAccountMetadata,
+};
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 const PROVIDER: &str = "desktop-lease-probe";
@@ -44,7 +48,7 @@ impl ProviderAdapter for ProbeAdapter {
         Ok(providers::LaunchSpec::new(std::env::current_exe()?)
             .current_dir(&self.directory)
             .arg("--exact")
-            .arg("commands::launch_tests::launch_child_probe")
+            .arg("launch_client::tests::launch_child_probe")
             .arg("--nocapture")
             .set_plain_env("CAM_DESKTOP_LEASE_BARRIER", &self.directory))
     }
@@ -81,26 +85,37 @@ fn launch_reaper_retains_exact_selected_use_lease() {
     let registry = crate::account_authority::StoredAccountRegistry::new(
         directory.path().join("accounts.json"),
     );
-    registry
-        .begin_add(
-            PROVIDER,
-            "work",
-            "Work",
-            AuthKind::OAuth,
-            StoredAccountMaterial::VendorHome,
-        )
-        .unwrap();
-    registry.complete_add(PROVIDER, "work").unwrap();
+    for id in ["work", "other"] {
+        registry
+            .begin_add(
+                PROVIDER,
+                id,
+                id,
+                AuthKind::OAuth,
+                StoredAccountMaterial::VendorHome,
+            )
+            .unwrap();
+        registry.complete_add(PROVIDER, id).unwrap();
+    }
     registry.select_complete(PROVIDER, "work").unwrap();
     let expected = registry.selected_binding(PROVIDER).unwrap().unwrap();
     let authority = AccountAuthority::InProcess(registry);
-    let process = launch_provider_with_authority(&adapter, &authority).unwrap();
-    let registry = authority.in_process_registry().unwrap();
+    let service = ManagedLaunchService::new(authority);
+    let DesktopLaunch::Local(process) = service.start(&adapter).unwrap() else {
+        panic!("expected local launch");
+    };
+    let registry = service.authority.in_process_registry().unwrap();
     assert_eq!(process.provider_id, expected.provider_id);
     assert_eq!(process.account_id, expected.account_id);
     assert_ne!(process.process_id, 0);
     await_file(&directory.path().join("ready"));
-    assert_eq!(registry.selected_binding(PROVIDER).unwrap(), Some(expected));
+    let future = registry
+        .select_complete_revision(PROVIDER, "other", Some(expected.selection_revision))
+        .unwrap();
+    assert_eq!(future.account_id, "other");
+    assert_eq!(process.account_id, expected.account_id);
+    registry.begin_delete(PROVIDER, "other").unwrap();
+    registry.finish_delete(PROVIDER, "other").unwrap();
     let deletion = registry.begin_delete(PROVIDER, "work");
     // Always release the fixture child before asserting, including on failure.
     fs::write(directory.path().join("release"), b"ok").unwrap();
@@ -116,30 +131,4 @@ fn launch_reaper_retains_exact_selected_use_lease() {
         }
     }
     registry.finish_delete(PROVIDER, "work").unwrap();
-}
-
-#[cfg(unix)]
-#[test]
-fn socket_backed_launch_remains_refused() {
-    use std::os::unix::fs::PermissionsExt;
-    use std::os::unix::net::UnixListener;
-
-    let directory = tempfile::tempdir().unwrap();
-    let root = directory.path().canonicalize().unwrap();
-    fs::set_permissions(&root, fs::Permissions::from_mode(0o700)).unwrap();
-    let socket = root.join("account.sock");
-    let listener = UnixListener::bind(&socket).unwrap();
-    fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
-    listener.set_nonblocking(true).unwrap();
-    let authority =
-        AccountAuthority::Remote(authority_client::AuthorityClient::connect(&socket).unwrap());
-    let adapter = ProbeAdapter { directory: root };
-    assert!(matches!(
-        launch_provider_with_authority(&adapter, &authority),
-        Err(Error::NotImplemented("remote launch_provider"))
-    ));
-    assert_eq!(
-        listener.accept().unwrap_err().kind(),
-        io::ErrorKind::WouldBlock
-    );
 }

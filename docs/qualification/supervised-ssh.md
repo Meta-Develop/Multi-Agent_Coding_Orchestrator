@@ -1,8 +1,10 @@
 # Supervised SSH qualification
 
 Status: **not qualified**. The attempt adapter has deterministic injected-transport
-coverage. Normal supervisor dispatch still refuses SSH before launch. There is no
-shipped lifecycle SSH client or operator trust-config loader for that dispatch.
+coverage. Supervisor dispatch supports explicitly installed trusted embedding
+configuration, with authenticated lifecycle receipts and collection recovery.
+Normal CLI dispatch still refuses SSH before launch because there is no shipped
+lifecycle SSH client or operator trust-config loader for that dispatch.
 The existing atomic command SSH client speaks a different protocol. Do not use it
 to manufacture lifecycle receipts or treat a direct remote command as supervised
 execution.
@@ -27,7 +29,9 @@ An uncertain launch is queried using the submitted identity and never relaunched
 execution identity, collection key, and policy. Stage uncertainty remains an
 operator reconciliation gate. Cancellation uses the existing lifecycle
 TERM/grace/KILL/wait sequence, and collection requires a terminal observation.
-The adapter never calls workspace cleanup, including on drop or error.
+The attempt adapter never calls workspace cleanup on drop or error. The supervisor
+requests it separately after authenticated collection persistence, idempotent local
+import, successful local recapture, and durable import/recapture receipts.
 
 ## Deterministic checks
 
@@ -39,18 +43,52 @@ cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::exe
 cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::lost_launch_reconciles_before_cancellation_without_relaunch -- --exact
 cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::cancellation_keeps_custody_until_terminal_proof -- --exact
 cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::lost_collection_reuses_exact_key_and_never_cleans_up -- --exact
+cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::lost_reply_restart_never_duplicates_launch -- --exact
+cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::cleanup_requires_persisted_imported_collection -- --exact
+cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::selected_supervisor_dispatch_requires_explicit_trust_and_keeps_local_default -- --exact
 ```
 
 ## Opt-in two-host gate (do not run as part of deterministic checks)
 
-This gate remains blocked until production supervisor wiring and durable recovery
-ship. That follow-up must persist intent/receipts before the next external effect,
-persist the bounded collection bundle before local import, recapture the imported
-candidate using coordinator-owned inspection, and authorize cleanup only after
-both persistence and import/recapture succeed. It must also provide the real
-lifecycle client and reviewed operator trust configuration. The in-memory adapter
-alone does not provide crash recovery or duplicate-launch protection after a
-coordinator restart.
+The live gate remains unproven. An embedding caller can configure
+`supervise::remote_execution::SupervisedSshHost::configure` with matching
+`SshConfig`, a lifecycle transport factory, and a trusted
+`SupervisedSshCoordinator`. `bind_supervised_ssh_hosts` captures that configuration
+when loading the plan, including for scheduler threads. A plan cannot install
+these capabilities. Missing, changed, or revoked trust refuses without Local
+fallback. Attached parent messaging and hosted pre-action review require an
+equivalent remote capability and currently refuse SSH.
+
+The coordinator integration supplies bounded frozen inputs, imports the validated
+candidate idempotently using its exact collection key, and recaptures the local
+candidate and held native runtime evidence. Remote JSON cannot manufacture that
+native evidence. Existing claim, budget, containment, acceptance, and publication
+gates still apply to the returned run. No default integration or real wire client
+is installed by this API.
+After native recapture returns, receipt or cleanup failures retain that run's
+observations for normal supervisor usage settlement and mark it nonpublishable.
+
+Receipts live in the repository-authenticated `supervised-ssh-v1` journal namespace.
+The stable run/assignment/optional Worker/attempt tuple selects one exclusively
+locked journal. Its first intent retains the nonce; checkpoints bind the exact
+stage key, session, workspace, launch key, PID/PGID/start token, and collection
+policy. Launch intent is written before launch. A restart queries that submitted
+identity, including when the reply was lost; `NotFound` does not authorize replay.
+Collections use bounded chunks with an authenticated final digest/commit before
+import. An interrupted collection retries its original key. Failed persistence,
+import, or recapture preserves remote output. Cleanup is recorded before its
+effect and reconciled using the exact cleanup key only after the import barrier.
+Stage uncertainty remains an operator gate.
+
+An embedding caller resumes with `SupervisedSshHost::dispatch` using the identical
+identity, command, scopes, and frozen inputs. A completed collection is restored
+and revalidated locally, without fetching remote output again; native runtime
+evidence must be recaptured, never restored from serialized flags. The general
+CLI `supervise resume` still refuses uncertain assignments: reconciliation of
+remote custody alone does not settle the interrupted scheduler's accounting or
+accept its candidate. A future operator integration must document its actual
+trust-loader, recovery/accounting handoff, and fault-control commands before a
+live qualification can begin.
 
 Use an existing authenticated, explicitly trusted second host and a disposable
 qualification repository. Do not create credentials, guess endpoints, weaken
@@ -60,7 +98,7 @@ to the accepted installed binary. `SSH_PLAN` is a reviewed plan containing one
 substantive bounded source edit with an explicit SSH executor. `EVIDENCE` is an
 existing private directory. Choose a fresh `RUN_ID` and use it throughout.
 
-After the production follow-up makes this route available, the exact supervisor
+After an operator integration makes the CLI route available, the exact supervisor
 commands are:
 
 ```sh

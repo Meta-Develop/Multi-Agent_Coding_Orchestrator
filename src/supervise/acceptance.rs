@@ -1018,6 +1018,7 @@ pub(super) fn generated_licensed_follow_up_tasks(
                 );
             }
             let follow_up_assignment = OrchestratorAssignment {
+                assignment_shape: None,
                 id,
                 phase: AssignmentPhase::Execution,
                 runtime: None,

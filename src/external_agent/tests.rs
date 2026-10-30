@@ -11068,17 +11068,6 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
             path: PathBuf::from("injected-tee"),
             source: std::io::Error::other("injected tee failure"),
         },
-        ProcessRunError::TeeConflict {
-            label: "codex version preflight".to_string(),
-            stdout: PathBuf::from("injected-stdout"),
-            stderr: PathBuf::from("injected-stderr"),
-        },
-        ProcessRunError::SetupTimeout {
-            label: "codex version preflight".to_string(),
-            command: "codex --version".to_string(),
-            phase: "injected post-spawn setup",
-            source: std::io::Error::other("injected setup timeout"),
-        },
         ProcessRunError::ProcessOwnership {
             label: "codex version preflight".to_string(),
             command: "codex --version".to_string(),
@@ -11127,6 +11116,39 @@ fn environment_preflight_process_errors_retain_fail_closed_containment_evidence(
         );
         assert!(report.environment_blocked());
         assert!(!report.environment_preflight_quiescence_verified());
+    }
+
+    let pre_release_errors = vec![
+        ProcessRunError::TeeConflict {
+            label: "codex version preflight".to_string(),
+            stdout: PathBuf::from("injected-stdout"),
+            stderr: PathBuf::from("injected-stderr"),
+        },
+        ProcessRunError::SetupTimeout {
+            label: "codex version preflight".to_string(),
+            command: "codex --version".to_string(),
+            phase: "injected pre-release setup",
+            source: std::io::Error::other("injected setup timeout"),
+        },
+    ];
+    for error in pre_release_errors {
+        assert!(process_run_error_definitely_before_process_start(&error));
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        evidence.record_error(&error);
+        assert!(evidence.started);
+        assert!(!evidence.unconfirmed_child);
+        assert_eq!(
+            evidence.process_tree,
+            Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService
+            ))
+        );
+        assert_eq!(
+            evidence.side_effects,
+            Some(SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex
+            ))
+        );
     }
 
     let pre_spawn_errors = vec![
@@ -13892,6 +13914,53 @@ fn verified_grok_cam_run_releases_use_lease_on_failure() -> Result<()> {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn verified_grok_cam_lifecycle_refusal_serializes_references_only() -> Result<()> {
+    use coding_agent_manager_lib::account_authority::StoredAccountRegistry;
+    use coding_agent_manager_lib::providers::launch_lifecycle::{LaunchFinalization, LaunchPhase};
+
+    let _no_socket = CamSocketEnvGuard::unset();
+    let temp = tempfile::tempdir()?;
+    let (harness, home, expected_binding) = build_cam_grok_test_harness("account-a")?;
+    let registry = StoredAccountRegistry::new(harness.registry.metadata_path());
+    let command = admitted_verified_grok_cam_command(temp.path())?;
+    let _fixture_guard = crate::account_authority::activate_cam_grok_test_harness(harness);
+    GROK_PREFLIGHT_HOOK.with(|hook| {
+        *hook.borrow_mut() = Some(Box::new(move || {
+            fs::rename(home.join("auth.json"), home.join("held-auth.json")).unwrap();
+        }));
+    });
+    let report = run_external_agent(&command);
+    assert!(GROK_PREFLIGHT_HOOK.with(|hook| hook.borrow().is_none()));
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(report.environment_blocked());
+    let lifecycle = report
+        .provider_launch_lifecycle()
+        .context("declared lifecycle missing")?;
+    assert_eq!(lifecycle.run_id, "verified-grok-cam");
+    assert_eq!(
+        lifecycle.binding.account_incarnation,
+        expected_binding.account_incarnation
+    );
+    assert_eq!(
+        lifecycle.phase,
+        LaunchPhase::Finalized(LaunchFinalization::Refused)
+    );
+    let serialized = serde_json::to_string(&report)?;
+    assert!(!serialized.contains("FAKE-managed-refresh"));
+    let restored: ExternalAgentRun = serde_json::from_str(&serialized)?;
+    assert_eq!(restored.provider_launch_lifecycle(), Some(lifecycle));
+    assert!(restored
+        .stdout
+        .run_metadata
+        .launch_lifecycle_handle
+        .is_none());
+    registry.select_complete("grok-cli", "account-b")?;
+    registry.begin_delete("grok-cli", "account-a")?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn serve_cam_registry_on_socket(
     registry: coding_agent_manager_lib::account_authority::StoredAccountRegistry,
 ) -> (
@@ -15354,6 +15423,79 @@ fn grok_native_auth_failure_is_environment_and_fails_closed() -> Result<()> {
             .contains("provider_auth_required"));
         assert!(!report.publishable);
         assert!(!report.succeeded());
+    }
+    Ok(())
+}
+
+#[test]
+fn provider_setup_refusals_retain_requested_containment_without_granting_custody() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let spec = ExternalAgentCommand::codex(
+        "synthetic-provider",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("events"),
+        temp.path().join("result"),
+        Duration::from_secs(1),
+    );
+    for profile in [
+        SideEffectConfinementProfileKind::ExternalCodex,
+        SideEffectConfinementProfileKind::ExternalClaude,
+        SideEffectConfinementProfileKind::ExternalCursor,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        SideEffectConfinementProfileKind::ExternalGrok,
+    ] {
+        for timeout in [false, true] {
+            let error = if timeout {
+                ProcessRunError::SetupTimeout {
+                    label: "synthetic provider".into(),
+                    command: "synthetic target".into(),
+                    phase: "pre-release setup",
+                    source: std::io::Error::from(std::io::ErrorKind::TimedOut),
+                }
+            } else {
+                ProcessRunError::TeeConflict {
+                    label: "synthetic provider".into(),
+                    stdout: "synthetic-tee".into(),
+                    stderr: "synthetic-tee".into(),
+                }
+            };
+            let mut report =
+                failed_external_run(&spec, Instant::now(), vec![], false, "refused".into());
+            report.stdout.target_launch_attempted = true;
+            retain_pre_release_refusal_evidence(&mut report, &error, profile);
+            assert_eq!(report.timed_out, timeout);
+            assert_eq!(
+                report.process_tree,
+                Some(ProcessTreeEvidence::Unverified(
+                    ContainmentBackend::SystemdUserService
+                ))
+            );
+            assert_eq!(
+                report.side_effects,
+                Some(SideEffectConfinementEvidence::Unverified(profile))
+            );
+            assert!(!report.stdout.target_launch_attempted);
+            assert!(!report.publishable);
+            // Never-started target proof permits cleanup, but a previous uncertain
+            // preflight child still prevents it after this target refusal.
+            assert!(report.scratch_quiescence_verified());
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_process_started = true;
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified = false;
+            assert!(!report.scratch_quiescence_verified());
+            let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&report)?)?;
+            assert_eq!(restored.process_tree, report.process_tree);
+            assert_eq!(restored.side_effects, report.side_effects);
+            assert!(!restored.publishable);
+            assert!(!restored.scratch_quiescence_verified());
+        }
     }
     Ok(())
 }

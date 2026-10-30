@@ -449,7 +449,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
     KernelStateLock::acquire_direct(&state, "claims.lock").expect("claims lock");
 
     let sources = crate::artifacts::state_auth::authenticated_state_consumers();
-    assert_eq!(sources.len(), 10, "all authenticated consumer sources");
+    assert_eq!(sources.len(), 11, "all authenticated consumer sources");
     let registered_roots = sources
         .iter()
         .map(|source| source.root_name)
@@ -459,6 +459,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
         "authenticated-megafile-history-v1",
         "authenticated-generated-follow-up-queues-v1",
         "supervisor-messaging-v1",
+        "supervised-ssh-v1",
     ] {
         assert!(
             registered_roots.contains(required),
@@ -476,6 +477,7 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
         "megafile-history-operation-v1.lock",
         ".generated-follow-up-queues.lock",
         ".supervisor-messaging.lock",
+        ".supervised-ssh.lock",
     ] {
         assert!(
             registered_state_root_locks.contains(required),
@@ -483,33 +485,140 @@ fn registered_authenticated_consumer_roots_and_state_locks_migrate_across_all_mo
         );
     }
 
+    let mut root_identities = BTreeMap::new();
+    let mut lock_identities = BTreeMap::new();
     for source in sources {
-        SafeRoot::open_or_create(state.path().join(source.root_name))
+        let root = SafeRoot::open_or_create(state.path().join(source.root_name))
             .expect("registered authenticated consumer root");
+        root_identities.insert(source.root_name, root.identity().clone());
+        fs::set_permissions(root.path(), fs::Permissions::from_mode(0o755))
+            .expect("legacy consumer root mode");
         for lock_name in source.state_root_lock_names {
             KernelStateLock::acquire_direct(&state, lock_name)
                 .expect("registered authenticated consumer state-root lock");
+            let lock_path = state.path().join(lock_name);
+            lock_identities.insert(
+                *lock_name,
+                identity_for_path(&lock_path).expect("lock identity"),
+            );
+            fs::set_permissions(lock_path, fs::Permissions::from_mode(0o644))
+                .expect("legacy consumer lock mode");
         }
     }
+    let ssh_evidence = state.path().join("supervised-ssh-v1/collection-evidence");
+    let collected_bytes = b"collected candidate bytes\n";
+    fs::write(&ssh_evidence, collected_bytes).expect("opaque SSH collection evidence");
+    let evidence_identity = identity_for_path(&ssh_evidence).expect("collection identity");
+    let assert_consumers = |root_mode, lock_mode| {
+        for (name, identity) in &root_identities {
+            let root_path = state.path().join(name);
+            assert_eq!(
+                identity_for_path(&root_path).expect("consumer root"),
+                *identity
+            );
+            assert_eq!(mode(&root_path), root_mode, "consumer root {name}");
+        }
+        for (name, identity) in &lock_identities {
+            let lock_path = state.path().join(name);
+            assert_eq!(
+                identity_for_path(&lock_path).expect("consumer lock"),
+                *identity
+            );
+            assert_eq!(mode(&lock_path), lock_mode, "consumer lock {name}");
+        }
+        assert_eq!(
+            fs::read(&ssh_evidence).expect("collection evidence"),
+            collected_bytes
+        );
+        assert_eq!(
+            identity_for_path(&ssh_evidence).expect("collection identity"),
+            evidence_identity
+        );
+    };
     make_legacy_permissions(state.path());
+    let repository = crate::git_repository::open(&path).expect("repository");
+    let transaction_path = repository.commondir().join(TRANSACTION_ROOT_NAME);
 
     let dry = migrate_repository_state(&path, false).expect("registered-source dry run");
     assert_eq!(dry.status, StateMigrationStatus::Ready);
     assert_eq!(dry.mode, StateMigrationMode::DryRun);
+    assert!(!dry.hardened);
+    assert!(!transaction_path.exists());
+    assert_eq!(mode(state.path()), 0o755);
+    assert_consumers(0o755, 0o644);
 
     let applied = migrate_repository_state(&path, true).expect("registered-source apply");
     assert_eq!(applied.status, StateMigrationStatus::Applied);
     assert_eq!(applied.mode, StateMigrationMode::Apply);
+    assert!(applied.hardened);
+    assert_eq!(applied.transaction_phase, Some(MigrationPhase::Completed));
+    assert_eq!(mode(state.path()), 0o700);
+    assert_consumers(0o700, 0o600);
+    let transaction_bytes = fs::read(transaction_path.join(TRANSACTION_FILE)).expect("transaction");
+    let transaction: MigrationTransaction =
+        serde_json::from_slice(&transaction_bytes).expect("transaction JSON");
+    assert_eq!(transaction.phase, MigrationPhase::Completed);
+    for name in lock_identities.keys() {
+        assert_eq!(transaction.original_file_modes[*name], 0o644);
+    }
+    let receipt_bytes = fs::read(transaction_path.join(RECEIPT_FILE)).expect("completion receipt");
+    let receipt: MigrationReceipt = serde_json::from_slice(&receipt_bytes).expect("receipt JSON");
+    assert_eq!(receipt.entries, applied.entries);
+    let manifest_store = AuthenticatedSnapshotStore::<
+        StateMigrationManifestSpec,
+        StateMigrationManifest,
+    >::open_instance(
+        repository_authenticator_key_only(&path).expect("repository authenticator"),
+        MANIFEST_INSTANCE_ID,
+    )
+    .expect("signed migration manifest");
+    let snapshot = manifest_store.current();
+    verify_migration_receipt(
+        &SafeRoot::open_existing(&transaction_path).expect("transaction root"),
+        &snapshot.value,
+        snapshot.generation,
+        snapshot.token,
+    )
+    .expect("receipt binds the signed manifest");
+    drop(manifest_store);
 
     let repeated_dry =
         migrate_repository_state(&path, false).expect("registered-source repeated dry run");
     assert_eq!(repeated_dry.status, StateMigrationStatus::AlreadyApplied);
     assert_eq!(repeated_dry.mode, StateMigrationMode::DryRun);
+    assert!(repeated_dry.hardened);
+    assert_eq!(
+        repeated_dry.transaction_phase,
+        Some(MigrationPhase::Completed)
+    );
+    assert_consumers(0o700, 0o600);
+    assert_eq!(
+        fs::read(transaction_path.join(TRANSACTION_FILE)).expect("transaction"),
+        transaction_bytes
+    );
+    assert_eq!(
+        fs::read(transaction_path.join(RECEIPT_FILE)).expect("receipt"),
+        receipt_bytes
+    );
 
     let repeated_apply =
         migrate_repository_state(&path, true).expect("registered-source repeated apply");
     assert_eq!(repeated_apply.status, StateMigrationStatus::AlreadyApplied);
     assert_eq!(repeated_apply.mode, StateMigrationMode::Apply);
+    assert!(repeated_apply.hardened);
+    assert_eq!(
+        repeated_apply.transaction_phase,
+        Some(MigrationPhase::Completed)
+    );
+    assert_consumers(0o700, 0o600);
+    assert_eq!(
+        fs::read(transaction_path.join(TRANSACTION_FILE)).expect("transaction"),
+        transaction_bytes
+    );
+    assert_eq!(
+        fs::read(transaction_path.join(RECEIPT_FILE)).expect("receipt"),
+        receipt_bytes
+    );
 }
 
 #[cfg(unix)]

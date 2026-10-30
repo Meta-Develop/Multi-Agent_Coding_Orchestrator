@@ -6,12 +6,14 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::selected_launch::{LaunchAdmission, SelectedLaunch};
 use anyhow::{anyhow, bail, Context, Result};
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
 use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
+use coding_agent_manager_lib::providers::launch_lifecycle::CredentialEnvironmentInput;
 use coding_agent_manager_lib::storage::Secret;
 use serde::de::{Deserializer, Error as _, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
@@ -52,6 +54,7 @@ pub(crate) struct ClaudeLaunchAuthority {
     authority_id: Option<String>,
     socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
+    pub(crate) launch: SelectedLaunch,
     #[cfg(test)]
     managed_home: PathBuf,
     managed_data_root: PathBuf,
@@ -141,25 +144,18 @@ impl ClaudeLaunchAuthority {
             ));
         }
         if let Some(socket_path) = &self.socket_path {
-            let live =
-                super::selected_binding_via_authority_socket(socket_path, CLAUDE_CODE_PROVIDER_ID)
-                    .context("failed to revalidate Coding Agent Manager Claude selection")?;
-            let Some((authority_id, binding)) = live else {
-                bail!("no complete selected Coding Agent Manager Claude account");
-            };
-            if self.authority_id.as_deref() != Some(authority_id.as_str())
-                || binding != self.binding
-            {
-                bail!("Coding Agent Manager Claude selection changed after reservation");
+            let authority_id = super::socket_client::authority_id_via_authority_socket(socket_path)
+                .context("failed to revalidate Coding Agent Manager Claude authority socket")?;
+            if self.authority_id.as_deref() != Some(authority_id.as_str()) {
+                bail!("Coding Agent Manager Claude authority changed after reservation");
             }
         }
-        let current = self
+        let account = self
             .registry
-            .selected_binding(CLAUDE_CODE_PROVIDER_ID)
-            .context("failed to read Coding Agent Manager Claude selection")?
-            .context("no complete selected Coding Agent Manager Claude account")?;
-        if current != self.binding {
-            bail!("Coding Agent Manager Claude selection changed after reservation");
+            .complete(CLAUDE_CODE_PROVIDER_ID, &self.binding.account_id)
+            .context("leased Coding Agent Manager Claude account is no longer complete")?;
+        if account.account_incarnation != self.binding.account_incarnation {
+            bail!("leased Coding Agent Manager Claude account was replaced");
         }
         if let Some(expected) = &self.authority_id {
             if authority_id_for(self.registry.metadata_path()) != *expected {
@@ -181,6 +177,7 @@ impl ClaudeLaunchAuthority {
 pub(crate) fn acquire_claude_launch_authority(
     carried: Option<&FrozenClaudeSelectedBinding>,
     deadline_unix_millis: u64,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<ClaudeLaunchAuthority> {
     let socket_path = super::cam_socket_for_frozen_selection(
         carried.and_then(|frozen| frozen.authority_socket.as_deref()),
@@ -210,6 +207,7 @@ pub(crate) fn acquire_claude_launch_authority(
         frozen,
         socket_path,
         deadline_unix_millis,
+        admission,
     )
 }
 
@@ -219,6 +217,7 @@ fn acquire_from_registry(
     frozen: Option<&FrozenClaudeSelectedBinding>,
     socket_path: Option<PathBuf>,
     deadline_unix_millis: u64,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<ClaudeLaunchAuthority> {
     let current = registry
         .selected_binding(CLAUDE_CODE_PROVIDER_ID)
@@ -240,34 +239,68 @@ fn acquire_from_registry(
     let selected_use_lease = registry
         .acquire_selected_use(&binding)
         .context("failed to acquire selected Coding Agent Manager Claude account")?;
-    let account = registry
-        .complete(CLAUDE_CODE_PROVIDER_ID, &binding.account_id)
-        .context("selected Coding Agent Manager Claude account is not complete")?;
-    if account.auth_kind != AuthKind::OAuth || account.material != StoredAccountMaterial::VendorHome
-    {
-        bail!("selected Coding Agent Manager Claude account is not managed OAuth vendor-home material");
-    }
-    if !safe_account_component(&binding.account_id) {
-        bail!("selected Coding Agent Manager Claude account id is unsafe");
-    }
-    let managed_home = data_dir
-        .join("accounts")
-        .join(CLAUDE_CODE_PROVIDER_ID)
-        .join(&binding.account_id);
-    require_private_managed_home(data_dir, &managed_home)?;
-    let credential_path = managed_home.join(".credentials.json");
-    let mut credential_file = open_credential_file(&credential_path)?;
-    let (oauth_grant, credential_identity, oauth_expires_at_unix_millis) =
-        read_oauth_grant(&mut credential_file, deadline_unix_millis)?;
-    let (child_config_home, child_oauth_grant) = create_child_oauth_home(deadline_unix_millis)?;
+    let (
+        launch,
+        (
+            _managed_home,
+            credential_path,
+            credential_file,
+            oauth_grant,
+            credential_identity,
+            oauth_expires_at_unix_millis,
+            child_config_home,
+            child_oauth_grant,
+        ),
+    ) = SelectedLaunch::prepare_material(registry, &binding, admission, |account| {
+        if account.auth_kind != AuthKind::OAuth
+            || account.material != StoredAccountMaterial::VendorHome
+        {
+            bail!("selected Coding Agent Manager Claude account is not managed OAuth vendor-home material");
+        }
+        if !safe_account_component(&binding.account_id) {
+            bail!("selected Coding Agent Manager Claude account id is unsafe");
+        }
+        let managed_home = data_dir
+            .join("accounts")
+            .join(CLAUDE_CODE_PROVIDER_ID)
+            .join(&binding.account_id);
+        require_private_managed_home(data_dir, &managed_home)?;
+        let credential_path = managed_home.join(".credentials.json");
+        let mut credential_file = open_credential_file(&credential_path)?;
+        let (oauth_grant, credential_identity, oauth_expires_at_unix_millis) =
+            read_oauth_grant(&mut credential_file, deadline_unix_millis)?;
+        let (child_config_home, child_oauth_grant) = create_child_oauth_home(deadline_unix_millis)?;
+        Ok((
+            (
+                managed_home,
+                credential_path,
+                credential_file,
+                oauth_grant,
+                credential_identity,
+                oauth_expires_at_unix_millis,
+                child_config_home,
+                child_oauth_grant,
+            ),
+            [
+                "ANTHROPIC_API_KEY",
+                "ANTHROPIC_AUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_SECURESTORAGE_CONFIG_DIR",
+            ]
+            .into_iter()
+            .map(|name| CredentialEnvironmentInput::Removed(name.into()))
+            .collect(),
+        ))
+    })?;
     Ok(ClaudeLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         binding,
         authority_id,
         socket_path,
         _selected_use_lease: selected_use_lease,
+        launch,
         #[cfg(test)]
-        managed_home,
+        managed_home: _managed_home,
         managed_data_root: data_dir.to_path_buf(),
         child_config_home,
         credential_path,
@@ -329,7 +362,7 @@ pub(crate) fn acquire_claude_launch_authority_from(
     frozen: Option<&FrozenClaudeSelectedBinding>,
     deadline_unix_millis: u64,
 ) -> Result<ClaudeLaunchAuthority> {
-    acquire_from_registry(registry, data_dir, frozen, None, deadline_unix_millis)
+    acquire_from_registry(registry, data_dir, frozen, None, deadline_unix_millis, None)
 }
 
 fn safe_account_component(value: &str) -> bool {
@@ -641,6 +674,44 @@ impl<'de> Deserialize<'de> for UniqueJson {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn claude_selected_lifecycle_covers_production_construction_and_exit() -> Result<()> {
+        use super::super::selected_launch::tests::{exercise, SCENARIOS};
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+        for scenario in SCENARIOS {
+            let (_root, registry, data, deadline) = selected_fixture()?;
+            fs::write(
+                data.join("accounts")
+                    .join(CLAUDE_CODE_PROVIDER_ID)
+                    .join("work/.credentials.json"),
+                fixture_credentials(
+                    "synthetic-lifecycle-material",
+                    deadline.saturating_add(60_000),
+                ),
+            )?;
+            exercise(
+                &registry,
+                CLAUDE_CODE_PROVIDER_ID,
+                scenario,
+                |admission| {
+                    let authority = acquire_from_registry(
+                        &registry,
+                        &data,
+                        None,
+                        None,
+                        deadline,
+                        Some(admission),
+                    )?;
+                    let material = std::str::from_utf8(authority.oauth_grant_bytes()?)?.to_string();
+                    Ok((authority, material))
+                },
+                |authority| &authority.launch,
+            );
+        }
+        Ok(())
+    }
     use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
     use std::fs;
 
@@ -692,7 +763,9 @@ mod tests {
     fn claude_launch_endpoint_changes_after_acquire_are_refused() -> Result<()> {
         let (_root, registry, data, deadline) = selected_fixture()?;
         super::super::launch_endpoint_tests::assert_endpoint_changes_refused(
-            |socket_path| acquire_from_registry(&registry, &data, None, socket_path, deadline),
+            |socket_path| {
+                acquire_from_registry(&registry, &data, None, socket_path, deadline, None)
+            },
             |authority| authority.verify_binding_unchanged(),
         )
     }
@@ -761,6 +834,33 @@ mod tests {
             child_json["claudeAiOauth"]["scopes"],
             serde_json::json!(["user:inference"])
         );
+        registry.begin_add(
+            CLAUDE_CODE_PROVIDER_ID,
+            "personal",
+            "Personal",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        registry.complete_add(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        registry.select_complete_revision(CLAUDE_CODE_PROVIDER_ID, "personal", None)?;
+        authority.verify_binding_unchanged()?;
+        registry.begin_delete(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        registry.finish_delete(CLAUDE_CODE_PROVIDER_ID, "personal")?;
+        authority.verify_binding_unchanged()?;
+        assert!(registry
+            .begin_delete(CLAUDE_CODE_PROVIDER_ID, "work")
+            .is_err());
+        let original = fs::read(registry.metadata_path())?;
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: Value = serde_json::from_slice(&original)?;
+            document["accounts"][0][field] = value.into();
+            fs::write(registry.metadata_path(), serde_json::to_vec(&document)?)?;
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
+        fs::write(registry.metadata_path(), original)?;
         authority.verify_binding_unchanged()?;
         authority.oauth_expires_at_unix_millis = now_unix_millis()?.saturating_sub(1);
         assert!(authority.verify_binding_unchanged().is_err());

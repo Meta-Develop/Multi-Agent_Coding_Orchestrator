@@ -359,25 +359,10 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
                     })));
                 }
             };
-        let manifest_digest = receipt.manifest_digest.clone();
-        let validated = validate_collection_contents(&policy, receipt).map_err(|error| {
-            ExecutorError::CollectionRejected {
-                reason: error.to_string(),
-            }
-        })?;
-        Ok(Effect::Confirmed(CollectedResult {
-            identity: request.identity,
-            patch: validated.patch,
-            patch_digest: validated.patch_digest,
-            changed_paths: validated.changed_paths,
-            outputs: validated.outputs,
-            binding: CollectionEvidenceBinding {
-                manifest_digest,
-                policy_digest,
-                collection_key: key,
-            },
-            candidate_evidence_only: true,
-        }))
+        Ok(Effect::Confirmed(restore_collection_receipt(
+            &request.identity,
+            receipt,
+        )?))
     }
 
     fn cleanup(&self, request: CleanupRequest) -> ExecutorResult<Effect<CleanupReceipt>> {
@@ -742,6 +727,41 @@ fn validate_execution_collection_authority(identity: &ExecutionIdentity) -> Exec
         &identity.staged_digest,
         &identity.launch_spec_digest,
     )
+}
+
+/// Revalidate authenticated local collection bytes through the same boundary as
+/// a fresh receipt. Restoring a checkpoint never creates native run evidence.
+pub(super) fn restore_collection_receipt(
+    identity: &ExecutionIdentity,
+    receipt: CollectionReceipt,
+) -> ExecutorResult<CollectedResult> {
+    validate_execution_collection_authority(identity)?;
+    let authority = identity.collection_authority();
+    let receipt = validate_collection_envelope(
+        identity,
+        authority.policy_digest(),
+        authority.collection_key(),
+        receipt,
+    )?;
+    let manifest_digest = receipt.manifest_digest.clone();
+    let validated = validate_collection_contents(authority.policy(), receipt).map_err(|error| {
+        ExecutorError::CollectionRejected {
+            reason: error.to_string(),
+        }
+    })?;
+    Ok(CollectedResult {
+        identity: identity.clone(),
+        patch: validated.patch,
+        patch_digest: validated.patch_digest,
+        changed_paths: validated.changed_paths,
+        outputs: validated.outputs,
+        binding: CollectionEvidenceBinding {
+            manifest_digest,
+            policy_digest: authority.policy_digest().clone(),
+            collection_key: authority.collection_key().clone(),
+        },
+        candidate_evidence_only: true,
+    })
 }
 
 struct ValidatedCollection {

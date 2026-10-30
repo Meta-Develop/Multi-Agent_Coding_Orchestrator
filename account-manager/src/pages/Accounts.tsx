@@ -12,6 +12,7 @@ import AccountActions, {
 } from '@/components/AccountActions'
 import AddAccountForm from '@/components/AddAccountForm'
 import InitialMark from '@/components/InitialMark'
+import LaunchOperations from '@/components/LaunchOperations'
 import NotImplemented from '@/components/NotImplemented'
 import PageHeader from '@/components/PageHeader'
 import SelectedAccountObservation from '@/components/SelectedAccountObservation'
@@ -112,6 +113,7 @@ export default function Accounts() {
         title="Accounts"
         description="Every account this application can see, grouped by provider. Some adapters switch the tool itself; launch-selected adapters change only which account this application uses for a child process it launches."
       />
+      <LaunchOperations />
       {loading && (
         <p className="text-sm text-ink-muted" role="status">
           Loading accounts…

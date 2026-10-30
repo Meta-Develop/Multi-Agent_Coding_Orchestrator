@@ -323,6 +323,7 @@ mod parent_initial_yield_schema_tests {
 
     fn delegating_parent(worker_ids: &[&str]) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: "parent-yield".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -2886,6 +2887,7 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
             "semantic_symbols": string_array_schema_value(),
             "semantic_modules": string_array_schema_value(),
             "task": {"type": "string"},
+            "assignment_shape": assignment_shape_schema_value(),
             "worker_assignments": {"type": "array", "items": worker_assignment_schema_value()},
             "environment_requirements": {"type": "array", "items": environment_requirement_schema_value()},
             "licensed_breakage": licensed_breakage_declaration_schema_value(),
@@ -2903,6 +2905,28 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
                     }
                 }
             }
+        }
+    })
+}
+
+fn assignment_shape_schema_value() -> serde_json::Value {
+    let event = crate::selection::selection_event_schema_value();
+    let input = &event["properties"]["provenance"]["properties"]["normalized_input"];
+    // Declarations, like historical task profiles, must preserve Unknown axes.
+    let profile = input["properties"]["outcomes"]["items"]["properties"]["task"].clone();
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "version", "policy_sha256", "assignment_input_sha256", "profile", "effects", "delegation"
+        ],
+        "properties": {
+            "version": {"type": "integer", "const": 1},
+            "policy_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "assignment_input_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+            "profile": profile,
+            "effects": {"enum": ["read_only", "repository_write", "external_side_effects", "publication"]},
+            "delegation": {"enum": ["terminal", "delegating"]}
         }
     })
 }
@@ -4803,6 +4827,81 @@ pub(super) fn write_private_prompt(
 mod selection_schema_tests {
     use super::*;
 
+    #[test]
+    fn assignment_shape_schema_is_optional_closed_and_versioned() -> Result<()> {
+        let schema = orchestrator_assignment_schema_value();
+        let mut assignment = json!({
+            "id": "leaf", "phase": "execution", "role": "worker",
+            "assigned_paths": ["README.md"], "semantic_symbols": [], "semantic_modules": [],
+            "worker_assignments": [], "environment_requirements": []
+        });
+        let schema_id = "https://example.invalid/assignment-shape";
+        let mut compiler = boon::Compiler::new();
+        compiler.set_default_draft(boon::Draft::V2020_12);
+        compiler
+            .add_resource(schema_id, schema)
+            .expect("register assignment schema");
+        let mut schemas = boon::Schemas::new();
+        let index = compiler
+            .compile(schema_id, &mut schemas)
+            .expect("compile assignment schema");
+        assert!(schemas.validate(&assignment, index).is_ok());
+        let shape = json!({
+            "version": 1, "policy_sha256": "a".repeat(64),
+            "assignment_input_sha256": "b".repeat(64),
+            "profile": {
+                "task_class": "localized_code_change", "risk": "unknown",
+                "boundedness": "unknown", "context": "unknown", "horizon": "unknown",
+                "authority_role": "terminal_leaf"
+            },
+            "effects": "repository_write", "delegation": "terminal"
+        });
+        assignment["assignment_shape"] = shape.clone();
+        assert!(schemas.validate(&assignment, index).is_ok());
+        let typed: OrchestratorAssignment = serde_json::from_value(assignment.clone())?;
+        assert_eq!(serde_json::to_value(typed.assignment_shape)?, shape);
+        for (field, invalid) in [
+            ("version", json!(2)),
+            ("policy_sha256", json!("invalid")),
+            ("effects", json!("none")),
+            ("delegation", json!("none")),
+            ("extra", json!(true)),
+        ] {
+            let mut changed = assignment.clone();
+            changed["assignment_shape"][field] = invalid;
+            assert!(schemas.validate(&changed, index).is_err(), "{field}");
+        }
+        for field in shape.as_object().unwrap().keys() {
+            let mut changed = assignment.clone();
+            changed["assignment_shape"]
+                .as_object_mut()
+                .unwrap()
+                .remove(field);
+            assert!(
+                schemas.validate(&changed, index).is_err(),
+                "missing {field}"
+            );
+        }
+        assignment["assignment_shape"] = Value::Null;
+        assert!(schemas.validate(&assignment, index).is_err());
+        for published in [
+            supervisor_final_report_schema_value(),
+            supervisor_collect_report_schema_value(),
+            serde_json::from_str(include_str!(
+                "../../schemas/supervisor-final-report-v1.schema.json"
+            ))?,
+            serde_json::from_str(include_str!(
+                "../../schemas/supervisor-collect-report-v1.schema.json"
+            ))?,
+        ] {
+            let carried = &published["properties"]["generated_follow_up_tasks"]["items"]
+                ["properties"]["supervisor_plan"]["properties"]["assignments"]["items"]
+                ["properties"]["assignment_shape"];
+            assert_eq!(*carried, assignment_shape_schema_value());
+        }
+        Ok(())
+    }
+
     fn open_object_schema_paths(value: &serde_json::Value) -> Vec<String> {
         fn walk(value: &serde_json::Value, path: &str, open: &mut Vec<String>) {
             match value {
@@ -4868,6 +4967,7 @@ mod selection_schema_tests {
             }],
         };
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "source-child".into(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -5529,6 +5629,52 @@ mod selection_schema_tests {
     }
 
     #[test]
+    fn published_selection_identity_is_optional_closed_and_versioned() -> Result<()> {
+        let mut input = crate::selection::selection_test_base_input();
+        input.assignment_shape_identity =
+            Some(crate::selection::AssignmentShapeIdentity::v1("a".repeat(64)).unwrap());
+        let event = json!({
+            "assignment_id": "leaf", "attempt": 0, "role": "worker", "primary_cause": "initial",
+            "provenance": crate::selection::select(&input)?,
+        });
+        for schema in [
+            supervisor_final_report_schema_value(),
+            supervisor_collect_report_schema_value(),
+        ] {
+            let schema = &schema["properties"]["role_economics_profile"]["properties"]["execution"]
+                ["properties"]["selection_decisions"]["items"];
+            let schema_id = "https://example.invalid/selection-assignment-identity";
+            let mut compiler = boon::Compiler::new();
+            compiler.set_default_draft(boon::Draft::V2020_12);
+            compiler
+                .add_resource(schema_id, schema.clone())
+                .expect("register selection identity schema");
+            let mut schemas = boon::Schemas::new();
+            let index = compiler
+                .compile(schema_id, &mut schemas)
+                .expect("compile selection identity schema");
+            assert!(schemas.validate(&event, index).is_ok());
+            let mut legacy = event.clone();
+            legacy["provenance"]["normalized_input"]
+                .as_object_mut()
+                .unwrap()
+                .remove("assignment_shape_identity");
+            assert!(schemas.validate(&legacy, index).is_ok());
+            for invalid in [
+                json!({"version": 2, "sha256": "a".repeat(64)}),
+                json!({"version": 1, "sha256": "bad"}),
+                json!({"version": 1, "sha256": "a".repeat(64), "extra": true}),
+                serde_json::Value::Null,
+            ] {
+                let mut malformed = event.clone();
+                malformed["provenance"]["normalized_input"]["assignment_shape_identity"] = invalid;
+                assert!(schemas.validate(&malformed, index).is_err());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn published_selection_prior_ceiling_is_required_nullable_and_closed() -> Result<()> {
         let decision = crate::selection::select(&crate::selection::selection_test_base_input())?;
         let event = json!({
@@ -6107,6 +6253,26 @@ mod selection_schema_tests {
 
     #[test]
     fn generated_complete_contracts_match_tracked_schemas() -> Result<()> {
+        if std::env::var_os("MACO_REGENERATE_REPORT_SCHEMAS").as_deref()
+            == Some(std::ffi::OsStr::new("1"))
+        {
+            for (name, schema) in [
+                (
+                    "supervisor-final-report-v1.schema.json",
+                    supervisor_final_report_schema_value(),
+                ),
+                (
+                    "supervisor-collect-report-v1.schema.json",
+                    supervisor_collect_report_schema_value(),
+                ),
+            ] {
+                println!(
+                    "GENERATED_REPORT_SCHEMA:{name}:{}",
+                    serde_json::to_string_pretty(&schema)?
+                );
+            }
+            return Ok(());
+        }
         let tracked: serde_json::Value = serde_json::from_str(include_str!(
             "../../schemas/supervisor-final-report-v1.schema.json"
         ))?;

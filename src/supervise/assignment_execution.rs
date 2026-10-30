@@ -1193,6 +1193,7 @@ fn dispatch_isolated_parent_workers_inner(
             bail!("isolated dispatch grant order differs from the frozen authored turn");
         }
         let subject = OrchestratorAssignment {
+            assignment_shape: None,
             id: worker.id.clone(),
             phase: AssignmentPhase::Execution,
             runtime: Some(nested_worker_launch_runtime(
@@ -3049,9 +3050,9 @@ fn prepare_child_attempt_with_purpose<'a>(
             record_budget_dispatch_refusal(
                 outcome,
                 assignment,
-                &assignment.id,
-                assignment.role,
+                (&assignment.id, assignment.role),
                 &refusal,
+                (launch_runtime, &command, budget_ledger),
                 artifacts,
                 journal_parent_id,
             )?;
@@ -3898,8 +3899,89 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         })?;
         return Err(error);
     }
-    let external_run_result = match launch_runtime {
-        SupervisorRuntime::Codex => {
+    #[cfg(test)]
+    if assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local {
+        SSH_DISPATCH_ENDPOINT.with(|slot| {
+            *slot.borrow_mut() = command
+                .assignment_messaging_launch()
+                .map(|launch| launch.endpoint().to_string());
+        });
+    }
+    let external_run_result = match (
+        assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local,
+        launch_runtime,
+    ) {
+        (true, _) => {
+            if let Some(state) = release_state {
+                state.store(2, Ordering::Release);
+            }
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                if requires_hosted_pre_action_review(&command) {
+                    bail!("SSH dispatch requires an equivalent hosted pre-action review route");
+                }
+                assignment_executor::dispatch_assignment_external(
+                    assignment_metadata,
+                    context.repo,
+                    &options.run_id,
+                    &assignment.id,
+                    None,
+                    attempt,
+                    &assignment.assigned_paths,
+                    &command,
+                    cancellation,
+                    None,
+                    *external_runner,
+                )
+            }));
+            match result {
+                Ok(Ok(run)) => Ok(run),
+                Ok(Err(error)) if !remote_execution::launch_may_have_started(&error) => {
+                    // No remote provider can write these local resources. Close
+                    // the bearer endpoint and use ordinary not-started cleanup.
+                    drop(messaging_server);
+                    budget_reservation.state =
+                        DispatchBudgetReservationState::Reserved(launch_runtime);
+                    if let Some(state) = release_state {
+                        state.store(1, Ordering::Release);
+                    }
+                    Err(error)
+                }
+                failure => {
+                    outcome.external_containment_failed = true;
+                    outcome.usage_incomplete = true;
+                    cancellation.cancel();
+                    let settlement = budget_reservation
+                        .ledger
+                        .reconcile_for_runtime_if_configured(
+                            budget_reservation.reservation.id,
+                            UsageMeasurement::Missing,
+                            Some(runtime_name(launch_runtime)),
+                        );
+                    if settlement.is_ok() {
+                        budget_reservation.state = DispatchBudgetReservationState::Settled;
+                    }
+                    let detail = match failure {
+                        Ok(Err(error)) => format!("{error:#}"),
+                        Err(_) => "SSH coordinator panicked".into(),
+                        Ok(Ok(_)) => unreachable!(),
+                    };
+                    // Remote custody is unresolved. Do not let local deterministic
+                    // failure cleanup discard capture roots or mark this unstarted.
+                    std::mem::forget((
+                        incoming_output_root,
+                        capture_output_root,
+                        incoming_scratch,
+                        capture_scratch,
+                        command,
+                        messaging_server,
+                    ));
+                    // Keep reservation Drop armed if the explicit Missing
+                    // reconciliation failed; it must still attempt settlement.
+                    bail!("SSH attempt retained for checkpoint reconciliation: {detail}; missing usage settlement: {settlement:?}");
+                }
+            }
+        }
+        (false, SupervisorRuntime::Codex) => {
             let review_context = if requires_hosted_pre_action_review(&command) {
                 pre_action_review_context.as_ref()
             } else {
@@ -3970,10 +4052,13 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             drop(messaging_server);
             external_run_result
         }
-        SupervisorRuntime::Grok
-        | SupervisorRuntime::Cursor
-        | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => {
+        (
+            false,
+            SupervisorRuntime::Grok
+            | SupervisorRuntime::Cursor
+            | SupervisorRuntime::ClaudeCode
+            | SupervisorRuntime::GeminiCli,
+        ) => {
             if let Some(state) = release_state {
                 state.store(2, Ordering::Release);
             }
@@ -4015,7 +4100,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             drop(messaging_server);
             Ok(external_run)
         }
-        SupervisorRuntime::Fake => deterministic_fake_child_run(
+        (false, SupervisorRuntime::Fake) => deterministic_fake_child_run(
             &command,
             assignment,
             assignment_metadata,
@@ -4203,6 +4288,11 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             "managed parent returned evidence import also failed: {import_error:#}"
         )),
     }
+}
+
+#[cfg(test)]
+thread_local! {
+    static SSH_DISPATCH_ENDPOINT: RefCell<Option<String>> = const { RefCell::new(None) };
 }
 
 // Copy only descriptor-held observations into private artifacts. Do not read the
@@ -4520,6 +4610,10 @@ fn dispatch_and_capture_attached_parent_attempt<'budget, 'turn>(
     }
     let cancellation = preflight.managed_process_cancellation.cancellation();
     let assignment = &preflight.assignment;
+    if context.assignment_metadata.executor(&assignment.id, None) != ExecutorSelection::Local {
+        abandon_unstarted_attached_parent(context.artifacts, prepared)?;
+        bail!("SSH dispatch cannot use the coordinator-local attached parent messaging endpoint");
+    }
     if let Some(admission) = &prepared.command_admission {
         let result = AssignmentAttemptAuthority::from_preflight(context, preflight, attempt)
             .and_then(|authority| {
@@ -6703,9 +6797,9 @@ fn prepare_parent_auditor<'a>(
             record_budget_dispatch_refusal(
                 outcome,
                 assignment,
-                &auditor_id,
-                AgentRole::Auditor,
+                (&auditor_id, AgentRole::Auditor),
                 &refusal,
+                (launch_runtime, &auditor_command, budget_ledger),
                 artifacts,
                 journal_parent_id,
             )?;
@@ -6777,7 +6871,6 @@ struct ParentAuditorDispatchFrame<'a> {
     journal_parent_id: &'a str,
     auditor_attempt: usize,
     review_cost_binding: &'a mut ParentWorkerAttemptReviewCostBinding,
-    dated_plan_pricing: &'a BTreeMap<String, ModelPricing>,
 }
 
 // A grant authenticates the exact launch, including the final duration. Parent
@@ -6841,7 +6934,6 @@ fn dispatch_and_collect_parent_auditor(
 ) -> Result<ParentAuditorCollection> {
     let journal_parent_id = frame.journal_parent_id;
     let auditor_attempt = frame.auditor_attempt;
-    let dated_plan_pricing = frame.dated_plan_pricing;
     let review_cost_binding = &mut frame.review_cost_binding;
     let AssignmentExecutionContext {
         repo,
@@ -7015,13 +7107,20 @@ fn dispatch_and_collect_parent_auditor(
             return Err(error).context("failed to produce deterministic parent auditor output");
         }
     };
-    review_cost_binding.observe_parent_auditor_external_run(&auditor_run, dated_plan_pricing);
     let auditor_environment_blocked = auditor_run.environment_blocked();
     outcome
         .gate_denials
         .extend(auditor_run.gate_denials().iter().cloned());
     let usage_settlement =
-        auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command)?;
+        auditor_budget_reservation.settle_bound_runtime(&auditor_run, &auditor_command);
+    // Retain actual review dispatch even when settlement or its projection fails.
+    let pricing_charge = review_cost_binding.observe_settled_parent_auditor(
+        auditor_budget_reservation.ledger,
+        auditor_budget_reservation.reservation.id,
+        native_outcome_cost_microunits(&auditor_run),
+    );
+    let usage_settlement = usage_settlement?;
+    pricing_charge?;
     match usage_settlement.role_sample(AgentRole::Auditor, Some(lens.id.clone())) {
         Some(sample) => {
             let usage = sample.usage;
@@ -7873,6 +7972,10 @@ fn execute_supervisor_assignment_inner(
                     AssignmentExecutionDisposition::Complete => return Ok(()),
                 };
                 let attempted_launch_model_provenance = prepared.model_provenance.clone();
+                let attempt_settlement = (
+                    prepared.budget_reservation.ledger,
+                    prepared.budget_reservation.reservation.id,
+                );
                 let requested_effort = prepared.command.reasoning_effort.clone();
                 let account_observe = active_budget_policy.account_observe_environment_decision();
                 let collected = match if managed_parent_cycle {
@@ -7921,6 +8024,7 @@ fn execute_supervisor_assignment_inner(
                                 completed_parent_review_cycles,
                             )),
                             account_observe,
+                            Some(attempt_settlement),
                         )?;
                         return Err(error);
                     }
@@ -7961,6 +8065,7 @@ fn execute_supervisor_assignment_inner(
                                 completed_parent_review_cycles,
                             )),
                             account_observe,
+                            Some(attempt_settlement),
                         )?;
                         return Err(error);
                     }
@@ -7985,6 +8090,7 @@ fn execute_supervisor_assignment_inner(
                         completed_parent_review_cycles,
                     )),
                     account_observe,
+                    Some(attempt_settlement),
                 )?;
                 match disposition {
                     ChildAttemptDisposition::Retry => {
@@ -8345,7 +8451,6 @@ fn execute_supervisor_assignment_inner(
                         journal_parent_id,
                         auditor_attempt,
                         review_cost_binding: &mut review_cost_binding,
-                        dated_plan_pricing: &active_plan.model_pricing,
                     };
                     match dispatch_and_collect_parent_auditor(
                         context,
@@ -8722,7 +8827,8 @@ mod decomposition_tests {
         with_source_inputs: bool,
         dispatch_case: Option<&str>,
     ) -> Result<()> {
-        let runtime = if dispatch_case.is_some_and(|case| case != "codex") {
+        let runtime = if dispatch_case.is_some_and(|case| !matches!(case, "codex" | "ssh-refusal"))
+        {
             SupervisorRuntime::GeminiCli
         } else {
             SupervisorRuntime::Codex
@@ -8823,6 +8929,15 @@ mod decomposition_tests {
             ..Default::default()
         })?;
         let mut assignment_metadata = loaded.assignment_metadata.clone();
+        if dispatch_case == Some("ssh-refusal") {
+            assignment_metadata.executors.insert(
+                (assignment.id.clone(), None),
+                serde_json::from_value(json!({"kind":"ssh", "target":{
+                    "host_id":"untrusted", "endpoint":"test.invalid", "user":"runner", "port":2222,
+                    "helper":"/opt/maco/helper", "root":"/srv/maco/workspaces"
+                }}))?,
+            );
+        }
         if dispatch_case.is_some() {
             let authority_writer = Arc::new(Mutex::new(ArtifactRunWriter::reserve(
                 &repo,
@@ -9007,6 +9122,10 @@ mod decomposition_tests {
             } else if case == "released" {
                 budget_ledger.release(prepared.budget_reservation.reservation.id)?;
             }
+            let scratches = [
+                prepared.incoming_scratch.path().to_path_buf(),
+                prepared.capture_scratch.path().to_path_buf(),
+            ];
             let dispatched = dispatch_and_capture_child_attempt(
                 &context,
                 &mut outcome,
@@ -9015,6 +9134,29 @@ mod decomposition_tests {
                 1,
                 prepared,
             );
+            if case == "ssh-refusal" {
+                assert!(dispatched.is_err());
+                assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+                assert!(!outcome.external_containment_failed);
+                assert!(!outcome.usage_incomplete);
+                let report = budget_ledger.report()?;
+                assert_eq!(report.active_reservations, 0);
+                assert_eq!(report.consumed.tokens, 0);
+                assert!(report.usage_complete);
+                assert!(scratches.iter().all(|path| !path.exists()));
+                let endpoint = SSH_DISPATCH_ENDPOINT
+                    .with(|slot| slot.borrow_mut().take())
+                    .context("SSH fixture did not bind messaging")?;
+                assert!(
+                    std::net::TcpStream::connect_timeout(
+                        &endpoint.parse()?,
+                        Duration::from_millis(100)
+                    )
+                    .is_err(),
+                    "refused SSH dispatch leaked its loopback listener"
+                );
+                return Ok(());
+            }
             if matches!(case, "stopped" | "released") {
                 assert!(dispatched.is_err());
                 assert_eq!(runner_calls.load(std::sync::atomic::Ordering::SeqCst), 0);
@@ -9059,6 +9201,12 @@ mod decomposition_tests {
     #[test]
     fn prepared_researcher_source_inputs_preserve_messaging_appendix() -> Result<()> {
         verify_prepared_researcher_messaging_prompt(true, None)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn ssh_prelaunch_refusal_closes_messaging_scratches_and_budget() -> Result<()> {
+        verify_prepared_researcher_messaging_prompt(false, Some("ssh-refusal"))
     }
 
     #[cfg(target_os = "linux")]
@@ -9279,6 +9427,7 @@ mod decomposition_tests {
             .acquire_repository_cleanliness()
             .expect("source cleanliness capability");
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "leased-source-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9751,6 +9900,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -10092,7 +10242,6 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
-            dated_plan_pricing: &plan.model_pricing,
         };
         let auditor_collection = dispatch_and_collect_parent_auditor(
             &context,
@@ -10178,6 +10327,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -10675,6 +10825,7 @@ mod decomposition_tests {
             child_context
                 .budget_policy
                 .account_observe_environment_decision(),
+            None,
         )
         .expect("record worker attempt outcome");
         let execution_cost_before_persist =
@@ -10789,7 +10940,6 @@ mod decomposition_tests {
             journal_parent_id: options.run_id.as_str(),
             auditor_attempt,
             review_cost_binding: &mut review_cost_binding,
-            dated_plan_pricing: &plan.model_pricing,
         };
         dispatch_and_collect_parent_auditor(
             &grok_context,
@@ -10844,6 +10994,10 @@ mod decomposition_tests {
         assert_eq!(
             stored.costs.review_cost_microunits,
             Some(REVIEW_COST_MICROUNITS)
+        );
+        assert_eq!(
+            stored.pricing[0].pricing.basis,
+            ChargePricingBasis::ProviderNativeCostEquivalent
         );
         assert_eq!(
             stored.costs.execution_cost_microunits,
@@ -10904,6 +11058,7 @@ mod decomposition_tests {
     #[cfg(unix)]
     #[test]
     fn execute_supervisor_assignment_persists_cycle_proof_on_assignment_complete_after_dispatch() {
+        skip_without_containment!();
         use crate::mutation_taxonomy::AssignmentProcessLaunchKind;
         use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -10914,6 +11069,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -11066,6 +11222,7 @@ mod decomposition_tests {
                     &mut plan,
                     &mut plan_metadata,
                     super::scheduler::PreparedSupervisorSelectionRequest {
+                        assignment_shapes: None,
                         repo: &repo,
                         current_run: Some(&options.run_id),
                         runtime: options.runtime,
@@ -11290,6 +11447,7 @@ mod decomposition_tests {
         fs::write(repo.join("README.md"), "baseline\n").expect("write fixture file");
         commit_fixture_repository(&repo);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -11436,6 +11594,7 @@ mod decomposition_tests {
                     &mut plan,
                     &mut plan_metadata,
                     super::scheduler::PreparedSupervisorSelectionRequest {
+                        assignment_shapes: None,
                         repo: &repo,
                         current_run: Some(&options.run_id),
                         runtime: options.runtime,
@@ -11784,6 +11943,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -12525,6 +12685,7 @@ mod decomposition_tests {
         commit_fixture_repository(&repo);
 
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "phase-child".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -13385,6 +13546,7 @@ done
 
     fn phase_fixture_assignment(id: &str, phase: AssignmentPhase) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase,
             runtime: None,
@@ -13637,6 +13799,7 @@ done
 
     fn valid_child_plan_with_nested_worker() -> Result<SupervisorPlan> {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-with-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14217,6 +14380,7 @@ done
         fs::write(&grok, "fixture")?;
         let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14404,6 +14568,7 @@ done
         let (_environment_lock, _environment_guard) =
             GrokBinaryEnvironmentGuard::install_with(&grok, extra_env);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14639,6 +14804,7 @@ done
     #[test]
     fn writable_grok_binding_requires_the_explicit_terminal_worker_category() -> Result<()> {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -14689,6 +14855,7 @@ done
         fs::write(&grok, "fixture")?;
         let (_environment_lock, _environment_guard) = GrokBinaryEnvironmentGuard::install(&grok);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "grok-planner".to_string(),
             phase: AssignmentPhase::Planning,
             runtime: None,
@@ -14775,6 +14942,7 @@ done
     #[test]
     fn assignment_launch_uses_selected_runtime_pair_not_run_global() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "worker-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Cursor),
@@ -14809,6 +14977,7 @@ done
     #[test]
     fn admission_consumes_stored_category_and_refuses_luna_coordinator() -> Result<()> {
         let mut assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "leaf-worker".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -15146,6 +15315,7 @@ done
     #[test]
     fn retry_selected_runtime_supersedes_the_assignment_initial_runtime() {
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "worker-retry".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: Some(SupervisorRuntime::Codex),
@@ -15426,6 +15596,7 @@ done
 
     fn weak_mechanical_executor_worker(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -16812,6 +16983,7 @@ done
         commit_fixture_repository(&repo);
         chmod_control_dirs(&repo)?;
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "luna-named-codex".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -17850,6 +18022,7 @@ done
         let sync_store = open_sync_with_sim_remote(&repo, sim.shared_clone())?;
         let manager = WorktreeManager::new(&repo);
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "remote-bind-agent".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

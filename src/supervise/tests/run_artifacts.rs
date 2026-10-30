@@ -4488,6 +4488,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: assignment_id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

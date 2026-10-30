@@ -413,7 +413,7 @@ fn separate_process_concurrent_selections_both_persist() {
 
 #[cfg(unix)]
 #[test]
-fn child_held_use_lease_refuses_select_and_delete_until_release() {
+fn child_held_use_lease_allows_selection_but_refuses_delete_until_release() {
     if coding_agent_manager_lib::account_authority::test_worker::run_from_env() {
         return;
     }
@@ -428,7 +428,7 @@ fn child_held_use_lease_refuses_select_and_delete_until_release() {
     add_complete(&registry, "gemini-cli", "personal");
     let mut child = Command::new(std::env::current_exe().expect("test executable"))
         .arg("--exact")
-        .arg("child_held_use_lease_refuses_select_and_delete_until_release")
+        .arg("child_held_use_lease_allows_selection_but_refuses_delete_until_release")
         .arg("--nocapture")
         .env(WORKER_ENV, "hold_use_lease")
         .env("CAM_REGISTRY_PATH", &path)
@@ -444,7 +444,9 @@ fn child_held_use_lease_refuses_select_and_delete_until_release() {
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    assert!(registry.select_complete("gemini-cli", "personal").is_err());
+    registry.select_complete("gemini-cli", "personal").unwrap();
+    registry.begin_delete("gemini-cli", "personal").unwrap();
+    registry.finish_delete("gemini-cli", "personal").unwrap();
     assert!(registry.begin_delete("gemini-cli", "work").is_err());
     fs::write(&signal, b"release").expect("release child");
     let wait_deadline = Instant::now() + Duration::from_secs(15);
@@ -457,6 +459,6 @@ fn child_held_use_lease_refuses_select_and_delete_until_release() {
     }
     assert!(child.wait().expect("wait").success());
     registry
-        .select_complete("gemini-cli", "personal")
-        .expect("select after release");
+        .begin_delete("gemini-cli", "work")
+        .expect("delete after release");
 }

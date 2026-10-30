@@ -254,8 +254,13 @@ pub(crate) fn live_quota_concurrency_bound(
 }
 mod plan_api;
 pub use plan_api::*;
+mod assignment_shape;
+pub use assignment_shape::{
+    AssignmentDelegation, AssignmentEffects, AssignmentShapeDeclaration, ValidatedAssignmentShape,
+};
 mod assignment_executor;
 pub mod authored_checks;
+pub mod remote_execution;
 pub(crate) use plan_api::{
     load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,
     validate_generated_follow_up_plan_document_in_repo,
@@ -433,7 +438,11 @@ mod dispatch;
 pub(crate) mod operator_pricing;
 mod pricing_provenance;
 use dispatch::*;
-pub use pricing_provenance::{ChargePricing, ChargePricingBasis, PricingContractProvenance};
+pub(crate) use pricing_provenance::outcome_charge_schema_value;
+pub use pricing_provenance::{
+    ChargePricing, ChargePricingBasis, OutcomeChargePricing, OutcomeCostPhase,
+    PricingContractProvenance,
+};
 
 mod gate_health;
 pub use gate_health::*;
@@ -2013,6 +2022,8 @@ struct AssignmentMetadata {
     authored_independent_checks: BTreeMap<String, Vec<authored_checks::AuthoredIndependentCheck>>,
     /// Parent assignment and optional nested Worker id; omission selects Local.
     executors: BTreeMap<(String, Option<String>), ExecutorSelection>,
+    /// Explicit embedding configuration, captured before scheduler threads start.
+    ssh_hosts: Vec<remote_execution::SupervisedSshHost>,
     /// Assignment-level mechanical duty for a direct Worker (empty nested list).
     /// Nested `worker_assignments` keep [`WorkerAssignmentMetadata::mechanical_duty`].
     direct_mechanical_duties: BTreeMap<String, MechanicalTerminalDuty>,
@@ -2082,6 +2093,7 @@ impl From<BTreeMap<(String, String), WorkerAssignmentMetadata>> for AssignmentMe
             source_inputs: BTreeMap::new(),
             authored_independent_checks: BTreeMap::new(),
             executors: BTreeMap::new(),
+            ssh_hosts: Vec::new(),
             direct_mechanical_duties: BTreeMap::new(),
         }
     }
@@ -2144,6 +2156,14 @@ pub enum AssignmentPhase {
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct OrchestratorAssignment {
     pub id: String,
+    /// Parent-declared fitness, revalidated against exact assignment inputs and
+    /// frozen policy. Omission remains unproven and grants no eligibility.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "assignment_shape::deserialize_shape"
+    )]
+    pub assignment_shape: Option<AssignmentShapeDeclaration>,
     /// Planning-versus-execution capability selector for implementation roles.
     /// A Researcher remains read-only in either phase.
     ///

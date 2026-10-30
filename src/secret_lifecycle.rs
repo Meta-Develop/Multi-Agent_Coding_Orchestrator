@@ -5,8 +5,17 @@
 //!
 //! This module is the lifecycle governance surface. It does **not** replace
 //! bounded credential redaction in `external_agent` (presence detection plus
-//! log/report scrubbing). Callers that still copy host environment values into
-//! child processes, plans, or journals remain a cross-lane handoff.
+//! log/report scrubbing). CAM selected launches and root selected-account dispatch use the
+//! equivalent closed operation: an exact incarnation/use lease and run-bound admission.
+//! Codex, Claude, Cursor, Gemini and Grok open their selected credential capability during guarded
+//! construction and settles custody only from live process-tree evidence.
+//! On Linux, `ProviderLaunchMetadata` is reference-only descriptive evidence.
+//! Admission deadlines and pre-spawn revocation refuse pending construction.
+//! Once a child starts, cancellation and verified tree exit govern finalization;
+//! expiry or revocation cannot assert that a running child has stopped. The
+//! incarnation/use lease prevents rotation and account replacement until exit,
+//! and an outer authority lease also covers report and relay teardown. Unknown
+//! exit retains custody. Managed Grok catalog discovery follows the same rule.
 //!
 //! The contract is:
 //!
@@ -46,11 +55,15 @@
 mod audit;
 mod injection;
 mod material;
+#[cfg(target_os = "linux")]
+mod provider_dispatch;
 mod types;
 mod vault;
 
 pub use audit::{SecretAuditAction, SecretAuditEvent, SecretAuditOutcome, SecretAuditTrail};
 pub use injection::{SecretEnvironment, SecretLease};
+#[cfg(target_os = "linux")]
+pub use provider_dispatch::ProviderLaunchMetadata;
 pub use types::{
     DelegationPolicy, PersistencePolicy, SecretDeclaration, SecretLifecycleError,
     SecretPlanBinding, SecretRef, SecretScope, SecretState, SecretStatusView,

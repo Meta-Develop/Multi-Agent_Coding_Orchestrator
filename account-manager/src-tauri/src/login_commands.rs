@@ -2,15 +2,14 @@
 
 use std::sync::Arc;
 
-use serde::{Deserialize, Serialize};
 use tauri::State;
 use tauri_plugin_opener::OpenerExt;
 
 use crate::account_authority::{GeminiLoginPort, LoginPort};
 use crate::error::{Error, Result};
 use crate::login::{
-    LoginAccountBinding, LoginAuthorization, LoginBrowserMode, LoginHandle, LoginService,
-    LoginStartRequest, LoginState, LoginStatus,
+    LoginAccountBinding, LoginBrowserMode, LoginHandle, LoginService, LoginStartRequest,
+    LoginState, LoginStatus,
 };
 use crate::model::{AuthKind, ProviderCapability};
 use crate::providers::claude_code::ClaudeCodeAdapter;
@@ -19,32 +18,7 @@ use crate::providers::gemini_cli::GeminiCliAdapter;
 use super::authority_client::AccountAuthority;
 use super::authority_client::AuthorityClient;
 
-/// Private GUI response; the core status and public owner action stay bound together.
-#[derive(Clone, Deserialize, Serialize)]
-#[serde(rename_all = "camelCase")]
-pub(crate) struct LoginIpcStatus {
-    #[serde(flatten)]
-    pub status: LoginStatus,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub authorization: Option<LoginAuthorization>,
-}
-
-impl std::ops::Deref for LoginIpcStatus {
-    type Target = LoginStatus;
-    fn deref(&self) -> &Self::Target {
-        &self.status
-    }
-}
-
-impl std::fmt::Debug for LoginIpcStatus {
-    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        formatter
-            .debug_struct("LoginIpcStatus")
-            .field("status", &self.status)
-            .field("authorization_available", &self.authorization.is_some())
-            .finish()
-    }
-}
+pub(crate) use crate::login_ipc::LoginIpcStatus;
 
 fn in_process_status(service: &dyn LoginPort, status: LoginStatus) -> Result<LoginIpcStatus> {
     let authorization = service.authorization(&status.handle, &status.binding)?;
@@ -253,7 +227,7 @@ fn current_authorization_url(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::login::{LoginState, LoginStatus};
+    use crate::login::{LoginAuthorization, LoginState, LoginStatus};
     use crate::paths;
     use crate::providers::StoredAccountRegistry;
 

@@ -2182,6 +2182,7 @@ mod tests {
 
     fn assignment() -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: "child-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,

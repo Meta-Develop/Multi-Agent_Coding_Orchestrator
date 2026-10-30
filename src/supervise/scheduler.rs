@@ -633,7 +633,7 @@ impl AssignmentBudgetPolicy {
             let load = load_this_run_outcome_records(run_dir)?;
             state.set_this_run_outcomes(load.records, load.exclusions);
         }
-        let reselection = reselect_roles_from_supplied_catalog_snapshot(
+        let reselection = reselect_assignment_from_supplied_catalog_snapshot(
             state,
             runtime,
             catalog,
@@ -641,6 +641,7 @@ impl AssignmentBudgetPolicy {
             retry_count,
             budget_signal,
             environment_rejections,
+            assignment_id,
         )?;
         self.selector_overrides.extend(reselection.overrides);
         self.selector_runtime_overrides
@@ -897,6 +898,27 @@ impl BudgetDegradationController {
             && !selection_roles.contains(&AgentRole::Researcher)
         {
             selection_roles.push(AgentRole::Researcher);
+        }
+        if assignment.assignment_shape.is_some()
+            && assignment.role == AgentRole::ChildOrchestrator
+            && assignment
+                .worker_assignments
+                .iter()
+                .any(|worker| worker.role == AgentRole::Worker)
+            && !selection_roles.contains(&AgentRole::Worker)
+        {
+            selection_roles.push(AgentRole::Worker);
+        }
+        selection_roles.retain(|role| {
+            *role == assignment.role
+                || *role == AgentRole::Auditor
+                || assignment
+                    .worker_assignments
+                    .iter()
+                    .any(|worker| worker.role == *role)
+        });
+        if let Some(state) = self.policy.selector_state.as_ref() {
+            state.validate_current_assignment(plan, assignment)?;
         }
         let selector_decisions = self.policy.reselect(
             request.runtime,
@@ -3973,6 +3995,11 @@ fn prepare_supervisor_run(
     )?;
     let max_concurrent_children = admission_policy_input.resolved_bound;
     resolve_preselection_objective_profile(&repo, &mut plan_metadata)?;
+    let assignment_shapes = AssignmentSelectionShapes::validate(
+        &plan,
+        &validated_scheduler_assignment_schedule(&plan, &plan_metadata)?,
+        plan_metadata.resolved_routing_policy.as_ref(),
+    )?;
     let mut selector_plan = plan.clone();
     selector_plan.assignments = selector_plan
         .assignments
@@ -3987,6 +4014,7 @@ fn prepare_supervisor_run(
             &mut selector_plan,
             &mut plan_metadata,
             PreparedSupervisorSelectionRequest {
+                assignment_shapes: Some(&assignment_shapes),
                 repo: &repo,
                 current_run: Some(&options.run_id),
                 runtime,
@@ -4097,6 +4125,7 @@ fn prepare_supervisor_run(
 }
 
 pub(super) struct PreparedSupervisorSelectionRequest<'a> {
+    pub(super) assignment_shapes: Option<&'a AssignmentSelectionShapes>,
     pub(super) repo: &'a Path,
     pub(super) current_run: Option<&'a RunId>,
     pub(super) runtime: SupervisorRuntime,
@@ -6697,6 +6726,7 @@ fn initialize_supervisor_selection_with_catalog_discovery(
     let selected_concurrent_fixture =
         selected_concurrent_fixture_matches(plan, plan_metadata, &request)?;
     let PreparedSupervisorSelectionRequest {
+        assignment_shapes,
         repo,
         current_run,
         runtime,
@@ -6712,6 +6742,18 @@ fn initialize_supervisor_selection_with_catalog_discovery(
     let _routing_policy_guard = crate::selection::routing_policy::bind_routing_policy(
         plan_metadata.resolved_routing_policy.clone(),
     )?;
+    let validated_shapes;
+    let assignment_shapes = match assignment_shapes {
+        Some(shapes) => shapes,
+        None => {
+            validated_shapes = AssignmentSelectionShapes::validate(
+                plan,
+                &validated_scheduler_assignment_schedule(plan, plan_metadata)?,
+                plan_metadata.resolved_routing_policy.as_ref(),
+            )?;
+            &validated_shapes
+        }
+    };
     if plan_metadata.resolved_objective_profile.is_none() {
         let requested_objective_profile = plan_metadata.objective_profile.clone();
         plan_metadata.resolved_objective_profile = Some(
@@ -6735,6 +6777,7 @@ fn initialize_supervisor_selection_with_catalog_discovery(
             plan,
             plan_metadata,
             &PreparedSupervisorSelectionRequest {
+                assignment_shapes: Some(assignment_shapes),
                 repo,
                 current_run,
                 runtime,
@@ -6751,7 +6794,7 @@ fn initialize_supervisor_selection_with_catalog_discovery(
                 .as_ref()
                 .map(|fixture| fixture.current_assessment.clone())
         });
-        let resolution = super::selection_bridge::initialize_supervisor_selection_with_assessment(
+        let resolution = super::selection_bridge::initialize_supervisor_selection_with_shapes(
             plan,
             runtime,
             catalog,
@@ -6764,6 +6807,7 @@ fn initialize_supervisor_selection_with_catalog_discovery(
             current_reaudit_assessment
                 .as_ref()
                 .or(plan_metadata.task_routing_assessment.as_ref()),
+            assignment_shapes,
         )?;
         if resolution.selection_preflight_failure.is_none() {
             bind_selected_assignment_runtimes(plan, &resolution.decisions)?;
@@ -6838,23 +6882,23 @@ fn initialize_supervisor_selection_with_catalog_discovery(
                 // than carrying an earlier advertisement as live access proof.
                 plan_metadata.normal_intake_selection = Some(revalidated);
             }
-            let resolution =
-                super::selection_bridge::initialize_supervisor_selection_with_assessment(
-                    plan,
-                    runtime,
-                    catalog,
-                    admission_policy_input,
-                    &advertised,
-                    plan_metadata.resolved_objective_profile.as_ref(),
-                    quota,
-                    frozen_history.as_ref(),
-                    &account_observations,
-                    if plan_metadata.evidence_only_reaudit.is_some() {
-                        None
-                    } else {
-                        plan_metadata.task_routing_assessment.as_ref()
-                    },
-                )?;
+            let resolution = super::selection_bridge::initialize_supervisor_selection_with_shapes(
+                plan,
+                runtime,
+                catalog,
+                admission_policy_input,
+                &advertised,
+                plan_metadata.resolved_objective_profile.as_ref(),
+                quota,
+                frozen_history.as_ref(),
+                &account_observations,
+                if plan_metadata.evidence_only_reaudit.is_some() {
+                    None
+                } else {
+                    plan_metadata.task_routing_assessment.as_ref()
+                },
+                assignment_shapes,
+            )?;
             #[cfg(all(test, target_os = "linux"))]
             let resolution = {
                 let mut resolution = resolution;
@@ -8266,6 +8310,7 @@ mod selection_policy_tests {
 
     fn terminal_worker_assignment(id: &str) -> OrchestratorAssignment {
         OrchestratorAssignment {
+            assignment_shape: None,
             id: id.to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -8640,6 +8685,7 @@ mod selection_policy_tests {
         let mut plan = test_plan();
         plan.review_lenses = single_parent_acceptance_review_lenses();
         let assignment = OrchestratorAssignment {
+            assignment_shape: None,
             id: "active-effort-assignment".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -8956,6 +9002,7 @@ mod selection_policy_tests {
             ("legacy", None),
         ] {
             let evidence = AttemptOutcomeEvidence {
+                pricing: Vec::new(),
                 version: 1,
                 run_id: "cost-cohorts".to_string(),
                 assignment_id: id.to_string(),
@@ -9110,6 +9157,7 @@ mod selection_policy_tests {
         let attempts = run_dir.path().join("selection-attempts");
         std::fs::create_dir_all(&attempts)?;
         let evidence = AttemptOutcomeEvidence {
+            pricing: Vec::new(),
             version: 1,
             run_id: "cpo-refresh".to_string(),
             assignment_id: "assignment-1".to_string(),
@@ -9464,6 +9512,7 @@ mod selection_policy_tests {
         let (temporary, repo) = initialized_repository();
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "assignment-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9532,6 +9581,7 @@ mod selection_policy_tests {
         let (temporary, repo) = initialized_repository();
         let mut plan = test_plan();
         plan.assignments = vec![OrchestratorAssignment {
+            assignment_shape: None,
             id: "assignment-a".to_string(),
             phase: AssignmentPhase::Execution,
             runtime: None,
@@ -9890,6 +9940,7 @@ mod selection_policy_tests {
             admission: &'a SupervisorAdmissionPolicyInput,
         ) -> PreparedSupervisorSelectionRequest<'a> {
             PreparedSupervisorSelectionRequest {
+                assignment_shapes: None,
                 repo,
                 current_run: None,
                 runtime: SupervisorRuntime::Codex,

@@ -6,10 +6,12 @@ use anyhow::{anyhow, Context, Result};
 use coding_agent_manager_lib::account_authority::{
     authority_id_for, SelectedAccountBinding, SelectedUseLease, StoredAccountRegistry,
 };
+use coding_agent_manager_lib::model::StoredAccountMetadata;
 use coding_agent_manager_lib::paths::{project_dirs, stored_accounts_path};
 use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
 use coding_agent_manager_lib::providers::{launch_spec_for, LaunchSpec};
 
+use super::selected_launch::{LaunchAdmission, SelectedLaunch};
 use super::{cam_socket_for_frozen_selection, FrozenCodexSelectedBinding, CODEX_CLI_PROVIDER_ID};
 
 #[cfg(test)]
@@ -22,6 +24,7 @@ pub(crate) struct CodexLaunchAuthority {
     frozen: FrozenCodexSelectedBinding,
     socket_path: Option<PathBuf>,
     _selected_use_lease: SelectedUseLease,
+    pub(crate) launch: SelectedLaunch,
     managed_codex_home: PathBuf,
 }
 
@@ -49,13 +52,13 @@ impl CodexLaunchAuthority {
             ));
         }
         if let Some(path) = &self.socket_path {
-            revalidate_socket(path, &self.frozen)?;
+            let authority_id = super::socket_client::authority_id_via_authority_socket(path)
+                .context("failed to revalidate selected Codex authority socket")?;
+            if authority_id != self.frozen.authority_id {
+                return Err(anyhow!("selected Codex socket authority changed"));
+            }
         }
-        require_registry_binding(&self.registry, &self.frozen)?;
-        let account = self
-            .registry
-            .complete(CODEX_CLI_PROVIDER_ID, &self.frozen.account_id)
-            .context("selected Codex account is no longer complete")?;
+        let account = require_leased_registry_account(&self.registry, &self.frozen)?;
         let adapter = adapter_for_registry(&self.registry)?;
         let spec = launch_spec_for(&adapter, &account)
             .context("selected Codex launch declaration is no longer valid")?;
@@ -68,13 +71,14 @@ impl CodexLaunchAuthority {
 
 pub(crate) fn acquire_codex_launch_authority(
     frozen: &FrozenCodexSelectedBinding,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<CodexLaunchAuthority> {
     let socket_path = cam_socket_for_frozen_selection(frozen.authority_socket.as_deref())?;
     if let Some(path) = &socket_path {
         revalidate_socket(path, frozen)?;
     }
     let registry = execution_registry()?;
-    finish_codex_launch_authority(&registry, frozen, socket_path)
+    finish_codex_launch_authority(&registry, frozen, socket_path, admission)
 }
 
 fn execution_registry() -> Result<StoredAccountRegistry> {
@@ -136,26 +140,65 @@ fn finish_codex_launch_authority(
     registry: &StoredAccountRegistry,
     frozen: &FrozenCodexSelectedBinding,
     socket_path: Option<PathBuf>,
+    admission: Option<LaunchAdmission<'_>>,
 ) -> Result<CodexLaunchAuthority> {
     let binding = require_registry_binding(registry, frozen)?;
     let lease = registry
         .acquire_selected_use(&binding)
         .context("failed to acquire selected Codex account use lease")?;
-    let account = registry
-        .complete(CODEX_CLI_PROVIDER_ID, &binding.account_id)
-        .context("selected Codex account is not complete")?;
-    let spec = launch_spec_for(&adapter_for_registry(registry)?, &account)
-        .context("selected Codex adapter refused its launch declaration")?;
-    let managed_codex_home = codex_home_from_launch_spec(&spec)?;
-    // A concurrent mutation before lease acquisition cannot become the captured source.
-    require_registry_binding(registry, frozen)?;
+    let (launch, managed_codex_home) = SelectedLaunch::prepare(
+        registry,
+        &adapter_for_registry(registry)?,
+        &binding,
+        admission,
+        codex_home_from_launch_spec,
+    )?;
+    // Future selection changes do not invalidate the leased account incarnation.
+    require_leased_registry_account(registry, frozen)?;
     Ok(CodexLaunchAuthority {
         registry: StoredAccountRegistry::new(registry.metadata_path()),
         frozen: frozen.clone(),
         socket_path,
         _selected_use_lease: lease,
+        launch,
         managed_codex_home,
     })
+}
+
+#[cfg(test)]
+pub(crate) fn acquire_from_registry_for_test(
+    registry: &StoredAccountRegistry,
+) -> Result<CodexLaunchAuthority> {
+    let binding = registry
+        .selected_binding(CODEX_CLI_PROVIDER_ID)?
+        .context("synthetic selection")?;
+    let frozen = FrozenCodexSelectedBinding {
+        authority_socket: None,
+        authority_id: authority_id_for(registry.metadata_path()),
+        provider_id: binding.provider_id,
+        account_id: binding.account_id,
+        account_incarnation: binding.account_incarnation,
+        selection_revision: binding.selection_revision,
+    };
+    finish_codex_launch_authority(registry, &frozen, None, None)
+}
+
+fn require_leased_registry_account(
+    registry: &StoredAccountRegistry,
+    frozen: &FrozenCodexSelectedBinding,
+) -> Result<StoredAccountMetadata> {
+    if frozen.provider_id != CODEX_CLI_PROVIDER_ID
+        || frozen.authority_id != authority_id_for(registry.metadata_path())
+    {
+        return Err(anyhow!("selected Codex execution authority changed"));
+    }
+    let account = registry
+        .complete(CODEX_CLI_PROVIDER_ID, &frozen.account_id)
+        .context("leased Codex account is no longer complete")?;
+    if account.account_incarnation != frozen.account_incarnation {
+        return Err(anyhow!("leased Codex account was replaced"));
+    }
+    Ok(account)
 }
 
 fn codex_home_from_launch_spec(spec: &LaunchSpec) -> Result<PathBuf> {
@@ -179,6 +222,40 @@ fn codex_home_from_launch_spec(spec: &LaunchSpec) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use coding_agent_manager_lib::model::{AuthKind, StoredAccountMaterial};
+
+    #[test]
+    fn codex_selected_lifecycle_covers_production_construction_and_exit() -> Result<()> {
+        use super::super::selected_launch::tests::{exercise, SCENARIOS};
+        let _socket =
+            super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+        for scenario in SCENARIOS {
+            let (_root, registry, frozen) = selected_fixture();
+            let account = registry.complete(CODEX_CLI_PROVIDER_ID, "work")?;
+            let home = codex_home_from_launch_spec(&launch_spec_for(
+                &adapter_for_registry(&registry)?,
+                &account,
+            )?)?;
+            std::fs::create_dir_all(&home)?;
+            std::fs::write(home.join("auth.json"), b"synthetic-lifecycle-material")?;
+            exercise(
+                &registry,
+                CODEX_CLI_PROVIDER_ID,
+                scenario,
+                |admission| {
+                    let authority =
+                        finish_codex_launch_authority(&registry, &frozen, None, Some(admission))?;
+                    let material = authority.launch.construct(|| {
+                        Ok(std::fs::read_to_string(
+                            authority.managed_codex_home().join("auth.json"),
+                        )?)
+                    })?;
+                    Ok((authority, material))
+                },
+                |authority| &authority.launch,
+            );
+        }
+        Ok(())
+    }
 
     fn selected_fixture() -> (
         tempfile::TempDir,
@@ -257,30 +334,42 @@ mod tests {
         let _socket =
             super::super::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
         let (_root, registry, frozen) = selected_fixture();
-        let authority = finish_codex_launch_authority(&registry, &frozen, None).unwrap();
+        let authority = finish_codex_launch_authority(&registry, &frozen, None, None).unwrap();
         authority.verify_binding_unchanged().unwrap();
-        assert!(registry
+        registry
             .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
-            .is_err());
+            .unwrap();
+        authority.verify_binding_unchanged().unwrap();
+        registry
+            .begin_delete(CODEX_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        registry
+            .finish_delete(CODEX_CLI_PROVIDER_ID, "personal")
+            .unwrap();
+        authority.verify_binding_unchanged().unwrap();
         assert!(registry
             .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
             .is_err());
-        // Simulate an out-of-band registry writer rather than weakening the lease.
+        // A writer bypassing the lease must not replace or invalidate its account.
         let original = std::fs::read(registry.metadata_path()).unwrap();
-        let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
-        document["selectionRevisions"][CODEX_CLI_PROVIDER_ID] =
-            (frozen.selection_revision + 1).into();
-        std::fs::write(
-            registry.metadata_path(),
-            serde_json::to_vec(&document).unwrap(),
-        )
-        .unwrap();
-        assert!(authority.verify_binding_unchanged().is_err());
+        for (field, value) in [
+            ("accountIncarnation", "0".repeat(32)),
+            ("state", "deleting".into()),
+        ] {
+            let mut document: serde_json::Value = serde_json::from_slice(&original).unwrap();
+            document["accounts"][0][field] = value.into();
+            std::fs::write(
+                registry.metadata_path(),
+                serde_json::to_vec(&document).unwrap(),
+            )
+            .unwrap();
+            assert!(authority.verify_binding_unchanged().is_err(), "{field}");
+        }
         std::fs::write(registry.metadata_path(), original).unwrap();
         authority.verify_binding_unchanged().unwrap();
         drop(authority);
         registry
-            .select_complete_revision(CODEX_CLI_PROVIDER_ID, "personal", None)
+            .begin_delete(CODEX_CLI_PROVIDER_ID, "work")
             .unwrap();
         assert!(require_registry_binding(&registry, &frozen).is_err());
     }
@@ -303,7 +392,7 @@ mod tests {
             CODEX_TEST_REGISTRY
                 .with(|slot| slot.replace(Some(registry.metadata_path().to_path_buf()))),
         );
-        let authority = acquire_codex_launch_authority(&frozen).unwrap();
+        let authority = acquire_codex_launch_authority(&frozen, None).unwrap();
         authority.verify_binding_unchanged().unwrap();
         assert_eq!(authority.selection_evidence(), frozen);
     }
@@ -322,10 +411,10 @@ mod tests {
         cam_socket_for_frozen_selection(frozen.authority_socket.as_deref()).unwrap();
         std::fs::remove_file(&socket).unwrap();
         // A remaining maco directory still requires the socket and refuses.
-        assert!(acquire_codex_launch_authority(&frozen).is_err());
+        assert!(acquire_codex_launch_authority(&frozen, None).is_err());
         std::fs::remove_dir(socket.parent().unwrap()).unwrap();
         assert!(super::super::configured_cam_authority_socket().is_none());
-        let error = acquire_codex_launch_authority(&frozen).unwrap_err();
+        let error = acquire_codex_launch_authority(&frozen, None).unwrap_err();
         assert!(format!("{error:#}").contains("refusing local fallback"));
     }
 
@@ -375,7 +464,7 @@ mod tests {
         }
         std::fs::remove_dir(parent).unwrap();
         assert!(super::super::configured_cam_authority_socket().is_none());
-        let error = acquire_codex_launch_authority(&frozen).unwrap_err();
+        let error = acquire_codex_launch_authority(&frozen, None).unwrap_err();
         assert!(format!("{error:#}").contains("refusing local fallback"));
     }
 
@@ -387,11 +476,11 @@ mod tests {
         let socket = root.path().join("maco/account-authority.sock");
         {
             let _explicit = CamAuthoritySocketTestGuard::install(Some(socket.as_os_str()));
-            assert!(acquire_codex_launch_authority(&frozen).is_err());
+            assert!(acquire_codex_launch_authority(&frozen, None).is_err());
         }
         std::fs::create_dir(socket.parent().unwrap()).unwrap();
         std::fs::write(&socket, b"not a Unix socket").unwrap();
         let _default = CamAuthoritySocketTestGuard::install_default(socket);
-        assert!(acquire_codex_launch_authority(&frozen).is_err());
+        assert!(acquire_codex_launch_authority(&frozen, None).is_err());
     }
 }
