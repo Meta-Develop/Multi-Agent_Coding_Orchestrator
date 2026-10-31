@@ -293,6 +293,295 @@ fn supervise_collect_preserves_finalized_researcher_usage_and_requires_core_role
     }
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn supervise_collect_requires_finalized_researcher_input_receipts() -> Result<()> {
+    use crate::artifacts::state_auth::sha256_hex;
+    use crate::external_agent::researcher_inputs::{
+        tests::attach_synthetic_receipts, ResearcherSourceInput,
+    };
+
+    let (temp, repo) = injected_repository();
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    plan.assignments.clear();
+    let template = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        injected_options(&repo, temp.path(), "source-receipt-template"),
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut |_command| panic!("empty plan must not call a provider"),
+    )?;
+    let source = b"bounded synthetic source packet\n";
+    fs::write(repo.join("source.diff"), source)?;
+    fs::write(repo.join("second.diff"), source)?;
+    let inputs = vec![
+        ResearcherSourceInput {
+            path: "source.diff".into(),
+            sha256: sha256_hex(source),
+        },
+        ResearcherSourceInput {
+            path: "second.diff".into(),
+            sha256: sha256_hex(source),
+        },
+    ];
+    for case in [
+        "complete",
+        "missing",
+        "hash",
+        "size",
+        "identity",
+        "regular",
+        "symlink",
+        "path",
+        "expected_hash",
+        "outer",
+        "inner",
+        "revalidation",
+        "probe_hash",
+        "missing_summary",
+        "no_launch",
+        "binding",
+        "summary_digest",
+        "post_finalize",
+        "legacy_receipt",
+        "missing_symlink",
+        "duplicate_input",
+        "refused_prelaunch",
+        "undeclared_inputs",
+        "runtime",
+    ] {
+        let run_id = RunId::new(format!("source-receipts-{case}"))?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "test",
+        )?;
+        let dirs = RunDirs::for_writer(&writer);
+        let artifacts = child_attempt_artifacts(
+            &dirs,
+            &dirs.run_dir.join("incoming"),
+            &dirs.run_dir.join("capture"),
+            "research",
+            2,
+            true,
+        );
+        let mut command = ExternalAgentCommand::codex(
+            "provider-must-not-run",
+            &repo,
+            &artifacts.prompt_path,
+            &artifacts.log_path,
+            &artifacts.report_path,
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle(&repo, "researcher", run_id.as_str(), "research")
+        .with_workspace_access(crate::process_runner::WorkspaceAccess::ReadOnly);
+        command.assignment_process_launch_attempt = Some(2);
+        command.researcher_source_inputs = inputs.clone();
+        command.read_only_input_files = inputs.iter().map(|input| repo.join(&input.path)).collect();
+        let mut run = deterministic_fake_run(&command, Vec::new());
+        // Synthetic probe outcomes isolate serialization/collection from sandbox availability.
+        // The production outer/inner reader and late revalidation have separate regressions.
+        attach_synthetic_receipts(&mut run, &command)?;
+        run.stdout.target_launch_attempted = true;
+        if case == "refused_prelaunch" {
+            run = crate::external_agent::researcher_inputs::tests::failed_local_probe(
+                &command, false,
+            )?;
+        }
+        writer.write_json(
+            "assignments/supervisor-plan.json",
+            &json!({
+                "assignments": [{"id": "research", "role": "researcher", "source_inputs": inputs}]
+            }),
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        if case == "undeclared_inputs" {
+            writer.write_json(
+                "assignments/supervisor-plan.json",
+                &json!({
+                    "assignments": [{"id": "research", "role": "researcher"}]
+                }),
+                ArtifactFileDisposition::PrivateEvidence,
+            )?;
+        }
+        if case != "missing_summary" {
+            super::super::target_containment::persist(
+                &mut writer,
+                &artifacts,
+                &command,
+                SupervisorRuntime::Codex,
+                &run,
+            )?;
+            let summary_path = &artifacts.command_record_relative;
+            let target_path = summary_path.with_extension("target-containment.json");
+            let mut summary: Value = serde_json::from_slice(
+                &writer.read_authenticated(summary_path, MAX_SUPERVISOR_REPORT_BYTES)?,
+            )?;
+            let mut target: Value = serde_json::from_slice(
+                &writer.read_authenticated(&target_path, MAX_SUPERVISOR_REPORT_BYTES)?,
+            )?;
+            let receipt = &mut summary["researcher_input_receipts"][1];
+            match case {
+                "missing" => {
+                    summary
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("researcher_input_receipts");
+                }
+                "hash" => receipt["sha256"] = json!("0".repeat(64)),
+                "size" => receipt["bytes"] = json!(source.len() + 1),
+                "identity" => receipt["identity"] = Value::Null,
+                "missing_symlink" => {
+                    receipt.as_object_mut().unwrap().remove("symlink");
+                }
+                "legacy_receipt" => {
+                    receipt.as_object_mut().unwrap().retain(|key, _| {
+                        [
+                            "path",
+                            "sha256",
+                            "bytes",
+                            "identity",
+                            "child_profile_visible",
+                        ]
+                        .contains(&key.as_str())
+                    });
+                }
+                "duplicate_input" => {
+                    summary["researcher_input_receipts"][1] =
+                        summary["researcher_input_receipts"][0].clone();
+                }
+                "regular" => receipt["regular_file"] = json!(false),
+                "symlink" => receipt["symlink"] = json!(true),
+                "path" => receipt["path"] = json!("undeclared.diff"),
+                "expected_hash" => receipt["expected_sha256"] = json!("0".repeat(64)),
+                "outer" => receipt["outer_preflight"] = json!({"status": "not_attempted"}),
+                "inner" => {
+                    receipt["inner_preflight"] =
+                        json!({"status": "refused", "reason": "read_mismatch"})
+                }
+                "revalidation" => {
+                    receipt
+                        .as_object_mut()
+                        .unwrap()
+                        .remove("pre_provider_revalidation");
+                }
+                "probe_hash" => receipt["inner_preflight"]["sha256"] = json!("0".repeat(64)),
+                "no_launch" => target["target_launch_attempted"] = json!(false),
+                "binding" => target["binding"]["task_id"] = json!("other"),
+                "runtime" => target["binding"]["runtime"] = json!("fake"),
+                _ => {}
+            }
+            let summary_bytes = serde_json::to_vec_pretty(&summary)?;
+            // Rebind and authenticate semantic mutations so the collector must inspect
+            // receipt content; these are not merely manifest checksum failures.
+            if case != "summary_digest" {
+                target["command_summary_sha256"] = json!(sha256_hex(&summary_bytes));
+            }
+            writer.write_bytes(
+                summary_path,
+                &summary_bytes,
+                ArtifactFileDisposition::PrivateEvidence,
+            )?;
+            writer.write_json(
+                &target_path,
+                &target,
+                ArtifactFileDisposition::PrivateEvidence,
+            )?;
+        }
+        let mut report = template.clone();
+        report.run_id = run_id.clone();
+        report.run_dir = RunArtifactFamily::Supervise
+            .run_root()
+            .join(run_id.as_str());
+        report.accepted = true;
+        report.publishable = true;
+        report.success = true;
+        report.rejected = false;
+        report.status = ReviewStatus::Succeeded;
+        report.runtime = SupervisorRuntime::Codex;
+        if case == "refused_prelaunch" {
+            report.accepted = false;
+            report.publishable = false;
+            report.success = false;
+            report.rejected = true;
+            report.status = ReviewStatus::Failed;
+        }
+        write_final_report(&mut writer, &report)?;
+        writer.finalize(
+            RunArtifactFamily::Supervise.final_report_relative_path(),
+            report.publishable,
+        )?;
+        if case == "post_finalize" {
+            fs::write(dirs.run_dir.join(&artifacts.command_record_relative), b"{}")?;
+        }
+        let collected = collect_supervisor_run(&repo, run_id.clone())?;
+        if case == "complete" {
+            assert_eq!(
+                collected.collection_state,
+                SupervisorCollectState::Finalized
+            );
+            assert!(collected.accepted);
+            assert_eq!(collected.report, report);
+            validate_supervisor_collect_with_advertised_schema(&collected);
+            let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)?;
+            let bytes = reader.read(&artifacts.command_record_relative)?;
+            let summary: Value = serde_json::from_slice(&bytes)?;
+            let receipt = &summary["researcher_input_receipts"][1];
+            assert_eq!(receipt["path"], "second.diff");
+            assert_eq!(receipt["expected_sha256"], sha256_hex(source));
+            assert_eq!(receipt["sha256"], sha256_hex(source));
+            assert_eq!(receipt["bytes"], source.len());
+            assert!(receipt["identity"].is_array());
+            assert_eq!(receipt["regular_file"], true);
+            assert_eq!(receipt["symlink"], false);
+            for check in [
+                "outer_preflight",
+                "inner_preflight",
+                "pre_provider_revalidation",
+            ] {
+                assert_eq!(receipt[check]["status"], "passed");
+                assert_eq!(receipt[check]["sha256"], sha256_hex(source));
+                assert_eq!(receipt[check]["bytes"], source.len());
+            }
+            assert!(!String::from_utf8(bytes)?.contains(repo.to_str().unwrap()));
+        } else if case == "refused_prelaunch" {
+            assert_eq!(
+                collected.collection_state,
+                SupervisorCollectState::Finalized
+            );
+            assert!(!collected.accepted);
+            let reader = ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)?;
+            let summary: Value =
+                serde_json::from_slice(&reader.read(&artifacts.command_record_relative)?)?;
+            assert_eq!(
+                summary["researcher_input_receipts"][0]["outer_preflight"]["status"],
+                "refused"
+            );
+            assert_eq!(
+                summary["researcher_input_receipts"][0]["outer_preflight"]["reason"],
+                "read_mismatch"
+            );
+            assert_eq!(
+                summary["researcher_input_receipts"][0]["outer_preflight"]["observed_bytes"],
+                0
+            );
+            assert_eq!(
+                summary["researcher_input_receipts"][0]["inner_preflight"]["status"],
+                "not_attempted"
+            );
+        } else {
+            assert_eq!(
+                collected.collection_state,
+                SupervisorCollectState::InconsistentFinalized,
+                "accepted {case}"
+            );
+            assert!(!collected.accepted, "accepted {case}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {

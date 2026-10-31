@@ -42,6 +42,16 @@ struct TargetContainmentReceipt {
     target_side_effects: Observation<SideEffectConfinementEvidence>,
 }
 
+/// Additive private-summary fields; the public CommandRunRecord contract is unchanged.
+#[derive(Serialize)]
+struct RetainedCommandSummary<'a> {
+    #[serde(flatten)]
+    command: &'a CommandRunRecord,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    researcher_input_receipts:
+        Vec<crate::external_agent::researcher_inputs::ResearcherInputReceipt>,
+}
+
 fn receipt_path(summary: &Path) -> PathBuf {
     summary.with_extension("target-containment.json")
 }
@@ -111,7 +121,10 @@ pub(super) fn persist(
 ) -> Result<()> {
     let binding = binding(writer.run_dir(), artifacts, command, runtime)?;
     let record = command_record_from_external_for_runtime(run, command, runtime);
-    let mut summary = serde_json::to_vec_pretty(&record)?;
+    let mut summary = serde_json::to_vec_pretty(&RetainedCommandSummary {
+        command: &record,
+        researcher_input_receipts: run.retained_researcher_input_receipts(),
+    })?;
     summary.push(b'\n');
     if summary.len() > MAX_SUPERVISOR_REPORT_BYTES {
         bail!("target command summary exceeds its configured byte limit");
@@ -220,6 +233,179 @@ fn read(reader: &ArtifactRunReader, expected: &TargetBinding) -> Result<Restored
     }
     let receipt = validate(&reader.read(relative)?, expected, &summary)?;
     Ok(RestoredTargetContainment::Retained(receipt))
+}
+
+/// Verify preparation observations against declarations in the digest-bound plan.
+/// These checks authenticate historical evidence only, never restored launch authority.
+pub(super) fn verify_researcher_inputs(
+    reader: &ArtifactRunReader,
+    report: &SupervisorFinalReport,
+) -> Result<()> {
+    use crate::external_agent::researcher_inputs::{
+        validate_declarations, ResearcherInputReceipt, ResearcherSourceInput,
+    };
+    const PLAN: &str = "assignments/supervisor-plan.json";
+    let files = &reader.finalization().files;
+    let mut declarations = BTreeMap::<String, Vec<ResearcherSourceInput>>::new();
+    fn collect(
+        value: &Value,
+        declarations: &mut BTreeMap<String, Vec<ResearcherSourceInput>>,
+    ) -> Result<()> {
+        if let Some(assignments) = value
+            .get("assignments")
+            .or_else(|| value.get("child_assignments"))
+        {
+            for assignment in assignments
+                .as_array()
+                .context("retained assignments must be an array")?
+            {
+                if let Some(inputs) = assignment.get("source_inputs") {
+                    let inputs: Vec<ResearcherSourceInput> =
+                        serde_json::from_value(inputs.clone())?;
+                    validate_declarations(&inputs)?;
+                    if !inputs.is_empty() {
+                        let id = assignment["id"]
+                            .as_str()
+                            .context("source input assignment has no id")?;
+                        if assignment["role"] != "researcher"
+                            || normalize_agent_id(id)? != id
+                            || declarations.insert(id.to_owned(), inputs).is_some()
+                        {
+                            bail!("retained source input assignment identity is inconsistent");
+                        }
+                    }
+                }
+                collect(assignment, declarations)?;
+            }
+        }
+        Ok(())
+    }
+    if let Some(file) = files.iter().find(|file| file.path == Path::new(PLAN)) {
+        if file.bytes > MAX_SUPERVISOR_REPORT_BYTES as u64
+            || file.disposition != ArtifactFileDisposition::PrivateEvidence
+        {
+            bail!("retained source input plan must be bounded private evidence");
+        }
+        collect(
+            &serde_json::from_slice::<Value>(&reader.read(PLAN)?)?,
+            &mut declarations,
+        )?;
+    } else if report.accepted && report.role_usage.contains_key(&AgentRole::Researcher) {
+        bail!("accepted Researcher evidence requires its retained plan");
+    }
+
+    // Orphan target receipts also reveal missing process summaries.
+    for file in files {
+        let Some(stem) = file
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".target-containment.json"))
+        else {
+            continue;
+        };
+        if declarations.keys().any(|id| {
+            stem == format!("{id}.summary")
+                || (stem.starts_with(&format!("{id}.attempt-")) && stem.ends_with(".summary"))
+        }) && !files
+            .iter()
+            .any(|candidate| candidate.path == file.path.with_file_name(format!("{stem}.json")))
+        {
+            bail!("Researcher target receipt lacks its process summary");
+        }
+    }
+    let mut proven = BTreeSet::new();
+    // Every process summary belonging to a declared assignment needs its own
+    // bound receipt, including retries. A single good attempt cannot hide another.
+    for file in files {
+        let Some(name) = file.path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let expected = declarations.iter().find(|(id, _)| {
+            name == format!("{id}.summary.json")
+                || (name.starts_with(&format!("{id}.attempt-")) && name.ends_with(".summary.json"))
+        });
+        let Some((id, inputs)) = expected else {
+            if name.ends_with(".summary.json") {
+                if file.bytes > MAX_SUPERVISOR_REPORT_BYTES as u64 {
+                    bail!("process summary exceeds its byte limit");
+                }
+                let summary: Value = serde_json::from_slice(&reader.read(&file.path)?)?;
+                if let Some(receipts) = summary.get("researcher_input_receipts") {
+                    if receipts
+                        .as_array()
+                        .is_none_or(|receipts| !receipts.is_empty())
+                    {
+                        bail!("Researcher input receipts have no matching source declaration");
+                    }
+                }
+            }
+            continue;
+        };
+        if file.bytes > MAX_SUPERVISOR_REPORT_BYTES as u64
+            || file.disposition != ArtifactFileDisposition::PrivateEvidence
+        {
+            bail!("Researcher input summary must be bounded private evidence");
+        }
+        let summary = reader.read(&file.path)?;
+        let relative = receipt_path(&file.path);
+        let record = files
+            .iter()
+            .find(|file| file.path == relative)
+            .context("Researcher input summary lacks its bound target receipt")?;
+        if record.bytes > MAX_RECEIPT_BYTES as u64
+            || record.disposition != ArtifactFileDisposition::PrivateEvidence
+        {
+            bail!("Researcher target receipt must be bounded private evidence");
+        }
+        let bytes = reader.read(&relative)?;
+        let receipt: TargetContainmentReceipt = serde_json::from_slice(&bytes)?;
+        validate(&bytes, &receipt.binding, &summary)?;
+        if receipt.binding.run_id != report.run_id.as_str()
+            || receipt.binding.task_id != *id
+            || receipt.binding.role != "researcher"
+            || receipt.binding.runtime != SupervisorRuntime::Codex
+            || receipt.binding.attempt == 0
+            || receipt.binding.command_summary != file.path
+            || (file.path != PathBuf::from("logs").join(format!("{id}.summary.json"))
+                && file.path
+                    != PathBuf::from("logs").join(format!(
+                        "{id}.attempt-{}.summary.json",
+                        receipt.binding.attempt
+                    )))
+        {
+            bail!("Researcher source input attempt binding mismatch");
+        }
+        let value: Value = serde_json::from_slice(&summary)?;
+        let retained: Vec<ResearcherInputReceipt> = value
+            .get("researcher_input_receipts")
+            .map(|receipts| serde_json::from_value(receipts.clone()))
+            .transpose()?
+            .unwrap_or_default();
+        if retained.len() != inputs.len()
+            || retained
+                .iter()
+                .zip(inputs)
+                .any(|(receipt, input)| !receipt.matches_declaration(input))
+        {
+            // Prelaunch validation may fail before an identity can be observed.
+            if receipt.target_launch_attempted || report.accepted || !retained.is_empty() {
+                bail!("Researcher source input receipts are missing or disagree with declarations");
+            }
+            continue;
+        }
+        let complete = retained.iter().all(ResearcherInputReceipt::proves_release);
+        if receipt.target_launch_attempted && !complete {
+            bail!("launched Researcher lacks complete input preflight and revalidation evidence");
+        }
+        if complete && receipt.target_launch_attempted {
+            proven.insert(id.clone());
+        }
+    }
+    if report.accepted && declarations.keys().any(|id| !proven.contains(id)) {
+        bail!("accepted Researcher lacks retained input release evidence");
+    }
+    Ok(())
 }
 
 #[cfg(test)]

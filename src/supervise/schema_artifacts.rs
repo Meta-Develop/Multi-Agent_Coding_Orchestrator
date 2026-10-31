@@ -4755,7 +4755,9 @@ pub(super) fn read_finalized_supervisor_report(
                         run_id.as_str()
                     )
                 })?;
-            Ok(Some(read_supervisor_final_report(&reader)?))
+            let report = read_supervisor_final_report(&reader)?;
+            super::target_containment::verify_researcher_inputs(&reader, &report)?;
+            Ok(Some(report))
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(error) => Err(error).with_context(|| {
