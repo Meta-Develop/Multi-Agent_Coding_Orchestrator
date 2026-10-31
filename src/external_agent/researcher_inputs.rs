@@ -59,13 +59,62 @@ enum SourceInputCheck {
     },
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, thiserror::Error)]
 #[serde(rename_all = "snake_case")]
 enum SourceInputRefusal {
+    #[error("preparation_failed")]
     PreparationFailed,
+    #[error("process_failed")]
     ProcessFailed,
+    #[error("read_mismatch")]
     ReadMismatch,
+    #[error("identity_or_content_changed")]
     IdentityOrContentChanged,
+    #[error("packaged_codex_runtime_not_visible: codex-resources/bwrap and the package executable are not covered by the sandbox runtime bindings")]
+    PackagedRuntimeNotVisible,
+    #[error("sandbox_helper_unavailable: codex-resources/bwrap")]
+    SandboxHelperUnavailable,
+    #[error("sandbox_executable_unavailable")]
+    SandboxExecutableUnavailable,
+    #[error("sandbox_permission_denied")]
+    SandboxPermissionDenied,
+    #[error("process_timed_out")]
+    ProcessTimedOut,
+    #[error("process_cancelled")]
+    ProcessCancelled,
+    #[error("process_spawn_failed")]
+    ProcessSpawnFailed,
+    #[error("containment_unverified")]
+    ContainmentUnverified,
+}
+
+#[derive(Debug, thiserror::Error)]
+#[error("declared source input inner Codex sandbox refused: {0}")]
+struct InnerSourceInputRefusal(SourceInputRefusal);
+
+// Child text is untrusted. Inspect only a bounded prefix, then retain a fixed
+// failure class, never stderr, argv, helper paths, or configuration contents.
+fn inner_source_input_failure(output: &ProcessOutput) -> SourceInputRefusal {
+    if output.timed_out {
+        return SourceInputRefusal::ProcessTimedOut;
+    }
+    if !output.process_tree.is_verified_empty() || !output.side_effects.is_verified() {
+        return SourceInputRefusal::ContainmentUnverified;
+    }
+    let stderr = output.stderr.as_bytes();
+    let stderr = &stderr[..stderr.len().min(8192)];
+    let contains = |needle: &[u8]| stderr.windows(needle.len()).any(|part| part == needle);
+    if contains(b"bubblewrap is unavailable") {
+        SourceInputRefusal::SandboxHelperUnavailable
+    } else if contains(b"bwrap: execvp") && contains(b"No such file or directory") {
+        SourceInputRefusal::SandboxExecutableUnavailable
+    } else if contains(b"bwrap:")
+        && (contains(b"Permission denied") || contains(b"Operation not permitted"))
+    {
+        SourceInputRefusal::SandboxPermissionDenied
+    } else {
+        SourceInputRefusal::ProcessFailed
+    }
 }
 
 impl ResearcherInputReceipt {
@@ -117,6 +166,17 @@ impl ResearcherInputReceipt {
                 observed_bytes: Some(bytes.len()),
             }
         }
+    }
+
+    fn observed_inner_read(&self, output: &ProcessOutput) -> SourceInputCheck {
+        let succeeded = output.safety_sensitive_succeeded();
+        let mut check = self.observed_read(succeeded, output.stdout.as_bytes());
+        if !succeeded {
+            if let SourceInputCheck::Refused { reason, .. } = &mut check {
+                *reason = inner_source_input_failure(output);
+            }
+        }
+        check
     }
 
     fn passed(&self) -> SourceInputCheck {
@@ -350,8 +410,24 @@ fn probe_source_inputs_in_inner_sandbox(
         return Ok(());
     }
     let profile = profile.context("inner source input visibility requires verified containment")?;
-    let program = resolve_external_program(&spec.program, &spec.cwd)
-        .context("selected Codex sandbox helper could not be resolved")?;
+    let program = match resolve_external_program(&spec.program, &spec.cwd) {
+        Ok(program) => program,
+        Err(error) if error.is::<PackagedCodexRuntimeNotVisible>() => {
+            for receipt in receipts {
+                receipt.inner_preflight = SourceInputCheck::Refused {
+                    reason: SourceInputRefusal::PackagedRuntimeNotVisible,
+                    observed_sha256: None,
+                    observed_bytes: None,
+                };
+            }
+            return Err(
+                InnerSourceInputRefusal(SourceInputRefusal::PackagedRuntimeNotVisible).into(),
+            );
+        }
+        Err(error) => {
+            return Err(error.context("selected Codex sandbox helper could not be resolved"))
+        }
+    };
     let trusted = external_program_trust_for_resolved_executable(spec, &program)
         == ExternalProgramTrust::TrustedSystemCodex;
     #[cfg(test)]
@@ -416,18 +492,28 @@ fn probe_source_inputs_in_inner_sandbox(
             }
             Err(error) => {
                 evidence.record_error(&error);
-                return Err(error.into());
+                let reason = match error {
+                    ProcessRunError::Cancelled { .. } => SourceInputRefusal::ProcessCancelled,
+                    ProcessRunError::SetupTimeout { .. } => SourceInputRefusal::ProcessTimedOut,
+                    ProcessRunError::Spawn { .. } => SourceInputRefusal::ProcessSpawnFailed,
+                    ProcessRunError::ContainmentUnavailable { .. }
+                    | ProcessRunError::ProcessOwnership { .. }
+                    | ProcessRunError::EnvironmentFailure { .. } => {
+                        SourceInputRefusal::ContainmentUnverified
+                    }
+                    _ => SourceInputRefusal::ProcessFailed,
+                };
+                receipt.inner_preflight = SourceInputCheck::Refused {
+                    reason,
+                    observed_sha256: None,
+                    observed_bytes: None,
+                };
+                return Err(InnerSourceInputRefusal(reason).into());
             }
         };
-        receipt.inner_preflight = receipt.observed_read(
-            output.safety_sensitive_succeeded(),
-            output.stdout.as_bytes(),
-        );
-        if !matches!(receipt.inner_preflight, SourceInputCheck::Passed { .. }) {
-            bail!(
-                "declared source input is not readable with its bound hash in the actual inner Codex sandbox: {}",
-                receipt.path.display()
-            );
+        receipt.inner_preflight = receipt.observed_inner_read(&output);
+        if let SourceInputCheck::Refused { reason, .. } = receipt.inner_preflight {
+            return Err(InnerSourceInputRefusal(reason).into());
         }
     }
     Ok(())
@@ -657,6 +743,229 @@ pub(crate) mod tests {
             sha256: sha256_hex(SOURCE),
         }];
         Ok((root, command))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn packaged_runtime(root: &Path) -> Result<PathBuf> {
+        use std::os::unix::fs::PermissionsExt;
+        let package = root.join("home/user/codex-package");
+        fs::create_dir_all(package.join("bin"))?;
+        fs::create_dir(package.join("codex-resources"))?;
+        fs::create_dir(package.join("codex-path"))?;
+        fs::write(
+            package.join("codex-package.json"),
+            br#"{"layoutVersion":1,"version":"0.144.4","target":"x86_64-unknown-linux-musl","variant":"codex","entrypoint":"bin/codex","resourcesDir":"codex-resources","pathDir":"codex-path"}"#,
+        )?;
+        let program = package.join("bin/codex");
+        fs::write(&program, b"#!/bin/sh\nexit 99\n")?;
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+        fs::write(package.join("codex-resources/bwrap"), b"fake helper")?;
+        Ok(program)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_packaged_runtime_outer_refuses_before_launch() -> Result<()> {
+        let (root, mut command) = fixture()?;
+        command.program = packaged_runtime(root.path())?;
+        let controls = ProtectedWorktreeControls {
+            writable_artifact_root: Some(root.path().to_path_buf()),
+            ..ProtectedWorktreeControls::default()
+        };
+        let error = external_side_effect_profile(
+            &command,
+            &command.program,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )
+        .expect_err("the outer bin-only binding must not admit a packaged runtime");
+        assert!(error
+            .to_string()
+            .contains("packaged_codex_runtime_not_visible"));
+        assert!(error.to_string().contains("codex-resources/bwrap"));
+        assert!(!command.json_log.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_packaged_runtime_inner_refuses_before_launch() -> Result<()> {
+        let (root, mut command) = fixture()?;
+        command.program = packaged_runtime(root.path())?;
+        let profile = SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only(
+            &command.cwd,
+        ));
+        let mut receipts = validate_command(&command)?;
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        let error = probe_source_inputs_in_inner_sandbox(
+            &command,
+            Some(&profile),
+            Duration::from_secs(1),
+            &ProcessCancellation::new(),
+            &mut receipts,
+            &[],
+            &mut evidence,
+        )
+        .expect_err("the inner minimal policy cannot execute this package");
+        assert!(format!("{error:#}").contains("packaged_codex_runtime_not_visible"));
+        assert!(matches!(
+            receipts[0].inner_preflight,
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::PackagedRuntimeNotVisible,
+                ..
+            }
+        ));
+        assert!(!evidence.started);
+        assert!(!command.json_log.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_packaged_runtime_version_refuses_before_launch() -> Result<()> {
+        let (root, command) = fixture()?;
+        let program = packaged_runtime(root.path())?;
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        let failure = preflight_custom_codex_version(
+            &program,
+            &command.cwd,
+            Duration::from_secs(1),
+            &ProcessCancellation::new(),
+            None,
+            &mut evidence,
+        )
+        .expect_err("a version helper must not bypass package visibility admission");
+        assert_eq!(
+            failure.failure.category,
+            EnvironmentFailureCategory::SandboxUnavailable
+        );
+        assert!(failure
+            .failure
+            .summary
+            .contains("packaged_codex_runtime_not_visible"));
+        assert!(!evidence.started);
+        let error = resolve_external_program(&program, &command.cwd).unwrap_err();
+        assert!(error.is::<PackagedCodexRuntimeNotVisible>());
+        assert!(codex_runtime_model_catalog_failure(&error)
+            .summary
+            .contains("codex-resources/bwrap"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_inner_failure_classes_are_bounded_and_redacted() -> Result<()> {
+        use std::os::unix::process::ExitStatusExt;
+        let (_root, command) = fixture()?;
+        let receipt = validate_command(&command)?.remove(0);
+        let cases = [
+            (
+                "bubblewrap is unavailable: no bundled codex-resources/bwrap binary was found /home/private/secret",
+                SourceInputRefusal::SandboxHelperUnavailable,
+            ),
+            (
+                "bwrap: execvp /home/private/secret/bin/codex: No such file or directory",
+                SourceInputRefusal::SandboxExecutableUnavailable,
+            ),
+            (
+                "bwrap: Creating new namespace failed: Operation not permitted /home/private/secret",
+                SourceInputRefusal::SandboxPermissionDenied,
+            ),
+            ("unrecognized failure /home/private/secret", SourceInputRefusal::ProcessFailed),
+        ];
+        for (stderr, reason) in cases {
+            let mut output = ProcessOutput {
+                status: Some(std::process::ExitStatus::from_raw(256)),
+                duration: Duration::ZERO,
+                timed_out: false,
+                process_tree: ProcessTreeEvidence::VerifiedEmpty(
+                    ContainmentBackend::SystemdUserService,
+                ),
+                side_effects: SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalCodex,
+                ),
+                stdout: CapturedBytes::default(),
+                stderr: CapturedBytes::from_bytes_for_test(stderr.as_bytes()),
+                process_error: None,
+                stdin_error: None,
+            };
+            let check = receipt.observed_inner_read(&output);
+            assert!(
+                matches!(check, SourceInputCheck::Refused { reason: actual, .. } if actual == reason)
+            );
+            let encoded = serde_json::to_string(&check)?;
+            let message = InnerSourceInputRefusal(reason).to_string();
+            assert!(!encoded.contains("/home/private"));
+            assert!(!message.contains("/home/private"));
+            assert!(message.len() < 256);
+
+            output.timed_out = true;
+            assert_eq!(
+                inner_source_input_failure(&output),
+                SourceInputRefusal::ProcessTimedOut
+            );
+            output.timed_out = false;
+            output.side_effects = SideEffectConfinementEvidence::Unverified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            );
+            assert_eq!(
+                inner_source_input_failure(&output),
+                SourceInputRefusal::ContainmentUnverified
+            );
+            output.side_effects = SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            );
+            output.stderr = CapturedBytes::from_bytes_for_test(
+                format!("{}bubblewrap is unavailable", "x".repeat(8192)).into_bytes(),
+            );
+            assert_eq!(
+                inner_source_input_failure(&output),
+                SourceInputRefusal::ProcessFailed
+            );
+            output.status = Some(std::process::ExitStatus::from_raw(0));
+            assert!(matches!(
+                receipt.observed_inner_read(&output),
+                SourceInputCheck::Refused {
+                    reason: SourceInputRefusal::ReadMismatch,
+                    ..
+                }
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_packaged_runtime_rejects_unverified_layouts() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        for mutation in ["root_symlink", "writable_resources", "manifest_mismatch"] {
+            let (root, command) = fixture()?;
+            let mut program = packaged_runtime(root.path())?;
+            let package = program.parent().unwrap().parent().unwrap();
+            match mutation {
+                "root_symlink" => {
+                    let alias = root.path().join("package-alias");
+                    symlink(package, &alias)?;
+                    program = alias.join("bin/codex");
+                }
+                "writable_resources" => fs::set_permissions(
+                    package.join("codex-resources"),
+                    fs::Permissions::from_mode(0o777),
+                )?,
+                "manifest_mismatch" => fs::write(
+                    package.join("codex-package.json"),
+                    br#"{"version":"9.9.9","target":"aarch64-apple-darwin"}"#,
+                )?,
+                _ => unreachable!(),
+            }
+            let error = resolve_external_program(&program, &command.cwd)
+                .expect_err("unsupported packages must never be admitted on manifest claims");
+            assert!(
+                format!("{error:#}").contains("packaged_codex_runtime_not_visible"),
+                "{mutation}: {error:#}"
+            );
+        }
+        Ok(())
     }
 
     #[cfg(target_os = "linux")]

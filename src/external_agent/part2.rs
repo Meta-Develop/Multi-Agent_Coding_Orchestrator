@@ -220,6 +220,11 @@ fn run_fixed_version_probe(
     credential_redactor: Option<&CredentialRedactor>,
     process_evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> std::result::Result<EnvironmentVersionProbe, EnvironmentProbeFailure> {
+    validate_packaged_runtime_visibility(program).map_err(|error| EnvironmentProbeFailure {
+        category: EnvironmentFailureCategory::SandboxUnavailable,
+        summary: error.to_string(),
+        timed_out: false,
+    })?;
     let label = format!("{} version preflight", executable.program_name());
     let process_spec = ProcessSpec::direct(
         label,
@@ -996,6 +1001,7 @@ fn prepare_codex_runtime_model_catalog_process(
             }
         };
 
+        validate_packaged_runtime_visibility(&resolved_program)?;
         let program_identity = external_program_identity(&resolved_program)
             .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
         let auth = ValidatedCodexAuth::load()
@@ -1258,8 +1264,13 @@ pub(crate) fn supervisor_catalog_preflight_grant_admit_failure(
 
 fn codex_runtime_model_catalog_failure(error: &anyhow::Error) -> Box<EnvironmentFailure> {
     let cause = error
-        .downcast_ref::<CodexAuthValidationFailureCause>()
+        .downcast_ref::<PackagedCodexRuntimeNotVisible>()
         .map(ToString::to_string)
+        .or_else(|| {
+            error
+                .downcast_ref::<CodexAuthValidationFailureCause>()
+                .map(ToString::to_string)
+        })
         .or_else(|| {
             error
                 .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
@@ -1576,6 +1587,7 @@ fn executable_ancestor_permission_decision(
 }
 
 fn validate_external_program_identity(path: &Path, require_root_owned: bool) -> Result<()> {
+    validate_packaged_runtime_visibility(path)?;
     let metadata = fs::symlink_metadata(path)
         .with_context(|| format!("failed to inspect {}", path.display()))?;
     if metadata.file_type().is_symlink() || !metadata.is_file() {
@@ -5402,6 +5414,7 @@ fn external_side_effect_profile_with_claude_relay(
     protected_controls: &ProtectedWorktreeControls,
     claude: ClaudeProfileBinding<'_>,
 ) -> Result<SideEffectConfinementProfile> {
+    validate_packaged_runtime_visibility(program)?;
     if program_trust != ExternalProgramTrust::TrustedSystemCodex
         && !spec.invocation.is_adapter_subprocess()
     {

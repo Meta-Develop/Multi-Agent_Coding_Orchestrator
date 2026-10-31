@@ -95,6 +95,9 @@ mod grok_output;
 mod grok_progress;
 mod grok_steering;
 pub(crate) mod researcher_inputs;
+mod runtime_visibility;
+
+use runtime_visibility::{validate_packaged_runtime_visibility, PackagedCodexRuntimeNotVisible};
 
 use codex_parent_evidence::{
     codex_parent_evidence_from_app_server_run, codex_parent_evidence_from_run,
@@ -7363,7 +7366,9 @@ fn run_external_agent_runtime(
             );
             if spec.program == Path::new("codex") {
                 let requirement = codex_environment_requirement();
-                let category = if trusted_codex_fixed_candidate_exists() {
+                let category = if error.is::<PackagedCodexRuntimeNotVisible>() {
+                    EnvironmentFailureCategory::SandboxUnavailable
+                } else if trusted_codex_fixed_candidate_exists() {
                     EnvironmentFailureCategory::ProbeFailed
                 } else {
                     EnvironmentFailureCategory::MissingExecutable
@@ -7393,7 +7398,11 @@ fn run_external_agent_runtime(
                     .run_metadata
                     .environment_failures
                     .push(environment_failure(
-                        EnvironmentFailureCategory::ProbeFailed,
+                        if error.is::<PackagedCodexRuntimeNotVisible>() {
+                            EnvironmentFailureCategory::SandboxUnavailable
+                        } else {
+                            EnvironmentFailureCategory::ProbeFailed
+                        },
                         None,
                         summary,
                     ));
