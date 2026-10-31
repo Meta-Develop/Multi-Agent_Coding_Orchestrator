@@ -1752,6 +1752,7 @@ mod tests {
                 let client = AuthorityClient::connect(&socket).unwrap();
                 let server = thread::spawn(move || {
                     let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_nonblocking(false).unwrap();
                     let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
                     apply_io_deadline(&stream, deadline).unwrap();
                     let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();
@@ -1895,6 +1896,7 @@ mod tests {
                 let expected_authorization = authorization.clone();
                 let server = thread::spawn(move || {
                     let (mut stream, _) = listener.accept().unwrap();
+                    stream.set_nonblocking(false).unwrap();
                     let deadline = std::time::Instant::now() + REQUEST_IO_DEADLINE;
                     apply_io_deadline(&stream, deadline).unwrap();
                     let request = read_framed(&mut stream, MAX_REQUEST_BYTES, deadline).unwrap();

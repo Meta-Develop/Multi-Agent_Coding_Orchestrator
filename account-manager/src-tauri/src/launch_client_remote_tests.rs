@@ -148,6 +148,7 @@ impl Fixture {
                         }
                         Err(error) => panic!("proxy accept: {error}"),
                     };
+                    prepare_peer(&stream);
                     let request = read(&mut stream);
                     let value: Value = serde_json::from_slice(&request).unwrap();
                     let launch_request =
@@ -156,6 +157,7 @@ impl Fixture {
                     let server: Arc<AuthorityListener> = Arc::clone(&listener);
                     let serve = std::thread::spawn(move || server.accept_once().unwrap());
                     let mut upstream = UnixStream::connect(listener.path()).unwrap();
+                    prepare_peer(&upstream);
                     write(&mut upstream, &request);
                     let response = read(&mut upstream);
                     serve.join().unwrap();
@@ -211,15 +213,30 @@ impl Drop for Fixture {
         let _ = fs::write(self.root.join("release"), b"okay");
         self.stop.store(true, Ordering::SeqCst);
         if let Some(proxy) = self.proxy.take() {
-            proxy.join().unwrap();
+            let result = proxy.join();
+            // Preserve the original failure if the peer already panicked.
+            if !std::thread::panicking() {
+                result.unwrap();
+            }
         }
     }
 }
 
-fn read(stream: &mut UnixStream) -> Vec<u8> {
+fn prepare_peer(stream: &UnixStream) {
+    // accept() inherits O_NONBLOCK on macOS/BSD, unlike Linux. Framed test
+    // peers use blocking I/O with finite timeouts, regardless of listener mode.
+    stream.set_nonblocking(false).unwrap();
+    // Install both timeouts before any request can make the peer close;
+    // Darwin may reject timeout changes on a disconnected socket with EINVAL.
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .unwrap();
+    stream
+        .set_write_timeout(Some(Duration::from_secs(5)))
+        .unwrap();
+}
+
+fn read(stream: &mut UnixStream) -> Vec<u8> {
     let mut size = [0; 4];
     stream.read_exact(&mut size).unwrap();
     let size = u32::from_be_bytes(size) as usize;
@@ -231,12 +248,64 @@ fn read(stream: &mut UnixStream) -> Vec<u8> {
 
 fn write(stream: &mut UnixStream, body: &[u8]) {
     stream
-        .set_write_timeout(Some(Duration::from_secs(5)))
-        .unwrap();
-    stream
         .write_all(&(body.len() as u32).to_be_bytes())
         .unwrap();
     stream.write_all(body).unwrap();
+}
+
+#[test]
+fn accepted_peer_clears_inherited_nonblocking_before_reading() {
+    let directory = tempfile::tempdir().unwrap();
+    let socket = directory.path().join("nonblocking.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    listener.set_nonblocking(true).unwrap();
+    let mut client = UnixStream::connect(&socket).unwrap();
+    let (mut peer, _) = listener.accept().unwrap();
+    // Force BSD inheritance on every host: a nonblocking listener alone does
+    // not reproduce the bug on Linux, where accepted sockets are blocking.
+    peer.set_nonblocking(true).unwrap();
+    prepare_peer(&peer);
+
+    // No writer exists yet, so this read must wait for the finite timeout.
+    // A still-nonblocking peer fails immediately with WouldBlock instead.
+    let timeout = Duration::from_millis(100);
+    peer.set_read_timeout(Some(timeout)).unwrap();
+    let started = Instant::now();
+    let error = peer.read_exact(&mut [0; 1]).unwrap_err();
+    assert!(matches!(
+        error.kind(),
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+    ));
+    assert!(
+        started.elapsed() >= timeout / 2,
+        "read did not block: {error}"
+    );
+
+    prepare_peer(&client);
+    write(&mut client, b"request after read timeout");
+    assert_eq!(read(&mut peer), b"request after read timeout");
+    write(&mut peer, b"reply");
+    assert_eq!(read(&mut client), b"reply");
+}
+
+#[test]
+fn failed_proxy_cleanup_preserves_original_panic() {
+    for unwinding in [false, true] {
+        let mut fixture = Fixture::new(true);
+        fixture.stop.store(true, Ordering::SeqCst);
+        fixture.proxy.take().unwrap().join().unwrap();
+        fixture.proxy = Some(std::thread::spawn(|| panic!("peer failed")));
+        let error = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            let _fixture = fixture;
+            if unwinding {
+                panic!("original test failure");
+            }
+        }))
+        .expect_err("peer failure must still fail the test");
+        if unwinding {
+            assert_eq!(error.downcast_ref::<&str>(), Some(&"original test failure"));
+        }
+    }
 }
 
 #[test]
@@ -362,6 +431,7 @@ fn confirmed_start_refusals_refresh_service_and_retry_key() {
                 };
                 for operation in operations {
                     let (mut stream, _) = listener.accept().unwrap();
+                    prepare_peer(&stream);
                     let request: Value = serde_json::from_slice(&read(&mut stream)).unwrap();
                     assert_eq!(request["operation"], operation, "{failure}");
                     let mut response = json!({
