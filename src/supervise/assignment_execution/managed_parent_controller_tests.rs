@@ -183,6 +183,11 @@ fn exercise_isolated_result(
     result: Result<CollectedChildAttempt<'_>>,
     observed: &[String],
 ) -> Result<()> {
+    if case.starts_with("managed-cycle-isolated-interrupted-") {
+        return super::isolated_worker_evidence_tests::check_interrupted_result(
+            case, context, preflight, outcome, result, observed,
+        );
+    }
     assert_eq!(observed.first().map(String::as_str), Some("parent"));
     if case == "managed-cycle-isolated-unstarted" {
         assert!(result.is_err());

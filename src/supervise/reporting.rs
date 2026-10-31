@@ -812,53 +812,14 @@ pub(super) fn import_external_attempt_evidence(
     writer: &mut ArtifactRunWriter,
     context: ExternalAttemptEvidenceContext<'_>,
 ) -> Result<()> {
+    let import_result = retain_external_attempt_evidence(writer, &context);
     let ExternalAttemptEvidenceContext {
         incoming_scratch,
         capture_scratch,
-        artifacts,
         external_run,
-        external_command,
-        raw_report_validated,
         runtime,
+        ..
     } = context;
-    let import_result = (|| -> Result<()> {
-        super::target_containment::persist(
-            writer,
-            artifacts,
-            external_command,
-            runtime,
-            external_run,
-        )?;
-        if raw_report_validated {
-            if let Some(contents) = external_run.output_last_message() {
-                if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
-                    bail!(
-                        "descriptor-held external report exceeds its configured {} byte limit",
-                        MAX_SUPERVISOR_REPORT_BYTES
-                    );
-                }
-                writer.write_bytes(
-                    &artifacts.raw_report_relative,
-                    contents,
-                    ArtifactFileDisposition::PrivateEvidence,
-                )?;
-            }
-        }
-        let stdout_bytes = external_run.stdout_bytes();
-        if stdout_bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
-            bail!(
-                "descriptor-held external stdout exceeds its configured {} byte limit",
-                MAX_SUPERVISOR_REPORT_BYTES
-            );
-        }
-        writer.write_bytes(
-            &artifacts.raw_stdout_relative,
-            stdout_bytes,
-            ArtifactFileDisposition::PrivateEvidence,
-        )?;
-        Ok(())
-    })();
-
     let discard_result = if external_process_quiescent_for_scratch(external_run, runtime) {
         discard_invocation_scratches(writer, incoming_scratch, capture_scratch)
     } else {
@@ -877,6 +838,51 @@ pub(super) fn import_external_attempt_evidence(
             "artifact scratch cleanup also failed: {discard_error:#}"
         ))),
     }
+}
+
+/// Copy descriptor-held evidence without consuming its source scratches. Callers
+/// retaining independent evidence decide when it is safe to discard the sources.
+pub(super) fn retain_external_attempt_evidence(
+    writer: &mut ArtifactRunWriter,
+    context: &ExternalAttemptEvidenceContext<'_>,
+) -> Result<()> {
+    let ExternalAttemptEvidenceContext {
+        artifacts,
+        external_run,
+        external_command,
+        raw_report_validated,
+        runtime,
+        ..
+    } = *context;
+    super::target_containment::persist(writer, artifacts, external_command, runtime, external_run)?;
+    if raw_report_validated {
+        if let Some(contents) = external_run.output_last_message() {
+            if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
+                bail!(
+                    "descriptor-held external report exceeds its configured {} byte limit",
+                    MAX_SUPERVISOR_REPORT_BYTES
+                );
+            }
+            writer.write_bytes(
+                &artifacts.raw_report_relative,
+                contents,
+                ArtifactFileDisposition::PrivateEvidence,
+            )?;
+        }
+    }
+    let stdout_bytes = external_run.stdout_bytes();
+    if stdout_bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+        bail!(
+            "descriptor-held external stdout exceeds its configured {} byte limit",
+            MAX_SUPERVISOR_REPORT_BYTES
+        );
+    }
+    writer.write_bytes(
+        &artifacts.raw_stdout_relative,
+        stdout_bytes,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    Ok(())
 }
 
 pub(super) fn create_named_invocation_scratches(

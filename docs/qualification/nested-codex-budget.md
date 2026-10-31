@@ -1,6 +1,7 @@
 # Nested writable token-control qualification (#714)
 
-Status: prepared; real within-turn exhaustion is unproven. Follow the
+Status: observed interruption and subsequent refusal; full acceptance remains
+unproven. Follow the
 [shared preparation and evidence contract](README.md) before running.
 The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
 has one execution parent and exactly two disjoint terminal Workers, requested
@@ -98,15 +99,57 @@ attempt, reservation, account, thread and turn identities:
   zero residual reservations and no additional provider dispatch after observed
   exhaustion. A refused subsequent dispatch/reservation must be visible in the
   production journal; do not launch a separate paid probe to manufacture it.
-- Independent review of actual fixture changes and command observations,
-  expected rejection of incomplete output, complete accounted usage, and exact
-  owned child/cgroup quiescence. Timeout or process cancellation alone is not
-  token-control qualification.
+- Independent review of the actual retained candidate and command observations,
+  expected rejection of incomplete output, honest usage accounting as described
+  below, and exact owned child/cgroup quiescence. Timeout or process cancellation
+  alone is not token-control qualification. Native source mutation must still
+  be observed to prove the writable sandbox's edit confinement; an unchanged
+  candidate does not establish that part of acceptance.
+
+The retained `qualification-nested-budget-ct101-01` attempt observed Worker 1's
+19,325 then 39,121 cumulative tokens against a 21,767-token live grant. The
+interrupted terminal arrived 10 ms after the crossing notice, with no later
+usage notice. Worker 2 received a typed admission refusal without dispatch;
+both reservations settled and none remained. The 43,233-token parent charge
+plus the Worker's 39,121-token floor gives 82,354 accounted tokens, **a lower
+bound**, with Worker and run `usage_complete=false`. The reliable usage
+aggregate excludes that incomplete Worker sample. These observations prove
+the stop/refusal behavior, not complete final consumption or full acceptance.
+
+For an interrupted turn, retain the largest trustworthy correlated cumulative
+observation through the bounded drain, charge it once as incomplete, and retain
+the missing-usage flag. An interrupted terminal acknowledges stopping; it does
+not certify the last cumulative notice as final usage. Codex 0.162.0 supplied
+no final usage certification in this attempt. Neither another identical notice
+nor a successful interrupt response would establish completeness. Complete
+actual consumption remains unknown unless the provider supplies a trustworthy
+final usage observation with explicit finality for that exact interrupted turn.
+Do not infer zero unobserved consumption, label the floor complete, or relax
+dispatch/publication gates. Stop/refusal qualification can use this explicitly
+incomplete lower bound; any claim of complete actual usage remains unproven
+until that separate provider observation exists.
+
+After verified writer quiescence, isolated Worker collection retains the
+runner-held journals, raw response and native stream before report parsing or
+cancellation rejection. A private `*.candidate.json` manifest beside the raw
+response binds the run, parent/Worker attempt, exact reservation, source commit,
+candidate tree, changed paths, and the SHA256/size of a binary `*.candidate.patch`.
+These artifacts carry no acceptance or continuation authority. Evidence-import
+or candidate-capture failure remains a rejection and must be reported; it cannot
+be replaced with a claimed successful review.
 
 Both assigned files are recognized runnable test targets, so preflight does not
 depend on a new generic authored-check capability. The independent reviewer
-must run these commands against the actual candidate and verify existing test
-bodies were preserved (a Worker can otherwise weaken its own test):
+must reconstruct each retained candidate in a separate checkout of the manifest's
+exact source commit, apply its binary patch, verify the resulting tree matches
+`candidate_tree`, and run these commands there. An empty patch denotes the
+unchanged base; still verify its tree and run the checks. Verify existing test
+bodies were preserved (a Worker can otherwise weaken its own test). For interrupted output,
+review and reject the actual partial or unchanged candidate, retain command exit
+codes/stdout/stderr with its manifest binding, and report failing seed tests as
+failures. Do not substitute tests on the original seed or the parent checkout
+for a changed Worker's candidate. This review is an independent offline step
+after quiescence; exhaustion authorizes no further provider review call:
 
 ```bash
 python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v

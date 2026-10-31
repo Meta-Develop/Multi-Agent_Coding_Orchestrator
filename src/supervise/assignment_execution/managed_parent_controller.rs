@@ -357,7 +357,7 @@ fn collect_isolated_parent_cycle<'budget>(
             &prepared.command,
         )?);
         continuation.revalidate(context, preflight, next_attempt)?;
-        let captured = super::dispatch_and_capture_child_attempt_with_release_state(
+        let mut captured = super::dispatch_and_capture_child_attempt_with_release_state(
             context,
             outcome,
             preflight,
@@ -381,6 +381,9 @@ fn collect_isolated_parent_cycle<'budget>(
             return Err(error);
         }
         verified_final_capture = true;
+        if let Some(error) = captured.post_return_error.take() {
+            return Err(error);
+        }
         let final_attempt = super::prepare_managed_parent_isolated_final_attempt(
             context,
             preflight,

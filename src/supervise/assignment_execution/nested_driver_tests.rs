@@ -67,6 +67,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         )
     });
     let isolated = case.starts_with("managed-cycle-isolated-");
+    let interrupted_worker = case.starts_with("managed-cycle-isolated-interrupted-");
     let grok_continuation = case == "continuation-grok-happy";
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
@@ -262,12 +263,17 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             ..Default::default()
         },
     )?;
-    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let ledger = RunBudgetLedger::new(RunBudgetLimits {
+        hard_tokens: interrupted_worker.then_some(65_000),
+        ..Default::default()
+    })?;
     let metadata = AssignmentMetadata::new();
     let consultant = SupervisorConsultantPlan::default();
-    // Only this case exercises completion-checkpoint failure. Bind the existing
-    // authenticated writer before preparation creates non-resumable scratches.
-    let mut checkpoint = if case == "managed-cycle-retained-checkpoint-error" {
+    // Bind the existing checkpoint writer for completion-failure cases before
+    // preparation creates non-resumable scratches.
+    let checkpoint_failure = case == "managed-cycle-retained-checkpoint-error"
+        || case == super::isolated_worker_evidence_tests::CHECKPOINT_FAILURE_CASE;
+    let mut checkpoint = if checkpoint_failure {
         Some(SupervisorCheckpointWriter::create(
             &repo,
             SupervisorCheckpointPreparation::new(
@@ -299,13 +305,19 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         autonomy_kpis: &mut kpis,
         checkpoint: checkpoint.as_mut(),
     });
-    if case == "managed-cycle-retained-checkpoint-error" {
+    if checkpoint_failure {
         record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
     }
     let budget_config = SupervisorBudgetConfig {
         role_token_reservations: BTreeMap::from([
-            (AgentRole::ChildOrchestrator, 2),
-            (AgentRole::Worker, 2),
+            (
+                AgentRole::ChildOrchestrator,
+                if interrupted_worker { 4_000 } else { 2 },
+            ),
+            (
+                AgentRole::Worker,
+                if interrupted_worker { 1_000 } else { 2 },
+            ),
         ]),
         ..Default::default()
     };
@@ -505,14 +517,17 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 None,
             ));
             ready.notify_all();
-            let (live, deadline) = ready
-                .wait_timeout_while(live, Duration::from_secs(5), |live| live.len() < 2)
-                .unwrap();
-            assert!(
-                !deadline.timed_out(),
-                "workers did not overlap within the bounded fixture wait"
-            );
-            assert_ne!(live[0].1, live[1].1, "workers share one worktree lease");
+            if !interrupted_worker {
+                let (observed, deadline) = ready
+                    .wait_timeout_while(live, Duration::from_secs(5), |live| live.len() < 2)
+                    .unwrap();
+                assert!(
+                    !deadline.timed_out(),
+                    "workers did not overlap within the bounded fixture wait"
+                );
+                live = observed;
+                assert_ne!(live[0].1, live[1].1, "workers share one worktree lease");
+            }
             drop(live);
             // Recheck the held read-only source while both workers are alive.
             assert_eq!(
@@ -868,6 +883,20 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     .3 = Some(std::time::Instant::now());
             }
         }
+        if interrupted_worker {
+            super::isolated_worker_evidence_tests::interrupt_returned_worker(
+                case,
+                command,
+                runner_cancellation,
+                subject,
+                &mut run,
+            );
+        }
+        if case == super::isolated_worker_evidence_tests::JOURNAL_FAILURE_CASE
+            && subject.id == "worker"
+        {
+            fs::create_dir_all(run_dir.join("logs/workers/worker/worker.jsonl")).unwrap();
+        }
         if subject.id == "parent" && case == "attached-capture-errors" {
             sync_store.release(claim.token).unwrap();
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -918,7 +947,11 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         budget_ledger: &ledger,
         budget_policy: {
             let mut policy = AssignmentBudgetPolicy::default();
-            policy.worker_dispatch_limit = if isolated { 2 } else { 1 };
+            policy.worker_dispatch_limit = if isolated && !interrupted_worker {
+                2
+            } else {
+                1
+            };
             policy
         },
         admission_commit: None,
@@ -987,7 +1020,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 "protected primary index bytes changed"
             );
         }
-        if isolated && case != "managed-cycle-isolated-unstarted" {
+        if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
             let live = overlapping_workers.0.lock().unwrap();
             assert_eq!(live.len(), 2);
             let latest_start = live.iter().map(|entry| entry.2).max().unwrap();

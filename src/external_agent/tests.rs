@@ -15196,6 +15196,100 @@ mod managed_worker_live_budget {
     }
 
     #[test]
+    fn worker_handler_interrupted_terminal_without_later_usage_keeps_observed_floor() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(65_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let BudgetAdmission::Admitted {
+            reservation: parent,
+            ..
+        } = ledger
+            .reserve(BudgetReservationRequest {
+                role: crate::supervise::AgentRole::ChildOrchestrator,
+                tokens: 4_000,
+                cost_usd: None,
+            })
+            .unwrap()
+        else {
+            panic!("parent reservation")
+        };
+        ledger
+            .reconcile(
+                parent.id,
+                crate::supervise_budget::UsageMeasurement::Reliable {
+                    tokens: 43_233,
+                    cost_usd: None,
+                },
+            )
+            .unwrap();
+        let held = reserve(&ledger);
+        let grant = ledger.live_token_grant(held.id).unwrap().unwrap();
+        assert_eq!(grant.tokens(), 21_767);
+        let mut spec = command();
+        spec.bind_live_token_grant(Some(grant.clone()));
+        let mut messages = prefix();
+        messages.extend([
+            usage(18_965, 360), usage(38_557, 564),
+            serde_json::json!({"id":4,"result":{}}),
+            serde_json::json!({"method":"thread/status/changed","params":{"threadId":"worker-thread","status":{"type":"idle"}}}),
+            serde_json::json!({"method":"turn/completed","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"interrupted","error":null}}}),
+        ]);
+        let mut transport = Transport::new(messages);
+        let cancellation = ProcessCancellation::new();
+        let outcome =
+            run_managed_worker_app_server_turn(&mut transport, &turn(), &spec, &cancellation)
+                .unwrap();
+        assert!(
+            transport.incoming.is_empty(),
+            "interrupted terminal was not drained"
+        );
+        assert!(grant.stopped());
+        assert!(cancellation.is_cancelled());
+        assert_eq!(observed_tokens(&outcome), Some(39_121));
+        assert_eq!(outcome.status, codex_app_server::TurnTerminalStatus::Failed);
+        assert!(outcome.final_message.is_none());
+        assert!(outcome
+            .protocol_error
+            .as_deref()
+            .unwrap()
+            .contains("token grant exhausted"));
+        assert_eq!(
+            transport
+                .sent
+                .iter()
+                .filter(|v| v["method"] == "turn/interrupt")
+                .count(),
+            1
+        );
+        ledger
+            .reconcile(
+                held.id,
+                crate::supervise_budget::UsageMeasurement::Estimated {
+                    tokens: 39_121,
+                    cost_usd: None,
+                },
+            )
+            .unwrap();
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 82_354);
+        assert!(!report.usage_complete);
+        assert_eq!(report.active_reservations, 0);
+        assert_eq!(report.reserved.tokens, 0);
+        assert!(matches!(
+            ledger
+                .reserve(BudgetReservationRequest {
+                    role: crate::supervise::AgentRole::Worker,
+                    tokens: 1_000,
+                    cost_usd: None,
+                })
+                .unwrap(),
+            BudgetAdmission::Refused { .. }
+        ));
+    }
+
+    #[test]
     fn worker_handler_retains_partial_floor_and_missing_usage_on_protocol_failure() {
         for failure in [
             "eof",
