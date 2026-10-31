@@ -10706,7 +10706,7 @@ fn run_read_only_terminal_app_server_process_with_auth(
     })
 }
 
-fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTransport>(
+pub(crate) fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTransport>(
     transport: &mut T,
     turn: &codex_app_server::AppServerTurn,
     spec: &ExternalAgentCommand,

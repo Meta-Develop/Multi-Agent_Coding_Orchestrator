@@ -1250,123 +1250,188 @@ fn dispatch_isolated_parent_workers_inner(
         subjects.push((index, subject));
     }
     let group_cancellation = context.cancellation.child_scope();
+    let width = policy.worker_dispatch_limit.max(1);
     let mut results = std::thread::scope(|scope| {
-        let mut handles = Vec::new();
-        for (ordinal, (grant, (index, subject))) in
-            grants.into_iter().zip(subjects.iter()).enumerate()
-        {
-            #[cfg(test)]
-            if ISOLATED_TEST_REFUSE_SPAWN.with(std::cell::Cell::get) {
-                group_cancellation.cancel();
-                drop(grant);
-                handles.push(Err(std::io::Error::other(
-                    "injected isolated thread creation refusal before runner entry",
-                )));
-                continue;
-            }
-            let release_state = release_states[ordinal].1.clone();
-            let prior_binding = super::prior_input::captured_binding();
-            let runtime_binding = super::runtime_executables::captured_binding();
-            #[cfg(all(test, target_os = "linux"))]
-            let cam_observe_fixture = super::scheduler::captured_cam_observe_test_harness();
-            let authorizations = routing_policy::captured_selected_authorizations();
-            let frozen = frozen.clone();
-            let cancellation = group_cancellation.clone();
-            let plan = &plan;
-            let schedule = &schedule;
-            handles.push(std::thread::Builder::new().spawn_scoped(scope, move || {
-                #[cfg(all(test, target_os = "linux"))]
-                let _cam_observe_guard =
-                    super::scheduler::install_captured_cam_observe_test_harness(
-                        cam_observe_fixture,
-                    );
-                let _prior = super::prior_input::install_captured(prior_binding);
-                let _runtime = super::runtime_executables::install_captured(runtime_binding);
-                let mut child_outcome = AssignmentExecutionOutcome {
-                    gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
-                    ..AssignmentExecutionOutcome::default()
-                };
-                let result = (|| {
-                    let _policy = routing_policy::bind_routing_policy(Some(frozen))?;
-                    routing_policy::install_selected_authorizations(authorizations);
-                    let child_context = AssignmentExecutionContext {
-                        index: *index,
-                        concurrent_mode: true,
-                        plan,
-                        requested_plan: plan,
-                        budget_config: context.budget_config,
-                        consultant: context.consultant,
-                        assignment_metadata: context.assignment_metadata,
-                        assignment: subject,
-                        evidence_only_reaudit: None,
-                        options: context.options,
-                        repo: context.repo,
-                        run_dir: context.run_dir,
-                        dirs: context.dirs,
-                        execution_runtime: context.execution_runtime,
-                        execution_target: None,
-                        worktree_creation: context.worktree_creation,
-                        manager: context.manager,
-                        reused: false,
-                        sync_store: context.sync_store,
-                        semantic_store: context.semantic_store,
-                        prepared_semantic_token: None,
-                        prepared_semantic_findings: &[],
-                        prepared_semantic_signals: &[],
-                        prepared_semantic_failed: false,
-                        assignment_schedule: schedule,
-                        field_guide: context.field_guide,
-                        serial_semantic_warn_intents: None,
-                        semantic_block_order: None,
-                        semantic_block_gate: None,
-                        artifacts: context.artifacts,
-                        budget_ledger: context.budget_ledger,
-                        budget_policy: policy.clone(),
-                        admission_commit: None,
-                        runtime_model_catalog: context.runtime_model_catalog,
-                        cancellation: cancellation.clone(),
-                        external_runner: context.external_runner,
+        let mut pending = grants
+            .into_iter()
+            .zip(subjects.iter())
+            .enumerate()
+            .peekable();
+        let mut results = Vec::new();
+        // Join each bounded batch before admitting another. In particular, width
+        // one preserves authored order through settlement, not merely launch.
+        while pending.peek().is_some() {
+            let mut handles = Vec::new();
+            for (ordinal, (grant, (index, subject))) in pending.by_ref().take(width) {
+                if context.budget_ledger.dispatch_stopped() {
+                    let mut child = AssignmentExecutionOutcome {
+                        gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                        ..Default::default()
                     };
-                    execute_isolated_worker_capture(
-                        &child_context,
+                    let result = refuse_stopped_isolated_worker(
                         context,
                         parent_preflight,
-                        parent_attempt,
-                        grant,
-                        &mut child_outcome,
-                        policy,
-                        &release_state,
+                        subject,
+                        &mut child,
                     )
-                })();
-                if result.is_err() {
-                    cancellation.cancel();
+                    .and_then(|()| {
+                        Err(anyhow!(
+                            "isolated Worker budget admission refused before dispatch"
+                        ))
+                    });
+                    results.push((result, child));
+                    continue;
                 }
-                (result, child_outcome)
-            }));
-        }
-        let mut results = Vec::new();
-        for handle in handles {
-            match handle {
-                Ok(handle) => match handle.join() {
-                    Ok(result) => results.push(result),
-                    Err(_) => {
-                        group_cancellation.cancel();
-                        results.push((
-                            Err(anyhow!(
-                                "isolated Worker thread panicked; held claims require recovery"
-                            )),
-                            AssignmentExecutionOutcome::fatal("isolated Worker thread panicked"),
-                        ));
-                    }
-                },
-                Err(error) => {
+                if group_cancellation.is_cancelled() {
+                    results.push((
+                        Err(anyhow!("isolated Worker cancelled before dispatch")),
+                        AssignmentExecutionOutcome::default(),
+                    ));
+                    continue;
+                }
+                #[cfg(test)]
+                if ISOLATED_TEST_REFUSE_SPAWN.with(std::cell::Cell::get) {
                     group_cancellation.cancel();
-                    results.push((Err(error.into()), AssignmentExecutionOutcome::default()));
+                    drop(grant);
+                    handles.push(Err(std::io::Error::other(
+                        "injected isolated thread creation refusal before runner entry",
+                    )));
+                    continue;
+                }
+                let release_state = release_states[ordinal].1.clone();
+                let prior_binding = super::prior_input::captured_binding();
+                let runtime_binding = super::runtime_executables::captured_binding();
+                #[cfg(all(test, target_os = "linux"))]
+                let cam_observe_fixture = super::scheduler::captured_cam_observe_test_harness();
+                let authorizations = routing_policy::captured_selected_authorizations();
+                let frozen = frozen.clone();
+                let cancellation = group_cancellation.clone();
+                let plan = &plan;
+                let schedule = &schedule;
+                handles.push(std::thread::Builder::new().spawn_scoped(scope, move || {
+                    #[cfg(all(test, target_os = "linux"))]
+                    let _cam_observe_guard =
+                        super::scheduler::install_captured_cam_observe_test_harness(
+                            cam_observe_fixture,
+                        );
+                    let _prior = super::prior_input::install_captured(prior_binding);
+                    let _runtime = super::runtime_executables::install_captured(runtime_binding);
+                    let mut child_outcome = AssignmentExecutionOutcome {
+                        gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                        ..AssignmentExecutionOutcome::default()
+                    };
+                    let result = (|| {
+                        let _policy = routing_policy::bind_routing_policy(Some(frozen))?;
+                        routing_policy::install_selected_authorizations(authorizations);
+                        let child_context = AssignmentExecutionContext {
+                            index: *index,
+                            concurrent_mode: true,
+                            plan,
+                            requested_plan: plan,
+                            budget_config: context.budget_config,
+                            consultant: context.consultant,
+                            assignment_metadata: context.assignment_metadata,
+                            assignment: subject,
+                            evidence_only_reaudit: None,
+                            options: context.options,
+                            repo: context.repo,
+                            run_dir: context.run_dir,
+                            dirs: context.dirs,
+                            execution_runtime: context.execution_runtime,
+                            execution_target: None,
+                            worktree_creation: context.worktree_creation,
+                            manager: context.manager,
+                            reused: false,
+                            sync_store: context.sync_store,
+                            semantic_store: context.semantic_store,
+                            prepared_semantic_token: None,
+                            prepared_semantic_findings: &[],
+                            prepared_semantic_signals: &[],
+                            prepared_semantic_failed: false,
+                            assignment_schedule: schedule,
+                            field_guide: context.field_guide,
+                            serial_semantic_warn_intents: None,
+                            semantic_block_order: None,
+                            semantic_block_gate: None,
+                            artifacts: context.artifacts,
+                            budget_ledger: context.budget_ledger,
+                            budget_policy: policy.clone(),
+                            admission_commit: None,
+                            runtime_model_catalog: context.runtime_model_catalog,
+                            cancellation: cancellation.clone(),
+                            external_runner: context.external_runner,
+                        };
+                        execute_isolated_worker_capture(
+                            &child_context,
+                            context,
+                            parent_preflight,
+                            parent_attempt,
+                            grant,
+                            &mut child_outcome,
+                            policy,
+                            &release_state,
+                        )
+                    })();
+                    if result.is_err() {
+                        cancellation.cancel();
+                    }
+                    (result, child_outcome)
+                }));
+            }
+            for handle in handles {
+                match handle {
+                    Ok(handle) => match handle.join() {
+                        Ok(result) => results.push(result),
+                        Err(_) => {
+                            group_cancellation.cancel();
+                            results.push((
+                                Err(anyhow!(
+                                    "isolated Worker thread panicked; held claims require recovery"
+                                )),
+                                AssignmentExecutionOutcome::fatal(
+                                    "isolated Worker thread panicked",
+                                ),
+                            ));
+                        }
+                    },
+                    Err(error) => {
+                        group_cancellation.cancel();
+                        results.push((Err(error.into()), AssignmentExecutionOutcome::default()));
+                    }
                 }
             }
         }
         results
     });
+    if context.budget_ledger.dispatch_stopped() {
+        // A thread in the last batch may have been waiting for a live grant
+        // when its sibling exhausted. Cancellation of that wait is not a
+        // provider invocation. Record its budget refusal as well, exactly once.
+        for ((_, subject), (_, state)) in subjects.iter().zip(release_states) {
+            let already_refused = results.iter().any(|(_, child)| {
+                child.gate_tracker.as_ref().is_some_and(|tracker| {
+                    tracker.denials.iter().any(|denial| {
+                        denial.context.owner == subject.id
+                            && matches!(denial.reason, GateDenialReason::BudgetAdmission { .. })
+                    })
+                })
+            });
+            if state.load(Ordering::Acquire) == 0 && !already_refused {
+                let mut child = AssignmentExecutionOutcome {
+                    gate_tracker: Some(GateCorrectionTracker::new(plan.max_gate_corrections)),
+                    ..Default::default()
+                };
+                let result =
+                    refuse_stopped_isolated_worker(context, parent_preflight, subject, &mut child)
+                        .and_then(|()| {
+                            Err(anyhow!(
+                                "unstarted isolated Worker budget admission refused"
+                            ))
+                        });
+                results.push((result, child));
+            }
+        }
+    }
     let mut completed = Vec::new();
     let mut errors = Vec::new();
     for (result, mut child) in results.drain(..) {
@@ -1381,6 +1446,13 @@ fn dispatch_isolated_parent_workers_inner(
             .pre_action_review_metrics
             .append(&mut child.pre_action_review_metrics);
         outcome.gate_denials.append(&mut child.gate_denials);
+        if let Some(mut tracker) = child.gate_tracker.take() {
+            outcome.gate_denials.append(&mut tracker.denials);
+            outcome
+                .gate_correction_outcomes
+                .append(&mut tracker.outcomes);
+        }
+        outcome.budget_dispatch_stopped |= child.budget_dispatch_stopped;
         outcome.external_containment_failed |= child.external_containment_failed;
         match result {
             Ok(worker) => completed.push(worker),
@@ -1398,6 +1470,44 @@ fn dispatch_isolated_parent_workers_inner(
     Ok(completed)
 }
 
+fn refuse_stopped_isolated_worker(
+    context: &AssignmentExecutionContext<'_, '_>,
+    parent: &AssignmentExecutionPreflight<'_>,
+    worker: &OrchestratorAssignment,
+    outcome: &mut AssignmentExecutionOutcome,
+) -> Result<()> {
+    // Obtain a real ledger refusal for this authored duty without creating a
+    // worktree, reservation, grant or provider invocation after the stop latch.
+    let admission = context.budget_ledger.reserve_waiting_for_live_grants(
+        BudgetReservationRequest {
+            role: worker.role,
+            tokens: context
+                .budget_config
+                .reservation_tokens(worker.role)
+                .context("stopped Worker has no admission estimate")?,
+            cost_usd: None,
+        },
+        Duration::ZERO,
+        || false,
+    )?;
+    let refusal = match admission {
+        BudgetAdmission::Refused { refusal, .. } => refusal,
+        BudgetAdmission::Admitted { reservation, .. } => {
+            context.budget_ledger.release(reservation.id)?;
+            bail!("stopped isolated Worker unexpectedly admitted");
+        }
+    };
+    record_budget_dispatch_refusal(
+        outcome,
+        worker,
+        (&worker.id, worker.role),
+        &refusal,
+        None,
+        context.artifacts,
+        &parent.assignment.id,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn execute_isolated_worker_capture(
     child: &AssignmentExecutionContext<'_, '_>,
@@ -1410,6 +1520,12 @@ fn execute_isolated_worker_capture(
     release_state: &std::sync::atomic::AtomicU8,
 ) -> Result<bound_parent_turn::IsolatedWorkerAttemptEvidence> {
     grant.revalidate(parent, parent_preflight)?;
+    #[cfg(test)]
+    observe_budget_admission_for_test(
+        child.options.run_id.as_str(),
+        "preparing",
+        &child.assignment.id,
+    );
     let mut preflight =
         match prepare_assignment_execution_with_claim(child, outcome, Some(grant.claim()))? {
             AssignmentExecutionDisposition::Continue(preflight) => preflight,
@@ -1474,6 +1590,24 @@ fn execute_isolated_worker_capture(
         std::mem::forget(capture);
         std::mem::forget(preflight);
         bail!("isolated Worker returned without verified scratch quiescence; resources retained");
+    }
+    if child.budget_ledger.dispatch_stopped() {
+        // Retain descriptor-held partial output even when cancellation/report
+        // validation below rejects the exhausted turn. This is private evidence,
+        // never a validated Worker result or authority for continuation.
+        if let Some(bytes) = capture.external_run.output_last_message() {
+            if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
+                bail!("interrupted Worker report exceeds its configured byte limit");
+            }
+            with_supervisor_artifacts(child.artifacts, |writer, _| {
+                writer.write_bytes(
+                    &capture.attempt_artifacts.raw_report_relative,
+                    bytes,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+                Ok(())
+            })?;
+        }
     }
     if child.cancellation.is_cancelled() {
         bail!("isolated Worker was cancelled after its returned dispatch settled; no continuation authorized");
@@ -3052,13 +3186,15 @@ fn prepare_child_attempt_with_purpose<'a>(
                 assignment,
                 (&assignment.id, assignment.role),
                 &refusal,
-                (launch_runtime, &command, budget_ledger),
+                Some((launch_runtime, &command, budget_ledger)),
                 artifacts,
                 journal_parent_id,
             )?;
             return Ok(AssignmentExecutionDisposition::Complete);
         }
     };
+    #[cfg(test)]
+    observe_budget_admission_for_test(context.options.run_id.as_str(), "reserved", &assignment.id);
     let pre_action_review_context = if launch_runtime == SupervisorRuntime::Codex {
         match pre_action_review_context(options, assignment, &worktree.path) {
             Ok(review_context) => Some(review_context),
@@ -6799,7 +6935,7 @@ fn prepare_parent_auditor<'a>(
                 assignment,
                 (&auditor_id, AgentRole::Auditor),
                 &refusal,
-                (launch_runtime, &auditor_command, budget_ledger),
+                Some((launch_runtime, &auditor_command, budget_ledger)),
                 artifacts,
                 journal_parent_id,
             )?;
@@ -18249,3 +18385,6 @@ mod bound_parent_turn_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/managed_parent_controller_tests.rs"]
 mod managed_parent_controller_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+mod worker_dispatch_limits_tests;

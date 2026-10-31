@@ -528,6 +528,9 @@ impl SchedulerProgress {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct AssignmentBudgetPolicy {
+    /// Inner dispatch inherits the run bound, including provider, quota, host
+    /// capacity and any subsequent fan-out degradation. Zero fails closed to one.
+    pub(super) worker_dispatch_limit: usize,
     model_overrides: BTreeMap<AgentRole, RoleModelSelection>,
     worker_effort_degradation_steps: usize,
     assignment_reasoning_effort: Option<ReasoningEffort>,
@@ -935,6 +938,7 @@ impl BudgetDegradationController {
         )?;
         self.last_new_dispatch_allowed = report.new_dispatch_allowed;
         let mut policy = self.policy.clone();
+        policy.worker_dispatch_limit = self.effective_fan_out;
         if mechanical_duties.is_none() {
             policy.model_overrides.remove(&AgentRole::Worker);
             policy.worker_effort_degradation_steps = 0;
