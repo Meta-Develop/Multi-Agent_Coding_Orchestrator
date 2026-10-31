@@ -2,6 +2,31 @@
 //! capture. Public usage evidence and deserialized reports cannot supply it.
 use super::*;
 
+impl ExternalAgentRun {
+    /// A single served model across the original, command-bound native captures.
+    /// Effort is deliberately absent: the pinned protocol does not attest it.
+    pub(crate) fn authenticated_grok_model(&self, command: &ExternalAgentCommand) -> Option<&str> {
+        let capture = self.stdout.run_metadata.grok_native_usage.as_ref()?;
+        if capture.command != *command || !self.authenticated_grok_usage(command)?.1 {
+            return None;
+        }
+        let mut model = None;
+        for observation in std::iter::once(&capture.observation).chain(&capture.prior_observations)
+        {
+            let identity = observation.served_identity();
+            if !identity.model_observation_complete || identity.observed_models.len() != 1 {
+                return None;
+            }
+            let observed = identity.observed_models[0].as_str();
+            if model.is_some_and(|previous| previous != observed) {
+                return None;
+            }
+            model = Some(observed);
+        }
+        model
+    }
+}
+
 pub(super) fn publication_refusal(
     command: &ExternalAgentCommand,
     report: &ExternalAgentRun,

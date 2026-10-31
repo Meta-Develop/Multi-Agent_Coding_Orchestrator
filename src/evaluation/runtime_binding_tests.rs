@@ -285,3 +285,258 @@ fn cross_runtime_unknown_identity_withholds_later_paid_cells_and_rejects_tamperi
         summarize_executed_observation_runs(&manifest, &results.manifest_sha256, &runs).is_err()
     );
 }
+
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum IdentityReceiptCase {
+    AppServer,
+    Exec,
+    ServedMismatch,
+    EffortMismatch,
+    RequestedMismatch,
+    Missing,
+    MissingSummary,
+    SummaryMismatch,
+    Tampered,
+    UnknownRetry,
+    WrongRole,
+    WrongRuntime,
+    WrongRun,
+    WrongReportRun,
+    Grok,
+    LabelsOnly,
+}
+
+/// Synthetic parent receipts exercise capture and withholding without starting a provider.
+#[cfg(target_os = "linux")]
+fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperimentResults, usize) {
+    use crate::artifacts::{
+        state_auth::sha256_hex, ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
+    };
+    use crate::supervise::{
+        HeldOutProductionExperimentOutcome, HeldOutProductionLaunchObservation,
+        SupervisorFinalReport, SupervisorPlan,
+    };
+    let mut manifest = pilot_manifest();
+    let template = manifest.profiles[0].clone();
+    for profile in &mut manifest.profiles {
+        profile.role_models = template.role_models.clone();
+        profile.worker_runtime = template.worker_runtime;
+        if case == IdentityReceiptCase::Grok {
+            profile.worker_runtime = Some(SupervisorRuntime::Grok);
+            profile
+                .role_models
+                .get_mut(&AgentRole::Worker)
+                .unwrap()
+                .model = Some("grok-4.6".into());
+        }
+    }
+    let (_source, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plans = tempfile::TempDir::new().unwrap();
+    let (_artifact, artifact_repo) = artifact_owner();
+    let mut request = real_provider_request(
+        HeldOutExplicitSourceBaseline {
+            source_repo,
+            base_commit,
+        },
+        direct_plan(plans.path()),
+    );
+    request.runtime = SupervisorRuntime::Codex;
+    if case == IdentityReceiptCase::Grok {
+        request
+            .additional_runtime_executables
+            .push(HeldOutAdditionalRuntimeBinding {
+                runtime: SupervisorRuntime::Grok,
+                executable: "/usr/bin/true".into(),
+            });
+    }
+    let _runtime_bindings = (case == IdentityReceiptCase::Grok).then(|| {
+        crate::supervise::bind_explicit_runtime_executables(
+            &request.source.source_repo,
+            &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
+            SupervisorRuntime::Codex,
+            std::path::Path::new("/usr/bin/true"),
+            &[(SupervisorRuntime::Grok, "/usr/bin/true".into())],
+        )
+        .unwrap()
+    });
+    let mut calls = 0;
+    let results = super::super::executed_experiment::run_held_out_real_provider_experiment_with_dispatch(
+        &manifest, request, &artifact_repo, |options, _, _| {
+            calls += 1;
+            let plan: SupervisorPlan = serde_json::from_slice(&fs::read(&options.plan_file)?).unwrap();
+            let mut writer = ArtifactRunWriter::reserve(&options.repo, RunArtifactFamily::Supervise, options.run_id.clone(), "synthetic-identity-test")?;
+            let mut tamper_path = None;
+            for (role, selection) in &plan.role_models {
+                let worker = *role == AgentRole::Worker;
+                let runtime = if worker { plan.assignments[0].runtime.unwrap() } else { options.runtime };
+                let attempts = if worker && case == IdentityReceiptCase::UnknownRetry { 2 } else { 1 };
+                for attempt in 1..=attempts {
+                    let path = format!("logs/{}.attempt-{attempt}.summary.json", role.as_str());
+                    let observed_model = if worker && case == IdentityReceiptCase::ServedMismatch { "other-model" } else { selection.model.as_deref().unwrap() };
+                    let mut summary = json!({
+                        "codex_parent_evidence": {
+                            "codex_version":"0.162.0", "thread_id":format!("thread-{}-{attempt}", role.as_str()),
+                            "requested_model":selection.model, "requested_effort":selection.reasoning_effort,
+                            "rollout_model":"unknown", "rollout_effort":"unknown",
+                            "observed_model":{"known":observed_model}, "observed_effort":{"known":"xhigh"},
+                            "server_rerouted_model":null, "model_mismatch":false,
+                            "turn_usage":{"status":"known","input_tokens":10,"output_tokens":4,"cached_input_tokens":0,"reasoning_output_tokens":1},
+                            "resolution_status":"complete"
+                        }
+                    });
+                    if case == IdentityReceiptCase::Exec {
+                        summary["codex_parent_evidence"]["rollout_model"] = json!({"known":observed_model});
+                        summary["codex_parent_evidence"]["rollout_effort"] = json!({"known":"xhigh"});
+                    }
+                    if worker && case == IdentityReceiptCase::RequestedMismatch {
+                        summary["codex_parent_evidence"]["requested_effort"] = json!("low");
+                    }
+                    if worker && case == IdentityReceiptCase::EffortMismatch {
+                        summary["codex_parent_evidence"]["observed_effort"] = json!({"known":"low"});
+                    }
+                    if worker && case == IdentityReceiptCase::Grok {
+                        summary = json!({"runtime_identity":{
+                            "requested_model":selection.model,"requested_effort":selection.reasoning_effort,
+                            "model":"grok-4.6-build","effort":null
+                        }});
+                    }
+                    if (worker && case == IdentityReceiptCase::LabelsOnly) || attempt == 2 {
+                        summary = json!({"models":[selection.model],"model":selection.model,"reasoning_effort":"xhigh"});
+                    }
+                    let bytes = serde_json::to_vec(&summary)?;
+                    if !(worker && case == IdentityReceiptCase::MissingSummary) {
+                        writer.write_bytes(&path, &bytes, ArtifactFileDisposition::PrivateEvidence)?;
+                    }
+                    if !(worker && case == IdentityReceiptCase::Missing) {
+                        let receipt = json!({
+                            "version":1,
+                            "binding":{
+                                "run_id":if worker && case == IdentityReceiptCase::WrongRun { "another-run" } else { options.run_id.as_str() },
+                                "task_id":role.as_str(), "parent":null, "attempt":attempt,
+                                "role":if worker && case == IdentityReceiptCase::WrongRole { "auditor" } else { role.as_str() },
+                                "runtime":if worker && case == IdentityReceiptCase::WrongRuntime { SupervisorRuntime::Grok } else { runtime },
+                                "command_summary":path
+                            },
+                            "command_summary_sha256":if worker && case == IdentityReceiptCase::SummaryMismatch { "0".repeat(64) } else { sha256_hex(&bytes) }, "target_launch_attempted":true,
+                            "target_process_tree":{"status":"unknown"}, "target_side_effects":{"status":"unknown"}
+                        });
+                        writer.write_json(std::path::Path::new(&path).with_extension("target-containment.json"), &receipt, ArtifactFileDisposition::PrivateEvidence)?;
+                    }
+                    if worker && case == IdentityReceiptCase::Tampered {
+                        tamper_path = Some(writer.run_dir().join(path));
+                    }
+                }
+            }
+            let mut report: SupervisorFinalReport = serde_json::from_slice(&super::super::executed_measurements::supervisor_final_report_execution_fixture_bytes())?;
+            report.run_id = options.run_id;
+            if case == IdentityReceiptCase::WrongReportRun {
+                report.run_id = crate::orchestrator::RunId::new("another-run").unwrap();
+            }
+            report.runtime = options.runtime;
+            // Deliberately misleading role labels never override native observations.
+            report.role_usage.insert(AgentRole::Worker, crate::supervise::RoleUsageReport {
+                models: vec!["label-only-model".into()], usage: None, cost_usd: None,
+                observation: crate::supervise::RoleUsageObservation::ProcessObserved, unavailable_reason: None,
+            });
+            let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+            writer.write_json(&report_path, &report, ArtifactFileDisposition::PrivateEvidence)?;
+            writer.finalize(&report_path, false)?;
+            if let Some(path) = tamper_path { fs::write(path, b"tampered")?; }
+            Ok(HeldOutProductionExperimentOutcome {
+                report: Ok(report),
+                launch: HeldOutProductionLaunchObservation { target_launch_attempted:false, native_runtime_result_captured:false },
+            })
+        },
+    ).unwrap();
+    assert!(
+        !results.real_provider_executed
+            && !results.production_eligible
+            && !results.eligible_for_production_economics
+            && !results.eligible_to_justify_named_default
+    );
+    (results, calls)
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn authenticated_codex_role_receipts_project_app_server_and_exec_identity() {
+    for case in [IdentityReceiptCase::AppServer, IdentityReceiptCase::Exec] {
+        let (results, calls) = identity_receipt_experiment(case);
+        assert_eq!(
+            calls, 3,
+            "complete matching identity should not withhold the next cell"
+        );
+        for run in &results.runs {
+            for role in run.profile_binding.as_ref().unwrap().roles.values() {
+                assert_eq!(role.observed_model.as_deref(), Some("gpt-6.1-sol"));
+                assert_eq!(role.observed_effort.as_deref(), Some("xhigh"));
+                assert!(role.unavailable_reason.is_none());
+            }
+        }
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn authenticated_role_receipts_refuse_mismatch_and_withhold_later_cells() {
+    for case in [
+        IdentityReceiptCase::ServedMismatch,
+        IdentityReceiptCase::EffortMismatch,
+        IdentityReceiptCase::RequestedMismatch,
+        IdentityReceiptCase::WrongRole,
+        IdentityReceiptCase::WrongRuntime,
+        IdentityReceiptCase::WrongRun,
+        IdentityReceiptCase::WrongReportRun,
+    ] {
+        let (results, calls) = identity_receipt_experiment(case);
+        assert_eq!(calls, 1);
+        let role = &results.runs[0].profile_binding.as_ref().unwrap().roles[&AgentRole::Worker];
+        assert!(role.observed_model.is_none() && role.observed_effort.is_none());
+        assert!(role.unavailable_reason.is_some());
+        assert!(results.runs[1]
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("paid cell withheld"));
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn authenticated_role_receipts_missing_tampered_or_unknown_retry_stay_unknown() {
+    for case in [
+        IdentityReceiptCase::Missing,
+        IdentityReceiptCase::Tampered,
+        IdentityReceiptCase::MissingSummary,
+        IdentityReceiptCase::SummaryMismatch,
+        IdentityReceiptCase::UnknownRetry,
+        IdentityReceiptCase::LabelsOnly,
+    ] {
+        let (results, calls) = identity_receipt_experiment(case);
+        assert_eq!(calls, 1);
+        let role = &results.runs[0].profile_binding.as_ref().unwrap().roles[&AgentRole::Worker];
+        assert!(role.observed_model.is_none() && role.observed_effort.is_none());
+        assert!(role.unavailable_reason.is_some());
+        assert!(results.runs[1]
+            .failure
+            .as_deref()
+            .unwrap()
+            .contains("paid cell withheld"));
+    }
+}
+
+#[test]
+#[cfg(target_os = "linux")]
+fn authenticated_grok_role_receipt_projects_model_only_and_withholds_later_cells() {
+    let (results, calls) = identity_receipt_experiment(IdentityReceiptCase::Grok);
+    assert_eq!(calls, 1);
+    let role = &results.runs[0].profile_binding.as_ref().unwrap().roles[&AgentRole::Worker];
+    assert_eq!(role.observed_model.as_deref(), Some("grok-4.6-build"));
+    assert!(role.observed_effort.is_none() && role.unavailable_reason.is_some());
+    assert!(results.runs[1]
+        .failure
+        .as_deref()
+        .unwrap()
+        .contains("paid cell withheld"));
+}

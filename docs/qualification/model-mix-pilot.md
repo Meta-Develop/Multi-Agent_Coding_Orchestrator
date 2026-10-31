@@ -44,8 +44,13 @@ allowlist. Per-cell evidence retains the manifest/profile digest, original and
 effective plan, requested runtime/model/effort for every declared role and
 explicitly unknown observed model/effort when unavailable. Catalog resolution,
 requested effort and usage labels are insufficient provider identity evidence.
-The current per-role projection conservatively leaves observed identity unknown;
-retained native evidence remains available for a future reviewed projection.
+Observed model and effort are projected per role only from authenticated,
+dispatch-bound native evidence after the cell's finalized artifacts and live
+report are verified, and only when every retained dispatch for that role
+agrees. Codex app-server and exec runs can supply both fields. Grok, Claude and
+Gemini supply only their native model, so their effort stays unknown; Cursor
+supplies neither. Missing, mismatched or tampered evidence stays unknown and
+later paid cells are withheld.
 
 Prepare live inputs under the [shared prerequisites](README.md). Copy the caller
 plan outside the evaluated repository. Complete the existing

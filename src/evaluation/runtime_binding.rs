@@ -41,6 +41,32 @@ pub struct ObservedRoleIdentity {
 }
 
 impl ObservedProfileBinding {
+    pub(super) fn observe(&mut self, reader: &crate::artifacts::ArtifactRunReader) {
+        for (role, identity) in &mut self.roles {
+            match supervise::observed_role_identity(
+                reader,
+                *role,
+                identity.requested_runtime,
+                identity.requested_model.as_deref(),
+                identity.requested_effort.as_deref(),
+            ) {
+                Ok((model, effort)) => {
+                    identity.observed_model = model;
+                    identity.observed_effort = effort;
+                    identity.unavailable_reason = (identity.observed_model.is_none()
+                        || identity.observed_effort.is_none())
+                    .then(|| "complete source-bound native model/effort observations are unavailable for every dispatch of this role".into());
+                }
+                Err(error) => {
+                    identity.observed_model = None;
+                    identity.observed_effort = None;
+                    identity.unavailable_reason =
+                        Some(format!("native role identity refused: {error}"));
+                }
+            }
+        }
+    }
+
     pub(super) fn requested(
         profile: &super::EvaluationProfile,
         primary: SupervisorRuntime,
@@ -109,6 +135,27 @@ pub(super) fn validate_observed_bindings(
                     && Some(identity.requested_runtime) != profile.worker_runtime)
             {
                 bail!("requested role identity differs from manifest");
+            }
+            if identity.observed_model.as_deref().is_some_and(|observed| {
+                identity
+                    .requested_model
+                    .as_deref()
+                    .is_some_and(|requested| {
+                        if identity.requested_runtime == SupervisorRuntime::Grok {
+                            !crate::runtime_adapter::grok::identity::served_model_matches(
+                                requested, observed,
+                            )
+                        } else {
+                            requested != observed
+                        }
+                    })
+            }) || identity.observed_effort.as_deref().is_some_and(|observed| {
+                identity
+                    .requested_effort
+                    .as_deref()
+                    .is_some_and(|requested| requested != observed)
+            }) {
+                bail!("observed role identity differs from requested dispatch");
             }
             if (identity.observed_model.is_none() || identity.observed_effort.is_none())
                 && identity
