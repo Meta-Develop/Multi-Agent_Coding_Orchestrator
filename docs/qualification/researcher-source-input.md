@@ -124,6 +124,6 @@ conduct paid negative probes. Retain the historical missing-mount failures and
 the [195,972-token failed review](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/680#issuecomment-5862565454)
 (41,321 Researcher, 154,651 Auditor); none of its lenses inspected the packet.
 The earlier bad-contract attempt consumed 212,868 tokens before the final lens;
-the new ceiling leaves only 27,132 tokens beyond that partial trajectory and
-does not guarantee completion. Incomplete historical evidence and prior 0/3 lens
+the 300,000 ceiling leaves 87,132 tokens beyond that partial trajectory and
+still does not guarantee completion. Incomplete historical evidence and prior 0/3 lens
 results remain failures. This qualification does not close #629 or #680.
