@@ -1,5 +1,6 @@
 Captured 2026-10-22 from the trusted /usr/bin/codex, codex-cli 0.162.0.
 No inference turn or provider worker was launched.
+
 The production app-server argv surface (--stdio, --strict-config, all eleven
 disabled features, shell-environment controls, project_doc_max_bytes=0 and
 the fixed permission profile) also initialized successfully with this binary.
@@ -133,3 +134,15 @@ https://github.com/openai/codex/blob/rust-v0.162.0/codex-rs/app-server/src/bespo
 ErrorNotification has error: TurnError, will_retry: bool, thread_id and turn_id.
 The StreamError handler emits will_retry=true without recording last_error;
 the terminal error handler records last_error and emits will_retry=false.
+
+2026-10-30 Researcher command regression:
+researcher-commands.jsonl contains the two commandExecution start/completion
+pairs at original lines 48-49 and 146-147 from the failed source-packet
+qualification on codex-cli 0.162.0. researcher-command-report.json is its
+incoming report. Only the private workspace prefix is replaced by /workspace;
+command strings, IDs, correlation, status, exit, output and timing are preserved.
+The events record /bin/bash -lc while the report claims /bin/bash -c. The replay
+uses synthetic protocol startup/completion around these four native events;
+this proves offline command binding, not successful live review or acceptance.
+The original report must still fail; only exact submitted inner-command claims
+can match. No new inference was performed to create these fixtures.

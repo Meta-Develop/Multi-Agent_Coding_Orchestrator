@@ -164,7 +164,15 @@ The current implementation covers a local-first command-line slice:
   scheduling dependencies and parent audit, including subject coverage for a
   successful zero-diff result. Reports must attest read-only execution and no
   further delegation; reported or observed changes are rejected. Other runtimes
-  and primary-worktree execution are refused. Generated goal/provider lowering
+  and primary-worktree execution are refused. Codex Researcher command arrays contain
+  one string: the exact command submitted to the tool, including its whitespace and
+  quoting, without the host-added shell wrapper. MACO decodes one literal
+  `/bin/bash -lc` or `/bin/bash -c` wrapper from each correlated native execution;
+  unknown wrappers fail closed. Every claim must match a distinct completed execution
+  with the same inner command, cwd, status and exit code; every execution must be claimed.
+  Claims are never unwrapped, so a claimed `-c` wrapper cannot stand in for native `-lc`.
+  Validation entries cite distinct successful command entries with the same command array.
+  Generated goal/provider lowering
   does not emit Researchers. For source packets, an operator-authored Researcher assignment
   may declare `"source_inputs": [{"path": "review-packets/source.diff", "sha256": "<64 lowercase hex digits>"}]`.
   These are exact, non-hidden, repo-relative regular files **already present in the selected

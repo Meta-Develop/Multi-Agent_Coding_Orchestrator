@@ -6877,7 +6877,15 @@ fn supervisor_final_report_is_current_contract(report: &SupervisorFinalReport) -
         && report.plan_file != Path::new(SUPERVISOR_COLLECT_UNFINALIZED_PLAN_FILE)
         && report.run_lifecycle == SupervisorRunLifecycle::Finalized
         && report.role_economics_profile.is_some()
-        && report.role_usage.len() == 5
+        && [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Worker,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ]
+        .iter()
+        .all(|role| report.role_usage.contains_key(role))
         && report.publishable == report.accepted
         && (report.environment_failures.is_empty()
             || (!report.accepted && report.rejected && report.status == ReviewStatus::Failed))
