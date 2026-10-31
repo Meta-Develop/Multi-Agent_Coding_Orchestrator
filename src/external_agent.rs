@@ -5278,6 +5278,19 @@ impl ExternalAgentRun {
     }
 }
 
+impl ExternalAgentRun {
+    pub(crate) fn retained_researcher_input_receipts(
+        &self,
+    ) -> Vec<researcher_inputs::ResearcherInputReceipt> {
+        self.stdout
+            .run_metadata
+            .researcher_input_receipts
+            .iter()
+            .map(|receipt| receipt.retained())
+            .collect()
+    }
+}
+
 #[derive(Serialize)]
 struct ExternalAgentRunWireRef<'a> {
     command: &'a [String],
@@ -9084,9 +9097,9 @@ fn run_external_agent_runtime(
         }
     }
 
-    if let Err(error) = researcher_inputs::revalidate_source_inputs(
+    if let Err(error) = researcher_inputs::revalidate_before_provider(
         &target_spec,
-        &report.stdout.run_metadata.researcher_input_receipts,
+        &mut report.stdout.run_metadata.researcher_input_receipts,
     ) {
         report.duration_ms = duration_millis(started.elapsed());
         record_external_error(

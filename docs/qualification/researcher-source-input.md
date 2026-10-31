@@ -57,6 +57,31 @@ separate. These bounds are admission limits, not provider spending caps; role
 estimates do not cap actual usage. A timeout or insufficient allowance is a
 retained failed/inconclusive attempt, not a reason to remove the bounds.
 
+The retained proof for **C1/C2** is the `researcher_input_receipts[]` field in
+`logs/<researcher-id>[.attempt-N].summary.json`.
+Each input records the snapshot-relative `path` and `input_path`,
+`expected_sha256`, observed `sha256`, `bytes`, launch-bound `identity`
+(`[device, inode]`), `regular_file=true` and `symlink=false`. The independent
+`outer_preflight`, `inner_preflight` and `pre_provider_revalidation` fields
+record `status=passed` with the observed hash/length, `status=not_attempted`,
+or `status=refused` with a typed `reason` (`preparation_failed`,
+`process_failed`, `read_mismatch`, or `identity_or_content_changed`). A failed
+read also retains its observed hash/length when available, never source bytes,
+helper paths, environment or credentials. Early snapshot validation can refuse
+before an identity receipt exists; that attempt cannot prove successful release.
+
+These are additive fields in the existing unversioned private process summary;
+the versioned public final/collect report schemas are unchanged. The summary is
+bound by its target-containment receipt's `command_summary_sha256` and the final
+artifact manifest. Finalized collection checks each declared input against the
+retained plan and requires complete outer/inner/revalidation receipts for every
+launched attempt and at least one proven launch per accepted source assignment.
+Missing, inconsistent or tampered evidence cannot produce clean acceptance.
+Older source-input runs without these receipts remain readable as historical
+artifacts but cannot be collected as clean accepted runs. These preparation
+receipts prove identity and visibility before release; authentic native command
+observations and independent review still prove substantive source inspection.
+
 Required acceptance evidence:
 
 - Exact source commit, packet bytes/hash, staged regular-file identity,

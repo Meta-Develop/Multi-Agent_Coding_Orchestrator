@@ -17,14 +17,114 @@ pub(crate) struct ResearcherSourceInput {
     pub(crate) sha256: String,
 }
 
+/// Parent observations only; deserializing this record never grants file access.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct ResearcherInputReceipt {
     path: PathBuf,
     sha256: String,
     bytes: usize,
     identity: Option<(u64, u64)>,
-    /// The same bytes were read through the launch's actual outer profile.
     child_profile_visible: bool,
+    #[serde(default)]
+    input_path: String,
+    #[serde(default)]
+    expected_sha256: String,
+    #[serde(default)]
+    regular_file: bool,
+    #[serde(default)]
+    symlink: Option<bool>,
+    #[serde(default)]
+    outer_preflight: SourceInputCheck,
+    #[serde(default)]
+    inner_preflight: SourceInputCheck,
+    #[serde(default)]
+    pre_provider_revalidation: SourceInputCheck,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case", deny_unknown_fields)]
+enum SourceInputCheck {
+    #[default]
+    NotAttempted,
+    Passed {
+        sha256: String,
+        bytes: usize,
+    },
+    Refused {
+        reason: SourceInputRefusal,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_sha256: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_bytes: Option<usize>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SourceInputRefusal {
+    PreparationFailed,
+    ProcessFailed,
+    ReadMismatch,
+    IdentityOrContentChanged,
+}
+
+impl ResearcherInputReceipt {
+    /// Export only the operator's already-retained snapshot-relative path.
+    pub(crate) fn retained(&self) -> Self {
+        let mut receipt = self.clone();
+        receipt.path = PathBuf::from(&self.input_path);
+        receipt
+    }
+
+    pub(crate) fn matches_declaration(&self, input: &ResearcherSourceInput) -> bool {
+        self.path == Path::new(&input.path)
+            && self.input_path == input.path
+            && self.expected_sha256 == input.sha256
+    }
+
+    pub(crate) fn proves_release(&self) -> bool {
+        let passed = SourceInputCheck::Passed {
+            sha256: self.sha256.clone(),
+            bytes: self.bytes,
+        };
+        self.sha256 == self.expected_sha256
+            && self.bytes > 0
+            && self.bytes <= MAX_PROMPT_BYTES
+            && self.identity.is_some()
+            && self.regular_file
+            && self.symlink == Some(false)
+            && self.child_profile_visible
+            && self.outer_preflight == passed
+            && self.inner_preflight == passed
+            && self.pre_provider_revalidation == passed
+    }
+
+    fn observed_read(&self, succeeded: bool, bytes: &[u8]) -> SourceInputCheck {
+        let sha256 = sha256_hex(bytes);
+        if succeeded && bytes.len() == self.bytes && sha256 == self.sha256 {
+            SourceInputCheck::Passed {
+                sha256,
+                bytes: bytes.len(),
+            }
+        } else {
+            SourceInputCheck::Refused {
+                reason: if succeeded {
+                    SourceInputRefusal::ReadMismatch
+                } else {
+                    SourceInputRefusal::ProcessFailed
+                },
+                observed_sha256: Some(sha256),
+                observed_bytes: Some(bytes.len()),
+            }
+        }
+    }
+
+    fn passed(&self) -> SourceInputCheck {
+        SourceInputCheck::Passed {
+            sha256: self.sha256.clone(),
+            bytes: self.bytes,
+        }
+    }
 }
 
 pub(crate) fn validate_declarations(inputs: &[ResearcherSourceInput]) -> Result<()> {
@@ -99,7 +199,8 @@ pub(crate) fn validate_snapshot(
             #[cfg(not(unix))]
             let identity = None;
             let bytes = read_bounded_regular_file_nofollow(&path, MAX_PROMPT_BYTES)?;
-            if bytes.is_empty() || sha256_hex(&bytes) != input.sha256 {
+            let observed_sha256 = sha256_hex(&bytes);
+            if bytes.is_empty() || observed_sha256 != input.sha256 {
                 bail!(
                     "source input is empty or its SHA256 changed: {}",
                     input.path
@@ -107,10 +208,17 @@ pub(crate) fn validate_snapshot(
             }
             Ok(ResearcherInputReceipt {
                 path,
-                sha256: input.sha256.clone(),
+                sha256: observed_sha256,
                 bytes: bytes.len(),
                 identity,
                 child_profile_visible: false,
+                input_path: input.path.clone(),
+                expected_sha256: input.sha256.clone(),
+                regular_file: metadata.is_file(),
+                symlink: Some(metadata.file_type().is_symlink()),
+                outer_preflight: SourceInputCheck::NotAttempted,
+                inner_preflight: SourceInputCheck::NotAttempted,
+                pre_provider_revalidation: SourceInputCheck::NotAttempted,
             })
         })
         .collect()
@@ -171,20 +279,37 @@ pub(super) fn prepare_source_inputs(
             .clone(),
     };
     let started = Instant::now();
-    let result = probe_source_inputs(spec, profile, timeout, cancellation, &mut evidence).and_then(
-        |(receipts, snapshots)| {
-            probe_source_inputs_in_inner_sandbox(
-                spec,
-                profile,
-                timeout.saturating_sub(started.elapsed()),
-                cancellation,
-                &receipts,
-                &snapshots,
-                &mut evidence,
-            )?;
-            Ok((receipts, snapshots))
-        },
-    );
+    let mut receipts = Vec::new();
+    let result = (|| {
+        receipts = validate_command(spec)?;
+        let snapshots = probe_source_inputs(
+            spec,
+            profile,
+            timeout,
+            cancellation,
+            &mut evidence,
+            &mut receipts,
+        )?;
+        // Mark setup refusals too, without retaining helper paths or diagnostics.
+        for receipt in &mut receipts {
+            receipt.inner_preflight = SourceInputCheck::Refused {
+                reason: SourceInputRefusal::PreparationFailed,
+                observed_sha256: None,
+                observed_bytes: None,
+            };
+        }
+        probe_source_inputs_in_inner_sandbox(
+            spec,
+            profile,
+            timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            &mut receipts,
+            &snapshots,
+            &mut evidence,
+        )?;
+        Ok(snapshots)
+    })();
+    report.stdout.run_metadata.researcher_input_receipts = receipts;
     retain_environment_preflight_process_evidence(report, &evidence);
     // This private witness also covers later preparation/bookkeeping refusals.
     // The target-launch boundary must discard it before attempting any release.
@@ -197,8 +322,7 @@ pub(super) fn prepare_source_inputs(
             .run_metadata
             .environment_preflight_quiescence_verified;
     match result {
-        Ok((receipts, snapshots)) => {
-            report.stdout.run_metadata.researcher_input_receipts = receipts;
+        Ok(snapshots) => {
             report.stdout.run_metadata.read_only_input_snapshots = snapshots;
             Ok(())
         }
@@ -211,7 +335,7 @@ fn probe_source_inputs_in_inner_sandbox(
     profile: Option<&SideEffectConfinementProfile>,
     timeout: Duration,
     cancellation: &ProcessCancellation,
-    receipts: &[ResearcherInputReceipt],
+    receipts: &mut [ResearcherInputReceipt],
     snapshots: &[crate::process_runner::ReadOnlyInputSnapshot],
     evidence: &mut EnvironmentPreflightProcessEvidence,
 ) -> Result<()> {
@@ -220,6 +344,9 @@ fn probe_source_inputs_in_inner_sandbox(
     }
     #[cfg(test)]
     if TEST_SKIP_INNER_SOURCE_SANDBOX.with(|flag| flag.replace(false)) {
+        for receipt in receipts {
+            receipt.inner_preflight = SourceInputCheck::NotAttempted;
+        }
         return Ok(());
     }
     let profile = profile.context("inner source input visibility requires verified containment")?;
@@ -244,7 +371,15 @@ fn probe_source_inputs_in_inner_sandbox(
     let reader = fs::canonicalize(reader)?;
     validate_external_program_identity(&reader, false)?;
     let started = Instant::now();
+    for receipt in receipts.iter_mut() {
+        receipt.inner_preflight = SourceInputCheck::NotAttempted;
+    }
     for receipt in receipts {
+        receipt.inner_preflight = SourceInputCheck::Refused {
+            reason: SourceInputRefusal::ProcessFailed,
+            observed_sha256: None,
+            observed_bytes: None,
+        };
         let args = vec![
             OsString::from("sandbox"),
             OsString::from("--permission-profile"),
@@ -284,10 +419,11 @@ fn probe_source_inputs_in_inner_sandbox(
                 return Err(error.into());
             }
         };
-        if !output.safety_sensitive_succeeded()
-            || output.stdout.as_bytes().len() != receipt.bytes
-            || sha256_hex(output.stdout.as_bytes()) != receipt.sha256
-        {
+        receipt.inner_preflight = receipt.observed_read(
+            output.safety_sensitive_succeeded(),
+            output.stdout.as_bytes(),
+        );
+        if !matches!(receipt.inner_preflight, SourceInputCheck::Passed { .. }) {
             bail!(
                 "declared source input is not readable with its bound hash in the actual inner Codex sandbox: {}",
                 receipt.path.display()
@@ -316,13 +452,17 @@ fn probe_source_inputs(
     timeout: Duration,
     cancellation: &ProcessCancellation,
     evidence: &mut EnvironmentPreflightProcessEvidence,
-) -> Result<(
-    Vec<ResearcherInputReceipt>,
-    Vec<crate::process_runner::ReadOnlyInputSnapshot>,
-)> {
-    let mut receipts = validate_command(spec)?;
+    receipts: &mut [ResearcherInputReceipt],
+) -> Result<Vec<crate::process_runner::ReadOnlyInputSnapshot>> {
     if receipts.is_empty() {
-        return Ok((receipts, Vec::new()));
+        return Ok(Vec::new());
+    }
+    for receipt in receipts.iter_mut() {
+        receipt.outer_preflight = SourceInputCheck::Refused {
+            reason: SourceInputRefusal::PreparationFailed,
+            observed_sha256: None,
+            observed_bytes: None,
+        };
     }
     let snapshots = receipts
         .iter()
@@ -345,7 +485,15 @@ fn probe_source_inputs(
     let program = fs::canonicalize(program)?;
     validate_external_program_identity(&program, false)?;
     let started = Instant::now();
-    for receipt in &mut receipts {
+    for receipt in receipts.iter_mut() {
+        receipt.outer_preflight = SourceInputCheck::NotAttempted;
+    }
+    for receipt in receipts.iter_mut() {
+        receipt.outer_preflight = SourceInputCheck::Refused {
+            reason: SourceInputRefusal::ProcessFailed,
+            observed_sha256: None,
+            observed_bytes: None,
+        };
         let mut probe = ProcessSpec::direct(
             "Researcher source input visibility",
             &program,
@@ -370,16 +518,17 @@ fn probe_source_inputs(
                 return Err(error.into());
             }
         };
-        if !output.safety_sensitive_succeeded()
-            || output.stdout.as_bytes().len() != receipt.bytes
-            || sha256_hex(output.stdout.as_bytes()) != receipt.sha256
-        {
+        receipt.outer_preflight = receipt.observed_read(
+            output.safety_sensitive_succeeded(),
+            output.stdout.as_bytes(),
+        );
+        if !matches!(receipt.outer_preflight, SourceInputCheck::Passed { .. }) {
             bail!("declared source input is not readable with its bound hash in the child profile: {}", receipt.path.display());
         }
         receipt.child_profile_visible = true;
     }
-    revalidate_source_inputs(spec, &receipts)?;
-    Ok((receipts, snapshots))
+    revalidate_source_inputs(spec, receipts)?;
+    Ok(snapshots)
 }
 
 pub(super) fn revalidate_source_inputs(
@@ -401,6 +550,26 @@ pub(super) fn revalidate_source_inputs(
     Ok(())
 }
 
+/// Called at the actual provider boundary, separately from the earlier probe check.
+pub(super) fn revalidate_before_provider(
+    spec: &ExternalAgentCommand,
+    receipts: &mut [ResearcherInputReceipt],
+) -> Result<()> {
+    let result = revalidate_source_inputs(spec, receipts);
+    for receipt in receipts {
+        receipt.pre_provider_revalidation = if result.is_ok() {
+            receipt.passed()
+        } else {
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::IdentityOrContentChanged,
+                observed_sha256: None,
+                observed_bytes: None,
+            }
+        };
+    }
+    result
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use super::*;
@@ -408,6 +577,63 @@ pub(crate) mod tests {
     use anyhow::ensure;
 
     const SOURCE: &[u8] = b"diff --git a/src/budget.rs b/src/budget.rs\n--- a/src/budget.rs\n+++ b/src/budget.rs\n@@ -1 +1 @@\n-total.saturating_add(next)\n+total.checked_add(next).ok_or(BudgetOverflow)?\n";
+
+    /// Synthetic successful read observations for custody/serialization tests only.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn attach_synthetic_receipts(
+        run: &mut ExternalAgentRun,
+        command: &ExternalAgentCommand,
+    ) -> Result<()> {
+        let mut receipts = validate_snapshot(&command.cwd, &command.researcher_source_inputs)?;
+        for receipt in &mut receipts {
+            receipt.child_profile_visible = true;
+            receipt.outer_preflight = receipt.passed();
+            receipt.inner_preflight = receipt.passed();
+        }
+        revalidate_before_provider(command, &mut receipts)?;
+        run.stdout.run_metadata.researcher_input_receipts = receipts;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn source_inputs_read_outcomes_and_release_receipts_are_independent() -> Result<()> {
+        let (_root, command) = fixture()?;
+        let mut receipts = validate_command(&command)?;
+        let receipt = &mut receipts[0];
+        assert!(matches!(
+            receipt.observed_read(true, SOURCE),
+            SourceInputCheck::Passed { .. }
+        ));
+        assert!(matches!(
+            receipt.observed_read(true, b""),
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::ReadMismatch,
+                observed_bytes: Some(0),
+                ..
+            }
+        ));
+        assert!(matches!(
+            receipt.observed_read(false, SOURCE),
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::ProcessFailed,
+                ..
+            }
+        ));
+        receipt.outer_preflight = receipt.observed_read(true, SOURCE);
+        receipt.child_profile_visible = true;
+        revalidate_before_provider(&command, &mut receipts)?;
+        assert!(
+            !receipts[0].proves_release(),
+            "outer read cannot stand in for inner read"
+        );
+        receipts[0].inner_preflight = receipts[0].observed_read(true, SOURCE);
+        assert!(receipts[0].proves_release());
+        let retained = receipts[0].retained();
+        assert!(retained.matches_declaration(&command.researcher_source_inputs[0]));
+        assert!(!retained.path.is_absolute());
+        Ok(())
+    }
 
     pub(crate) fn fixture() -> Result<(tempfile::TempDir, ExternalAgentCommand)> {
         let root = tempfile::tempdir()?;
@@ -434,14 +660,106 @@ pub(crate) mod tests {
     }
 
     #[cfg(target_os = "linux")]
-    pub(crate) fn failed_local_probe(
-        command: &ExternalAgentCommand,
-        unknown_prior_helper: bool,
-    ) -> Result<ExternalAgentRun> {
+    #[test]
+    fn source_inputs_snapshot_refusal_preserves_preflight_quiescence() -> Result<()> {
+        let (_root, command) = fixture()?;
+        let mut report = failed_external_run(
+            &command,
+            Instant::now(),
+            Vec::new(),
+            false,
+            "preflight".into(),
+        );
+        let mut evidence = EnvironmentPreflightProcessEvidence::default();
+        evidence.record(
+            ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService),
+            SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalCodex,
+            ),
+            true,
+        );
+        retain_environment_preflight_process_evidence(&mut report, &evidence);
+        fs::remove_file(command.cwd.join("source.diff"))?;
+        prepare_source_inputs(
+            &command,
+            None,
+            Duration::from_secs(30),
+            &ProcessCancellation::new(),
+            &mut report,
+        )
+        .expect_err("missing snapshot must refuse before a source reader starts");
+        assert!(
+            report
+                .stdout
+                .run_metadata
+                .environment_preflight_quiescence_verified
+        );
+        assert!(
+            report
+                .stdout
+                .run_metadata
+                .local_source_probe_refusal_quiescent
+        );
+        assert!(report
+            .stdout
+            .run_metadata
+            .researcher_input_receipts
+            .is_empty());
+        assert!(!report.stdout.target_launch_attempted);
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn source_inputs_inner_setup_refusal_preserves_outer_receipt() -> Result<()> {
+        let (_root, command) = fixture()?;
         let profile = SideEffectConfinementProfile::ExternalCodex(
             ExternalCodexProfile::read_only(&command.cwd)
                 .with_visible_read_only_file(command.cwd.join("source.diff")),
         );
+        let mut report = failed_external_run(
+            &command,
+            Instant::now(),
+            Vec::new(),
+            false,
+            "preflight".into(),
+        );
+        prepare_source_inputs(
+            &command,
+            Some(&profile),
+            Duration::from_secs(30),
+            &ProcessCancellation::new(),
+            &mut report,
+        )
+        .expect_err("nonexistent inner helper must refuse without a provider call");
+        let receipt = &report.stdout.run_metadata.researcher_input_receipts[0];
+        assert_eq!(receipt.outer_preflight, receipt.passed());
+        assert!(matches!(
+            receipt.inner_preflight,
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::PreparationFailed,
+                ..
+            }
+        ));
+        assert_eq!(
+            receipt.pre_provider_revalidation,
+            SourceInputCheck::NotAttempted
+        );
+        assert!(!report.stdout.target_launch_attempted);
+        assert!(!command.json_log.exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn failed_local_probe(
+        command: &ExternalAgentCommand,
+        unknown_prior_helper: bool,
+    ) -> Result<ExternalAgentRun> {
+        let mut profile = ExternalCodexProfile::read_only(&command.cwd);
+        for input in &command.researcher_source_inputs {
+            profile = profile.with_visible_read_only_file(command.cwd.join(&input.path));
+        }
+        let profile = SideEffectConfinementProfile::ExternalCodex(profile);
         let mut report = failed_external_run(
             command,
             Instant::now(),
@@ -472,9 +790,26 @@ pub(crate) mod tests {
         )
         .expect_err("empty local reader must refuse");
         report.error = Some(error.to_string());
-        assert!(report.error.as_deref().unwrap().contains("not readable"));
+        assert!(
+            report.error.as_deref().unwrap().contains("not readable"),
+            "unexpected local probe refusal: {:?}",
+            report.error
+        );
         assert!(!report.stdout.target_launch_attempted);
         assert!(!report.publishable);
+        let receipt = &report.stdout.run_metadata.researcher_input_receipts[0];
+        assert!(matches!(
+            receipt.outer_preflight,
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::ReadMismatch,
+                ..
+            }
+        ));
+        assert_eq!(receipt.inner_preflight, SourceInputCheck::NotAttempted);
+        assert_eq!(
+            receipt.pre_provider_revalidation,
+            SourceInputCheck::NotAttempted
+        );
         Ok(report)
     }
 
@@ -525,9 +860,9 @@ pub(crate) mod tests {
             }
             _ => panic!("unknown mutation"),
         }
-        let error = revalidate_source_inputs(
+        let error = revalidate_before_provider(
             command,
-            &report.stdout.run_metadata.researcher_input_receipts,
+            &mut report.stdout.run_metadata.researcher_input_receipts,
         )
         .expect_err("late source mutation must refuse target release");
         record_external_error(
@@ -538,6 +873,13 @@ pub(crate) mod tests {
         assert!(!report.publishable);
         assert!(!command.json_log.exists());
         assert!(!command.output_last_message.exists());
+        assert!(matches!(
+            report.stdout.run_metadata.researcher_input_receipts[0].pre_provider_revalidation,
+            SourceInputCheck::Refused {
+                reason: SourceInputRefusal::IdentityOrContentChanged,
+                ..
+            }
+        ));
         Ok(report)
     }
 
@@ -675,12 +1017,14 @@ pub(crate) mod tests {
                 .with_visible_read_only_file(command.cwd.join("source.diff")),
         );
         let mut evidence = EnvironmentPreflightProcessEvidence::default();
-        let (receipts, snapshots) = probe_source_inputs(
+        let mut receipts = validate_command(&command)?;
+        let snapshots = probe_source_inputs(
             &command,
             Some(&profile),
             Duration::from_secs(30),
             &ProcessCancellation::new(),
             &mut evidence,
+            &mut receipts,
         )?;
         assert_eq!(receipts[0].bytes, SOURCE.len());
         assert_eq!(receipts[0].sha256, sha256_hex(SOURCE));
@@ -774,7 +1118,8 @@ pub(crate) mod tests {
             Some(&hidden),
             Duration::from_secs(30),
             &ProcessCancellation::new(),
-            &mut EnvironmentPreflightProcessEvidence::default()
+            &mut EnvironmentPreflightProcessEvidence::default(),
+            &mut validate_command(&command)?,
         )
         .is_err());
         assert_eq!(fs::read(command.cwd.join("source.diff"))?, SOURCE);
@@ -886,6 +1231,19 @@ pub(crate) mod tests {
             &ProcessCancellation::new(),
             &mut production_report,
         )?;
+        revalidate_before_provider(
+            &command,
+            &mut production_report
+                .stdout
+                .run_metadata
+                .researcher_input_receipts,
+        )?;
+        ensure!(production_report
+            .stdout
+            .run_metadata
+            .researcher_input_receipts
+            .iter()
+            .all(ResearcherInputReceipt::proves_release));
         ensure!(!production_report.stdout.target_launch_attempted);
         ensure!(!command.json_log.exists());
         // All checks run inside the actual inner namespace after the outer
