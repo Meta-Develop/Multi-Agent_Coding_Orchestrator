@@ -12,6 +12,13 @@ Native runtime delegation is prohibited; nested dispatch goes through
 the authenticated coordinator channel. No retries or gate corrections are
 authorized by the fixture.
 
+The disjoint scopes select isolated sibling worktrees. Their inner dispatch
+inherits the effective run concurrency bound, including provider inflight and
+capacity limits. With the width-one command below, Workers run in authored order
+through settlement. Observed exhaustion records a typed budget-admission refusal
+for each queued Worker without another provider invocation. Wider effective
+bounds still allow concurrent isolated Workers.
+
 The revised finite ceiling is 65,000 run tokens, with admission estimates of 4,000 for
 the parent/reviewer and 1,000 per Worker. Each child has a 1,200-second timeout;
 the outer command has a 3,600-second deadline. Estimates do not bound actual

@@ -127,7 +127,7 @@ pub(super) fn record_budget_dispatch_refusal(
     assignment: &OrchestratorAssignment,
     owner_role: (&str, AgentRole),
     refusal: &BudgetAdmissionRefusal,
-    pricing_context: (SupervisorRuntime, &ExternalAgentCommand, &RunBudgetLedger),
+    pricing_context: Option<(SupervisorRuntime, &ExternalAgentCommand, &RunBudgetLedger)>,
     artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
     journal_parent_id: &str,
 ) -> Result<()> {
@@ -169,7 +169,8 @@ pub(super) fn record_budget_dispatch_refusal(
     outcome.assignment_failed = true;
     outcome.budget_dispatch_stopped = true;
     let guidance = if matches!(refusal, BudgetAdmissionRefusal::MissingCostEstimate) {
-        let (runtime, command, ledger) = pricing_context;
+        let (runtime, command, ledger) =
+            pricing_context.context("missing pricing context for cost-estimate refusal")?;
         operator_pricing::missing_cost_estimate_guidance(runtime, command, ledger)
     } else {
         "inspect the typed gate denial and run_budget report".to_string()
