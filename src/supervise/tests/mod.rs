@@ -1870,7 +1870,12 @@ fn assert_injected_dispatch_cleanup(
 #[derive(Clone, Copy)]
 enum ParseablePartialRunOutcome {
     Failed,
+    #[cfg(target_os = "linux")]
     TimedOut,
+    #[cfg(target_os = "linux")]
+    SilentTimedOut,
+    #[cfg(not(target_os = "linux"))]
+    InjectedTimedOut,
 }
 
 fn assert_parseable_partial_usage_is_conservative(
@@ -1903,6 +1908,17 @@ fn assert_parseable_partial_usage_is_conservative(
             .reasoning_effort = Some(existing_effort.clone());
     }
     let budget = injected_run_budget(None, Some(200), None, Some(1.0), 50, 50);
+    #[cfg(target_os = "linux")]
+    if !matches!(partial_outcome, ParseablePartialRunOutcome::Failed) {
+        assert_silent_codex_batch_accounting(
+            &plan,
+            &budget,
+            &child_a,
+            &repo_path,
+            matches!(partial_outcome, ParseablePartialRunOutcome::TimedOut),
+        );
+        return;
+    }
     let options = injected_options(&repo_path, temp.path(), run_id);
     let mut invocations = 0usize;
     let mut runner = |command: &ExternalAgentCommand| {
@@ -1913,20 +1929,22 @@ fn assert_parseable_partial_usage_is_conservative(
             "latched degraded settlement must prevent the later child dispatch"
         );
         write_injected_assignment_report(command, &child_a);
-        // The capture is syntactically complete and contains a genuine Codex usage event,
-        // but it is only a partial observation because the enclosing run does not complete.
         write_injected_usage(command, 7, 3);
-        match partial_outcome {
-            ParseablePartialRunOutcome::Failed => injected_verified_nonzero_run(command, 23),
-            ParseablePartialRunOutcome::TimedOut => {
-                let mut run = injected_verified_run(command);
-                run.exit_code = None;
-                run.timed_out = true;
-                run.publishable = false;
-                run.error = Some("external agent timed out after partial usage".to_string());
-                run
-            }
+        // Preserve the original portable timeout-accounting regression where
+        // Linux private output staging cannot launch the real batch fixture.
+        #[cfg(not(target_os = "linux"))]
+        if matches!(
+            partial_outcome,
+            ParseablePartialRunOutcome::InjectedTimedOut
+        ) {
+            let mut run = injected_verified_run(command);
+            run.exit_code = None;
+            run.timed_out = true;
+            run.publishable = false;
+            run.error = Some("external agent timed out after partial usage".to_string());
+            return run;
         }
+        injected_verified_nonzero_run(command, 23)
     };
 
     let report = run_supervisor_plan_with_selected_nested_review_fixture(
@@ -1942,6 +1960,11 @@ fn assert_parseable_partial_usage_is_conservative(
     .expect("finalize partial-usage run");
 
     assert!(!report.success);
+    assert!(!report.accepted);
+    assert!(report
+        .orchestrator_reports
+        .iter()
+        .all(|child| !child.accepted));
     assert_eq!(invocations, 1);
     assert!(!report.usage_complete);
     assert!(report.total_usage.is_none());
@@ -1962,6 +1985,16 @@ fn assert_parseable_partial_usage_is_conservative(
         .as_deref()
         .is_some_and(|reason| reason.contains("no reliable process-observable usage sample")));
     let budget = report.run_budget.as_ref().expect("partial usage budget");
+    assert_eq!(budget.active_reservations, 0);
+    assert_eq!(budget.reserved.tokens, 0);
+    assert_eq!(
+        budget
+            .roles
+            .iter()
+            .find(|role| role.role == AgentRole::ChildOrchestrator)
+            .map(|role| (role.consumed.tokens, role.usage_complete)),
+        Some((50, false)),
+    );
     assert_eq!(budget.consumed.tokens, 50);
     assert_eq!(budget.committed.tokens, 50);
     assert_eq!(budget.consumed.cost_usd, None);
@@ -1997,6 +2030,151 @@ fn assert_parseable_partial_usage_is_conservative(
         .message
         .contains("run budget stopped one or more new dispatches")));
     assert_injected_dispatch_cleanup(&report, &repo_path, run_id, "child-a", &["child-b"], true);
+}
+
+// The simulation intentionally cannot attest production containment. Exercise
+// the same settlement, final usage aggregation and report-acceptance functions
+// directly, without forging containment to bypass scratch quarantine.
+#[cfg(target_os = "linux")]
+fn assert_silent_codex_batch_accounting(
+    plan: &SupervisorPlan,
+    budget: &SupervisorBudgetConfig,
+    assignment: &OrchestratorAssignment,
+    repo: &Path,
+    partial_usage: bool,
+) {
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("silent batch ledger");
+    operator_pricing::synthetic_ledger(plan, &mut ledger);
+    let mut command = ExternalAgentCommand::codex(
+        "unused-codex",
+        repo,
+        repo.join("prompt.md"),
+        repo.join("capture.jsonl"),
+        repo.join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+    let DispatchBudgetAdmission::Admitted(mut reservation) = reserve_dispatch_budget(
+        plan,
+        budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+        &command,
+    )
+    .expect("reserve silent batch dispatch") else {
+        panic!("silent batch dispatch must be admitted");
+    };
+    reservation.mark_invoked().expect("mark batch invoked");
+    let message =
+        partial_usage.then(|| serde_json::to_string(&injected_child_report(assignment)).unwrap());
+    let run = crate::external_agent::run_codex_batch_silent_child(message.as_deref())
+        .expect("actual silent Codex batch run");
+    let settlement = reservation
+        .settle_bound_runtime(&run, &command)
+        .expect("settle actual timed-out batch");
+    assert_eq!(
+        settlement.reliability,
+        if partial_usage {
+            DispatchUsageReliability::Estimated
+        } else {
+            DispatchUsageReliability::Missing
+        }
+    );
+    assert_eq!(
+        settlement.observed_usage.map(|usage| usage.total_tokens),
+        partial_usage.then_some(10)
+    );
+    assert!(settlement.is_degraded());
+    assert!(settlement.reliable_usage().is_none());
+    let samples = settlement
+        .role_sample(AgentRole::ChildOrchestrator, None)
+        .into_iter()
+        .collect();
+    let mut usage = role_usage_report(plan, samples).expect("final role usage aggregation");
+    assert!(usage.total_usage.is_none());
+    assert!(finalize_supervisor_cost(
+        !settlement.is_degraded(),
+        &mut usage.reports,
+        usage.total_cost_usd
+    )
+    .is_none());
+    assert!(!usage.reports.contains_key(&AgentRole::ChildOrchestrator));
+    usage.reports =
+        crate::supervise::scheduler::complete_role_usage_reports_for_test(usage.reports);
+    let child_usage = &usage.reports[&AgentRole::ChildOrchestrator];
+    assert_eq!(
+        child_usage.observation,
+        RoleUsageObservation::NotProcessObservable
+    );
+    assert!(child_usage.usage.is_none());
+    assert!(child_usage.cost_usd.is_none());
+    assert!(usage.reports[&AgentRole::Supervisor]
+        .unavailable_reason
+        .as_deref()
+        .is_some_and(|reason| reason.contains("missing, incomplete, or unreliable")));
+    let report = ledger.report().expect("final silent batch budget");
+    assert_eq!(report.consumed.tokens, 50);
+    assert_eq!(report.committed.tokens, 50);
+    assert_eq!(report.reserved.tokens, 0);
+    assert_eq!(report.active_reservations, 0);
+    assert!(!report.usage_complete);
+    assert!(!report.new_dispatch_allowed);
+    assert_eq!(report.action, BudgetAction::OwnerEscalation);
+    assert!(report.reasons.contains(&if partial_usage {
+        BudgetReason::EstimatedProviderUsage
+    } else {
+        BudgetReason::MissingProviderUsage
+    }));
+    assert_eq!(
+        report
+            .roles
+            .iter()
+            .find(|role| role.role == AgentRole::ChildOrchestrator)
+            .map(|role| (role.consumed.tokens, role.usage_complete)),
+        Some((50, false))
+    );
+    assert!(ledger.dispatch_stopped());
+    assert!(matches!(
+        reserve_dispatch_budget(
+            plan,
+            budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+            &command
+        )
+        .unwrap(),
+        DispatchBudgetAdmission::Refused(_)
+    ));
+    assert!(!external_process_completed(&run, SupervisorRuntime::Codex));
+    let (child, _) = collect_child_report_for_runtime(
+        ChildReportCollectionContext {
+            assignment,
+            assignment_metadata: &AssignmentMetadata::default(),
+            report_path: &command.output_last_message,
+            external_run: &run,
+            external_command: &command,
+            worktree_path: repo,
+            child_base_head: &injected_oid("silent-batch-base"),
+            worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+            evidence_only_source: None,
+            observed_changed_paths: Some(&[]),
+        },
+        SupervisorRuntime::Codex,
+    );
+    assert!(!child.accepted);
+    assert_eq!(
+        child.status,
+        if partial_usage {
+            ReviewStatus::Failed
+        } else {
+            ReviewStatus::Missing
+        }
+    );
+    if partial_usage {
+        assert!(child.findings.iter().any(|finding| finding
+            .message
+            .contains("external child process failed despite report success")));
+    }
 }
 
 pub(super) fn sample_child_report_json(id: &str) -> String {

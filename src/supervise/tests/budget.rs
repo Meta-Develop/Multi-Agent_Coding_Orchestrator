@@ -1825,11 +1825,31 @@ fn budget_integration_parseable_partial_usage_from_failed_run_is_estimated_and_l
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn budget_integration_parseable_partial_usage_from_timeout_is_estimated_and_latched() {
     assert_parseable_partial_usage_is_conservative(
         "budget-partial-usage-timeout",
         ParseablePartialRunOutcome::TimedOut,
+    );
+}
+
+// Keep the pre-existing portable regression on hosts without Linux output staging.
+#[cfg(not(target_os = "linux"))]
+#[test]
+fn budget_integration_parseable_partial_usage_from_timeout_is_estimated_and_latched() {
+    assert_parseable_partial_usage_is_conservative(
+        "budget-partial-usage-timeout",
+        ParseablePartialRunOutcome::InjectedTimedOut,
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn budget_integration_codex_batch_silent_child_timeout_is_missing_and_latched() {
+    assert_parseable_partial_usage_is_conservative(
+        "budget-silent-batch-timeout",
+        ParseablePartialRunOutcome::SilentTimedOut,
     );
 }
 
