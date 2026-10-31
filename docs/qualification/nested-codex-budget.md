@@ -106,7 +106,7 @@ attempt, reservation, account, thread and turn identities:
   be observed to prove the writable sandbox's edit confinement; an unchanged
   candidate does not establish that part of acceptance.
 
-The retained `qualification-nested-budget-ct101-01` attempt observed Worker 1's
+The first retained Linux container attempt observed Worker 1's
 19,325 then 39,121 cumulative tokens against a 21,767-token live grant. The
 interrupted terminal arrived 10 ms after the crossing notice, with no later
 usage notice. Worker 2 received a typed admission refusal without dispatch;
