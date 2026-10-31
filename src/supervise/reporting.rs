@@ -3104,6 +3104,7 @@ mod cursor_managed_usage_evidence {
                 .bind(&run_id)
                 .unwrap();
             let budget = SupervisorBudgetConfig {
+                worker_live_token_limits: BTreeMap::new(),
                 limits: RunBudgetLimits {
                     hard_cost_usd: Some(1.0),
                     ..Default::default()

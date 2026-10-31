@@ -1,66 +1,80 @@
 # Nested writable token-control qualification (#714)
 
-Status: observed interruption and subsequent refusal; full acceptance remains
-unproven. Follow the
-[shared preparation and evidence contract](README.md) before running.
-The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
-has one execution parent and exactly two disjoint terminal Workers, requested
-serially, on `gpt-6.1-sol` / `high` for both the delegating parent and terminal
-Workers; independent control/review roles retain `xhigh`.
-The bundled task/authority priors admit `high` and `xhigh` for these localized
-changes. The original `medium` requests failed selection before release.
-Native runtime delegation is prohibited; nested dispatch goes through
-the authenticated coordinator channel. No retries or gate corrections are
-authorized by the fixture.
+Status: implementation prepared; a new real contained attempt is still required.
+Preserve `qualification-nested-budget-ct101-01` and the earlier failure records.
+Follow the [shared evidence contract](README.md); never run in the owner desktop
+or an occupied checkout. The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
+uses two execution parents, three terminal Workers, and effective width one.
+Both parents and Workers use `gpt-6.1-sol/high`; independent review retains
+`xhigh` and the three default review lenses. No retries or gate corrections.
 
-The disjoint scopes select isolated sibling worktrees. Their inner dispatch
-inherits the effective run concurrency bound, including provider inflight and
-capacity limits. With the width-one command below, Workers run in authored order
-through settlement. Observed exhaustion records a typed budget-admission refusal
-for each queued Worker without another provider invocation. Wider effective
-bounds still allow concurrent isolated Workers.
+The first parent dispatches only `admission-worker`. Its meaningful repair of
+`test_admission.py` must pass independent unittest execution and parent/Auditor
+acceptance before the second parent runs. The second parent queues
+`settlement-worker` and `refusal-worker`; the former starts the real settlement
+repair with a deliberately small observation threshold, and the latter is
+refused after exhaustion. The whole run is expected to be rejected even though
+the first stage produced an accepted candidate. Preserve the first stage's
+acceptance separately from final run acceptance; never publish the failed run.
 
-The revised finite ceiling is 65,000 run tokens, with admission estimates of 4,000 for
-the parent/reviewer and 1,000 per Worker. Each child has a 1,200-second timeout;
-the outer command has a 3,600-second deadline. Estimates do not bound actual
-consumption and the Worker live grant is the remaining admitted allowance,
-not its 1,000-token estimate. The meaningful task repairs two deliberately
-flawed Python test fixtures with disjoint ownership. It does not pad output
-or request unlimited turns to force usage.
+The CT101 harness must assert **hard_tokens = 650000** (previously 65000).
+Admission estimates remain 4000 per parent/Auditor and 1000 per Worker.
+`worker_live_token_limits` explicitly bounds the granted allowance to 240000
+for `admission-worker` and 1000 for each second-stage Worker. These are
+within-turn observation thresholds, not provider-call spending guarantees.
+The allocator grants the smaller of the requested threshold and available
+hard balance; it never enlarges an issued grant or overlaps reservations.
+A required threshold on an unsupported runtime/route is refused before release.
+Each child retains a 1200-second timeout; the outer deadline remains 3600 seconds.
 
-The retained `qualification-nested-budget-c31` attempt on
-`f16ed38fcab1eb37ac7ee6c1b7a3aeff4fc09fe2` is **inconclusive**. Its original
-32,000-token plan admitted the real parent on `gpt-6.1-sol` / `high`, which
-settled 41,684 tokens before either Worker launched: 41,495 input and 189
-output. The 27,264 cached input tokens are included in input, not added again.
-The parent exceeded that ceiling by 9,684; both Worker preparations were
-refused, so no within-turn Worker interruption or drain was exercised.
-Preserve that original checked plan, fixture, usage receipts and retained run
-alongside the revised checked plan and its evidence; do not rewrite c31's result.
+Arithmetic is based on the -01 trace: parent usage was 43233, then Worker
+cumulative notices were 19325 and 39121 before any edit. The old grant was
+65000 - 43233 = 21767, so the second notice interrupted seed inspection.
+The new first-Worker threshold is 240000: 200879 beyond that pre-edit floor,
+and 48769 beyond the original incident Worker's 191231 terminal total.
+For finite planning, allow 65000 tokens for each of six coordinator/reviewer
+turns (first parent initial + continuation, three Auditors, second parent
+initial): 6 * 65000 + 240000 = 630000, leaving 20000 under the 650000 ceiling.
+This is a planning envelope, not measured consumption or guaranteed success.
+At the old observed parent rate the same six turns total 259398, leaving
+390602 before Workers. Unused allowance is released on settlement.
 
-The revised ceiling budgets 1.5 times observed parent usage:
-`41,684 * 3 / 2 = 62,526`, plus a 2,474-token remaining grant, totaling 65,000.
-This leaves 23,316 tokens of headroom over the observed parent usage (20,842
-for setup variation plus 2,474 for Worker 1). With no other outstanding
-reservations, parent usage of 41,684 leaves Worker 1 a live grant of 23,316;
-usage of 62,526 leaves 2,474. Both admit its unchanged 1,000-token estimate.
-The parent estimate remains 4,000: it is an admission estimate, not a cap on
-the parent's turn. No task, effort, gate, timeout or retry setting changes.
+The second-Worker threshold remains 1000 regardless of how cheaply stage one
+finishes. A replay of its first observed 19325-token notice would immediately
+cross 1000; later trustworthy drain notices still increase its settled floor.
+The 1000-token estimate is unchanged and is distinct from the live grant.
+`live_token_grant_exhausted` latches the run stop even if the aggregate ceiling has spare room,
+so the queued third Worker receives a real typed refusal. No output padding,
+spending target, or intentional infinite loop is needed. Provider notices and
+usage can vary: early first-stage exhaustion, failed review, no crossing notice,
+or timeout without observed exhaustion makes the attempt inconclusive.
+Do not automatically retry or change the ceiling.
 
-Even the larger 23,316-token grant is less than one eighth of the original
-incident Worker's 191,231-token usage. This makes Worker 1 reaching the grant
-during its native turn plausible with substantial margin, while allowing
-50% parent setup growth. It is not a usage prediction or guarantee: setup can
-vary, Worker 1 can finish cheaply, and cumulative usage notices can arrive
-late or overshoot. After Worker 1 reaches its actual grant, observed exhaustion
-must stop dispatch and Worker 2 must be refused; capture that refusal in the
-same run. Parent-first exhaustion or failure to reach Worker exhaustion remains
-inconclusive. This fixture revision prepares a separately reviewable plan;
-it does not authorize another live attempt or establish qualification.
+Before each eligible Worker provider release, `budget/dispatch-N.admitted.json` and the authenticated
+`live_budget_admitted` checkpoint bind grant ID/amount, exact reservation,
+run/assignment/parent/attempt, runtime, command digest, non-secret selected
+account authority/provider/account/incarnation/revision, and admission balances.
+`run_budget.dispatch_bindings` in collect/final reports retains that identity
+and adds the host-authenticated thread/turn and exactly one charge. The
+`*.settled.json` receipt and checkpoint are written before fallible completion
+acceptance. Local-auth/unspecified identity explicitly makes no authenticated
+account claim; qualification requires a selected-account receipt. Thread and
+turn IDs do not exist at admission and are reconciled from the trusted runner,
+never from Worker JSON. A restored public report cannot supply live authority.
+
+Admission checkpoints also retain the complete budget snapshot and reservation.
+If the process dies before usage arrives, `supervise resume` journals one
+`live_budget_recovered` disposition at the existing reservation estimate floor,
+marks usage incomplete, and keeps dispatch blocked; repeated resume does not
+charge again. Collect exposes the authenticated budget before and after that
+reconciliation. Failed admission writes distinguish an unpublished binding
+from a published admission. If release was withheld, scheduler closure retains
+its `not_started` disposition; a crash before closure remains conservative. Command receipts hash the launch seal, including input
+lists, bounded input content/file identities, source declarations and confinement.
 
 ```bash
 fixture=examples/supervise/nested-codex-budget-qualification.json
-run_id=qualification-nested-budget-01
+run_id=qualification-nested-budget-ct101-02
 sha256sum "$fixture" > "$OUT/fixture-sha256.txt"
 "$maco" supervise plan "$fixture" --repo "$repo" --json > "$OUT/checked-plan.json" || exit 1
 if timeout --signal=TERM --kill-after=30s 3600 systemd-run --user --scope --quiet -p Delegate=yes \
@@ -176,3 +190,10 @@ and changed/stopped/released-grant regressions, plus
 in the admitted Linux environment. Providerless tests do not satisfy this gate.
 Keep #692 settlement-order evidence separate. Closure requires the real
 exhaustion evidence above and independent acceptance, not fixture preparation.
+
+Before accepting a fresh attempt, map every target, version probe, catalog probe
+and journal helper to its owner and typed containment/quiescence receipt. An
+empty process-group watchdog alone does not certify all helpers. The old -01
+run lacks that complete mapping and has no accepted candidate; preserve it as
+positive stop/refusal evidence with those explicit limits. Preparation and
+providerless regressions do not close the real-qualification criterion.

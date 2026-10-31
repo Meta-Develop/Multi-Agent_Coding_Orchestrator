@@ -7,6 +7,9 @@ use crate::{
 };
 
 const SUPERVISE_CHECKPOINT_VERSION: u32 = 1;
+const PHASE_LIVE_BUDGET_ADMITTED: &str = "live_budget_admitted";
+const PHASE_LIVE_BUDGET_SETTLED: &str = "live_budget_settled";
+const PHASE_LIVE_BUDGET_RECOVERED: &str = "live_budget_recovered";
 const PHASE_PREPARED: &str = "supervise_prepared";
 const PHASE_ASSIGNMENT_STARTED: &str = "assignment_started";
 const PHASE_ASSIGNMENT_COMPLETED: &str = "assignment_completed";
@@ -94,6 +97,23 @@ struct DispatchCheckpoint {
     attempt: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LiveBudgetCheckpoint {
+    binding: BudgetDispatchBinding,
+    budget: RunBudgetReport,
+    reservation: BudgetReservation,
+}
+
+// Accept the first implementation's binding-only records without granting
+// them authority to execute an interrupted invocation again.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum LiveBudgetCheckpointPayload {
+    Snapshot(Box<LiveBudgetCheckpoint>),
+    Legacy(Box<BudgetDispatchBinding>),
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SchedulerClosedCheckpoint {
@@ -167,6 +187,8 @@ pub(super) struct SupervisorCheckpointSnapshot {
     pub(super) final_report: Option<FinalReportResumePlan>,
     pub(super) finalization_started: bool,
     pub(super) finalized: bool,
+    pub(super) run_budget: RunBudgetReport,
+    live_reservations: BTreeMap<u64, BudgetReservation>,
     primary_base: Oid,
     pub(super) inbox_pr_source_head_oid: Option<Oid>,
     worktrees: BTreeMap<String, CheckpointWorktreeBinding>,
@@ -174,6 +196,26 @@ pub(super) struct SupervisorCheckpointSnapshot {
 }
 
 impl SupervisorCheckpointSnapshot {
+    pub(super) fn reconcile_live_budget(
+        &mut self,
+        checkpoint: &mut SupervisorCheckpointWriter,
+    ) -> Result<bool> {
+        if !self
+            .run_budget
+            .dispatch_bindings
+            .iter()
+            .any(|binding| binding.state == crate::supervise_budget::BudgetDispatchState::Admitted)
+        {
+            return Ok(false);
+        }
+        let recovered = self
+            .run_budget
+            .reconcile_interrupted_dispatches(&self.live_reservations)?;
+        checkpoint.append(PHASE_LIVE_BUDGET_RECOVERED, None, &recovered)?;
+        self.run_budget = recovered;
+        Ok(true)
+    }
+
     pub(super) fn verify_primary_binding(
         &self,
         repo: &Path,
@@ -256,6 +298,7 @@ impl SupervisorCheckpointSnapshot {
 
 pub(super) struct SupervisorCheckpointWriter {
     journal: StateJournal,
+    append_recovery_failed: bool,
     assignment_states: BTreeMap<String, AssignmentResumeState>,
 }
 
@@ -326,6 +369,7 @@ impl SupervisorCheckpointWriter {
         let mut writer = Self {
             journal: StateJournal::create(authenticator, run_id.as_str())?,
             assignment_states,
+            append_recovery_failed: false,
         };
         let assignment_claim_paths = plan
             .assignments
@@ -554,6 +598,9 @@ impl SupervisorCheckpointWriter {
         subject: Option<&str>,
         payload: &T,
     ) -> Result<()> {
+        if self.append_recovery_failed {
+            bail!("supervise checkpoint requires authenticated recovery after an uncertain append");
+        }
         #[cfg(test)]
         if take_checkpoint_failure(self.journal.instance_id(), phase) {
             bail!("injected supervise checkpoint failure before phase '{phase}'");
@@ -651,6 +698,284 @@ pub(super) fn record_dispatch_checkpoint(
     }
 }
 
+pub(super) fn record_live_budget_admission(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    reservation: &DispatchBudgetReservation<'_>,
+    command: &ExternalAgentCommand,
+) -> Result<()> {
+    // This evidence contract covers terminal Worker dispatches (both shared
+    // parent-worktree and isolated sibling routes).
+    if reservation.reservation.role != AgentRole::Worker {
+        return Ok(());
+    }
+    let Some(invocation) = command
+        .live_budget_invocation()
+        .map_err(anyhow::Error::msg)?
+    else {
+        return Ok(());
+    };
+    let grant = command
+        .bound_live_token_grant()
+        .map_err(anyhow::Error::msg)?
+        .context("live dispatch has no retained grant")?;
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifacts poisoned"))?;
+    reservation
+        .ledger
+        .bind_dispatch(reservation.reservation.id, invocation, grant)?;
+    let result = persist_live_budget_binding_locked(&mut guard, reservation, false);
+    if result.is_err() {
+        reservation
+            .ledger
+            .discard_unconfirmed_dispatch(reservation.reservation.id)?;
+    }
+    result
+}
+
+pub(super) fn persist_live_budget_binding(
+    artifacts: &Mutex<SharedSupervisorArtifacts<'_>>,
+    reservation: &DispatchBudgetReservation<'_>,
+    settled: bool,
+) -> Result<()> {
+    let mut guard = artifacts
+        .lock()
+        .map_err(|_| anyhow!("supervisor artifacts poisoned"))?;
+    let result = persist_live_budget_binding_locked(&mut guard, reservation, settled);
+    if !settled && result.is_err() {
+        reservation
+            .ledger
+            .discard_unconfirmed_dispatch(reservation.reservation.id)?;
+    }
+    result
+}
+
+fn persist_live_budget_binding_locked(
+    guard: &mut SharedSupervisorArtifacts<'_>,
+    reservation: &DispatchBudgetReservation<'_>,
+    settled: bool,
+) -> Result<()> {
+    let budget = reservation.ledger.report()?;
+    let Some(binding) = budget
+        .dispatch_bindings
+        .iter()
+        .find(|binding| binding.reservation_id == reservation.reservation.id.get())
+    else {
+        return Ok(());
+    };
+    if settled && binding.state == crate::supervise_budget::BudgetDispatchState::Admitted {
+        // No successful accounting transaction exists yet (for example a
+        // runner error before release). The final checkpoint records the
+        // release/drop disposition; never label this an observed settlement.
+        return Ok(());
+    }
+    let suffix = if settled { "settled" } else { "admitted" };
+    write_artifact_json(
+        guard.writer,
+        &PathBuf::from(format!(
+            "budget/dispatch-{}.{}.json",
+            binding.reservation_id, suffix
+        )),
+        &json!({"binding": binding, "budget": budget}),
+        MAX_SUPERVISOR_REPORT_BYTES,
+        ArtifactFileDisposition::PrivateEvidence,
+    )?;
+    if let Some(checkpoint) = guard.checkpoint.as_deref_mut() {
+        let phase = if settled {
+            PHASE_LIVE_BUDGET_SETTLED
+        } else {
+            PHASE_LIVE_BUDGET_ADMITTED
+        };
+        let previous_records = checkpoint.journal.records().len();
+        let result = checkpoint.append(
+            phase,
+            Some(&binding.invocation.assignment_id),
+            &LiveBudgetCheckpoint {
+                binding: binding.clone(),
+                budget: budget.clone(),
+                reservation: reservation.reservation.clone(),
+            },
+        );
+        if !settled && result.is_err() {
+            checkpoint
+                .journal
+                .recover_failed_append()
+                .map_err(|error| {
+                    checkpoint.append_recovery_failed = true;
+                    error.context("could not authenticate failed live admission append")
+                })?;
+        }
+        // An error can occur after the immutable record is published (for
+        // example updating its head). Retain that admission on abort; otherwise
+        // releasing the reservation removes the unjournaled tentative binding.
+        if !settled && checkpoint.journal.records().len() > previous_records {
+            reservation
+                .ledger
+                .confirm_dispatch_admission(reservation.reservation.id)?;
+        }
+        result?;
+    } else if !settled {
+        reservation
+            .ledger
+            .confirm_dispatch_admission(reservation.reservation.id)?;
+    }
+    Ok(())
+}
+
+fn same_budget_admission(
+    before: &crate::supervise_budget::BudgetDispatchBinding,
+    after: &crate::supervise_budget::BudgetDispatchBinding,
+) -> bool {
+    let mut copy = after.clone();
+    copy.state = before.state;
+    copy.thread_id.clone_from(&before.thread_id);
+    copy.turn_id.clone_from(&before.turn_id);
+    copy.invocation_verified = before.invocation_verified;
+    copy.charged_tokens = before.charged_tokens;
+    copy.usage_complete = before.usage_complete;
+    copy == *before
+}
+
+fn validate_live_budget_report(
+    budget: &RunBudgetReport,
+    admitted: &BTreeMap<u64, BudgetDispatchBinding>,
+) -> Result<()> {
+    use crate::supervise_budget::BudgetDispatchState;
+    if budget.dispatch_bindings.len() != admitted.len() {
+        bail!("budget lost authenticated live dispatch bindings");
+    }
+    let mut seen = BTreeSet::new();
+    for binding in &budget.dispatch_bindings {
+        let before = admitted
+            .get(&binding.reservation_id)
+            .context("unauthenticated live dispatch binding")?;
+        if !seen.insert(binding.reservation_id)
+            || !same_budget_admission(before, binding)
+            || (before.state != BudgetDispatchState::Admitted && before != binding)
+        {
+            bail!("budget changed its authenticated live dispatch binding");
+        }
+        let charges = budget
+            .charges
+            .iter()
+            .filter(|charge| charge.reservation_id == binding.reservation_id)
+            .collect::<Vec<_>>();
+        match binding.state {
+            BudgetDispatchState::Settled
+                if charges.len() == 1
+                    && Some(charges[0].tokens) == binding.charged_tokens
+                    && Some(charges[0].usage_complete) == binding.usage_complete => {}
+            BudgetDispatchState::Admitted | BudgetDispatchState::NotStarted
+                if charges.is_empty()
+                    && binding.charged_tokens.is_none()
+                    && binding.usage_complete.is_none() => {}
+            _ => bail!("live dispatch disposition differs from its unique charge"),
+        }
+    }
+    Ok(())
+}
+
+fn merge_legacy_budget_binding(
+    budget: &mut RunBudgetReport,
+    binding: BudgetDispatchBinding,
+) -> Result<()> {
+    use crate::supervise_budget::BudgetDispatchState;
+    if binding.state == BudgetDispatchState::Admitted {
+        let grant = usize::try_from(binding.grant_tokens)?;
+        budget.consumed.tokens = budget.consumed.tokens.max(binding.consumed_before);
+        budget.reserved.tokens = binding.reserved_at_admission;
+        budget.reserved.cost_usd = None;
+        budget.active_reservations = binding.active_at_admission;
+        if !budget
+            .roles
+            .iter()
+            .any(|role| role.role == AgentRole::Worker)
+        {
+            budget
+                .roles
+                .push(crate::supervise_budget::RoleBudgetReport {
+                    role: AgentRole::Worker,
+                    consumed: BudgetAmount {
+                        tokens: 0,
+                        cost_usd: Some(0.0),
+                    },
+                    reserved: BudgetAmount {
+                        tokens: 0,
+                        cost_usd: None,
+                    },
+                    active_reservations: 0,
+                    usage_complete: true,
+                });
+        }
+        let role = budget
+            .roles
+            .iter_mut()
+            .find(|role| role.role == AgentRole::Worker)
+            .unwrap();
+        role.reserved.tokens = role
+            .reserved
+            .tokens
+            .checked_add(grant)
+            .context("legacy grant overflow")?;
+        role.reserved.cost_usd = None;
+        role.active_reservations += 1;
+        budget.dispatch_bindings.push(binding);
+    } else {
+        // Old settlement records lack a full accounting snapshot. Start with
+        // the same conservative transaction, then retain the authenticated
+        // observed token count and its explicit completeness, never a guess.
+        let mut recovered = budget.reconcile_interrupted_dispatches_matching(
+            &BTreeMap::new(),
+            Some(binding.reservation_id),
+        )?;
+        let target = recovered
+            .dispatch_bindings
+            .iter_mut()
+            .find(|item| item.reservation_id == binding.reservation_id)
+            .context("legacy settlement has no admission")?;
+        let floor = target
+            .charged_tokens
+            .context("legacy settlement has no floor")?;
+        let charge = recovered
+            .charges
+            .iter_mut()
+            .find(|item| item.reservation_id == binding.reservation_id)
+            .unwrap();
+        let tokens = binding.charged_tokens.unwrap_or(0);
+        recovered.consumed.tokens = recovered.consumed.tokens - floor + tokens;
+        let role = recovered
+            .roles
+            .iter_mut()
+            .find(|role| role.role == AgentRole::Worker)
+            .unwrap();
+        role.consumed.tokens = role.consumed.tokens - floor + tokens;
+        if binding.state == BudgetDispatchState::NotStarted {
+            recovered
+                .charges
+                .retain(|charge| charge.reservation_id != binding.reservation_id);
+        } else {
+            charge.tokens = tokens;
+            charge.usage_complete = binding.usage_complete.unwrap_or(false);
+        }
+        *target = binding;
+        *budget = recovered;
+    }
+    budget.committed.tokens = budget
+        .consumed
+        .tokens
+        .checked_add(budget.reserved.tokens)
+        .context("legacy committed tokens overflow")?;
+    budget.remaining.soft_tokens = budget
+        .limits
+        .soft_tokens
+        .map(|limit| limit.saturating_sub(budget.committed.tokens));
+    budget.remaining.hard_tokens = budget
+        .limits
+        .hard_tokens
+        .map(|limit| limit.saturating_sub(budget.committed.tokens));
+    Ok(())
+}
+
 pub(super) fn normalized_supervisor_plan_sha256(
     plan: &SupervisorPlan,
     consultant: &SupervisorConsultantPlan,
@@ -691,6 +1016,7 @@ pub(super) fn open_supervisor_checkpoint(
         SupervisorCheckpointWriter {
             journal,
             assignment_states,
+            append_recovery_failed: false,
         },
         snapshot,
     ))
@@ -764,7 +1090,10 @@ fn analyze_checkpoint_records(
     let mut claims = BTreeMap::new();
     let mut scheduler_closed = false;
     let mut scheduler_budget = None;
+    let mut run_budget = prepared.budget.clone();
+    let mut live_reservations = BTreeMap::new();
     let mut dispatches = BTreeSet::new();
+    let mut live_bindings = BTreeMap::new();
     let mut final_report = None;
     let mut final_report_committed = false;
     let mut finalization_started = false;
@@ -775,6 +1104,7 @@ fn analyze_checkpoint_records(
                 let subject = required_subject(record)?;
                 let payload: AssignmentCheckpoint = decode_payload(record)?;
                 validate_assignment_payload(&prepared, subject, &payload)?;
+                run_budget = payload.budget.clone();
                 let state = assignments
                     .get_mut(subject)
                     .context("checkpoint start references an unknown assignment")?;
@@ -787,6 +1117,7 @@ fn analyze_checkpoint_records(
                 let subject = required_subject(record)?;
                 let payload: AssignmentCheckpoint = decode_payload(record)?;
                 validate_assignment_payload(&prepared, subject, &payload)?;
+                run_budget = payload.budget.clone();
                 let state = assignments
                     .get_mut(subject)
                     .context("checkpoint completion references an unknown assignment")?;
@@ -856,6 +1187,84 @@ fn analyze_checkpoint_records(
                     bail!("checkpoint dispatch completion has no unique preceding start");
                 }
             }
+            PHASE_LIVE_BUDGET_ADMITTED | PHASE_LIVE_BUDGET_SETTLED => {
+                use crate::supervise_budget::{BudgetDispatchBinding, BudgetDispatchState};
+                let payload: LiveBudgetCheckpointPayload = decode_payload(record)?;
+                let (binding, budget) = match payload {
+                    LiveBudgetCheckpointPayload::Snapshot(payload) => {
+                        if payload.reservation.id.get() != payload.binding.reservation_id
+                            || payload.reservation.tokens != payload.binding.estimate_tokens
+                            || payload.reservation.role != AgentRole::Worker
+                        {
+                            bail!("live budget checkpoint changed its reservation");
+                        }
+                        live_reservations
+                            .insert(payload.binding.reservation_id, payload.reservation);
+                        (payload.binding, Some(payload.budget))
+                    }
+                    LiveBudgetCheckpointPayload::Legacy(binding) => (*binding, None),
+                };
+                if scheduler_closed {
+                    bail!("live budget checkpoint followed scheduler closure");
+                }
+                if binding.version != 1
+                    || binding.invocation.run_id != run_id.as_str()
+                    || record.subject.as_deref() != Some(&binding.invocation.assignment_id)
+                    || binding.reservation_id == 0
+                    || binding.invocation.attempt == 0
+                    || binding.grant_tokens < binding.estimate_tokens as u64
+                {
+                    bail!("invalid authenticated live budget binding");
+                }
+                if record.phase == PHASE_LIVE_BUDGET_ADMITTED {
+                    if binding.state != BudgetDispatchState::Admitted
+                        || live_bindings
+                            .values()
+                            .any(|prior: &BudgetDispatchBinding| prior.grant_id == binding.grant_id)
+                        || !is_canonical_lower_hex_64(&binding.invocation.command_sha256)
+                        || binding.reserved_at_admission < binding.grant_tokens as usize
+                        || live_bindings
+                            .insert(binding.reservation_id, binding.clone())
+                            .is_some()
+                    {
+                        bail!("duplicate or invalid live budget admission");
+                    }
+                } else {
+                    let before = live_bindings
+                        .get_mut(&binding.reservation_id)
+                        .context("live budget settlement has no admission")?;
+                    if before.state != BudgetDispatchState::Admitted
+                        || binding.state == BudgetDispatchState::Admitted
+                        || !same_budget_admission(before, &binding)
+                    {
+                        bail!("live budget settlement changed its admitted invocation");
+                    }
+                    *before = binding.clone();
+                }
+                if let Some(budget) = budget {
+                    validate_live_budget_report(&budget, &live_bindings)?;
+                    run_budget = budget;
+                } else {
+                    merge_legacy_budget_binding(&mut run_budget, binding)?;
+                }
+            }
+            PHASE_LIVE_BUDGET_RECOVERED => {
+                if scheduler_closed || record.subject.is_some() {
+                    bail!("live budget recovery is outside the interrupted lifecycle");
+                }
+                validate_live_budget_report(&run_budget, &live_bindings)?;
+                let recovered: RunBudgetReport = decode_payload(record)?;
+                if recovered == run_budget
+                    || recovered
+                        != run_budget.reconcile_interrupted_dispatches(&live_reservations)?
+                {
+                    bail!("live budget recovery changed or repeated its conservative disposition");
+                }
+                for binding in &recovered.dispatch_bindings {
+                    live_bindings.insert(binding.reservation_id, binding.clone());
+                }
+                run_budget = recovered;
+            }
             PHASE_SCHEDULER_CLOSED => {
                 if record.subject.is_some() || scheduler_closed {
                     bail!("checkpoint contains a duplicate scheduler closure");
@@ -871,6 +1280,37 @@ fn analyze_checkpoint_records(
                 if payload.pending_assignments != pending {
                     bail!("checkpoint scheduler closure has inconsistent pending assignments");
                 }
+                if payload.budget.dispatch_bindings.len() != live_bindings.len() {
+                    bail!("final budget lost authenticated live dispatch bindings");
+                }
+                for binding in &payload.budget.dispatch_bindings {
+                    let admitted = live_bindings
+                        .get(&binding.reservation_id)
+                        .context("final budget has an unauthenticated dispatch binding")?;
+                    if !same_budget_admission(admitted, binding)
+                        || (admitted.state
+                            != crate::supervise_budget::BudgetDispatchState::Admitted
+                            && admitted != binding)
+                    {
+                        bail!("final budget changed its admitted invocation or settlement");
+                    }
+                    if binding.state == crate::supervise_budget::BudgetDispatchState::Admitted
+                        || (binding.state == crate::supervise_budget::BudgetDispatchState::Settled
+                            && binding.charged_tokens.is_none())
+                    {
+                        bail!("final budget has an unsettled live dispatch binding");
+                    }
+                    if let Some(tokens) = binding.charged_tokens {
+                        if !payload.budget.charges.iter().any(|charge| {
+                            charge.reservation_id == binding.reservation_id
+                                && charge.tokens == tokens
+                                && Some(charge.usage_complete) == binding.usage_complete
+                        }) {
+                            bail!("final live budget settlement differs from its charge");
+                        }
+                    }
+                }
+                run_budget = payload.budget.clone();
                 scheduler_budget = Some(payload.budget);
                 scheduler_closed = true;
             }
@@ -967,6 +1407,7 @@ fn analyze_checkpoint_records(
     uncertain_assignments.extend(dispatches.into_iter().map(|(_, subject, _)| {
         owning_assignment_id_for_dispatch_subject(&subject, &prepared.assignment_ids).to_string()
     }));
+    validate_live_budget_report(&run_budget, &live_bindings)?;
     Ok(SupervisorCheckpointSnapshot {
         completed_assignments,
         pending_assignments,
@@ -974,6 +1415,8 @@ fn analyze_checkpoint_records(
         final_report,
         finalization_started,
         finalized,
+        run_budget,
+        live_reservations,
         primary_base,
         inbox_pr_source_head_oid,
         worktrees,
@@ -1069,5 +1512,345 @@ fn take_checkpoint_failure(run_id: &str, phase: &str) -> bool {
             true
         }
         None => false,
+    }
+}
+
+#[cfg(test)]
+pub(super) fn verify_live_budget_checkpoint_tampering(repo: &Path, run_id: &RunId) -> Result<()> {
+    let (writer, _) = open_supervisor_checkpoint(repo, run_id)?;
+    for pointer in [
+        "/grant_id",
+        "/grant_tokens",
+        "/reservation_id",
+        "/invocation/attempt",
+        "/invocation/command_sha256",
+        "/invocation/account",
+    ] {
+        let mut records = writer.journal.records().to_vec();
+        let record = records
+            .iter_mut()
+            .find(|record| record.phase == PHASE_LIVE_BUDGET_SETTLED)
+            .unwrap();
+        let pointer = format!("/binding{pointer}");
+        let field = record.payload.pointer_mut(&pointer).unwrap();
+        *field = if field.is_number() {
+            json!(field.as_u64().unwrap() + 1)
+        } else if field.is_object() {
+            json!({"kind":"local_auth"})
+        } else {
+            json!("substituted")
+        };
+        assert!(
+            analyze_checkpoint_records(&records, run_id).is_err(),
+            "accepted tampered {pointer}"
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod auditor_failure_probes {
+    use super::*;
+    use crate::supervise_budget::BudgetReservationId;
+
+    struct Fixture {
+        _temp: tempfile::TempDir,
+        repo: PathBuf,
+        run_id: RunId,
+        plan: SupervisorPlan,
+        writer: ArtifactRunWriter,
+        checkpoint: SupervisorCheckpointWriter,
+        ledger: RunBudgetLedger,
+        id: BudgetReservationId,
+        binding: BudgetDispatchBinding,
+    }
+
+    fn prepare(case: &str) -> Result<Fixture> {
+        let (temp, repo) = super::super::tests::injected_repository();
+        let run_id = RunId::new(format!("auditor-{case}"))?;
+        let plan: SupervisorPlan = serde_json::from_value(
+            json!({"assignments":[{"id":"parent", "phase":"execution", "assigned_paths":["README.md"], "worker_assignments":[{"id":"worker", "role":"worker", "assigned_paths":["README.md"]}]}]}),
+        )?;
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(1000),
+            ..Default::default()
+        })?;
+        let writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "auditor-probe",
+        )?;
+        let mut checkpoint = SupervisorCheckpointWriter::create(
+            &repo,
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &current_head_oid(&repo)?,
+                "a".repeat(64),
+                1,
+                &plan,
+                writer.resume_binding()?,
+                ledger.report()?,
+            ),
+        )?;
+        checkpoint.assignment_started(
+            &plan.assignments[0],
+            0,
+            Some(writer.resume_binding()?),
+            ledger.report()?,
+        )?;
+        let BudgetAdmission::Admitted { reservation, .. } =
+            ledger.reserve(BudgetReservationRequest {
+                role: AgentRole::Worker,
+                tokens: 10,
+                cost_usd: None,
+            })?
+        else {
+            unreachable!()
+        };
+        let grant = ledger.live_token_grant(reservation.id)?.unwrap();
+        let binding = ledger.bind_dispatch(
+            reservation.id,
+            BudgetDispatchInvocation {
+                run_id: run_id.as_str().into(),
+                assignment_id: "worker".into(),
+                parent_id: Some("parent".into()),
+                attempt: 1,
+                runtime: "codex".into(),
+                account: BudgetAccountIdentity::Unspecified,
+                command_sha256: "b".repeat(64),
+            },
+            &grant,
+        )?;
+        Ok(Fixture {
+            _temp: temp,
+            repo,
+            run_id,
+            plan,
+            writer,
+            checkpoint,
+            ledger,
+            id: reservation.id,
+            binding,
+        })
+    }
+
+    #[test]
+    fn review714_crash_before_observation_preserves_budget_for_reconciliation() -> Result<()> {
+        let Fixture {
+            _temp,
+            repo,
+            run_id,
+            writer,
+            mut checkpoint,
+            ledger,
+            binding,
+            ..
+        } = prepare("crash")?;
+        checkpoint.append(PHASE_LIVE_BUDGET_ADMITTED, Some("worker"), &binding)?;
+        drop(checkpoint);
+        drop(writer);
+        drop(ledger);
+        let resumed = resume_supervisor_run(&repo, run_id.clone())?;
+        let collected = collect_supervisor_run(&repo, run_id.clone())?;
+        assert!(
+            resumed.run_budget.is_some() && collected.run_budget.is_some(),
+            "durably admitted grant disappeared: resume budget={:?}, collect budget={:?}",
+            resumed.run_budget,
+            collected.run_budget
+        );
+        assert!(resumed.budget_reconciled_from_checkpoint);
+        assert!(!resumed.resumed);
+        let budget = resumed.run_budget.unwrap();
+        assert_eq!(budget.consumed.tokens, 10);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(!budget.usage_complete);
+        assert!(!budget.new_dispatch_allowed);
+        assert_eq!(budget.charges.len(), 1);
+        assert!(!budget.charges[0].usage_complete);
+        assert_eq!(
+            budget.dispatch_bindings[0].state,
+            crate::supervise_budget::BudgetDispatchState::Settled
+        );
+        assert_eq!(budget.dispatch_bindings[0].thread_id, None);
+        assert_eq!(Some(budget.clone()), collected.run_budget);
+        let again = resume_supervisor_run(&repo, run_id.clone())?;
+        assert_eq!(again.run_budget, Some(budget));
+        let (checkpoint, _) = open_supervisor_checkpoint(&repo, &run_id)?;
+        assert_eq!(
+            checkpoint
+                .journal
+                .records()
+                .iter()
+                .filter(|record| record.phase == PHASE_LIVE_BUDGET_RECOVERED)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_recovers_full_snapshot_after_append_failure(
+    ) -> Result<()> {
+        let Fixture {
+            _temp,
+            repo,
+            run_id,
+            writer,
+            mut checkpoint,
+            ledger,
+            id,
+            binding,
+            ..
+        } = prepare("snapshot-crash")?;
+        let reservation = BudgetReservation {
+            id,
+            role: AgentRole::Worker,
+            tokens: 10,
+            cost_usd: None,
+        };
+        checkpoint.append(
+            PHASE_LIVE_BUDGET_ADMITTED,
+            Some("worker"),
+            &LiveBudgetCheckpoint {
+                binding,
+                budget: ledger.report()?,
+                reservation,
+            },
+        )?;
+        drop(checkpoint);
+        drop(writer);
+        drop(ledger);
+        install_checkpoint_failure(run_id.as_str(), "after:live_budget_recovered");
+        assert!(resume_supervisor_run(&repo, run_id.clone()).is_err());
+        let resumed = resume_supervisor_run(&repo, run_id.clone())?;
+        let budget = resumed.run_budget.context("missing recovered snapshot")?;
+        assert!(!resumed.resumed);
+        assert_eq!(budget.charges.len(), 1);
+        assert_eq!(budget.charges[0].tokens, 10);
+        assert_eq!(budget.reserved.tokens, 0);
+        assert_eq!(budget.active_reservations, 0);
+        assert!(!budget.usage_complete);
+        assert_eq!(
+            collect_supervisor_run(&repo, run_id.clone())?.run_budget,
+            Some(budget)
+        );
+        let (checkpoint, _) = open_supervisor_checkpoint(&repo, &run_id)?;
+        assert_eq!(
+            checkpoint
+                .journal
+                .records()
+                .iter()
+                .filter(|record| record.phase == PHASE_LIVE_BUDGET_RECOVERED)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn review714_admission_write_failure_leaves_readable_checkpoint() -> Result<()> {
+        let Fixture {
+            _temp,
+            repo,
+            run_id,
+            plan,
+            writer,
+            mut checkpoint,
+            ledger,
+            id,
+            binding,
+        } = prepare("admission-write")?;
+        install_checkpoint_failure(run_id.as_str(), PHASE_LIVE_BUDGET_ADMITTED);
+        assert!(checkpoint
+            .append(PHASE_LIVE_BUDGET_ADMITTED, Some("worker"), &binding)
+            .is_err());
+        ledger.release(id)?;
+        checkpoint.assignment_completed(
+            &plan.assignments[0],
+            0,
+            Some(writer.resume_binding()?),
+            ledger.report()?,
+            None,
+            vec![],
+        )?;
+        checkpoint.scheduler_closed(writer.resume_binding()?, ledger.report()?)?;
+        drop(checkpoint);
+        drop(writer);
+        let opened = open_supervisor_checkpoint(&repo, &run_id);
+        if let Err(error) = opened {
+            panic!("refused-before-release dispatch corrupted checkpoint: {error:#}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_admission_abort_before_and_after_append() -> Result<()>
+    {
+        for after in [false, true] {
+            let mut fixture = prepare(if after { "abort-after" } else { "abort-before" })?;
+            let reservation = DispatchBudgetReservation {
+                ledger: &fixture.ledger,
+                reservation: BudgetReservation {
+                    id: fixture.id,
+                    role: AgentRole::Worker,
+                    tokens: 10,
+                    cost_usd: None,
+                },
+                pricing: None,
+                pricing_model: None,
+                state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Codex),
+            };
+            install_checkpoint_failure(
+                fixture.run_id.as_str(),
+                if after {
+                    "after:live_budget_admitted"
+                } else {
+                    PHASE_LIVE_BUDGET_ADMITTED
+                },
+            );
+            let mut journal = None;
+            let mut autonomy_kpis = AutonomyKpiCollector::default();
+            let artifacts = Mutex::new(SharedSupervisorArtifacts {
+                writer: &mut fixture.writer,
+                journal: &mut journal,
+                autonomy_kpis: &mut autonomy_kpis,
+                checkpoint: Some(&mut fixture.checkpoint),
+            });
+            assert!(persist_live_budget_binding(&artifacts, &reservation, false).is_err());
+            artifacts
+                .into_inner()
+                .map_err(|_| anyhow!("test artifacts poisoned"))?;
+            drop(reservation);
+            let budget = fixture.ledger.report()?;
+            assert_eq!(budget.charges.len(), 0);
+            assert_eq!(budget.dispatch_bindings.len(), usize::from(after));
+            fixture.checkpoint.assignment_completed(
+                &fixture.plan.assignments[0],
+                0,
+                Some(fixture.writer.resume_binding()?),
+                budget.clone(),
+                None,
+                vec![],
+            )?;
+            fixture
+                .checkpoint
+                .scheduler_closed(fixture.writer.resume_binding()?, budget)?;
+            drop(fixture.checkpoint);
+            drop(fixture.writer);
+            let (_, snapshot) = open_supervisor_checkpoint(&fixture.repo, &fixture.run_id)?;
+            assert_eq!(
+                snapshot.run_budget.dispatch_bindings.len(),
+                usize::from(after)
+            );
+            if after {
+                assert_eq!(
+                    snapshot.run_budget.dispatch_bindings[0].state,
+                    crate::supervise_budget::BudgetDispatchState::NotStarted
+                );
+            }
+        }
+        Ok(())
     }
 }

@@ -1296,6 +1296,7 @@ fn run_positive_gate_selected_plan(
         plan,
         SupervisorConsultantPlan::default(),
         SupervisorBudgetConfig {
+            worker_live_token_limits: BTreeMap::new(),
             limits: RunBudgetLimits::default(),
             role_token_reservations: BTreeMap::new(),
         },

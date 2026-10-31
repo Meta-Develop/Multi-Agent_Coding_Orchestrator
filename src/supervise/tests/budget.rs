@@ -1,78 +1,88 @@
 use super::*;
 
 #[test]
-fn nested_budget_qualification_ceiling_preserves_observed_parent_headroom() {
+fn nested_budget_qualification_ceiling_preserves_candidate_then_exhaustion() -> Result<()> {
     let (_temporary, repo) = injected_repository();
     let loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(
         include_str!("../../../examples/supervise/nested-codex-budget-qualification.json"),
         Some(&repo),
-    )
-    .expect("load qualification fixture without regenerating hash-bound inputs");
-    let budget = loaded.plan_metadata.run_budget;
-    let ceiling = budget
-        .limits
-        .hard_tokens
-        .expect("finite qualification ceiling");
-    let observed_parent_tokens = 41_684;
-    let documented_headroom = 23_316;
-    let parent_planning_allowance = observed_parent_tokens * 3 / 2;
-    assert!(ceiling >= observed_parent_tokens + documented_headroom);
-    assert_eq!(
-        budget.role_token_reservations[&AgentRole::ChildOrchestrator],
-        4_000
-    );
-    let worker_estimate = budget.role_token_reservations[&AgentRole::Worker];
-    assert_eq!(worker_estimate, 1_000);
-
-    for parent_tokens in [observed_parent_tokens, parent_planning_allowance] {
-        let ledger = RunBudgetLedger::new(budget.limits).expect("qualification ledger");
-        let reserve = |role| {
-            ledger
-                .reserve(BudgetReservationRequest {
-                    role,
-                    tokens: budget.role_token_reservations[&role],
-                    cost_usd: None,
-                })
-                .expect("reserve qualification role")
-        };
-        let parent = reserve(AgentRole::ChildOrchestrator)
-            .reservation()
-            .expect("parent admitted")
-            .clone();
-        ledger
-            .reconcile(
-                parent.id,
-                UsageMeasurement::Reliable {
-                    tokens: parent_tokens,
-                    cost_usd: None,
-                },
-            )
-            .expect("settle parent before Worker 1");
-        let worker = reserve(AgentRole::Worker)
-            .reservation()
-            .expect("Worker 1 admitted after parent settlement")
-            .clone();
-        let grant = ledger.live_token_grant(worker.id).unwrap().unwrap();
-        let grant_tokens = usize::try_from(grant.tokens()).expect("fixture grant fits usize");
-        assert_eq!(grant_tokens, ceiling - parent_tokens);
-        assert!(grant_tokens >= 2_474);
-        assert!(grant_tokens < 191_231 / 8);
-        grant.exhaust();
-        ledger
-            .reconcile(
-                worker.id,
-                UsageMeasurement::Reliable {
-                    tokens: grant_tokens,
-                    cost_usd: None,
-                },
-            )
-            .expect("settle observed Worker 1 exhaustion");
-        assert!(matches!(
-            reserve(AgentRole::Worker),
-            BudgetAdmission::Refused { .. }
-        ));
-        assert_eq!(ledger.report().unwrap().reserved.tokens, 0);
+    )?;
+    let config = loaded.plan_metadata.run_budget;
+    assert_eq!(config.limits.hard_tokens, Some(650_000));
+    assert_eq!(config.worker_live_token_limits["admission-worker"], 240_000);
+    assert_eq!(config.worker_live_token_limits["settlement-worker"], 1_000);
+    assert_eq!(loaded.plan.assignments.len(), 2);
+    let ledger = RunBudgetLedger::new(config.limits)?;
+    let reserve = |role| -> Result<BudgetReservation> {
+        match ledger.reserve(BudgetReservationRequest {
+            role,
+            tokens: config.role_token_reservations[&role],
+            cost_usd: None,
+        })? {
+            BudgetAdmission::Admitted { reservation, .. } => Ok(reservation),
+            BudgetAdmission::Refused { .. } => bail!("qualification planning envelope refused"),
+        }
+    };
+    // Six parent/reviewer turns at the documented 65k allowance and a full
+    // first-Worker grant still leave 20k. This is arithmetic, not a usage promise.
+    for _ in 0..6 {
+        let reservation = reserve(AgentRole::ChildOrchestrator)?;
+        ledger.reconcile(
+            reservation.id,
+            UsageMeasurement::Reliable {
+                tokens: 65_000,
+                cost_usd: None,
+            },
+        )?;
     }
+    let first = reserve(AgentRole::Worker)?;
+    ledger.configure_live_token_limit(first.id, 240_000)?;
+    assert_eq!(
+        ledger.live_token_grant(first.id)?.unwrap().tokens(),
+        240_000
+    );
+    ledger.reconcile(
+        first.id,
+        UsageMeasurement::Reliable {
+            tokens: 240_000,
+            cost_usd: None,
+        },
+    )?;
+    let second = reserve(AgentRole::Worker)?;
+    ledger.configure_live_token_limit(second.id, 1_000)?;
+    let grant = ledger.live_token_grant(second.id)?.unwrap();
+    assert_eq!(grant.tokens(), 1_000);
+    grant.exhaust();
+    ledger.reconcile(
+        second.id,
+        UsageMeasurement::Estimated {
+            tokens: 19_325,
+            cost_usd: None,
+        },
+    )?;
+    assert!(reserve(AgentRole::Worker).is_err());
+    assert_eq!(ledger.report()?.active_reservations, 0);
+    assert!(!ledger.report()?.usage_complete);
+    let command = ExternalAgentCommand::codex(
+        "never-invoke",
+        &repo,
+        "prompt",
+        "events",
+        "report",
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle(&repo, "worker", "q714", "settlement-worker");
+    let ledger = RunBudgetLedger::new(config.limits)?;
+    assert!(reserve_dispatch_budget(
+        &loaded.plan,
+        &config,
+        &ledger,
+        (AgentRole::Worker, SupervisorRuntime::Fake),
+        &command
+    )
+    .is_err());
+    assert_eq!(ledger.report()?.active_reservations, 0);
+    Ok(())
 }
 
 pub(super) fn operator_pricing_document(plan: &SupervisorPlan) -> Value {
@@ -3112,6 +3122,7 @@ fn dispatch_composes_plan_and_cli_token_ceilings_in_all_four_directions() {
         let budget = match plan_hard {
             Some(hard) => injected_run_budget(None, Some(hard), None, None, 10, 10),
             None => SupervisorBudgetConfig {
+                worker_live_token_limits: BTreeMap::new(),
                 limits: RunBudgetLimits::default(),
                 role_token_reservations: BTreeMap::from([
                     (AgentRole::ChildOrchestrator, 10),
@@ -4532,4 +4543,56 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
             10
         );
     }
+}
+
+#[test]
+#[ignore = "maintenance: regenerate the frozen qualification assessment after a task edit"]
+fn regenerate_nested_budget_qualification_assessment() -> Result<()> {
+    use crate::planning::*;
+    use crate::selection::routing_policy::FrozenRoutingPolicy;
+    let path = Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("examples/supervise/nested-codex-budget-qualification.json");
+    let mut document: serde_json::Value = serde_json::from_slice(&std::fs::read(&path)?)?;
+    let policy: FrozenRoutingPolicy =
+        serde_json::from_value(document["resolved_routing_policy"].clone())?;
+    let mut proposal = TaskDecompositionProposal {
+        fragments: Vec::new(),
+        assignments: Vec::new(),
+        coverage_gaps: Vec::new(),
+        diagnostics: Default::default(),
+        disjointness: TaskDisjointnessReport {
+            disjoint: true,
+            ..Default::default()
+        },
+    };
+    for parent in document["assignments"].as_array().unwrap() {
+        for worker in parent["worker_assignments"].as_array().unwrap() {
+            let id = worker["id"].as_str().unwrap().to_owned();
+            let task = worker["task"].as_str().unwrap().to_owned();
+            let fragment = format!("{id}-scope");
+            proposal.fragments.push(TaskSpecFragment {
+                id: fragment.clone(),
+                text: task.clone(),
+            });
+            proposal.assignments.push(TaskAssignmentProposal {
+                id,
+                task,
+                fragment_ids: vec![fragment],
+                assigned_paths: serde_json::from_value(worker["assigned_paths"].clone())?,
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                decision_dependencies: Vec::new(),
+            });
+        }
+    }
+    document["task_routing_assessment"] = serde_json::to_value(assess_task_routing(
+        document["task"].as_str().unwrap(),
+        &proposal,
+        &policy,
+    )?)?;
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&document)?),
+    )?;
+    Ok(())
 }

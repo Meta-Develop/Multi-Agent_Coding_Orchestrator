@@ -38,6 +38,23 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
     cancellation: &ProcessCancellation,
 ) -> Result<DispatchBudgetAdmission<'a>> {
     let (role, runtime) = role_runtime;
+    let live_limit = command
+        .agent_lifecycle
+        .as_ref()
+        .and_then(|identity| {
+            budget_config
+                .worker_live_token_limits
+                .get(&identity.task_id)
+        })
+        .copied();
+    if live_limit.is_some()
+        && (role != AgentRole::Worker
+            || runtime != SupervisorRuntime::Codex
+            || !command.uses_live_app_server_budget())
+    {
+        bail!("required Worker live token control is unsupported for this dispatch; no provider release");
+    }
+
     let tokens = budget_config.reservation_tokens(role).with_context(|| {
         format!(
             "run_budget has no token reservation for dispatched role '{}'",
@@ -97,15 +114,23 @@ pub(super) fn reserve_dispatch_budget_cancellable<'a>(
         )
         .context("run budget admission failed")?
     {
-        BudgetAdmission::Admitted { reservation, .. } => Ok(DispatchBudgetAdmission::Admitted(
-            DispatchBudgetReservation {
-                ledger,
-                reservation,
-                pricing,
-                pricing_model: command.model.clone(),
-                state: DispatchBudgetReservationState::Reserved(runtime),
-            },
-        )),
+        BudgetAdmission::Admitted { reservation, .. } => {
+            if let Some(limit) = live_limit {
+                if let Err(error) = ledger.configure_live_token_limit(reservation.id, limit) {
+                    ledger.release(reservation.id)?;
+                    return Err(error.into());
+                }
+            }
+            Ok(DispatchBudgetAdmission::Admitted(
+                DispatchBudgetReservation {
+                    ledger,
+                    reservation,
+                    pricing,
+                    pricing_model: command.model.clone(),
+                    state: DispatchBudgetReservationState::Reserved(runtime),
+                },
+            ))
+        }
         BudgetAdmission::Refused { refusal, .. } => Ok(DispatchBudgetAdmission::Refused(refusal)),
     }
 }

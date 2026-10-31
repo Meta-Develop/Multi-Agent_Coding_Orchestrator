@@ -14779,6 +14779,148 @@ mod managed_worker_live_budget {
     }
 
     #[test]
+    fn review714_durable_command_digest_distinguishes_input_files() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let reservation = reserve(&ledger);
+        let mut original = command();
+        original.bind_live_token_grant(ledger.live_token_grant(reservation.id).unwrap());
+        let original_invocation = original.live_budget_invocation().unwrap().unwrap();
+        let mut different = original.clone();
+        different.bind_live_token_grant(None);
+        different
+            .read_only_input_files
+            .push(PathBuf::from("/private/substituted-schema.json"));
+        different.bind_live_token_grant(ledger.live_token_grant(reservation.id).unwrap());
+        let different_invocation = different.live_budget_invocation().unwrap().unwrap();
+        assert_ne!(
+            original_invocation.command_sha256, different_invocation.command_sha256,
+            "different admitted command inputs have identical durable receipts"
+        );
+    }
+
+    #[test]
+    fn managed_worker_live_budget_receipt_binds_contents_identity_and_confinement() {
+        let temp = tempfile::tempdir().unwrap();
+        let input = temp.path().join("input.json");
+        fs::write(&input, b"first input").unwrap();
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let reservation = reserve(&ledger);
+        let grant = ledger.live_token_grant(reservation.id).unwrap();
+        let mut original = command();
+        original.read_only_input_files.push(input.clone());
+        original.bind_live_token_grant(grant.clone());
+        let before = original.live_budget_invocation().unwrap().unwrap();
+        for mutate in [
+            (|spec: &mut ExternalAgentCommand| spec.hidden_roots.push("/new-hidden-root".into()))
+                as fn(&mut ExternalAgentCommand),
+            |spec| spec.worker_change_required = !spec.worker_change_required,
+            |spec| spec.worker_journal_artifacts[0].path = "/new-journal-path".into(),
+            |spec| spec.codex_managed_readonly_route = CodexManagedReadonlyRoute::Continuation,
+        ] {
+            let mut changed = original.clone();
+            changed.bind_live_token_grant(None);
+            mutate(&mut changed);
+            changed.bind_live_token_grant(grant.clone());
+            assert_ne!(
+                before.command_sha256,
+                changed
+                    .live_budget_invocation()
+                    .unwrap()
+                    .unwrap()
+                    .command_sha256
+            );
+        }
+        fs::write(&input, b"other input").unwrap();
+        assert!(original.live_budget_invocation().is_err());
+        let mut changed = original.clone();
+        changed.bind_live_token_grant(grant.clone());
+        let content_changed = changed.live_budget_invocation().unwrap().unwrap();
+        assert_ne!(before.command_sha256, content_changed.command_sha256);
+        let replacement = temp.path().join("replacement");
+        fs::write(&replacement, b"other input").unwrap();
+        fs::rename(replacement, &input).unwrap();
+        assert!(changed.live_budget_invocation().is_err());
+        changed.bind_live_token_grant(grant);
+        assert_ne!(
+            content_changed.command_sha256,
+            changed
+                .live_budget_invocation()
+                .unwrap()
+                .unwrap()
+                .command_sha256
+        );
+    }
+
+    #[test]
+    fn worker_live_grant_rejects_selected_account_and_reservation_substitution() {
+        let ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let reservation = reserve(&ledger);
+        let mut spec = command();
+        spec.codex_run_account_binding = Some(CodexRunAccountBinding::Selected(
+            crate::account_authority::FrozenCodexSelectedBinding {
+                authority_socket: None,
+                authority_id: "authority".into(),
+                provider_id: "codex-cli".into(),
+                account_id: "account".into(),
+                account_incarnation: "incarnation".into(),
+                selection_revision: 1,
+            },
+        ));
+        spec.bind_live_token_grant(ledger.live_token_grant(reservation.id).unwrap());
+        let original = spec.live_budget_invocation().unwrap().unwrap();
+        let mut changed = spec.clone();
+        if let Some(CodexRunAccountBinding::Selected(account)) =
+            &mut changed.codex_run_account_binding
+        {
+            account.selection_revision += 1;
+        }
+        assert!(changed.live_budget_invocation().is_err());
+        assert!(changed.verified_live_token_grant().is_err());
+        let other = reserve(
+            &RunBudgetLedger::new(RunBudgetLimits {
+                hard_tokens: Some(220_000),
+                ..Default::default()
+            })
+            .unwrap(),
+        );
+        assert_eq!(
+            other.id, reservation.id,
+            "numeric IDs alone do not identify a grant"
+        );
+        let another = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: Some(220_000),
+            ..Default::default()
+        })
+        .unwrap();
+        let other = reserve(&another);
+        changed = spec;
+        changed.bind_live_token_grant(another.live_token_grant(other.id).unwrap());
+        assert_ne!(changed.live_budget_invocation().unwrap().unwrap(), original);
+        assert!(
+            ledger
+                .bind_dispatch(
+                    reservation.id,
+                    changed.live_budget_invocation().unwrap().unwrap(),
+                    changed.bound_live_token_grant().unwrap().unwrap(),
+                )
+                .is_err(),
+            "a different ledger's live grant must not acquire this reservation's receipt"
+        );
+    }
+
+    #[test]
     fn worker_selection_requires_private_authority_and_preserves_other_routes() {
         let spec = command();
         assert_eq!(

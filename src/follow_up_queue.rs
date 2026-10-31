@@ -3451,6 +3451,7 @@ mod tests {
             information_scope: ReviewInformationScope::FullChildTranscript,
         }];
         let run_budget = SupervisorBudgetConfig {
+            worker_live_token_limits: BTreeMap::new(),
             limits: RunBudgetLimits {
                 soft_tokens: Some(2),
                 hard_tokens: Some(2),

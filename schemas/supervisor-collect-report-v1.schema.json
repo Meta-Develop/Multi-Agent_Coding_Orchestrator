@@ -6268,6 +6268,13 @@
                   "soft_tokens": {
                     "minimum": 1,
                     "type": "integer"
+                  },
+                  "worker_live_token_limits": {
+                    "additionalProperties": {
+                      "minimum": 1,
+                      "type": "integer"
+                    },
+                    "type": "object"
                   }
                 },
                 "type": "object"
@@ -13262,6 +13269,13 @@
                         "soft_tokens": {
                           "minimum": 1,
                           "type": "integer"
+                        },
+                        "worker_live_token_limits": {
+                          "additionalProperties": {
+                            "minimum": 1,
+                            "type": "integer"
+                          },
+                          "type": "object"
                         }
                       },
                       "type": "object"
@@ -17394,6 +17408,7 @@
                       "enum": [
                         "soft_token_ceiling_reached",
                         "hard_token_ceiling_reached",
+                        "live_token_grant_exhausted",
                         "soft_cost_ceiling_reached",
                         "hard_cost_ceiling_reached",
                         "max_duration_reached",
@@ -25938,6 +25953,199 @@
         "cost_complete": {
           "type": "boolean"
         },
+        "dispatch_bindings": {
+          "items": {
+            "additionalProperties": false,
+            "properties": {
+              "active_at_admission": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "charged_tokens": {
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "consumed_before": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "estimate_tokens": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "grant_id": {
+                "minLength": 1,
+                "type": "string"
+              },
+              "grant_tokens": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "hard_tokens": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "invocation": {
+                "additionalProperties": false,
+                "properties": {
+                  "account": {
+                    "oneOf": [
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "account_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "account_incarnation": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "authority_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "kind": {
+                            "const": "selected"
+                          },
+                          "provider_id": {
+                            "minLength": 1,
+                            "type": "string"
+                          },
+                          "selection_revision": {
+                            "minimum": 0,
+                            "type": "integer"
+                          }
+                        },
+                        "required": [
+                          "kind",
+                          "authority_id",
+                          "provider_id",
+                          "account_id",
+                          "account_incarnation",
+                          "selection_revision"
+                        ],
+                        "type": "object"
+                      },
+                      {
+                        "additionalProperties": false,
+                        "properties": {
+                          "kind": {
+                            "enum": [
+                              "local_auth",
+                              "unspecified"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "kind"
+                        ],
+                        "type": "object"
+                      }
+                    ]
+                  },
+                  "assignment_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "attempt": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "command_sha256": {
+                    "pattern": "^[0-9a-f]{64}$",
+                    "type": "string"
+                  },
+                  "parent_id": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "run_id": {
+                    "minLength": 1,
+                    "type": "string"
+                  },
+                  "runtime": {
+                    "const": "codex"
+                  }
+                },
+                "required": [
+                  "run_id",
+                  "assignment_id",
+                  "parent_id",
+                  "attempt",
+                  "runtime",
+                  "account",
+                  "command_sha256"
+                ],
+                "type": "object"
+              },
+              "invocation_verified": {
+                "type": "boolean"
+              },
+              "reservation_id": {
+                "minimum": 1,
+                "type": "integer"
+              },
+              "reserved_at_admission": {
+                "minimum": 0,
+                "type": "integer"
+              },
+              "state": {
+                "enum": [
+                  "admitted",
+                  "settled",
+                  "not_started"
+                ]
+              },
+              "thread_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "turn_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "usage_complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "version": {
+                "const": 1
+              }
+            },
+            "required": [
+              "version",
+              "reservation_id",
+              "grant_id",
+              "grant_tokens",
+              "estimate_tokens",
+              "invocation",
+              "consumed_before",
+              "reserved_at_admission",
+              "active_at_admission",
+              "hard_tokens",
+              "state",
+              "thread_id",
+              "turn_id",
+              "invocation_verified",
+              "charged_tokens",
+              "usage_complete"
+            ],
+            "type": "object"
+          },
+          "type": "array"
+        },
         "elapsed_seconds": {
           "minimum": 0,
           "type": "integer"
@@ -26101,6 +26309,7 @@
             "enum": [
               "soft_token_ceiling_reached",
               "hard_token_ceiling_reached",
+              "live_token_grant_exhausted",
               "soft_cost_ceiling_reached",
               "hard_cost_ceiling_reached",
               "max_duration_reached",

@@ -6,8 +6,9 @@ use crate::follow_up_queue::GeneratedFollowUpQueueEntrypoint;
 #[cfg(test)]
 use crate::review::{build_review_lens_request, ReviewLensRequestSources};
 pub use crate::supervise_budget::{
-    BudgetAction, BudgetAmount, BudgetChargeReport, BudgetReason, BudgetRemaining,
-    RoleBudgetReport, RunBudgetLimits, RunBudgetReport, RunBudgetSource, RunBudgetSources,
+    BudgetAccountIdentity, BudgetAction, BudgetAmount, BudgetChargeReport, BudgetDispatchBinding,
+    BudgetDispatchInvocation, BudgetDispatchState, BudgetReason, BudgetRemaining, RoleBudgetReport,
+    RunBudgetLimits, RunBudgetReport, RunBudgetSource, RunBudgetSources,
 };
 use crate::{
     artifacts::{
@@ -918,6 +919,9 @@ pub struct SupervisorBudgetConfig {
     pub limits: RunBudgetLimits,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_token_reservations: BTreeMap<AgentRole, usize>,
+    /// Optional smaller within-turn observation thresholds, keyed by authored Worker ID.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub worker_live_token_limits: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
@@ -1191,7 +1195,9 @@ impl SupervisorHostResourcePolicyInput {
 
 impl SupervisorBudgetConfig {
     fn is_unconfigured(&self) -> bool {
-        self.limits.is_unconfigured() && self.role_token_reservations.is_empty()
+        self.limits.is_unconfigured()
+            && self.role_token_reservations.is_empty()
+            && self.worker_live_token_limits.is_empty()
     }
 
     fn reservation_tokens(&self, role: AgentRole) -> Option<usize> {

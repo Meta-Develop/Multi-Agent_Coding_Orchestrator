@@ -447,6 +447,7 @@ fn completed_quota_refresh_switches_the_next_actual_assignment_launch_to_cursor(
         );
     }
     let budget_config = SupervisorBudgetConfig {
+        worker_live_token_limits: BTreeMap::new(),
         limits: RunBudgetLimits::default(),
         role_token_reservations: BTreeMap::from([(AgentRole::Worker, 10)]),
     };

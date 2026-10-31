@@ -302,6 +302,25 @@ pub(super) fn validate_supervisor_plan_in_repo(
             );
         }
     }
+    for (worker_id, limit) in &metadata.run_budget.worker_live_token_limits {
+        let authored_worker = plan.assignments.iter().any(|assignment| {
+            (assignment.role == AgentRole::Worker && assignment.id == *worker_id)
+                || assignment
+                    .worker_assignments
+                    .iter()
+                    .any(|worker| worker.id == *worker_id)
+        });
+        if !authored_worker
+            || *limit == 0
+            || metadata.run_budget.limits.hard_tokens.is_none()
+            || metadata
+                .run_budget
+                .reservation_tokens(AgentRole::Worker)
+                .is_none_or(|estimate| *limit < estimate)
+        {
+            bail!("worker_live_token_limits requires an authored Worker, hard token ceiling and limit >= its positive estimate: {worker_id}");
+        }
+    }
     if metadata.run_budget.limits.has_any_ceiling() {
         for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
             if !metadata
@@ -710,6 +729,7 @@ pub(super) fn derived_generated_follow_up_budget(
         .checked_add(auditor_budget)
         .context("generated follow-up token closure overflowed")?;
     Ok(SupervisorBudgetConfig {
+        worker_live_token_limits: BTreeMap::new(),
         limits: RunBudgetLimits {
             soft_tokens: Some(token_closure),
             hard_tokens: Some(token_closure),

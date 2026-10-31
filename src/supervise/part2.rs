@@ -323,7 +323,19 @@ impl DispatchBudgetReservation<'_> {
                 cost_usd: None,
             });
         }
-        let usage = external_usage_for_runtime(run, command, launch_runtime);
+        // Match the returned host-held receipt to the admitted reservation before
+        // assigning its usage. Even a mismatch consumes a conservative charge once.
+        let invocation = command.live_budget_invocation().ok().flatten();
+        let returned = run.live_budget_invocation();
+        let commands = run.codex_command_execution_evidence();
+        let identity_verified = self.ledger.observe_dispatch_identity(
+            self.reservation.id,
+            returned,
+            run.authenticated_app_server_evidence().and_then(|e| e.thread_id.clone()),
+            commands.map(|e| e.turn_id.clone()),
+        )?;
+        let usage = external_usage_for_runtime(run, command, launch_runtime)
+            .filter(|_| identity_verified);
         // One parent-owned allocation feeds both the ledger and every role/lens report.
         // A reroute notice cannot allocate cumulative turn usage between models.
         let model = match launch_runtime {
@@ -436,6 +448,9 @@ impl DispatchBudgetReservation<'_> {
             }
         };
         self.state = DispatchBudgetReservationState::Settled;
+        if !identity_verified || (returned.is_some() && returned != invocation.as_ref()) {
+            bail!("returned live budget invocation does not match the admitted reservation");
+        }
         Ok(settlement)
     }
 
