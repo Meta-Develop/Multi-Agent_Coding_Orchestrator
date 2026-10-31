@@ -6,6 +6,10 @@ use crate::artifacts::state_auth::sha256_hex;
 const VERSION: u32 = 1;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 
+#[path = "observed_identity.rs"]
+mod observed_identity;
+pub(crate) use observed_identity::observed_role_identity;
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct TargetBinding {
@@ -47,6 +51,7 @@ struct TargetContainmentReceipt {
 struct RetainedCommandSummary<'a> {
     #[serde(flatten)]
     command: &'a CommandRunRecord,
+    runtime_identity: observed_identity::RuntimeIdentityObservation,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     researcher_input_receipts:
         Vec<crate::external_agent::researcher_inputs::ResearcherInputReceipt>,
@@ -123,6 +128,9 @@ pub(super) fn persist(
     let record = command_record_from_external_for_runtime(run, command, runtime);
     let mut summary = serde_json::to_vec_pretty(&RetainedCommandSummary {
         command: &record,
+        runtime_identity: observed_identity::RuntimeIdentityObservation::capture(
+            run, command, runtime,
+        ),
         researcher_input_receipts: run.retained_researcher_input_receipts(),
     })?;
     summary.push(b'\n');
@@ -200,7 +208,6 @@ enum RestoredTargetContainment {
     Retained(TargetContainmentReceipt),
 }
 
-#[allow(dead_code)] // Kept private until an operator diagnostic consumer needs readback.
 fn read(reader: &ArtifactRunReader, expected: &TargetBinding) -> Result<RestoredTargetContainment> {
     if reader.finalization().run_id != expected.run_id {
         bail!("target receipt expected run does not match the authenticated manifest");

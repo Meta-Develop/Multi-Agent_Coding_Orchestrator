@@ -503,7 +503,7 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
             {
                 bail!("effective profile plan differs from the prevalidated comparison binding");
             }
-            let profile_binding = super::ObservedProfileBinding::requested(
+            let mut profile_binding = super::ObservedProfileBinding::requested(
                 profile,
                 request.runtime,
                 &comparison_sha256,
@@ -638,7 +638,10 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                     ArtifactFileDisposition::PrivateEvidence,
                 )?;
             let (supervisor_succeeded, supervisor_evidence, failure, measurements) = match report {
-                Ok(report) => {
+                Ok(report) => (|| -> Result<_> {
+                    if report.run_id != isolated.run_id {
+                        bail!("supervisor report belongs to a different experiment cell");
+                    }
                     let reader = ArtifactRunReader::open(&isolated.repo, family, &isolated.run_id)?;
                     let report_relative = family.final_report_relative_path();
                     let report_bytes = reader.read(&report_relative)?;
@@ -649,12 +652,7 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                             &report_bytes,
                             &isolated.repo,
                             &BTreeSet::new(),
-                        )
-                        .map(Some)
-                        .unwrap_or_else(|error| {
-                            let reason = error.to_string();
-                            Some(observed_run_measurements_unavailable(&held_out, &reason))
-                        });
+                        )?;
                     let mut retained = writer
                         .lock()
                         .map_err(|_| anyhow!("experiment artifact lock poisoned"))?;
@@ -670,13 +668,23 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
                         reader.finalization(),
                         ArtifactFileDisposition::PrivateEvidence,
                     )?;
-                    (
+                    profile_binding.observe(&reader);
+                    Ok((
                         report.success,
                         Some(prefix.join(report_relative)),
                         None,
-                        measurements,
+                        Some(measurements),
+                    ))
+                })()
+                .unwrap_or_else(|error| {
+                    let reason = format!("supervisor evidence authentication failed: {error}");
+                    (
+                        false,
+                        None,
+                        Some(reason.clone()),
+                        Some(observed_run_measurements_unavailable(&held_out, &reason)),
                     )
-                }
+                }),
                 Err(error) => {
                     let reason =
                         format!("supervisor did not produce a verified finalized report: {error}");

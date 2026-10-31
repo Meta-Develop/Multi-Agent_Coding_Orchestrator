@@ -473,6 +473,7 @@ pub(crate) use reporting::parse_worker_execution_journal;
 pub(crate) use reporting::run_worker_execution_journal_command;
 pub(crate) use reporting::run_worker_execution_journal_command_with_clock;
 use reporting::*;
+pub(crate) use target_containment::observed_role_identity;
 
 #[cfg(test)]
 pub(crate) use reporting::command_record_from_external;

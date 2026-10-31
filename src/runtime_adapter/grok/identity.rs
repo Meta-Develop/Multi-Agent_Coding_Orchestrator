@@ -92,7 +92,7 @@ const MODEL_LABELS: [(&str, &str); 2] = [
     ("grok-4.7", "grok-4.7-build"),
 ];
 
-fn served_model_matches(requested: &str, observed: &str) -> bool {
+pub(crate) fn served_model_matches(requested: &str, observed: &str) -> bool {
     MODEL_LABELS.iter().any(|(standard, build)| {
         [*standard, *build].contains(&requested) && [*standard, *build].contains(&observed)
     })
