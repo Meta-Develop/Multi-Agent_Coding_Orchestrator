@@ -39,7 +39,7 @@
     }
   },
   "run_budget": {
-    "hard_tokens": 240000,
+    "hard_tokens": 300000,
     "role_token_reservations": {
       "child_orchestrator": 4000,
       "worker": 1000,
