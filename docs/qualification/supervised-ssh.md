@@ -1,140 +1,224 @@
 # Supervised SSH qualification
 
-Status: **not qualified**. The attempt adapter has deterministic injected-transport
-coverage. Supervisor dispatch supports explicitly installed trusted embedding
-configuration, with authenticated lifecycle receipts and collection recovery.
-Normal CLI dispatch still refuses SSH before launch because there is no shipped
-lifecycle SSH client or operator trust-config loader for that dispatch.
-The existing atomic command SSH client speaks a different protocol. Do not use it
-to manufacture lifecycle receipts or treat a direct remote command as supervised
-execution.
+Status: **not qualified**. The shipped Linux lifecycle client/helper and operator
+trust loader support a bounded **candidate-only** CLI route. Native provider
+admission, network/account capabilities, trusted usage recapture, worktree import,
+and scheduler recovery/accounting are not implemented for this route. It cannot
+publish or accept an assignment. A live two-host qualification remains an owner
+gate; the deterministic tests contact no SSH host and make no provider calls.
 
-The adapter requires an explicit `ExecutorSelection::Ssh`, an exactly matching
-`SshConfig`, and a lifecycle transport factory that uses that validated trust.
-Host ID, endpoint, user, port, helper, and workspace root must all match. It
-rechecks local trust-file ownership, permissions, and file identity before each
-transport operation. The transport must retain strict host-key checking, explicit
-identity, bounded reads/timeouts, and noninteractive execution.
+The atomic command SSH client uses a different protocol and is not a source of
+supervised lifecycle receipts. Only its fixed OpenSSH option construction is reused.
 
-Coordinator input readers supply bounded bytes. `SupervisedPaths` only translates
-declared absolute local paths into relative manifest paths; it does no filesystem
-reading or symlink resolution. The input manifest, launch specification, output
-policy, run, assignment, attempt number, and coordinator nonce bind the lifecycle
-keys. The cancellation token and termination policy stay fixed for that attempt.
-Remote output remains candidate evidence; no `ExternalAgentRun` is deserialized
-or fabricated from it.
+## Operator trust
 
-An uncertain launch is queried using the submitted identity and never relaunched.
-`NotFound` preserves uncertainty. A lost collection reply reuses the exact
-execution identity, collection key, and policy. Stage uncertainty remains an
-operator reconciliation gate. Cancellation uses the existing lifecycle
-TERM/grace/KILL/wait sequence, and collection requires a terminal observation.
-The attempt adapter never calls workspace cleanup on drop or error. The supervisor
-requests it separately after authenticated collection persistence, idempotent local
-import, successful local recapture, and durable import/recapture receipts.
+An assignment may explicitly select `{"kind":"ssh","target":{...}}`. Omission
+keeps local execution. Plan data cannot load trust, install a transport, or change
+credentials. `maco supervise run PLAN --ssh-trust TRUST.json` explicitly loads
+operator capabilities before parsing the plan. Unknown/mismatched targets refuse
+without Local fallback. Attached messaging, hosted pre-action review, non-Codex
+adapters, and additional native runtime capabilities remain unsupported.
+
+Create a private regular JSON file (mode 0600, owned by the invoking user), with
+no symbolic-link ancestors or hard links. Parent directories must not be writable
+by other users, except a sticky temporary-directory ancestor. Use existing,
+reviewed credentials only. Do not generate keys or modify authorized_keys for this
+qualification. Example shape (replace all example values with reviewed values):
+
+```json
+{
+  "version": 1,
+  "ssh_binary": "/usr/bin/ssh",
+  "targets": [{
+    "target": {
+      "host_id": "reviewed-target",
+      "endpoint": "reviewed.example.invalid",
+      "user": "reviewed-user",
+      "port": 22,
+      "helper": "/opt/maco/bin/maco",
+      "root": "/srv/maco/candidates"
+    },
+    "identity_file": "/operator/ssh/identity",
+    "known_hosts_file": "/operator/ssh/known_hosts",
+    "limits": {
+      "max_workspace_entries": 1024,
+      "max_workspace_bytes": 16777216,
+      "max_file_bytes": 1048576,
+      "max_stdout_bytes": 1048576,
+      "max_stderr_bytes": 65536,
+      "max_event_count": 1024,
+      "max_event_bytes": 1048576,
+      "max_request_bytes": 33554432,
+      "max_receipt_bytes": 33554432,
+      "connect_timeout_millis": 5000,
+      "execution_timeout_millis": 15000,
+      "cancellation_grace_millis": 1000,
+      "poll_interval_millis": 50
+    }
+  }]
+}
+```
+
+The plan's target must match host ID, endpoint, user, port, helper, and root
+exactly. Identity and known-hosts paths are never accepted from a plan. Paths
+containing OpenSSH expansion syntax (`$`, `%`, or `~`) are rejected, including
+literal `${VARIABLE}` file names. All path components are opened without
+following symlinks; ancestors must be owned by root or the invoking user and
+must not be writable by others (apart from sticky temporary-directory ancestors).
+
+The loader pins complete source-file identity (device, inode, size, owner, mode,
+link count, nanosecond mtime/ctime) and a content digest. It rechecks both before
+each exec. It copies the bounded validated bytes into anonymous, write-sealed
+memfds; no credential bytes are printed, logged, or persisted on disk. OpenSSH
+reads identity and known-hosts bytes through parent-owned `/proc/PID/fd/N` paths,
+which remain held through child cleanup even if OpenSSH closes inherited FDs.
+The executable is also a sealed snapshot and executes through an inherited
+`/proc/self/fd/N`, so replacement between validation and exec cannot select
+another image. A source change revokes subsequent calls until explicit reload.
+
+OpenSSH receives `-F /dev/null`, `BatchMode=yes`, `StrictHostKeyChecking=yes`,
+`IdentitiesOnly=yes`, `IdentityAgent=none`, explicit `-i` and
+`UserKnownHostsFile`, disabled global known-hosts/DNS trust, disabled password and
+keyboard-interactive authentication, one bounded connection attempt, no proxy,
+no forwarding, and no TTY. The client removes agent/askpass/display environment
+hooks. Data is sent on stdin, never interpolated into the remote command.
+
+The local SSH transport requires a delegated cgroup-v2 scope. Run the coordinator
+under `systemd-run --user --scope --quiet -p Delegate=yes ...`. Each call creates
+a private child cgroup, attaches before exec, and uses `cgroup.kill` for all
+remaining local descendants, including processes that call `setsid`. Stdin and
+stdout are nonblocking. One absolute deadline covers validation, serialization,
+child exit, pipe completion, decoding and cleanup. Source-file validation streams
+SHA-256 in 16 KiB read/hash chunks and checks the same deadline between chunks
+and ancestor-path steps; it never hashes a whole executable without interruption.
+Snapshot copying and sealing occur only at trust load, before per-operation
+deadlines start. Request serialization and frame copying also check bounded
+chunks. A reserved part of that budget
+is used for bounded reaping. A cleanup that cannot be proved by the deadline is
+an uncertain transport failure; there are no pipe-reader/writer threads to join.
+This cleanup never targets the actual remote workload.
+
+Before recording stage or launch intent, the coordinator revalidates trust and
+checks that it can create, inspect, kill and remove an empty private cgroup.
+Missing delegation returns the `systemd-run --user --scope -p Delegate=yes` remedy
+without a stage checkpoint or SSH child. Repair the prerequisite and retry the
+same assignment identity. If a local prerequisite changes after preflight, a
+bounded typed `NotStarted` result restores and persists the preceding retryable
+state. After SSH starts, lost replies still require the original reconciliation
+rules; they never become permission to relaunch.
+
+
+Install the same reviewed binary on the remote host. Its root directory must
+already exist, be canonical, owned by the remote user and mode 0700. The remote
+Linux host must support the existing required user-systemd/cgroup-v2 containment
+backend. The helper has no fallback to uncontained execution. Its current profile
+is an offline workspace, with separate staged inputs and output directories;
+networked provider execution requires a future reviewed runtime profile.
+Runtime program names are literals (for example `codex`), not coordinator-local
+absolute paths. A reviewed fixture can be installed as `ROOT/bin/codex` in a
+private `bin` directory; otherwise the helper uses the fixed system PATH.
+
+## Lifecycle contract
+
+The fixed command is `maco __supervised-ssh-helper ROOT HOST_ID`. It accepts one
+frame and emits one frame: eight magic bytes `MACOLC01`, an unsigned big-endian
+64-bit JSON length, and exactly that many UTF-8 JSON bytes. Trailing bytes, unknown
+fields, invalid scalar types, and over-limit frames are rejected. The global
+frame ceiling is 64 MiB; the client further restricts request/reply sizes from
+operator limits. Outgoing serialization stops at its cap before expanding the
+rest of a value. Typed helper replies avoid a full `serde_json::Value` copy, and
+patch appends check the remaining capacity before copying a line. Collection replies account for JSON byte-array expansion and
+are revalidated against the policy's artifact/count limits before acceptance.
+
+Operations are `stage`, `launch`, `status`, `wait`, `control`, `collect`, and
+`cleanup`. They use the typed `SshTransport` request/receipt structures. Host,
+run, assignment, attempt/nonce, staged-input digest, launch spec, output policy,
+session, workspace, launch key, PID/PGID/start token bind every operation.
+Stage keys name private sessions. The helper serializes requests with a root
+lock, persists intent/receipts with fsync+rename, and never replays a submitted
+launch. The detached runner retains native process ownership independently of
+an SSH connection. Control requests signal its cancellation token; the existing
+native backend performs TERM/grace/KILL/wait. Only verified native quiescence
+produces a terminal receipt. A vanished runner without such a receipt remains
+uncertain, even when its PID is absent.
+
+A lost launch reply is queried, never relaunched. `NotFound` preserves uncertainty.
+A lost collection reply reuses the same identity/key/policy and immutable saved
+collection receipt. Stage uncertainty remains an operator gate. Cleanup removes
+only that session's workspace after terminal collection and explicit coordinator
+authorization; receipts/tombstones remain for exact-key reconciliation.
+
+The coordinator journals authenticated intent before effects and commits bounded
+collection chunks and their final digest before import. Remote results are
+candidate evidence, never an `ExternalAgentRun`. The current CLI coordinator
+stages bounded tracked files and prompt/schema inputs, translates declared paths,
+and persists the collected candidate, then refuses import/native recapture.
+It retains the remote workspace and leaves the local worktree unchanged. Hidden
+runtime/credential-like tracked paths are refused. No serialized usage/native
+flags can bypass existing claim, containment, accounting or acceptance gates.
 
 ## Deterministic checks
 
-Run these only on an admitted validation host. They contact no SSH host:
+On the assigned build lane, with no SSH host or provider:
 
 ```sh
-cargo fmt --all -- --check
-cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::selected_transport_binds_host_attempt_and_paths -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::lost_launch_reconciles_before_cancellation_without_relaunch -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::cancellation_keeps_custody_until_terminal_proof -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib external_agent::executor::supervised_tests::lost_collection_reuses_exact_key_and_never_cleans_up -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::lost_reply_restart_never_duplicates_launch -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::cleanup_requires_persisted_imported_collection -- --exact
-cargo test --locked -p multi-agent-coding-orchestrator --lib supervise::remote_execution::tests::selected_supervisor_dispatch_requires_explicit_trust_and_keeps_local_default -- --exact
+lane-check s1 120 'cargo fmt --check'
+lane-check s1 1200 'cargo clippy --locked --all-targets -- -D warnings'
+lane-check s1 1200 'cargo test --locked --lib external_agent::executor'
+lane-check s1 1200 'cargo test --locked --lib supervise::remote_execution'
+lane-check s1 1200 'cargo test --locked --test supervised_ssh_lifecycle -- --test-threads=1'
 ```
 
-## Opt-in two-host gate (do not run as part of deterministic checks)
+The integration test runs the actual helper through a local fake SSH executable.
+The simulated remote helper runs in a separate delegated scope, modeling another
+host rather than escaping transport cleanup accidentally. Five permanent
+`review_` probes cover the independently reproduced trust/deadline defects;
+additional tests cover immutable snapshots and serialization/patch bounds.
+It covers completion, explicit cleanup, cancellation, lost launch/collection
+replies, trust tampering/replacement/permissions, strict host-key arguments,
+plan-only refusal, and candidate persistence before the native import gate.
 
-The live gate remains unproven. An embedding caller can configure
-`supervise::remote_execution::SupervisedSshHost::configure` with matching
-`SshConfig`, a lifecycle transport factory, and a trusted
-`SupervisedSshCoordinator`. `bind_supervised_ssh_hosts` captures that configuration
-when loading the plan, including for scheduler threads. A plan cannot install
-these capabilities. Missing, changed, or revoked trust refuses without Local
-fallback. Attached parent messaging and hosted pre-action review require an
-equivalent remote capability and currently refuse SSH.
+## Live operator gate (not yet qualified)
 
-The coordinator integration supplies bounded frozen inputs, imports the validated
-candidate idempotently using its exact collection key, and recaptures the local
-candidate and held native runtime evidence. Remote JSON cannot manufacture that
-native evidence. Existing claim, budget, containment, acceptance, and publication
-gates still apply to the returned run. No default integration or real wire client
-is installed by this API.
-After native recapture returns, receipt or cleanup failures retain that run's
-observations for normal supervisor usage settlement and mark it nonpublishable.
-
-Receipts live in the repository-authenticated `supervised-ssh-v1` journal namespace.
-The stable run/assignment/optional Worker/attempt tuple selects one exclusively
-locked journal. Its first intent retains the nonce; checkpoints bind the exact
-stage key, session, workspace, launch key, PID/PGID/start token, and collection
-policy. Launch intent is written before launch. A restart queries that submitted
-identity, including when the reply was lost; `NotFound` does not authorize replay.
-Collections use bounded chunks with an authenticated final digest/commit before
-import. An interrupted collection retries its original key. Failed persistence,
-import, or recapture preserves remote output. Cleanup is recorded before its
-effect and reconciled using the exact cleanup key only after the import barrier.
-Stage uncertainty remains an operator gate.
-
-An embedding caller resumes with `SupervisedSshHost::dispatch` using the identical
-identity, command, scopes, and frozen inputs. A completed collection is restored
-and revalidated locally, without fetching remote output again; native runtime
-evidence must be recaptured, never restored from serialized flags. The general
-CLI `supervise resume` still refuses uncertain assignments: reconciliation of
-remote custody alone does not settle the interrupted scheduler's accounting or
-accept its candidate. A future operator integration must document its actual
-trust-loader, recovery/accounting handoff, and fault-control commands before a
-live qualification can begin.
-
-Use an existing authenticated, explicitly trusted second host and a disposable
-qualification repository. Do not create credentials, guess endpoints, weaken
-host trust, change shared services, or interrupt other work. All values below
-must come from reviewed operator configuration. `MACO_BIN` is the absolute path
-to the accepted installed binary. `SSH_PLAN` is a reviewed plan containing one
-substantive bounded source edit with an explicit SSH executor. `EVIDENCE` is an
-existing private directory. Choose a fresh `RUN_ID` and use it throughout.
-
-After an operator integration makes the CLI route available, the exact supervisor
-commands are:
+Use only an already trusted second host and a disposable repository. No live
+commands are part of deterministic testing. `MACO_BIN`, `SSH_PLAN`, `SSH_TRUST`,
+`COORD_REPO`, `EVIDENCE`, `RUN_ID`, and machine-global binding values below are
+reviewed operator inputs. The current candidate-only route cannot pass the full
+live acceptance gate; these commands exercise the available dispatch boundary:
 
 ```sh
 "$MACO_BIN" supervise plan "$SSH_PLAN" --repo "$COORD_REPO" --json > "$EVIDENCE/plan.json"
-"$MACO_BIN" supervise run "$SSH_PLAN" --repo "$COORD_REPO" --run-id "$RUN_ID" \
-  --runtime codex --codex-bin codex \
+systemd-run --user --scope --quiet -p Delegate=yes "$MACO_BIN" supervise run "$SSH_PLAN" --repo "$COORD_REPO" --run-id "$RUN_ID" \
+  --ssh-trust "$SSH_TRUST" --runtime codex --codex-bin codex \
   --machine-global-config "$MACHINE_GLOBAL_CONFIG" \
   --machine-global-runtime-root-id "$RUNTIME_ROOT_ID" --json > "$EVIDENCE/run.json"
 "$MACO_BIN" supervise collect "$RUN_ID" --repo "$COORD_REPO" --json > "$EVIDENCE/collect.json"
 ```
 
-These commands currently must refuse SSH dispatch. There is deliberately no
-invented trust-loader flag, lifecycle helper command, or lost-reply switch here.
-The follow-up must document its actual trust-loader and fault-control commands
-before a live qualification can begin.
-
-Run separate cases for ordinary completion, cancellation, and reply loss. For
-cancellation, `CANCEL_REQUEST` must be an operator-authored typed request bound to
-the exact live assignment and run. Repeat that same request to test idempotent
-delivery. For reply loss, the reviewed transport fault control must withhold only
-the selected reply, preserve the remote workload, and record its exact key. Resume
-the same run rather than starting another run:
+The fixture must already be installed and emit bounded candidate data without
+provider access. Completion currently ends at the native import refusal. For
+cancellation, use an operator-authored typed request bound to the live assignment:
 
 ```sh
 "$MACO_BIN" steer submit "$CANCEL_REQUEST" --repo "$COORD_REPO" --json > "$EVIDENCE/cancel-first.json"
 "$MACO_BIN" steer submit "$CANCEL_REQUEST" --repo "$COORD_REPO" --json > "$EVIDENCE/cancel-retry.json"
 "$MACO_BIN" steer evidence "$RUN_ID" --repo "$COORD_REPO" --json > "$EVIDENCE/steering.json"
-"$MACO_BIN" supervise resume "$RUN_ID" --repo "$COORD_REPO" --json > "$EVIDENCE/resume.json"
-"$MACO_BIN" supervise collect "$RUN_ID" --repo "$COORD_REPO" --json > "$EVIDENCE/collect-resumed.json"
 ```
 
-Acceptance requires independent evidence for the selected remote host and
-containment, staged-source digest, exact run/assignment/attempt/session/process
-start identity, authentic usage/events, one launch despite reply loss, terminal
-process custody after cancellation, durable collection before local import,
-successful local recapture before cleanup, and no surviving owned workload. Retain
-the exact cleanup receipt and prove unrelated remote workspaces were untouched.
-Claims, validation, acceptance, and publication remain coordinator-owned. No live
-case or successful two-host qualification is claimed by the offline tests.
+Lost-reply qualification currently has exact offline commands only:
+
+```sh
+lane-check s1 1200 'cargo test --locked --test supervised_ssh_lifecycle lost_launch_and_collection_replies_reuse_identity_without_relaunch -- --exact'
+```
+
+There is no production reply-loss switch. A live fault wrapper, immutable frozen
+input recovery and scheduler accounting handoff must be reviewed before live
+reply-loss/restart qualification. General `supervise resume` continues to refuse
+uncertain assignments; transport reconciliation alone cannot settle scheduling
+or accept a candidate. Do not start a replacement run to bypass that refusal.
+
+Full qualification still requires independent native provider usage/events,
+containment, exact staged-source/session/start identity, one launch across reply
+loss, terminal cancellation custody, durable collection before idempotent import,
+trusted local recapture before cleanup, no surviving owned workload, and proof
+that unrelated workspaces were untouched. No live qualification is claimed.

@@ -13,31 +13,69 @@ const ROUND_CONSTANTS: [u32; 64] = [
     0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2,
 ];
 
+/// Incremental state; callers with a deadline feed bounded chunks between checks.
+pub(super) struct Sha256 {
+    state: [u32; 8],
+    pending: [u8; 64],
+    pending_len: usize,
+    byte_length: u64,
+}
+
+impl Sha256 {
+    pub(super) fn new() -> Self {
+        Self {
+            state: INITIAL_STATE,
+            pending: [0; 64],
+            pending_len: 0,
+            byte_length: 0,
+        }
+    }
+
+    pub(super) fn update(&mut self, mut bytes: &[u8]) {
+        self.byte_length = self.byte_length.wrapping_add(bytes.len() as u64);
+        if self.pending_len != 0 {
+            let count = bytes.len().min(64 - self.pending_len);
+            self.pending[self.pending_len..self.pending_len + count]
+                .copy_from_slice(&bytes[..count]);
+            self.pending_len += count;
+            bytes = &bytes[count..];
+            if self.pending_len != 64 {
+                return;
+            }
+            compress(&mut self.state, &self.pending);
+            self.pending_len = 0;
+        }
+        let mut chunks = bytes.chunks_exact(64);
+        for chunk in &mut chunks {
+            compress(&mut self.state, chunk);
+        }
+        let remainder = chunks.remainder();
+        self.pending[..remainder.len()].copy_from_slice(remainder);
+        self.pending_len = remainder.len();
+    }
+
+    pub(super) fn finish(mut self) -> [u8; 32] {
+        let encoded_length = self.byte_length.wrapping_mul(8).to_be_bytes();
+        let mut final_blocks = [0_u8; 128];
+        final_blocks[..self.pending_len].copy_from_slice(&self.pending[..self.pending_len]);
+        final_blocks[self.pending_len] = 0x80;
+        let padded_length = if self.pending_len < 56 { 64 } else { 128 };
+        final_blocks[padded_length - 8..padded_length].copy_from_slice(&encoded_length);
+        for chunk in final_blocks[..padded_length].chunks_exact(64) {
+            compress(&mut self.state, chunk);
+        }
+        let mut digest = [0_u8; 32];
+        for (index, word) in self.state.into_iter().enumerate() {
+            digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
+        }
+        digest
+    }
+}
+
 pub(super) fn sha256(bytes: &[u8]) -> [u8; 32] {
-    let mut state = INITIAL_STATE;
-    let bit_length = (bytes.len() as u128).saturating_mul(8);
-    let encoded_length = (bit_length as u64).to_be_bytes();
-
-    let complete_chunks = bytes.len() / 64;
-    for chunk in bytes[..complete_chunks * 64].chunks_exact(64) {
-        compress(&mut state, chunk);
-    }
-
-    let remainder = &bytes[complete_chunks * 64..];
-    let mut final_blocks = [0_u8; 128];
-    final_blocks[..remainder.len()].copy_from_slice(remainder);
-    final_blocks[remainder.len()] = 0x80;
-    let padded_length = if remainder.len() < 56 { 64 } else { 128 };
-    final_blocks[padded_length - 8..padded_length].copy_from_slice(&encoded_length);
-    for chunk in final_blocks[..padded_length].chunks_exact(64) {
-        compress(&mut state, chunk);
-    }
-
-    let mut digest = [0_u8; 32];
-    for (index, word) in state.into_iter().enumerate() {
-        digest[index * 4..index * 4 + 4].copy_from_slice(&word.to_be_bytes());
-    }
-    digest
+    let mut hash = Sha256::new();
+    hash.update(bytes);
+    hash.finish()
 }
 
 fn compress(state: &mut [u32; 8], block: &[u8]) {
@@ -96,4 +134,29 @@ fn compress(state: &mut [u32; 8], block: &[u8]) {
     state[5] = state[5].wrapping_add(f);
     state[6] = state[6].wrapping_add(g);
     state[7] = state[7].wrapping_add(h);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn incremental_hash_handles_chunk_and_padding_boundaries() {
+        for length in [0, 1, 55, 56, 63, 64, 65, 127, 128, 129, 4096, 17003] {
+            let bytes: Vec<_> = (0..length).map(|i| (i % 251) as u8).collect();
+            let expected = sha256(&bytes);
+            for chunk_size in [1, 3, 63, 64, 65, 255, 16384] {
+                let mut hash = Sha256::new();
+                for chunk in bytes.chunks(chunk_size) {
+                    hash.update(chunk);
+                    hash.update(&[]);
+                }
+                assert_eq!(
+                    hash.finish(),
+                    expected,
+                    "length {length}, chunk {chunk_size}"
+                );
+            }
+        }
+    }
 }

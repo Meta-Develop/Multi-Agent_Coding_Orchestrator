@@ -88,7 +88,8 @@ use std::{
 pub(crate) mod codex_app_server;
 mod codex_parent_evidence;
 #[allow(dead_code, unused_imports)]
-pub(crate) mod executor;
+#[doc(hidden)]
+pub mod executor;
 pub(crate) mod gemini_bridge;
 mod grok_identity;
 mod grok_output;

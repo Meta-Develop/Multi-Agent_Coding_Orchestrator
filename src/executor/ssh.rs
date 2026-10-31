@@ -1179,11 +1179,14 @@ impl OpenSshTransport {
     }
 
     pub fn command_arguments(&self, config: &SshConfig) -> Vec<OsString> {
-        self.command_arguments_with_trust(config, config.identity_file(), config.known_hosts_file())
+        Self::command_arguments_with_trust(
+            config,
+            config.identity_file(),
+            config.known_hosts_file(),
+        )
     }
 
-    fn command_arguments_with_trust(
-        &self,
+    pub(crate) fn command_arguments_with_trust(
         config: &SshConfig,
         identity_file: &Path,
         known_hosts_file: &Path,
@@ -1247,7 +1250,7 @@ impl OpenSshTransport {
 
     fn spawn(&self, config: &SshConfig, trust: &TrustSnapshot) -> std::io::Result<Child> {
         let mut command = Command::new(&self.ssh_binary);
-        command.args(self.command_arguments_with_trust(
+        command.args(Self::command_arguments_with_trust(
             config,
             &trust.identity_file,
             &trust.known_hosts_file,

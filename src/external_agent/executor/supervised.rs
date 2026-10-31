@@ -231,6 +231,18 @@ pub struct SupervisedSshAttempt<'a, T> {
 }
 
 impl<T: SshTransport> SupervisedSshAttempt<'_, T> {
+    pub(crate) fn preflight(&mut self) -> ExecutorResult<()> {
+        self.observe_prelaunch_cancellation();
+        if matches!(self.state, State::CancelledBeforeLaunch) {
+            return Ok(());
+        }
+        revalidate_trust(&self.owner.trust)
+            .map_err(|error| TransportNotStarted::new(error.to_string()))?;
+        if matches!(self.state, State::Collected(_) | State::StageUncertain(_)) {
+            return Ok(());
+        }
+        self.owner.executor.transport().preflight()
+    }
     pub(crate) fn observe_prelaunch_cancellation(&mut self) {
         if matches!(self.state, State::Prepared | State::Staged(_))
             && self.cancellation.is_cancelled()
@@ -282,12 +294,18 @@ impl<T: SshTransport> SupervisedSshAttempt<'_, T> {
         if matches!(self.state, State::CancelledBeforeLaunch) {
             return Ok(SupervisedEvent::CancelledBeforeLaunch);
         }
-        revalidate_trust(&self.owner.trust)?;
+        self.preflight()?;
         match &self.state {
             State::Prepared => {
                 // Do not blindly retry even if the lifecycle call returns an error.
                 self.state = State::Failed;
-                let effect = self.owner.executor.stage(self.request.clone())?;
+                let effect = match self.owner.executor.stage(self.request.clone()) {
+                    Err(error @ ExecutorError::NotStarted(_)) => {
+                        self.state = State::Prepared;
+                        return Err(error);
+                    }
+                    outcome => outcome?,
+                };
                 match effect {
                     Effect::Confirmed(staged) => {
                         let submitted = SubmittedLaunchIdentity::for_launch(&staged);
@@ -308,14 +326,21 @@ impl<T: SshTransport> SupervisedSshAttempt<'_, T> {
             }
             State::Staged(staged) => {
                 // Retain the exact submitted identity before crossing the effect.
-                // Every subsequent advance queries it rather than launching again.
+                // After a possible effect, subsequent advances query instead of relaunching.
                 let submitted = SubmittedLaunchIdentity::for_launch(staged);
+                let retry = self.checkpoint();
                 let State::Staged(staged) =
                     std::mem::replace(&mut self.state, State::Submitted(submitted))
                 else {
                     unreachable!();
                 };
-                let effect = self.owner.executor.launch(LaunchRequest::new(staged))?;
+                let effect = match self.owner.executor.launch(LaunchRequest::new(staged)) {
+                    Err(error @ ExecutorError::NotStarted(_)) => {
+                        self.restore_checkpoint(&retry, None)?;
+                        return Err(error);
+                    }
+                    outcome => outcome?,
+                };
                 if let Effect::Confirmed(receipt) = &effect {
                     self.state = State::Running(receipt.identity().clone());
                 }
