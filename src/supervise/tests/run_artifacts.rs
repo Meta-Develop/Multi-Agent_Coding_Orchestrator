@@ -582,6 +582,158 @@ fn supervise_collect_requires_finalized_researcher_input_receipts() -> Result<()
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+fn collect_attempt_named_assignments(orphan: bool) -> Result<()> {
+    use crate::artifacts::state_auth::sha256_hex;
+    use crate::external_agent::researcher_inputs::{
+        tests::attach_synthetic_receipts, ResearcherSourceInput,
+    };
+
+    let (temp, repo) = injected_repository();
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    plan.assignments.clear();
+    let template = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        injected_options(&repo, temp.path(), "attempt-named-template"),
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut |_| panic!("empty plan must not call a provider"),
+    )?;
+    let source = b"attempt identity source packet\n";
+    fs::write(repo.join("source.diff"), source)?;
+    let inputs = vec![ResearcherSourceInput {
+        path: "source.diff".into(),
+        sha256: sha256_hex(source),
+    }];
+    for suffix in ["extra", "2"] {
+        for role in ["worker", "researcher"] {
+            for numbered in [false, true] {
+                let sibling = format!("research.attempt-{suffix}");
+                let run_id =
+                    RunId::new(format!("attempt-named-{orphan}-{suffix}-{role}-{numbered}"))?;
+                let mut writer = ArtifactRunWriter::reserve(
+                    &repo,
+                    RunArtifactFamily::Supervise,
+                    run_id.clone(),
+                    "test",
+                )?;
+                let dirs = RunDirs::for_writer(&writer);
+                writer.write_json(
+                    "assignments/supervisor-plan.json",
+                    &json!({"assignments": [
+                        {"id": "research", "role": "researcher", "source_inputs": inputs},
+                        {"id": sibling, "role": role,
+                         "source_inputs": if role == "researcher" { inputs.clone() } else { vec![] }}
+                    ]}),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+                // Keep the shorter task's numbered attempt beside each distinct ID.
+                // Attempt 3 avoids a filename collision with the plain numeric sibling.
+                for (id, task_role, attempt, use_number) in [
+                    ("research", "researcher", 3, true),
+                    (sibling.as_str(), role, 2, numbered),
+                ] {
+                    let artifacts = child_attempt_artifacts(
+                        &dirs,
+                        &dirs.run_dir.join("incoming"),
+                        &dirs.run_dir.join("capture"),
+                        id,
+                        attempt,
+                        use_number,
+                    );
+                    if orphan && id == sibling {
+                        // A retained diagnostic for an unrelated task must not be
+                        // mistaken for a missing summary of the source Researcher.
+                        writer.write_json(
+                            artifacts.command_record_relative.with_extension("target-containment.json"),
+                            &json!({
+                                "version": 1,
+                                "binding": {"run_id": run_id.as_str(), "task_id": id,
+                                    "parent": null, "attempt": attempt, "role": task_role,
+                                    "runtime": "codex", "command_summary": artifacts.command_record_relative},
+                                "command_summary_sha256": sha256_hex(b"missing"),
+                                "target_launch_attempted": false,
+                                "target_process_tree": {"status": "unknown"},
+                                "target_side_effects": {"status": "unknown"}
+                            }),
+                            ArtifactFileDisposition::PrivateEvidence,
+                        )?;
+                        continue;
+                    }
+                    let mut command = ExternalAgentCommand::codex(
+                        "provider-must-not-run",
+                        &repo,
+                        &artifacts.prompt_path,
+                        &artifacts.log_path,
+                        &artifacts.report_path,
+                        Duration::from_secs(1),
+                    )
+                    .with_agent_lifecycle(&repo, task_role, run_id.as_str(), id)
+                    .with_workspace_access(crate::process_runner::WorkspaceAccess::ReadOnly);
+                    command.assignment_process_launch_attempt = Some(attempt);
+                    let mut run = deterministic_fake_run(&command, Vec::new());
+                    if task_role == "researcher" {
+                        command.researcher_source_inputs = inputs.clone();
+                        command.read_only_input_files =
+                            inputs.iter().map(|input| repo.join(&input.path)).collect();
+                        // Probe outcomes are synthetic; no provider or sandbox is launched.
+                        attach_synthetic_receipts(&mut run, &command)?;
+                    }
+                    run.stdout.target_launch_attempted = true;
+                    super::super::target_containment::persist(
+                        &mut writer,
+                        &artifacts,
+                        &command,
+                        SupervisorRuntime::Codex,
+                        &run,
+                    )?;
+                }
+                let mut report = template.clone();
+                report.run_id = run_id.clone();
+                report.run_dir = RunArtifactFamily::Supervise
+                    .run_root()
+                    .join(run_id.as_str());
+                report.accepted = true;
+                report.publishable = true;
+                report.success = true;
+                report.rejected = false;
+                report.status = ReviewStatus::Succeeded;
+                report.runtime = SupervisorRuntime::Codex;
+                write_final_report(&mut writer, &report)?;
+                writer.finalize(
+                    RunArtifactFamily::Supervise.final_report_relative_path(),
+                    true,
+                )?;
+                let collected = collect_supervisor_run(&repo, run_id)?;
+                let should_accept = !orphan || role != "researcher";
+                assert_eq!(collected.accepted, should_accept,
+                    "orphan={orphan}, id={sibling}, role={role}, numbered={numbered}: {collected:?}");
+                assert_eq!(
+                    collected.collection_state,
+                    if should_accept {
+                        SupervisorCollectState::Finalized
+                    } else {
+                        SupervisorCollectState::InconsistentFinalized
+                    }
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervise_collect_researcher_receipt_ownership_uses_bound_attempt_named_id() -> Result<()> {
+    collect_attempt_named_assignments(false)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn supervise_collect_researcher_receipt_orphans_use_bound_attempt_named_id() -> Result<()> {
+    collect_attempt_named_assignments(true)
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {

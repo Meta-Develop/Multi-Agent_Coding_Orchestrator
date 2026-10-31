@@ -304,13 +304,20 @@ pub(super) fn verify_researcher_inputs(
         else {
             continue;
         };
-        if declarations.keys().any(|id| {
-            stem == format!("{id}.summary")
-                || (stem.starts_with(&format!("{id}.attempt-")) && stem.ends_with(".summary"))
-        }) && !files
-            .iter()
-            .any(|candidate| candidate.path == file.path.with_file_name(format!("{stem}.json")))
+        if !stem.ends_with(".summary")
+            || files
+                .iter()
+                .any(|candidate| candidate.path == file.path.with_file_name(format!("{stem}.json")))
         {
+            continue;
+        }
+        if file.bytes > MAX_RECEIPT_BYTES as u64
+            || file.disposition != ArtifactFileDisposition::PrivateEvidence
+        {
+            bail!("orphan target receipt must be bounded private evidence");
+        }
+        let receipt: TargetContainmentReceipt = serde_json::from_slice(&reader.read(&file.path)?)?;
+        if declarations.contains_key(&receipt.binding.task_id) {
             bail!("Researcher target receipt lacks its process summary");
         }
     }
@@ -321,11 +328,46 @@ pub(super) fn verify_researcher_inputs(
         let Some(name) = file.path.file_name().and_then(|name| name.to_str()) else {
             continue;
         };
-        let expected = declarations.iter().find(|(id, _)| {
-            name == format!("{id}.summary.json")
-                || (name.starts_with(&format!("{id}.attempt-")) && name.ends_with(".summary.json"))
-        });
+        if !name.ends_with(".summary.json") {
+            continue;
+        }
+        let relative = receipt_path(&file.path);
+        let bound_receipt = if let Some(record) = files.iter().find(|file| file.path == relative) {
+            if record.bytes > MAX_RECEIPT_BYTES as u64
+                || record.disposition != ArtifactFileDisposition::PrivateEvidence
+            {
+                bail!("target receipt must be bounded private evidence");
+            }
+            let bytes = reader.read(&relative)?;
+            let receipt: TargetContainmentReceipt = serde_json::from_slice(&bytes)?;
+            Some((bytes, receipt))
+        } else {
+            None
+        };
+        // Task IDs may themselves contain `.attempt-`, including numeric suffixes.
+        // Only the authenticated binding identifies the owner of an existing receipt.
+        let expected = bound_receipt
+            .as_ref()
+            .and_then(|(_, receipt)| declarations.get_key_value(&receipt.binding.task_id));
         let Some((id, inputs)) = expected else {
+            // Without a binding, fail closed for any exact canonical source filename.
+            // This is only a missing-evidence check, never an ownership decision.
+            let stem = name.strip_suffix(".summary.json").expect("summary suffix");
+            let source_filename = declarations.contains_key(stem)
+                || stem.rsplit_once(".attempt-").is_some_and(|(id, number)| {
+                    number.parse::<usize>().is_ok_and(|attempt| {
+                        attempt > 0
+                            && number == attempt.to_string()
+                            && declarations.contains_key(id)
+                    })
+                });
+            if bound_receipt.is_none()
+                && file.path.parent() == Some(Path::new("logs"))
+                && source_filename
+            {
+                bail!("Researcher input summary lacks its bound target receipt");
+            }
+
             if name.ends_with(".summary.json") {
                 if file.bytes > MAX_SUPERVISOR_REPORT_BYTES as u64 {
                     bail!("process summary exceeds its byte limit");
@@ -348,19 +390,10 @@ pub(super) fn verify_researcher_inputs(
             bail!("Researcher input summary must be bounded private evidence");
         }
         let summary = reader.read(&file.path)?;
-        let relative = receipt_path(&file.path);
-        let record = files
-            .iter()
-            .find(|file| file.path == relative)
+        let (bytes, receipt) = bound_receipt
+            .as_ref()
             .context("Researcher input summary lacks its bound target receipt")?;
-        if record.bytes > MAX_RECEIPT_BYTES as u64
-            || record.disposition != ArtifactFileDisposition::PrivateEvidence
-        {
-            bail!("Researcher target receipt must be bounded private evidence");
-        }
-        let bytes = reader.read(&relative)?;
-        let receipt: TargetContainmentReceipt = serde_json::from_slice(&bytes)?;
-        validate(&bytes, &receipt.binding, &summary)?;
+        validate(bytes, &receipt.binding, &summary)?;
         if receipt.binding.run_id != report.run_id.as_str()
             || receipt.binding.task_id != *id
             || receipt.binding.role != "researcher"
