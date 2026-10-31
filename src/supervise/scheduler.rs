@@ -2493,6 +2493,13 @@ fn complete_role_usage_reports(
     reports
 }
 
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn complete_role_usage_reports_for_test(
+    reports: BTreeMap<AgentRole, RoleUsageReport>,
+) -> BTreeMap<AgentRole, RoleUsageReport> {
+    complete_role_usage_reports(reports)
+}
+
 fn resolved_role_execution_bindings(
     plan: &SupervisorPlan,
     runtime: SupervisorRuntime,

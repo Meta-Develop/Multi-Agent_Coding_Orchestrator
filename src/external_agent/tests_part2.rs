@@ -920,6 +920,140 @@ printf 'A\377B\n'
         Ok(())
     }
 
+    // Private output staging requires Linux, in addition to Unix signals and PIDs.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn run_codex_batch_silent_child(last_message: Option<&str>) -> Result<ExternalAgentRun> {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir()?;
+        create_mandatory_control_roots(temp.path())?;
+        let agent = temp.path().join("fake-agent.sh");
+        fs::write(
+            &agent,
+            r#"#!/bin/sh
+set -eu
+printf '%s\n' "$@" > actual-argv
+report=
+while [ "$#" -gt 0 ]; do
+    if [ "$1" = "--output-last-message" ]; then
+        shift
+        report=$1
+    fi
+    shift
+done
+cat >/dev/null
+printf '%s\n' "$$" > parent.pid
+if [ -f partial-report.json ]; then
+    cat partial-report.json > "$report"
+    printf '%s\n' '{"type":"turn.completed","usage":{"input_tokens":7,"output_tokens":3}}'
+fi
+sh -c 'trap "" TERM; printf "%s\n" "$$" > descendant.pid; sleep 2; touch delayed-marker; while :; do sleep 1; done' &
+wait
+"#,
+        )?;
+        fs::set_permissions(&agent, fs::Permissions::from_mode(0o755))?;
+        if let Some(message) = last_message {
+            fs::write(temp.path().join("partial-report.json"), message)?;
+        }
+        let prompt = temp.path().join("prompt.txt");
+        fs::write(&prompt, "read-only planning Worker fixture\n")?;
+        let output_dir = temp.path().join("incoming");
+        fs::create_dir(&output_dir)?;
+        fs::set_permissions(&output_dir, fs::Permissions::from_mode(0o700))?;
+        let spec = ExternalAgentCommand::codex(
+            &agent,
+            temp.path(),
+            &prompt,
+            output_dir.join("events.jsonl"),
+            output_dir.join("last-message.txt"),
+            Duration::from_secs(1),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_codex_native_delegation_disabled();
+        // Planning can dispatch a read-only terminal Worker. Prove that this
+        // equivalent verified shape still misses every app-server selector.
+        let verified_shape = spec.clone().with_agent_lifecycle(
+            temp.path(),
+            "worker",
+            "silent-batch-run",
+            "silent-batch-worker",
+        );
+        assert!(!should_use_read_only_terminal_app_server(
+            &verified_shape,
+            ExternalExecutionRuntime::Verified,
+        ));
+        assert_eq!(
+            classify_managed_worker_app_server(&verified_shape, ExternalExecutionRuntime::Verified),
+            Ok(false)
+        );
+        assert_eq!(
+            classify_managed_readonly_app_server(&verified_shape, ExternalExecutionRuntime::Verified),
+            Ok(None)
+        );
+
+        let cleanup_allowance = Duration::from_secs(2);
+        let started = Instant::now();
+        let run = run_external_agent_nonpublishable_simulation(&spec);
+        assert!(
+            started.elapsed() < spec.timeout + cleanup_allowance,
+            "silent batch exceeded timeout plus cleanup allowance: {run:?}"
+        );
+        let argv = fs::read_to_string(temp.path().join("actual-argv"))?;
+        let argv = argv.lines().collect::<Vec<_>>();
+        assert!(argv.contains(&"exec"), "actual argv: {argv:?}");
+        assert!(argv.contains(&"--json"), "actual argv: {argv:?}");
+        assert!(!argv.contains(&"app-server"), "actual argv: {argv:?}");
+        assert!(run.timed_out, "silent batch must time out: {run:?}");
+        assert!(
+            run.error.as_deref().is_some_and(|error| error.contains("timed out")),
+            "timeout must have an explicit error: {run:?}"
+        );
+        assert!(!run.publishable);
+        assert!(!run.succeeded());
+        assert!(!run.simulation_succeeded());
+        assert_eq!(
+            run.output_last_message().unwrap_or_default(),
+            last_message.unwrap_or_default().as_bytes()
+        );
+        if last_message.is_some() {
+            let usage = codex_usage_from_jsonl(run.stdout_bytes())?.expect("partial usage retained");
+            assert_eq!(usage.total_tokens, 10);
+        } else {
+            assert!(run.stdout_bytes().is_empty());
+        }
+        // The runner reaps its direct child; an orphan's adopter can reap later.
+        // Share one finite grace period across both PIDs and require ESRCH.
+        let reaping_deadline = Instant::now() + cleanup_allowance;
+        for name in ["parent.pid", "descendant.pid"] {
+            let pid = fs::read_to_string(temp.path().join(name))?
+                .trim()
+                .parse::<libc::pid_t>()?;
+            loop {
+                let result = unsafe { libc::kill(pid, 0) };
+                let error = std::io::Error::last_os_error();
+                if result == -1 && error.raw_os_error() == Some(libc::ESRCH) {
+                    break;
+                }
+                assert!(
+                    Instant::now() < reaping_deadline,
+                    "{name} {pid} survived cleanup allowance: kill={result}, error={error}"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        // Wait beyond the descendant's delayed write, even if timeout happened early.
+        std::thread::sleep(Duration::from_millis(2100));
+        assert!(!temp.path().join("delayed-marker").exists());
+        Ok(run)
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn codex_batch_silent_child_times_out_and_reaps() -> Result<()> {
+        run_codex_batch_silent_child(None)?;
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn run_external_agent_finalizes_descendant_holding_output_pipes() -> Result<()> {

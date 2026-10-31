@@ -13399,3 +13399,6 @@ mod tests;
 
 #[cfg(all(test, unix))]
 pub(crate) use tests::claude_identity::record_claude_completion_for_test;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use tests::run_codex_batch_silent_child;
