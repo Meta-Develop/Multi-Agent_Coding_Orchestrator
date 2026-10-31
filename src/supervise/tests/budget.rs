@@ -1191,9 +1191,9 @@ fn exercise_researcher_parent_review_evidence_gate(case: &str) {
         let mut run = injected_verified_run(command);
         let started = CommandExecutionSnapshot {
             command: if case == "forged" {
-                "true"
+                "/bin/bash -lc true"
             } else {
-                "git status"
+                "/bin/bash -lc 'git status'"
             }
             .to_string(),
             cwd: command.cwd.to_string_lossy().into_owned(),
@@ -1498,7 +1498,7 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
         write_injected_json(&command.output_last_message, &wire);
         let mut run = injected_verified_run(command);
         let started = CommandExecutionSnapshot {
-            command: "git status".to_string(),
+            command: "/bin/bash -lc 'git status'".to_string(),
             cwd: command.cwd.to_string_lossy().into_owned(),
             status: CommandExecutionStatus::InProgress,
             exit_code: None,

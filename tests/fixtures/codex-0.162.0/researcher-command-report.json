@@ -1,0 +1,136 @@
+{
+  "accepted": true,
+  "assigned_paths": [
+    "examples/supervise/qualification-data/source-packet.md"
+  ],
+  "audit_reports": [],
+  "claim_token": 1,
+  "commands_run": [
+    {
+      "command": [
+        "/bin/bash -c 'nl -ba examples/supervise/qualification-data/source-packet.md'"
+      ],
+      "cwd": "/workspace",
+      "duration_ms": 0,
+      "environment_failures": [],
+      "environment_preflight_results": [],
+      "error": null,
+      "exit_code": 0,
+      "sandbox_denials": [],
+      "status": "succeeded",
+      "stderr": "",
+      "stdout": "",
+      "timed_out": false,
+      "timeout_seconds": 0
+    },
+    {
+      "command": [
+        "/bin/bash -c 'ps -p $$ -o args=; :'"
+      ],
+      "cwd": "/workspace",
+      "duration_ms": 0,
+      "environment_failures": [],
+      "environment_preflight_results": [],
+      "error": null,
+      "exit_code": 0,
+      "sandbox_denials": [],
+      "status": "succeeded",
+      "stderr": "",
+      "stdout": "",
+      "timed_out": false,
+      "timeout_seconds": 0
+    }
+  ],
+  "decomposition_completions": [],
+  "environment_failures": [],
+  "field_guide_entries": [],
+  "files_changed": [],
+  "findings": [
+    {
+      "message": "Case 1 — admit, lines 10–15: the admission predicate at line 11 ignores ledger.reserved. Starting with ceiling=100, consumed=0 and reserved=0, admit(A,60) succeeds and reserves 60; admit(B,60) also evaluates 0+60<=100 and succeeds, leaving reserved=120. Admission must atomically check consumed+reserved+estimate<=ceiling and insert the reservation/update its aggregate. The check and mutation must share a transaction or lock; merely correcting the expression would still permit concurrent admissions to read the same capacity. Estimates must be nonnegative and reservation ids must not overwrite existing or settled invocations.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "error"
+    },
+    {
+      "message": "Case 2 — observe, lines 17–18, and complete, lines 20–23: line 18 adds each cumulative total, and line 22 adds the terminal total again. With successful report persistence, observations 20,35,35 produce consumed=20,55,90; completion with 40 produces consumed=130 for an invocation whose trustworthy total is 40. Track the previously charged cumulative amount per reservation and apply only new usage: increments 20,15,0,5 total 40. Duplicate or stale observations must not increase consumption; an inconsistent terminal total below already charged usage needs explicit reconciliation rather than a negative adjustment or silent reset.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "error"
+    },
+    {
+      "message": "Case 3 — complete, lines 20–23: persist_report at line 21 precedes both accounting changes. For an admitted A=60 with no observations, terminal usage 40 followed by an I/O exception leaves consumed=0, reserved=60 and active[A]=60 because lines 22–23 are skipped. Accounting settlement must be independent of report persistence: atomically record the terminal accounting transition and reservation release before, or through a recovery protocol independent of, the report write. Record report failure separately and prevent a passing candidate outcome. The snippet contains no candidate-selection implementation, so the required rejection behavior cannot be verified from this source.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "error"
+    },
+    {
+      "message": "Case 4 — complete, lines 20–23, especially line 22: after admitting A=60, complete(A,None,report) with successful persistence adds zero and releases the reservation, leaving consumed=0 and reserved=0 despite unknown actual usage. For example, actual usage of 80 would be entirely absent from that state. Replace truthiness coercion with explicit known/unknown handling; known zero is valid, while unknown must remain a durable uncertainty state alongside any trustworthy lower bound. A terminal unknown invocation may close its active reservation exactly once, but that closure must not clear uncertainty or permit guarantees requiring complete usage. Retaining an estimate alone cannot establish an upper bound on unknown usage.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "error"
+    },
+    {
+      "message": "Case 5 — complete, lines 20–23: a successful first completion with usage 40 leaves consumed=40, reserved=0 and no active[A]. If restart restores that state without a settled-id record, redelivery with successful report persistence increments consumed to 80 at line 22, then pop(A) raises KeyError at line 23. This demonstrates duplicate charging before the missing-key failure under an explicit restoration assumption. No restart or reconstruction code is present. With a correctly keyed dictionary, pop(A) cannot remove a distinct-key reservation B; claiming otherwise would require an unshown id-reuse or reconstruction defect. Persist settled identities, forbid id reuse, and check terminal state before any duplicate accounting or report side effect.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "error"
+    },
+    {
+      "message": "Recommended accounting invariant for admit/observe/complete, lines 10–23: consumed equals the sum of trustworthy amounts charged once per invocation; reserved equals the sum of remaining holds for active invocations. One coherent policy sets each active hold to max(estimate−charged_cumulative,0), updating the charged amount and hold atomically on observation. Terminal settlement charges only the remaining trustworthy delta and releases the remaining hold once. Unknown terminal usage retains an explicit uncertainty marker that blocks guarantees requiring complete accounting. Admission uses this same accounting convention atomically. Because line 5 defines reservations as estimates, actual usage can exceed a reservation; a hard ceiling additionally requires enforced usage limits or proven upper bounds.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "info"
+    },
+    {
+      "message": "Recommended ordering and idempotency invariant for complete, lines 20–23: the durable terminal record, consumption delta, active-reservation removal, reserved aggregate, and known/unknown state form one atomic transition keyed by the stable reservation id. Commit that transition before acknowledging completion; recovery must restore both accounting and settled-id records. Repeated completion returns the recorded outcome without another charge or release, and late observations cannot resurrect a closed invocation. Report persistence and retries need a separate recorded outcome and idempotency key so report errors cannot skip settlement and replay cannot duplicate report effects. Candidate success requires the necessary report and usage-completeness conditions.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "info"
+    },
+    {
+      "message": "Evidence boundary: the command channel returned all 42 numbered source lines. Lines 3–7 identify deliberately flawed review data and define the accounting contract; the functions occupy lines 10–23 and the requested cases occupy lines 28–37. The counterexamples above are static traces of that source, not executed scenario tests. Production integration, concurrency control, report-storage behavior, crash durability, reconstruction, and candidate rejection were not tested. The process inspection observed the host wrapper as /bin/bash -c; it provides command-format evidence only. Independent reviewers must inspect the cited source before implementation acceptance.",
+      "paths": [
+        "examples/supervise/qualification-data/source-packet.md"
+      ],
+      "severity": "info"
+    }
+  ],
+  "id": "source-packet-researcher",
+  "next_safe_action": "Have independent reviewers verify the cited source ranges and proposed invariants. Then have the implementation owner provide executable accounting and recovery behavior with checks for the five counterexamples, concurrent admission, and crash/replay boundaries.",
+  "no_further_delegation": true,
+  "read_only": true,
+  "rejected": false,
+  "remaining_risk": "Inspection succeeded, but the packet is illustrative code and no runtime scenarios were executed. Durable settlement, restart reconstruction, concurrent admission, uncertainty handling, report retry effects, and candidate rejection remain unverified. Estimates alone cannot guarantee a hard consumption ceiling.",
+  "role": "researcher",
+  "semantic_intent_token": null,
+  "semantic_modules": [],
+  "semantic_symbols": [],
+  "status": "succeeded",
+  "validation_results": [
+    {
+      "command": [
+        "/bin/bash -c 'nl -ba examples/supervise/qualification-data/source-packet.md'"
+      ],
+      "message": "Successfully read all 42 numbered lines, including the contract, all three functions, and all five review cases.",
+      "name": "Assigned source inspection",
+      "status": "succeeded"
+    },
+    {
+      "command": [
+        "/bin/bash -c 'ps -p $$ -o args=; :'"
+      ],
+      "message": "Observed /bin/bash -c as the host-added shell wrapper. This validates command representation, not ledger behavior.",
+      "name": "Host command wrapper observation",
+      "status": "succeeded"
+    }
+  ],
+  "worker_reports": []
+}
