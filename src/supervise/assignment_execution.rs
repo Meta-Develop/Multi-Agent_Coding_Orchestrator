@@ -7584,16 +7584,26 @@ fn parent_terminal_reject_is_attributable(
 fn parent_terminal_rejection_class(
     report: &OrchestratorReviewReport,
 ) -> crate::selection::FailureClass {
-    // A timeout proves that the bounded invocation did not finish. Even when
-    // its empty report/diff correctly fails review, it does not identify why
-    // the native runtime stalled or establish a model-quality failure.
-    if report.commands_run.iter().any(|command| {
-        command.timed_out
-            || command
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("Grok native inference failure tail ("))
-    }) {
+    // A procedural denial or unfinished review does not establish a
+    // model-quality failure, even when the resulting empty report fails review.
+    if report
+        .gate_denials
+        .iter()
+        .any(gate_denial_is_non_quality_failure)
+        || report
+            .review_lens_aggregate
+            .as_ref()
+            .is_some_and(|aggregate| {
+                aggregate.decision == ReviewAggregationDecision::ProceduralFailure
+            })
+        || report.commands_run.iter().any(|command| {
+            command.timed_out
+                || command
+                    .error
+                    .as_deref()
+                    .is_some_and(|error| error.contains("Grok native inference failure tail ("))
+        })
+    {
         crate::selection::FailureClass::Unknown
     } else {
         crate::selection::FailureClass::ModelQuality
@@ -7638,7 +7648,28 @@ fn parent_auditor_rejection_kind(
     let rejecting = child_report
         .audit_reports
         .iter()
-        .filter(|report| is_parent_auditor_id(assignment, &report.id) && report_failed(*report))
+        .filter(|report| {
+            if !is_parent_auditor_id(assignment, &report.id) || report.rejection_kind.is_none() {
+                return false;
+            }
+            // The parent-computed verdict owns admission, including rejecting
+            // reports whose status/flags alone would look inconsistent.
+            if let Some(aggregate) = child_report.review_lens_aggregate.as_ref() {
+                report
+                    .id
+                    .strip_prefix(&format!("{}-review-auditor-lens-", assignment.id))
+                    .and_then(|index| index.parse::<usize>().ok())
+                    .and_then(|index| aggregate.lens_verdicts.get(index))
+                    .is_some_and(|verdict| {
+                        verdict.effective_verdict == ReviewLensVerdictStatus::Reject
+                    })
+            } else {
+                // Legacy single-auditor reports have no stacked verdict.
+                !report.accepted
+                    && (report.rejected || report.status == ReviewStatus::Rejected)
+                    && matches!(report.status, ReviewStatus::Rejected | ReviewStatus::Failed)
+            }
+        })
         .collect::<Vec<_>>();
     if !rejecting.is_empty()
         && rejecting
@@ -7671,6 +7702,9 @@ fn decide_parent_auditor_gate(
 ) -> Result<ParentAuditorGateDisposition> {
     let AssignmentExecutionContext { artifacts, .. } = context;
     let assignment = &preflight.assignment;
+    // A child gate may have stopped before parent review was eligible. Its
+    // absent auditor is not another review failure and must keep that denial.
+    let parent_review_pending = !report_failed(&child_report) || pre_auditor_candidate.is_some();
     if child_containment_verified
         && child_report.environment_failures.is_empty()
         && !auditor_environment_blocked
@@ -7683,14 +7717,28 @@ fn decide_parent_auditor_gate(
         .as_ref()
         .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
         .unwrap_or_else(|| {
-            child_report
+            let mut parent_reports = child_report
                 .audit_reports
                 .iter()
-                .any(|report| report.id == parent_auditor_id(assignment) && report_failed(report))
+                .filter(|report| is_parent_auditor_id(assignment, &report.id))
+                .peekable();
+            (parent_review_pending
+                && parent_reports.peek().is_none()
+                && parent_auditor_required(assignment, &child_report))
+                || parent_reports.any(report_failed)
         });
     let auditor_rejection_kind = parent_auditor_rejection_kind(assignment, &child_report);
+    let procedural_failure = parent_auditor_failed && auditor_rejection_kind.is_none();
+    let procedural_budget = if procedural_failure {
+        Some(context.budget_ledger.report()?).filter(|budget| !budget.new_dispatch_allowed)
+    } else {
+        None
+    };
+    // Missing review evidence can only request a bounded re-audit of the
+    // preserved candidate. It cannot authorize changing the child's files.
     let evidence_only_rejection = parent_auditor_failed
-        && auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality);
+        && (auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality)
+            || (procedural_failure && procedural_budget.is_none()));
     if parent_auditor_repair_eligible(
         parent_auditor_failed,
         assignment_containment_verified,
@@ -7704,20 +7752,45 @@ fn decide_parent_auditor_gate(
             .as_ref()
             .context("gate correction tracker was not initialized")?
             .correlation_id_for_observation(&assignment.id);
+        let (reason, source) = if let Some(budget) = procedural_budget.as_ref() {
+            let denial = if budget
+                .reasons
+                .contains(&BudgetReason::HardTokenCeilingReached)
+            {
+                BudgetAdmissionDenial::HardTokenCeiling
+            } else if budget
+                .reasons
+                .contains(&BudgetReason::HardCostCeilingReached)
+            {
+                BudgetAdmissionDenial::HardCostCeiling
+            } else {
+                BudgetAdmissionDenial::NewDispatchStopped
+            };
+            (
+                GateDenialReason::BudgetAdmission { denial },
+                GateCheckSource::BudgetAdmission,
+            )
+        } else {
+            (
+                GateDenialReason::AuditorRepair {
+                    rejection: auditor_rejection_kind
+                        .unwrap_or(AuditorRejectionKind::EvidenceQuality),
+                },
+                GateCheckSource::Auditor,
+            )
+        };
+        let paths = if procedural_failure {
+            &[][..]
+        } else {
+            &assignment.assigned_paths
+        };
         let denial = GateDenial::new(
             correction_correlation_id,
-            GateDenialReason::AuditorRepair {
-                rejection: auditor_rejection_kind
-                    .unwrap_or(AuditorRejectionKind::ImplementationDefect),
-            },
-            VerifiedGateContext::new(
-                &assignment.id,
-                GateCheckSource::Auditor,
-                &assignment.assigned_paths,
-            )?,
+            reason,
+            VerifiedGateContext::new(&assignment.id, source, paths)?,
         )
         .context("failed to construct parent-auditor gate denial")?;
-        if evidence_only_rejection {
+        if evidence_only_rejection || procedural_failure {
             outcome
                 .gate_tracker
                 .as_mut()
@@ -10052,6 +10125,30 @@ mod decomposition_tests {
         exercise_captured_child_boundary("drop");
     }
 
+    #[test]
+    fn parent_lens_budget_interruption_is_not_child_repair() {
+        exercise_captured_child_boundary("lens-budget");
+    }
+
+    #[test]
+    fn parent_lens_untyped_failure_is_not_child_repair() {
+        exercise_captured_child_boundary("lens-untyped");
+        exercise_captured_child_boundary("lens-absent");
+        exercise_captured_child_boundary("lens-legacy-absent");
+    }
+
+    #[test]
+    fn parent_lens_invalid_typed_report_is_not_child_repair() {
+        exercise_captured_child_boundary("lens-invalid");
+    }
+
+    #[test]
+    fn parent_lens_explicit_substantive_rejections_keep_their_kind() {
+        exercise_captured_child_boundary("lens-implementation");
+        exercise_captured_child_boundary("lens-implementation-succeeded");
+        exercise_captured_child_boundary("lens-evidence");
+    }
+
     fn exercise_captured_child_boundary(case: &str) {
         let temp = tempfile::tempdir().expect("temporary phase fixture");
         let repo = temp.path().join("repo");
@@ -10084,7 +10181,9 @@ mod decomposition_tests {
             max_depth: 2,
             max_child_assignments: 1,
             max_child_retries: 0,
-            max_gate_corrections: 0,
+            max_gate_corrections: u8::from(
+                case.starts_with("lens-") && !case.starts_with("lens-implementation"),
+            ),
             child_timeout_seconds: 10,
             semantic_coordination: SemanticCoordinationMode::Off,
             role_models: BTreeMap::new(),
@@ -10135,8 +10234,11 @@ mod decomposition_tests {
             flattened_index: 0,
         }];
         let field_guide = SupervisorFieldGuidePrompt::empty().expect("empty fixture field guide");
-        let budget_ledger =
-            RunBudgetLedger::new(RunBudgetLimits::default()).expect("fixture budget ledger");
+        let budget_ledger = RunBudgetLedger::new(RunBudgetLimits {
+            hard_tokens: (case == "lens-budget").then_some(240_000),
+            ..RunBudgetLimits::default()
+        })
+        .expect("fixture budget ledger");
         // Fake catalog hides the slug; the provisional default (sol) is still
         // configured capability evidence. Runtime-default with no configured
         // model would be refused.
@@ -10417,6 +10519,166 @@ mod decomposition_tests {
         assert!(auditor_collection.containment_verified);
         assert_eq!(child_report.audit_reports.len(), 1);
 
+        if case.starts_with("lens-") {
+            // Replay two admitted accepts and a third lens that either rejects
+            // explicitly or fails before a usable report is admitted.
+            let template = child_report.audit_reports[0].clone();
+            child_report.audit_reports.clear();
+            let mut requests = Vec::new();
+            let mut verdicts = Vec::new();
+            for (index, lens) in plan.review_lenses.iter().enumerate() {
+                let request = build_review_lens_request(
+                    lens,
+                    ReviewLensRequestSources {
+                        child_transcript: "retained child transcript",
+                        diff: "retained diff",
+                        output_report: &output_report,
+                    },
+                )
+                .unwrap();
+                let mut report = template.clone();
+                report.id = review_lens_auditor_id(&assignment, index);
+                report.accepted = index < 2;
+                report.rejected = index == 2 && case != "lens-implementation";
+                report.status = if index < 2 || case == "lens-implementation-succeeded" {
+                    ReviewStatus::Succeeded
+                } else if case == "lens-budget" {
+                    ReviewStatus::Missing
+                } else if case == "lens-invalid" {
+                    ReviewStatus::Failed
+                } else {
+                    ReviewStatus::Rejected
+                };
+                report.rejection_kind = if index < 2 {
+                    None
+                } else {
+                    match case {
+                        "lens-implementation"
+                        | "lens-implementation-succeeded"
+                        | "lens-invalid" => Some(AuditorRejectionKind::ImplementationDefect),
+                        "lens-evidence" => Some(AuditorRejectionKind::EvidenceQuality),
+                        _ => None,
+                    }
+                };
+                let verdict = if index < 2 {
+                    ReviewLensVerdictStatus::Accept
+                } else if matches!(
+                    case,
+                    "lens-implementation" | "lens-implementation-succeeded" | "lens-evidence"
+                ) {
+                    ReviewLensVerdictStatus::Reject
+                } else {
+                    ReviewLensVerdictStatus::ProceduralFailure
+                };
+                if index == 2 && case == "lens-implementation-succeeded" {
+                    let admitted = review_lens_verdict_from_auditor(
+                        lens,
+                        &request,
+                        &report.id,
+                        &report,
+                        report.commands_run.last().unwrap(),
+                        None,
+                        false,
+                    )
+                    .unwrap();
+                    assert_eq!(admitted.verdict, ReviewLensVerdictStatus::Reject);
+                    verdicts.push(admitted);
+                } else {
+                    verdicts.push(
+                        ReviewLensVerdict::for_lens(
+                            lens,
+                            request.request_binding.clone(),
+                            verdict,
+                            ReviewLensCoverage {
+                                worker_ids: required_coverage.worker_ids.clone(),
+                                paths: required_coverage.paths.clone(),
+                            },
+                            if verdict == ReviewLensVerdictStatus::ProceduralFailure {
+                                Vec::new()
+                            } else {
+                                vec![(
+                                    ReviewLensEvidenceKind::ModelReview,
+                                    "admitted report".into(),
+                                )]
+                            },
+                        )
+                        .unwrap(),
+                    );
+                }
+                requests.push(request);
+                if index < 2 || case != "lens-absent" {
+                    child_report.audit_reports.push(report);
+                }
+            }
+            let aggregate = aggregate_active_parent_review_lenses(
+                &plan,
+                &requests,
+                required_coverage.clone(),
+                verdicts,
+            )
+            .unwrap();
+            assert_eq!(aggregate.validated_accepts, 2);
+            if case == "lens-implementation-succeeded" {
+                assert_eq!(aggregate.decision, ReviewAggregationDecision::Reject);
+            }
+            assert_eq!(
+                aggregate.rejected_lenses,
+                usize::from(matches!(
+                    case,
+                    "lens-implementation" | "lens-implementation-succeeded" | "lens-evidence"
+                ))
+            );
+            child_report.review_lens_aggregate = Some(aggregate);
+            if case == "lens-legacy-absent" {
+                child_report.review_lens_aggregate = None;
+                child_report.audit_reports.clear();
+                child_report.files_changed = assignment.assigned_paths.clone();
+            }
+            child_report.accepted = false;
+            child_report.rejected = true;
+            child_report.status = ReviewStatus::Failed;
+            if case == "lens-legacy-absent" {
+                // The eligible child reached review; legacy validation must
+                // refuse its wholly absent auditor before accepting it.
+                child_report.accepted = true;
+                child_report.rejected = false;
+                child_report.status = ReviewStatus::Succeeded;
+            }
+            if case == "lens-budget" {
+                let admission = budget_ledger
+                    .reserve(BudgetReservationRequest {
+                        role: AgentRole::Auditor,
+                        tokens: 4_000,
+                        cost_usd: None,
+                    })
+                    .unwrap();
+                let reservation = admission.reservation().unwrap();
+                budget_ledger
+                    .live_token_grant(reservation.id)
+                    .unwrap()
+                    .unwrap()
+                    .exhaust();
+                budget_ledger
+                    .reconcile(
+                        reservation.id,
+                        UsageMeasurement::Estimated {
+                            tokens: 14_887,
+                            cost_usd: None,
+                        },
+                    )
+                    .unwrap();
+                child_report.commands_run.push(
+                    serde_json::from_value(serde_json::json!({
+                        "command": ["codex", "app-server"], "cwd": "review",
+                        "exit_code": 255, "status": "failed", "timeout_seconds": 1200,
+                        "duration_ms": 21496, "timed_out": false,
+                        "error": "remaining token grant exhausted"
+                    }))
+                    .unwrap(),
+                );
+            }
+        }
+        let budget_before_gate = budget_ledger.report().unwrap();
         let (child_report, candidate, containment_verified) = match decide_parent_auditor_gate(
             &context,
             &mut outcome,
@@ -10443,6 +10705,67 @@ mod decomposition_tests {
                 panic!("auditor gate unexpectedly retried")
             }
         };
+        if case.starts_with("lens-") {
+            assert!(!child_report.accepted);
+            assert!(child_report.rejected);
+            assert_eq!(child_report.gate_denials.len(), 1);
+            let denial = &child_report.gate_denials[0];
+            assert_eq!(
+                denial.route,
+                crate::gate_denial::GateDenialRoute::ChildController
+            );
+            if case == "lens-budget" {
+                assert_eq!(
+                    denial.reason,
+                    GateDenialReason::BudgetAdmission {
+                        denial: BudgetAdmissionDenial::HardTokenCeiling,
+                    }
+                );
+                assert_eq!(
+                    denial.next_safe_operation,
+                    crate::gate_denial::NextSafeOperation::ReviewRunBudgetAndStartNewRun
+                );
+                assert_eq!(denial.retryability, GateRetryability::NotRetryable);
+                assert!(!budget_before_gate.new_dispatch_allowed);
+            } else {
+                let rejection = if case.starts_with("lens-implementation") {
+                    AuditorRejectionKind::ImplementationDefect
+                } else {
+                    AuditorRejectionKind::EvidenceQuality
+                };
+                assert_eq!(denial.reason, GateDenialReason::AuditorRepair { rejection });
+                assert_eq!(
+                    denial.next_safe_operation,
+                    if case.starts_with("lens-implementation") {
+                        crate::gate_denial::NextSafeOperation::RepairAuditorFindings
+                    } else {
+                        crate::gate_denial::NextSafeOperation::EvidenceOnlyReaudit
+                    }
+                );
+            }
+            if !matches!(
+                case,
+                "lens-implementation" | "lens-implementation-succeeded" | "lens-evidence"
+            ) {
+                assert!(denial.context.paths.is_empty());
+                assert_eq!(
+                    parent_terminal_rejection_class(&child_report),
+                    crate::selection::FailureClass::Unknown
+                );
+                assert!(!parent_terminal_reject_is_attributable(
+                    &child_report,
+                    false,
+                    false,
+                    false,
+                    false
+                ));
+            }
+            assert!(retry_feedback.is_none());
+            let mut budget_after_gate = budget_ledger.report().unwrap();
+            budget_after_gate.elapsed_seconds = budget_before_gate.elapsed_seconds;
+            assert_eq!(budget_after_gate, budget_before_gate);
+            assert_eq!(outcome.gate_tracker.as_ref().unwrap().used, 0);
+        }
         assert!(containment_verified);
         publish_assignment_report(
             &context,
