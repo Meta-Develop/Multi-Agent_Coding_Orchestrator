@@ -97,6 +97,7 @@ pub(super) fn interrupt_returned_worker(
         },
     );
     run.retain_app_server_parent_evidence_for_test();
+    run.retain_live_budget_invocation_for_test(command);
     assert!(!run.authenticated_app_server_usage_complete());
     if case == CHECKPOINT_FAILURE_CASE {
         super::super::checkpoint::install_checkpoint_failure(

@@ -2670,6 +2670,7 @@ const CONSERVATIVE_GENERATED_ROLE_RESERVATION_TOKENS: usize = 1_024;
 
 fn conservative_generated_role_budget() -> SupervisorBudgetConfig {
     SupervisorBudgetConfig {
+        worker_live_token_limits: BTreeMap::new(),
         limits: RunBudgetLimits::default(),
         role_token_reservations: BTreeMap::from([
             (
@@ -6379,7 +6380,7 @@ pub fn resume_supervisor_run(
         });
     }
 
-    let (mut checkpoint, snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
+    let (mut checkpoint, mut snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
         Ok(opened) => opened,
         Err(error) => {
             return resume_refusal(
@@ -6393,6 +6394,9 @@ pub fn resume_supervisor_run(
             )
         }
     };
+    snapshot.reconcile_live_budget(&mut checkpoint)?;
+    let recovered_live_budget =
+        (!snapshot.run_budget.dispatch_bindings.is_empty()).then(|| snapshot.run_budget.clone());
     if !snapshot.uncertain_assignments.is_empty() {
         let denial = GateDenial::new(
             run_id.as_str(),
@@ -6411,8 +6415,8 @@ pub fn resume_supervisor_run(
             lifecycle: SupervisorRunLifecycle::Uncertain,
             success: false,
             resumed: false,
-            budget_reconciled_from_checkpoint: false,
-            run_budget: None,
+            budget_reconciled_from_checkpoint: recovered_live_budget.is_some(),
+            run_budget: recovered_live_budget,
             completed_assignments: snapshot.completed_assignments,
             pending_assignments: snapshot.pending_assignments,
             uncertain_assignments: snapshot.uncertain_assignments,
@@ -6422,7 +6426,7 @@ pub fn resume_supervisor_run(
         });
     }
     let Some(plan) = snapshot.final_report.as_ref() else {
-        return resume_refusal(
+        let mut refusal = resume_refusal(
             &run_id,
             SupervisorRunLifecycle::Interrupted,
             ResumeCheckpointDenial::UnsupportedLifecycle,
@@ -6430,7 +6434,10 @@ pub fn resume_supervisor_run(
             snapshot.pending_assignments,
             snapshot.uncertain_assignments,
             None,
-        );
+        )?;
+        refusal.budget_reconciled_from_checkpoint = recovered_live_budget.is_some();
+        refusal.run_budget = recovered_live_budget;
+        return Ok(refusal);
     };
     if snapshot.finalized {
         return resume_refusal(
@@ -6849,7 +6856,7 @@ pub fn collect_supervisor_run(
         ),
     };
 
-    let report = supervisor_collect_lifecycle_snapshot(
+    let mut report = supervisor_collect_lifecycle_snapshot(
         &repo,
         &run_dir,
         &final_report_path,
@@ -6862,6 +6869,13 @@ pub fn collect_supervisor_run(
             finding_message: "supervisor final report is missing",
         },
     );
+    if lifecycle != SupervisorRunLifecycle::Active {
+        if let Ok((_writer, snapshot)) = open_supervisor_checkpoint(&repo, &report.run_id) {
+            if !snapshot.run_budget.dispatch_bindings.is_empty() {
+                report.run_budget = Some(snapshot.run_budget);
+            }
+        }
+    }
     let report = SupervisorCollectReport::lifecycle_snapshot(
         report,
         SupervisorCollectState::from_lifecycle(lifecycle),

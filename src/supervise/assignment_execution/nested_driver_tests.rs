@@ -309,6 +309,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
     }
     let budget_config = SupervisorBudgetConfig {
+        worker_live_token_limits: BTreeMap::new(),
         role_token_reservations: BTreeMap::from([
             (
                 AgentRole::ChildOrchestrator,

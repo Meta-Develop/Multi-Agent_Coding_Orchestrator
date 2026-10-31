@@ -517,6 +517,7 @@ pub(super) fn execute_nested_worker_attempt(
         admission.revalidate(&authority, worker_id, &command)?;
         permit.revalidate(preflight, parent_attempt)?;
         super::runtime_executables::validate_launch(&command)?;
+        record_live_budget_admission(context.artifacts, &reservation, &command)?;
         reservation.mark_invoked_for_runtime(runtime)?;
         invoked = true;
         let mut review_journal = SupervisorPreActionJournalSink {
@@ -558,6 +559,8 @@ pub(super) fn execute_nested_worker_attempt(
         // No early return after invocation until accounting and evidence cleanup have
         // both been attempted. Unknown quiescence retains both private scratch roots.
         let settlement = reservation.settle_bound_runtime(&run, &command);
+        let budget_binding_persistence =
+            persist_live_budget_binding(context.artifacts, &reservation, true);
         let report = read_worker_report(run.output_last_message(), &artifacts.raw_report_relative)
             .and_then(|parsed| {
                 validate_report_binding(
@@ -605,6 +608,7 @@ pub(super) fn execute_nested_worker_attempt(
             outcome.usage_incomplete = true;
         }
         cleanup?;
+        budget_binding_persistence?;
         let primary_after = primary_worktree_snapshot(context.repo, context.execution_runtime)?;
         if primary_after.inspection_problem().is_some()
             || !primary_integrity_changes(&primary_before, &primary_after).is_empty()
@@ -929,7 +933,7 @@ mod tests {
             plan.child_timeout_seconds = 300;
         }
         let subject = terminal_subject(&parent, "worker")?;
-        let run_id = RunId::new("nested-executor-test")?;
+        let run_id = RunId::new(format!("nested-executor-test-{case}"))?;
         let manager = WorktreeManager::new(&repo);
         let worktree = manager.create(crate::worktree::WorktreeCreateOptions {
             agent_id: parent.id.clone(),
@@ -1025,15 +1029,31 @@ mod tests {
             &mut writer,
             Path::new("schemas/worker-report.codex-output.schema.json"),
         )?;
+        let initial_budget = RunBudgetLedger::new(RunBudgetLimits::default())?.report()?;
+        let base = current_head_oid(&repo)?;
+        let mut checkpoint = SupervisorCheckpointWriter::create(
+            &repo,
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &base,
+                "a".repeat(64),
+                1,
+                &plan,
+                writer.resume_binding()?,
+                initial_budget.clone(),
+            ),
+        )?;
+        checkpoint.assignment_started(&parent, 0, None, initial_budget)?;
         let mut journal = initialize_orchestration_event_journal(&repo, &run_id, None);
         let mut kpis = AutonomyKpiCollector::default();
         let artifacts = Mutex::new(SharedSupervisorArtifacts {
             writer: &mut writer,
             journal: &mut journal,
             autonomy_kpis: &mut kpis,
-            checkpoint: None,
+            checkpoint: Some(&mut checkpoint),
         });
         let budget_config = SupervisorBudgetConfig {
+            worker_live_token_limits: BTreeMap::new(),
             role_token_reservations: BTreeMap::from([(AgentRole::Worker, 2)]),
             ..Default::default()
         };
@@ -1047,7 +1067,14 @@ mod tests {
                 hard_cost_usd: Some(1.0),
                 ..Default::default()
             }
-        } else if matches!(case, "live-budget" | "live-report" | "live-partial") {
+        } else if matches!(
+            case,
+            "live-budget"
+                | "live-report"
+                | "live-partial"
+                | "live-mismatch"
+                | "live-checkpoint-failure"
+        ) {
             RunBudgetLimits {
                 hard_tokens: Some(220_000),
                 ..Default::default()
@@ -1108,6 +1135,23 @@ mod tests {
             );
             assert!(command.assignment_messaging_launch().is_none());
             assert_eq!(command.worker_journal_artifacts.len(), 1);
+            if matches!(
+                case,
+                "live-budget"
+                    | "live-report"
+                    | "live-partial"
+                    | "live-mismatch"
+                    | "live-checkpoint-failure"
+            ) {
+                let budget = serde_json::to_value(ledger.report().unwrap()).unwrap();
+                let bindings = budget["dispatch_bindings"]
+                    .as_array()
+                    .expect("durable invocation/grant binding must exist before provider release");
+                assert_eq!(bindings.len(), 1);
+                assert_eq!(bindings[0]["invocation"]["assignment_id"], "worker");
+                assert_eq!(bindings[0]["grant_tokens"], 220_000);
+                assert!(run_dir.join("budget/dispatch-1.admitted.json").is_file());
+            }
             if case.starts_with("live-") {
                 assert!(
                     command.timeout > Duration::ZERO
@@ -1164,6 +1208,13 @@ mod tests {
                     command,
                     case == "live-partial",
                 );
+            }
+            if case == "live-mismatch" {
+                let mut changed = command.clone();
+                changed.bind_live_token_grant(None);
+                changed = changed.with_agent_parent("different-parent");
+                changed.bind_live_token_grant(command.live_token_grant_for_test().cloned());
+                run.retain_live_budget_invocation_for_test(&changed);
             }
             if matches!(case, "report" | "live-report") {
                 run.output_last_message = Some(b"{}".to_vec());
@@ -1319,6 +1370,9 @@ mod tests {
             .as_ref()
             .unwrap_or(&preflight)
             .issue_nested_turn(if case == "wrong-permit-attempt" { 2 } else { 1 })?;
+        if case == "live-checkpoint-failure" {
+            install_checkpoint_failure(run_id.as_str(), "live_budget_settled");
+        }
         let result = execute_nested_worker_attempt(
             &context,
             &preflight,
@@ -1413,6 +1467,8 @@ mod tests {
                         | "revoked-after"
                         | "live-report"
                         | "live-partial"
+                        | "live-mismatch"
+                        | "live-checkpoint-failure"
                 ))
             );
         }
@@ -1489,7 +1545,7 @@ mod tests {
         if case.starts_with("live-") {
             assert_eq!(
                 ledger.report()?.consumed.tokens,
-                37_000,
+                if case == "live-mismatch" { 2 } else { 37_000 },
                 "settlement must precede rejected report/drain handling"
             );
             if case == "live-partial" {
@@ -1504,10 +1560,50 @@ mod tests {
                 ));
             }
         }
+        if matches!(
+            case,
+            "live-budget"
+                | "live-report"
+                | "live-partial"
+                | "live-mismatch"
+                | "live-checkpoint-failure"
+        ) {
+            let budget = ledger.report()?;
+            let binding = &budget.dispatch_bindings[0];
+            assert_eq!(
+                binding.state,
+                crate::supervise_budget::BudgetDispatchState::Settled
+            );
+            assert_eq!(binding.invocation_verified, case != "live-mismatch");
+            assert_eq!(binding.charged_tokens, Some(budget.charges[0].tokens));
+            assert_eq!(budget.charges.len(), 1);
+            assert_eq!(binding.invocation.run_id, run_id.as_str());
+            assert_eq!(binding.invocation.attempt, 1);
+            let receipt: Value =
+                serde_json::from_slice(&fs::read(run_dir.join("budget/dispatch-1.settled.json"))?)?;
+            assert_eq!(receipt["binding"], serde_json::to_value(binding)?);
+        }
         assert_eq!(
             manager.list_managed_verified()?.len(),
             if case == "foreign-permit" { 2 } else { 1 }
         );
+        artifacts
+            .into_inner()
+            .map_err(|_| anyhow!("test artifacts poisoned"))?;
+        drop(checkpoint);
+        if matches!(
+            case,
+            "live-budget"
+                | "live-report"
+                | "live-partial"
+                | "live-mismatch"
+                | "live-checkpoint-failure"
+        ) {
+            open_supervisor_checkpoint(&repo, &run_id)?;
+            if case == "live-budget" {
+                verify_live_budget_checkpoint_tampering(&repo, &run_id)?;
+            }
+        }
         Ok(())
     }
 
@@ -1538,6 +1634,31 @@ mod tests {
             execution_fixture(case)?;
         }
         Ok(())
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_positive() -> Result<()> {
+        execution_fixture("live-budget")
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_rejected_completion() -> Result<()> {
+        execution_fixture("live-report")
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_checkpoint_failure() -> Result<()> {
+        execution_fixture("live-checkpoint-failure")
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_mismatch() -> Result<()> {
+        execution_fixture("live-mismatch")
+    }
+
+    #[test]
+    fn nested_worker_durable_budget_binding_partial_failure() -> Result<()> {
+        execution_fixture("live-partial")
     }
 
     #[test]

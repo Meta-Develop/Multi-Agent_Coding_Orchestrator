@@ -1,86 +1,65 @@
 {
-  "version": 1,
-  "task": "Complete the two disjoint ledger repairs using exactly the declared nested Workers, serially: admission-worker then settlement-worker. Remain a coordinator and do not write their files yourself. Use only authenticated parent dispatch, never native delegation. Preserve native writable sandbox, exact path claims and the live invocation-bound budget. Stop on observed exhaustion and refuse subsequent dispatch; do not retry or raise the ceiling. Require independent unittest execution after each candidate and preserve rejected partial output as evidence. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
-  "max_depth": 3,
-  "max_child_assignments": 3,
-  "max_child_retries": 0,
-  "max_gate_corrections": 0,
-  "child_timeout_seconds": 1200,
-  "role_models": {
-    "supervisor": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "xhigh",
-      "unavailable_model_fallback": "fail_closed"
-    },
-    "child_orchestrator": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "high",
-      "unavailable_model_fallback": "fail_closed"
-    },
-    "worker": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "high",
-      "unavailable_model_fallback": "fail_closed"
-    },
-    "researcher": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "xhigh",
-      "unavailable_model_fallback": "fail_closed"
-    },
-    "gate_classifier": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "xhigh",
-      "unavailable_model_fallback": "fail_closed"
-    },
-    "auditor": {
-      "model": "gpt-6.1-sol",
-      "reasoning_effort": "xhigh",
-      "unavailable_model_fallback": "fail_closed"
-    }
-  },
-  "run_budget": {
-    "hard_tokens": 65000,
-    "role_token_reservations": {
-      "child_orchestrator": 4000,
-      "worker": 1000,
-      "researcher": 4000,
-      "auditor": 4000
-    }
-  },
   "assignments": [
     {
-      "id": "ledger-budget-parent",
+      "assigned_paths": [
+        "examples/supervise/qualification-data/test_admission.py"
+      ],
+      "id": "candidate-budget-parent",
       "phase": "execution",
       "role": "child_orchestrator",
       "role_category": "delegating_coordinator",
       "runtime": "codex",
-      "assigned_paths": [
-        "examples/supervise/qualification-data/test_admission.py",
-        "examples/supervise/qualification-data/test_settlement.py"
-      ],
-      "task": "Complete the two disjoint ledger repairs using exactly the declared nested Workers, serially: admission-worker then settlement-worker. Remain a coordinator and do not write their files yourself. Use only authenticated parent dispatch, never native delegation. Preserve native writable sandbox, exact path claims and the live invocation-bound budget. Stop on observed exhaustion and refuse subsequent dispatch; do not retry or raise the ceiling. Require independent unittest execution after each candidate and preserve rejected partial output as evidence. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
+      "task": "Dispatch admission-worker only. Remain a coordinator, preserve native containment and exact path claims, and require its actual candidate to pass independent unittest and parent/Auditor acceptance. Do not write Worker files, delegate natively, retry, or change budgets. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts.",
       "worker_assignments": [
         {
-          "id": "admission-worker",
-          "role": "worker",
-          "role_category": "non_delegating_terminal_worker",
           "assigned_paths": [
             "examples/supervise/qualification-data/test_admission.py"
           ],
-          "task": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked."
-        },
-        {
-          "id": "settlement-worker",
+          "id": "admission-worker",
           "role": "worker",
           "role_category": "non_delegating_terminal_worker",
+          "task": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts."
+        }
+      ]
+    },
+    {
+      "assigned_paths": [
+        "examples/supervise/qualification-data/test_settlement.py",
+        "examples/supervise/qualification-data/test_refusal.py"
+      ],
+      "id": "exhaustion-budget-parent",
+      "phase": "execution",
+      "role": "child_orchestrator",
+      "role_category": "delegating_coordinator",
+      "runtime": "codex",
+      "task": "After the separate candidate stage is accepted, queue settlement-worker then refusal-worker in authored order through authenticated serial dispatch. Remain a coordinator. The 1000-token observation threshold intentionally interrupts settlement-worker; preserve its actual partial candidate and reject incomplete output. Refusal-worker must receive a budget denial without another provider call. Do not write Worker files, retry, or change budgets. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully. Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets.",
+      "worker_assignments": [
+        {
           "assigned_paths": [
             "examples/supervise/qualification-data/test_settlement.py"
           ],
-          "task": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked."
+          "id": "settlement-worker",
+          "role": "worker",
+          "role_category": "non_delegating_terminal_worker",
+          "task": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully."
+        },
+        {
+          "assigned_paths": [
+            "examples/supervise/qualification-data/test_refusal.py"
+          ],
+          "id": "refusal-worker",
+          "role": "worker",
+          "role_category": "non_delegating_terminal_worker",
+          "task": "Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets."
         }
       ]
     }
   ],
+  "child_timeout_seconds": 1200,
+  "max_child_assignments": 5,
+  "max_child_retries": 0,
+  "max_depth": 3,
+  "max_gate_corrections": 0,
   "resolved_routing_policy": {
     "policy": {
       "default_role": {
@@ -280,54 +259,117 @@
     "sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
     "source": "bundled-routing-policy"
   },
+  "role_models": {
+    "auditor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "child_orchestrator": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "high",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "gate_classifier": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "researcher": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "supervisor": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "xhigh",
+      "unavailable_model_fallback": "fail_closed"
+    },
+    "worker": {
+      "model": "gpt-6.1-sol",
+      "reasoning_effort": "high",
+      "unavailable_model_fallback": "fail_closed"
+    }
+  },
+  "run_budget": {
+    "hard_tokens": 650000,
+    "role_token_reservations": {
+      "auditor": 4000,
+      "child_orchestrator": 4000,
+      "researcher": 4000,
+      "worker": 1000
+    },
+    "worker_live_token_limits": {
+      "admission-worker": 240000,
+      "refusal-worker": 1000,
+      "settlement-worker": 1000
+    }
+  },
+  "task": "First complete and independently accept a real admission repair in candidate-budget-parent; then exercise observed exhaustion and refusal in exhaustion-budget-parent. Run with effective width one and no retries/corrections. Preserve both the accepted candidate and the rejected partial candidate. Dispatch admission-worker only. Remain a coordinator, preserve native containment and exact path claims, and require its actual candidate to pass independent unittest and parent/Auditor acceptance. Do not write Worker files, delegate natively, retry, or change budgets. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts. After the separate candidate stage is accepted, queue settlement-worker then refusal-worker in authored order through authenticated serial dispatch. Remain a coordinator. The 1000-token observation threshold intentionally interrupts settlement-worker; preserve its actual partial candidate and reject incomplete output. Refusal-worker must receive a budget denial without another provider call. Do not write Worker files, retry, or change budgets. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully. Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets.",
   "task_routing_assessment": {
     "declaration": {
-      "declared_task": "Complete the two disjoint ledger repairs using exactly the declared nested Workers, serially: admission-worker then settlement-worker. Remain a coordinator and do not write their files yourself. Use only authenticated parent dispatch, never native delegation. Preserve native writable sandbox, exact path claims and the live invocation-bound budget. Stop on observed exhaustion and refuse subsequent dispatch; do not retry or raise the ceiling. Require independent unittest execution after each candidate and preserve rejected partial output as evidence. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
-      "fragments": [
-        {
-          "id": "admission-worker-scope",
-          "text": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked."
-        },
-        {
-          "id": "settlement-worker-scope",
-          "text": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked."
-        }
-      ],
       "assignments": [
         {
-          "id": "admission-worker",
-          "task": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
-          "fragment_ids": [
-            "admission-worker-scope"
-          ],
           "assigned_paths": [
             "examples/supervise/qualification-data/test_admission.py"
           ],
-          "semantic_symbols": [],
+          "decision_dependencies": [],
+          "fragment_ids": [
+            "admission-worker-scope"
+          ],
+          "id": "admission-worker",
           "semantic_modules": [],
-          "decision_dependencies": []
+          "semantic_symbols": [],
+          "task": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts."
         },
         {
-          "id": "settlement-worker",
-          "task": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked.",
-          "fragment_ids": [
-            "settlement-worker-scope"
-          ],
           "assigned_paths": [
             "examples/supervise/qualification-data/test_settlement.py"
           ],
-          "semantic_symbols": [],
+          "decision_dependencies": [],
+          "fragment_ids": [
+            "settlement-worker-scope"
+          ],
+          "id": "settlement-worker",
           "semantic_modules": [],
-          "decision_dependencies": []
+          "semantic_symbols": [],
+          "task": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully."
+        },
+        {
+          "assigned_paths": [
+            "examples/supervise/qualification-data/test_refusal.py"
+          ],
+          "decision_dependencies": [],
+          "fragment_ids": [
+            "refusal-worker-scope"
+          ],
+          "id": "refusal-worker",
+          "semantic_modules": [],
+          "semantic_symbols": [],
+          "task": "Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets."
+        }
+      ],
+      "declared_task": "First complete and independently accept a real admission repair in candidate-budget-parent; then exercise observed exhaustion and refusal in exhaustion-budget-parent. Run with effective width one and no retries/corrections. Preserve both the accepted candidate and the rejected partial candidate. Dispatch admission-worker only. Remain a coordinator, preserve native containment and exact path claims, and require its actual candidate to pass independent unittest and parent/Auditor acceptance. Do not write Worker files, delegate natively, retry, or change budgets. Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts. After the separate candidate stage is accepted, queue settlement-worker then refusal-worker in authored order through authenticated serial dispatch. Remain a coordinator. The 1000-token observation threshold intentionally interrupts settlement-worker; preserve its actual partial candidate and reject incomplete output. Refusal-worker must receive a budget denial without another provider call. Do not write Worker files, retry, or change budgets. Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully. Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets.",
+      "fragments": [
+        {
+          "id": "admission-worker-scope",
+          "text": "Update `examples/supervise/qualification-data/test_admission.py`. Read the entire file before editing. Repair can_admit to include outstanding reservations, and observed_floor to retain a monotonic cumulative maximum rather than summing notices. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_admission.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is the candidate stage: complete the repair and truthful terminal report within the separately bound 240000-token live allowance; the parent and independent Auditors must accept this actual candidate before the exhaustion stage starts."
+        },
+        {
+          "id": "settlement-worker-scope",
+          "text": "Update `examples/supervise/qualification-data/test_settlement.py`. Read the entire file before editing. Repair complete to validate unknown usage before any effect, settle consumption and release the exact reservation before fallible report persistence, and handle identical replay idempotently using state[\"settled\"]. Preserve the original persistence error and reject conflicting replay. Preserve all existing tests and public function signatures; add boundary checks only if needed. Run `python3 -B -m unittest discover -s examples/supervise/qualification-data -p test_settlement.py -v` and verify every named contract passes. Explain the numerical traces and correction in the terminal report. Journal every read, command and edit through the parent-bound operation, omitting optional --changed-path so the wrapper derives changes per operation. Run git diff --check and confirm only the assigned file changed. Never use native delegation, widen paths, alter credentials, or accept your own output. Return the native structured terminal report with truthful observations; report failed when blocked. This is a deliberately short observation-control probe with a 1000-token live grant. Start with the required full seed inspection. If interrupted, preserve partial output and stop; never evade the grant. A complete repair is not required for this stage; interrupted evidence must be rejected truthfully."
+        },
+        {
+          "id": "refusal-worker-scope",
+          "text": "Repair can_dispatch in examples/supervise/qualification-data/test_refusal.py so a stopped run refuses and an unstopped run may dispatch. Preserve its tests and report unittest results through the authenticated Worker journal. This queued Worker is expected to be refused before dispatch after settlement-worker exhausts its live grant. Never retry or alter budgets."
         }
       ]
     },
-    "declared_input_sha256": "d48d032011ff97b1d1c3d5735abbf3f0ef1665a7f7ae03f12508d7d24d7108e2",
+    "declared_input_sha256": "db5e495605413baaf6768ff6c568d7ff6e5a643f64b19b26f1389e602cd4ac55",
     "features": {
-      "scope_paths": 2,
-      "scope_modules": 0,
+      "complexity": 5050,
+      "context_tokens": 6281,
       "dependency_edges": 0,
-      "independent_groups": 2,
       "evidence": [
         "canonical_scope_and_disjointness_revalidated",
         "fragment_coverage_revalidated",
@@ -337,12 +379,14 @@
         "context_estimates_encoded_declared_inputs_and_policy_allowances_only",
         "score_saturation_is_explicit_loaded_policy"
       ],
-      "complexity": 3600,
-      "risk": 580,
-      "horizon": 3460,
-      "context_tokens": 4394
+      "horizon": 4840,
+      "independent_groups": 3,
+      "risk": 620,
+      "scope_modules": 0,
+      "scope_paths": 3
     },
     "policy_sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
     "provenance": "policy_heuristic"
-  }
+  },
+  "version": 1
 }

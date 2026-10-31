@@ -1667,7 +1667,7 @@ fn budget_degradation_records_schema_value() -> serde_json::Value {
                 "budget_reasons": {
                     "type": "array",
                     "items": {"type": "string", "enum": [
-                        "soft_token_ceiling_reached", "hard_token_ceiling_reached",
+                        "soft_token_ceiling_reached", "hard_token_ceiling_reached", "live_token_grant_exhausted",
                         "soft_cost_ceiling_reached", "hard_cost_ceiling_reached",
                         "max_duration_reached",
                         "missing_pricing", "estimated_provider_usage", "missing_provider_usage",
@@ -2130,6 +2130,10 @@ fn usage_schema_value() -> serde_json::Value {
     })
 }
 
+fn dispatch_budget_bindings_schema_value() -> serde_json::Value {
+    json!({"type":"array","items":{"type":"object","additionalProperties":false,"required":["version","reservation_id","grant_id","grant_tokens","estimate_tokens","invocation","consumed_before","reserved_at_admission","active_at_admission","hard_tokens","state","thread_id","turn_id","invocation_verified","charged_tokens","usage_complete"],"properties":{"version":{"const":1},"reservation_id":{"type":"integer","minimum":1},"grant_id":{"type":"string","minLength":1},"grant_tokens":{"type":"integer","minimum":1},"estimate_tokens":{"type":"integer","minimum":1},"invocation":{"type":"object","additionalProperties":false,"required":["run_id","assignment_id","parent_id","attempt","runtime","account","command_sha256"],"properties":{"run_id":{"type":"string","minLength":1},"assignment_id":{"type":"string","minLength":1},"parent_id":{"type":["string","null"]},"attempt":{"type":"integer","minimum":1},"runtime":{"const":"codex"},"account":{"oneOf":[{"type":"object","additionalProperties":false,"required":["kind","authority_id","provider_id","account_id","account_incarnation","selection_revision"],"properties":{"kind":{"const":"selected"},"authority_id":{"type":"string","minLength":1},"provider_id":{"type":"string","minLength":1},"account_id":{"type":"string","minLength":1},"account_incarnation":{"type":"string","minLength":1},"selection_revision":{"type":"integer","minimum":0}}},{"type":"object","additionalProperties":false,"required":["kind"],"properties":{"kind":{"enum":["local_auth","unspecified"]}}}]},"command_sha256":{"type":"string","pattern":"^[0-9a-f]{64}$"}}},"consumed_before":{"type":"integer","minimum":0},"reserved_at_admission":{"type":"integer","minimum":0},"active_at_admission":{"type":"integer","minimum":1},"hard_tokens":{"type":"integer","minimum":1},"state":{"enum":["admitted","settled","not_started"]},"thread_id":{"type":["string","null"]},"turn_id":{"type":["string","null"]},"invocation_verified":{"type":"boolean"},"charged_tokens":{"type":["integer","null"],"minimum":0},"usage_complete":{"type":["boolean","null"]}}}})
+}
+
 fn run_budget_report_schema_value() -> serde_json::Value {
     let amount = || {
         json!({
@@ -2160,6 +2164,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
         "properties": {
             "pricing_contract": {"oneOf": [{"type": "null"}, pricing_provenance::contract_schema_value()]},
             "charges": {"type": "array", "items": pricing_provenance::charge_schema_value(agent_role_schema_value())},
+            "dispatch_bindings": dispatch_budget_bindings_schema_value(),
             "cost_complete": {"type": "boolean"},
             "limits": {
                 "type": "object",
@@ -2275,7 +2280,7 @@ fn run_budget_report_schema_value() -> serde_json::Value {
                     "type": "string",
                     "enum": [
                         "soft_token_ceiling_reached",
-                        "hard_token_ceiling_reached",
+                        "hard_token_ceiling_reached", "live_token_grant_exhausted",
                         "soft_cost_ceiling_reached",
                         "hard_cost_ceiling_reached",
                         "max_duration_reached",
@@ -2954,6 +2959,7 @@ fn supervisor_budget_config_schema_value() -> serde_json::Value {
             "hard_tokens": {"type": "integer", "minimum": 1},
             "soft_cost_usd": {"type": "number", "exclusiveMinimum": 0},
             "hard_cost_usd": {"type": "number", "exclusiveMinimum": 0},
+            "worker_live_token_limits": {"type":"object", "additionalProperties":{"type":"integer", "minimum":1}},
             "role_token_reservations": partial_role_map_schema_value(
                 json!({"type": "integer", "minimum": 1})
             )
@@ -5036,6 +5042,7 @@ mod selection_schema_tests {
             }],
         });
         let budget = SupervisorBudgetConfig {
+            worker_live_token_limits: BTreeMap::new(),
             limits: RunBudgetLimits::default(),
             role_token_reservations: BTreeMap::from([
                 (AgentRole::ChildOrchestrator, 1),

@@ -470,6 +470,7 @@ fn injected_run_budget(
     auditor_tokens: usize,
 ) -> SupervisorBudgetConfig {
     SupervisorBudgetConfig {
+        worker_live_token_limits: BTreeMap::new(),
         limits: RunBudgetLimits {
             soft_tokens,
             hard_tokens,
@@ -1502,6 +1503,7 @@ pub(crate) fn injected_verified_run(command: &ExternalAgentCommand) -> ExternalA
         })
         .collect();
     run.replace_worker_journal_artifacts(captures);
+    run.retain_live_budget_invocation_for_test(command);
     run
 }
 

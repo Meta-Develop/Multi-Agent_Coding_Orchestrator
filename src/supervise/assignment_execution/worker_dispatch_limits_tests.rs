@@ -79,6 +79,7 @@ fn retain_usage(
         },
     });
     run.retain_app_server_parent_evidence_for_test();
+    run.retain_live_budget_invocation_for_test(command);
 }
 
 fn rendezvous(state: &(Mutex<usize>, std::sync::Condvar)) {
@@ -124,7 +125,7 @@ fn wait_for_signal(state: &AdmissionSignals, launched: bool) {
 }
 
 fn qualification(parent_tokens: usize, width: usize, inflight: usize) -> Result<()> {
-    qualification_mode(parent_tokens, width, inflight, false)
+    qualification_mode(parent_tokens, width, inflight, false, None)
 }
 
 fn qualification_mode(
@@ -132,6 +133,7 @@ fn qualification_mode(
     width: usize,
     inflight: usize,
     waiting: bool,
+    live_limit: Option<usize>,
 ) -> Result<()> {
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
@@ -140,6 +142,27 @@ fn qualification_mode(
         include_str!("../../../examples/supervise/nested-codex-budget-qualification.json"),
         Some(&repo),
     )?;
+    let second = loaded.plan.assignments.remove(1);
+    loaded.plan.assignments[0]
+        .worker_assignments
+        .push(second.worker_assignments[0].clone());
+    loaded.plan.assignments[0]
+        .assigned_paths
+        .extend(second.worker_assignments[0].assigned_paths.clone());
+    loaded.plan_metadata.assignment_schedule.truncate(1);
+    loaded.plan_metadata.run_budget.limits.hard_tokens = Some(65_000);
+    loaded
+        .plan_metadata
+        .run_budget
+        .worker_live_token_limits
+        .clear();
+    if let Some(limit) = live_limit {
+        loaded
+            .plan_metadata
+            .run_budget
+            .worker_live_token_limits
+            .insert("admission-worker".into(), limit);
+    }
     let git = crate::git_repository::open(&repo)?;
     git.config()?.set_str("user.name", "Fixture Owner")?;
     git.config()?
@@ -450,6 +473,30 @@ fn qualification_mode(
                 rendezvous(&live);
             }
             let grant = command.live_token_grant_for_test().unwrap();
+            let binding = ledger
+                .report()
+                .unwrap()
+                .dispatch_bindings
+                .into_iter()
+                .find(|binding| binding.invocation.assignment_id == *id)
+                .unwrap();
+            assert_eq!(binding.grant_id, grant.id());
+            assert_eq!(
+                binding.invocation.account,
+                crate::supervise_budget::BudgetAccountIdentity::Selected {
+                    authority_id: "fixture-authority".into(),
+                    provider_id: "codex-cli".into(),
+                    account_id: "fixture-account".into(),
+                    account_incarnation: "fixture-incarnation".into(),
+                    selection_revision: 1,
+                }
+            );
+            assert!(run_dir
+                .join(format!(
+                    "budget/dispatch-{}.admitted.json",
+                    binding.reservation_id
+                ))
+                .is_file());
             if waiting {
                 assert_eq!(id, "admission-worker");
                 signal(&admission_signals, true);
@@ -457,7 +504,10 @@ fn qualification_mode(
             }
             reservations.lock().unwrap().push(grant.tokens());
             if !concurrent {
-                assert_eq!(grant.tokens(), (65000 - parent_tokens) as u64);
+                assert_eq!(
+                    grant.tokens(),
+                    live_limit.unwrap_or(65000 - parent_tokens) as u64
+                );
             }
             let limit = if concurrent { 100 } else { grant.tokens() };
             let mut transport = Transport {
@@ -695,6 +745,23 @@ fn qualification_mode(
         budget.charges.len(),
         "reservation settled more than once"
     );
+    for binding in &budget.dispatch_bindings {
+        let charge = budget
+            .charges
+            .iter()
+            .find(|charge| charge.reservation_id == binding.reservation_id)
+            .unwrap();
+        assert_eq!(binding.charged_tokens, Some(charge.tokens));
+        assert_eq!(binding.usage_complete, Some(charge.usage_complete));
+        assert!(binding.invocation_verified);
+        assert_eq!(binding.thread_id.as_deref(), Some("thread"));
+        assert_eq!(binding.turn_id.as_deref(), Some("turn"));
+        let receipt: Value = serde_json::from_slice(&fs::read(run_dir.join(format!(
+            "budget/dispatch-{}.settled.json",
+            binding.reservation_id
+        )))?)?;
+        assert_eq!(receipt["binding"], serde_json::to_value(binding)?);
+    }
     assert_eq!(budget.charges[0].role, AgentRole::ChildOrchestrator);
     assert_eq!(budget.charges[0].tokens, parent_tokens);
     assert_eq!(budget.active_reservations, 0);
@@ -710,6 +777,12 @@ fn qualification_mode(
                 reservations.lock().unwrap().iter().sum::<u64>() + 7
             }
     );
+    if live_limit.is_some() {
+        assert!(budget.remaining.hard_tokens.unwrap() > 20_000);
+        assert!(budget
+            .reasons
+            .contains(&BudgetReason::LiveTokenGrantExhausted));
+    }
     assert_eq!(budget.new_dispatch_allowed, concurrent);
     assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
     assert!(
@@ -745,5 +818,10 @@ fn frozen_nested_workers_width_two_allows_bounded_concurrency() -> Result<()> {
 
 #[test]
 fn frozen_nested_workers_stopped_live_grant_wait_records_budget_refusal() -> Result<()> {
-    qualification_mode(41684, 2, 2, true)
+    qualification_mode(41684, 2, 2, true, None)
+}
+
+#[test]
+fn frozen_nested_worker_explicit_grant_exhausts_with_unused_run_balance() -> Result<()> {
+    qualification_mode(43_233, 1, 1, false, Some(1_000))
 }

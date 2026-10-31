@@ -171,6 +171,7 @@ pub struct BudgetRemaining {
 pub enum BudgetReason {
     SoftTokenCeilingReached,
     HardTokenCeilingReached,
+    LiveTokenGrantExhausted,
     SoftCostCeilingReached,
     HardCostCeilingReached,
     MaxDurationReached,
@@ -221,6 +222,8 @@ pub struct RunBudgetReport {
     pub pricing_contract: Option<PricingContractProvenance>,
     #[serde(default)]
     pub charges: Vec<BudgetChargeReport>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dispatch_bindings: Vec<BudgetDispatchBinding>,
     /// Separate from token completeness: an unpriced charge makes this false.
     #[serde(default)]
     pub cost_complete: bool,
@@ -245,6 +248,250 @@ pub struct RunBudgetReport {
     pub new_dispatch_allowed: bool,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub reasons: Vec<BudgetReason>,
+}
+
+impl RunBudgetReport {
+    /// Terminal recovery only: never creates an executable ledger or fabricates
+    /// observed usage. Use the same missing-usage floor as ordinary settlement.
+    pub(super) fn reconcile_interrupted_dispatches(
+        &self,
+        reservations: &BTreeMap<u64, BudgetReservation>,
+    ) -> Result<Self> {
+        self.reconcile_interrupted_dispatches_matching(reservations, None)
+    }
+
+    pub(super) fn reconcile_interrupted_dispatches_matching(
+        &self,
+        reservations: &BTreeMap<u64, BudgetReservation>,
+        only: Option<u64>,
+    ) -> Result<Self> {
+        let mut recovered = self.clone();
+        for binding in &mut recovered.dispatch_bindings {
+            if binding.state != BudgetDispatchState::Admitted
+                || only.is_some_and(|id| id != binding.reservation_id)
+            {
+                continue;
+            }
+            if recovered
+                .charges
+                .iter()
+                .any(|charge| charge.reservation_id == binding.reservation_id)
+            {
+                return Err(BudgetError::InconsistentState);
+            }
+            let reservation = reservations
+                .get(&binding.reservation_id)
+                .cloned()
+                .unwrap_or(BudgetReservation {
+                    id: BudgetReservationId(binding.reservation_id),
+                    role: AgentRole::Worker,
+                    tokens: binding.estimate_tokens,
+                    cost_usd: None,
+                });
+            if reservation.role != AgentRole::Worker
+                || reservation.tokens != binding.estimate_tokens
+            {
+                return Err(BudgetError::InconsistentState);
+            }
+            let charge = reconciliation_charge(&reservation, &UsageMeasurement::Missing)?;
+            let grant =
+                usize::try_from(binding.grant_tokens).map_err(|_| BudgetError::TokenOverflow)?;
+            recovered.reserved.tokens = recovered
+                .reserved
+                .tokens
+                .checked_sub(grant)
+                .ok_or(BudgetError::InconsistentState)?;
+            recovered.active_reservations = recovered
+                .active_reservations
+                .checked_sub(1)
+                .ok_or(BudgetError::InconsistentState)?;
+            recovered.consumed.tokens = recovered
+                .consumed
+                .tokens
+                .checked_add(charge.tokens)
+                .ok_or(BudgetError::TokenOverflow)?;
+            recovered.consumed.cost_usd = None;
+            recovered.reserved.cost_usd = remaining_reserved_cost(
+                recovered.reserved.cost_usd,
+                reservation.cost_usd,
+                recovered.active_reservations,
+            )?;
+            let role = recovered
+                .roles
+                .iter_mut()
+                .find(|role| role.role == AgentRole::Worker)
+                .ok_or(BudgetError::InconsistentState)?;
+            role.reserved.tokens = role
+                .reserved
+                .tokens
+                .checked_sub(grant)
+                .ok_or(BudgetError::InconsistentState)?;
+            role.active_reservations = role
+                .active_reservations
+                .checked_sub(1)
+                .ok_or(BudgetError::InconsistentState)?;
+            role.consumed.tokens = role
+                .consumed
+                .tokens
+                .checked_add(charge.tokens)
+                .ok_or(BudgetError::TokenOverflow)?;
+            role.consumed.cost_usd = None;
+            role.reserved.cost_usd = remaining_reserved_cost(
+                role.reserved.cost_usd,
+                reservation.cost_usd,
+                role.active_reservations,
+            )?;
+            role.usage_complete = false;
+            recovered.charges.push(BudgetChargeReport {
+                reservation_id: binding.reservation_id,
+                role: reservation.role,
+                tokens: charge.tokens,
+                cost_usd: None,
+                usage_complete: false,
+                pricing: ChargePricing {
+                    basis: if reservation.cost_usd.is_some() {
+                        ChargePricingBasis::ConservativeReservation
+                    } else {
+                        ChargePricingBasis::Unpriced
+                    },
+                    contract: recovered.pricing_contract.clone(),
+                    runtime: Some(binding.invocation.runtime.clone()),
+                    model: None,
+                },
+            });
+            binding.state = BudgetDispatchState::Settled;
+            binding.charged_tokens = Some(charge.tokens);
+            binding.usage_complete = Some(false);
+            recovered.usage_complete = false;
+            recovered.cost_complete = false;
+            recovered.new_dispatch_allowed = false;
+            recovered.action = BudgetAction::OwnerEscalation;
+            if !recovered
+                .reasons
+                .contains(&BudgetReason::MissingProviderUsage)
+            {
+                recovered.reasons.push(BudgetReason::MissingProviderUsage);
+            }
+        }
+        recovered.committed.tokens = recovered
+            .consumed
+            .tokens
+            .checked_add(recovered.reserved.tokens)
+            .ok_or(BudgetError::TokenOverflow)?;
+        if !recovered.cost_complete {
+            recovered.committed.cost_usd = None;
+            recovered.remaining.soft_cost_usd = None;
+            recovered.remaining.hard_cost_usd = None;
+        }
+        recovered.remaining.soft_tokens = recovered
+            .limits
+            .soft_tokens
+            .map(|limit| limit.saturating_sub(recovered.committed.tokens));
+        recovered.remaining.hard_tokens = recovered
+            .limits
+            .hard_tokens
+            .map(|limit| limit.saturating_sub(recovered.committed.tokens));
+        recovered.reasons.retain(|reason| {
+            !matches!(
+                reason,
+                BudgetReason::SoftTokenCeilingReached | BudgetReason::HardTokenCeilingReached
+            )
+        });
+        if recovered
+            .limits
+            .soft_tokens
+            .is_some_and(|limit| recovered.committed.tokens >= limit)
+        {
+            recovered
+                .reasons
+                .push(BudgetReason::SoftTokenCeilingReached);
+        }
+        if recovered
+            .limits
+            .hard_tokens
+            .is_some_and(|limit| recovered.committed.tokens >= limit)
+        {
+            recovered
+                .reasons
+                .push(BudgetReason::HardTokenCeilingReached);
+        }
+        recovered.reasons.sort();
+        Ok(recovered)
+    }
+}
+
+fn remaining_reserved_cost(
+    total: Option<f64>,
+    released: Option<f64>,
+    active: usize,
+) -> Result<Option<f64>> {
+    if active == 0 {
+        return Ok(Some(0.0));
+    }
+    match (total, released) {
+        (Some(total), Some(released)) if total >= released => Ok(Some(total - released)),
+        (Some(_), Some(_)) => Err(BudgetError::InconsistentState),
+        _ => Ok(None),
+    }
+}
+
+/// Non-secret account selection frozen for the admitted invocation. Local auth
+/// explicitly carries no authenticated account/principal claim.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum BudgetAccountIdentity {
+    Selected {
+        authority_id: String,
+        provider_id: String,
+        account_id: String,
+        account_incarnation: String,
+        selection_revision: u64,
+    },
+    LocalAuth,
+    Unspecified,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDispatchInvocation {
+    pub run_id: String,
+    pub assignment_id: String,
+    pub parent_id: Option<String>,
+    pub attempt: usize,
+    pub runtime: String,
+    pub account: BudgetAccountIdentity,
+    pub command_sha256: String,
+}
+
+/// Authenticated by the run checkpoint before release; settlement never replaces
+/// the admission identity. Thread/turn IDs are allocated by the provider later.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct BudgetDispatchBinding {
+    pub version: u32,
+    pub reservation_id: u64,
+    pub grant_id: String,
+    pub grant_tokens: u64,
+    pub estimate_tokens: usize,
+    pub invocation: BudgetDispatchInvocation,
+    pub consumed_before: usize,
+    pub reserved_at_admission: usize,
+    pub active_at_admission: usize,
+    pub hard_tokens: usize,
+    pub state: BudgetDispatchState,
+    pub thread_id: Option<String>,
+    pub turn_id: Option<String>,
+    pub invocation_verified: bool,
+    pub charged_tokens: Option<usize>,
+    pub usage_complete: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BudgetDispatchState {
+    Admitted,
+    Settled,
+    NotStarted,
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -413,6 +660,14 @@ impl LiveTokenGrant {
     pub(crate) fn tokens(&self) -> u64 {
         self.tokens
     }
+    pub(crate) fn id(&self) -> String {
+        format!(
+            "{}/grant/{}",
+            self.ledger.session_id,
+            self.reservation.get()
+        )
+    }
+
     pub(crate) fn stopped(&self) -> bool {
         self.ledger.lock_state().map_or(true, |state| {
             state.force_stop || !state.active.contains_key(&self.reservation)
@@ -421,9 +676,12 @@ impl LiveTokenGrant {
     pub(crate) fn exhaust(&self) {
         if let Ok(mut state) = self.ledger.lock_state() {
             state.force_stop = true;
-            state
-                .persistent_reasons
-                .insert(BudgetReason::HardTokenCeilingReached);
+            let reason = if state.live_limits.contains_key(&self.reservation) {
+                BudgetReason::LiveTokenGrantExhausted
+            } else {
+                BudgetReason::HardTokenCeilingReached
+            };
+            state.persistent_reasons.insert(reason);
             self.ledger.changed.notify_all();
         }
     }
@@ -441,9 +699,12 @@ struct AttachedRollingBudget {
 #[derive(Debug, Clone)]
 struct LedgerState {
     charges: Vec<BudgetChargeReport>,
+    dispatch_bindings: BTreeMap<BudgetReservationId, BudgetDispatchBinding>,
+    durable_dispatches: BTreeSet<BudgetReservationId>,
     next_reservation_id: u64,
     active: BTreeMap<BudgetReservationId, BudgetReservation>,
     live_grants: BTreeMap<BudgetReservationId, usize>,
+    live_limits: BTreeMap<BudgetReservationId, usize>,
     consumed_tokens: usize,
     consumed_cost_usd: f64,
     reserved_tokens: usize,
@@ -460,9 +721,12 @@ impl Default for LedgerState {
     fn default() -> Self {
         Self {
             charges: Vec::new(),
+            dispatch_bindings: BTreeMap::new(),
+            durable_dispatches: BTreeSet::new(),
             next_reservation_id: 1,
             active: BTreeMap::new(),
             live_grants: BTreeMap::new(),
+            live_limits: BTreeMap::new(),
             consumed_tokens: 0,
             consumed_cost_usd: 0.0,
             reserved_tokens: 0,
@@ -898,6 +1162,36 @@ impl RunBudgetLedger {
         &self,
         id: BudgetReservationId,
     ) -> Result<Option<LiveTokenGrant>> {
+        let limit = self.lock_state()?.live_limits.get(&id).copied();
+        self.live_token_grant_with_limit(id, limit)
+    }
+
+    pub(super) fn configure_live_token_limit(
+        &self,
+        id: BudgetReservationId,
+        limit: usize,
+    ) -> Result<()> {
+        let mut state = self.lock_state()?;
+        let reservation = state
+            .active
+            .get(&id)
+            .ok_or(BudgetError::UnknownReservation(id.get()))?;
+        if limit < reservation.tokens
+            || state.live_grants.contains_key(&id)
+            || state.live_limits.contains_key(&id)
+            || self.limits.hard_tokens.is_none()
+        {
+            return Err(BudgetError::InconsistentState);
+        }
+        state.live_limits.insert(id, limit);
+        Ok(())
+    }
+
+    pub(crate) fn live_token_grant_with_limit(
+        &self,
+        id: BudgetReservationId,
+        limit: Option<usize>,
+    ) -> Result<Option<LiveTokenGrant>> {
         let mut state = self.lock_state()?;
         let reservation = state
             .active
@@ -908,6 +1202,9 @@ impl RunBudgetLedger {
             return Ok(None);
         };
         let tokens = if let Some(tokens) = state.live_grants.get(&id) {
+            if limit.is_some_and(|limit| *tokens > limit) {
+                return Err(BudgetError::InconsistentState);
+            }
             *tokens
         } else {
             let committed = state
@@ -923,11 +1220,15 @@ impl RunBudgetLedger {
                 .checked_sub(state.live_grants.len())
                 .filter(|count| *count > 0)
                 .ok_or(BudgetError::InconsistentState)?;
-            let extra = available / pending;
-            let tokens = reservation
+            let allowance = reservation
                 .tokens
-                .checked_add(extra)
+                .checked_add(available / pending)
                 .ok_or(BudgetError::TokenOverflow)?;
+            let tokens = limit.map_or(allowance, |limit| allowance.min(limit));
+            if tokens < reservation.tokens {
+                return Err(BudgetError::InconsistentState);
+            }
+            let extra = tokens - reservation.tokens;
             let mut next = state.clone();
             next.reserved_tokens = next
                 .reserved_tokens
@@ -951,6 +1252,94 @@ impl RunBudgetLedger {
             reservation: id,
             tokens: u64::try_from(tokens).map_err(|_| BudgetError::TokenOverflow)?,
         }))
+    }
+
+    pub(super) fn bind_dispatch(
+        &self,
+        id: BudgetReservationId,
+        invocation: BudgetDispatchInvocation,
+        grant: &LiveTokenGrant,
+    ) -> Result<BudgetDispatchBinding> {
+        let mut state = self.lock_state()?;
+        let reservation = state
+            .active
+            .get(&id)
+            .ok_or(BudgetError::UnknownReservation(id.get()))?;
+        if state.dispatch_bindings.contains_key(&id)
+            || state.force_stop
+            || grant.reservation != id
+            || !Arc::ptr_eq(&self.inner, &grant.ledger.inner)
+            || state.live_grants.get(&id).map(|tokens| *tokens as u64) != Some(grant.tokens)
+        {
+            return Err(BudgetError::InconsistentState);
+        }
+        let binding = BudgetDispatchBinding {
+            version: 1,
+            reservation_id: id.get(),
+            grant_id: format!("{}/grant/{}", self.session_id, id.get()),
+            grant_tokens: *state
+                .live_grants
+                .get(&id)
+                .ok_or(BudgetError::InconsistentState)? as u64,
+            estimate_tokens: reservation.tokens,
+            invocation,
+            consumed_before: state.consumed_tokens,
+            reserved_at_admission: state.reserved_tokens,
+            active_at_admission: state.active.len(),
+            hard_tokens: self
+                .limits
+                .hard_tokens
+                .ok_or(BudgetError::InconsistentState)?,
+            state: BudgetDispatchState::Admitted,
+            thread_id: None,
+            turn_id: None,
+            invocation_verified: false,
+            charged_tokens: None,
+            usage_complete: None,
+        };
+        state.dispatch_bindings.insert(id, binding.clone());
+        Ok(binding)
+    }
+
+    pub(super) fn observe_dispatch_identity(
+        &self,
+        id: BudgetReservationId,
+        invocation: Option<&BudgetDispatchInvocation>,
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+    ) -> Result<bool> {
+        let mut state = self.lock_state()?;
+        let Some(binding) = state.dispatch_bindings.get_mut(&id) else {
+            return Ok(true);
+        };
+        if binding.state != BudgetDispatchState::Admitted {
+            return Err(BudgetError::InconsistentState);
+        }
+        binding.invocation_verified = invocation == Some(&binding.invocation);
+        if binding.invocation_verified {
+            binding.thread_id = thread_id;
+            binding.turn_id = turn_id;
+        }
+        Ok(binding.invocation_verified)
+    }
+
+    /// Called only after the admission is present in the authenticated journal.
+    /// A failed pre-append admission must disappear when its reservation is released.
+    pub(super) fn confirm_dispatch_admission(&self, id: BudgetReservationId) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if !state.dispatch_bindings.contains_key(&id) {
+            return Err(BudgetError::InconsistentState);
+        }
+        state.durable_dispatches.insert(id);
+        Ok(())
+    }
+
+    pub(super) fn discard_unconfirmed_dispatch(&self, id: BudgetReservationId) -> Result<()> {
+        let mut state = self.lock_state()?;
+        if !state.durable_dispatches.contains(&id) {
+            state.dispatch_bindings.remove(&id);
+        }
+        Ok(())
     }
 
     /// Replaces an active reservation with conservative consumed usage in one transaction.
@@ -1085,6 +1474,11 @@ impl RunBudgetLedger {
         }
         let rolling_reasons =
             self.persist_rolling_consumption(id, &charge, pool.as_ref(), &pricing)?;
+        if let Some(binding) = next.dispatch_bindings.get_mut(&id) {
+            binding.state = BudgetDispatchState::Settled;
+            binding.charged_tokens = Some(charge.tokens);
+            binding.usage_complete = Some(charge.usage_complete);
+        }
         next.charges.push(BudgetChargeReport {
             reservation_id: id.get(),
             role: reservation.role,
@@ -1120,6 +1514,13 @@ impl RunBudgetLedger {
         let mut state = self.lock_state()?;
         let mut next = state.clone();
         let reservation = remove_reservation(&mut next, id)?;
+        if next.durable_dispatches.contains(&id) {
+            if let Some(binding) = next.dispatch_bindings.get_mut(&id) {
+                binding.state = BudgetDispatchState::NotStarted;
+            }
+        } else {
+            next.dispatch_bindings.remove(&id);
+        }
         let rolling_reasons = self.persist_conservative_rolling_abandonment(&reservation)?;
         if !rolling_reasons.is_empty() {
             next.persistent_reasons.extend(rolling_reasons);
@@ -1583,6 +1984,7 @@ fn remove_reservation(
         .active
         .remove(&id)
         .ok_or(BudgetError::UnknownReservation(id.get()))?;
+    state.live_limits.remove(&id);
     let held_tokens = state.live_grants.remove(&id).unwrap_or(reservation.tokens);
     state.reserved_tokens = state
         .reserved_tokens
@@ -1825,6 +2227,7 @@ fn report_for(
     Ok(RunBudgetReport {
         pricing_contract: None,
         charges: state.charges.clone(),
+        dispatch_bindings: state.dispatch_bindings.values().cloned().collect(),
         cost_complete: state.cost_complete,
         limits,
         max_duration_seconds,
@@ -1962,6 +2365,58 @@ mod tests {
                 panic!("expected admitted reservation, got {refusal:?}")
             }
         }
+    }
+
+    #[test]
+    fn checkpoint_recovery_settles_multiple_grants_once_at_reservation_floors() {
+        let ledger = RunBudgetLedger::new(token_limits(900, 1000)).unwrap();
+        let first = admitted_reservation(ledger.reserve(request(10, Some(0.25))).unwrap());
+        let second = admitted_reservation(ledger.reserve(request(20, Some(0.5))).unwrap());
+        for reservation in [&first, &second] {
+            let grant = ledger.live_token_grant(reservation.id).unwrap().unwrap();
+            ledger
+                .bind_dispatch(
+                    reservation.id,
+                    BudgetDispatchInvocation {
+                        run_id: "recovery".into(),
+                        assignment_id: format!("worker-{}", reservation.id.get()),
+                        parent_id: Some("parent".into()),
+                        attempt: 1,
+                        runtime: "codex".into(),
+                        account: BudgetAccountIdentity::LocalAuth,
+                        command_sha256: "b".repeat(64),
+                    },
+                    &grant,
+                )
+                .unwrap();
+        }
+        let original = ledger.report().unwrap();
+        let reservations = [(first.id.get(), first.clone()), (second.id.get(), second)]
+            .into_iter()
+            .collect();
+        let partial = original
+            .reconcile_interrupted_dispatches_matching(&reservations, Some(first.id.get()))
+            .unwrap();
+        assert_eq!(partial.consumed.tokens, 10);
+        assert_eq!(partial.active_reservations, 1);
+        assert_eq!(partial.reserved.cost_usd, Some(0.5));
+        let recovered = partial
+            .reconcile_interrupted_dispatches(&reservations)
+            .unwrap();
+        assert_eq!(recovered.consumed.tokens, 30);
+        assert_eq!(recovered.reserved.tokens, 0);
+        assert_eq!(recovered.active_reservations, 0);
+        assert_eq!(recovered.charges.len(), 2);
+        assert_eq!(recovered.reserved.cost_usd, Some(0.0));
+        assert_eq!(recovered.consumed.cost_usd, None);
+        assert!(!recovered.new_dispatch_allowed);
+        assert!(!recovered.usage_complete);
+        assert_eq!(
+            recovered,
+            recovered
+                .reconcile_interrupted_dispatches(&reservations)
+                .unwrap()
+        );
     }
 
     #[test]

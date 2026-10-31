@@ -494,6 +494,12 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         Ok(self.authenticator)
     }
 
+    /// Re-authenticate a possibly published tail while retaining the exclusive
+    /// instance lock. Callers must withhold effects if this recovery fails.
+    pub(crate) fn recover_failed_append(&mut self) -> Result<()> {
+        self.load_and_recover()
+    }
+
     fn load_and_recover(&mut self) -> Result<()> {
         self.verify_boundaries()?;
         let inventory = inventory_run_directory::<S>(&self.run_root)?;

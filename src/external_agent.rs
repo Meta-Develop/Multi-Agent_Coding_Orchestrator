@@ -628,6 +628,8 @@ enum CodexManagedReadonlyRoute {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct BoundLiveTokenGrant {
+    input_receipts: Result<Vec<(PathBuf, Option<String>)>, String>,
+    codex_account: Option<CodexRunAccountBinding>,
     grant: crate::supervise_budget::LiveTokenGrant,
     invocation: ExternalAgentInvocation,
     program: PathBuf,
@@ -648,6 +650,63 @@ struct BoundLiveTokenGrant {
     process_kind: Option<AssignmentProcessLaunchKind>,
     process_attempt: Option<usize>,
     process_duty: Option<String>,
+}
+
+fn live_budget_input_receipts(
+    command: &ExternalAgentCommand,
+) -> Result<Vec<(PathBuf, Option<String>)>, String> {
+    let paths = std::iter::once(command.prompt.clone())
+        .chain(command.output_schema.iter().cloned())
+        .chain(command.read_only_input_files.iter().cloned())
+        .chain(
+            command
+                .researcher_source_inputs
+                .iter()
+                .map(|input| command.cwd.join(&input.path)),
+        );
+    paths
+        .map(|path| {
+            let before = match fs::symlink_metadata(&path) {
+                Ok(metadata) => metadata,
+                // Synthetic commands and a command under construction may refer
+                // to an absent file. Native launch still requires its own preflight.
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    return Ok((path, None))
+                }
+                Err(error) => return Err(error.to_string()),
+            };
+            if !before.is_file() || before.file_type().is_symlink() {
+                return Err("live budget input is not a regular non-symlink file".into());
+            }
+            let bytes = read_bounded_regular_file_nofollow(&path, MAX_PROMPT_BYTES)
+                .map_err(|error| error.to_string())?;
+            let after = fs::symlink_metadata(&path).map_err(|error| error.to_string())?;
+            #[cfg(unix)]
+            let identity = {
+                use std::os::unix::fs::MetadataExt;
+                if before.dev() != after.dev() || before.ino() != after.ino() {
+                    return Err("live budget input identity changed".into());
+                }
+                format!(
+                    "{}:{}:{}:{}",
+                    before.dev(),
+                    before.ino(),
+                    before.mode(),
+                    before.uid()
+                )
+            };
+            #[cfg(not(unix))]
+            let identity = format!("{:?}", before.created());
+            if before.len() != after.len() || before.modified().ok() != after.modified().ok() {
+                return Err("live budget input changed while binding".into());
+            }
+            let digest = sha256_hex(
+                &serde_json::to_vec(&(identity, sha256_hex(&bytes)))
+                    .map_err(|error| error.to_string())?,
+            );
+            Ok((path, Some(digest)))
+        })
+        .collect()
 }
 
 #[cfg(target_os = "linux")]
@@ -1650,6 +1709,8 @@ impl ExternalAgentCommand {
         grant: Option<crate::supervise_budget::LiveTokenGrant>,
     ) {
         self.live_token_grant = grant.map(|grant| BoundLiveTokenGrant {
+            input_receipts: live_budget_input_receipts(self),
+            codex_account: self.codex_run_account_binding.clone(),
             grant,
             invocation: self.invocation,
             program: self.program.clone(),
@@ -1756,13 +1817,15 @@ impl ExternalAgentCommand {
 
     // Post-quiescence evidence can compare the original launch binding after
     // settlement. This does not authorize another physical request/release.
-    fn bound_live_token_grant(
+    pub(crate) fn bound_live_token_grant(
         &self,
     ) -> Result<Option<&crate::supervise_budget::LiveTokenGrant>, String> {
         let Some(bound) = &self.live_token_grant else {
             return Ok(None);
         };
-        if bound.invocation != self.invocation
+        if bound.codex_account != self.codex_run_account_binding
+            || bound.input_receipts != live_budget_input_receipts(self)
+            || bound.invocation != self.invocation
             || bound.program != self.program
             || bound.cwd != self.cwd
             || bound.prompt != self.prompt
@@ -1785,6 +1848,61 @@ impl ExternalAgentCommand {
             return Err("live token grant launch binding changed".to_string());
         }
         Ok(Some(&bound.grant))
+    }
+
+    pub(crate) fn live_budget_invocation(
+        &self,
+    ) -> Result<Option<crate::supervise_budget::BudgetDispatchInvocation>, String> {
+        use crate::supervise_budget::{BudgetAccountIdentity, BudgetDispatchInvocation};
+        if self.invocation != ExternalAgentInvocation::CodexSupervisor
+            || self.bound_live_token_grant()?.is_none()
+        {
+            return Ok(None);
+        }
+        let identity = self
+            .agent_lifecycle
+            .as_ref()
+            .ok_or("live grant has no lifecycle")?;
+        let account = match &self.codex_run_account_binding {
+            Some(CodexRunAccountBinding::Selected(account)) => BudgetAccountIdentity::Selected {
+                authority_id: account.authority_id.clone(),
+                provider_id: account.provider_id.clone(),
+                account_id: account.account_id.clone(),
+                account_incarnation: account.account_incarnation.clone(),
+                selection_revision: account.selection_revision,
+            },
+            Some(CodexRunAccountBinding::LocalAuth) => BudgetAccountIdentity::LocalAuth,
+            Some(CodexRunAccountBinding::Missing) => {
+                return Err("live grant has no selected account".into())
+            }
+            None => BudgetAccountIdentity::Unspecified,
+        };
+        let bound = self.live_token_grant.as_ref().unwrap();
+        let inputs = bound.input_receipts.as_ref().map_err(Clone::clone)?;
+        // Hash the seal itself, including every confinement field. Debug on
+        // AssignmentMessagingLaunch deliberately redacts its bearer; account
+        // bindings contain only selection identifiers. No secret is persisted.
+        let snapshot = serde_json::json!({
+            "version": 2,
+            "confinement": format!("{:?}", bound.confinement),
+            "input_receipts": inputs,
+            "native_delegation_disabled": bound.native_delegation_disabled,
+            "managed_readonly_route": format!("{:?}", bound.managed_readonly_route),
+            "grant_id": bound.grant.id(),
+        });
+        Ok(Some(BudgetDispatchInvocation {
+            run_id: identity.run_id.clone(),
+            assignment_id: identity.task_id.clone(),
+            parent_id: identity.parent.clone(),
+            attempt: self
+                .assignment_process_launch_attempt
+                .ok_or("live grant has no attempt")?,
+            runtime: "codex".into(),
+            account,
+            command_sha256: crate::artifacts::state_auth::sha256_hex(
+                &serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?,
+            ),
+        }))
     }
 
     fn verified_claude_managed_reservation(
@@ -4845,6 +4963,20 @@ impl ExternalAgentRun {
         self.stdout.run_metadata.codex_command_execution_evidence = Some(evidence);
     }
 
+    pub(crate) fn live_budget_invocation(
+        &self,
+    ) -> Option<&crate::supervise_budget::BudgetDispatchInvocation> {
+        self.stdout.run_metadata.live_budget_invocation.as_ref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_live_budget_invocation_for_test(
+        &mut self,
+        command: &ExternalAgentCommand,
+    ) {
+        self.stdout.run_metadata.live_budget_invocation = command.live_budget_invocation().unwrap();
+    }
+
     /// The retained copy is never deserialized from reports or writable captures.
     pub(crate) fn authenticated_app_server_evidence(&self) -> Option<&CodexParentEvidence> {
         self.stdout
@@ -5537,6 +5669,7 @@ struct ExternalAgentRunMetadata {
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
+    live_budget_invocation: Option<crate::supervise_budget::BudgetDispatchInvocation>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
     codex_app_server_usage_complete: bool,
     /// Parent launch role only; never serialized or restored from public reports.
@@ -7160,6 +7293,18 @@ fn validate_role_execution_evidence_before_launch(
 }
 
 fn run_external_agent_runtime(
+    spec: &ExternalAgentCommand,
+    runtime: ExternalExecutionRuntime,
+    cancellation: &ProcessCancellation,
+    review_runtime: Option<ExternalPreActionReviewRuntime<'_>>,
+) -> ExternalAgentRun {
+    let identity = spec.live_budget_invocation().ok().flatten();
+    let mut run = run_external_agent_runtime_inner(spec, runtime, cancellation, review_runtime);
+    run.stdout.run_metadata.live_budget_invocation = identity;
+    run
+}
+
+fn run_external_agent_runtime_inner(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
     cancellation: &ProcessCancellation,

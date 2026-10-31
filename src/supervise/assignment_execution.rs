@@ -4018,6 +4018,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
                 .with_worktree_writable_confinement(admission);
         }
         super::runtime_executables::validate_launch(&command)?;
+        record_live_budget_admission(artifacts, &budget_reservation, &command)?;
         Ok(messaging_server)
     })() {
         Ok(server) => server,
@@ -4254,6 +4255,8 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         .as_ref()
         .ok()
         .map(|run| budget_reservation.settle_bound_runtime(run, &command));
+    let budget_binding_persistence =
+        persist_live_budget_binding(artifacts, &budget_reservation, true);
     if usage_settlement
         .as_ref()
         .is_some_and(|result| result.is_ok())
@@ -4352,6 +4355,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         drop(incoming_output_root);
         drop(capture_output_root);
         let diagnostics = (|| -> Result<()> {
+            budget_binding_persistence?;
             let external_run = &captured.external_run;
             let command = &captured.command;
             let attempt_artifacts = &captured.attempt_artifacts;
@@ -17725,6 +17729,7 @@ done
             run.publishable = false;
         }
         run.retain_app_server_parent_evidence_for_test();
+        run.retain_live_budget_invocation_for_test(command);
     }
 
     #[test]
