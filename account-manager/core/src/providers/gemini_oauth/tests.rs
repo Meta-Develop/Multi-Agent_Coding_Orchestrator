@@ -192,7 +192,9 @@ fn opener_fixture(session: &BrowserSession, mode: &str) -> (BrowserExit, OpenerF
         reaper: Some(reaper),
     };
     if mode != "fail" {
-        fixture.control = Some(control.accept().expect("browser control").0);
+        let (stream, _) = control.accept().expect("browser control");
+        stream.set_nonblocking(false).expect("blocking control");
+        fixture.control = Some(stream);
     }
     (exit, fixture)
 }

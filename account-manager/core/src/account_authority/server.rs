@@ -348,6 +348,8 @@ impl AuthorityListener {
     #[cfg(unix)]
     pub fn accept_once(&self) -> io::Result<()> {
         let (stream, _) = self.listener.accept()?;
+        // Deadline-aware reads/writes explicitly set nonblocking mode before
+        // I/O, so workers do not depend on platform-specific accept inheritance.
         let Some(permit) = ConnectionPermit::acquire(&self.active_connections) else {
             return Ok(());
         };
