@@ -4572,7 +4572,7 @@ fn exercise_authored_researcher_collection(persist_final: bool) {
     write_injected_json(&command.output_last_message, &wire);
     let mut external_run = injected_verified_run(&command);
     let started = CommandExecutionSnapshot {
-        command: "git status".to_string(),
+        command: "/bin/bash -lc 'git status'".to_string(),
         cwd: repo_path.to_string_lossy().into_owned(),
         status: CommandExecutionStatus::InProgress,
         exit_code: None,

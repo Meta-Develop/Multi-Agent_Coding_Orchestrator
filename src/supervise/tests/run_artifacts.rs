@@ -197,6 +197,102 @@ fn production_persistence_emits_schema_valid_finalized_reports_for_every_runtime
     );
 }
 
+#[test]
+fn supervise_collect_preserves_finalized_researcher_usage_and_requires_core_roles() {
+    let (_temp, repo_path) = injected_repository();
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    plan.assignments.clear();
+    let options = injected_options(&repo_path, _temp.path(), "collect-role-template");
+    let mut runner = |_command: &ExternalAgentCommand| -> ExternalAgentRun {
+        panic!("an empty supervisor plan must not launch a provider")
+    };
+    let template = run_supervisor_plan_with_runner(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &mut runner,
+    )
+    .expect("produce current finalized report");
+    let usage = Usage {
+        input_tokens: 88_284,
+        output_tokens: 7_007,
+        total_tokens: 95_291,
+    };
+
+    for missing_role in [
+        None,
+        Some(AgentRole::Supervisor),
+        Some(AgentRole::ChildOrchestrator),
+        Some(AgentRole::Worker),
+        Some(AgentRole::GateClassifier),
+        Some(AgentRole::Auditor),
+    ] {
+        let run_id = RunId::new(format!(
+            "collect-researcher-{}",
+            missing_role.map(|role| role.as_str()).unwrap_or("complete")
+        ))
+        .expect("valid role test run id");
+        let mut report = template.clone();
+        report.run_id = run_id.clone();
+        report.run_dir = RunArtifactFamily::Supervise
+            .run_root()
+            .join(run_id.as_str());
+        report.success = false;
+        report.accepted = false;
+        report.publishable = false;
+        report.rejected = true;
+        report.status = ReviewStatus::Failed;
+        report.total_usage = Some(usage);
+        report.usage_complete = true;
+        report.role_usage.insert(
+            AgentRole::Researcher,
+            RoleUsageReport {
+                models: vec!["gpt-6.1-sol".to_string()],
+                usage: Some(usage),
+                cost_usd: None,
+                observation: RoleUsageObservation::ProcessObserved,
+                unavailable_reason: None,
+            },
+        );
+        if let Some(role) = missing_role {
+            report.role_usage.remove(&role);
+        }
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo_path,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "supervise-test",
+        )
+        .expect("reserve authenticated role report");
+        write_final_report(&mut writer, &report).expect("write role report");
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .expect("finalize role report");
+        let collected = collect_supervisor_run(&repo_path, run_id).expect("collect role report");
+        if missing_role.is_some() {
+            assert_eq!(
+                collected.collection_state,
+                SupervisorCollectState::InconsistentFinalized
+            );
+        } else {
+            assert_eq!(
+                collected.collection_state,
+                SupervisorCollectState::Finalized
+            );
+            assert!(collected.final_report_available);
+            assert_eq!(collected.report, report);
+            assert!(collected.usage_complete);
+            assert_eq!(collected.total_usage, Some(usage));
+            assert!(!collected.accepted);
+            validate_supervisor_collect_with_advertised_schema(&collected);
+        }
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn worker_codex_schema_artifact_is_authenticated_across_resume_and_refuses_mutation() {

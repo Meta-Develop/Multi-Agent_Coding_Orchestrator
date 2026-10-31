@@ -63,6 +63,19 @@ Required acceptance evidence:
   declaration/assignment receipt and successful actual outer and inner
   containment visibility probes before release. No broader directory capability.
 - Authentic contained read commands and results that inspect the actual packet.
+  For Codex, each `commands_run[].command` is a one-element array holding the exact
+  command submitted to the tool, for example
+  `["nl -ba examples/supervise/qualification-data/source-packet.md"]`.
+  MACO decodes exactly one literal `/bin/bash -lc` or `/bin/bash -c` wrapper from
+  the native event; the submitted string is compared byte-for-byte, without
+  normalizing whitespace, quoting or nested shells. Unknown/malformed wrappers
+  fail closed. Host start/completion wrappers must agree exactly, and each claim
+  consumes a distinct completed, correlated execution with matching cwd/status/exit.
+  All native commands must be accounted for, and validation entries reference
+  distinct successful claims. The historical report claiming `/bin/bash -c '…'`
+  against a native `/bin/bash -lc '…'` event remains rejected; reports cannot infer
+  host wrappers from process listings. Native stdout and timing remain outside
+  the report's authenticated command fields.
   The report must cite `admit`, `observe`, and `complete` with real line ranges,
   demonstrate the two 60-token reservations against ceiling 100, distinguish
   cumulative 20/35/35/40 observations from deltas, identify persistence-before-

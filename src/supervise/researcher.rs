@@ -1,6 +1,10 @@
 //! Authored terminal research: its own wire contract and read-only launch.
 use super::*;
 
+mod command;
+#[cfg(test)]
+mod replay_tests;
+
 pub(super) fn validate_researcher_assignment(assignment: &OrchestratorAssignment) -> Result<()> {
     if assignment.role_category != Some(RoleCategory::ReadOnlyResearcher)
         || !assignment.worker_assignments.is_empty()
@@ -138,6 +142,7 @@ pub(super) fn final_researcher_report_schema_value() -> Value {
     // Do not apply the public report's redacted-path constraint to this evidence,
     // or relax that constraint in the public/child schemas themselves.
     schema["properties"]["commands_run"]["items"]["properties"]["cwd"] = json!({"type": "string"});
+    describe_researcher_commands(&mut schema);
     schema["properties"]["audit_reports"]["items"]["properties"]["commands_run"]["items"]
         ["properties"]["cwd"] = json!({"type": "string"});
     schema
@@ -217,8 +222,9 @@ pub(super) fn enforce_researcher_zero_diff(report: &mut OrchestratorReviewReport
 
 /// A Researcher report is authored by the model. Only the app-server transcript held by the
 /// supervisor can establish that its inspection commands actually ran. Require a complete,
-/// one-to-one account of every observed command, then bind validation claims to distinct
-/// successful commands. The protocol cannot authenticate stdout, timing, or timeout claims.
+/// one-to-one account of every observed command's exact submitted script, then bind validation
+/// claims to distinct successful commands. Full native wrappers must agree before decoding;
+/// report claims are never unwrapped. The protocol cannot authenticate stdout or timing claims.
 pub(super) fn verify_researcher_command_evidence(
     report: &OrchestratorReviewReport,
     evidence: Option<&crate::external_agent::codex_app_server::CommandExecutionEvidence>,
@@ -273,7 +279,8 @@ pub(super) fn verify_researcher_command_evidence(
             .find(|(index, observation)| {
                 !matched[*index]
                     && matches!(observation, Observation::Complete { started, completed, .. }
-                    if started.command == claim.command[0]
+                    if command::submitted_command(&started.command).as_deref()
+                            == Some(claim.command[0].as_str())
                         && claim.cwd == Path::new(&started.cwd)
                         && completed.command == started.command
                         && completed.cwd == started.cwd
@@ -321,6 +328,7 @@ pub(super) fn researcher_report_schema_value() -> Value {
     let mut schema = orchestrator_report_schema_value();
     schema["title"] = json!("ResearcherReport");
     schema["properties"]["role"] = json!({"type": "string", "const": "researcher"});
+    describe_researcher_commands(&mut schema);
     for key in ["read_only", "no_further_delegation"] {
         schema["properties"][key] = json!({"type": "boolean", "const": true});
         schema["required"]
@@ -337,6 +345,16 @@ pub(super) fn researcher_report_schema_value() -> Value {
         schema["properties"][key]["maxItems"] = json!(0);
     }
     schema
+}
+
+fn describe_researcher_commands(schema: &mut Value) {
+    for key in ["commands_run", "validation_results"] {
+        // Keep rejected claims representable in final private evidence. The custody
+        // verifier enforces the one-string contract independently of schema shape.
+        schema["properties"][key]["items"]["properties"]["command"]["description"] = json!(
+            "For Codex, exactly one string: the command submitted to the tool, byte-for-byte, without the host-added Bash wrapper. The parent decodes one literal /bin/bash -lc or -c wrapper from correlated native events and requires an exact match; it never unwraps claims. Gemini native ReadFile reports leave commands_run and validation_results empty."
+        );
+    }
 }
 
 #[cfg(test)]
@@ -383,9 +401,9 @@ mod tests {
             "id": "research", "role": "researcher", "read_only": true, "no_further_delegation": true,
             "assigned_paths": ["src"], "files_changed": [], "worker_reports": [], "audit_reports": [],
             "decomposition_completions": [], "accepted": true, "rejected": false, "status": "succeeded",
-            "commands_run": [{"command": ["rg", "API", "src"], "cwd": ".", "exit_code": 0,
-                "status": "succeeded", "timeout_seconds": 10, "duration_ms": 1, "timed_out": false}],
-            "validation_results": [{"name": "API inspection", "command": ["rg", "API", "src"], "status": "succeeded"}]
+            "commands_run": [{"command": ["rg API src"], "cwd": ".", "exit_code": 0,
+                "status": "succeeded", "timeout_seconds": 0, "duration_ms": 0, "timed_out": false}],
+            "validation_results": [{"name": "API inspection", "command": ["rg API src"], "status": "succeeded"}]
         })
     }
 
@@ -720,7 +738,7 @@ mod tests {
         report.commands_run[0].duration_ms = 0;
         report.validation_results[0].command = report.commands_run[0].command.clone();
         let started = CommandExecutionSnapshot {
-            command: "rg API src".to_string(),
+            command: "/bin/bash -lc 'rg API src'".to_string(),
             cwd: "/tmp/research-worktree".to_string(),
             status: Status::InProgress,
             exit_code: None,
