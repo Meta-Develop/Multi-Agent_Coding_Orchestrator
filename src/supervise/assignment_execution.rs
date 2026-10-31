@@ -20,6 +20,7 @@ mod bound_parent_turn;
 #[allow(dead_code)]
 mod parent_continuation_binding;
 // Staged continuation response; controller is the next leaf.
+mod isolated_worker_evidence;
 #[allow(dead_code)]
 mod managed_parent_controller;
 #[allow(dead_code)]
@@ -1513,7 +1514,7 @@ fn execute_isolated_worker_capture(
     child: &AssignmentExecutionContext<'_, '_>,
     parent: &AssignmentExecutionContext<'_, '_>,
     parent_preflight: &AssignmentExecutionPreflight<'_>,
-    _parent_attempt: usize,
+    parent_attempt: usize,
     grant: bound_parent_turn::IsolatedWorkerDispatchAuthority,
     outcome: &mut AssignmentExecutionOutcome,
     policy: &AssignmentBudgetPolicy,
@@ -1581,7 +1582,16 @@ fn execute_isolated_worker_capture(
         std::mem::forget(preflight);
         return capture_result.map(|_| unreachable!());
     }
-    let capture = capture_result?;
+    let mut capture = capture_result?;
+    if capture.post_return_error.is_some() && release_state.load(Ordering::Acquire) == 2 {
+        child.cancellation.cancel();
+        outcome.external_containment_failed = true;
+        let error = capture.post_return_error.take().unwrap();
+        // A diagnostic failure must not release an unknown-containment return.
+        std::mem::forget(capture);
+        std::mem::forget(preflight);
+        return Err(error);
+    }
     if !capture.external_run.scratch_quiescence_verified() {
         child.cancellation.cancel();
         outcome.external_containment_failed = true;
@@ -1591,24 +1601,24 @@ fn execute_isolated_worker_capture(
         std::mem::forget(preflight);
         bail!("isolated Worker returned without verified scratch quiescence; resources retained");
     }
-    if child.budget_ledger.dispatch_stopped() {
-        // Retain descriptor-held partial output even when cancellation/report
-        // validation below rejects the exhausted turn. This is private evidence,
-        // never a validated Worker result or authority for continuation.
-        if let Some(bytes) = capture.external_run.output_last_message() {
-            if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
-                bail!("interrupted Worker report exceeds its configured byte limit");
-            }
-            with_supervisor_artifacts(child.artifacts, |writer, _| {
-                writer.write_bytes(
-                    &capture.attempt_artifacts.raw_report_relative,
-                    bytes,
-                    ArtifactFileDisposition::PrivateEvidence,
-                )?;
-                Ok(())
-            })?;
-        }
+    // Retention is independent of report validity, cancellation and continued
+    // dispatch authority. It cannot turn a stopped/partial result into acceptance.
+    let retention = isolated_worker_evidence::retain(
+        child,
+        &preflight,
+        &parent_preflight.assignment.id,
+        parent_attempt,
+        &capture,
+    );
+    if let Some(error) = capture.post_return_error.take() {
+        return Err(match retention {
+            Ok(_) => error,
+            Err(retention_error) => error.context(format!(
+                "isolated Worker evidence retention also failed: {retention_error:#}"
+            )),
+        });
     }
+    let (journals, candidate_after) = retention?;
     if child.cancellation.is_cancelled() {
         bail!("isolated Worker was cancelled after its returned dispatch settled; no continuation authorized");
     }
@@ -1617,8 +1627,6 @@ fn execute_isolated_worker_capture(
         capture.external_run.output_last_message(),
         &capture.attempt_artifacts.raw_report_relative,
     )?;
-    let candidate_after =
-        primary_worktree_snapshot(&preflight.worktree.path, child.execution_runtime)?;
     let changes = primary_integrity_changes(&candidate_before, &candidate_after);
     if !primary_integrity_changes(
         &capture.primary_before,
@@ -1628,28 +1636,6 @@ fn execute_isolated_worker_capture(
     {
         bail!("isolated Worker changed the protected primary");
     }
-    let journals = with_supervisor_artifacts(child.artifacts, |writer, journal| {
-        let journals = import_worker_execution_journals(
-            writer,
-            &preflight.assignment,
-            &capture.incoming_scratch,
-            &capture.external_run,
-        )?;
-        record_worker_journal_events(journal, writer, &preflight.assignment, &journals);
-        import_external_attempt_evidence(
-            writer,
-            ExternalAttemptEvidenceContext {
-                incoming_scratch: &capture.incoming_scratch,
-                capture_scratch: &capture.capture_scratch,
-                artifacts: &capture.attempt_artifacts,
-                external_run: &capture.external_run,
-                external_command: &capture.command,
-                raw_report_validated: !parsed.recovered,
-                runtime: capture.launch_runtime,
-            },
-        )?;
-        Ok(journals)
-    })?;
     let lease = preflight
         .worktree_write_lease
         .take()
@@ -3368,6 +3354,18 @@ struct CapturedChildAttempt<'a> {
     launch_runtime: SupervisorRuntime,
     environment_blocked: bool,
     attempt_containment_verified: bool,
+    post_return_error: Option<anyhow::Error>,
+}
+
+impl CapturedChildAttempt<'_> {
+    fn record_post_return_error(&mut self, error: anyhow::Error) {
+        self.post_return_error = Some(match self.post_return_error.take() {
+            Some(previous) => {
+                previous.context(format!("additional post-return failure: {error:#}"))
+            }
+            None => error,
+        });
+    }
 }
 
 struct CollectedChildAttempt<'a> {
@@ -3846,7 +3844,7 @@ fn dispatch_and_capture_child_attempt<'a>(
     attempt: usize,
     prepared: Box<PreparedChildAttempt<'a>>,
 ) -> Result<Box<CapturedChildAttempt<'a>>> {
-    dispatch_and_capture_child_attempt_with_release_state(
+    let mut captured = dispatch_and_capture_child_attempt_with_release_state(
         context,
         outcome,
         preflight,
@@ -3854,9 +3852,15 @@ fn dispatch_and_capture_child_attempt<'a>(
         attempt,
         prepared,
         None,
-    )
+    )?;
+    if let Some(error) = captured.post_return_error.take() {
+        return Err(error);
+    }
+    Ok(captured)
 }
 
+// A settled capture retains post-return diagnostic failures for its owner to
+// propagate after evidence retention. Such failures never authorize acceptance.
 #[allow(clippy::too_many_arguments)]
 fn dispatch_and_capture_child_attempt_with_release_state<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -4326,74 +4330,9 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
         let environment_blocked = external_run.environment_blocked();
         let usage_settlement =
             usage_settlement.context("returned dispatch is missing its retained settlement")??;
-        match usage_settlement.role_sample(assignment.role, None) {
-            Some(sample) => {
-                let usage = sample.usage;
-                outcome.usage_samples.push(sample);
-                record_and_persist_live_invocation(
-                    artifacts,
-                    LiveInvocationObservation {
-                        run_id: options.run_id.as_str(),
-                        assignment_id: &assignment.id,
-                        attempt,
-                        role: assignment.role,
-                        runtime: launch_runtime,
-                        model: command.model.as_deref(),
-                        effort: command.reasoning_effort.as_deref(),
-                        worktree_id: &worktree.name,
-                        usage: Some(&usage),
-                        duration_ms: Some(external_run.duration_ms),
-                        started_at_unix_millis: live_invocation_started_millis(
-                            external_run.duration_ms,
-                        ),
-                    },
-                )?;
-            }
-            None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
-            None => {}
-        }
-        drop(incoming_output_root);
-        drop(capture_output_root);
-        let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
-        record_shared_orchestration_event(
-            artifacts,
-            &assignment.id,
-            Some(journal_parent_id),
-            assignment_journal_role,
-            OrchestrationEventKind::Status,
-            lifecycle_event_payload(
-                if external_process_completed(&external_run, launch_runtime) {
-                    "completed"
-                } else {
-                    "failed"
-                },
-                Some(attempt),
-                child_thread_id.as_deref(),
-            ),
-        )?;
         let attempt_containment_verified =
             external_containment_verified(&external_run, launch_runtime);
-        if !attempt_containment_verified {
-            outcome.external_containment_failed = true;
-            outcome.findings.push(Finding {
-            severity: FindingSeverity::Error,
-            message: format!(
-                "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
-                assignment.id,
-                (external_run.process_tree, external_run.side_effects),
-                attempt_artifacts.raw_report_relative.display()
-            ),
-            paths: vec![attempt_artifacts.raw_report_relative.clone()],
-        });
-        }
-        outcome
-            .command_records
-            .push(command_record_from_external_for_runtime(
-                &external_run,
-                &command,
-                launch_runtime,
-            ));
-        Ok(Box::new(CapturedChildAttempt {
+        let mut captured = Box::new(CapturedChildAttempt {
             attempt_artifacts,
             corrective_retry_used,
             model_provenance,
@@ -4408,22 +4347,107 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             launch_runtime,
             environment_blocked,
             attempt_containment_verified,
-        }))
+            post_return_error: None,
+        });
+        drop(incoming_output_root);
+        drop(capture_output_root);
+        let diagnostics = (|| -> Result<()> {
+            let external_run = &captured.external_run;
+            let command = &captured.command;
+            let attempt_artifacts = &captured.attempt_artifacts;
+            let usage_settlement = &captured.usage_settlement;
+            match usage_settlement.role_sample(assignment.role, None) {
+                Some(sample) => {
+                    let usage = sample.usage;
+                    outcome.usage_samples.push(sample);
+                    record_and_persist_live_invocation(
+                        artifacts,
+                        LiveInvocationObservation {
+                            run_id: options.run_id.as_str(),
+                            assignment_id: &assignment.id,
+                            attempt,
+                            role: assignment.role,
+                            runtime: launch_runtime,
+                            model: command.model.as_deref(),
+                            effort: command.reasoning_effort.as_deref(),
+                            worktree_id: &worktree.name,
+                            usage: Some(&usage),
+                            duration_ms: Some(external_run.duration_ms),
+                            started_at_unix_millis: live_invocation_started_millis(
+                                external_run.duration_ms,
+                            ),
+                        },
+                    )?;
+                }
+                None if usage_settlement.is_degraded() => outcome.usage_incomplete = true,
+                None => {}
+            }
+            let child_thread_id = codex_thread_id_from_stdout(external_run.stdout_bytes());
+            record_shared_orchestration_event(
+                artifacts,
+                &assignment.id,
+                Some(journal_parent_id),
+                assignment_journal_role,
+                OrchestrationEventKind::Status,
+                lifecycle_event_payload(
+                    if external_process_completed(external_run, launch_runtime) {
+                        "completed"
+                    } else {
+                        "failed"
+                    },
+                    Some(attempt),
+                    child_thread_id.as_deref(),
+                ),
+            )?;
+            if !attempt_containment_verified {
+                outcome.external_containment_failed = true;
+                outcome.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: format!(
+                "external child process containment was not verified empty for '{}' attempt {attempt}; evidence: {:?}; report: {}",
+                assignment.id,
+                (external_run.process_tree, external_run.side_effects),
+                attempt_artifacts.raw_report_relative.display()
+            ),
+            paths: vec![attempt_artifacts.raw_report_relative.clone()],
+        });
+            }
+            outcome
+                .command_records
+                .push(command_record_from_external_for_runtime(
+                    external_run,
+                    command,
+                    launch_runtime,
+                ));
+            Ok(())
+        })();
+        if let Err(error) = diagnostics {
+            captured.record_post_return_error(error);
+        }
+        Ok(captured)
     })();
-    let captured_result = match (captured_result, completion_checkpoint) {
-        (result, Ok(())) => result,
-        (Ok(_capture), Err(error)) => Err(error),
-        (Err(error), Err(checkpoint_error)) => Err(error).context(format!(
-            "child post-return dispatch checkpoint also failed: {checkpoint_error:#}"
-        )),
-    };
-    match (captured_result, returned_evidence) {
-        (result, Ok(())) => result,
-        (Ok(_capture), Err(error)) => Err(error),
-        (Err(error), Err(import_error)) => Err(error).context(format!(
-            "managed parent returned evidence import also failed: {import_error:#}"
-        )),
+    let mut captured_result = captured_result;
+    for (label, diagnostic) in [
+        (
+            "child post-return dispatch checkpoint failed",
+            completion_checkpoint,
+        ),
+        (
+            "managed parent returned evidence import failed",
+            returned_evidence,
+        ),
+    ] {
+        if let Err(error) = diagnostic {
+            captured_result = match captured_result {
+                Ok(mut captured) => {
+                    captured.record_post_return_error(error.context(label));
+                    Ok(captured)
+                }
+                Err(capture_error) => Err(capture_error.context(format!("{label}: {error:#}"))),
+            };
+        }
     }
+    captured_result
 }
 
 #[cfg(test)]
@@ -18382,6 +18406,8 @@ mod attached_parent_capture_tests;
 #[path = "assignment_execution/bound_parent_turn_tests.rs"]
 mod bound_parent_turn_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod isolated_worker_evidence_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/managed_parent_controller_tests.rs"]
 mod managed_parent_controller_tests;
