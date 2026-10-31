@@ -41,11 +41,12 @@ if "$maco" supervise collect "$run_id" --repo "$repo" --json \
 printf '%s\n' "$rc" > "$OUT/collect.exit"
 ```
 
-The plan has a finite 240,000-token ceiling, 4,000-token parent/Researcher/reviewer
-estimates, no retries and a 1,200-second child timeout. The ceiling adds roughly
-20% headroom to the historical supplied-source failure: 41,321 Researcher +
-154,651 Auditor = 195,972 tokens; 195,972 × 1.20 = 235,166.4, rounded up to
-240,000 (44,028 tokens, about 22.5% headroom). Historical positive routes used
+The plan has a finite 300,000-token ceiling, 4,000-token parent/Researcher/reviewer
+estimates, no retries and a 1,200-second child timeout. The ceiling was first set
+to 240,000, about 20% above the historical supplied-source failure (41,321
+Researcher + 154,651 Auditor = 195,972 tokens). A later attempt charged 242,032
+tokens against that limit and interrupted its last review lens, so the ceiling
+was raised to 300,000 (57,968 tokens, about 24% above that attempt). Historical positive routes used
 [130,507 tokens](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/680#issuecomment-5850136768)
 and [127,944 tokens](https://github.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/issues/631#issuecomment-5868103079);
 neither qualifies this fixture or proves its current `xhigh` consumption.
