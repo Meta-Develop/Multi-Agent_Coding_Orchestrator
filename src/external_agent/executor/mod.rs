@@ -1,6 +1,6 @@
 //! Typed executor protocol foundation for local-compatible and remote agent runs.
 //!
-//! This module intentionally has no SSH client and no dependency on the current
+//! This module has no dependency on the current
 //! external-agent report types. [`LocalExecutor`] preserves the existing atomic
 //! callback contract, while [`SshExecutor`] exercises the lifecycle protocol only
 //! through an injected [`SshTransport`]. Remote results remain candidate evidence;
@@ -10,7 +10,7 @@
 //! [`SupervisedSshExecutor`] binds an explicitly selected, locally validated trust
 //! configuration to a transport factory and an attempt-scoped lifecycle. It
 //! translates declared local paths to manifest names and observes the existing
-//! cancellation token. It does not install a lifecycle SSH wire client.
+//! cancellation token. A Linux lifecycle client is available through `lifecycle`.
 //! The supervisor owns durable receipts, recovery,
 //! candidate import/recapture, and cleanup through explicit embedding configuration.
 //!
@@ -26,6 +26,8 @@
 mod checksum;
 #[cfg(target_os = "linux")]
 pub(crate) mod launch_lifecycle;
+#[cfg(target_os = "linux")]
+pub mod lifecycle;
 mod local;
 mod selection;
 mod ssh;

@@ -1144,6 +1144,16 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             print_query_report(&plan, json)
         }
         SuperviseSubcommand::Run(args) => {
+            #[cfg(target_os = "linux")]
+            let _ssh_binding = args
+                .ssh_trust
+                .as_deref()
+                .map(supervise::remote_cli::bind_operator_ssh)
+                .transpose()?;
+            #[cfg(not(target_os = "linux"))]
+            if args.ssh_trust.is_some() {
+                bail!("supervised SSH requires Linux");
+            }
             validate_supervise_only_runtime(args.runtime, args.only_runtime)?;
             pin_cam_authority_socket(args.cam_authority_socket.as_deref())?;
             let routed_literal = args.literal_goal.is_some();
@@ -1887,6 +1897,9 @@ fn validate_supervise_only_runtime(
 
 #[derive(Debug, Args)]
 struct RunSuperviseArgs {
+    /// Explicit operator trust file for candidate-only supervised SSH (Linux).
+    #[arg(long)]
+    ssh_trust: Option<PathBuf>,
     /// Qualification only: permit one bounded grok-4.7/xhigh ACP Worker under Codex control.
     /// Recorded in run evidence; does not bypass account, prior, containment or publication gates.
     #[arg(long, requires_all = ["runtime", "run_id"], conflicts_with_all = ["from_goal", "literal_goal", "allow_primary_worktree"])]

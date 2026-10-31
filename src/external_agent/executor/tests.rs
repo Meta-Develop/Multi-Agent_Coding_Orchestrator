@@ -511,6 +511,13 @@ fn sha256_matches_known_and_padding_boundary_vectors() {
     ];
     for (bytes, expected) in vectors {
         assert_eq!(Digest::for_bytes(&bytes).as_str(), expected);
+        for chunk_size in [1, 7, 63, 64, 65] {
+            let mut hash = super::checksum::Sha256::new();
+            for chunk in bytes.chunks(chunk_size) {
+                hash.update(chunk);
+            }
+            assert_eq!(Digest::from_sha256(hash.finish()).as_str(), expected);
+        }
     }
 }
 

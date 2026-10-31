@@ -33,6 +33,8 @@ const RECEIPT_OUTPUT_FRAMING_BYTES: u64 = 128;
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 pub enum ExecutorError {
+    #[error(transparent)]
+    NotStarted(#[from] TransportNotStarted),
     #[error("invalid {field}: {reason}")]
     InvalidField { field: &'static str, reason: String },
     #[error("{what} exceeds its limit of {limit}")]
@@ -153,7 +155,11 @@ impl Digest {
     }
 
     pub fn for_bytes(bytes: &[u8]) -> Self {
-        Self(hex_encode(&sha256(bytes)))
+        Self::from_sha256(sha256(bytes))
+    }
+
+    pub(super) fn from_sha256(bytes: [u8; 32]) -> Self {
+        Self(hex_encode(&bytes))
     }
 
     pub fn as_str(&self) -> &str {
@@ -454,7 +460,7 @@ impl<'de> Deserialize<'de> for LogicalPath {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BoundedLiteral(String);
 
 impl BoundedLiteral {
@@ -482,14 +488,15 @@ impl BoundedLiteral {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum TypedArg {
     Literal(BoundedLiteral),
     ManifestPath(LogicalPath),
     FinalStdinMarker,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct TypedArgv(Vec<TypedArg>);
 
 impl TypedArgv {
@@ -537,7 +544,8 @@ impl TypedArgv {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ManifestPurpose {
     Prompt,
     Schema,
@@ -568,7 +576,8 @@ impl ManifestPurpose {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 enum ManifestEntryKind {
     Input { bytes: Vec<u8>, digest: Digest },
     Output { max_bytes: u64 },
@@ -590,7 +599,8 @@ impl fmt::Debug for ManifestEntryKind {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ManifestEntry {
     path: LogicalPath,
     purpose: ManifestPurpose,
@@ -713,7 +723,8 @@ impl ManifestEntry {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct InputManifest {
     entries: Vec<ManifestEntry>,
     digest: Digest,
@@ -826,7 +837,8 @@ impl InputManifest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentIdentity {
     pub host_id: HostId,
     pub run_id: RunId,
@@ -861,7 +873,8 @@ impl AssignmentIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageRequest {
     pub(super) identity: AssignmentIdentity,
     pub(super) manifest: InputManifest,
@@ -922,13 +935,15 @@ impl StageRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageTransportRequest {
     pub target: SshTargetConfig,
     pub stage: StageRequest,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StageTransportReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -1023,7 +1038,7 @@ impl StagedAssignment {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct BoundedMillis(u64);
 
 impl BoundedMillis {
@@ -1042,7 +1057,8 @@ impl BoundedMillis {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchSpec {
     pub(super) argv: TypedArgv,
     pub(super) stdin: LogicalPath,
@@ -1130,7 +1146,8 @@ impl LaunchRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SubmittedLaunchIdentity {
     pub(super) assignment: AssignmentIdentity,
     pub(super) staged_digest: Digest,
@@ -1184,7 +1201,8 @@ impl SubmittedLaunchIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchTransportRequest {
     pub target: SshTargetConfig,
     pub submitted: SubmittedLaunchIdentity,
@@ -1193,7 +1211,8 @@ pub struct LaunchTransportRequest {
     pub deadline: BoundedMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ExecutionIdentity {
     pub(super) host_id: HostId,
     pub(super) run_id: RunId,
@@ -1324,7 +1343,8 @@ impl ExecutionIdentity {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LaunchReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -1357,7 +1377,8 @@ impl LaunchReceipt {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExecutionQuery {
     Submitted(SubmittedLaunchIdentity),
     Known(ExecutionIdentity),
@@ -1368,7 +1389,8 @@ pub struct StatusRequest {
     pub query: ExecutionQuery,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatusTransportRequest {
     pub target: SshTargetConfig,
     pub key: IdempotencyKey,
@@ -1380,7 +1402,7 @@ pub struct StatusTransportRequest {
 /// This is deliberately distinct from [`ControlSignal`]: process status may report
 /// any standard or real-time Linux signal, while control requests are restricted to
 /// the protocol's TERM-then-KILL policy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub struct ProcessSignal(NonZeroU16);
 
 impl ProcessSignal {
@@ -1405,7 +1427,8 @@ impl ProcessSignal {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ExecutionStatus {
     NotFound,
     Running(ExecutionIdentity),
@@ -1430,7 +1453,8 @@ impl ExecutionStatus {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StatusReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -1505,7 +1529,8 @@ impl WaitRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaitTransportRequest {
     pub target: SshTargetConfig,
     pub key: IdempotencyKey,
@@ -1513,7 +1538,8 @@ pub struct WaitTransportRequest {
     pub max_wait: BoundedMillis,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum WaitOutcome {
     Exited { code: i32 },
     Signaled { signal: ProcessSignal },
@@ -1527,7 +1553,8 @@ impl WaitOutcome {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WaitReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -1567,13 +1594,15 @@ impl WaitReceipt {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum ControlSignal {
     Term,
     Kill,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlTransportRequest {
     pub target: SshTargetConfig,
     pub key: IdempotencyKey,
@@ -1581,7 +1610,8 @@ pub struct ControlTransportRequest {
     pub signal: ControlSignal,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ControlReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -1673,7 +1703,8 @@ pub struct TerminationReceipt {
     pub after_kill: Option<WaitOutcome>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DeclaredOutput {
     pub(super) path: LogicalPath,
     pub(super) media_type: String,
@@ -1725,7 +1756,8 @@ impl DeclaredOutput {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct OutputPolicy {
     pub(super) patch_max_bytes: u64,
     pub(super) changed_paths_max: usize,
@@ -1858,7 +1890,8 @@ impl OutputPolicy {
 /// The full policy is retained so collection cannot substitute a wider scope or a
 /// different output declaration after launch. The digest and collection key are
 /// canonical bindings carried through every later lifecycle identity.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionAuthority {
     policy: OutputPolicy,
     policy_digest: Digest,
@@ -2030,7 +2063,8 @@ impl CollectRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionTransportRequest {
     pub target: SshTargetConfig,
     pub key: IdempotencyKey,
@@ -2045,7 +2079,8 @@ pub struct CollectionTransportRequest {
 /// A production transport must reject an over-limit length prefix before allocating
 /// or reading that object. Constructing a bounded artifact after an arbitrary
 /// transport already allocated it is not a memory-safety boundary.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TransportReadLimits {
     pub(super) receipt_max_bytes: u64,
     pub(super) patch_max_bytes: u64,
@@ -2179,7 +2214,8 @@ impl TransportReadLimits {
     }
 }
 
-#[derive(Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectedBlob {
     pub(super) bytes: Vec<u8>,
     pub(super) declared_size: u64,
@@ -2252,7 +2288,8 @@ impl CollectedBlob {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectedOutputEnvelope {
     pub(super) path: String,
     pub(super) media_type: String,
@@ -2304,7 +2341,8 @@ impl CollectedOutputEnvelope {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CollectionReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -2766,7 +2804,8 @@ impl CleanupRequest {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupTransportRequest {
     pub target: SshTargetConfig,
     pub key: IdempotencyKey,
@@ -2774,7 +2813,8 @@ pub struct CleanupTransportRequest {
     pub workspace_id: WorkspaceId,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct CleanupReceipt {
     pub(super) protocol_version: u32,
     pub(super) key: IdempotencyKey,
@@ -2909,9 +2949,32 @@ pub enum Effect<T> {
     Uncertain(Box<UncertainEffect>),
 }
 
+/// Trusted transport assertion that no helper could have received the request.
+/// Never use this for a lost reply or any failure after successful process spawn.
+#[derive(Debug, Error, Clone, PartialEq, Eq)]
+#[error("SSH transport did not start: {detail}")]
+pub struct TransportNotStarted {
+    detail: String,
+}
+
+impl TransportNotStarted {
+    pub fn new(mut detail: String) -> Self {
+        const MAX_DETAIL: usize = 4096;
+        if detail.len() > MAX_DETAIL {
+            let mut end = MAX_DETAIL;
+            while !detail.is_char_boundary(end) {
+                end -= 1;
+            }
+            detail.truncate(end);
+        }
+        Self { detail }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TransportCall<T> {
     Response(T),
+    NotStarted(TransportNotStarted),
     LostResponse { detail: String },
 }
 
@@ -3075,5 +3138,29 @@ pub(crate) fn derive_query_key(phase: &str, query: &ExecutionQuery) -> Idempoten
     match query {
         ExecutionQuery::Submitted(submitted) => derive_submitted_key(phase, submitted),
         ExecutionQuery::Known(identity) => derive_execution_key(phase, identity),
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedLiteral {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(String::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for TypedArgv {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(Vec::<TypedArg>::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for BoundedMillis {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u64::deserialize(deserializer)?).map_err(de::Error::custom)
+    }
+}
+
+impl<'de> Deserialize<'de> for ProcessSignal {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Self::new(u16::deserialize(deserializer)?).map_err(de::Error::custom)
     }
 }

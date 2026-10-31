@@ -24,6 +24,11 @@ pub trait AgentExecutor: Send + Sync {
 /// artifact constructors are a second validation layer, not permission to decode
 /// an unbounded remote response first.
 pub trait SshTransport: Send + Sync {
+    /// Check local prerequisites without contacting the remote helper. Called
+    /// before durable intent; failures must be actionable and safe to retry.
+    fn preflight(&self) -> ExecutorResult<()> {
+        Ok(())
+    }
     fn stage(&self, request: StageTransportRequest) -> TransportCall<StageTransportReceipt>;
     fn launch(&self, request: LaunchTransportRequest) -> TransportCall<LaunchReceipt>;
     fn status(&self, request: StatusTransportRequest) -> TransportCall<StatusReceipt>;
@@ -93,6 +98,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Stage,
@@ -159,6 +165,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Launch,
@@ -193,6 +200,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Err(ExecutorError::TransportLost {
                     operation: Operation::Status,
@@ -330,6 +338,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Collect,
@@ -375,7 +384,7 @@ impl<T: SshTransport> AgentExecutor for SshExecutor<T> {
                 reason: "is not bound to the exact execution identity".to_string(),
             });
         }
-        Ok(self.call_cleanup(request))
+        self.call_cleanup(request)
     }
 }
 
@@ -429,8 +438,19 @@ impl<T: SshTransport> SshExecutor<T> {
             identity: identity.clone(),
             max_wait,
         });
+        // Earlier termination requests may already have taken effect. A local
+        // refusal of a later leg must retain conservative reconciliation.
+        let call = match call {
+            TransportCall::NotStarted(error) if operation != Operation::Wait => {
+                TransportCall::LostResponse {
+                    detail: error.to_string(),
+                }
+            }
+            call => call,
+        };
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation,
@@ -488,8 +508,19 @@ impl<T: SshTransport> SshExecutor<T> {
             identity: identity.clone(),
             signal,
         });
+        // Earlier termination requests may already have taken effect. A local
+        // refusal of a later leg must retain conservative reconciliation.
+        let call = match call {
+            TransportCall::NotStarted(error) if operation == Operation::TerminateKill => {
+                TransportCall::LostResponse {
+                    detail: error.to_string(),
+                }
+            }
+            call => call,
+        };
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
                 return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation,
@@ -535,7 +566,7 @@ impl<T: SshTransport> SshExecutor<T> {
         }
     }
 
-    fn call_cleanup(&self, request: CleanupRequest) -> Effect<CleanupReceipt> {
+    fn call_cleanup(&self, request: CleanupRequest) -> ExecutorResult<Effect<CleanupReceipt>> {
         let identity = request.identity;
         let key = request.key;
         let lookup = CleanupLookup {
@@ -551,13 +582,14 @@ impl<T: SshTransport> SshExecutor<T> {
         });
         let receipt = match call {
             TransportCall::Response(receipt) => receipt,
+            TransportCall::NotStarted(error) => return Err(error.into()),
             TransportCall::LostResponse { detail } => {
-                return Effect::Uncertain(Box::new(UncertainEffect {
+                return Ok(Effect::Uncertain(Box::new(UncertainEffect {
                     operation: Operation::Cleanup,
                     key,
                     reconciliation: ReconciliationTarget::Cleanup(lookup),
                     detail,
-                }));
+                })));
             }
         };
         let validation = require_protocol(Operation::Cleanup, receipt.protocol_version)
@@ -585,7 +617,7 @@ impl<T: SshTransport> SshExecutor<T> {
                     "workspace identity does not match the cleanup request",
                 )
             });
-        match validation {
+        Ok(match validation {
             Ok(()) => Effect::Confirmed(receipt),
             Err(error) => Effect::Uncertain(Box::new(UncertainEffect {
                 operation: Operation::Cleanup,
@@ -593,7 +625,7 @@ impl<T: SshTransport> SshExecutor<T> {
                 reconciliation: ReconciliationTarget::Cleanup(lookup),
                 detail: error.to_string(),
             })),
-        }
+        })
     }
 }
 

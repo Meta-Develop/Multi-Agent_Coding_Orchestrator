@@ -93,6 +93,10 @@ pub use git_repository::configure_libgit2_repository_extensions;
 /// initialization so the helper path has no ambient CLI/runtime side effects.
 #[doc(hidden)]
 pub fn maybe_run_pinned_helper_from_args() -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    if external_agent::executor::lifecycle::maybe_run_helper()? {
+        return Ok(true);
+    }
     if process_runner::maybe_run_claude_helper_from_args()? {
         return Ok(true);
     }

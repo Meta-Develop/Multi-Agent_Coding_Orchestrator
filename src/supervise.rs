@@ -260,6 +260,8 @@ pub use assignment_shape::{
 };
 mod assignment_executor;
 pub mod authored_checks;
+#[cfg(target_os = "linux")]
+pub mod remote_cli;
 pub mod remote_execution;
 pub(crate) use plan_api::{
     load_supervisor_plan_file_in_repo, task_routing_assessment_from_plan_document,

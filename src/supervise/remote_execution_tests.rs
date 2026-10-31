@@ -19,6 +19,11 @@ struct Observed {
     cancel_on_stage: Option<ProcessCancellation>,
     identity: Option<ExecutionIdentity>,
     lost_stage: bool,
+    not_started_stage: bool,
+    not_started_launch: bool,
+    preflight_failure: bool,
+    not_started_grace_wait: bool,
+    refuse_wait_after_term: bool,
     lost_launch: bool,
     fail_launch_receipt_write: bool,
     lost_collect: bool,
@@ -33,9 +38,23 @@ struct Observed {
 struct FakeTransport(Arc<Mutex<Observed>>);
 
 impl SshTransport for FakeTransport {
+    fn preflight(&self) -> ExecutorResult<()> {
+        if self.0.lock().unwrap().preflight_failure {
+            return Err(TransportNotStarted::new(
+                "enable delegated local cgroup with Delegate=yes".into(),
+            )
+            .into());
+        }
+        Ok(())
+    }
     fn stage(&self, request: StageTransportRequest) -> TransportCall<StageTransportReceipt> {
         let mut state = self.0.lock().unwrap();
         state.stages.push(request.clone());
+        if std::mem::take(&mut state.not_started_stage) {
+            return TransportCall::NotStarted(TransportNotStarted::new(
+                "stage local prerequisite changed".into(),
+            ));
+        }
         if let Some(cancellation) = state.cancel_on_stage.take() {
             cancellation.cancel();
         }
@@ -54,6 +73,11 @@ impl SshTransport for FakeTransport {
 
     fn launch(&self, request: LaunchTransportRequest) -> TransportCall<LaunchReceipt> {
         let mut state = self.0.lock().unwrap();
+        if std::mem::take(&mut state.not_started_launch) {
+            return TransportCall::NotStarted(TransportNotStarted::new(
+                "launch local prerequisite changed".into(),
+            ));
+        }
         let submitted = &request.submitted;
         let assignment = submitted.assignment();
         let identity = ExecutionIdentity::from_wire(
@@ -107,6 +131,11 @@ impl SshTransport for FakeTransport {
     fn wait(&self, request: WaitTransportRequest) -> TransportCall<WaitReceipt> {
         let mut state = self.0.lock().unwrap();
         state.waits.push(request.clone());
+        if std::mem::take(&mut state.not_started_grace_wait) {
+            return TransportCall::NotStarted(TransportNotStarted::new(
+                "wait local prerequisite changed".into(),
+            ));
+        }
         if let Some(cancellation) = state.cancel_on_wait.take() {
             cancellation.cancel();
             return TransportCall::Response(WaitReceipt::from_wire(
@@ -134,6 +163,9 @@ impl SshTransport for FakeTransport {
     fn control(&self, request: ControlTransportRequest) -> TransportCall<ControlReceipt> {
         let mut state = self.0.lock().unwrap();
         state.controls.push(request.clone());
+        if state.refuse_wait_after_term && request.signal == ControlSignal::Term {
+            state.not_started_grace_wait = true;
+        }
         if std::mem::take(&mut state.lost_control) {
             return lost();
         }
@@ -874,4 +906,68 @@ fn selected_supervisor_dispatch_requires_explicit_trust_and_keeps_local_default(
         fixture.coordinator.clone()
     )
     .is_err());
+}
+
+#[test]
+fn preflight_failure_has_no_intent_and_retries_after_repair() {
+    let f = Fixture::new();
+    f.transport.0.lock().unwrap().preflight_failure = true;
+    let error = f.dispatch(&ProcessCancellation::new()).unwrap_err();
+    assert!(error.to_string().contains("Delegate=yes"));
+    assert!(!launch_may_have_started(&error));
+    assert!(f.journal().records().is_empty());
+    assert!(f.transport.0.lock().unwrap().stages.is_empty());
+    f.transport.0.lock().unwrap().preflight_failure = false;
+    f.dispatch(&ProcessCancellation::new()).unwrap();
+    assert_eq!(f.transport.0.lock().unwrap().stages.len(), 1);
+}
+
+#[test]
+fn no_effect_stage_or_launch_restores_durable_retry_state() {
+    for stage in [true, false] {
+        let f = Fixture::new();
+        if stage {
+            f.transport.0.lock().unwrap().not_started_stage = true;
+        } else {
+            f.transport.0.lock().unwrap().not_started_launch = true;
+        }
+        let error = f.dispatch(&ProcessCancellation::new()).unwrap_err();
+        assert!(error.is::<ExecutorError>());
+        assert!(!launch_may_have_started(&error));
+        let journal = f.journal();
+        let record = journal.records().last().unwrap();
+        assert_eq!(record.phase, "not_started");
+        let progress: Progress = serde_json::from_value(record.payload.clone()).unwrap();
+        assert!(!progress.checkpoint.may_have_launched());
+        let checkpoint = serde_json::to_value(&progress.checkpoint).unwrap();
+        assert_ne!(checkpoint["state"], "StageUncertain");
+        assert!(checkpoint["state"].get("Submitted").is_none());
+        drop(journal);
+        f.dispatch(&ProcessCancellation::new()).unwrap();
+        let observed = f.transport.0.lock().unwrap();
+        assert_eq!(observed.stages.len(), if stage { 2 } else { 1 });
+        assert_eq!(observed.launches.len(), 1);
+        assert!(
+            observed.statuses.is_empty(),
+            "no-effect launch must not require remote lookup"
+        );
+    }
+}
+
+#[test]
+fn local_refusal_after_term_preserves_uncertain_cancellation() {
+    let f = Fixture::new();
+    let cancellation = ProcessCancellation::new();
+    {
+        let mut state = f.transport.0.lock().unwrap();
+        state.cancel_on_wait = Some(cancellation.clone());
+        state.refuse_wait_after_term = true;
+    }
+    let error = f.dispatch(&cancellation).unwrap_err();
+    assert!(launch_may_have_started(&error));
+    assert!(error.to_string().contains("reconciliation"));
+    let state = f.transport.0.lock().unwrap();
+    assert_eq!(state.controls.len(), 1);
+    assert_eq!(state.controls[0].signal, ControlSignal::Term);
+    assert!(!phases(&f.repo).contains(&"not_started".into()));
 }

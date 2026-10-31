@@ -1,14 +1,14 @@
 //! Explicitly configured SSH dispatch with authenticated write-ahead recovery.
 //!
-//! This is an embedding API, not a trust-config loader or an SSH wire client.
+//! This embedding API is also used by the Linux operator trust loader and lifecycle client.
 //! Plan data cannot install a transport or grant local capture authority.
 use super::*;
 use crate::{
     artifacts::{repository_auth_writer, state_auth::AuthenticationDomain},
     external_agent::executor::{
-        AssignmentId, BoundedMillis, CollectedResult, DurableCollection, Effect, InputManifest,
-        LaunchSpec, Nonce, OutputPolicy, SshTransport, SupervisedAttemptId, SupervisedCheckpoint,
-        SupervisedEvent, SupervisedSshExecutor, TerminationPolicy,
+        AssignmentId, BoundedMillis, CollectedResult, DurableCollection, Effect, ExecutorError,
+        InputManifest, LaunchSpec, Nonce, OutputPolicy, SshTransport, SupervisedAttemptId,
+        SupervisedCheckpoint, SupervisedEvent, SupervisedSshExecutor, TerminationPolicy,
     },
     state_journal::{AuthenticatedStateJournal, JournalSpec},
 };
@@ -40,6 +40,13 @@ pub struct SupervisedSshInputs {
 /// evidence, containment, claim, validation, or acceptance checks.
 pub trait SupervisedSshCoordinator: Send + Sync {
     fn prepare(&self, command: &ExternalAgentCommand) -> Result<SupervisedSshInputs>;
+    fn prepare_for_scopes(
+        &self,
+        command: &ExternalAgentCommand,
+        _scopes: &[PathBuf],
+    ) -> Result<SupervisedSshInputs> {
+        self.prepare(command)
+    }
     fn import_candidate(
         &self,
         command: &ExternalAgentCommand,
@@ -288,7 +295,7 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
         // refuses before another transport operation. Decode only authenticated records.
         for record in journal.records().iter().skip(1) {
             let checkpoint = match record.phase.as_str() {
-                "before_effect" | "receipt" => {
+                "before_effect" | "receipt" | "not_started" => {
                     Some(serde_json::from_value::<Progress>(record.payload.clone())?.checkpoint)
                 }
                 "collection_committed" => Some(
@@ -300,7 +307,7 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
                 custody.set(checkpoint.may_have_launched());
             }
         }
-        let inputs = self.coordinator.prepare(command)?;
+        let inputs = self.coordinator.prepare_for_scopes(command, scopes)?;
         let expected_scopes = normalize_paths(scopes.to_vec())?
             .into_iter()
             .map(|path| {
@@ -380,6 +387,7 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
             attempt.restore_checkpoint(&intent.checkpoint, None)?;
         } else {
             attempt.observe_prelaunch_cancellation();
+            attempt.preflight()?;
             append_remote(
                 &mut journal,
                 "intent",
@@ -405,7 +413,7 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
         let mut last_receipt = String::new();
         for record in journal.records().iter().skip(1) {
             match record.phase.as_str() {
-                "before_effect" | "receipt" => {
+                "before_effect" | "receipt" | "not_started" => {
                     let progress: Progress = serde_json::from_value(record.payload.clone())?;
                     checkpoint = progress.checkpoint;
                     if progress.cancelled {
@@ -478,6 +486,7 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
             if started.elapsed() >= command.timeout {
                 cancellation.cancel();
             }
+            attempt.preflight()?;
             let before = attempt.write_ahead_checkpoint();
             if before != checkpoint || cancellation.is_cancelled() != last_cancelled {
                 append_remote(
@@ -494,7 +503,26 @@ impl<T: SshTransport> HostDispatch for ConfiguredHost<T> {
                 last_cancelled = cancellation.is_cancelled();
             }
             custody.set(checkpoint.may_have_launched());
-            let event = attempt.advance()?;
+            let event = match attempt.advance() {
+                Err(error @ ExecutorError::NotStarted(_)) => {
+                    // A trusted local refusal proves this operation had no effect.
+                    // Supersede write-ahead uncertainty with the retryable state.
+                    let retry = attempt.checkpoint();
+                    append_remote(
+                        &mut journal,
+                        "not_started",
+                        None,
+                        &Progress {
+                            checkpoint: retry.clone(),
+                            receipt: error.to_string(),
+                            cancelled: cancellation.is_cancelled(),
+                        },
+                    )?;
+                    custody.set(retry.may_have_launched());
+                    return Err(error.into());
+                }
+                outcome => outcome?,
+            };
             if matches!(event, SupervisedEvent::CancelledBeforeLaunch) {
                 custody.set(false);
             }
