@@ -2426,6 +2426,7 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         .join(format!(".maco/o2/runs/{RUN_ID}"))
         .join(ORCHESTRATION_EVENT_PATH);
     let (lock, condvar) = &*state;
+    let admission_started = Instant::now();
     let breaker = wait_for_fixture_state(
         condvar,
         lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
@@ -2436,6 +2437,10 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
         WAIT_BOUND,
     );
     drop(breaker);
+    eprintln!(
+        "{TEST}: child-d runner entry after {:?}",
+        admission_started.elapsed()
+    );
     wait_for_fixture_file_marker(
         &event_path,
         "swarm_health_circuit_breaker",
@@ -2503,6 +2508,21 @@ fn cascade_breaker_stops_admission_drains_active_and_releases_claims() {
     let run_id = RunId::new(RUN_ID).expect("valid breaker run id");
     let reader = ArtifactRunReader::open(&repo_path, RunArtifactFamily::Supervise, &run_id)
         .expect("open finalized breaker artifacts");
+    // These rejected, unchanged children need no review or candidate validation.
+    // Capturing unused Git snapshots delays slot release and the next admission.
+    for id in ["child-a", "child-b", "child-c"] {
+        for extension in ["json", "patch"] {
+            let unused_candidate = PathBuf::from(format!("reports/{id}.candidate.{extension}"));
+            assert!(
+                !reader
+                    .finalization()
+                    .files
+                    .iter()
+                    .any(|file| file.path == unused_candidate),
+                "unreviewed rejection retained an unused candidate: {unused_candidate:?}"
+            );
+        }
+    }
     let events = read_finalized_orchestration_events(&reader);
     let breaker_event = events
         .iter()

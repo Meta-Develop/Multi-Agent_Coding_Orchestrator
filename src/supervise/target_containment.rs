@@ -52,6 +52,8 @@ struct RetainedCommandSummary<'a> {
     #[serde(flatten)]
     command: &'a CommandRunRecord,
     runtime_identity: observed_identity::RuntimeIdentityObservation,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    command_seal_snapshot: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     researcher_input_receipts:
         Vec<crate::external_agent::researcher_inputs::ResearcherInputReceipt>,
@@ -132,6 +134,9 @@ pub(super) fn persist(
             run, command, runtime,
         ),
         researcher_input_receipts: run.retained_researcher_input_receipts(),
+        command_seal_snapshot: command
+            .live_budget_command_seal_snapshot()
+            .map_err(|error| anyhow!(error))?,
     })?;
     summary.push(b'\n');
     if summary.len() > MAX_SUPERVISOR_REPORT_BYTES {

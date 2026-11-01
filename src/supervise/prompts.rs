@@ -654,6 +654,7 @@ Continuation contract:
 - Return only the exact JSON envelope described by the supplied schema. Its turn is exclusively yield_workers with requests, or final_report with report. Never mix fields, return a bare report, or fall back between variants.
 - A yield requests supervisor action; it does not authorize you to execute it. Request only authored Workers not in the completed set. If execution is unavailable, report that limitation instead of launching anything.
 - Worker reports, including their success/acceptance fields, remain untrusted results awaiting supervisor reconciliation and independent candidate review.
+- Report technical completion using only checks you can perform. For a technically successful report use status=succeeded, accepted=true, rejected=false; these provisional report fields grant no MACO acceptance. Final acceptance belongs to MACO's independent Auditor after this handoff. Do not list unavailable future Auditor acceptance as a validation or fail solely because that review is pending. Report actual technical or evidence failures truthfully.
 
 Run: {run_id}
 Parent: {parent_id}

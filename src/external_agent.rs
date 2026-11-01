@@ -1877,19 +1877,9 @@ impl ExternalAgentCommand {
             }
             None => BudgetAccountIdentity::Unspecified,
         };
-        let bound = self.live_token_grant.as_ref().unwrap();
-        let inputs = bound.input_receipts.as_ref().map_err(Clone::clone)?;
-        // Hash the seal itself, including every confinement field. Debug on
-        // AssignmentMessagingLaunch deliberately redacts its bearer; account
-        // bindings contain only selection identifiers. No secret is persisted.
-        let snapshot = serde_json::json!({
-            "version": 2,
-            "confinement": format!("{:?}", bound.confinement),
-            "input_receipts": inputs,
-            "native_delegation_disabled": bound.native_delegation_disabled,
-            "managed_readonly_route": format!("{:?}", bound.managed_readonly_route),
-            "grant_id": bound.grant.id(),
-        });
+        let snapshot = self
+            .live_budget_command_seal_snapshot()?
+            .ok_or("live grant has no seal snapshot")?;
         Ok(Some(BudgetDispatchInvocation {
             run_id: identity.run_id.clone(),
             assignment_id: identity.task_id.clone(),
@@ -1903,6 +1893,27 @@ impl ExternalAgentCommand {
                 &serde_json::to_vec(&snapshot).map_err(|error| error.to_string())?,
             ),
         }))
+    }
+
+    /// The exact non-secret version-2 hash preimage. Use the held input receipts,
+    /// even after settlement; rereading inputs would describe a different launch.
+    pub(crate) fn live_budget_command_seal_snapshot(
+        &self,
+    ) -> Result<Option<serde_json::Value>, String> {
+        let Some(bound) = &self.live_token_grant else {
+            return Ok(None);
+        };
+        let inputs = bound.input_receipts.as_ref().map_err(Clone::clone)?;
+        // AssignmentMessagingLaunch Debug redacts its bearer. Confinement stores
+        // selection identifiers and input hashes, never credential contents.
+        Ok(Some(serde_json::json!({
+            "version": 2,
+            "confinement": format!("{:?}", bound.confinement),
+            "input_receipts": inputs,
+            "native_delegation_disabled": bound.native_delegation_disabled,
+            "managed_readonly_route": format!("{:?}", bound.managed_readonly_route),
+            "grant_id": bound.grant.id(),
+        })))
     }
 
     fn verified_claude_managed_reservation(

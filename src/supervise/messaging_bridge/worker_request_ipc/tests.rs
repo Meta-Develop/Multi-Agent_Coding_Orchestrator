@@ -404,7 +404,8 @@ fn fresh_worker_admission_refuses_ineligible_authored_parent() -> Result<()> {
 }
 
 #[test]
-fn fresh_worker_admission_refuses_reopened_recovered_and_refreshed_sessions() -> Result<()> {
+fn fresh_worker_admission_preserves_live_reopens_but_refuses_restored_and_refreshed_sessions(
+) -> Result<()> {
     for mode in 0..8 {
         let mut fixture = FreshFixture::new()?;
         match mode {
@@ -462,6 +463,10 @@ fn fresh_worker_admission_refuses_reopened_recovered_and_refreshed_sessions() ->
                 )?;
             }
             _ => unreachable!(),
+        }
+        if mode <= 1 {
+            fixture.claim()?;
+            fixture.claim_at(1)?;
         }
         assert!(fixture.claim().is_err(), "mode {mode}");
         assert!(fixture.claim().is_err(), "retry mode {mode}");

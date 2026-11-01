@@ -1,7 +1,7 @@
 # Nested writable token-control qualification (#714)
 
 Status: implementation prepared; a new real contained attempt is still required.
-Preserve `qualification-nested-budget-ct101-01` and the earlier failure records.
+Preserve `qualification-nested-budget-ct101-01`, `-03`, AUD714 and the earlier failure records.
 Follow the [shared evidence contract](README.md); never run in the owner desktop
 or an occupied checkout. The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
 uses two execution parents, three terminal Workers, and effective width one.
@@ -10,7 +10,15 @@ Both parents and Workers use `gpt-6.1-sol/high`; independent review retains
 
 The first parent dispatches only `admission-worker`. Its meaningful repair of
 `test_admission.py` must pass independent unittest execution and parent/Auditor
-acceptance before the second parent runs. The second parent queues
+acceptance before the second parent runs. The fixture's explicit
+`assignment_schedule` makes the second parent depend on the first: the scheduler
+waits for the first outcome and suppresses stage two when that outcome fails.
+The parent reports technical completion using only its own checks; unavailable
+future Auditor acceptance is never a validation prerequisite. In the current
+report protocol, `status=succeeded, accepted=true, rejected=false` means provisional
+technical success; only MACO's subsequent independent review can accept it.
+Actual technical or evidence failures remain failed, including after a positive
+Auditor verdict. The second parent queues
 `settlement-worker` and `refusal-worker`; the former starts the real settlement
 repair with a deliberately small observation threshold, and the latter is
 refused after exhaustion. The whole run is expected to be rejected even though
@@ -32,12 +40,18 @@ cumulative notices were 19325 and 39121 before any edit. The old grant was
 65000 - 43233 = 21767, so the second notice interrupted seed inspection.
 The new first-Worker threshold is 240000: 200879 beyond that pre-edit floor,
 and 48769 beyond the original incident Worker's 191231 terminal total.
-For finite planning, allow 65000 tokens for each of six coordinator/reviewer
-turns (first parent initial + continuation, three Auditors, second parent
-initial): 6 * 65000 + 240000 = 630000, leaving 20000 under the 650000 ceiling.
-This is a planning envelope, not measured consumption or guaranteed success.
-At the old observed parent rate the same six turns total 259398, leaving
-390602 before Workers. Unused allowance is released on settlement.
+The old uniform 65000-token coordinator/reviewer allowance is invalidated by
+-03's **168672-token continuation**. Reassessing the whole envelope uses -03's
+measured first parent 27942, continuation 168672 and three Auditors
+92786 + 20689 + 15039 = **325128** total coordinator/reviewer tokens.
+Add the full 240000 first-Worker allowance and a 65000 planning allowance for
+the still-unmeasured second parent: **630128**. Including a replay of the
+19325-token crossing notice gives **649453**, leaving only **547** below
+**q714 = 650000**, which is unchanged. The previous whole-run envelope was only
+128 tokens lower before the crossing notice; raising the ceiling is not required
+by this arithmetic. The narrow margin and possible later drain notices make this
+a finite planning assumption, not a spending guarantee or assurance of success.
+Unused allowance is released on settlement; no retry or automatic increase follows.
 
 The second-Worker threshold remains 1000 regardless of how cheaply stage one
 finishes. A replay of its first observed 19325-token notice would immediately
@@ -71,6 +85,13 @@ reconciliation. Failed admission writes distinguish an unpublished binding
 from a published admission. If release was withheld, scheduler closure retains
 its `not_started` disposition; a crash before closure remains conservative. Command receipts hash the launch seal, including input
 lists, bounded input content/file identities, source declarations and confinement.
+Each private Worker `command.json` retains `command_seal_snapshot`, the exact
+non-secret version-2 hash preimage (including redacted confinement, input receipts,
+route flags and grant ID). Recompute SHA256 over its compact UTF-8 JSON encoding
+with sorted keys (`ensure_ascii=False`, separators `(',', ':')` in Python) and
+compare with the admission receipt's `command_sha256`. No credential contents are
+included. Selected-account binding remains an owner gate; `local_auth` stays an
+honest unqualified record and must not be relabelled as a selected account.
 
 ```bash
 fixture=examples/supervise/nested-codex-budget-qualification.json
@@ -151,6 +172,14 @@ candidate tree, changed paths, and the SHA256/size of a binary `*.candidate.patc
 These artifacts carry no acceptance or continuation authority. Evidence-import
 or candidate-capture failure remains a rejection and must be reported; it cannot
 be replaced with a claimed successful review.
+
+The shared-parent review handoff also retains `reports/<parent>.candidate.json`
+and its binary `.candidate.patch` before Auditor launch, even when the parent
+reports failure. The packet binds parent and Worker validation observations to
+that held candidate and supplies separately bounded, redacted excerpts of each
+authenticated original Worker journal and native transcript with their complete
+byte counts and SHA256 identities. Post-review recapture must match the held
+candidate. Evidence retention cannot turn a failed report into an accepted one.
 
 Both assigned files are recognized runnable test targets, so preflight does not
 depend on a new generic authored-check capability. The independent reviewer

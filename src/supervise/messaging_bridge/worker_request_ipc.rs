@@ -45,7 +45,7 @@ impl SupervisorMessagingSessionFactory {
         Ok(())
     }
 
-    /// Claims one fresh inbox identity for an exact authored parent, before any broker reopen.
+    /// Claims one fresh inbox identity for an exact authored parent in this live session.
     /// `parent`, `attempt`, and the resolved runtime must come from supervisor launch
     /// context. The critical section removes only the entry with that parent id. Exact
     /// authored equality then prevents substituting another parent's Workers. The only
