@@ -14,6 +14,156 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 // on assertion failure. Its exact native tests run serially in this module.
 static GROK_BINARY_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+#[derive(Default)]
+pub(super) struct WorkerRendezvous {
+    state: Mutex<WorkerRendezvousState>,
+    ready: std::sync::Condvar,
+}
+
+#[derive(Default)]
+struct WorkerRendezvousState {
+    workers: Vec<(
+        String,
+        PathBuf,
+        std::time::Instant,
+        Option<std::time::Instant>,
+    )>,
+    failure: Option<String>,
+}
+
+impl WorkerRendezvous {
+    fn arrive(&self, worker: &str, cwd: &Path, timeout: Option<Duration>) -> Result<()> {
+        let mut state = self.state.lock().unwrap();
+        state
+            .workers
+            .push((worker.into(), cwd.into(), std::time::Instant::now(), None));
+        self.ready.notify_all();
+        if let Some(timeout) = timeout {
+            // The peer still has to prepare its private worktree before entering
+            // this runner. Wait for its arrival, with a generous deadlock bound.
+            // A timeout notification alone is not proof the predicate is false:
+            // the other Worker may have arrived while this lock was reacquired.
+            let (observed, _) = self
+                .ready
+                .wait_timeout_while(state, timeout, |state| {
+                    state.workers.len() < 2 && state.failure.is_none()
+                })
+                .unwrap();
+            state = observed;
+            if state.workers.len() < 2 && state.failure.is_none() {
+                state.failure =
+                    Some(format!(
+                    "fake Worker `{worker}` timed out waiting for its peer; arrived Workers: {:?}",
+                    state.workers.iter().map(|entry| &entry.0).collect::<Vec<_>>()
+                ));
+                self.ready.notify_all();
+            }
+        }
+        // Return the error normally so callers panic only after dropping the
+        // guard. A failed rendezvous must never poison the sibling's mutex.
+        if let Some(failure) = &state.failure {
+            bail!("{failure}");
+        }
+        Ok(())
+    }
+
+    fn run<T>(&self, worker: &str, run: impl FnOnce() -> T) -> T {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(run)) {
+            Ok(output) => {
+                let mut state = self.state.lock().unwrap();
+                if let Some(entry) = state.workers.iter_mut().find(|entry| entry.0 == worker) {
+                    entry.3 = Some(std::time::Instant::now());
+                }
+                output
+            }
+            Err(payload) => {
+                let detail = payload
+                    .downcast_ref::<String>()
+                    .map(String::as_str)
+                    .or_else(|| payload.downcast_ref::<&str>().copied())
+                    .unwrap_or("unspecified panic payload");
+                let mut state = self.state.lock().unwrap();
+                state
+                    .failure
+                    .get_or_insert_with(|| format!("fake Worker `{worker}` panicked: {detail}"));
+                drop(state);
+                self.ready.notify_all();
+                // Preserve the real controller's panic/containment path, but
+                // surface this original diagnostic before result assertions.
+                std::panic::resume_unwind(payload)
+            }
+        }
+    }
+
+    pub(super) fn check(&self) -> Result<()> {
+        if let Some(failure) = &self.state.lock().unwrap().failure {
+            bail!("isolated Worker fixture failed: {failure}");
+        }
+        Ok(())
+    }
+}
+
+#[test]
+fn worker_rendezvous_timeout_preserves_failure_without_poisoning() {
+    let rendezvous = WorkerRendezvous::default();
+    let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        rendezvous.run("worker", || {
+            rendezvous
+                .arrive("worker", Path::new("worker"), Some(Duration::ZERO))
+                .unwrap();
+        });
+    }));
+    assert!(panic.is_err());
+    assert!(!rendezvous.state.is_poisoned());
+    let failure = rendezvous.check().unwrap_err().to_string();
+    assert!(failure.contains("fake Worker `worker` timed out waiting for its peer"));
+    let peer_error = rendezvous
+        .arrive("worker-two", Path::new("worker-two"), Some(Duration::ZERO))
+        .unwrap_err();
+    assert!(failure.contains(&peer_error.to_string()));
+    assert_eq!(rendezvous.check().unwrap_err().to_string(), failure);
+}
+
+#[test]
+fn worker_rendezvous_peer_panic_wakes_waiting_worker() {
+    let rendezvous = WorkerRendezvous::default();
+    std::thread::scope(|scope| {
+        let waiting = scope.spawn(|| {
+            rendezvous.arrive("worker", Path::new("worker"), Some(Duration::from_secs(60)))
+        });
+        let (state, _) = rendezvous
+            .ready
+            .wait_timeout_while(
+                rendezvous.state.lock().unwrap(),
+                Duration::from_secs(60),
+                |state| state.workers.is_empty(),
+            )
+            .unwrap();
+        let arrived = state.workers.len();
+        drop(state);
+        assert_eq!(arrived, 1);
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            rendezvous.run("worker-two", || panic!("injected peer panic"));
+        }));
+        assert!(panic.is_err());
+        let failure = waiting.join().unwrap().unwrap_err().to_string();
+        assert_eq!(
+            failure,
+            "fake Worker `worker-two` panicked: injected peer panic"
+        );
+    });
+    assert!(!rendezvous.state.is_poisoned());
+}
+
+#[test]
+fn isolated_fixture_worker_panic_reports_before_settlement_assertions() {
+    let error = driver_fixture("managed-cycle-isolated-fixture-panic").unwrap_err();
+    assert_eq!(
+        error.to_string(),
+        "isolated Worker fixture failed: fake Worker `worker` panicked: injected isolated Worker fixture panic"
+    );
+}
+
 const INVALID_CONTINUATION_CASES: [&str; 8] = [
     "continuation-missing",
     "continuation-duplicate",
@@ -422,18 +572,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let managed_parent_turns = AtomicUsize::new(0);
     let captured_worker_reports = Mutex::new(Vec::<WorkerReport>::new());
     let captured_worker_claims = Mutex::new(Vec::new());
-    let overlapping_workers = (
-        Mutex::new(Vec::<(
-            String,
-            PathBuf,
-            std::time::Instant,
-            Option<std::time::Instant>,
-        )>::new()),
-        std::sync::Condvar::new(),
-    );
-    let runner = |command: &ExternalAgentCommand,
-                  runner_cancellation: &ProcessCancellation,
-                  _: Option<ExternalPreActionReviewRuntime<'_>>| {
+    let overlapping_workers = WorkerRendezvous::default();
+    let run_fixture = |command: &ExternalAgentCommand,
+                       runner_cancellation: &ProcessCancellation,
+                       _: Option<ExternalPreActionReviewRuntime<'_>>| {
         let subject = if command.agent_lifecycle.as_ref().unwrap().task_id == "parent" {
             assert!(!parent_running.swap(true, Ordering::SeqCst));
             &parent
@@ -469,6 +611,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             subject
         };
         calls.lock().unwrap().push(subject.id.clone());
+        if case == "managed-cycle-isolated-fixture-panic" && subject.id == "worker" {
+            panic!("injected isolated Worker fixture panic");
+        }
         if attached_capture || ((bound_parent || unbound_parent) && subject.id == "parent") {
             let identity = command.agent_lifecycle.as_ref().unwrap();
             assert_eq!(identity.run_id, run_id.as_str());
@@ -508,28 +653,14 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 .unwrap();
             assert_eq!(child.paths, subject.assigned_paths);
             captured_worker_claims.lock().unwrap().push(child.clone());
-            let (lock, ready) = &overlapping_workers;
-            let mut live = lock.lock().unwrap();
-            live.push((
-                subject.id.clone(),
-                command.cwd.clone(),
-                std::time::Instant::now(),
-                None,
-            ));
-            ready.notify_all();
-            if !interrupted_worker {
-                let (observed, deadline) = ready
-                    .wait_timeout_while(live, Duration::from_secs(5), |live| live.len() < 2)
-                    .unwrap();
-                assert!(
-                    !deadline.timed_out(),
-                    "workers did not overlap within the bounded fixture wait"
-                );
-                live = observed;
-                assert_ne!(live[0].1, live[1].1, "workers share one worktree lease");
-            }
-            drop(live);
-            // Recheck the held read-only source while both workers are alive.
+            overlapping_workers
+                .arrive(
+                    &subject.id,
+                    &command.cwd,
+                    (!interrupted_worker).then_some(Duration::from_secs(60)),
+                )
+                .unwrap_or_else(|error| panic!("{error:#}"));
+            // Recheck the held read-only source after the overlap rendezvous.
             assert_eq!(
                 fs::read_to_string(worktree.path.join("src/lib.rs")).unwrap(),
                 "pub fn selected() {}\n"
@@ -890,13 +1021,6 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             if case == "managed-cycle-cancel-after-first" && subject.id == "worker" {
                 cancellation.cancel();
             }
-            if isolated {
-                let mut live = overlapping_workers.0.lock().unwrap();
-                live.iter_mut()
-                    .find(|entry| entry.0 == subject.id)
-                    .unwrap()
-                    .3 = Some(std::time::Instant::now());
-            }
         }
         if case == "managed-cycle-isolated-worker-malformed" && subject.id == "worker" {
             assert!(external_process_completed(&run, SupervisorRuntime::Codex));
@@ -927,6 +1051,18 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             run.process_tree = None;
         }
         run
+    };
+    let runner = |command: &ExternalAgentCommand,
+                  runner_cancellation: &ProcessCancellation,
+                  review: Option<ExternalPreActionReviewRuntime<'_>>| {
+        let identity = command.agent_lifecycle.as_ref().unwrap();
+        if isolated && identity.task_id != "parent" {
+            overlapping_workers.run(&identity.task_id, || {
+                run_fixture(command, runner_cancellation, review)
+            })
+        } else {
+            run_fixture(command, runner_cancellation, review)
+        }
     };
     let context = AssignmentExecutionContext {
         index: 0,
@@ -1029,6 +1165,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         &preflight,
         &mut outcome,
         &calls,
+        &overlapping_workers,
         unbound_launch.as_ref(),
     )?
     else {
@@ -1040,7 +1177,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             );
         }
         if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
-            let live = overlapping_workers.0.lock().unwrap();
+            let live = overlapping_workers.state.lock().unwrap().workers.clone();
             assert_eq!(live.len(), 2);
             let latest_start = live.iter().map(|entry| entry.2).max().unwrap();
             let first_finish = live
@@ -1328,6 +1465,7 @@ fn prepare_and_collect_fixture_parent<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
     calls: &Mutex<Vec<String>>,
+    overlapping_workers: &WorkerRendezvous,
     unbound_launch: Option<&crate::messaging::transport::AssignmentMessagingLaunch>,
 ) -> Result<Option<Box<CollectedChildAttempt<'a>>>> {
     let run_id = &context.options.run_id;
@@ -1389,7 +1527,13 @@ fn prepare_and_collect_fixture_parent<'a>(
             return Ok(None);
         }
         super::managed_parent_controller_tests::exercise(
-            case, context, preflight, outcome, prepared, calls,
+            case,
+            context,
+            preflight,
+            outcome,
+            prepared,
+            calls,
+            overlapping_workers,
         )?;
         return Ok(None);
     }

@@ -56,6 +56,7 @@ pub(super) fn exercise(
     outcome: &mut AssignmentExecutionOutcome,
     prepared: Box<PreparedChildAttempt<'_>>,
     calls: &Mutex<Vec<String>>,
+    overlapping_workers: &super::nested_driver_tests::WorkerRendezvous,
 ) -> Result<()> {
     if case.starts_with("managed-cycle-retained-") {
         return exercise_retained_failure(case, context, preflight, outcome, prepared, calls);
@@ -90,6 +91,7 @@ pub(super) fn exercise(
         &schemas.join("worker-report.schema.json"),
         &schemas.join("auditor-report.schema.json"),
     );
+    overlapping_workers.check()?;
     let observed = calls.lock().unwrap().clone();
     if case.starts_with("managed-cycle-isolated-") {
         return exercise_isolated_result(case, context, preflight, outcome, result, &observed);
@@ -300,6 +302,17 @@ fn exercise_isolated_result(
         worker_budget.consumed.tokens, 28,
         "both returned Worker usages must settle exactly once"
     );
+    let worker_charges = budget
+        .charges
+        .iter()
+        .filter(|charge| charge.role == AgentRole::Worker)
+        .collect::<Vec<_>>();
+    assert_eq!(worker_charges.len(), 2);
+    assert!(worker_charges.iter().all(|charge| charge.tokens == 14));
+    assert_ne!(
+        worker_charges[0].reservation_id,
+        worker_charges[1].reservation_id
+    );
     assert_eq!(worker_budget.active_reservations, 0);
     if case.ends_with("final-panic") {
         assert!(
@@ -375,6 +388,16 @@ fn exercise_isolated_result(
                 claims.iter().any(|claim| claim.agent_id == "worker"),
                 "unknown child was released"
             );
+            if case == "managed-cycle-isolated-unknown-containment" {
+                assert_eq!(
+                    claims
+                        .iter()
+                        .map(|claim| claim.agent_id.as_str())
+                        .collect::<BTreeSet<_>>(),
+                    BTreeSet::from(["parent", "worker"]),
+                    "only the parent and the exact unknown child must remain quarantined"
+                );
+            }
             assert!(
                 context.sync_store.release(preflight.claim.token).is_err(),
                 "quarantined descendant allowed parent release"
