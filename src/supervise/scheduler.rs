@@ -3918,6 +3918,7 @@ fn prepare_supervisor_run(
         options.run_id.clone(),
         "maco-supervise",
     )?;
+    super::helper_inventory::persist_catalog(&mut artifact_writer, &runtime_model_catalog)?;
     let preflight_spec = crate::run_ops::LaunchPreflightSpec {
         family: RunArtifactFamily::Supervise,
         run_id: options.run_id.clone(),

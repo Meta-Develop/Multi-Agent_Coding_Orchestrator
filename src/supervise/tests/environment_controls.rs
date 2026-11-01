@@ -104,6 +104,7 @@ fn environment_failure_schemas_and_outcomes_are_typed_and_secret_free() {
     let marker = "DO_NOT_PERSIST_SECRET_MARKER";
     let mut report = injected_child_report(&injected_assignment(false));
     report.environment_failures.push(EnvironmentFailure {
+        catalog_probe_receipt: None,
         category: EnvironmentFailureCategory::MissingCredential,
         requirement: Some(EnvironmentRequirement::configuration(
             EnvironmentConfiguration::CodexAuthFile,
@@ -135,6 +136,7 @@ fn nested_command_environment_failures_are_recursively_sanitized_and_terminal() 
         |marker: &str, category: EnvironmentFailureCategory| -> CommandRunRecord {
             let mut command = injected_command_record();
             command.environment_failures.push(EnvironmentFailure {
+                catalog_probe_receipt: None,
                 category,
                 requirement: None,
                 summary: marker.to_string(),
@@ -300,6 +302,7 @@ fn environment_preflight_refusal_is_typed_terminal_and_not_malformed_or_containm
         EnvironmentRequirement::configuration(EnvironmentConfiguration::CodexAuthFile);
     let marker = "DO_NOT_PERSIST_PREFLIGHT_SECRET_MARKER";
     let failure = EnvironmentFailure {
+        catalog_probe_receipt: None,
         category: EnvironmentFailureCategory::MissingCredential,
         requirement: Some(requirement.clone()),
         summary: marker.to_string(),
@@ -812,6 +815,7 @@ fn native_network_failure_category_is_schema_valid_and_keeps_acceptance_failed()
         ),
     ] {
         let failure = EnvironmentFailure {
+            catalog_probe_receipt: None,
             category,
             requirement: (category == EnvironmentFailureCategory::NetworkUnavailable)
                 .then(|| EnvironmentRequirement::network(EnvironmentNetworkAccess::Enabled)),

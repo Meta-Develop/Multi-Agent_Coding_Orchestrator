@@ -108,6 +108,20 @@ pub(super) fn exercise(
                 collected.report_shape_problems
             );
             assert!(collected.attempt_containment_verified);
+            if case == "managed-cycle-isolated-raw-false" {
+                assert!(
+                    collected
+                        .attempt_report
+                        .worker_reports
+                        .iter()
+                        .all(|worker| {
+                            !worker.accepted
+                                && !worker.rejected
+                                && worker.status == ReviewStatus::Succeeded
+                        }),
+                    "the captured Worker acceptance bits must remain unchanged"
+                );
+            }
             assert_eq!(collected._worker_journal_evidence.len(), 2);
             assert!(collected._worker_journal_evidence.contains_key("worker"));
             assert!(collected
@@ -201,6 +215,29 @@ fn exercise_isolated_result(
             case, context, preflight, outcome, result, observed,
         );
     }
+    if case == "managed-cycle-isolated-worker-malformed" {
+        let error = result
+            .as_ref()
+            .err()
+            .expect("malformed completed report must fail");
+        assert!(
+            format!("{error:#}").contains("failed to parse direct worker report"),
+            "{error:#}"
+        );
+        assert!(!error
+            .chain()
+            .any(|cause| cause.is::<super::worker_completion::IncompleteWorkerOutcome>()));
+    }
+    if case == "managed-cycle-isolated-final-acceptance-forgery" {
+        let error = result
+            .as_ref()
+            .err()
+            .expect("parent acceptance forgery must fail");
+        assert!(
+            format!("{error:#}").contains("substitutes the actual ordered Worker captures"),
+            "{error:#}"
+        );
+    }
     assert_eq!(observed.first().map(String::as_str), Some("parent"));
     if case == "managed-cycle-isolated-unstarted" {
         assert!(result.is_err());
@@ -291,11 +328,25 @@ fn exercise_isolated_result(
         preflight.issue_nested_turn(1).is_err(),
         "spent frozen turn was replayed"
     );
-    if case == "managed-cycle-isolated-happy" {
+    if case == "managed-cycle-isolated-happy" || case == "managed-cycle-isolated-raw-false" {
         let collected = result?;
         assert!(!report_failed(&collected.attempt_report));
         assert!(collected.report_shape_problems.is_empty());
         assert!(collected.attempt_containment_verified);
+        if case == "managed-cycle-isolated-raw-false" {
+            assert!(
+                collected
+                    .attempt_report
+                    .worker_reports
+                    .iter()
+                    .all(|worker| {
+                        !worker.accepted
+                            && !worker.rejected
+                            && worker.status == ReviewStatus::Succeeded
+                    }),
+                "the captured Worker acceptance bits must remain unchanged"
+            );
+        }
         assert_eq!(observed.len(), 4);
         assert_eq!(observed.last().map(String::as_str), Some("parent"));
         assert_eq!(collected._worker_journal_evidence.len(), 2);

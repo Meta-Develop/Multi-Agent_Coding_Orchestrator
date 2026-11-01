@@ -383,6 +383,14 @@ fn supervise_collect_requires_finalized_researcher_input_receipts() -> Result<()
         // Synthetic probe outcomes isolate serialization/collection from sandbox availability.
         // The production outer/inner reader and late revalidation have separate regressions.
         attach_synthetic_receipts(&mut run, &command)?;
+        // This fixture exercises collection after a synthetic completed target;
+        // missing target receipts are rejected independently by the inventory gate.
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            crate::process_runner::ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+        ));
         run.stdout.target_launch_attempted = true;
         if case == "refused_prelaunch" {
             run = crate::external_agent::researcher_inputs::tests::failed_local_probe(
@@ -679,6 +687,12 @@ fn collect_attempt_named_assignments(orphan: bool) -> Result<()> {
                         // Probe outcomes are synthetic; no provider or sandbox is launched.
                         attach_synthetic_receipts(&mut run, &command)?;
                     }
+                    run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                        crate::process_runner::ContainmentBackend::SystemdUserService,
+                    ));
+                    run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                        crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+                    ));
                     run.stdout.target_launch_attempted = true;
                     super::super::target_containment::persist(
                         &mut writer,

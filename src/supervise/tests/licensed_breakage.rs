@@ -1414,6 +1414,20 @@ fn licensed_worker_failure_remains_subject_to_child_and_parent_auditor_gates() {
         report.worker_reports[0].validation_results[0].status,
         ReviewStatus::Failed
     );
+    for raw_accepted in [false, true] {
+        let mut worker = report.worker_reports[0].clone();
+        worker.accepted = raw_accepted;
+        assert!(!reviewed_worker_failed(report, &worker));
+        let mut unlicensed = report.clone();
+        unlicensed.licensed_breakage_review = None;
+        assert!(reviewed_worker_failed(&unlicensed, &worker));
+        worker.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "unrelated failure is not licensed".into(),
+            paths: Vec::new(),
+        });
+        assert!(reviewed_worker_failed(report, &worker));
+    }
     assert!(report
         .review_lens_aggregate
         .as_ref()

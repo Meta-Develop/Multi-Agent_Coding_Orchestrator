@@ -26,6 +26,7 @@ mod managed_parent_controller;
 #[allow(dead_code)]
 mod parent_continuation_response;
 mod review_handoff;
+mod worker_completion;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(super) fn worker_review_evidence_for_test(
@@ -1467,16 +1468,13 @@ fn dispatch_isolated_parent_workers_inner(
         outcome.external_containment_failed |= child.external_containment_failed;
         match result {
             Ok(worker) => completed.push(worker),
-            Err(error) => errors.push(format!("{error:#}")),
+            Err(error) => errors.push(error),
         }
     }
     if !errors.is_empty() {
         context.cancellation.cancel();
         outcome.assignment_failed = true;
-        bail!(
-            "isolated Worker set failed; no continuation or replay authorized: {}",
-            errors.join("; ")
-        );
+        return Err(worker_completion::incomplete_set(errors));
     }
     Ok(completed)
 }
@@ -1629,6 +1627,7 @@ fn execute_isolated_worker_capture(
         });
     }
     let (journals, candidate_after) = retention?;
+    worker_completion::require_completed(child, &capture)?;
     if child.cancellation.is_cancelled() {
         bail!("isolated Worker was cancelled after its returned dispatch settled; no continuation authorized");
     }
@@ -4479,7 +4478,8 @@ fn preserve_returned_parent_evidence(
     run: &ExternalAgentRun,
 ) -> Result<()> {
     with_supervisor_artifacts(context.artifacts, |writer, _| {
-        super::target_containment::persist(writer, artifacts, command, runtime, run)?;
+        let containment =
+            super::target_containment::persist(writer, artifacts, command, runtime, run);
         let bytes = run.stdout_bytes();
         if bytes.len() > MAX_SUPERVISOR_REPORT_BYTES {
             bail!("descriptor-held parent stdout exceeds its configured byte limit");
@@ -4489,7 +4489,7 @@ fn preserve_returned_parent_evidence(
             bytes,
             ArtifactFileDisposition::PrivateEvidence,
         )?;
-        Ok(())
+        containment
     })
     .context("managed parent returned evidence import failed")
 }
@@ -8031,7 +8031,10 @@ fn publish_assignment_report(
             .as_ref()
             .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
             .unwrap_or_else(|| child_report.audit_reports.iter().any(report_failed)),
-        child_report.worker_reports.iter().any(report_failed),
+        child_report
+            .worker_reports
+            .iter()
+            .any(|worker| reviewed_worker_failed(&child_report, worker)),
     );
     if failure_flags.assignment_failed {
         outcome.findings.push(Finding {
@@ -8051,6 +8054,7 @@ fn publish_assignment_report(
         });
     }
     if failure_flags.worker_failed {
+        outcome.assignment_failed = true;
         outcome.findings.push(Finding {
             severity: FindingSeverity::Error,
             message: format!(

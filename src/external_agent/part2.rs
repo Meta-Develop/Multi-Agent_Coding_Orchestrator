@@ -245,7 +245,14 @@ fn run_fixed_version_probe(
         agent_lifecycle,
         None,
     );
-    let output = match run_process_cancellable(process_spec, cancellation) {
+    let process_result = run_process_cancellable(process_spec, cancellation);
+    process_evidence
+        .version_probe_receipts
+        .push(helper_receipts::HelperProcessReceipt::capture(
+            program,
+            &process_result,
+        ));
+    let output = match process_result {
         Ok(output) => {
             record_fixed_version_probe_output(
                 executable,
@@ -616,6 +623,7 @@ fn environment_failure(
         requirement,
         summary,
         remediation: environment_remediation(category),
+        catalog_probe_receipt: None,
     }
 }
 
@@ -1101,25 +1109,36 @@ fn execute_prepared_codex_runtime_model_catalog(
     CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS
         .with(|attempts| attempts.set(attempts.get() + 1));
     let process_result = run_process_cancellable(process_spec, &ProcessCancellation::new());
-    let current_identity = external_program_identity(&resolved_program)
-        .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
-    let auth_result = auth
-        .verify_source_unchanged()
-        .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
-    if current_identity != program_identity {
-        return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
+    let receipt =
+        helper_receipts::HelperProcessReceipt::capture(&resolved_program, &process_result);
+    let result = (|| {
+        let current_identity = external_program_identity(&resolved_program)
+            .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
+        let auth_result = auth
+            .verify_source_unchanged()
+            .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
+        if current_identity != program_identity {
+            return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
+        }
+        auth_result?;
+        let output = process_result
+            .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
+        if !output.safety_sensitive_succeeded() {
+            return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
+        }
+        if output.stdout.is_truncated() || output.stderr.is_truncated() {
+            return Err(CodexRuntimeModelCatalogFailureCause::OutputLimitExceeded.into());
+        }
+        parse_codex_runtime_model_catalog(output.stdout.as_bytes())
+            .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
+    })();
+    match result {
+        Ok(mut catalog) => {
+            catalog.probe_receipt = Some(receipt);
+            Ok(catalog)
+        }
+        Err(error) => Err(helper_receipts::ObservedCatalogFailure { error, receipt }.into()),
     }
-    auth_result?;
-    let output = process_result
-        .map_err(|error| codex_runtime_model_catalog_process_failure_cause(&error))?;
-    if !output.safety_sensitive_succeeded() {
-        return Err(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into());
-    }
-    if output.stdout.is_truncated() || output.stderr.is_truncated() {
-        return Err(CodexRuntimeModelCatalogFailureCause::OutputLimitExceeded.into());
-    }
-    parse_codex_runtime_model_catalog(output.stdout.as_bytes())
-        .context(CodexRuntimeModelCatalogFailureCause::InvalidOutput)
 }
 
 fn codex_runtime_model_catalog_process_root(resolved_program: &Path) -> Result<&Path> {
@@ -1267,23 +1286,34 @@ pub(crate) fn supervisor_catalog_preflight_grant_admit_failure(
 }
 
 fn codex_runtime_model_catalog_failure(error: &anyhow::Error) -> Box<EnvironmentFailure> {
-    let cause = error
-        .downcast_ref::<PackagedCodexRuntimeNotVisible>()
-        .map(ToString::to_string)
-        .or_else(|| {
-            error
-                .downcast_ref::<CodexAuthValidationFailureCause>()
-                .map(ToString::to_string)
-        })
-        .or_else(|| {
-            error
-                .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
-                .map(ToString::to_string)
-        })
+    // Anyhow's downcast also recognizes typed context; std::error::Error's
+    // source chain alone does not. Preserve that lookup inside our receipt wrapper.
+    let typed_cause = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<PackagedCodexRuntimeNotVisible>()
+            .map(ToString::to_string)
+            .or_else(|| {
+                error
+                    .downcast_ref::<CodexAuthValidationFailureCause>()
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
+                    .map(ToString::to_string)
+            })
+    };
+    let observed = error
+        .chain()
+        .find_map(|error| error.downcast_ref::<helper_receipts::ObservedCatalogFailure>());
+    let cause = typed_cause(error)
+        .or_else(|| observed.and_then(|observed| typed_cause(&observed.error)))
         .unwrap_or_else(|| "unexpected_failure".to_string());
-    Box::new(EnvironmentFailure::runtime_model_catalog(format!(
+    let mut failure = EnvironmentFailure::runtime_model_catalog(format!(
         "Codex runtime model catalog acquisition failed: cause={cause}"
-    )))
+    ));
+    failure.catalog_probe_receipt = observed.map(|observed| observed.receipt.clone());
+    Box::new(failure)
 }
 
 fn parse_codex_runtime_model_catalog(bytes: &[u8]) -> Result<CodexRuntimeModelCatalog> {

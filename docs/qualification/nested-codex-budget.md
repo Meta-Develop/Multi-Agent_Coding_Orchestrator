@@ -71,8 +71,9 @@ account authority/provider/account/incarnation/revision, and admission balances.
 `run_budget.dispatch_bindings` in collect/final reports retains that identity
 and adds the host-authenticated thread/turn and exactly one charge. The
 `*.settled.json` receipt and checkpoint are written before fallible completion
-acceptance. Local-auth/unspecified identity explicitly makes no authenticated
-account claim; qualification requires a selected-account receipt. Thread and
+acceptance. The receipt records the actual non-secret account route honestly;
+`local_auth` is accepted. Selected-account binding is supported but is not
+required for this qualification. Thread and
 turn IDs do not exist at admission and are reconciled from the trusted runner,
 never from Worker JSON. A restored public report cannot supply live authority.
 
@@ -90,8 +91,7 @@ non-secret version-2 hash preimage (including redacted confinement, input receip
 route flags and grant ID). Recompute SHA256 over its compact UTF-8 JSON encoding
 with sorted keys (`ensure_ascii=False`, separators `(',', ':')` in Python) and
 compare with the admission receipt's `command_sha256`. No credential contents are
-included. Selected-account binding remains an owner gate; `local_auth` stays an
-honest unqualified record and must not be relabelled as a selected account.
+included. A `local_auth` route must not be relabelled as a selected account.
 
 ```bash
 fixture=examples/supervise/nested-codex-budget-qualification.json
@@ -226,3 +226,21 @@ empty process-group watchdog alone does not certify all helpers. The old -01
 run lacks that complete mapping and has no accepted candidate; preserve it as
 positive stop/refusal evidence with those explicit limits. Preparation and
 providerless regressions do not close the real-qualification criterion.
+
+MACO retains `logs/catalog.helper-inventory.json` for its local Codex catalog
+process, including a failed catalog return, and a `*.helper-inventory.json`
+beside each private command summary for its target and fixed version probe.
+Each inventory identifies the run/owner/attempt and embeds the typed process
+tree and side-effect receipts. A missing receipt refuses collection; an
+unverified receipt is retained as unverified and cannot establish quiescence.
+These are historical diagnostics, never restored launch or cleanup authority.
+
+This inventory covers direct MACO catalog, version-probe and target launches.
+Provider-spawned journal wrappers and their commands remain inside the target's
+owned process boundary, but MACO does not observe each wrapper launch separately
+(including one that fails before appending a journal record). It therefore does
+not claim a complete per-wrapper inventory. CAM service internals and the
+operator's build/launcher/watchdog processes are also outside this supervisor's
+spawn scope. A fresh qualification must retain separate ownership evidence for
+those helpers before claiming the complete qualification contract above. Existing
+live evidence is unchanged and is not retroactively upgraded by these receipts.

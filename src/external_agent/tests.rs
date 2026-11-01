@@ -1181,6 +1181,7 @@ fn read_only_researcher_app_server_completed_turn_cannot_erase_approval_refusal(
 
     let mut outcome = AppServerOutcome {
         protocol_error: None,
+        budget_interruption: None,
         thread_id: "research-thread".to_string(),
         turn_id: "research-turn".to_string(),
         status: TurnTerminalStatus::Completed,
@@ -1735,6 +1736,7 @@ fn local_executor_forwards_the_concrete_reviewed_runner_once_without_changing_it
         "forwarding-test",
         &codex_app_server::AppServerOutcome {
             protocol_error: None,
+            budget_interruption: None,
             thread_id: "thread-forwarded".to_string(),
             turn_id: "turn-forwarded".to_string(),
             status: codex_app_server::TurnTerminalStatus::Completed,
@@ -12362,6 +12364,7 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
     };
     let outcome = AppServerOutcome {
         protocol_error: None,
+        budget_interruption: None,
         thread_id: evidence.thread_id.clone(),
         turn_id: evidence.turn_id.clone(),
         status: evidence.turn_status,

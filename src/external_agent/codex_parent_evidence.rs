@@ -878,6 +878,7 @@ mod tests {
         };
         let mut outcome = AppServerOutcome {
             protocol_error: None,
+            budget_interruption: None,
             thread_id: "ephemeral-thread".to_string(),
             turn_id: "ephemeral-turn".to_string(),
             status: TurnTerminalStatus::Completed,

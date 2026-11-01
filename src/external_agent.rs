@@ -95,6 +95,8 @@ mod grok_identity;
 mod grok_output;
 mod grok_progress;
 mod grok_steering;
+mod helper_receipts;
+pub(crate) use helper_receipts::HelperProcessReceipt;
 pub(crate) mod researcher_inputs;
 mod runtime_visibility;
 
@@ -220,11 +222,20 @@ enum ExternalExecutionRuntime {
     NonpublishableSimulation,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub(crate) struct CodexRuntimeModelCatalog {
     slugs: BTreeSet<String>,
     effort_metadata: std::collections::BTreeMap<String, CodexModelEffortMetadata>,
+    pub(crate) probe_receipt: Option<HelperProcessReceipt>,
 }
+
+impl PartialEq for CodexRuntimeModelCatalog {
+    fn eq(&self, other: &Self) -> bool {
+        self.slugs == other.slugs && self.effort_metadata == other.effort_metadata
+    }
+}
+
+impl Eq for CodexRuntimeModelCatalog {}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CodexModelEffortMetadata {
@@ -277,6 +288,7 @@ impl CodexRuntimeModelCatalog {
         Ok(Self {
             slugs: validated,
             effort_metadata: Default::default(),
+            probe_receipt: None,
         })
     }
 
@@ -3363,7 +3375,7 @@ pub struct EnvironmentRemediation {
     pub guidance: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentFailure {
     pub category: EnvironmentFailureCategory,
@@ -3371,7 +3383,22 @@ pub struct EnvironmentFailure {
     pub requirement: Option<EnvironmentRequirement>,
     pub summary: String,
     pub remediation: Vec<EnvironmentRemediation>,
+    /// Live host evidence for retention only; public reports cannot recreate it.
+    #[serde(skip)]
+    pub(crate) catalog_probe_receipt: Option<HelperProcessReceipt>,
 }
+
+// Host diagnostic custody does not change the public failure's identity.
+impl PartialEq for EnvironmentFailure {
+    fn eq(&self, other: &Self) -> bool {
+        self.category == other.category
+            && self.requirement == other.requirement
+            && self.summary == other.summary
+            && self.remediation == other.remediation
+    }
+}
+
+impl Eq for EnvironmentFailure {}
 
 impl EnvironmentFailure {
     pub(crate) fn sandbox_unavailable(summary: String) -> Self {
@@ -4918,6 +4945,10 @@ impl ExternalAgentRun {
             .as_ref()
     }
 
+    pub(crate) fn version_probe_receipts(&self) -> &[HelperProcessReceipt] {
+        &self.stdout.run_metadata.version_probe_receipts
+    }
+
     #[cfg(test)]
     pub(crate) fn attach_fixed_version_probe_evidence_for_test(
         &mut self,
@@ -5233,6 +5264,19 @@ impl ExternalAgentRun {
     ) {
         self.stdout.run_metadata.codex_command_execution_evidence =
             Some(outcome.command_execution_evidence.clone());
+        self.stdout.run_metadata.budget_interruption = outcome.budget_interruption.clone();
+    }
+
+    pub(crate) fn budget_interruption(&self) -> Option<&codex_app_server::BudgetInterruption> {
+        self.stdout.run_metadata.budget_interruption.as_ref()
+    }
+
+    #[cfg(all(test, target_os = "linux"))]
+    pub(crate) fn set_budget_interruption_for_test(
+        &mut self,
+        interruption: codex_app_server::BudgetInterruption,
+    ) {
+        self.stdout.run_metadata.budget_interruption = Some(interruption);
     }
 
     pub(crate) fn replace_worker_journal_artifacts(
@@ -5668,6 +5712,7 @@ struct ExternalAgentRunMetadata {
     environment_preflight_results: Vec<EnvironmentPreflightResult>,
     environment_failures: Vec<EnvironmentFailure>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
+    version_probe_receipts: Vec<HelperProcessReceipt>,
     environment_preflight_process_started: bool,
     /// Held proof for scratch cleanup after a probe-only run. This is never serialized: a
     /// restored report cannot confer cleanup authority, and a target launch must earn fresh
@@ -5681,6 +5726,7 @@ struct ExternalAgentRunMetadata {
     external_side_effect_state: Option<ExternalSideEffectState>,
     worker_journal_artifacts: Vec<WorkerJournalArtifactCapture>,
     codex_command_execution_evidence: Option<codex_app_server::CommandExecutionEvidence>,
+    budget_interruption: Option<codex_app_server::BudgetInterruption>,
     live_budget_invocation: Option<crate::supervise_budget::BudgetDispatchInvocation>,
     codex_app_server_parent_evidence: Option<CodexParentEvidence>,
     codex_app_server_usage_complete: bool,
@@ -12566,6 +12612,7 @@ struct EnvironmentPreflightProcessEvidence {
     process_tree: Option<ProcessTreeEvidence>,
     side_effects: Option<SideEffectConfinementEvidence>,
     fixed_version_probe_evidence: Option<EnvironmentFixedVersionProbeEvidence>,
+    version_probe_receipts: Vec<HelperProcessReceipt>,
 }
 
 impl EnvironmentPreflightProcessEvidence {
@@ -12741,6 +12788,7 @@ fn retain_environment_preflight_process_evidence(
 ) {
     report.stdout.run_metadata.fixed_version_probe_evidence =
         evidence.fixed_version_probe_evidence.clone();
+    report.stdout.run_metadata.version_probe_receipts = evidence.version_probe_receipts.clone();
     report
         .stdout
         .run_metadata

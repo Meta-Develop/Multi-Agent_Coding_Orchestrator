@@ -773,6 +773,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     };
                     report.audit_reports.clear();
                     report.review_lens_aggregate = None;
+                    if case == "managed-cycle-isolated-final-acceptance-forgery" {
+                        assert!(report.worker_reports[0].accepted);
+                        report.worker_reports[0].accepted = false;
+                    }
                     if case == "managed-cycle-final-forgery"
                         || case == "managed-cycle-isolated-final-forgery"
                     {
@@ -878,6 +882,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             if case == "managed-cycle-isolated-unknown-containment" && subject.id == "worker" {
                 run.process_tree = None;
             }
+            if case == "managed-cycle-isolated-raw-false" {
+                report.accepted = false;
+                run.output_last_message = Some(serde_json::to_vec(&report).unwrap());
+            }
             captured_worker_reports.lock().unwrap().push(report);
             if case == "managed-cycle-cancel-after-first" && subject.id == "worker" {
                 cancellation.cancel();
@@ -889,6 +897,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     .unwrap()
                     .3 = Some(std::time::Instant::now());
             }
+        }
+        if case == "managed-cycle-isolated-worker-malformed" && subject.id == "worker" {
+            assert!(external_process_completed(&run, SupervisorRuntime::Codex));
+            run.output_last_message = Some(b"{malformed completed Worker".to_vec());
         }
         if interrupted_worker {
             super::isolated_worker_evidence_tests::interrupt_returned_worker(
@@ -1890,4 +1902,19 @@ fn parent_continuation_accepts_only_contained_qualified_native_grok_completion()
             .is_err()
     );
     Ok(())
+}
+
+#[test]
+fn audit_parent_cannot_substitute_captured_raw_acceptance() -> Result<()> {
+    driver_fixture("managed-cycle-isolated-final-acceptance-forgery")
+}
+
+#[test]
+fn audit_completed_malformed_worker_still_parses_and_fails() -> Result<()> {
+    driver_fixture("managed-cycle-isolated-worker-malformed")
+}
+
+#[test]
+fn audit_isolated_technically_successful_raw_false_worker_reaches_parent() -> Result<()> {
+    driver_fixture("managed-cycle-isolated-raw-false")
 }

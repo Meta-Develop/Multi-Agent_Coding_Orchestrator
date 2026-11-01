@@ -293,6 +293,124 @@ fn parent_report_slots_reject_child_time_symlink_rebinding_without_clobbering_se
 }
 
 #[test]
+fn reviewed_worker_raw_false_acceptance_does_not_fail_final_reporting() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "reviewed-worker-raw-false");
+    let mut child = injected_child_report(&assignment);
+    child.worker_reports[0].accepted = false;
+    let mut calls = Vec::new();
+    let mut runner = |command: &ExternalAgentCommand| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .unwrap()
+            .to_string_lossy();
+        calls.push(name.to_string());
+        if name.contains("review-auditor") {
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &child),
+            );
+        } else {
+            write_injected_json(&command.output_last_message, &child);
+        }
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
+        &mut runner,
+    )
+    .expect("collect reviewed Worker");
+    assert!(calls.iter().any(|name| name.contains("review-auditor")));
+    assert!(report.success, "{report:#?}");
+    assert!(
+        !report.orchestrator_reports[0].worker_reports[0].accepted,
+        "raw Worker evidence must remain unchanged"
+    );
+    assert!(!report
+        .findings
+        .iter()
+        .any(|finding| finding.message.contains("failed or rejected worker output")));
+    let events = fs::read_to_string(
+        repo_path
+            .join(&report.run_dir)
+            .join(ORCHESTRATION_EVENT_PATH),
+    )
+    .unwrap();
+    let event = events
+        .lines()
+        .map(|line| serde_json::from_str::<OrchestrationEvent>(line).unwrap())
+        .find(|event| {
+            event.role == OrchestrationRole::Worker && event.kind == OrchestrationEventKind::Accept
+        })
+        .expect("reviewed Worker acceptance event");
+    assert_eq!(event.payload["raw_accepted"], false);
+    assert_eq!(event.payload["accepted"], true);
+}
+
+#[test]
+fn reviewed_worker_acceptance_requires_authoritative_review_and_technical_success() {
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let mut parent = injected_child_report(&assignment);
+    assert!(
+        reviewed_worker_failed(&parent, &parent.worker_reports[0]),
+        "self-acceptance is not parent review"
+    );
+    parent.worker_reports[0].accepted = false;
+    assert!(reviewed_worker_failed(&parent, &parent.worker_reports[0]));
+    parent
+        .audit_reports
+        .push(injected_auditor_report(&assignment, &parent));
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut parent);
+    assert!(!reviewed_worker_failed(&parent, &parent.worker_reports[0]));
+    let restored: OrchestratorReviewReport =
+        serde_json::from_value(serde_json::to_value(&parent).unwrap()).unwrap();
+    assert!(reviewed_worker_failed(
+        &restored,
+        &restored.worker_reports[0]
+    ));
+    for cause in [
+        "rejected",
+        "failed",
+        "validation",
+        "environment",
+        "evidence",
+    ] {
+        let mut changed = parent.clone();
+        let worker = &mut changed.worker_reports[0];
+        match cause {
+            "rejected" => worker.rejected = true,
+            "failed" => worker.status = ReviewStatus::Failed,
+            "validation" => worker.validation_results[0].status = ReviewStatus::Failed,
+            "environment" => worker
+                .environment_failures
+                .push(EnvironmentFailure::probe_failed("fixture failure".into())),
+            "evidence" => worker.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: "fixture evidence failure".into(),
+                paths: vec![],
+            }),
+            _ => unreachable!(),
+        }
+        assert!(
+            reviewed_worker_failed(&changed, &changed.worker_reports[0]),
+            "{cause}"
+        );
+    }
+    parent.accepted = false;
+    parent.rejected = true;
+    assert!(reviewed_worker_failed(&parent, &parent.worker_reports[0]));
+}
+
+#[test]
 fn injected_parent_auditor_primary_mutation_is_rejected() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
@@ -938,6 +1056,11 @@ fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
         }]
     );
 
+    assert!(accepted_bloated_file_flags(std::slice::from_ref(&child)).is_empty());
+    child
+        .audit_reports
+        .push(injected_auditor_report(&assignment, &child));
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child);
     let reports = vec![child.clone(), child];
     assert_eq!(
         accepted_bloated_file_flags(&reports),
@@ -5041,4 +5164,148 @@ fn generated_direct_workers_require_parent_audit_for_zero_diff_success() {
             assert!(rejected.rejected);
         }
     }
+}
+
+#[test]
+fn audit_parent_forged_aggregate_cannot_accept_worker() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let options = injected_options(&repo_path, temp.path(), "audit-forged-aggregate");
+    let mut child = injected_child_report(&assignment);
+    child.worker_reports[0].accepted = false;
+    child
+        .audit_reports
+        .push(injected_auditor_report(&assignment, &child));
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut child);
+    let mut runner = |command: &ExternalAgentCommand| {
+        if command
+            .output_last_message
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("review-auditor")
+        {
+            write_injected_json(
+                &command.output_last_message,
+                &injected_auditor_report(&assignment, &child),
+            );
+        } else {
+            write_injected_json(&command.output_last_message, &child);
+        }
+        injected_verified_run(command)
+    };
+    let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
+        plan,
+        SupervisorConsultantPlan::default(),
+        options,
+        SupervisorExecutionRuntime::NonpublishableSimulation,
+        &temp,
+        &mut runner,
+    )
+    .expect("collect forged parent");
+    assert!(!report.success, "forged review was accepted: {report:#?}");
+    assert!(
+        report
+            .orchestrator_reports
+            .iter()
+            .flat_map(|parent| &parent.findings)
+            .any(|finding| finding
+                .message
+                .contains("self-assert a supervisor-owned review-lens aggregate")),
+        "{report:#?}"
+    );
+}
+
+#[test]
+fn audit_worker_report_failures_do_not_gain_acceptance_from_raw_bit() {
+    skip_without_containment!();
+    let mut accepted_failures = Vec::new();
+    for cause in ["validation", "finding", "command"] {
+        for raw_accepted in [false, true] {
+            let (temp, repo_path) = injected_repository();
+            let assignment = injected_assignment(true);
+            let plan = injected_plan(assignment.clone(), 0);
+            let options = injected_options(
+                &repo_path,
+                temp.path(),
+                &format!("audit-raw-bit-{cause}-{raw_accepted}"),
+            );
+            let mut child = injected_child_report(&assignment);
+            let worker = &mut child.worker_reports[0];
+            worker.accepted = raw_accepted;
+            match cause {
+                "validation" => worker.validation_results[0].status = ReviewStatus::Failed,
+                "finding" => worker.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: "unresolved worker evidence failure".into(),
+                    paths: vec![],
+                }),
+                "command" => {
+                    if worker.commands_run.is_empty() {
+                        worker.commands_run.push(injected_command_record());
+                    }
+                    worker.commands_run[0].status = ReviewStatus::Failed;
+                    worker.commands_run[0].exit_code = Some(1);
+                    worker.commands_run[0].error = Some("unresolved command failure".into());
+                }
+                _ => unreachable!(),
+            }
+            let mut runner = |command: &ExternalAgentCommand| {
+                if command
+                    .output_last_message
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains("review-auditor")
+                {
+                    write_injected_json(
+                        &command.output_last_message,
+                        &injected_auditor_report(&assignment, &child),
+                    );
+                } else {
+                    write_injected_json(&command.output_last_message, &child);
+                }
+                injected_verified_run(command)
+            };
+            let report = run_supervisor_plan_with_selected_default_parent_acceptance_fixture(
+                plan,
+                SupervisorConsultantPlan::default(),
+                options,
+                SupervisorExecutionRuntime::NonpublishableSimulation,
+                &temp,
+                &mut runner,
+            )
+            .expect("collect worker technical failure");
+            let effective = report
+                .orchestrator_reports
+                .first()
+                .and_then(|parent| {
+                    parent
+                        .worker_reports
+                        .first()
+                        .map(|worker| !reviewed_worker_failed(parent, worker))
+                })
+                .unwrap_or(false);
+            println!("audit failure case={cause}, raw_accepted={raw_accepted}, success={}, effective_accepted={effective}, parents={}", report.success, report.orchestrator_reports.len());
+            if report.orchestrator_reports.is_empty() {
+                println!(
+                    "audit refusal findings: {:?}",
+                    report
+                        .findings
+                        .iter()
+                        .map(|finding| &finding.message)
+                        .collect::<Vec<_>>()
+                );
+            }
+            if effective || report.success {
+                accepted_failures.push((cause, raw_accepted));
+            }
+        }
+    }
+    assert!(
+        accepted_failures.is_empty(),
+        "accepted failing Worker reports: {accepted_failures:?}"
+    );
 }

@@ -854,7 +854,13 @@ pub(super) fn retain_external_attempt_evidence(
         runtime,
         ..
     } = *context;
-    super::target_containment::persist(writer, artifacts, external_command, runtime, external_run)?;
+    let containment = super::target_containment::persist(
+        writer,
+        artifacts,
+        external_command,
+        runtime,
+        external_run,
+    );
     if raw_report_validated {
         if let Some(contents) = external_run.output_last_message() {
             if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
@@ -882,7 +888,7 @@ pub(super) fn retain_external_attempt_evidence(
         stdout_bytes,
         ArtifactFileDisposition::PrivateEvidence,
     )?;
-    Ok(())
+    containment
 }
 
 pub(super) fn create_named_invocation_scratches(
@@ -1628,14 +1634,97 @@ pub(super) fn report_failed<T: ReportStatus>(report: &T) -> bool {
     !report.accepted() || report.rejected() || report.status() != ReviewStatus::Succeeded
 }
 
+/// Technical completion is independent of the Worker's self-reported acceptance.
+/// Exceptions require the supervisor's reconciled licensed-failure records.
+pub(super) fn worker_technical_failure(
+    worker: &WorkerReport,
+    licensed: &[LicensedDependentFailure],
+) -> bool {
+    let licensed_validation = |validation: &ValidationResult| {
+        licensed.iter().any(|failure| {
+            failure.validation_name == validation.name
+                && validation.message.as_deref() == Some(failure.failure_signature.as_str())
+        })
+    };
+    let licensed_signature = |message: &str| {
+        licensed
+            .iter()
+            .any(|failure| failure.failure_signature == message)
+    };
+    worker.rejected
+        || worker.status != ReviewStatus::Succeeded
+        || !worker.environment_failures.is_empty()
+        || worker
+            .validation_results
+            .iter()
+            .any(|validation| validation_failed(validation) && !licensed_validation(validation))
+        || worker.commands_run.iter().any(|command| {
+            command.timed_out
+                || command.error.is_some()
+                || !command.environment_failures.is_empty()
+                || !command.sandbox_denials.is_empty()
+                || ((command.status != ReviewStatus::Succeeded
+                    || command.exit_code.is_some_and(|code| code != 0))
+                    && !licensed.iter().any(|failure| {
+                        command.stdout.contains(&failure.failure_signature)
+                            || command.stderr.contains(&failure.failure_signature)
+                    }))
+        })
+        || worker.findings.iter().any(|finding| {
+            finding.severity == FindingSeverity::Error && !licensed_signature(&finding.message)
+        })
+}
+
+/// A Worker's raw acceptance bit is not parent review authority. Only the
+/// reconciled, host-computed review of this candidate can supply acceptance.
+/// Keep the embedded/raw report unchanged, including explicit rejections.
+pub(super) fn reviewed_worker_failed(
+    parent: &OrchestratorReviewReport,
+    worker: &WorkerReport,
+) -> bool {
+    if report_failed(parent) {
+        return true;
+    }
+    let reviewed = parent
+        .review_lens_aggregate
+        .as_ref()
+        .is_some_and(|aggregate| {
+            aggregate.authority() == ReviewLensAggregateAuthority::ParentComputed
+                && aggregate.decision == ReviewAggregationDecision::Accept
+                && aggregate.required_coverage.worker_ids.contains(&worker.id)
+                && aggregate.validated_accepts >= aggregate.required_accepts
+        });
+    if !reviewed
+        || !parent.audit_reports.iter().any(|auditor| {
+            !report_failed(auditor)
+                && auditor.read_only
+                && auditor.no_further_delegation == Some(true)
+                && auditor.reviewed_worker_ids.contains(&worker.id)
+        })
+    {
+        return true;
+    }
+    // Collection removes child-supplied licenses; parent review reconciles the
+    // remaining packet. The raw Worker acceptance bit never licenses failures.
+    let licensed = parent
+        .licensed_breakage_review
+        .as_ref()
+        .map_or(&[][..], |review| review.failures.as_slice());
+    worker_technical_failure(worker, licensed)
+}
+
 pub(super) fn accepted_bloated_file_flags(
     reports: &[OrchestratorReviewReport],
 ) -> Vec<BloatedFileFlag> {
     reports
         .iter()
         .filter(|report| !report_failed(*report))
-        .flat_map(|report| report.worker_reports.iter())
-        .filter(|report| !report_failed(*report))
+        .flat_map(|parent| {
+            parent
+                .worker_reports
+                .iter()
+                .filter(|worker| !reviewed_worker_failed(parent, worker))
+        })
         .flat_map(|report| report.bloated_file_flags.iter().cloned())
         .collect::<BTreeSet<_>>()
         .into_iter()
@@ -1704,7 +1793,7 @@ pub(super) fn accepted_field_guide_drafts(
             else {
                 continue;
             };
-            if report_failed(worker_report) {
+            if reviewed_worker_failed(report, worker_report) {
                 continue;
             }
             for suggestion in &worker_report.field_guide_entries {
