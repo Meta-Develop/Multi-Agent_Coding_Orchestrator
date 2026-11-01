@@ -379,6 +379,15 @@ fn confined_child_probe() -> Result<()> {
 
 fn commit_fixture_repository(path: &Path) {
     let repo = Repository::open(path).expect("open fixture repository");
+    // Positive writable-child fixtures declare the author used by their baseline commit.
+    let mut local = git2::Config::open(&repo.commondir().join("config"))
+        .expect("open fixture local Git config");
+    local
+        .set_str("user.name", "maco test")
+        .expect("set fixture author name");
+    local
+        .set_str("user.email", "maco-test@example.invalid")
+        .expect("set fixture author email");
     let mut index = repo.index().expect("fixture index");
     index
         .add_path(Path::new("README.md"))

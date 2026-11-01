@@ -496,6 +496,9 @@ printf '{"candidate":true}' > "$result"
     );
     let repo_path = f.temp.path().join("coordinator");
     let repo = git2::Repository::init(&repo_path).unwrap();
+    let mut local = git2::Config::open(&repo.commondir().join("config")).unwrap();
+    local.set_str("user.name", "test").unwrap();
+    local.set_str("user.email", "test@invalid").unwrap();
     write(&repo_path.join("a.txt"), "old\n", 0o600);
     let mut index = repo.index().unwrap();
     index.add_path(Path::new("a.txt")).unwrap();

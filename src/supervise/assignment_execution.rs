@@ -26,6 +26,14 @@ mod managed_parent_controller;
 #[allow(dead_code)]
 mod parent_continuation_response;
 mod review_handoff;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn worker_review_evidence_for_test(
+    writer: &ArtifactRunWriter,
+    journals: &WorkerExecutionJournalEvidenceSet,
+) -> Result<Value> {
+    review_handoff::worker_evidence(writer, journals)
+}
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
@@ -9543,6 +9551,16 @@ mod decomposition_tests {
 
     fn commit_fixture_repository(path: &Path) {
         let repo = crate::git_repository::open(path).expect("open fixture repository");
+        // Positive writable-launch fixtures must meet the same local-author
+        // prerequisite as production private Git materialization.
+        let mut local = git2::Config::open(&repo.commondir().join("config"))
+            .expect("open fixture local Git config");
+        local
+            .set_str("user.name", "maco test")
+            .expect("configure fixture author name");
+        local
+            .set_str("user.email", "maco-test@example.invalid")
+            .expect("configure fixture author email");
         let mut index = repo.index().expect("open fixture index");
         index
             .add_path(Path::new("README.md"))
@@ -18514,6 +18532,9 @@ done
         let repo = temp.path().join("repo");
         WorktreeManager::init_repository(&repo, "main")?;
         let git_repo = crate::git_repository::open(&repo)?;
+        let mut local = git2::Config::open(&git_repo.commondir().join("config"))?;
+        local.set_str("user.name", "test")?;
+        local.set_str("user.email", "test@example.com")?;
         let sig = Signature::now("test", "test@example.com")?;
         let tree = {
             let mut index = git_repo.index()?;

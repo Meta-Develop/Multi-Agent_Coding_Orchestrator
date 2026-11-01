@@ -385,6 +385,10 @@ fn create_committed_repo(root: &Path) -> Result<PathBuf> {
 }
 
 fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
+    // Writable child fixtures need the same local author as their baseline commit.
+    let mut local = git2::Config::open(&repo.commondir().join("config"))?;
+    local.set_str("user.name", "maco test")?;
+    local.set_str("user.email", "maco-test@example.invalid")?;
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;
     index.write()?;

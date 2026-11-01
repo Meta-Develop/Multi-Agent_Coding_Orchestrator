@@ -1196,12 +1196,25 @@ pub(super) fn run(
         &mut report,
         &mut selected_authority,
     ) {
-        record_external_error(&mut report, format!("Gemini bootstrap refused: {error:#}"));
+        record_bootstrap_refusal(&mut report, &error);
     }
     #[cfg(not(target_os = "linux"))]
     let _ = cancellation;
     report.duration_ms = duration_millis(started.elapsed());
     report
+}
+
+// Shared by the bridge's online/offline launch-result boundary and its
+// providerless regression; no provider or credential acquisition is needed
+// to verify how a protected-worktree preparation error is reported.
+#[cfg(target_os = "linux")]
+pub(super) fn record_bootstrap_refusal(report: &mut ExternalAgentRun, error: &anyhow::Error) {
+    let summary = format!("Gemini bootstrap refused: {error:#}");
+    if let Some(category) = managed_child_preflight_failure_category(error) {
+        record_environment_failure(report, category, None, summary);
+    } else {
+        record_external_error(report, summary);
+    }
 }
 
 #[cfg(target_os = "linux")]

@@ -143,24 +143,222 @@ pub(super) fn worker_evidence(
             );
         }
     }
-    let budget = 8 * 1024 / sources.len().max(1);
+    // Reserve the array brackets and separators as part of the packet bound.
+    let budget = (WORKER_REVIEW_EVIDENCE_BYTES - 2) / sources.len().max(1);
+    let budget = budget.saturating_sub(1);
     let mut evidence = Vec::new();
     for (path, (worker_id, kind)) in sources {
         let bytes = writer.read_authenticated(&path, MAX_SUPERVISOR_REPORT_BYTES)?;
-        let text = std::str::from_utf8(&bytes).context("Worker review evidence is not UTF-8")?;
-        let mut excerpt = crate::review::bounded_review_transcript(
-            text,
-            &path,
-            &crate::artifacts::state_auth::sha256_hex(&bytes),
-            budget,
-            text.len() > budget,
-        )?;
-        // Keep the original byte identity while applying the existing redactor
-        // to the only content that is allowed to cross the review boundary.
-        let redactor = crate::llm::Redactor::new();
-        excerpt.head_excerpt = redactor.redact(&excerpt.head_excerpt).text;
-        excerpt.tail_excerpt = redactor.redact(&excerpt.tail_excerpt).text;
-        evidence.push(json!({"worker_id":worker_id, "kind":kind, "evidence":excerpt}));
+        evidence.push(select_worker_operations(
+            worker_id, kind, &path, &bytes, budget,
+        )?);
     }
-    Ok(Value::Array(evidence))
+    let evidence = Value::Array(evidence);
+    if serde_json::to_vec(&evidence)?.len() > WORKER_REVIEW_EVIDENCE_BYTES {
+        bail!("Worker evidence exceeds the finite review packet budget");
+    }
+    Ok(evidence)
+}
+
+// The bound covers the serialized array, including redacted content, record
+// coordinates/hashes and omission manifests. In qualification -04 the journal
+// was 10,049 B and the stream 573,420 B, but its 21 operation events were only
+// 35,492 B. 128 KiB allows those whole records plus JSON escaping/metadata while
+// excluding the much larger reasoning/usage traffic. Sources receive equal
+// shares so a noisy stream cannot consume a journal's allowance.
+const WORKER_REVIEW_EVIDENCE_BYTES: usize = 128 * 1024;
+const WHOLE_WORKER_SOURCE_BYTES: usize = 16 * 1024;
+
+struct ReviewOperationRecord<'a> {
+    line: usize,
+    start: usize,
+    text: &'a str,
+    kind: &'static str,
+    required: bool,
+    selected: Option<Value>,
+    omission: &'static str,
+}
+
+impl ReviewOperationRecord<'_> {
+    fn end(&self) -> usize {
+        self.start + self.text.len()
+    }
+
+    fn select(&mut self, redactor: &crate::llm::Redactor) {
+        self.selected = Some(json!({
+            "line":self.line, "byte_start":self.start, "byte_end":self.end(),
+            "sha256":crate::artifacts::state_auth::sha256_hex(self.text.as_bytes()),
+            "kind":self.kind, "content":redactor.redact(self.text).text,
+        }));
+    }
+}
+
+// Retain every command/file-change boundary, including final diff observations.
+// This includes the journal's matching native events without guessing from a
+// shell command string or trusting provider output as execution authority.
+fn native_operation_kind(value: &Value) -> Option<&'static str> {
+    let method = value
+        .get("method")
+        .or_else(|| value.get("type"))?
+        .as_str()?;
+    if matches!(method, "turn/diff/updated" | "turn.diff.updated") {
+        return Some("native_diff");
+    }
+    if !matches!(
+        method,
+        "item/started" | "item/completed" | "item.started" | "item.completed"
+    ) {
+        return None;
+    }
+    let item = value
+        .pointer("/params/item")
+        .or_else(|| value.get("item"))?;
+    match item.get("type")?.as_str()? {
+        "commandExecution" | "command_execution" => Some("native_command"),
+        "fileChange" | "file_change" => Some("native_file_change"),
+        _ => None,
+    }
+}
+
+fn operation_evidence_value(
+    worker_id: &str,
+    kind: &str,
+    path: &Path,
+    bytes: &[u8],
+    records: &[ReviewOperationRecord<'_>],
+    budget: usize,
+) -> Value {
+    let mut ranges = Vec::new();
+    let mut omitted_records = 0;
+    let mut omitted_bytes = 0;
+    let mut required_records_omitted = 0;
+    let mut index = 0;
+    while index < records.len() {
+        if records[index].selected.is_some() {
+            index += 1;
+            continue;
+        }
+        let first = index;
+        let mut reasons = BTreeMap::<&str, usize>::new();
+        let mut kinds = BTreeMap::<&str, usize>::new();
+        while index < records.len() && records[index].selected.is_none() {
+            let record = &records[index];
+            *reasons.entry(record.omission).or_default() += 1;
+            *kinds.entry(record.kind).or_default() += 1;
+            required_records_omitted += usize::from(record.required);
+            omitted_bytes += record.text.len();
+            omitted_records += 1;
+            index += 1;
+        }
+        let start = records[first].start;
+        let end = records[index - 1].end();
+        ranges.push(json!({
+            "first_line":records[first].line, "last_line":records[index - 1].line,
+            "byte_start":start, "byte_end":end, "records":index - first,
+            "sha256":crate::artifacts::state_auth::sha256_hex(&bytes[start..end]),
+            "kinds":kinds, "reasons":reasons,
+        }));
+    }
+    json!({"worker_id":worker_id, "kind":kind, "evidence":{
+        "version":2, "source":path, "sha256":crate::artifacts::state_auth::sha256_hex(bytes),
+        "original_bytes":bytes.len(), "record_count":records.len(),
+        "source_budget_bytes":budget, "packet_budget_bytes":WORKER_REVIEW_EVIDENCE_BYTES,
+        "selection":"whole_short_sources_when_share_allows_else_journal_operations_and_native_command_file_change_diff_events",
+        "hashes":"original_bytes_before_redaction; offsets_zero_based_end_exclusive; lines_one_based",
+        "records":records.iter().filter_map(|record| record.selected.as_ref()).collect::<Vec<_>>(),
+        "omission_manifest":{
+            "omitted_records":omitted_records, "omitted_bytes":omitted_bytes,
+            "required_records_omitted":required_records_omitted, "ranges":ranges,
+        },
+    }})
+}
+
+fn select_worker_operations(
+    worker_id: &str,
+    kind: &str,
+    path: &Path,
+    bytes: &[u8],
+    budget: usize,
+) -> Result<Value> {
+    let text = std::str::from_utf8(bytes).context("Worker review evidence is not UTF-8")?;
+    let whole = bytes.len() <= WHOLE_WORKER_SOURCE_BYTES;
+    let journal = kind == "worker_journal";
+    let mut offset = 0;
+    let mut records = text
+        .split_inclusive('\n')
+        .enumerate()
+        .map(|(index, text)| {
+            let native = if journal {
+                None
+            } else {
+                serde_json::from_str::<Value>(text)
+                    .ok()
+                    .as_ref()
+                    .and_then(native_operation_kind)
+            };
+            let record = ReviewOperationRecord {
+                line: index + 1,
+                start: offset,
+                text,
+                kind: if journal {
+                    "journal_operation"
+                } else {
+                    native.unwrap_or("other_native_event")
+                },
+                required: journal || native.is_some(),
+                selected: None,
+                omission: if journal || native.is_some() || whole {
+                    "source_budget"
+                } else {
+                    "non_operation_event"
+                },
+            };
+            offset += text.len();
+            record
+        })
+        .collect::<Vec<_>>();
+    let redactor = crate::llm::Redactor::new();
+    if whole {
+        for record in &mut records {
+            record.select(&redactor);
+        }
+        let full = operation_evidence_value(worker_id, kind, path, bytes, &records, budget);
+        if serde_json::to_vec(&full)?.len() <= budget {
+            return Ok(full);
+        }
+        for record in &mut records {
+            record.selected = None;
+        }
+    }
+    let baseline = operation_evidence_value(worker_id, kind, path, bytes, &records, budget);
+    let baseline_len = serde_json::to_vec(&baseline)?.len();
+    if baseline_len > budget {
+        bail!("Worker review source metadata exceeds its finite {budget}-byte share");
+    }
+    let mut remaining = budget - baseline_len;
+    // Selecting one record can split one omission range in two. Reserve 512 B
+    // for the additional range (coordinates, counts, kinds, reasons and hash),
+    // independently of the exact serialized, redacted record size.
+    for record in &mut records {
+        if !record.required && !whole {
+            continue;
+        }
+        record.select(&redactor);
+        let cost = serde_json::to_vec(record.selected.as_ref().unwrap())?.len() + 512;
+        if cost <= remaining {
+            remaining -= cost;
+        } else {
+            record.selected = None;
+            record.omission = if cost > budget - baseline_len {
+                "record_exceeds_source_budget"
+            } else {
+                "source_budget"
+            };
+        }
+    }
+    let selected = operation_evidence_value(worker_id, kind, path, bytes, &records, budget);
+    if serde_json::to_vec(&selected)?.len() > budget {
+        bail!("Worker operation evidence exceeded its finite serialized budget");
+    }
+    Ok(selected)
 }

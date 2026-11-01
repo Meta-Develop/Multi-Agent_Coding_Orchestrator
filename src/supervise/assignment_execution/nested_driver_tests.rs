@@ -78,11 +78,10 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         fs::write(repo.join("src/other.rs"), "pub fn other() {}\n")?;
     }
     let git = crate::git_repository::open(&repo)?;
-    if case.starts_with("managed-cycle-") {
-        let mut config = git.config()?;
-        config.set_str("user.name", "Fixture Owner")?;
-        config.set_str("user.email", "fixture@example.invalid")?;
-    }
+    // Every nested writable-child fixture must have a local materialization author.
+    let mut local = git2::Config::open(&git.commondir().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     let mut index = git.index()?;
     index.add_path(Path::new("src/lib.rs"))?;
     if isolated {

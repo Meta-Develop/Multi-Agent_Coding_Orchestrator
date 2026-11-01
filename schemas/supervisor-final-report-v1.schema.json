@@ -1393,6 +1393,7 @@
                     "network_forbidden",
                     "network_unavailable",
                     "provider_auth_required",
+                    "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"
@@ -2678,6 +2679,7 @@
               "network_forbidden",
               "network_unavailable",
               "provider_auth_required",
+              "missing_git_attribution",
               "sandbox_unavailable",
               "probe_failed",
               "runtime_model_catalog_unavailable"
@@ -6683,6 +6685,7 @@
                                 "network_forbidden",
                                 "network_unavailable",
                                 "provider_auth_required",
+                                "missing_git_attribution",
                                 "sandbox_unavailable",
                                 "probe_failed",
                                 "runtime_model_catalog_unavailable"
@@ -7861,6 +7864,7 @@
                           "network_forbidden",
                           "network_unavailable",
                           "provider_auth_required",
+                          "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"
@@ -8515,6 +8519,7 @@
                           "network_forbidden",
                           "network_unavailable",
                           "provider_auth_required",
+                          "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"
@@ -9766,6 +9771,7 @@
                     "network_forbidden",
                     "network_unavailable",
                     "provider_auth_required",
+                    "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"
@@ -14033,6 +14039,7 @@
                                 "network_forbidden",
                                 "network_unavailable",
                                 "provider_auth_required",
+                                "missing_git_attribution",
                                 "sandbox_unavailable",
                                 "probe_failed",
                                 "runtime_model_catalog_unavailable"
@@ -15283,6 +15290,7 @@
                           "network_forbidden",
                           "network_unavailable",
                           "provider_auth_required",
+                          "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
                           "runtime_model_catalog_unavailable"

@@ -277,6 +277,9 @@ fn cursor_managed_worker_writes_only_assigned_path_and_runs_parent_owned_check()
     let primary = temp.path().join("primary");
     let child = temp.path().join("child");
     let repository = git2::Repository::init(&primary)?;
+    let mut local = git2::Config::open(&repository.commondir().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     fs::write(primary.join(ASSIGNED), "before\n")?;
     fs::write(primary.join("sibling.txt"), "sibling\n")?;
     let mut index = repository.index()?;
@@ -2708,6 +2711,10 @@ fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, 
     let child = root.join("child");
     let peer = root.join("peer");
     let repository = git2::Repository::init(&primary)?;
+    // Writable private materialization requires an explicit fixture identity.
+    let mut local = git2::Config::open(&repository.path().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     fs::write(primary.join("RELEASE_NOTES.md"), "initial\n")?;
     fs::write(primary.join("DELETE.md"), "delete this candidate\n")?;
     let mut index = repository.index()?;
@@ -4902,6 +4909,10 @@ fn environment_failure_category_spellings_are_stable() -> Result<()> {
         (
             EnvironmentFailureCategory::ProviderAuthRequired,
             "provider_auth_required",
+        ),
+        (
+            EnvironmentFailureCategory::MissingGitAttribution,
+            "missing_git_attribution",
         ),
         (EnvironmentFailureCategory::ProbeFailed, "probe_failed"),
         (
@@ -13078,7 +13089,10 @@ fn assignment_process_launch_fixture(
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
-    git2::Repository::init(&workspace)?;
+    let repository = git2::Repository::init(&workspace)?;
+    let mut local = git2::Config::open(&repository.commondir().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     create_mandatory_control_roots(&workspace)?;
     let marker = workspace.join("child-process-started");
     let agent = workspace.join("fixture-agent.sh");
@@ -15984,5 +15998,227 @@ fn provider_setup_refusals_retain_requested_containment_without_granting_custody
             assert!(!restored.scratch_quiescence_verified());
         }
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn q714_missing_git_attribution_refuses_before_provider_release() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let mut local = git2::Config::open(&common.join("config"))?;
+    for key in ["user.name", "user.email"] {
+        let _ = local.remove(key);
+    }
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Execution,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    assert_eq!(command.workspace_access, WorkspaceAccess::ReadWrite);
+    let before = snapshot_managed_git_tree(&common)?;
+    let error = protected_worktree_controls(&command)
+        .err()
+        .context("writable managed child without attribution was admitted")?;
+    assert!(error.to_string().contains("user.name"));
+    assert!(error.to_string().contains("user.email"));
+    // Refuse while preparing the projected config, before creating private storage.
+    assert_eq!(snapshot_managed_git_tree(&common)?, before);
+    assert!(!child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR).exists());
+    let run = run_external_agent_nonpublishable_simulation(&command);
+    assert!(!run.stdout.target_launch_attempted);
+    assert!(
+        !run.stdout
+            .run_metadata
+            .environment_preflight_process_started
+    );
+    let failure = run
+        .environment_failures()
+        .first()
+        .context("typed preflight failure")?;
+    assert_eq!(
+        serde_json::to_value(failure.category)?,
+        "missing_git_attribution"
+    );
+    assert!(failure
+        .remediation
+        .iter()
+        .any(|item| item.scope == EnvironmentRemediationScope::ProjectLocal));
+    assert_eq!(snapshot_managed_git_tree(&common)?, before);
+    assert_eq!(
+        crate::git_repository::open(&primary)?
+            .head()?
+            .peel_to_commit()?
+            .id(),
+        crate::git_repository::open(&child)?
+            .head()?
+            .peel_to_commit()?
+            .id()
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn q714_configured_git_attribution_proceeds_after_typed_refusal() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let mut local = git2::Config::open(&common.join("config"))?;
+    for key in ["user.name", "user.email"] {
+        let _ = local.remove(key);
+    }
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Execution,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    assert!(
+        protected_worktree_controls(&command).is_err(),
+        "missing identity must refuse first"
+    );
+    local.set_str("user.name", "Approved Fixture Owner")?;
+    local.set_str("user.email", "approved-fixture@example.invalid")?;
+    let controls = protected_worktree_controls(&command)?;
+    let metadata = controls.managed_git.context("configured managed Git")?;
+    let projected = git2::Config::open(&metadata.private_git_dir.join("config"))?;
+    assert_eq!(projected.get_string("user.name")?, "Approved Fixture Owner");
+    assert_eq!(
+        projected.get_string("user.email")?,
+        "approved-fixture@example.invalid"
+    );
+    verify_managed_git_boundary_after_launch(&metadata)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rp714_read_only_missing_git_attribution_is_allowed() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let mut local = git2::Config::open(&common.join("config"))?;
+    for key in ["user.name", "user.email"] {
+        let _ = local.remove(key);
+    }
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Planning,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+    assert!(protected_worktree_controls(&command)?.managed_git.is_some());
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn rp714_each_missing_git_attribution_key_has_typed_refusal() -> Result<()> {
+    let mut mismatches = Vec::new();
+    for missing in ["user.name", "user.email"] {
+        let temp = tempfile::tempdir()?;
+        let (_primary, child, common, _child_git_dir) =
+            create_linked_git_metadata_fixture(temp.path())?;
+        let mut local = git2::Config::open(&common.join("config"))?;
+        local.remove(missing)?;
+        let incoming = temp.path().join("incoming");
+        fs::create_dir(&incoming)?;
+        let command = crate::supervise::configure_assignment_phase_command_for_test(
+            managed_git_command(&child, &incoming),
+            crate::supervise::AssignmentPhase::Execution,
+            &[PathBuf::from("RELEASE_NOTES.md")],
+        )?;
+        let err = protected_worktree_controls(&command).unwrap_err();
+        eprintln!("R-P714 missing {missing}: {err:#}");
+        let run = run_external_agent_nonpublishable_simulation(&command);
+        assert!(!run.stdout.target_launch_attempted);
+        let failure = run
+            .environment_failures()
+            .first()
+            .context("environment failure")?;
+        eprintln!("R-P714 missing {missing} category={:?}", failure.category);
+        if !err.is::<ManagedChildPreflightRefusal>()
+            || failure.category != EnvironmentFailureCategory::MissingGitAttribution
+        {
+            mismatches.push(missing);
+        }
+    }
+    assert!(
+        mismatches.is_empty(),
+        "missing keys had no typed attribution refusal: {mismatches:?}"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rp714_gemini_bootstrap_preserves_typed_attribution_refusal() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let mut local = git2::Config::open(&common.join("config"))?;
+    for key in ["user.name", "user.email"] {
+        local.remove(key)?;
+    }
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Execution,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    // Exercise the real bridge launch-result boundary with a real protected-
+    // worktree refusal. This stops before any Gemini account/provider work.
+    let error = protected_worktree_controls(&command)
+        .unwrap_err()
+        .context("Gemini protected-worktree preparation");
+    let mut report = failed_external_run(
+        &command,
+        Instant::now(),
+        vec!["Gemini managed OAuth bootstrap".into()],
+        false,
+        "Gemini managed Worker did not complete".into(),
+    );
+    gemini_bridge::record_bootstrap_refusal(&mut report, &error);
+    assert!(!report.stdout.target_launch_attempted);
+    assert!(
+        !report
+            .stdout
+            .run_metadata
+            .environment_preflight_process_started
+    );
+    let failure = report
+        .environment_failures()
+        .first()
+        .context("Gemini typed preflight refusal")?;
+    assert_eq!(
+        failure.category,
+        EnvironmentFailureCategory::MissingGitAttribution
+    );
+    assert!(failure.remediation.iter().any(|item| item.scope
+        == EnvironmentRemediationScope::ProjectLocal
+        && item.guidance.contains("user.name")
+        && item.guidance.contains("user.email")));
+    assert!(report.environment_blocked());
+
+    // Unrelated bootstrap errors must keep their original classification.
+    let mut unrelated =
+        failed_external_run(&command, Instant::now(), vec![], false, "bootstrap".into());
+    gemini_bridge::record_bootstrap_refusal(
+        &mut unrelated,
+        &anyhow::anyhow!("other bootstrap error"),
+    );
+    assert!(unrelated.environment_failures().is_empty());
+    assert!(unrelated
+        .error
+        .as_deref()
+        .unwrap()
+        .contains("other bootstrap error"));
     Ok(())
 }

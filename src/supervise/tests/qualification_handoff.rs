@@ -378,3 +378,6 @@ fn q714_fixture_requires_stage_one_acceptance() -> Result<()> {
     drop(temp);
     Ok(())
 }
+
+#[path = "qualification_operation_evidence.rs"]
+mod operation_evidence;

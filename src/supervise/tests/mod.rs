@@ -294,6 +294,15 @@ pub(super) fn injected_repository() -> (tempfile::TempDir, PathBuf) {
 
 fn commit_injected_repository(path: &Path, message: &str) {
     let repo = crate::git_repository::open(path).expect("open injected repository");
+    // Positive writable-child fixtures declare the author used by their baseline commit.
+    let mut local = git2::Config::open(&repo.commondir().join("config"))
+        .expect("open fixture local Git config");
+    local
+        .set_str("user.name", "maco test")
+        .expect("set fixture author name");
+    local
+        .set_str("user.email", "maco-test@example.invalid")
+        .expect("set fixture author email");
     let mut index = repo.index().expect("open injected index");
     index
         .add_all(["*"], git2::IndexAddOption::DEFAULT, None)

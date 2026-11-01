@@ -691,6 +691,10 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
             guidance: "Repair the required user-service sandbox support through the declarative NixOS host configuration before retrying."
                 .to_string(),
         }],
+        EnvironmentFailureCategory::MissingGitAttribution => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::ProjectLocal,
+            guidance: "Configure repository-local user.name and user.email with the approved author identity in the source repository, then start a fresh managed run; global Git identity is not projected. Preserve the repository attribution and hook policy.".to_string(),
+        }],
         EnvironmentFailureCategory::ProbeFailed => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::ProjectLocal,
             guidance: "Correct the bounded requirement or fixed project environment, then rerun preflight; MACO will not install software or relax policy automatically."
@@ -1976,7 +1980,7 @@ impl ManagedChildGitBoundary {
     }
 
     pub(crate) fn revalidate(&self) -> Result<Oid> {
-        let observed = managed_worktree_git_metadata_with_mode(&self.workspace, false)?
+        let observed = managed_worktree_git_metadata_with_mode(&self.workspace, false, false)?
             .context("managed child collection requires an existing linked Git boundary")?;
         if observed != self.metadata {
             bail!("managed child Git boundary changed after its collection-time binding");
@@ -1991,7 +1995,7 @@ pub(crate) fn bind_existing_managed_child_git_boundary(
 ) -> Result<ManagedChildGitBoundary> {
     let workspace = fs::canonicalize(workspace)
         .context("managed child collection workspace could not be resolved")?;
-    let metadata = managed_worktree_git_metadata_with_mode(&workspace, false)?
+    let metadata = managed_worktree_git_metadata_with_mode(&workspace, false, false)?
         .context("managed child collection requires an existing linked Git boundary")?;
     verify_managed_git_boundary_after_launch(&metadata)?;
     Ok(ManagedChildGitBoundary {
@@ -3109,7 +3113,13 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
                     })
             }));
     if prepare_managed_git {
-        controls.managed_git = managed_worktree_git_metadata(&spec.cwd)?;
+        // This is reached only after launch admission. Do not move private Git
+        // preparation onto the scheduler's unreviewed/rejected-child path.
+        controls.managed_git = if spec.workspace_access == WorkspaceAccess::ReadWrite {
+            managed_worktree_git_metadata_with_mode(&spec.cwd, true, true)?
+        } else {
+            managed_worktree_git_metadata(&spec.cwd)?
+        };
     }
     controls.exact_read_only_input_files = validate_exact_read_only_input_files(spec, &controls)?;
     controls.exact_writable_artifact_files =
@@ -3555,12 +3565,13 @@ fn validate_exact_writable_artifact_identity(
 }
 
 fn managed_worktree_git_metadata(workspace: &Path) -> Result<Option<ManagedWorktreeGitMetadata>> {
-    managed_worktree_git_metadata_with_mode(workspace, true)
+    managed_worktree_git_metadata_with_mode(workspace, true, false)
 }
 
 fn managed_worktree_git_metadata_with_mode(
     workspace: &Path,
     prepare_private_storage: bool,
+    require_attribution: bool,
 ) -> Result<Option<ManagedWorktreeGitMetadata>> {
     let marker = workspace.join(".git");
     let marker_metadata = fs::symlink_metadata(&marker)
@@ -3704,6 +3715,7 @@ fn managed_worktree_git_metadata_with_mode(
         &config,
         base_oid,
         prepare_private_storage,
+        require_attribution,
     )?;
     let private_object_dir = canonical_git_directory(
         &private_git_dir.join("objects"),
@@ -3736,6 +3748,20 @@ fn managed_worktree_git_metadata_with_mode(
     }))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
+enum ManagedChildPreflightRefusal {
+    #[error("writable managed child private Git materialization requires repository-local user.name and user.email; configure both with the approved author identity in the source repository, then start a fresh managed run (global identity is not projected)")]
+    MissingGitAttribution,
+}
+
+fn managed_child_preflight_failure_category(
+    error: &anyhow::Error,
+) -> Option<EnvironmentFailureCategory> {
+    error
+        .is::<ManagedChildPreflightRefusal>()
+        .then_some(EnvironmentFailureCategory::MissingGitAttribution)
+}
+
 #[derive(Debug, Default, PartialEq, Eq)]
 struct ManagedChildProjectedIdentity {
     user_name: Option<String>,
@@ -3746,7 +3772,15 @@ struct ManagedChildProjectedIdentity {
 }
 
 fn managed_child_private_config(common_config: &[u8], filemode: &str) -> Result<Vec<u8>> {
-    let identity = parse_managed_child_projected_identity(common_config)?;
+    managed_child_private_config_with_attribution(common_config, filemode, false)
+}
+
+fn managed_child_private_config_with_attribution(
+    common_config: &[u8],
+    filemode: &str,
+    require_attribution: bool,
+) -> Result<Vec<u8>> {
+    let identity = parse_managed_child_projected_identity(common_config, require_attribution)?;
     let mut config = format!(
         "[core]\n\trepositoryformatversion = 0\n\tbare = false\n\tfilemode = {filemode}\n\tlogallrefupdates = true\n"
     );
@@ -3778,7 +3812,10 @@ fn escape_managed_child_config_value(value: &str) -> String {
     value.replace('\\', "\\\\").replace('"', "\\\"")
 }
 
-fn parse_managed_child_projected_identity(bytes: &[u8]) -> Result<ManagedChildProjectedIdentity> {
+fn parse_managed_child_projected_identity(
+    bytes: &[u8],
+    require_attribution: bool,
+) -> Result<ManagedChildProjectedIdentity> {
     #[derive(Clone, Copy, PartialEq, Eq)]
     enum Section {
         User,
@@ -3862,6 +3899,13 @@ fn parse_managed_child_projected_identity(bytes: &[u8]) -> Result<ManagedChildPr
         }
     }
 
+    // An admitted writable launch needs both components. Classify absence
+    // before the strict projection policy rejects a partial tuple; read-only
+    // and collection callers retain the existing projection rules below.
+    if require_attribution && (projected.user_name.is_none() || projected.user_email.is_none()) {
+        return Err(ManagedChildPreflightRefusal::MissingGitAttribution.into());
+    }
+
     let user_count =
         usize::from(projected.user_name.is_some()) + usize::from(projected.user_email.is_some());
     if user_count == 1 {
@@ -3927,6 +3971,7 @@ fn prepare_managed_child_private_git_dir(
     common_config: &Path,
     base_oid: Oid,
     create_if_missing: bool,
+    require_attribution: bool,
 ) -> Result<PathBuf> {
     use std::io::Write;
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
@@ -3973,7 +4018,11 @@ fn prepare_managed_child_private_git_dir(
     } else {
         "false"
     };
-    let expected_config = managed_child_private_config(&common_config_bytes, filemode)?;
+    let expected_config = managed_child_private_config_with_attribution(
+        &common_config_bytes,
+        filemode,
+        require_attribution,
+    )?;
     let private_git_dir = worktree_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR);
     match fs::symlink_metadata(&private_git_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create_if_missing => {
@@ -4080,6 +4129,7 @@ fn prepare_managed_child_private_git_dir(
     _common_config: &Path,
     _base_oid: Oid,
     _create_if_missing: bool,
+    _require_attribution: bool,
 ) -> Result<PathBuf> {
     bail!("managed child private Git storage is unsupported on this platform")
 }
