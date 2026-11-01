@@ -25,6 +25,7 @@ mod isolated_worker_evidence;
 mod managed_parent_controller;
 #[allow(dead_code)]
 mod parent_continuation_response;
+mod review_handoff;
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,
@@ -310,6 +311,7 @@ pub(super) fn supervisor_review_lens_binding_material(
         })
         .collect::<Vec<_>>();
     let mut validation_bindings = json!({
+        "validation_candidate": candidate.map(|inspection| &inspection.binding),
         "orchestrator_validation_results": child_report.validation_results,
         "worker_validation_results": worker_validations,
         "child_auditor_validation_results": auditor_validations,
@@ -7832,7 +7834,7 @@ fn decide_parent_auditor_gate(
             .self_corrected(artifacts, &assignment.id, journal_parent_id)?;
     }
     let mut traceability_candidate = None;
-    if !report_failed(&child_report) || evidence_only_rejection {
+    if pre_auditor_candidate.is_some() || !report_failed(&child_report) || evidence_only_rejection {
         let post_auditor_candidate = inspect_assignment_candidate(context, preflight);
         match (pre_auditor_candidate.as_ref(), post_auditor_candidate) {
             (Some(before), Ok(after)) if before == &after => {
@@ -8137,6 +8139,7 @@ fn execute_supervisor_assignment_inner(
         let mut retry_feedback: Option<ChildAttemptCorrection> = None;
         let mut active_budget_policy = context.budget_policy.clone();
         let mut attempt_history = Vec::new();
+        let mut review_worker_journals = WorkerExecutionJournalEvidenceSet::new();
         let mut structural_attempt = 1usize;
         let mut warning_streak: Option<crate::loop_guard::LoopGuardTracker> = None;
         let max_attempts = usize::from(plan.max_child_retries)
@@ -8268,6 +8271,7 @@ fn execute_supervisor_assignment_inner(
                 };
                 let attempted_launch_model_provenance = collected.model_provenance.clone();
                 let attempt_external_run = collected.external_run.clone();
+                review_worker_journals.clone_from(&collected._worker_journal_evidence);
                 let disposition = match decide_child_attempt(
                     context,
                     outcome,
@@ -8373,47 +8377,20 @@ fn execute_supervisor_assignment_inner(
                 append_child_attempt_history(&mut child_report, &attempt_history);
             }
             let pre_auditor_candidate = if child_containment_verified {
-                if preflight.primary_scope_baseline.is_some() {
-                    if !child_report.decomposition_completions.is_empty() {
-                        let error = anyhow!(
-                        "primary-worktree execution does not support megafile decomposition evidence"
-                    );
+                match review_handoff::capture_candidate(
+                    context,
+                    &preflight,
+                    &mut child_report,
+                    terminal_attempt_outcome.attempt,
+                ) {
+                    Ok(inspection) => Some(inspection),
+                    Err(error) => {
                         reject_supervisor_candidate_binding(
                             &mut child_report,
                             &final_report_path,
                             &error,
                         );
                         None
-                    } else if !report_failed(&child_report) {
-                        inspect_assignment_candidate(context, &preflight).ok()
-                    } else {
-                        None
-                    }
-                } else {
-                    let lease = preflight
-                        .worktree_write_lease
-                        .as_ref()
-                        .context("managed decomposition candidate has no worktree lease")?;
-                    match bind_supervisor_decomposition_candidate(
-                        repo,
-                        assignment,
-                        &mut child_report,
-                        lease,
-                        context.worktree_creation.expected_source_head(),
-                    ) {
-                        Ok(Some(inspection)) => Some(inspection),
-                        Ok(None) if !report_failed(&child_report) => {
-                            inspect_assignment_candidate(context, &preflight).ok()
-                        }
-                        Ok(None) => None,
-                        Err(error) => {
-                            reject_supervisor_candidate_binding(
-                                &mut child_report,
-                                &final_report_path,
-                                &error,
-                            );
-                            None
-                        }
                     }
                 }
             } else {
@@ -8506,6 +8483,7 @@ fn execute_supervisor_assignment_inner(
             let mut auditor_sandbox_denied = false;
             let mut auditor_environment_blocked = false;
             let parent_review_required = child_containment_verified
+                && pre_auditor_candidate.is_some()
                 && !child_gate_terminal
                 && parent_auditor_required(assignment, &child_report);
             let review_cycle_slot =
@@ -8538,7 +8516,17 @@ fn execute_supervisor_assignment_inner(
                     .transpose()
                     .context("preserved candidate binding primary HEAD is invalid")?
                     .unwrap_or(preflight.child_base_head);
-                let diff = if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
+                let retained_patch =
+                    PathBuf::from("reports").join(format!("{}.candidate.patch", assignment.id));
+                let diff = with_supervisor_artifacts(artifacts, |writer, _| {
+                    writer.read_optional_authenticated(
+                        &retained_patch,
+                        REVIEW_LENS_REQUEST_LIMIT_BYTES,
+                    )
+                })?;
+                let diff = if let Some(diff) = diff {
+                    String::from_utf8(diff).context("retained candidate patch is not UTF-8")?
+                } else if let Some(baseline) = preflight.primary_scope_baseline.as_ref() {
                     let current = capture_primary_scope_snapshot(
                         repo,
                         &assignment.assigned_paths,
@@ -8547,6 +8535,7 @@ fn execute_supervisor_assignment_inner(
                     )?;
                     render_primary_scope_diff(baseline, &current)?
                 } else {
+                    // Nonpublishing Fake simulation has no retained writable candidate.
                     collect_diff_since_base(
                         &preflight.worktree.path,
                         &review_base,
@@ -8555,12 +8544,16 @@ fn execute_supervisor_assignment_inner(
                 };
                 let output_report = serde_json::to_string(&child_report)
                     .context("failed to serialize child output report for review lenses")?;
-                let review_bindings = supervisor_review_lens_binding_material(
+                let mut review_bindings = supervisor_review_lens_binding_material(
                     assignment,
                     &child_report,
                     pre_auditor_candidate.as_ref(),
                     parent_held_out.as_ref(),
                 )?;
+                review_bindings.validation_bindings["worker_execution_evidence"] =
+                    with_supervisor_artifacts(artifacts, |writer, _| {
+                        review_handoff::worker_evidence(writer, &review_worker_journals)
+                    })?;
                 let sources = crate::review::BoundedReviewLensRequestSources {
                     child_transcript: &child_transcript,
                     authoritative_transcript_path: transcript_relative,

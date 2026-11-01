@@ -269,7 +269,17 @@ impl SupervisorMessagingSessionFactory {
     }
 
     fn open_existing_broker(&self) -> Result<MessagingBroker> {
-        self.revoke_fresh_worker_request_admission()?;
+        // An ordinary transport reopen is not a new supervisor incarnation.
+        // Keep the live factory's unclaimed parent permits; a restored factory
+        // starts with none. Any failed authentication still burns all permits.
+        let result = self.open_authenticated_broker();
+        if result.is_err() {
+            self.revoke_fresh_worker_request_admission()?;
+        }
+        result
+    }
+
+    fn open_authenticated_broker(&self) -> Result<MessagingBroker> {
         self.verify_run_and_binding()?;
         let broker = if self.persistent.is_some() {
             MessagingBroker::open(

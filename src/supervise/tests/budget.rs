@@ -23,14 +23,14 @@ fn nested_budget_qualification_ceiling_preserves_candidate_then_exhaustion() -> 
             BudgetAdmission::Refused { .. } => bail!("qualification planning envelope refused"),
         }
     };
-    // Six parent/reviewer turns at the documented 65k allowance and a full
-    // first-Worker grant still leave 20k. This is arithmetic, not a usage promise.
-    for _ in 0..6 {
+    // -03's five measured coordinator/reviewer turns plus a 65k second parent.
+    // The 168,672-token continuation replaces the old per-turn assumption.
+    for tokens in [27_942, 168_672, 92_786, 20_689, 15_039, 65_000] {
         let reservation = reserve(AgentRole::ChildOrchestrator)?;
         ledger.reconcile(
             reservation.id,
             UsageMeasurement::Reliable {
-                tokens: 65_000,
+                tokens,
                 cost_usd: None,
             },
         )?;
@@ -63,6 +63,7 @@ fn nested_budget_qualification_ceiling_preserves_candidate_then_exhaustion() -> 
     assert!(reserve(AgentRole::Worker).is_err());
     assert_eq!(ledger.report()?.active_reservations, 0);
     assert!(!ledger.report()?.usage_complete);
+    assert_eq!(ledger.report()?.consumed.tokens, 649_453);
     let command = ExternalAgentCommand::codex(
         "never-invoke",
         &repo,

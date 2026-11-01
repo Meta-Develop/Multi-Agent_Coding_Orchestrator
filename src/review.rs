@@ -757,7 +757,7 @@ fn build_bounded_review_lens_request_with_transcript(
     )
 }
 
-fn bounded_review_transcript(
+pub(crate) fn bounded_review_transcript(
     transcript: &str,
     authoritative_artifact: &Path,
     sha256: &str,
