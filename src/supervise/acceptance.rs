@@ -1773,6 +1773,28 @@ pub(super) fn inspect_primary_scope_candidate(
     })
 }
 
+// Decomposition technical success does not derive from the Worker's raw bit.
+// No licensed-failure exceptions authorize decomposition evidence. Unify with
+// reporting::worker_technical_failure(worker, &[]) when that helper lands.
+pub(super) fn decomposition_worker_technical_failure(worker: &WorkerReport) -> bool {
+    worker.rejected
+        || worker.status != ReviewStatus::Succeeded
+        || !worker.environment_failures.is_empty()
+        || worker.validation_results.iter().any(validation_failed)
+        || worker.commands_run.iter().any(|command| {
+            command.status != ReviewStatus::Succeeded
+                || command.exit_code.is_some_and(|code| code != 0)
+                || command.timed_out
+                || command.error.is_some()
+                || !command.environment_failures.is_empty()
+                || !command.sandbox_denials.is_empty()
+        })
+        || worker
+            .findings
+            .iter()
+            .any(|finding| finding.severity == FindingSeverity::Error)
+}
+
 pub(super) fn bind_supervisor_decomposition_candidate(
     repo: &Path,
     assignment: &OrchestratorAssignment,
@@ -1810,7 +1832,7 @@ pub(super) fn bind_supervisor_decomposition_candidate(
     }
 
     for worker in &mut report.worker_reports {
-        if report_failed(worker) {
+        if decomposition_worker_technical_failure(worker) {
             continue;
         }
         if let Some(completion) = &mut worker.decomposition_completion {
@@ -2129,7 +2151,7 @@ pub(super) fn validate_assignment_report_plumbing(
         let expected = report
             .worker_reports
             .iter()
-            .filter(|worker_report| !report_failed(*worker_report))
+            .filter(|worker_report| !decomposition_worker_technical_failure(worker_report))
             .filter_map(|worker_report| worker_report.decomposition_completion.clone())
             .collect::<BTreeSet<_>>();
         let successful =
@@ -2140,7 +2162,9 @@ pub(super) fn validate_assignment_report_plumbing(
             );
         }
         if successful && normalized != expected {
-            bail!("decomposition_completions does not match accepted successful worker evidence");
+            bail!(
+                "decomposition_completions does not match technically successful worker evidence"
+            );
         }
         for completion in &normalized {
             if !assignment.worker_assignments.iter().any(|worker| {
@@ -2313,15 +2337,14 @@ fn normalize_worker_report_plumbing(
                 .take()
                 .map(normalize_unbound_decomposition_completion)
                 .transpose()?;
-            let successful =
-                report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded;
+            let successful = !decomposition_worker_technical_failure(report);
             if successful && completion.is_none() {
                 bail!(
-                    "accepted successful megafile_decomposition worker omitted decomposition_completion"
+                    "technically successful megafile_decomposition worker omitted decomposition_completion"
                 );
             }
             if completion.is_some() && !successful {
-                bail!("decomposition_completion requires an accepted successful worker");
+                bail!("decomposition_completion requires a technically successful worker");
             }
             if completion.as_ref().map(|value| value.target_path.as_path()) != Some(target_path)
                 && completion.is_some()
@@ -2332,9 +2355,7 @@ fn normalize_worker_report_plumbing(
                 let files_changed = normalize_paths(report.files_changed.clone())
                     .context("megafile_decomposition worker files_changed is invalid")?;
                 if !files_changed.iter().any(|path| path == target_path) {
-                    bail!(
-                        "accepted megafile_decomposition worker files_changed omits the exact target"
-                    );
+                    bail!("megafile_decomposition worker files_changed omits the exact target");
                 }
                 for replacement in &completion.replacement_paths {
                     if !files_changed.contains(replacement) {
