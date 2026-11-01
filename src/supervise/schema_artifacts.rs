@@ -4497,6 +4497,7 @@ fn environment_failure_schema_value() -> serde_json::Value {
                     "network_forbidden",
                     "network_unavailable",
                     "provider_auth_required",
+                    "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
                     "runtime_model_catalog_unavailable"

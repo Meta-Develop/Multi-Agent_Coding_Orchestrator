@@ -1168,6 +1168,7 @@ fn environment_failure_category_name(category: EnvironmentFailureCategory) -> &'
         EnvironmentFailureCategory::NetworkUnavailable => "network_unavailable",
         EnvironmentFailureCategory::ProviderAuthRequired => "provider_auth_required",
         EnvironmentFailureCategory::SandboxUnavailable => "sandbox_unavailable",
+        EnvironmentFailureCategory::MissingGitAttribution => "missing_git_attribution",
         EnvironmentFailureCategory::ProbeFailed => "probe_failed",
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => {
             "runtime_model_catalog_unavailable"
@@ -1284,6 +1285,10 @@ fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentF
             guidance:
                 "restore the verified confinement capability before rerunning; do not broaden the sandbox automatically"
                     .to_string(),
+        }],
+        EnvironmentFailureCategory::MissingGitAttribution => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::ProjectLocal,
+            guidance: "configure repository-local user.name and user.email with the approved author identity in the source repository, then start a fresh managed run; global identity is not projected and attribution/hook policy is unchanged".to_string(),
         }],
         EnvironmentFailureCategory::ProbeFailed => vec![EnvironmentRemediation {
             scope: EnvironmentRemediationScope::ProjectLocal,

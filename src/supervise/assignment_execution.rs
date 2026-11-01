@@ -26,6 +26,14 @@ mod managed_parent_controller;
 #[allow(dead_code)]
 mod parent_continuation_response;
 mod review_handoff;
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn worker_review_evidence_for_test(
+    writer: &ArtifactRunWriter,
+    journals: &WorkerExecutionJournalEvidenceSet,
+) -> Result<Value> {
+    review_handoff::worker_evidence(writer, journals)
+}
 use crate::mutation_taxonomy::{
     admit_assignment_child_process_intent, admit_parent_auditor_process_intent,
     AssignmentProcessLaunchKind, SealedMechanicalExecutorDuty, SealedMechanicalExecutorPhase,

@@ -3341,6 +3341,7 @@ pub enum EnvironmentFailureCategory {
     NetworkForbidden,
     NetworkUnavailable,
     ProviderAuthRequired,
+    MissingGitAttribution,
     SandboxUnavailable,
     ProbeFailed,
     RuntimeModelCatalogUnavailable,
@@ -7679,7 +7680,8 @@ fn run_external_agent_runtime_inner(
                 started,
                 command_display(&resolved_program, &[]),
                 false,
-                EnvironmentFailureCategory::SandboxUnavailable,
+                managed_child_preflight_failure_category(&error)
+                    .unwrap_or(EnvironmentFailureCategory::SandboxUnavailable),
                 Some(external_sandbox_requirement(spec.invocation)),
                 format!("failed to validate protected worktree controls: {error}"),
             );
