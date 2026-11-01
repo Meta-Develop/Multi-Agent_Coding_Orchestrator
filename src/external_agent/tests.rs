@@ -277,6 +277,9 @@ fn cursor_managed_worker_writes_only_assigned_path_and_runs_parent_owned_check()
     let primary = temp.path().join("primary");
     let child = temp.path().join("child");
     let repository = git2::Repository::init(&primary)?;
+    let mut local = git2::Config::open(&repository.commondir().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     fs::write(primary.join(ASSIGNED), "before\n")?;
     fs::write(primary.join("sibling.txt"), "sibling\n")?;
     let mut index = repository.index()?;
@@ -13086,7 +13089,10 @@ fn assignment_process_launch_fixture(
     let temp = tempfile::tempdir()?;
     let workspace = temp.path().join("workspace");
     fs::create_dir_all(&workspace)?;
-    git2::Repository::init(&workspace)?;
+    let repository = git2::Repository::init(&workspace)?;
+    let mut local = git2::Config::open(&repository.commondir().join("config"))?;
+    local.set_str("user.name", "Fixture Owner")?;
+    local.set_str("user.email", "fixture@example.invalid")?;
     create_mandatory_control_roots(&workspace)?;
     let marker = workspace.join("child-process-started");
     let agent = workspace.join("fixture-agent.sh");

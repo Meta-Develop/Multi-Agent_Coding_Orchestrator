@@ -5607,6 +5607,10 @@ fn ready_wave_spawn_panic_hook_isolates_owner_repo_from_same_agent_id() {
 }
 
 fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
+    // Writable child fixtures need the same local author as their baseline commit.
+    let mut local = git2::Config::open(&repo.commondir().join("config"))?;
+    local.set_str("user.name", "maco test")?;
+    local.set_str("user.email", "maco-test@example.invalid")?;
     let mut index = repo.index().context("open index")?;
     index
         .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)

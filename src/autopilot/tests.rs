@@ -737,6 +737,12 @@ fn create_committed_autopilot_repo(root: &Path) -> PathBuf {
     {
         let mut config = repository.config().expect("open isolated Autopilot config");
         config
+            .set_str("user.name", "maco test")
+            .expect("set fixture author name");
+        config
+            .set_str("user.email", "maco-test@example.invalid")
+            .expect("set fixture author email");
+        config
             .set_bool("core.splitIndex", false)
             .expect("disable split-index for isolated Autopilot fixture");
         config
