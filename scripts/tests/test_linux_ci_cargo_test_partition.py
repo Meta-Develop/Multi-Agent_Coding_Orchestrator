@@ -1,9 +1,11 @@
 import importlib.util
+from collections import Counter
 import pathlib
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 
 ROOT = pathlib.Path(__file__).resolve().parents[2]
@@ -42,6 +44,7 @@ class LinuxCiCargoTestPartitionTests(unittest.TestCase):
         targets = partition.collect_testable_targets(sample_package())
         partition.verify_partition(targets)
         self.assertEqual(partition.partition_argv(targets, "lib"), ["--lib"])
+        self.assertEqual(partition.partition_argv(targets, "doc"), ["--doc"])
         self.assertEqual(
             partition.partition_argv(targets, "non-lib"),
             ["--bench", "coordination", "--bin", "maco", "--test", "merge_cli"],
@@ -55,7 +58,99 @@ class LinuxCiCargoTestPartitionTests(unittest.TestCase):
             ]
         }
         targets = partition.collect_testable_targets(package)
-        self.assertEqual([target.kind for target in targets], ["lib"])
+        self.assertEqual([target.kind for target in targets], ["doc", "lib"])
+
+    def test_explicitly_disabled_doctest_target_is_excluded(self) -> None:
+        package = {"targets": [{"kind": ["lib"], "name": "crate", "doctest": False}]}
+        targets = partition.collect_testable_targets(package)
+        partition.verify_partition(targets)
+        self.assertEqual(partition.partition_argv(targets, "doc"), [])
+
+    def test_doc_target_omission_fails_metadata_coverage(self) -> None:
+        targets = partition.collect_testable_targets(sample_package())
+        original = partition.partition_argv
+        with mock.patch.object(partition, "partition_argv", side_effect=lambda targets, group, shard=None: [] if group == "doc" else original(targets, group, shard)):
+            with self.assertRaisesRegex(ValueError, "does not cover metadata"):
+                partition.verify_partition(targets)
+
+    def test_inventory_includes_doctests_and_retains_explicit_benchmarks(self) -> None:
+        full = partition.parse_test_listing("unit: test\nshared: test\nshared: test\nsrc/lib.rs - api (line 1): test\n\n4 tests, 0 benchmarks\n")
+        groups = {
+            "lib": Counter({("test", "unit"): 1}),
+            "non-lib": Counter({("test", "shared"): 2, ("benchmark", "speed"): 1}),
+            "doc": Counter({("test", "src/lib.rs - api (line 1)"): 1}),
+        }
+        result = partition.verify_test_inventory(full, groups)
+        self.assertEqual((result["full_tests"], result["partition_tests"]), (4, 4))
+        self.assertEqual(result["additional_benchmarks"], ["speed"])
+        del groups["doc"]
+        with self.assertRaisesRegex(ValueError, "src/lib.rs - api"):
+            partition.verify_test_inventory(full, groups)
+
+    def test_inventory_rejects_future_missing_duplicate_or_extra_doctest(self) -> None:
+        current = ("test", "src/lib.rs - api (line 1)")
+        future = ("test", "src/new.rs - api (line 2)")
+        for full, observed in (
+            (Counter({current: 1, future: 1}), Counter({current: 1})),
+            (Counter({current: 1}), Counter({current: 2})),
+            (Counter({current: 1}), Counter({current: 1, future: 1})),
+        ):
+            with self.subTest(full=full, observed=observed), self.assertRaisesRegex(ValueError, "inventory differs"):
+                partition.verify_test_inventory(full, {"doc": observed})
+
+    def test_inventory_rejects_malformed_listing(self) -> None:
+        with self.assertRaisesRegex(ValueError, "unexpected Cargo test listing"):
+            partition.parse_test_listing("src/lib.rs: unknown\n")
+
+    def test_full_inventory_queries_doctests_and_exact_library_selection(self) -> None:
+        spec = importlib.util.spec_from_file_location("inventory_library", PARTITION_PY.with_name("linux_ci_library_shards.py"))
+        library = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(library)
+        doc = "src/lib.rs - api (line 1)"
+
+        def listing(command, **kwargs):
+            if "--doc" in command:
+                output = f"{doc}: test\n\n1 test, 0 benchmarks\n"
+            elif "--lib" in command:
+                output = "unit: test\n"
+                if "--format" not in command:
+                    output += "\n1 test, 0 benchmarks\n"
+            elif "--test" in command:
+                output = "integration: test\n\n1 test, 0 benchmarks\n"
+            elif "--bench" in command:
+                output = "speed: benchmark\n"
+            else:
+                output = f"unit: test\nintegration: test\n{doc}: test\n\n3 tests, 0 benchmarks\n"
+            return subprocess.CompletedProcess(command, 0, output, "")
+
+        with mock.patch.dict(sys.modules, {"linux_ci_library_shards": library}), mock.patch.object(library, "partition_inventory", return_value={"autopilot": ["unit"]}), mock.patch.object(library, "validate_mandatory_supervise_ownership"), mock.patch.object(partition.subprocess, "run", side_effect=listing) as run:
+            result = partition.verify_full_inventory(partition.collect_testable_targets(sample_package()), ROOT)
+        self.assertEqual(result["full_tests"], 3)
+        self.assertEqual(result["doctests"], [doc])
+        self.assertIn(["cargo", "test", "--locked", "--doc", "--", "--list"], [call.args[0] for call in run.call_args_list])
+        self.assertIn(["cargo", "test", "--locked", "--lib", "--", "--list", "--exact", "--", "unit"], [call.args[0] for call in run.call_args_list])
+
+    def test_doctests_and_full_inventory_are_required_after_source_bound_build(self) -> None:
+        source = WORKFLOW.read_text(encoding="utf-8")
+        library = source.split("  linux-library:\n", 1)[1].split("  linux-integration:\n", 1)[0]
+        self.assertIn("needs: nix-package", library)
+        self.assertIn("shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition,", library)
+        inventory = (
+            "- name: Verify full test inventory including doctests\n"
+            "        if: matrix.shard == 'supervise-decomposition'\n"
+            "        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh python3 .github/scripts/linux_ci_cargo_test_partition.py verify-inventory"
+        )
+        doctests = (
+            "- name: Run doctests\n"
+            "        if: matrix.shard == 'supervise-decomposition'\n"
+            "        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh doc"
+        )
+        self.assertEqual(library.count(inventory), 1)
+        self.assertEqual(library.count(doctests), 1)
+        self.assertLess(library.index("Verify independent bindings, import, and qualify"), library.index("Run library tests"))
+        self.assertLess(library.index("Run library tests"), library.index(inventory))
+        self.assertLess(library.index(inventory), library.index(doctests))
+        self.assertNotIn("continue-on-error", library)
 
     def test_non_lib_shards_cover_original_targets_once_including_future_targets(self) -> None:
         package = sample_package()

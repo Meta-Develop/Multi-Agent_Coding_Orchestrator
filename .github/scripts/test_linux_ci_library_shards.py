@@ -26,7 +26,8 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
         self.assertEqual(
             self.shards.SHARDS,
             ("autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
-             "supervise-nested", "supervise-fixtures", "external-agent", "worktree", "rest"),
+             "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
+             "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest"),
         )
 
     def test_mixed_inventory_disjoint_complete_union(self) -> None:
@@ -91,6 +92,26 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
         self.assertEqual(parts["autopilot"], [])
         self.assertEqual(parts["supervise-core"], [])
         self.assertEqual(parts["supervise-fixtures"], [])
+
+    def test_fixture_split_preserves_diagnostics_and_future_modules(self) -> None:
+        inventory = [
+            *self.shards.SUPERVISE_DIAGNOSTICS,
+            *self.shards.SUPERVISE_CAUSAL_DIAGNOSTICS,
+            "supervise::tests::budget::new",
+            "supervise::tests::prompts_gates::new",
+            "supervise::tests::licensed_breakage::new",
+            "supervise::tests::plan_runtime::new",
+            "supervise::tests::qualification_handoff::new",
+            "supervise::tests::reaudit::new",
+            "supervise::tests::run_artifacts::new",
+            "supervise::tests::future_module::new",
+        ]
+        parts = self.shards.partition_inventory(inventory)
+        self.shards.validate_mandatory_supervise_ownership(inventory, parts)
+        for module, shard in self.shards.FIXTURE_MODULE_SHARDS.items():
+            self.assertIn(f"supervise::tests::{module}::new", parts[shard])
+        self.assertIn("supervise::tests::future_module::new", parts["supervise-fixtures"])
+        self.assertCountEqual([n for group in parts.values() for n in group], inventory)
 
     def test_empty_and_duplicate_inventory_refuse(self) -> None:
         with self.assertRaises(ValueError):

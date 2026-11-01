@@ -93,6 +93,21 @@ class LibraryShardTests(unittest.TestCase):
                 shards.run_shard(["harness"], "autopilot")
             self.assertEqual(run.call_count, 1)
 
+    def test_list_mode_checks_real_selection_without_executing_bodies(self):
+        selected = sorted(INVENTORY[:2])
+        with mock.patch.object(shards, "enumerate_tests", side_effect=[INVENTORY, selected]) as enumerate_tests, mock.patch.object(shards.subprocess, "run") as run, mock.patch("sys.stdout", io.StringIO()) as output:
+            self.assertEqual(shards.run_shard(["harness"], "autopilot", list_only=True), 0)
+            self.assertEqual(enumerate_tests.call_count, 2)
+            run.assert_not_called()
+            records = [json.loads(line) for line in output.getvalue().splitlines()]
+            self.assertEqual(records[-1], {"selected": "autopilot", "tests": selected})
+
+    def test_list_mode_refuses_a_libtest_filter_mismatch(self):
+        with mock.patch.object(shards, "enumerate_tests", side_effect=[INVENTORY, []]), mock.patch.object(shards.subprocess, "run") as run:
+            with self.assertRaises(ValueError):
+                shards.run_shard(["harness"], "autopilot", list_only=True)
+            run.assert_not_called()
+
     def test_filter_gap_or_overlap_refuses_execution(self):
         for selected in [INVENTORY[:1], INVENTORY[:3]]:
             with self.subTest(selected=selected), mock.patch.object(shards.subprocess, "run") as run:
@@ -688,7 +703,7 @@ class LibraryShardTests(unittest.TestCase):
                 "        shard = sys.argv[sys.argv.index('--shard') + 1]\n"
                 "        print('--test\\nmerge_cli' if shard == 'merge' else '--bench\\ncoordination')\n"
                 "    else:\n"
-                "        print('--lib' if sys.argv[2] == 'lib' else '--bin\\nmaco')\n",
+                "        print('--lib' if sys.argv[2] == 'lib' else '--doc' if sys.argv[2] == 'doc' else '--bin\\nmaco')\n",
                 encoding="utf-8",
             )
             (scripts / "run-linux-all-tests-in-delegated-user-scope.sh").write_text(
@@ -707,6 +722,11 @@ class LibraryShardTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertEqual(result.stdout.splitlines(), ["cargo", "test", "--locked", "--bin", "maco"])
+            result = subprocess.run(
+                ["bash", str(wrapper), "doc"], capture_output=True, text=True
+            )
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["cargo", "test", "--locked", "--doc"])
             for shard, flags in (("merge", ["--test", "merge_cli"]), ("other", ["--bench", "coordination"])):
                 result = subprocess.run(
                     ["bash", str(wrapper), "non-lib", shard], capture_output=True, text=True
@@ -741,12 +761,15 @@ mod supervise {
         }
     }
     mod tests {
+        mod budget { #[test] fn new_budget_body() {} }
+        mod licensed_breakage { #[test] fn new_licensed_body() {} }
         mod scheduler {
             // Empty body verifies wrapper selection only, not concurrency semantics.
             #[test] fn claim_and_semantic_block_conflicts_fail_only_the_affected_assignment() {}
         }
         mod plan_runtime {
             #[test] fn no_override_selects_single_slug_effort_profile_for_every_role() {}
+            #[test] fn new_runtime_body() {}
         }
     }
     mod scheduler {
@@ -803,7 +826,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 26)
+            self.assertEqual(len(inventory), 29)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -829,7 +852,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 26', result.stdout)
+                self.assertIn('"total": 29', result.stdout)
 
 
 if __name__ == "__main__":

@@ -11,13 +11,27 @@ import re
 import signal
 import subprocess
 import sys
+import time
 from pathlib import Path
 from typing import Sequence
 
 SHARDS = (
     "autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
-    "supervise-nested", "supervise-fixtures", "external-agent", "worktree", "rest",
+    "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
+    "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest",
 )
+# Balance the former 2,285-second hosted job using CT101's full fixture run:
+# approximately 824/668/875/755 summed test seconds (three test threads).
+# Keep related modules together; new modules stay in supervise-fixtures.
+FIXTURE_MODULE_SHARDS = {
+    "budget": "supervise-fixtures-budget",
+    "prompts_gates": "supervise-fixtures-budget",
+    "licensed_breakage": "supervise-fixtures-licensed",
+    "plan_runtime": "supervise-fixtures-runtime",
+    "qualification_handoff": "supervise-fixtures-runtime",
+    "reaudit": "supervise-fixtures-runtime",
+    "run_artifacts": "supervise-fixtures-runtime",
+}
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
     "runtime_adapter::cursor_managed_parent::tests::offline_check_failure_diagnostic_keeps_untrusted_output_private",
@@ -108,6 +122,9 @@ def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
             owner = "autopilot"
         elif name.startswith("supervise::tests::"):
             owner = "supervise-fixtures"
+            if name not in standalone:
+                module = name.removeprefix("supervise::tests::").split("::", 1)[0]
+                owner = FIXTURE_MODULE_SHARDS.get(module, owner)
         elif name.startswith("supervise::"):
             owner = "supervise-core"
             # Keep the existing standalone preflights/diagnostics with their
@@ -147,6 +164,8 @@ def enumerate_tests(runner: Sequence[str], names: Sequence[str] | None = None) -
     if names is not None:
         command += test_command([], names)
     result = subprocess.run(command, check=True, capture_output=True, text=True)
+    if result.stderr:
+        print(result.stderr, end="", file=sys.stderr, flush=True)
     return parse_inventory(result.stdout)
 
 
@@ -304,10 +323,12 @@ def run_supervise_causal_diagnostics(runner: Sequence[str], selected: Sequence[s
                       "broad_allowed": status == 0}, sort_keys=True), flush=True)
     return status
 
-def run_shard(runner: Sequence[str], shard: str) -> int:
+def run_shard(runner: Sequence[str], shard: str, list_only: bool = False) -> int:
     if shard not in SHARDS:
         raise ValueError(f"unknown library shard: {shard}")
+    started = time.monotonic()
     inventory = enumerate_tests(runner)
+    enumerated = time.monotonic()
     partitions = partition_inventory(inventory)
     selected = partitions[shard]
     command = test_command(runner, selected)
@@ -324,11 +345,16 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
                 "total": len(inventory),
                 "shards": {key: len(value) for key, value in partitions.items()},
                 "selected": shard,
+                "compile_and_inventory_seconds": round(enumerated - started, 3),
+                "selection_check_seconds": round(time.monotonic() - enumerated, 3),
             },
             sort_keys=True,
         ),
         flush=True,
     )
+    if list_only:
+        print(json.dumps({"selected": shard, "tests": selected}, sort_keys=True), flush=True)
+        return 0
     if shard in SAFETY_PREFLIGHTS:
         preflight_status = run_safety_preflights(runner, selected, shard)
         if preflight_status != 0:
@@ -343,13 +369,18 @@ def run_shard(runner: Sequence[str], shard: str) -> int:
         causal_status = run_supervise_causal_diagnostics(runner, selected, own_causal)
         if causal_status != 0:
             return causal_status
-    return subprocess.run(command, check=False).returncode
+    started = time.monotonic()
+    result = subprocess.run(command, check=False)
+    print(json.dumps({"selected": shard, "test_seconds": round(time.monotonic() - started, 3),
+                      "returncode": result.returncode}, sort_keys=True), flush=True)
+    return result.returncode
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("shard", choices=SHARDS)
     parser.add_argument("--manifest-dir", type=Path, default=Path("."))
+    parser.add_argument("--list", action="store_true", help="verify and print this shard's exact inventory without running bodies")
     args = parser.parse_args(argv)
     root = args.manifest_dir.resolve()
     # The partition wrapper verifies the existing full Cargo metadata target
@@ -357,7 +388,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     os.chdir(root)
     # Keep Cargo's normal test environment and package-root working directory.
     # Enumeration builds the harness once; later calls reuse that same build.
-    return run_shard(["cargo", "test", "--locked", "--lib", "--"], args.shard)
+    return run_shard(["cargo", "test", "--locked", "--lib", "--"], args.shard, args.list)
 
 
 if __name__ == "__main__":
