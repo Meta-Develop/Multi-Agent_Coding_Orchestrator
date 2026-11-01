@@ -57,6 +57,8 @@ struct RetainedCommandSummary<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     researcher_input_receipts:
         Vec<crate::external_agent::researcher_inputs::ResearcherInputReceipt>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    budget_interruption: Option<&'a crate::external_agent::codex_app_server::BudgetInterruption>,
 }
 
 fn receipt_path(summary: &Path) -> PathBuf {
@@ -134,6 +136,7 @@ pub(super) fn persist(
             run, command, runtime,
         ),
         researcher_input_receipts: run.retained_researcher_input_receipts(),
+        budget_interruption: run.budget_interruption(),
         command_seal_snapshot: command
             .live_budget_command_seal_snapshot()
             .map_err(|error| anyhow!(error))?,
@@ -164,7 +167,12 @@ pub(super) fn persist(
             if existing != receipt {
                 bail!("target receipt contradicts a previously retained observation");
             }
-            return Ok(());
+            return super::helper_inventory::persist_target(
+                writer,
+                &artifacts.command_record_relative,
+                &serde_json::to_value(&receipt.binding)?,
+                run,
+            );
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(error.into()),
@@ -187,7 +195,12 @@ pub(super) fn persist(
     )?;
     let bytes = writer.read_authenticated(&relative, MAX_RECEIPT_BYTES)?;
     validate(&bytes, &receipt.binding, &summary)?;
-    Ok(())
+    super::helper_inventory::persist_target(
+        writer,
+        &artifacts.command_record_relative,
+        &serde_json::to_value(&receipt.binding)?,
+        run,
+    )
 }
 
 fn validate(
@@ -759,6 +772,77 @@ mod tests {
             &run,
             SupervisorRuntime::Codex
         ));
+    }
+
+    #[test]
+    fn helper_inventory_retains_owner_and_refuses_missing_target_receipt() {
+        let mut missing = fixture();
+        let mut fixture = fixture();
+        let mut run = super::super::tests::injected_verified_run(&fixture.command);
+        run.stdout.target_launch_attempted = true;
+        run.attach_fixed_version_probe_evidence_for_test(EnvironmentFixedVersionProbeEvidence {
+            executable: EnvironmentExecutable::Codex,
+            exit_code: Some(0),
+            timed_out: false,
+            stdout: EnvironmentFixedVersionProbeStream {
+                text: "codex test".into(),
+                truncated: false,
+            },
+            stderr: EnvironmentFixedVersionProbeStream {
+                text: String::new(),
+                truncated: false,
+            },
+            process_tree: run.process_tree.unwrap(),
+            side_effects: run.side_effects.unwrap(),
+        });
+        persist(
+            &mut fixture.writer,
+            &fixture.artifacts,
+            &fixture.command,
+            SupervisorRuntime::Codex,
+            &run,
+        )
+        .unwrap();
+        let path = fixture
+            .artifacts
+            .command_record_relative
+            .with_extension("helper-inventory.json");
+        let inventory: Value = serde_json::from_slice(
+            &fixture
+                .writer
+                .read_authenticated(&path, MAX_SUPERVISOR_REPORT_BYTES)
+                .expect("retained helper inventory"),
+        )
+        .unwrap();
+        assert_eq!(inventory["owner"]["task_id"], "research");
+        assert_eq!(inventory["helpers"][0]["kind"], "version_probe");
+        assert_eq!(inventory["helpers"][1]["kind"], "target");
+        assert_eq!(inventory["complete"], true);
+        assert_eq!(inventory["quiescence_verified"], true);
+        assert_eq!(
+            inventory["helpers"][0]["process_tree"]["status"],
+            "verified_empty"
+        );
+        run.process_tree = None;
+        assert!(
+            persist(
+                &mut missing.writer,
+                &missing.artifacts,
+                &missing.command,
+                SupervisorRuntime::Codex,
+                &run
+            )
+            .is_err(),
+            "spawned helper without a typed receipt must refuse"
+        );
+        let refused: Value = serde_json::from_slice(
+            &missing
+                .writer
+                .read_authenticated(&path, MAX_SUPERVISOR_REPORT_BYTES)
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(refused["complete"], false);
     }
 
     #[test]

@@ -5419,6 +5419,7 @@ mod selection_schema_tests {
             ),
         );
         let failure = EnvironmentFailure {
+            catalog_probe_receipt: None,
             category: EnvironmentFailureCategory::VersionMismatch,
             requirement: Some(requirement.clone()),
             summary: "representative version mismatch".to_string(),

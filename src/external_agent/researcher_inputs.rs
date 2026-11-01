@@ -337,6 +337,7 @@ pub(super) fn prepare_source_inputs(
             .run_metadata
             .fixed_version_probe_evidence
             .clone(),
+        version_probe_receipts: report.stdout.run_metadata.version_probe_receipts.clone(),
     };
     let started = Instant::now();
     let mut receipts = Vec::new();

@@ -1114,6 +1114,7 @@ pub(crate) struct AppServerOutcome {
     pub(crate) turn_id: String,
     pub(crate) status: TurnTerminalStatus,
     pub(crate) protocol_error: Option<String>,
+    pub(crate) budget_interruption: Option<BudgetInterruption>,
     /// Settings returned by the correlated `thread/start` response. Ephemeral
     /// threads write no rollout, so these are the provider-owned provenance.
     pub(crate) resolved_model: String,
@@ -1133,6 +1134,16 @@ pub(crate) struct AppServerOutcome {
     pub(crate) duplex_fallback_required: bool,
     pub(crate) messages_received: usize,
     pub(crate) bytes_received: usize,
+}
+
+/// Host-held cause retained independently of report bytes and diagnostic text.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub(crate) struct BudgetInterruption {
+    pub(crate) grant: u64,
+    pub(crate) observed_floor: u64,
+    pub(crate) thread_id: String,
+    pub(crate) turn_id: String,
+    pub(crate) terminal_acknowledgement: Option<TurnTerminalStatus>,
 }
 
 // Parse original notification bytes so duplicate usage/correlation keys cannot
@@ -1928,6 +1939,7 @@ where
         turn_id: String::new(),
         status: TurnTerminalStatus::Failed,
         protocol_error: Some("app-server turn startup incomplete".to_string()),
+        budget_interruption: None,
         resolved_model: resolved_model.clone(),
         resolved_effort: resolved_effort.clone(),
         token_usage: None,
@@ -2397,6 +2409,7 @@ where
     let mut retry_notice_count = 0usize;
 
     let mut budget_failure = None;
+    let mut budget_interruption: Option<BudgetInterruption> = None;
     let result = (|| loop {
         let message = match lifecycle
             .pending_turn_started
@@ -3242,6 +3255,9 @@ where
                             .iter()
                             .all(|item_id| adequate_review_targets.contains(item_id.as_str()))
                     };
+                if let Some(interruption) = &mut budget_interruption {
+                    interruption.terminal_acknowledgement = Some(status);
+                }
                 if let Some(error) = budget_failure.clone() {
                     return Err(error);
                 }
@@ -3250,6 +3266,7 @@ where
                     turn_id: turn_id.to_string(),
                     status,
                     protocol_error: None,
+                    budget_interruption: None,
                     resolved_model: resolved_model.clone(),
                     resolved_effort: resolved_effort.clone(),
                     token_usage,
@@ -3355,11 +3372,21 @@ where
                 // Commit only after the complete notice has passed every validation.
                 cache_write_tokens = current_cache_write;
                 token_usage = Some(current);
+                if let Some(interruption) = &mut budget_interruption {
+                    interruption.observed_floor = observed;
+                }
                 if budget_failure.is_none() {
                     if let Some(grant) = state.limits.token_grant.filter(|grant| observed >= *grant)
                     {
                         budget_failure =
                             Some(AppServerError::TokenBudgetExceeded { grant, observed });
+                        budget_interruption = Some(BudgetInterruption {
+                            grant,
+                            observed_floor: observed,
+                            thread_id: thread_id.to_string(),
+                            turn_id: turn_id.to_string(),
+                            terminal_acknowledgement: None,
+                        });
                         (observation.budget_exhausted)();
                         state.interrupt(transport, thread_id, turn_id);
                         // Bounded best-effort drain, not a provider spending guarantee.
@@ -3436,6 +3463,7 @@ where
             turn_id: turn_id.to_string(),
             status: TurnTerminalStatus::Failed,
             protocol_error: Some(error.to_string()),
+            budget_interruption,
             resolved_model,
             resolved_effort,
             token_usage,
@@ -5642,6 +5670,16 @@ mod tests {
         let partial = partial.unwrap();
         assert_eq!(partial.token_usage.unwrap().input_tokens, 230_000);
         assert_eq!(partial.status, TurnTerminalStatus::Failed);
+        assert_eq!(
+            partial.budget_interruption,
+            Some(BudgetInterruption {
+                grant: 220_000,
+                observed_floor: 242_000,
+                thread_id: "thread-1".into(),
+                turn_id: "turn-1".into(),
+                terminal_acknowledgement: Some(TurnTerminalStatus::Completed),
+            })
+        );
         assert!(!partial.command_execution_evidence.observations.is_empty());
         assert!(partial.final_message.is_none());
         let interrupt = transport

@@ -576,14 +576,15 @@ pub(super) fn record_final_report_decisions(
             &worker.id,
             Some(&report.id),
             OrchestrationRole::Worker,
-            if report_failed(worker) {
+            if reviewed_worker_failed(report, worker) {
                 OrchestrationEventKind::Reject
             } else {
                 OrchestrationEventKind::Accept
             },
             json!({
                 "status": worker.status,
-                "accepted": worker.accepted,
+                "accepted": !reviewed_worker_failed(report, worker),
+                "raw_accepted": worker.accepted,
                 "rejected": worker.rejected,
             }),
         );

@@ -463,6 +463,7 @@ mod researcher;
 use acceptance::*;
 use researcher::*;
 
+mod helper_inventory;
 mod reporting;
 mod target_containment;
 #[cfg(all(test, target_os = "linux"))]

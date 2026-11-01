@@ -29,7 +29,11 @@ pub(super) fn interrupt_returned_worker(
     let grant = command.live_token_grant_for_test().unwrap();
     assert_eq!(grant.tokens(), 21_767);
     grant.exhaust();
-    cancellation.cancel();
+    // The host can finish draining the interrupted process without cancelling
+    // the enclosing parent token. Completion must use the held process outcome.
+    if !case.ends_with("host-outcome") {
+        cancellation.cancel();
+    }
     if case.ends_with("empty") {
         fs::write(command.cwd.join("src/lib.rs"), "pub fn selected() {}\n").unwrap();
     } else {
@@ -88,6 +92,17 @@ pub(super) fn interrupt_returned_worker(
     });
     run.exit_code = Some(255);
     run.error = Some("Codex app-server token grant exhausted: 39121 >= 21767".into());
+    run.set_budget_interruption_for_test(
+        crate::external_agent::codex_app_server::BudgetInterruption {
+            grant: 21_767,
+            observed_floor: 39_121,
+            thread_id: "worker-thread".into(),
+            turn_id: "worker-turn".into(),
+            terminal_acknowledgement: Some(
+                crate::external_agent::codex_app_server::TurnTerminalStatus::Interrupted,
+            ),
+        },
+    );
     run.publishable = false;
     run.output_last_message = Some(
         if case.ends_with("malformed") || case == JOURNAL_FAILURE_CASE {
@@ -98,6 +113,12 @@ pub(super) fn interrupt_returned_worker(
     );
     run.retain_app_server_parent_evidence_for_test();
     run.retain_live_budget_invocation_for_test(command);
+    let restored: ExternalAgentRun =
+        serde_json::from_value(serde_json::to_value(&*run).unwrap()).unwrap();
+    assert!(
+        restored.budget_interruption().is_none(),
+        "wire evidence cannot restore host interruption authority"
+    );
     assert!(!run.authenticated_app_server_usage_complete());
     if case == CHECKPOINT_FAILURE_CASE {
         super::super::checkpoint::install_checkpoint_failure(
@@ -116,6 +137,29 @@ pub(super) fn check_interrupted_result(
     observed: &[String],
 ) -> Result<()> {
     assert!(result.is_err(), "interrupted candidate was accepted");
+    if case.ends_with("host-outcome") {
+        assert!(result
+            .as_ref()
+            .err()
+            .unwrap()
+            .chain()
+            .any(|cause| cause.is::<super::worker_completion::IncompleteWorkerOutcome>()));
+        let error = format!("{:#}", result.as_ref().err().unwrap());
+        assert!(error.contains("budget interruption"), "{error}");
+        assert!(!error.contains("parse direct worker report"), "{error}");
+        assert!(!error.contains("EOF"), "{error}");
+        let retained: Value = serde_json::from_slice(&fs::read(
+            context
+                .run_dir
+                .join("evidence/incoming/worker.outcome.json"),
+        )?)?;
+        assert_eq!(retained["status"], "rejected_incomplete");
+        assert_eq!(retained["usage_complete"], false);
+        assert_eq!(retained["cause"]["kind"], "budget_interruption");
+        assert_eq!(retained["cause"]["grant"], 21_767);
+        assert_eq!(retained["cause"]["observed_floor"], 39_121);
+        assert_eq!(retained["cause"]["terminal_acknowledgement"], "interrupted");
+    }
     assert!(outcome.assignment_failed);
     assert!(outcome.usage_incomplete);
     assert_eq!(observed, ["parent", "worker"]);
@@ -247,6 +291,11 @@ pub(super) fn check_interrupted_result(
     };
     assert_eq!(fs::read(context.run_dir.join(raw_report))?, expected_report);
     Ok(())
+}
+
+#[test]
+fn interrupted_isolated_worker_uses_host_outcome_before_empty_report() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-interrupted-host-outcome")
 }
 
 #[test]

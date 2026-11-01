@@ -626,7 +626,7 @@ impl IsolatedWorkerAttemptEvidence {
             || report.semantic_intent_token != self.semantic_token
             || report.no_further_delegation != Some(true)
             || report.files_changed != changes.paths
-            || report_failed(report)
+            || worker_technical_failure(report, &[])
             || self.run().environment_blocked()
             || self.run().external_side_effect_state().is_some()
             || !self.run().sandbox_denials().is_empty()
