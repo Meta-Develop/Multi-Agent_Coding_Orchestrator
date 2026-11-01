@@ -134,6 +134,8 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
             )),
         };
     }
+    // A serial Worker refusal still leaves the quiescent initial parent owned
+    // here. Retain the error until its evidence and scratch have been consumed.
     let prepared_final = prepare_serial_parent_continuation(
         context,
         outcome,
@@ -147,7 +149,7 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
         schema_path,
         worker_schema_path,
         auditor_schema_path,
-    )?;
+    );
     let imported = import_initial_parent_evidence(context, parent);
     match (prepared_final, imported) {
         (Ok(prepared_final), Ok(())) => {
@@ -218,7 +220,7 @@ fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent>(
     schema_path: &Path,
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
-) -> Result<Result<Box<PreparedManagedParentFinal<'budget>>>> {
+) -> Result<Box<PreparedManagedParentFinal<'budget>>> {
     let completed = bound.execute_serial(
         context,
         preflight,
@@ -284,7 +286,7 @@ fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent>(
     );
     drop(continuation);
     drop(completed);
-    Ok(prepared_final)
+    prepared_final
 }
 
 #[allow(clippy::too_many_arguments)]

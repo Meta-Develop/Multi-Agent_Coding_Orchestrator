@@ -137,6 +137,19 @@ pub(super) fn exercise(
             assert!(result.is_err(), "cancelled cycle was accepted");
             assert_eq!(observed, ["parent", "worker"]);
         }
+        "managed-cycle-worker-preflight-failure" => {
+            let error = result.err().context("preflight refusal was accepted")?;
+            assert!(error
+                .to_string()
+                .contains("nested worker process did not complete successfully"));
+            assert_eq!(observed, ["parent", "worker"]);
+            assert!(outcome.assignment_failed);
+            assert_eq!(context.budget_ledger.report()?.active_reservations, 0);
+            assert_eq!(
+                fs::read_to_string(context.repo.join("src/lib.rs"))?,
+                "pub fn selected() {}\n"
+            );
+        }
         "managed-cycle-initial-import-error" => {
             let error = match result {
                 Err(error) => error,
@@ -399,6 +412,11 @@ fn managed_cycle_foreign_yield_dispatches_no_worker() -> Result<()> {
 #[test]
 fn managed_cycle_final_forgery_keeps_edits_unmaterialized() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-final-forgery")
+}
+
+#[test]
+fn d714l_nested_worker_preflight_failure_finalizes_failed_run() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-worker-preflight-failure")
 }
 
 #[test]

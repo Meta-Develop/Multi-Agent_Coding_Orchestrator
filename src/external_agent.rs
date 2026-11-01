@@ -10185,6 +10185,13 @@ fn classify_managed_worker_app_server(
     Ok(true)
 }
 
+#[cfg(test)]
+pub(crate) fn classify_managed_worker_app_server_for_test(
+    spec: &ExternalAgentCommand,
+) -> Result<bool, String> {
+    classify_managed_worker_app_server(spec, ExternalExecutionRuntime::Verified)
+}
+
 fn classify_managed_readonly_app_server(
     spec: &ExternalAgentCommand,
     runtime: ExternalExecutionRuntime,
