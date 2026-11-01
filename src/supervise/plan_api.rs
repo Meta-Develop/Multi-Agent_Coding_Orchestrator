@@ -7134,12 +7134,14 @@ pub fn verified_megafile_decomposition_evidence(
             normalized_target.display()
         ),
     };
+    // The authenticated finalized parent and covering Auditor supply acceptance;
+    // the Worker's raw bit supplies neither review authority nor technical success.
     if worker.role != AgentRole::Worker
-        || report_failed(worker)
+        || decomposition_worker_technical_failure(worker)
         || worker.no_further_delegation != Some(true)
     {
         bail!(
-            "megafile_decomposition worker '{}' is not accepted successful terminal evidence",
+            "megafile_decomposition worker '{}' is not technically successful terminal evidence",
             worker.id
         );
     }
