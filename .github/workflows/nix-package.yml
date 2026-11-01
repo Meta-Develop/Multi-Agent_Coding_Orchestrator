@@ -91,7 +91,7 @@ jobs:
             .#packages.x86_64-linux.runtime-test-helpers.drvPath > "$LANE/helpers.drv"
           nix build --no-update-lock-file --no-write-lock-file --no-link --print-build-logs --json \
             .#packages.x86_64-linux.maco .#packages.x86_64-linux.runtime-test-helpers \
-            --max-jobs 1 --cores 1 --option sandbox true > "$LANE/build.json"
+            --max-jobs 1 --cores 4 --option sandbox true > "$LANE/build.json"
           NIX
           sha256sum --check "$NIX_CI_LANE/flake.lock.sha256"
           test -z "$(git status --porcelain)"

@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import re
 import subprocess
@@ -25,13 +26,13 @@ class TestableTarget:
     name: str
 
     def key(self) -> tuple[str, str]:
-        if self.kind == "lib":
-            return ("lib", "")
+        if self.kind in {"lib", "doc"}:
+            return (self.kind, "")
         return (self.kind, self.name)
 
     def argv_tokens(self) -> tuple[str, ...]:
-        if self.kind == "lib":
-            return ("--lib",)
+        if self.kind in {"lib", "doc"}:
+            return (f"--{self.kind}",)
         return (f"--{self.kind}", self.name)
 
 
@@ -88,6 +89,13 @@ def collect_testable_targets(package: Mapping[str, object]) -> list[TestableTarg
             raise ValueError(f"duplicate metadata target key: {key!r}")
         seen_keys.add(key)
         collected.append(target)
+        if kind == "lib":
+            doctest = raw.get("doctest", True)
+            if not isinstance(doctest, bool):
+                raise ValueError("library doctest metadata must be a boolean")
+            if doctest:
+                # --lib never runs rustdoc's tests; they need a separate owner.
+                collected.append(TestableTarget(kind="doc", name=name))
 
     return sorted(collected, key=lambda item: item.key())
 
@@ -124,15 +132,17 @@ def partition_argv(
 ) -> list[str]:
     if shard is not None and (partition != "non-lib" or shard not in NON_LIB_SHARDS):
         raise ValueError(f"invalid {partition} shard: {shard}")
-    if partition == "lib":
-        lib_targets = [target for target in targets if target.kind == "lib"]
-        if len(lib_targets) != 1:
+    if partition in {"lib", "doc"}:
+        selected = [target for target in targets if target.kind == partition]
+        if partition == "lib" and len(selected) != 1:
             raise ValueError("expected exactly one library target in metadata")
-        return list(lib_targets[0].argv_tokens())
+        if len(selected) > 1:
+            raise ValueError(f"expected at most one {partition} target in metadata")
+        return list(selected[0].argv_tokens()) if selected else []
     if partition == "non-lib":
         argv: list[str] = []
         for target in targets:
-            if target.kind == "lib":
+            if target.kind in {"lib", "doc"}:
                 continue
             owner = "merge" if target.kind == "test" and target.name in MERGE_TEST_TARGETS else "other"
             if shard is not None and owner != shard:
@@ -148,8 +158,8 @@ def argv_to_keys(argv: Sequence[str]) -> list[tuple[str, str]]:
     seen: set[tuple[str, str]] = set()
     while index < len(argv):
         token = argv[index]
-        if token == "--lib":
-            key = ("lib", "")
+        if token in {"--lib", "--doc"}:
+            key = (token[2:], "")
             index += 1
         elif token.startswith("--"):
             kind = token[2:]
@@ -179,12 +189,14 @@ def verify_partition(targets: Sequence[TestableTarget]) -> None:
         raise ValueError("duplicate metadata target keys in collected targets")
 
     lib_keys = argv_to_keys(partition_argv(targets, "lib"))
+    doc_keys = argv_to_keys(partition_argv(targets, "doc"))
     non_lib_keys = argv_to_keys(partition_argv(targets, "non-lib"))
     lib_set = set(lib_keys)
+    doc_set = set(doc_keys)
     non_lib_set = set(non_lib_keys)
-    if lib_set & non_lib_set:
-        raise ValueError("lib and non-lib partitions overlap")
-    union = lib_set | non_lib_set
+    if lib_set & non_lib_set or doc_set & (lib_set | non_lib_set):
+        raise ValueError("lib, doc and non-lib partitions overlap")
+    union = lib_set | doc_set | non_lib_set
     if union != expected:
         missing = sorted(expected - union)
         extra = sorted(union - expected)
@@ -200,6 +212,77 @@ def verify_partition(targets: Sequence[TestableTarget]) -> None:
         raise ValueError("non-lib shards do not form a disjoint complete partition")
 
 
+def parse_test_listing(output: str) -> Counter[tuple[str, str]]:
+    """Keep occurrences: distinct integration binaries can use the same name."""
+    result: Counter[tuple[str, str]] = Counter()
+    for line in output.splitlines():
+        if not line or re.fullmatch(r"\d+ tests?, \d+ benchmarks?", line):
+            continue
+        match = re.fullmatch(r"(.+): (test|benchmark)", line)
+        if match is None:
+            raise ValueError(f"unexpected Cargo test listing line: {line!r}")
+        result[(match[2], match[1])] += 1
+    return result
+
+
+def verify_test_inventory(
+    full: Counter[tuple[str, str]],
+    partitions: Mapping[str, Counter[tuple[str, str]]],
+) -> dict[str, object]:
+    combined: Counter[tuple[str, str]] = Counter()
+    for selected in partitions.values():
+        combined.update(selected)
+    missing = full - combined
+    extra = combined - full
+    # Bare cargo test omits explicit Criterion bench targets. Retain that
+    # additional coverage, but never tolerate an extra/duplicate test body.
+    extra_tests = Counter({key: count for key, count in extra.items() if key[0] != "benchmark"})
+    if missing or extra_tests:
+        raise ValueError(
+            f"full test inventory differs from partitions (missing={missing!r}, extra={extra_tests!r})"
+        )
+    return {
+        "full_tests": sum(count for (kind, _), count in full.items() if kind == "test"),
+        "partition_tests": sum(count for (kind, _), count in combined.items() if kind == "test"),
+        "partitions": {key: sum(value.values()) for key, value in partitions.items()},
+        "additional_benchmarks": sorted(name for (_, name) in extra.elements()),
+        "missing": [], "extra_tests": [],
+    }
+
+
+def verify_full_inventory(targets: Sequence[TestableTarget], manifest_dir: Path) -> dict[str, object]:
+    # Import locally so metadata-only verification does not need a test harness.
+    import linux_ci_library_shards as library
+
+    def listing(args: Sequence[str], test_args: Sequence[str] = ()) -> str:
+        result = subprocess.run(
+            ["cargo", "test", "--locked", *args, "--", "--list", *test_args],
+            cwd=manifest_dir, check=True, capture_output=True, text=True,
+        )
+        if result.stderr:
+            print(result.stderr, end="", file=sys.stderr, flush=True)
+        return result.stdout
+
+    verify_partition(targets)
+    full = parse_test_listing(listing([]))
+    inventory = library.parse_inventory(listing(["--lib"], ["--format", "terse"]))
+    groups = library.partition_inventory(inventory)
+    library.validate_mandatory_supervise_ownership(inventory, groups)
+    partitions = {}
+    for shard, names in groups.items():
+        selected = parse_test_listing(listing(["--lib"], library.test_command([], names)))
+        if selected != Counter(("test", name) for name in names):
+            raise ValueError(f"library shard selection differs from ownership: {shard}")
+        partitions[shard] = selected
+    for shard in NON_LIB_SHARDS:
+        partitions[f"non-lib-{shard}"] = parse_test_listing(listing(partition_argv(targets, "non-lib", shard)))
+    doc_args = partition_argv(targets, "doc")
+    partitions["doc"] = parse_test_listing(listing(doc_args)) if doc_args else Counter()
+    result = verify_test_inventory(full, partitions)
+    result["doctests"] = sorted(name for (_, name) in partitions["doc"].elements())
+    return result
+
+
 def emit_argv(argv: Sequence[str]) -> None:
     for token in argv:
         sys.stdout.write(f"{token}\n")
@@ -209,13 +292,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
     parser.add_argument(
         "command",
-        choices=("verify", "argv"),
-        help="verify full metadata coverage or emit argv lines for one partition",
+        choices=("verify", "verify-inventory", "argv"),
+        help="verify metadata or full test inventory, or emit argv for one partition",
     )
     parser.add_argument(
         "partition",
         nargs="?",
-        choices=("lib", "non-lib"),
+        choices=("lib", "non-lib", "doc"),
         help="required for argv",
     )
     parser.add_argument(
@@ -240,6 +323,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     if args.command == "verify":
         verify_partition(targets)
+        return 0
+    if args.command == "verify-inventory":
+        print(json.dumps(verify_full_inventory(targets, manifest_dir), sort_keys=True))
         return 0
 
     if args.partition is None:

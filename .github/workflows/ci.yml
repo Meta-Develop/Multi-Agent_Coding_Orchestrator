@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested, supervise-fixtures, external-agent, worktree, rest]
+        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested, supervise-fixtures, supervise-fixtures-budget, supervise-fixtures-licensed, supervise-fixtures-runtime, external-agent, worktree, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -279,6 +279,19 @@ jobs:
           cargo --version --verbose
           cargo clippy --version
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Never restore the source-bound controller or another workspace crate.
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          shared-key: linux-ci
+          save-if: ${{ github.ref == 'refs/heads/main' && matrix.shard == 'rest' }}
+
+      - name: Require cache to preserve checked-out source
+        # Cache metadata resolution must never repair Cargo.lock ahead of --locked gates.
+        run: git diff --no-ext-diff --no-textconv --exit-code HEAD -- .
+
       - name: Check formatting
         if: matrix.shard == 'rest'
         run: cargo fmt --all -- --check
@@ -327,6 +340,14 @@ jobs:
 
       - name: Run library tests
         run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh lib "${{ matrix.shard }}"
+
+      - name: Verify full test inventory including doctests
+        if: matrix.shard == 'supervise-decomposition'
+        run: bash .github/scripts/run-linux-all-tests-in-delegated-user-scope.sh python3 .github/scripts/linux_ci_cargo_test_partition.py verify-inventory
+
+      - name: Run doctests
+        if: matrix.shard == 'supervise-decomposition'
+        run: bash .github/scripts/run-linux-ci-cargo-test-partition.sh doc
 
   linux-integration:
     name: Linux integration tests (${{ matrix.shard }})
@@ -540,6 +561,19 @@ jobs:
           cargo --version --verbose
           cargo clippy --version
 
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Never restore the source-bound controller or another workspace crate.
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          shared-key: linux-ci
+          save-if: "false"
+
+      - name: Require cache to preserve checked-out source
+        # Cache metadata resolution must never repair Cargo.lock ahead of --locked gates.
+        run: git diff --no-ext-diff --no-textconv --exit-code HEAD -- .
+
       - name: Install pinned Codex CLI on GitHub-hosted Ubuntu
         run: bash .github/scripts/install-github-hosted-ci-codex.sh
 
@@ -594,6 +628,17 @@ jobs:
           rustc --version --verbose
           cargo --version --verbose
           cargo clippy --version
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          # Never restore the source-bound controller or another workspace crate.
+          cache-workspace-crates: "false"
+          cache-bin: "false"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Require cache to preserve checked-out source
+        run: git diff --no-ext-diff --no-textconv --exit-code HEAD -- .
 
       - name: Check all targets against Cargo.lock
         run: cargo check --locked --all-targets
