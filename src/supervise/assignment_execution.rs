@@ -8389,7 +8389,15 @@ fn execute_supervisor_assignment_inner(
             if plan.max_child_retries > 0 {
                 append_child_attempt_history(&mut child_report, &attempt_history);
             }
-            let pre_auditor_candidate = if child_containment_verified {
+            // A rejected report with no candidate consumer can finalize without
+            // repeated Git snapshots on the scheduler's admission path. Retain
+            // failed candidates whenever Worker evidence or review needs them.
+            let candidate_required = !report_failed(&child_report)
+                || !assignment.worker_assignments.is_empty()
+                || parent_auditor_required(assignment, &child_report)
+                || context.assignment_metadata.parent_validation.is_some()
+                || context.evidence_only_reaudit.is_some();
+            let pre_auditor_candidate = if child_containment_verified && candidate_required {
                 match review_handoff::capture_candidate(
                     context,
                     &preflight,
