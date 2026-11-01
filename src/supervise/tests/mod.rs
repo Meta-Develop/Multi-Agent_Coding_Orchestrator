@@ -7,6 +7,7 @@ mod licensed_breakage;
 mod plan_runtime;
 mod primary_worktree;
 mod prompts_gates;
+#[cfg(target_os = "linux")]
 mod qualification_handoff;
 mod reaudit;
 mod role_transition;

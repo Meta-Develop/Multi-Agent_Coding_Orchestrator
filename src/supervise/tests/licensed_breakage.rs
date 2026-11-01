@@ -956,6 +956,13 @@ fn run_licensed_scenario<'a>(
             child_dispatched = true;
             fs::write(command.cwd.join("README.md"), "licensed breaking change\n")
                 .expect("write breaking candidate");
+            if run_name == "rh714b-licensed-terminal" {
+                fs::write(
+                    repo.join("README.md"),
+                    "primary drift during licensed child\n",
+                )
+                .expect("inject primary-integrity failure");
+            }
             child.id = assignment.id.clone();
             write_injected_json(&command.output_last_message, &child);
         }
@@ -3731,4 +3738,61 @@ fn licensed_follow_up_heartbeat_interruption_recovers_through_authenticated_fina
         child_report,
         true,
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn rh714b_licensed_terminal_keeps_rejected_parent_report() {
+    skip_without_containment!();
+    let (owner, repo) = injected_repository();
+    let assignment = licensed_assignment();
+    let child = dependent_failure_child(&assignment, "src/client.rs");
+    let scenario = run_licensed_scenario(
+        &owner,
+        repo,
+        assignment,
+        child,
+        true,
+        "rh714b-licensed-terminal",
+    );
+    assert!(!scenario.report.success);
+    assert!(scenario.report.generated_follow_up_tasks.is_empty());
+    assert!(scenario
+        .report
+        .gate_denials
+        .iter()
+        .any(|denial| matches!(denial.reason, GateDenialReason::PrimaryIntegrityFailure)));
+    assert_eq!(
+        scenario.report.orchestrator_reports.len(),
+        1,
+        "terminal licensed failure lost its finalized parent report; findings={:?}",
+        scenario.report.findings
+    );
+    let child = &scenario.report.orchestrator_reports[0];
+    assert!(!child.accepted && child.rejected);
+    assert_eq!(child.status, ReviewStatus::Failed);
+    assert!(child.audit_reports.is_empty());
+    assert!(child.generated_follow_up_tasks.is_empty());
+    assert!(child
+        .licensed_breakage_review
+        .as_ref()
+        .is_some_and(|review| !review.failures.is_empty()));
+    assert!(!scenario
+        .report
+        .gate_denials
+        .iter()
+        .any(|denial| matches!(denial.reason, GateDenialReason::AuditorRepair { .. })));
+    let reader = ArtifactRunReader::open(
+        &scenario.repo,
+        RunArtifactFamily::Supervise,
+        &scenario.run_id,
+    )
+    .expect("open finalized terminal licensed run");
+    let retained: OrchestratorReviewReport = serde_json::from_slice(
+        &reader
+            .read("reports/child-a.json")
+            .expect("terminal rejection must publish its finalized parent report"),
+    )
+    .expect("parse finalized terminal parent report");
+    assert_eq!(&retained, child);
 }

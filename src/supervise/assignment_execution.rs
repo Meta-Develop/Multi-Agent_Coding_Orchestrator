@@ -7698,6 +7698,7 @@ fn decide_parent_auditor_gate(
     journal_parent_id: &str,
     final_report_path: &Path,
     child_containment_verified: bool,
+    child_gate_terminal: bool,
     assignment_containment_verified: bool,
     auditor_primary_integrity_failed: bool,
     auditor_sandbox_denied: bool,
@@ -7710,29 +7711,36 @@ fn decide_parent_auditor_gate(
     let assignment = &preflight.assignment;
     // A child gate may have stopped before parent review was eligible. Its
     // absent auditor is not another review failure and must keep that denial.
-    let parent_review_pending = !report_failed(&child_report) || pre_auditor_candidate.is_some();
-    if child_containment_verified
+    // Retained candidate evidence does not reopen a terminal validation or
+    // integrity gate. Evidence custody and review eligibility are independent.
+    let parent_review_pending =
+        !child_gate_terminal && (!report_failed(&child_report) || pre_auditor_candidate.is_some());
+    if !child_gate_terminal
+        && child_containment_verified
         && child_report.environment_failures.is_empty()
         && !auditor_environment_blocked
         && child_report.review_lens_aggregate.is_none()
     {
         validate_auditor_reports(assignment, final_report_path, &mut child_report);
     }
-    let parent_auditor_failed = child_report
-        .review_lens_aggregate
-        .as_ref()
-        .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
-        .unwrap_or_else(|| {
-            let mut parent_reports = child_report
-                .audit_reports
-                .iter()
-                .filter(|report| is_parent_auditor_id(assignment, &report.id))
-                .peekable();
-            (parent_review_pending
-                && parent_reports.peek().is_none()
-                && parent_auditor_required(assignment, &child_report))
-                || parent_reports.any(report_failed)
-        });
+    // A skipped terminal review is not a failure of the Auditor, but it is
+    // also not acceptance of the child or authority for follow-up work.
+    let parent_auditor_failed = !child_gate_terminal
+        && child_report
+            .review_lens_aggregate
+            .as_ref()
+            .map(|aggregate| aggregate.decision != ReviewAggregationDecision::Accept)
+            .unwrap_or_else(|| {
+                let mut parent_reports = child_report
+                    .audit_reports
+                    .iter()
+                    .filter(|report| is_parent_auditor_id(assignment, &report.id))
+                    .peekable();
+                (parent_review_pending
+                    && parent_reports.peek().is_none()
+                    && parent_auditor_required(assignment, &child_report))
+                    || parent_reports.any(report_failed)
+            });
     let auditor_rejection_kind = parent_auditor_rejection_kind(assignment, &child_report);
     let procedural_failure = parent_auditor_failed && auditor_rejection_kind.is_none();
     let procedural_budget = if procedural_failure {
@@ -7819,13 +7827,16 @@ fn decide_parent_auditor_gate(
                 return Ok(ParentAuditorGateDisposition::Retry);
             }
         }
-    } else if matches!(
-        outcome
-            .gate_tracker
-            .as_ref()
-            .and_then(GateCorrectionTracker::active_reason),
-        Some(GateDenialReason::AuditorRepair { .. })
-    ) && !parent_auditor_failed
+    } else if !child_gate_terminal
+        && !parent_auditor_failed
+        && !report_failed(&child_report)
+        && matches!(
+            outcome
+                .gate_tracker
+                .as_ref()
+                .and_then(GateCorrectionTracker::active_reason),
+            Some(GateDenialReason::AuditorRepair { .. })
+        )
     {
         outcome
             .gate_tracker
@@ -7869,7 +7880,9 @@ fn decide_parent_auditor_gate(
             }
         }
     }
-    if !parent_auditor_failed
+    if !child_gate_terminal
+        && !parent_auditor_failed
+        && !report_failed(&child_report)
         && child_report
             .licensed_breakage_review
             .as_ref()
@@ -8782,6 +8795,7 @@ fn execute_supervisor_assignment_inner(
                 journal_parent_id,
                 &final_report_path,
                 child_containment_verified,
+                child_gate_terminal,
                 assignment_containment_verified,
                 auditor_primary_integrity_failed,
                 auditor_sandbox_denied,
@@ -10683,6 +10697,7 @@ mod decomposition_tests {
             options.run_id.as_str(),
             &final_report_path,
             true,
+            false,
             auditor_collection.containment_verified,
             auditor_collection.primary_integrity_failed,
             auditor_collection.sandbox_denied,
@@ -11437,6 +11452,7 @@ mod decomposition_tests {
             options.run_id.as_str(),
             &final_report_path,
             true,
+            false,
             true,
             false,
             false,
