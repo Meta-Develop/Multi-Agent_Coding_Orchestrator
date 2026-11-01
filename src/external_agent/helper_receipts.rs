@@ -52,7 +52,8 @@ mod tests {
             )),
         };
         let error = ObservedCatalogFailure {
-            error: CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult.into(),
+            error: anyhow::anyhow!("private catalog diagnostic")
+                .context(CodexRuntimeModelCatalogFailureCause::UnsafeProcessResult),
             receipt: receipt.clone(),
         }
         .into();
@@ -65,6 +66,7 @@ mod tests {
             failure.summary
         );
         assert_eq!(failure.catalog_probe_receipt, Some(receipt));
+        assert!(!failure.summary.contains("private catalog diagnostic"));
         let restored: EnvironmentFailure =
             serde_json::from_value(serde_json::to_value(&failure).unwrap()).unwrap();
         assert!(restored.catalog_probe_receipt.is_none());

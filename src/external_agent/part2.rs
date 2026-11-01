@@ -1286,32 +1286,33 @@ pub(crate) fn supervisor_catalog_preflight_grant_admit_failure(
 }
 
 fn codex_runtime_model_catalog_failure(error: &anyhow::Error) -> Box<EnvironmentFailure> {
-    let cause = error
+    // Anyhow's downcast also recognizes typed context; std::error::Error's
+    // source chain alone does not. Preserve that lookup inside our receipt wrapper.
+    let typed_cause = |error: &anyhow::Error| {
+        error
+            .downcast_ref::<PackagedCodexRuntimeNotVisible>()
+            .map(ToString::to_string)
+            .or_else(|| {
+                error
+                    .downcast_ref::<CodexAuthValidationFailureCause>()
+                    .map(ToString::to_string)
+            })
+            .or_else(|| {
+                error
+                    .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
+                    .map(ToString::to_string)
+            })
+    };
+    let observed = error
         .chain()
-        .find_map(|cause| {
-            cause
-                .downcast_ref::<PackagedCodexRuntimeNotVisible>()
-                .map(ToString::to_string)
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<CodexAuthValidationFailureCause>()
-                        .map(ToString::to_string)
-                })
-                .or_else(|| {
-                    cause
-                        .downcast_ref::<CodexRuntimeModelCatalogFailureCause>()
-                        .map(ToString::to_string)
-                })
-        })
+        .find_map(|error| error.downcast_ref::<helper_receipts::ObservedCatalogFailure>());
+    let cause = typed_cause(error)
+        .or_else(|| observed.and_then(|observed| typed_cause(&observed.error)))
         .unwrap_or_else(|| "unexpected_failure".to_string());
     let mut failure = EnvironmentFailure::runtime_model_catalog(format!(
         "Codex runtime model catalog acquisition failed: cause={cause}"
     ));
-    failure.catalog_probe_receipt = error.chain().find_map(|error| {
-        error
-            .downcast_ref::<helper_receipts::ObservedCatalogFailure>()
-            .map(|error| error.receipt.clone())
-    });
+    failure.catalog_probe_receipt = observed.map(|observed| observed.receipt.clone());
     Box::new(failure)
 }
 
