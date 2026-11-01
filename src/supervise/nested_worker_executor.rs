@@ -360,6 +360,7 @@ pub(super) fn execute_nested_worker_attempt(
     )?;
     let mut command = bind_runtime_output_schema(bound.command, runtime, &schema)?;
     command = bind_runtime_read_only_schema_files(command, runtime, &[&schema]);
+    command = bind_codex_assignment_native_delegation(command, runtime, subject.role, false);
     command = command
         .with_agent_lifecycle(
             context.repo,
@@ -1002,7 +1003,12 @@ mod tests {
             plan_file: temp.path().join("plan.json"),
             run_id: run_id.clone(),
             parent_node: None,
-            codex_bin: "never-invoke-provider".into(),
+            codex_bin: if case == "packaged-preflight" {
+                "codex"
+            } else {
+                "never-invoke-provider"
+            }
+            .into(),
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
@@ -1053,11 +1059,20 @@ mod tests {
             checkpoint: Some(&mut checkpoint),
         });
         let budget_config = SupervisorBudgetConfig {
-            worker_live_token_limits: BTreeMap::new(),
+            worker_live_token_limits: if case == "packaged-preflight" {
+                BTreeMap::from([("worker".into(), 240_000)])
+            } else {
+                BTreeMap::new()
+            },
             role_token_reservations: BTreeMap::from([(AgentRole::Worker, 2)]),
             ..Default::default()
         };
-        let limits = if case == "budget" {
+        let limits = if case == "packaged-preflight" {
+            RunBudgetLimits {
+                hard_tokens: Some(650_000),
+                ..Default::default()
+            }
+        } else if case == "budget" {
             RunBudgetLimits {
                 hard_tokens: Some(1),
                 ..Default::default()
@@ -1135,6 +1150,30 @@ mod tests {
             );
             assert!(command.assignment_messaging_launch().is_none());
             assert_eq!(command.worker_journal_artifacts.len(), 1);
+            if case == "packaged-preflight" {
+                // Exercise the actual gate on the production-built nested command,
+                // before any provider or credential access. On a packaged host also
+                // use the production fixed-path resolver, including its trust checks.
+                if Path::new("/usr/bin/codex").exists() {
+                    let resolved =
+                        crate::external_agent::resolve_trusted_system_codex_executable_for_catalog(
+                            &command.cwd,
+                        )
+                        .expect("trusted system Codex package must remain visible");
+                    assert!(resolved.starts_with("/usr") || resolved.starts_with("/nix/store"));
+                    eprintln!("nested Worker offline preflight: {}", resolved.display());
+                }
+                assert_eq!(
+                    crate::external_agent::classify_managed_worker_app_server_for_test(command),
+                    Ok(true),
+                    "nested Worker must pass the native app-server preflight"
+                );
+                assert_eq!(
+                    command.live_token_grant_for_test().unwrap().tokens(),
+                    240_000
+                );
+                assert!(command.live_budget_invocation().unwrap().is_some());
+            }
             if matches!(
                 case,
                 "live-budget"
@@ -1202,7 +1241,7 @@ mod tests {
             if case == "quiescence" {
                 run.process_tree = None;
             }
-            if case.starts_with("live-") {
+            if case.starts_with("live-") || case == "packaged-preflight" {
                 super::super::decomposition_tests::retain_worker_app_server_usage_fixture(
                     &mut run,
                     command,
@@ -1385,7 +1424,10 @@ mod tests {
                 "worker"
             },
         );
-        if matches!(case, "happy" | "live-budget" | "live-cost-only") {
+        if matches!(
+            case,
+            "happy" | "live-budget" | "live-cost-only" | "packaged-preflight"
+        ) {
             let evidence = result?;
             assert_eq!(evidence.report.id, "worker");
             assert_eq!(evidence.journals.len(), 1);
@@ -1518,7 +1560,10 @@ mod tests {
             assert_eq!(terminal[0]["payload"]["attempt"], 1);
             assert_eq!(
                 terminal[0]["payload"]["status"],
-                if matches!(case, "happy" | "live-budget" | "live-cost-only") {
+                if matches!(
+                    case,
+                    "happy" | "live-budget" | "live-cost-only" | "packaged-preflight"
+                ) {
                     "completed"
                 } else {
                     "failed"
@@ -1634,6 +1679,12 @@ mod tests {
             execution_fixture(case)?;
         }
         Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn d714l_nested_worker_packaged_system_preflight() -> Result<()> {
+        execution_fixture("packaged-preflight")
     }
 
     #[test]

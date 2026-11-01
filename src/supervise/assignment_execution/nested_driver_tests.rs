@@ -589,6 +589,13 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 crate::runtime_adapter::WritableLaunchTarget::ManagedChildWorktree,
                 "managed-cycle worker launch must target the managed child worktree"
             );
+            if case == "managed-cycle-worker-preflight-failure" {
+                // Deliberately refuse an otherwise admitted Worker before launch.
+                // The already-returned parent must still be imported and cleaned.
+                let mut refused = command.clone();
+                refused.worker_journal_artifacts.clear();
+                return crate::external_agent::run_external_agent(&refused);
+            }
             crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
                 .expect(
                     "managed-cycle worker fixture failed to prepare the private child Git boundary",
@@ -1036,6 +1043,32 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             );
             assert_ne!(live[0].1, live[1].1);
             assert!(live.iter().all(|entry| entry.1 != worktree.path));
+        }
+        if case == "managed-cycle-worker-preflight-failure" {
+            drop(context);
+            artifacts
+                .into_inner()
+                .map_err(|_| anyhow!("test artifacts poisoned"))?;
+            let mut report = crate::supervise::tests::artifact_test_final_report(&run_id);
+            report.success = false;
+            report.rejected = true;
+            report.status = ReviewStatus::Failed;
+            report.commands_run = outcome.command_records;
+            report.run_budget = Some(ledger.report()?);
+            report.role_economics_profile = Some(plan.effective_role_economics_profile());
+            report.role_usage = crate::supervise::scheduler::complete_role_usage_reports_for_test(
+                role_usage_report(&plan, outcome.usage_samples)?.reports,
+            );
+            write_final_report(&mut writer, &report)?;
+            writer.finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )?;
+            let collected = crate::supervise::collect_supervisor_run(&repo, run_id.clone())?;
+            assert_eq!(collected.run_lifecycle, SupervisorRunLifecycle::Finalized);
+            assert!(!collected.success);
+            assert!(collected.rejected);
+            assert!(!collected.publishable);
         }
         return Ok(());
     };
