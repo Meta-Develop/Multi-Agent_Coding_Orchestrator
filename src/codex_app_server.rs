@@ -791,19 +791,6 @@ pub(crate) struct AppServerTurn {
     pub(crate) output_schema: Option<Value>,
 }
 
-pub(crate) fn observed_effort_meets(required: Option<&str>, observed: Option<&str>) -> bool {
-    let parse = |value: &str| {
-        serde_json::from_value::<crate::supervise::ReasoningEffort>(Value::String(
-            value.to_string(),
-        ))
-        .ok()
-    };
-    match (required.and_then(parse), observed.and_then(parse)) {
-        (Some(required), Some(observed)) => observed >= required,
-        _ => false,
-    }
-}
-
 impl AppServerTurn {
     fn validate(&self) -> Result<(), AppServerError> {
         validate_identifier(&self.permission_profile, "permission profile", 128)?;
@@ -1116,7 +1103,7 @@ pub(crate) struct AppServerOutcome {
     pub(crate) protocol_error: Option<String>,
     pub(crate) budget_interruption: Option<BudgetInterruption>,
     /// Settings returned by the correlated `thread/start` response. Ephemeral
-    /// threads write no rollout, so these are the provider-owned provenance.
+    /// threads write no rollout. These are client settings, not served identity.
     pub(crate) resolved_model: String,
     pub(crate) resolved_effort: Option<String>,
     /// Final cumulative token snapshot for this fresh ephemeral thread. A missing
@@ -1962,11 +1949,13 @@ where
     });
 
     if let Some(required) = &turn.minimum_effort {
-        if !observed_effort_meets(Some(required), resolved_effort.as_deref())
-            || turn
-                .model
-                .as_deref()
-                .is_some_and(|requested| requested != resolved_model)
+        if !crate::runtime_adapter::effort_matches_request(
+            Some(required),
+            resolved_effort.as_deref(),
+        ) || turn
+            .model
+            .as_deref()
+            .is_some_and(|requested| requested != resolved_model)
         {
             return Err(AppServerError::Unexpected {
                 phase: "thread/start Auditor qualification",
@@ -4430,7 +4419,7 @@ mod tests {
         for (observed, model, allowed) in [
             (Some("xhigh"), "gpt-5.6-sol", true),
             (Some("high"), "gpt-5.6-sol", false),
-            (None, "gpt-5.6-sol", false),
+            (None, "gpt-5.6-sol", true),
             (Some("invented"), "gpt-5.6-sol", false),
             (Some("xhigh"), "other-model", false),
         ] {

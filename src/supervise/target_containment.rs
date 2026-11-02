@@ -9,6 +9,7 @@ const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 #[path = "observed_identity.rs"]
 mod observed_identity;
 pub(crate) use observed_identity::observed_role_identity;
+pub(super) use observed_identity::RuntimeIdentityObservation;
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -51,7 +52,6 @@ struct TargetContainmentReceipt {
 struct RetainedCommandSummary<'a> {
     #[serde(flatten)]
     command: &'a CommandRunRecord,
-    runtime_identity: observed_identity::RuntimeIdentityObservation,
     #[serde(skip_serializing_if = "Option::is_none")]
     command_seal_snapshot: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -132,9 +132,6 @@ pub(super) fn persist(
     let record = command_record_from_external_for_runtime(run, command, runtime);
     let mut summary = serde_json::to_vec_pretty(&RetainedCommandSummary {
         command: &record,
-        runtime_identity: observed_identity::RuntimeIdentityObservation::capture(
-            run, command, runtime,
-        ),
         researcher_input_receipts: run.retained_researcher_input_receipts(),
         budget_interruption: run.budget_interruption(),
         command_seal_snapshot: command

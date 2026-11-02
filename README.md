@@ -1243,7 +1243,8 @@ the expected fail-closed consultant response; it does not launch Claude.
 For `runtime: gemini-cli`, the pinned 0.41.2 managed bridge can bind complete
 response usage and served model through private supervisor observations.
 Completion refuses missing/partial counters, missing model, model fallback or
-mismatch, and any requested effort because served effort is not exposed.
+mismatch, and unsupported effort requests because this model-only bootstrap
+does not apply an explicit thinking setting.
 Partial released runs retain known token lower bounds; worker logs and terminal
 JSON cannot establish usage or identity. Real substantive route qualification
 and independent acceptance remain required. See the
@@ -1737,17 +1738,29 @@ variable `MACO_GROK_INTERACTION_PROTOCOL`. Exact values are
 is refused while the supervisor loads worker and auditor adapter config, before
 usable launch; it is not coerced to the default. `MACO_GROK_ARGS` cannot replace
 Grok's immutable safety argv. `acp_stdio` renders contained
-`grok agent --no-leader … stdio`. Observed model and effort are client-resolved
-parent session evidence after `session/set_model`, not backend attestation.
-Writable managed-child launch retains the legacy exact typed contract for
-`grok-4.6`/`xhigh`. The standard `grok-4.7`/`xhigh` typed writable contract is
-supported only with `headless_streaming_json`. The Issue #604 publication gate
-is implemented. Headless writable publication retains exact `end.modelUsage`
-labels and checks them using receipt-backed 4.6/4.7 label mappings. CLI 1.0.60
-exposes no served effort: the existing standard `xhigh` lanes preserve publication
-with explicitly unknown effort, while observed contradictions refuse publication.
-The [#688 lower-effort identity gate](docs/qualification/grok-lower-effort.md)
-requires observed effort and remains closed. Grok 4.7 ACP writable admission
+`grok agent --no-leader … stdio`. Its model and effort acknowledgement is
+client-resolved session configuration, not backend attestation. Headless writable
+publication retains exact `end.modelUsage` labels and checks them using
+receipt-backed 4.6/4.7 label mappings. Under owner policy dated 2026-11-02,
+requested effort rendered into the exact supported launch is effort identity.
+Missing served effort uses `effort_basis: requested`; a reported contradiction
+refuses. Codex rollout/thread settings likewise use requested provenance, while
+provider response fields use `provider_reported` when available. Cursor records
+requested model and effort explicitly because its protocol reports neither.
+Command reports, comparison bindings and authenticated attempt journals retain
+the identity basis. Legacy Codex client acknowledgements use requested provenance;
+the retained `observed_candidate` journal field is not a served-effort assertion.
+These requested fields make no served-effort claim. Other runtimes still require
+matching served models where their native protocols report them.
+
+Supported advertised Grok lower efforts can pass the
+[#688 identity gate](docs/qualification/grok-lower-effort.md) without an xhigh
+upgrade; selected-account catalog support, dated priors, opaque launch proof,
+containment, journal, complete usage, independent review, acceptance and
+publication gates remain required. Per-effort selection priors use dated public
+benchmark scores (for example SWE-bench-style leaderboards), retaining source URL
+and benchmark/snapshot date. An xhigh score cannot stand in for a low score.
+Grok 4.7 ACP writable admission
 stays off pending Linux credential-confined, account-bound managed acceptance
 in Issue #616, returning
 `writable_grok47_acp_qualification_required`. The sole exception is an explicit
@@ -2221,10 +2234,11 @@ will succeed. MACO does not retry by cycling model names.
 
 The single-slug model binding follows the evidence-backed cost-per-accepted-task
 decision. Assignment-level effort matching is operationally selected but has
-not yet been evaluated with real-provider resolved-effort telemetry, so the
-combined profile remains `production_eligible=false`. Genuine Issue #26
-evidence is required before its effort policy can be qualified for production
-or revised on empirical grounds.
+not yet been evaluated in a bounded same-task provider comparison, so the
+combined profile remains `production_eligible=false`. Launch-bound requested
+effort is accepted identity, not evidence of served effort or cost/quality.
+Complete usage, applicable contract cost, held-out outcomes and independent
+acceptance evidence in #631 remain required before production qualification.
 
 ### Same-run context-switch cost
 

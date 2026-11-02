@@ -10,6 +10,13 @@ Worker, Codex supervision/control/review, 160,000 hard tokens, a 1,200-second
 child timeout, and zero retries or gate corrections. The seed tests deliberately
 fail until the actual assigned implementation is repaired.
 
+Owner policy dated 2026-11-02 records the exact launch-configured effort as
+`requested` identity, without claiming served effort. The original ACP launch,
+held output and matching client acknowledgement bind that basis; restored wire
+copies cannot supply it. Client model/effort acknowledgements remain separate
+from provider observations. The qualification flag's xhigh lane, identity,
+usage, journal, containment and independent acceptance gates are unchanged.
+
 Under bundled priors, selection preflight refuses this fixture before provider
 release with `model_unavailable` for Worker `grok` / `grok-4.7` / `xhigh`:
 there is no bundled prior row for that task profile, even if the catalog

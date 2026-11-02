@@ -477,10 +477,13 @@ Managed headless Grok writable publication checks exact `end.modelUsage` keys
 against the admitted model using the explicit receipt-backed mappings
 `grok-4.6` / `grok-4.6-build` and `grok-4.7` / `grok-4.7-build`.
 Missing, ambiguous, malformed or mismatched model identity refuses publication.
-CLI 1.0.60 supplies no served effort; it stays explicitly unknown and preserves
-publication for the existing standard 4.6/4.7 `xhigh` lanes. An observed effort
-contradiction still refuses publication. Lower-effort and future qualification-only
-lanes require matching observed effort and remain closed with this CLI.
+CLI 1.0.60 supplies no served effort. Under the owner's 2026-11-02 policy,
+supported effort rendered into the exact launch uses `effort_basis: requested`;
+the provider observation stays null. A reported effort contradiction still
+refuses publication. Supported advertised lower efforts can pass this identity
+gate without an xhigh upgrade. Selection priors must retain public per-effort
+benchmark sources and dates; all containment, usage, independent-review and
+publication gates, plus selected-account live qualification, remain required.
 Native token charges survive identity refusal. See the
 [identity qualification gate and mapping receipts](qualification/grok-lower-effort.md).
 

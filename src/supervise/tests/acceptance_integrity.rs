@@ -3532,6 +3532,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
         codex_parent_evidence: None,
+        runtime_identity: None,
         fixed_version_probe_evidence: None,
     };
     let value = serde_json::to_value(record).expect("serialize command cwd");
@@ -4353,6 +4354,40 @@ fn collect_child_report_rejects_orchestrator_self_asserted_codex_parent_evidence
         .commands_run
         .iter()
         .all(|record| record.codex_parent_evidence.is_none()));
+}
+
+#[test]
+fn collect_child_report_rejects_self_asserted_requested_identity_basis() {
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo_path,
+        temp.path().join("identity-prompt.md"),
+        temp.path().join("identity-log.jsonl"),
+        temp.path().join("identity-report.json"),
+        Duration::from_secs(1),
+    );
+    let mut child = injected_child_report(&assignment);
+    let mut forged = injected_command_record();
+    forged.runtime_identity = Some(crate::runtime_adapter::RuntimeIdentityObservation {
+        requested_model: Some("cursor-model".into()),
+        requested_effort: Some("low".into()),
+        model: None,
+        effort: None,
+        model_basis: Some(crate::runtime_adapter::IdentityBasis::Requested),
+        effort_basis: Some(crate::runtime_adapter::IdentityBasis::Requested),
+    });
+    child.commands_run.push(forged);
+    write_injected_json(&command.output_last_message, &child);
+    let run = injected_verified_run(&command);
+    let (report, _) =
+        collect_fixture_child_report_codex_parent_evidence(&assignment, &command, &run);
+    assert!(report.rejected);
+    assert!(report
+        .commands_run
+        .iter()
+        .all(|record| record.runtime_identity.is_none()));
 }
 
 #[test]

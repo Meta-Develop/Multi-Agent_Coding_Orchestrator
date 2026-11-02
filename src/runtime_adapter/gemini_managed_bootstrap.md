@@ -47,8 +47,11 @@ Completion requires the observed model to equal the exact selected model.
 Missing modelVersion and fallback/multiple-model responses cannot satisfy that
 gate. A complete mismatched-model observation can retain accounting and its
 actual model label, while publication fails. The response projection exposes
-no served effort; actual effort remains unknown and a requested effort cannot
-qualify completion. Requested configuration is never reported as served effort.
+no served effort. Under owner policy dated 2026-11-02 this absence alone is not
+a refusal, but the current model-only bootstrap does not render any explicit
+thinking setting. An effort request therefore remains unsupported and cannot
+qualify completion until it is bound to the actual launch configuration.
+Requested configuration is never reported as served effort.
 
 Supervised settlement reports complete private input/output/total usage and the
 observed model. Only successful, safe, identity-matching completion settles as

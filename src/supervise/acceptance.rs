@@ -48,12 +48,13 @@ fn strip_fixed_version_probe_evidence_from_command_records(records: &mut [Comman
 fn command_records_contain_codex_parent_evidence(records: &[CommandRunRecord]) -> bool {
     records
         .iter()
-        .any(|record| record.codex_parent_evidence.is_some())
+        .any(|record| record.codex_parent_evidence.is_some() || record.runtime_identity.is_some())
 }
 
 fn strip_codex_parent_evidence_from_command_records(records: &mut [CommandRunRecord]) {
     for record in records {
         record.codex_parent_evidence = None;
+        record.runtime_identity = None;
     }
 }
 

@@ -37,7 +37,38 @@ pub struct ObservedRoleIdentity {
     pub requested_effort: Option<String>,
     pub observed_model: Option<String>,
     pub observed_effort: Option<String>,
+    #[serde(default)]
+    pub model_basis: Option<crate::runtime_adapter::IdentityBasis>,
+    #[serde(default)]
+    pub effort_basis: Option<crate::runtime_adapter::IdentityBasis>,
     pub unavailable_reason: Option<String>,
+}
+
+impl ObservedRoleIdentity {
+    pub(super) fn complete(&self) -> bool {
+        use crate::runtime_adapter::IdentityBasis;
+        let model = match self.model_basis {
+            Some(IdentityBasis::ProviderReported) => self.observed_model.is_some(),
+            Some(IdentityBasis::Requested) => {
+                self.requested_model.is_some()
+                    && matches!(
+                        self.requested_runtime,
+                        SupervisorRuntime::Codex | SupervisorRuntime::Cursor
+                    )
+            }
+            None => false,
+        };
+        let effort = match self.effort_basis {
+            Some(IdentityBasis::ProviderReported) => self.observed_effort.is_some(),
+            Some(IdentityBasis::Requested) => self.requested_effort.is_some(),
+            // Gemini's managed bootstrap is model-only; no explicit effort is applied.
+            None => {
+                self.requested_runtime == SupervisorRuntime::GeminiCli
+                    && self.requested_effort.is_none()
+            }
+        };
+        model && effort
+    }
 }
 
 impl ObservedProfileBinding {
@@ -50,14 +81,17 @@ impl ObservedProfileBinding {
                 identity.requested_model.as_deref(),
                 identity.requested_effort.as_deref(),
             ) {
-                Ok((model, effort)) => {
-                    identity.observed_model = model;
-                    identity.observed_effort = effort;
-                    identity.unavailable_reason = (identity.observed_model.is_none()
-                        || identity.observed_effort.is_none())
-                    .then(|| "complete source-bound native model/effort observations are unavailable for every dispatch of this role".into());
+                Ok(observation) => {
+                    identity.observed_model = observation.model;
+                    identity.observed_effort = observation.effort;
+                    identity.model_basis = observation.model_basis;
+                    identity.effort_basis = observation.effort_basis;
+                    identity.unavailable_reason = (!identity.complete())
+                    .then(|| "complete source-bound model/effort identity is unavailable for every dispatch of this role".into());
                 }
                 Err(error) => {
+                    identity.model_basis = None;
+                    identity.effort_basis = None;
                     identity.observed_model = None;
                     identity.observed_effort = None;
                     identity.unavailable_reason =
@@ -81,6 +115,8 @@ impl ObservedProfileBinding {
                 requested_runtime: if *role == AgentRole::Worker { effective_worker_runtime } else { primary },
                 requested_model: selection.model.clone(),
                 requested_effort: selection.reasoning_effort.clone(),
+                model_basis: None,
+                effort_basis: None,
                 observed_model: None,
                 observed_effort: None,
                 unavailable_reason: Some("provider-resolved per-role model/effort is not established by requested plan, catalog resolution, or role usage labels; inspect retained native evidence".into()),
@@ -157,7 +193,7 @@ pub(super) fn validate_observed_bindings(
             }) {
                 bail!("observed role identity differs from requested dispatch");
             }
-            if (identity.observed_model.is_none() || identity.observed_effort.is_none())
+            if !identity.complete()
                 && identity
                     .unavailable_reason
                     .as_ref()

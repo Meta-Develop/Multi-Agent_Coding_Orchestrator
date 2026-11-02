@@ -3254,6 +3254,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
                 properties.remove("grok_stream_usage_evidence");
                 properties.remove("grok_acp_parent_evidence");
                 properties.remove("codex_parent_evidence");
+                properties.remove("runtime_identity");
                 properties.remove("fixed_version_probe_evidence");
             }
             if let Some(required) = object
@@ -3263,6 +3264,7 @@ fn remove_parent_process_usage_from_child_schema(schema: &mut serde_json::Value)
                 required.retain(|name| name != "grok_stream_usage_evidence");
                 required.retain(|name| name != "grok_acp_parent_evidence");
                 required.retain(|name| name != "codex_parent_evidence");
+                required.retain(|name| name != "runtime_identity");
                 required.retain(|name| name != "fixed_version_probe_evidence");
             }
             for value in object.values_mut() {
@@ -4195,6 +4197,21 @@ fn grok_stream_usage_evidence_schema_value() -> serde_json::Value {
     })
 }
 
+fn runtime_identity_schema_value() -> serde_json::Value {
+    json!({
+        "type": "object", "additionalProperties": false,
+        "required": ["requested_model", "requested_effort", "model", "effort", "model_basis", "effort_basis"],
+        "properties": {
+            "requested_model": {"type": ["string", "null"]},
+            "requested_effort": {"type": ["string", "null"]},
+            "model": {"type": ["string", "null"]},
+            "effort": {"type": ["string", "null"]},
+            "model_basis": {"enum": ["requested", "provider_reported", null]},
+            "effort_basis": {"enum": ["requested", "provider_reported", null]}
+        }
+    })
+}
+
 pub(super) fn command_run_record_schema_value() -> serde_json::Value {
     json!({
         "type": "object",
@@ -4238,6 +4255,7 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
             "grok_stream_usage_evidence": grok_stream_usage_evidence_schema_value(),
             "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value(),
             "codex_parent_evidence": codex_parent_evidence_schema_value(),
+            "runtime_identity": {"oneOf": [{"type": "null"}, runtime_identity_schema_value()]},
             "fixed_version_probe_evidence": fixed_version_probe_evidence_schema_value()
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
@@ -5460,6 +5478,7 @@ mod selection_schema_tests {
             grok_stream_usage_evidence: None,
             grok_acp_parent_evidence: None,
             codex_parent_evidence: None,
+            runtime_identity: None,
             fixed_version_probe_evidence: None,
         };
         let validation_result = ValidationResult {
@@ -6225,6 +6244,22 @@ mod selection_schema_tests {
         assert!(child_schema["properties"]
             .get("codex_parent_evidence")
             .is_none());
+        assert!(child_schema["properties"].get("runtime_identity").is_none());
+        let identity = json!({
+            "requested_model":"grok-4.6", "requested_effort":"low",
+            "model":"grok-4.6-build", "effort":null,
+            "model_basis":"provider_reported", "effort_basis":"requested"
+        });
+        assert!(schema_accepts_instance(
+            &runtime_identity_schema_value(),
+            &identity
+        ));
+        let mut invalid = identity;
+        invalid["effort_basis"] = json!("observed");
+        assert!(!schema_accepts_instance(
+            &runtime_identity_schema_value(),
+            &invalid
+        ));
     }
 
     #[test]

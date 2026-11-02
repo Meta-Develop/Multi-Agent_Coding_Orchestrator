@@ -2299,7 +2299,7 @@ pub(super) fn external_process_completed(
         && run.error.is_none()
         && (runtime != SupervisorRuntime::Codex
             || run.authenticated_codex_evidence().is_none_or(|evidence| {
-                !evidence.model_mismatch && run.authenticated_codex_usage().is_some()
+                evidence.identity_matches_request() && run.authenticated_codex_usage().is_some()
             }))
         && (runtime != SupervisorRuntime::ClaudeCode
             || (run.authenticated_claude_usage_complete()
@@ -2746,6 +2746,9 @@ pub(super) fn command_record_from_external_for_runtime(
         grok_stream_usage_evidence: run.grok_stream_usage_evidence.clone(),
         grok_acp_parent_evidence: run.grok_acp_parent_evidence.clone(),
         codex_parent_evidence: run.codex_parent_evidence.clone(),
+        runtime_identity: Some(target_containment::RuntimeIdentityObservation::capture(
+            run, command, runtime,
+        )),
         fixed_version_probe_evidence: run.fixed_version_probe_evidence().cloned(),
     }
 }

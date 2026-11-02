@@ -28,26 +28,21 @@ effort, an init claim, a hook value or a request parameter into served evidence.
 Any future observation source requires a separate source-bound implementation
 and qualification; adding a field to a synthetic receipt cannot qualify it.
 
-Managed ReadWrite child publication requires both observed model and observed
-effort to match the launch request. Unknown effort therefore fails closed for
-every supported effort on this pin, including `high`. Supervisor completion
-requires observed effort only for that same parent-recorded launch shape.
-ReadOnly auditors retain their complete-usage and observed-model requirements
-without inheriting the writable effort gate. This does not provide the
-missing whole-call witness for current read-only launches.
+Owner policy dated 2026-11-02 permits Managed ReadWrite child publication
+with a matching served model and exact launch-bound requested effort when
+served effort is absent. Reports retain a null effort observation and record
+`effort_basis: requested`. Requested effort is not a served-effort claim.
+A provider-reported contradiction still refuses. Missing/mismatched served
+model, missing whole-call usage, launch drift, confinement, command journal,
+independent review, acceptance and publication restrictions remain unchanged.
+ReadOnly auditors preserve their existing usage and model gates.
 
-Successful exit, valid result text, confinement, and complete token accounting
-cannot waive the writable identity gate. An identity-only refusal clears
-publication without introducing a process error: verified safety remains true
-and complete witnessed usage settles as Reliable. Other process or coverage
-failures retain their existing safety and settlement behavior. The contained
-launch contract alone does not establish successful writable qualification
-for issue #693.
+Complete witnessed usage still settles as Reliable independently of an identity
+refusal. Substantive selected-account Linux execution and independent acceptance
+remain live-only requirements in #693; this source policy does not qualify them.
 
 Providerless regressions cover missing and mismatched response models,
 unrecognized/missing effort, and a synthetic mismatched observed effort at the
 identity matcher and publication check. Synthetic matcher values are test
 inputs, not observations from this executable. No live provider acceptance or
-credential availability is established by those tests. Until a qualified
-served-effort source exists, no live command on this pin can satisfy the full
-observed-identity acceptance requirement.
+credential availability is established by those tests.

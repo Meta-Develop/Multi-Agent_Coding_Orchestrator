@@ -4465,9 +4465,6 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
                         crate::external_agent::CodexParentResolvedField::Known(value.to_string())
                     })
                     .unwrap_or(crate::external_agent::CodexParentResolvedField::Unknown);
-                if effort.is_none() {
-                    evidence.resolution_status = "ambiguous".to_string();
-                }
                 run.retain_app_server_parent_evidence_for_test();
                 run.qualify_codex_auditor_effort_for_test(command);
                 assert!(run.authenticated_codex_usage_complete());
@@ -4490,7 +4487,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
                 }
                 assert_eq!(
                     external_process_completed(&run, SupervisorRuntime::Codex),
-                    effort == Some("xhigh")
+                    effort.is_none() || effort == Some("xhigh")
                 );
             }
             run
@@ -4509,7 +4506,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
         assert_eq!(invocations, 2, "{effort:?}: {report:#?}");
         assert_eq!(
             report.success,
-            effort == Some("xhigh"),
+            effort.is_none() || effort == Some("xhigh"),
             "{effort:?}: {report:#?}"
         );
         assert!(!report.accepted, "simulation cannot authorize publication");
@@ -4518,11 +4515,14 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
         }
         let child = &report.orchestrator_reports[0];
         assert_eq!(child.audit_reports.len(), 1);
-        assert_eq!(child.audit_reports[0].accepted, effort == Some("xhigh"));
+        assert_eq!(
+            child.audit_reports[0].accepted,
+            effort.is_none() || effort == Some("xhigh")
+        );
         let aggregate = child.review_lens_aggregate.as_ref().unwrap();
         assert_eq!(
             aggregate.lens_verdicts[0].effective_verdict,
-            if effort == Some("xhigh") {
+            if effort.is_none() || effort == Some("xhigh") {
                 ReviewLensVerdictStatus::Accept
             } else {
                 ReviewLensVerdictStatus::ProceduralFailure
@@ -4533,7 +4533,7 @@ fn observed_auditor_effort_gate_reaches_parent_verdict_without_losing_accounting
         assert_eq!(charged.reserved.tokens, 0);
         assert_eq!(charged.active_reservations, 0);
         assert!(charged.usage_complete);
-        let cost = effort.map(|_| 0.00004);
+        let cost = Some(0.00004);
         assert_eq!(charged.consumed.cost_usd, cost);
         assert_eq!(report.total_cost_usd, cost);
         assert_eq!(

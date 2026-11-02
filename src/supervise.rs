@@ -568,7 +568,9 @@ pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_EVIDENCE: &str =
     "single-slug model decision with provisional effort-axis execution evidence";
 pub const PROVISIONAL_DEFAULT_HYBRID_PROFILE_NOTICE: &str =
     "the single standard model slug is evidence-backed, while assignment-level effort matching \
-     remains production-ineligible until real-provider resolved-effort telemetry is evaluated; \
+     remains production-ineligible until bounded same-task provider comparisons establish \
+     quality and applicable-contract costs; effort identity follows the launch-bound request \
+     with explicit provenance, not a served-effort claim; \
      this profile must not be represented as measured production effort economics; \
      before verified Codex dispatch, MACO resolves exact slug membership from one bounded, \
      contained, authenticated runtime-advertised model catalog and applies each role's declared \
@@ -3446,6 +3448,9 @@ pub struct CommandRunRecord {
     /// Parent-owned Codex model, effort, and usage evidence. Never accepted from child reports.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_parent_evidence: Option<crate::external_agent::CodexParentEvidence>,
+    /// Descriptive parent-owned launch provenance; never child-granted authority.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub runtime_identity: Option<crate::runtime_adapter::RuntimeIdentityObservation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_version_probe_evidence:
         Option<crate::external_agent::EnvironmentFixedVersionProbeEvidence>,
@@ -3918,6 +3923,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
         codex_parent_evidence: None,
+        runtime_identity: None,
         fixed_version_probe_evidence: None,
     };
     let worker = WorkerReport {

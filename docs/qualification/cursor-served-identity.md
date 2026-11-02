@@ -30,17 +30,18 @@ Consequently `actualProviderModel` and `actualEffort` remain explicitly `null`
 in the bridge envelope and parent evidence for this pin. The parent rejects
 non-null identity claims in that envelope and never promotes identity claims
 inside generated text, reports, or extra raw fields. Complete usage alone
-cannot make the result publishable. Publication requires nonempty selected
-and independently observed served model and effort, with exact matches.
-Omitting selection does not waive that requirement.
+does not establish served identity. Under owner policy dated 2026-11-02,
+publication uses the exact selected model/effort bound to the private managed
+session, recorded as `model_basis: requested` and `effort_basis: requested`.
+`model`/`effort` observations remain null; this is no provider assertion.
+Missing selection, selection disagreement, any reported contradiction, and all
+existing handshake, usage, assigned-write, offline-check, containment, journal,
+independent acceptance and publication gates still refuse.
 
-There is no live command or flag that closes this identity gap on the admitted
-contract. Before substantive qualification, a future source-bound contract
-must expose authoritative served model and effort for every admitted attempt,
-retain them through the private parent transport, and reject missing,
-conflicting, mismatched, or output-forged identities. Such a change must update
-the relevant source pins and pass independent review. Do not run a paid
-qualification merely to rediscover this source-level refusal.
+A substantive Linux managed Worker qualification with authentic command/result
+journal, complete usage, confined edits, independent acceptance, negative cases
+and quiescent cleanup remains open in #693. No live qualification or promotion
+is established by this source policy.
 
 Deterministic coverage is in `managed_bridge.test.cjs`, the
 `runtime_adapter::cursor_managed_parent::tests` module, and

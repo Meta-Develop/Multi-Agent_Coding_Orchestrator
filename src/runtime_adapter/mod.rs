@@ -15,6 +15,9 @@ pub mod gemini;
 pub mod grok;
 pub(crate) mod grok_acp;
 pub mod hosted_callback;
+mod identity;
+pub(crate) use identity::effort_matches_request;
+pub use identity::{IdentityBasis, RuntimeIdentityObservation};
 
 /// Exact owned bootstrap selection. This is not a capability or identity claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1609,6 +1612,38 @@ mod tests {
         );
         assert_eq!(spec.output_capture, OutputCaptureMode::Stdout);
         assert!(!spec.argv.iter().any(|arg| arg == "--output"));
+        Ok(())
+    }
+
+    #[test]
+    fn lower_grok_efforts_keep_exact_launch_and_containment_proof() -> Result<()> {
+        for effort in ["low", "medium"] {
+            let mut config = RuntimeAdapterConfig::defaults(RuntimeId::Grok);
+            let context = launch_context(
+                Path::new("prompt"),
+                Some("grok-4.6"),
+                Some(effort),
+                Path::new("/tmp/worker"),
+                Path::new("report"),
+            );
+            let proof = config
+                .typed_runtime_contract(AdapterId::Grok, &context)
+                .expect("bounded lower-effort contract");
+            assert!(
+                proof.has_bounded_cwd() && proof.has_bounded_output() && proof.subagents_disabled()
+            );
+            let argv = config.render(&context)?.argv;
+            assert!(argv
+                .windows(2)
+                .any(|pair| pair == ["--reasoning-effort", effort]));
+            assert!(!argv.iter().any(|arg| arg == "xhigh"));
+            config
+                .argument_template
+                .retain(|arg| arg != "--no-subagents");
+            assert!(config
+                .typed_runtime_contract(AdapterId::Grok, &context)
+                .is_none());
+        }
         Ok(())
     }
 

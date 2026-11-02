@@ -712,14 +712,12 @@ pub(super) fn run_held_out_real_provider_experiment_with_dispatch(
             };
             retain_completed_run(&writer, &run)?;
             if profile.worker_runtime.is_some()
-                && run.profile_binding.as_ref().is_some_and(|binding| {
-                    binding
-                        .roles
-                        .values()
-                        .any(|role| role.observed_model.is_none() || role.observed_effort.is_none())
-                })
+                && run
+                    .profile_binding
+                    .as_ref()
+                    .is_some_and(|binding| binding.roles.values().any(|role| !role.complete()))
             {
-                stop_reason.get_or_insert_with(|| "previous cell has unknown provider-resolved role model/effort; additional paid cells require complete measurement and independent acceptance".into());
+                stop_reason.get_or_insert_with(|| "previous cell has incomplete launch-bound role identity; additional paid cells require complete measurement and independent acceptance".into());
             }
             runs.push(run);
         }

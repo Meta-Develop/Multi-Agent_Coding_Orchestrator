@@ -291,6 +291,9 @@ fn cross_runtime_unknown_identity_withholds_later_paid_cells_and_rejects_tamperi
 enum IdentityReceiptCase {
     AppServer,
     Exec,
+    LegacySummary,
+    RequestedSummary,
+    ProviderReported,
     ServedMismatch,
     EffortMismatch,
     RequestedMismatch,
@@ -304,6 +307,7 @@ enum IdentityReceiptCase {
     WrongRun,
     WrongReportRun,
     Grok,
+    LegacyGrok,
     LabelsOnly,
 }
 
@@ -322,7 +326,10 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
     for profile in &mut manifest.profiles {
         profile.role_models = template.role_models.clone();
         profile.worker_runtime = template.worker_runtime;
-        if case == IdentityReceiptCase::Grok {
+        if matches!(
+            case,
+            IdentityReceiptCase::Grok | IdentityReceiptCase::LegacyGrok
+        ) {
             profile.worker_runtime = Some(SupervisorRuntime::Grok);
             profile
                 .role_models
@@ -342,7 +349,10 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
         direct_plan(plans.path()),
     );
     request.runtime = SupervisorRuntime::Codex;
-    if case == IdentityReceiptCase::Grok {
+    if matches!(
+        case,
+        IdentityReceiptCase::Grok | IdentityReceiptCase::LegacyGrok
+    ) {
         request
             .additional_runtime_executables
             .push(HeldOutAdditionalRuntimeBinding {
@@ -350,7 +360,11 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
                 executable: "/usr/bin/true".into(),
             });
     }
-    let _runtime_bindings = (case == IdentityReceiptCase::Grok).then(|| {
+    let _runtime_bindings = (matches!(
+        case,
+        IdentityReceiptCase::Grok | IdentityReceiptCase::LegacyGrok
+    ))
+    .then(|| {
         crate::supervise::bind_explicit_runtime_executables(
             &request.source.source_repo,
             &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
@@ -395,11 +409,27 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
                     if worker && case == IdentityReceiptCase::EffortMismatch {
                         summary["codex_parent_evidence"]["observed_effort"] = json!({"known":"low"});
                     }
-                    if worker && case == IdentityReceiptCase::Grok {
+                    if matches!(case, IdentityReceiptCase::LegacySummary | IdentityReceiptCase::RequestedSummary | IdentityReceiptCase::ProviderReported) {
+                        summary["runtime_identity"] = json!({
+                            "requested_model":selection.model, "requested_effort":selection.reasoning_effort,
+                            "model":observed_model, "effort":"xhigh"
+                        });
+                        if case != IdentityReceiptCase::LegacySummary {
+                            let basis = if case == IdentityReceiptCase::ProviderReported { "provider_reported" } else { "requested" };
+                            summary["runtime_identity"]["model_basis"] = json!(basis);
+                            summary["runtime_identity"]["effort_basis"] = json!(basis);
+                        }
+                    }
+                    if worker && matches!(case, IdentityReceiptCase::Grok | IdentityReceiptCase::LegacyGrok) {
                         summary = json!({"runtime_identity":{
                             "requested_model":selection.model,"requested_effort":selection.reasoning_effort,
-                            "model":"grok-4.6-build","effort":null
+                            "model":"grok-4.6-build","effort":null,
+                            "model_basis":"provider_reported","effort_basis":"requested"
                         }});
+                        if case == IdentityReceiptCase::LegacyGrok {
+                            summary["runtime_identity"].as_object_mut().unwrap().remove("model_basis");
+                            summary["runtime_identity"].as_object_mut().unwrap().remove("effort_basis");
+                        }
                     }
                     if (worker && case == IdentityReceiptCase::LabelsOnly) || attempt == 2 {
                         summary = json!({"models":[selection.model],"model":selection.model,"reasoning_effort":"xhigh"});
@@ -460,8 +490,14 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
 
 #[test]
 #[cfg(target_os = "linux")]
-fn authenticated_codex_role_receipts_project_app_server_and_exec_identity() {
-    for case in [IdentityReceiptCase::AppServer, IdentityReceiptCase::Exec] {
+fn authenticated_codex_role_receipts_distinguish_legacy_settings_and_provider_reports() {
+    for case in [
+        IdentityReceiptCase::AppServer,
+        IdentityReceiptCase::Exec,
+        IdentityReceiptCase::LegacySummary,
+        IdentityReceiptCase::RequestedSummary,
+        IdentityReceiptCase::ProviderReported,
+    ] {
         let (results, calls) = identity_receipt_experiment(case);
         assert_eq!(
             calls, 3,
@@ -469,8 +505,19 @@ fn authenticated_codex_role_receipts_project_app_server_and_exec_identity() {
         );
         for run in &results.runs {
             for role in run.profile_binding.as_ref().unwrap().roles.values() {
-                assert_eq!(role.observed_model.as_deref(), Some("gpt-6.1-sol"));
-                assert_eq!(role.observed_effort.as_deref(), Some("xhigh"));
+                let reported = case == IdentityReceiptCase::ProviderReported;
+                assert_eq!(
+                    role.observed_model.as_deref(),
+                    reported.then_some("gpt-6.1-sol")
+                );
+                assert_eq!(role.observed_effort.as_deref(), reported.then_some("xhigh"));
+                let expected = if reported {
+                    crate::runtime_adapter::IdentityBasis::ProviderReported
+                } else {
+                    crate::runtime_adapter::IdentityBasis::Requested
+                };
+                assert_eq!(role.model_basis, Some(expected));
+                assert_eq!(role.effort_basis, Some(expected));
                 assert!(role.unavailable_reason.is_none());
             }
         }
@@ -528,15 +575,16 @@ fn authenticated_role_receipts_missing_tampered_or_unknown_retry_stay_unknown() 
 
 #[test]
 #[cfg(target_os = "linux")]
-fn authenticated_grok_role_receipt_projects_model_only_and_withholds_later_cells() {
-    let (results, calls) = identity_receipt_experiment(IdentityReceiptCase::Grok);
-    assert_eq!(calls, 1);
-    let role = &results.runs[0].profile_binding.as_ref().unwrap().roles[&AgentRole::Worker];
-    assert_eq!(role.observed_model.as_deref(), Some("grok-4.6-build"));
-    assert!(role.observed_effort.is_none() && role.unavailable_reason.is_some());
-    assert!(results.runs[1]
-        .failure
-        .as_deref()
-        .unwrap()
-        .contains("paid cell withheld"));
+fn authenticated_grok_role_receipt_uses_requested_effort_without_claiming_observation() {
+    for case in [IdentityReceiptCase::Grok, IdentityReceiptCase::LegacyGrok] {
+        let (results, calls) = identity_receipt_experiment(case);
+        assert_eq!(calls, 3);
+        let role = &results.runs[0].profile_binding.as_ref().unwrap().roles[&AgentRole::Worker];
+        assert_eq!(role.observed_model.as_deref(), Some("grok-4.6-build"));
+        assert!(role.observed_effort.is_none() && role.unavailable_reason.is_none());
+        assert_eq!(
+            role.effort_basis,
+            Some(crate::runtime_adapter::IdentityBasis::Requested)
+        );
+    }
 }
