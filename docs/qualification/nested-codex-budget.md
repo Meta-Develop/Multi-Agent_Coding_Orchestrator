@@ -1,6 +1,7 @@
 # Nested writable token-control qualification (#714)
 
-Status: implementation prepared; a new real contained attempt is still required.
+Status: Linux contained qualification accepted on 2026-11-02: run -06 on `e8eae357`,
+under the owner's final helper-scope decision below. Windows/WSL remain unproven.
 Preserve `qualification-nested-budget-ct101-01`, `-03`, AUD714 and the earlier failure records.
 Follow the [shared evidence contract](README.md); never run in the owner desktop
 or an occupied checkout. The [fixture](../../examples/supervise/nested-codex-budget-qualification.json)
@@ -220,8 +221,8 @@ in the admitted Linux environment. Providerless tests do not satisfy this gate.
 Keep #692 settlement-order evidence separate. Closure requires the real
 exhaustion evidence above and independent acceptance, not fixture preparation.
 
-Before accepting a fresh attempt, map every target, version probe, catalog probe
-and journal helper to its owner and typed containment/quiescence receipt. An
+Before accepting a fresh attempt, map each direct MACO launch (target, version
+probe and catalog probe) to its owner and typed containment/quiescence receipt. An
 empty process-group watchdog alone does not certify all helpers. The old -01
 run lacks that complete mapping and has no accepted candidate; preserve it as
 positive stop/refusal evidence with those explicit limits. Preparation and
@@ -236,11 +237,25 @@ unverified receipt is retained as unverified and cannot establish quiescence.
 These are historical diagnostics, never restored launch or cleanup authority.
 
 This inventory covers direct MACO catalog, version-probe and target launches.
-Provider-spawned journal wrappers and their commands remain inside the target's
-owned process boundary, but MACO does not observe each wrapper launch separately
-(including one that fails before appending a journal record). It therefore does
-not claim a complete per-wrapper inventory. CAM service internals and the
-operator's build/launcher/watchdog processes are also outside this supervisor's
-spawn scope. A fresh qualification must retain separate ownership evidence for
-those helpers before claiming the complete qualification contract above. Existing
-live evidence is unchanged and is not retroactively upgraded by these receipts.
+The owner's final decision (2026-11-02) accepts provider-spawned runtime-internal
+processes (Codex journal wrappers and the commands they run) inside the target's
+owned systemd unit/cgroup. The typed target containment/quiescence receipt,
+verifying the owned cgroup is empty after termination, is sufficient ownership
+evidence; no per-wrapper launch instrumentation is required. MACO does not
+observe each wrapper launch separately, including one that fails before appending
+a journal record. This is an accepted scope limit, not a complete per-wrapper
+inventory claim. CAM service internals and operator build/launcher/watchdog
+processes remain out of scope.
+
+Accepted qualification: nested-budget run -06 on `e8eae357` retained typed receipts
+for all 17 direct launches across 9 helper inventories; target cgroups were empty
+after termination. Stage 1 was accepted by all 3 review lenses. Stage 2 interrupted
+after an observed 19,412-token usage notice against a 1,000-token grant, settled
+once with typed interruption, and refused the queued Worker before release.
+The run charged 575,258 of 650,000 tokens. Independent audit passed every
+functional criterion; its only gap was the helper-scope question resolved above.
+This accepts the qualification's stop/refusal behavior and stage-1 candidate;
+the expected stage-2 rejection does not authorize publication of the failed run.
+Earlier attempts retain their stated limits. This does not establish a hard
+provider-call spending limit, a monetary bound, an absence of overshoot, complete
+actual usage for an interrupted turn, or Windows/WSL qualification.
