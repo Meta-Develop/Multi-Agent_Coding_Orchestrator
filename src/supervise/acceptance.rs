@@ -51,6 +51,44 @@ fn command_records_contain_codex_parent_evidence(records: &[CommandRunRecord]) -
         .any(|record| record.codex_parent_evidence.is_some() || record.runtime_identity.is_some())
 }
 
+fn command_records_assert_codex_parent_evidence(
+    records: &mut [CommandRunRecord],
+    source_records: Option<&[CommandRunRecord]>,
+) -> bool {
+    let Some(source_records) = source_records else {
+        return command_records_contain_codex_parent_evidence(records);
+    };
+    let mut asserted = false;
+    for record in records {
+        // Only the descriptive identity can be inherited here. Native evidence
+        // keeps its existing refusal, even on an evidence-only dispatch.
+        asserted |= record.codex_parent_evidence.is_some();
+        let mut inherited = source_records.iter().filter(|source| {
+            if record.runtime_identity.is_some()
+                && record.runtime_identity != source.runtime_identity
+            {
+                return false;
+            }
+            let mut projected = (*source).clone();
+            projected.runtime_identity = record.runtime_identity.clone();
+            projected == *record
+        });
+        if let Some(source) = inherited.next() {
+            // The child schema omits parent-owned identity. Restore it only
+            // from an otherwise identical authenticated historical record.
+            // Ambiguous historical matches cannot choose a provenance basis.
+            if inherited.all(|other| other.runtime_identity == source.runtime_identity) {
+                record.runtime_identity = source.runtime_identity.clone();
+            } else {
+                asserted = true;
+            }
+        } else {
+            asserted |= record.runtime_identity.is_some();
+        }
+    }
+    asserted
+}
+
 fn strip_codex_parent_evidence_from_command_records(records: &mut [CommandRunRecord]) {
     for record in records {
         record.codex_parent_evidence = None;
@@ -154,10 +192,20 @@ fn reject_child_asserted_fixed_version_probe_evidence(
 fn reject_child_asserted_codex_parent_evidence(
     report_path: &Path,
     report: &mut OrchestratorReviewReport,
+    evidence_only_source: Option<&OrchestratorReviewReport>,
 ) {
-    let mut asserted = command_records_contain_codex_parent_evidence(&report.commands_run);
-    for worker in &report.worker_reports {
-        asserted |= command_records_contain_codex_parent_evidence(&worker.commands_run);
+    let mut asserted = command_records_assert_codex_parent_evidence(
+        &mut report.commands_run,
+        evidence_only_source.map(|source| source.commands_run.as_slice()),
+    );
+    for (index, worker) in report.worker_reports.iter_mut().enumerate() {
+        asserted |= command_records_assert_codex_parent_evidence(
+            &mut worker.commands_run,
+            evidence_only_source
+                .and_then(|source| source.worker_reports.get(index))
+                .filter(|source| source.id == worker.id)
+                .map(|source| source.commands_run.as_slice()),
+        );
     }
     for auditor in &report.audit_reports {
         asserted |= command_records_contain_codex_parent_evidence(&auditor.commands_run);
@@ -449,7 +497,11 @@ fn collect_child_report_from_source(
             let mut report = parsed.report;
             reject_child_asserted_grok_stream_usage_evidence(report_path, &mut report);
             reject_child_asserted_grok_acp_parent_evidence(report_path, &mut report);
-            reject_child_asserted_codex_parent_evidence(report_path, &mut report);
+            reject_child_asserted_codex_parent_evidence(
+                report_path,
+                &mut report,
+                evidence_only_source,
+            );
             reject_child_asserted_fixed_version_probe_evidence(report_path, &mut report);
             if parsed.recovered {
                 report.findings.push(Finding {

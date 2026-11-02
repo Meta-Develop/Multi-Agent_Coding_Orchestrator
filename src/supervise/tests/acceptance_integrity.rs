@@ -4390,6 +4390,133 @@ fn collect_child_report_rejects_self_asserted_requested_identity_basis() {
         .all(|record| record.runtime_identity.is_none()));
 }
 
+fn collect_evidence_only_identity_report(
+    source: &OrchestratorReviewReport,
+    child: &OrchestratorReviewReport,
+) -> OrchestratorReviewReport {
+    let (temp, repo) = injected_repository();
+    let assignment = injected_assignment(true);
+    let command = ExternalAgentCommand::codex(
+        "codex",
+        &repo,
+        temp.path().join("identity-prompt.md"),
+        temp.path().join("identity-log.jsonl"),
+        temp.path().join("identity-report.json"),
+        Duration::from_secs(1),
+    );
+    write_injected_json(&command.output_last_message, child);
+    let run = injected_verified_run(&command);
+    let (report, shape_problems) = collect_child_report(ChildReportCollectionContext {
+        assignment: &assignment,
+        assignment_metadata: &AssignmentMetadata::new(),
+        report_path: &command.output_last_message,
+        external_run: &run,
+        external_command: &command,
+        worktree_path: Path::new("."),
+        child_base_head: &injected_oid("evidence-only-identity-base"),
+        observed_changed_paths: None,
+        worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+        evidence_only_source: Some(source),
+    });
+    assert!(shape_problems.is_empty());
+    report
+}
+
+fn evidence_only_identity_source(
+    effort_basis: crate::runtime_adapter::IdentityBasis,
+) -> OrchestratorReviewReport {
+    use crate::runtime_adapter::{IdentityBasis, RuntimeIdentityObservation};
+    let mut source = injected_child_report(&injected_assignment(true));
+    let mut record = injected_command_record();
+    record.runtime_identity = Some(RuntimeIdentityObservation {
+        requested_model: Some("grok-4.6".into()),
+        requested_effort: Some("low".into()),
+        model: Some("grok-4.6-build".into()),
+        effort: (effort_basis == IdentityBasis::ProviderReported).then(|| "low".into()),
+        model_basis: Some(IdentityBasis::ProviderReported),
+        effort_basis: Some(effort_basis),
+    });
+    source.commands_run.push(record.clone());
+    source.worker_reports[0].commands_run.push(record);
+    source
+}
+
+#[test]
+fn evidence_only_identity_preserves_authenticated_records_and_restores_schema_omissions() {
+    use crate::runtime_adapter::IdentityBasis;
+    for basis in [IdentityBasis::Requested, IdentityBasis::ProviderReported] {
+        for omit_identity in [false, true] {
+            let source = evidence_only_identity_source(basis);
+            let mut child = source.clone();
+            if omit_identity {
+                child.commands_run[0].runtime_identity = None;
+                child.worker_reports[0].commands_run[0].runtime_identity = None;
+            }
+            let report = collect_evidence_only_identity_report(&source, &child);
+            assert_eq!(report.status, ReviewStatus::Succeeded, "{report:#?}");
+            assert_eq!(report.commands_run, source.commands_run);
+            assert_eq!(report.worker_reports, source.worker_reports);
+        }
+    }
+}
+
+#[test]
+fn evidence_only_identity_rejects_contradictions_rebinding_and_new_parent_claims() {
+    use crate::runtime_adapter::IdentityBasis;
+    for case in [
+        "effort",
+        "basis",
+        "command",
+        "worker",
+        "auditor",
+        "native",
+        "ambiguous",
+    ] {
+        let mut source = evidence_only_identity_source(IdentityBasis::Requested);
+        let mut child = source.clone();
+        match case {
+            "effort" => {
+                child.commands_run[0]
+                    .runtime_identity
+                    .as_mut()
+                    .unwrap()
+                    .effort = Some("xhigh".into());
+            }
+            "basis" => {
+                child.commands_run[0]
+                    .runtime_identity
+                    .as_mut()
+                    .unwrap()
+                    .effort_basis = Some(IdentityBasis::ProviderReported);
+            }
+            "command" => child.commands_run[0].command.push("changed-command".into()),
+            "worker" => child.worker_reports[0].id = "another-worker".into(),
+            "auditor" => {
+                let mut auditor = injected_auditor_report(&injected_assignment(true), &child);
+                auditor.commands_run = source.commands_run.clone();
+                child.audit_reports.push(auditor);
+            }
+            "native" => {
+                child.commands_run[0].codex_parent_evidence = Some(forged_codex_parent_evidence())
+            }
+            "ambiguous" => {
+                let mut other = source.commands_run[0].clone();
+                other.runtime_identity.as_mut().unwrap().effort_basis =
+                    Some(IdentityBasis::ProviderReported);
+                source.commands_run.push(other);
+                child.commands_run[0].runtime_identity = None;
+            }
+            _ => unreachable!(),
+        }
+        let report = collect_evidence_only_identity_report(&source, &child);
+        assert!(report.rejected, "{case}: {report:#?}");
+        assert!(
+            finding_messages(&report).contains(CHILD_ASSERTED_CODEX_PARENT_EVIDENCE_MESSAGE),
+            "{case}: {report:#?}"
+        );
+    }
+}
+
 #[test]
 fn collect_child_report_rejects_nested_worker_and_auditor_self_asserted_codex_parent_evidence() {
     let (temp, repo_path) = injected_repository();

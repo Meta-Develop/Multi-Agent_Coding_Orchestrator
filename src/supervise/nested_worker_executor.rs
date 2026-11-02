@@ -929,6 +929,9 @@ mod tests {
         let mut plan = plan(parent.clone());
         let mut worker_selection = configured_role_model_selection(&plan, AgentRole::Worker);
         worker_selection.model = Some(FRONTIER_PROFILE_MODEL.to_string());
+        // Successful budget cases require an explicit launch-bound effort;
+        // an implicit CLI default cannot supply requested identity.
+        worker_selection.reasoning_effort = Some("high".to_string());
         plan.role_models.insert(AgentRole::Worker, worker_selection);
         if case.starts_with("live-") {
             plan.child_timeout_seconds = 300;
