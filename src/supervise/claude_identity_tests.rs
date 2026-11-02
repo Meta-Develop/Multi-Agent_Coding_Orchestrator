@@ -2,7 +2,7 @@ use super::*;
 use crate::external_agent::record_claude_completion_for_test;
 
 #[test]
-fn managed_claude_identity_refusal_preserves_reliable_settlement() -> Result<()> {
+fn managed_claude_requested_effort_preserves_reliable_settlement() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let (command, run) =
         record_claude_completion_for_test(temp.path(), WorkspaceAccess::ReadWrite)?;
@@ -12,8 +12,8 @@ fn managed_claude_identity_refusal_preserves_reliable_settlement() -> Result<()>
     assert_eq!(run.authenticated_claude_effort(), None);
     assert_eq!(run.exit_code, Some(0));
     assert!(run.error.is_none(), "{:?}", run.error);
-    assert!(!run.publishable);
-    assert!(!external_process_completed(
+    assert!(run.publishable);
+    assert!(external_process_completed(
         &run,
         SupervisorRuntime::ClaudeCode
     ));
@@ -50,7 +50,7 @@ fn managed_claude_identity_refusal_preserves_reliable_settlement() -> Result<()>
 }
 
 #[test]
-fn claude_unknown_effort_preserves_readonly_auditor_completion_only() -> Result<()> {
+fn claude_requested_effort_allows_contained_completion() -> Result<()> {
     let readonly_root = tempfile::tempdir()?;
     let (command, readonly) =
         record_claude_completion_for_test(readonly_root.path(), WorkspaceAccess::ReadOnly)?;
@@ -77,14 +77,14 @@ fn claude_unknown_effort_preserves_readonly_auditor_completion_only() -> Result<
     assert!(writable.authenticated_claude_usage_complete());
     assert_eq!(writable.authenticated_claude_effort(), None);
     assert!(writable.error.is_none(), "{:?}", writable.error);
-    assert!(!writable.publishable);
-    assert!(!external_process_completed(
+    assert!(writable.publishable);
+    assert!(external_process_completed(
         &writable,
         SupervisorRuntime::ClaudeCode
     ));
     // Isolate the completion call site from the independently enforced publication gate.
     writable.publishable = true;
-    assert!(!external_process_completed(
+    assert!(external_process_completed(
         &writable,
         SupervisorRuntime::ClaudeCode
     ));

@@ -1780,6 +1780,7 @@ fn injected_command_record() -> CommandRunRecord {
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
         codex_parent_evidence: None,
+        runtime_identity: None,
         fixed_version_probe_evidence: None,
     }
 }

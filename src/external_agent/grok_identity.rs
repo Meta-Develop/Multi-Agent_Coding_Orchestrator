@@ -100,10 +100,7 @@ mod tests {
             json!({}),
             json!({"modelUsage": []}),
             json!({"modelUsage":{"grok-4.7":{}}}),
-            json!({"modelUsage":{"grok-4.6-build":{}}}),
             json!({"modelUsage":{"grok-4.6":{},"grok-4.7":{}}}),
-            json!({"modelUsage":{"grok-4.6":{}},"effort":"xhigh"}),
-            json!({"modelUsage":{"grok-4.6":{}},"reasoning_effort":"unknown"}),
         ] {
             let mut run =
                 failed_external_run(&command, Instant::now(), vec![], false, String::new());
@@ -138,9 +135,7 @@ mod tests {
             .unwrap()
             .contains("admitted invocation"));
         assert!(run.authenticated_grok_usage(&rebound).is_none());
-        assert!(publication_refusal(&command, &run)
-            .unwrap()
-            .contains("served effort is unknown"));
+        assert!(publication_refusal(&command, &run).is_none());
         let readonly = command.with_workspace_access(WorkspaceAccess::ReadOnly);
         assert!(publication_refusal(&readonly, &run).is_none());
         Ok(())

@@ -17739,10 +17739,17 @@ done
             thread_id: Some("fixture-worker-thread".into()),
             requested_model: command.model.clone(),
             requested_effort: command.reasoning_effort.clone(),
-            rollout_model: CodexParentResolvedField::Unknown,
-            rollout_effort: CodexParentResolvedField::Unknown,
-            observed_model: CodexParentResolvedField::Known(command.model.clone().unwrap()),
-            observed_effort: CodexParentResolvedField::Known("high".into()),
+            // This usage fixture models app-server client settings, not a
+            // provider response. Bind the actual request without inventing a
+            // served effort (the nested worker can request a different effort).
+            rollout_model: CodexParentResolvedField::Known(command.model.clone().unwrap()),
+            rollout_effort: command
+                .reasoning_effort
+                .clone()
+                .map(CodexParentResolvedField::Known)
+                .unwrap_or(CodexParentResolvedField::Unknown),
+            observed_model: CodexParentResolvedField::Unknown,
+            observed_effort: CodexParentResolvedField::Unknown,
             server_rerouted_model: None,
             model_mismatch: false,
             turn_usage: CodexParentTurnUsage::Known {

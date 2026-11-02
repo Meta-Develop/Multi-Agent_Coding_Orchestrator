@@ -587,6 +587,7 @@ Evidence-only operation:
 Report contract:
 - {report_contract}
 - Preserve every reported value and all evidence in assigned_paths, semantic_symbols, semantic_modules, files_changed, field_guide_entries, worker_reports, and decomposition_completions from the authenticated source report. When the response schema requires a property absent from the authenticated report, represent optional evidence as null and genuinely empty evidence arrays as []; do not invent or discard evidence. The immutable assignment JSON still carries any licensed_breakage declaration into this re-audit.
+- Omit parent-owned runtime_identity fields from historical command records while preserving their other fields exactly; the supervisor restores those identity records from the authenticated source. Never assert runtime identity for new or changed commands.
 - Set audit_reports=[]; the supervisor collects the parent review evidence.
 - Omit review_lens_aggregate, gate_denials, and gate_correction_outcomes; these are supervisor-owned and absent from the Codex response schema.
 - Do not emit licensed_breakage_review or generated_follow_up_tasks; the supervisor reconstructs those fields from the immutable declaration and current evidence.

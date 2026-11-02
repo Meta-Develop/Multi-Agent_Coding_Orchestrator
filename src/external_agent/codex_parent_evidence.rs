@@ -2,8 +2,9 @@
 //!
 //! `codex exec --json` never prints the model or reasoning effort it used. Its durable
 //! record is the rollout Codex writes below `$CODEX_HOME/sessions/`. App-server turns are
-//! ephemeral and do not write a rollout; their correlated `thread/start` response supplies
-//! the provider-resolved model and effort instead.
+//! ephemeral and do not write a rollout. Rollout and `thread/start` settings are
+//! client configuration, not provider observations. Absent a native provider
+//! response, identity uses the exact launch request with requested provenance.
 //!
 //! Everything here is derived by the parent from descriptor-held captures. Child reports may
 //! never assert it; acceptance strips any child-provided value.
@@ -40,18 +41,18 @@ pub struct CodexParentEvidence {
     pub requested_model: Option<String>,
     /// Reasoning effort requested on the command line. Copied, never promoted.
     pub requested_effort: Option<String>,
-    /// Client-resolved model slug from the rollout `turn_context` payloads.
+    /// Client-resolved model from rollout `turn_context` or app-server start settings.
     pub rollout_model: CodexParentResolvedField,
-    /// Configured reasoning effort from the rollout `turn_context` payloads.
+    /// Client-configured effort from rollout `turn_context` or app-server start settings.
     pub rollout_effort: CodexParentResolvedField,
-    /// Model resolved by the provider: the reroute target when Codex reported one, otherwise
-    /// the rollout model (CLI) or `thread/start` response model (app-server).
+    /// Provider-reported model, including an explicit server reroute.
+    /// Client rollout and thread/start settings never populate this field.
     pub observed_model: CodexParentResolvedField,
-    /// Effort reported by the rollout (CLI) or correlated `thread/start` response (app-server).
+    /// Provider-reported response effort; client settings never populate this field.
     pub observed_effort: CodexParentResolvedField,
     /// Server reroute reported through an `item.completed` error item.
     pub server_rerouted_model: Option<CodexServerRerouteEvidence>,
-    /// `requested_model` is known, `observed_model` is known, and they differ.
+    /// A provider report or client launch setting contradicts the requested model.
     pub model_mismatch: bool,
     pub turn_usage: CodexParentTurnUsage,
     /// One of the `CodexParentResolutionStatus` labels.
@@ -59,13 +60,29 @@ pub struct CodexParentEvidence {
 }
 
 impl CodexParentEvidence {
+    pub(crate) fn identity_matches_request(&self) -> bool {
+        !self.model_mismatch
+            && self.usage_model().is_some()
+            && crate::runtime_adapter::effort_matches_request(
+                self.requested_effort.as_deref(),
+                self.observed_effort.known(),
+            )
+            && self
+                .rollout_effort
+                .known()
+                .is_none_or(|effort| Some(effort) == self.requested_effort.as_deref())
+    }
+
     /// Whole-turn allocation requires one resolved identity. A reroute target
     /// alone does not say how the cumulative usage was split between models.
     pub(crate) fn usage_model(&self) -> Option<&str> {
         if self.resolution_status != "complete" || self.server_rerouted_model.is_some() {
             return None;
         }
-        let model = self.observed_model.known()?;
+        let model = self
+            .observed_model
+            .known()
+            .or(self.requested_model.as_deref())?;
         if self
             .rollout_model
             .known()
@@ -187,8 +204,8 @@ pub(crate) fn codex_parent_evidence_from_run(
 }
 
 /// App-server responses and notifications are not `codex exec --json` events.
-/// Ephemeral turns have no rollout, so only the bounded, correlated provider
-/// response and notifications can resolve model, effort, and usage.
+/// Ephemeral turns have no rollout. Correlated client settings bind the request;
+/// turn notifications supply usage. Client settings are not served identity.
 pub(crate) fn codex_parent_evidence_from_app_server_run(
     inputs: &CodexParentEvidenceInputs<'_>,
     outcome: Option<&AppServerOutcome>,
@@ -218,19 +235,29 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
     let observed_model = match &reroute {
         _ if invalid_reroute => CodexParentResolvedField::Unknown,
         Some(reroute) => CodexParentResolvedField::Known(reroute.to.clone()),
-        None => start_model.clone(),
+        None => CodexParentResolvedField::Unknown,
     };
     let model_mismatch = matches!(
         (inputs.requested_model, observed_model.known()),
         (Some(requested), Some(observed)) if requested != observed
     );
+    let model_mismatch = model_mismatch
+        || inputs
+            .requested_model
+            .is_some_and(|requested| start_model.known() != Some(requested));
     let mut status = CodexParentResolutionStatus::Complete;
+    if inputs.requested_effort.is_some_and(|requested| {
+        start_effort
+            .known()
+            .is_some_and(|actual| actual != requested)
+    }) {
+        status = status.min(CodexParentResolutionStatus::Ambiguous);
+    }
     if inputs.codex_version.is_none() {
         status = status.min(CodexParentResolutionStatus::VersionMismatch);
     }
     if invalid_reroute
         || matches!(start_model, CodexParentResolvedField::Unknown)
-        || matches!(start_effort, CodexParentResolvedField::Unknown)
         || reroute
             .as_ref()
             .is_some_and(|reroute| Some(reroute.from.as_str()) != start_model.known())
@@ -264,11 +291,11 @@ pub(crate) fn codex_parent_evidence_from_app_server_run(
         thread_id: Some(outcome.thread_id.clone()),
         requested_model: inputs.requested_model.map(str::to_string),
         requested_effort: inputs.requested_effort.map(str::to_string),
-        // An ephemeral app-server thread never materializes a rollout.
-        rollout_model: CodexParentResolvedField::Unknown,
-        rollout_effort: CodexParentResolvedField::Unknown,
+        // Retain client settings separately from provider observations.
+        rollout_model: start_model,
+        rollout_effort: start_effort,
         observed_model,
-        observed_effort: start_effort,
+        observed_effort: CodexParentResolvedField::Unknown,
         server_rerouted_model: reroute,
         model_mismatch,
         turn_usage,
@@ -306,6 +333,17 @@ fn assemble_evidence(
     stream: Result<ExecStreamSummary, ()>,
     rollout: RolloutResolution,
 ) -> CodexParentEvidence {
+    let response = stream
+        .as_ref()
+        .ok()
+        .and_then(|stream| stream.provider_response.as_ref());
+    let provider_model = response
+        .map(|response| response.0.clone())
+        .unwrap_or(CodexParentResolvedField::Unknown);
+    let provider_effort = response
+        .map(|response| response.1.clone())
+        .unwrap_or(CodexParentResolvedField::Unknown);
+    let response_missing_model = response.is_some() && provider_model.known().is_none();
     let mut status = CodexParentResolutionStatus::Complete;
     let mut note = |candidate: CodexParentResolutionStatus| {
         status = status.min(candidate);
@@ -360,20 +398,35 @@ fn assemble_evidence(
             )
         }
     };
+    if response_missing_model
+        || inputs.requested_effort.is_some_and(|requested| {
+            rollout
+                .effort
+                .known()
+                .is_some_and(|actual| actual != requested)
+        })
+    {
+        note(CodexParentResolutionStatus::Ambiguous);
+    }
     if let Some(failure) = rollout.failure {
         note(failure);
     }
 
     let observed_model = match &reroute {
         Some(reroute) => CodexParentResolvedField::Known(reroute.to.clone()),
-        None => rollout.model.clone(),
+        None => provider_model,
     };
-    let observed_effort = rollout.effort.clone();
+    let observed_effort = provider_effort;
     let model_mismatch = matches!(
         (inputs.requested_model, observed_model.known()),
         (Some(requested), Some(observed)) if requested != observed
     );
 
+    let model_mismatch = model_mismatch
+        || matches!(
+            (inputs.requested_model, rollout.model.known()),
+            (Some(requested), Some(resolved)) if requested != resolved
+        );
     CodexParentEvidence {
         codex_version: inputs.codex_version.map(format_version),
         thread_id,
@@ -410,6 +463,23 @@ struct ExecStreamSummary {
     /// Usage from the last `turn.completed`; Codex reports cumulative totals there.
     last_usage: Option<StreamUsage>,
     reroute: Option<CodexServerRerouteEvidence>,
+    provider_response: Option<(CodexParentResolvedField, CodexParentResolvedField)>,
+}
+
+// Parse original envelope bytes so duplicate identity keys cannot be collapsed.
+#[derive(Deserialize)]
+struct ProviderCompletedEvent {
+    response: ProviderCompletedResponse,
+}
+#[derive(Deserialize)]
+struct ProviderCompletedResponse {
+    status: String,
+    model: Option<String>,
+    reasoning: Option<ProviderResponseReasoning>,
+}
+#[derive(Deserialize)]
+struct ProviderResponseReasoning {
+    effort: Option<String>,
 }
 
 /// Summarizes the `codex exec --json` stream. `Err(())` means the capture is not valid JSONL.
@@ -431,6 +501,29 @@ fn parse_exec_stream(stdout: &[u8]) -> Result<ExecStreamSummary, ()> {
                         .filter(|id| !id.is_empty())
                         .map(str::to_string);
                 }
+            }
+            Some("response.completed") => {
+                // An optional native Responses envelope, never an agent message
+                // or thread/start configuration. Require a single completed response.
+                let response = serde_json::from_str::<ProviderCompletedEvent>(line)
+                    .map_err(|_| ())?
+                    .response;
+                if response.status != "completed" || summary.provider_response.is_some() {
+                    return Err(());
+                }
+                let field = |value: Option<String>| -> Result<CodexParentResolvedField, ()> {
+                    match value {
+                        None => Ok(CodexParentResolvedField::Unknown),
+                        Some(value) if !value.is_empty() && value.len() <= 256 => {
+                            Ok(CodexParentResolvedField::Known(value))
+                        }
+                        _ => Err(()),
+                    }
+                };
+                summary.provider_response = Some((
+                    field(response.model)?,
+                    field(response.reasoning.and_then(|r| r.effort))?,
+                ));
             }
             Some("turn.failed") => {
                 summary.turn_failed = summary.turn_failed.saturating_add(1);
@@ -560,7 +653,14 @@ fn resolve_rollout(
             .map(|turn| turn.effort.as_deref()),
     );
     let mut failure = None;
-    if model.known().is_none() || effort.known().is_none() {
+    if model.known().is_none()
+        || !crate::runtime_adapter::effort_matches_request(inputs.requested_effort, None)
+        || parsed.turn_contexts.iter().any(|turn| {
+            turn.effort
+                .as_deref()
+                .is_some_and(|effort| Some(effort) != inputs.requested_effort)
+        })
+    {
         failure = Some(CodexParentResolutionStatus::Ambiguous);
     }
     if let (Some(expected), Some(actual)) = (inputs.codex_version, meta.cli_version.as_deref()) {
@@ -846,8 +946,8 @@ mod tests {
                 requested_effort: Some("high".to_string()),
                 rollout_model: CodexParentResolvedField::Known("gpt-5-codex".to_string()),
                 rollout_effort: CodexParentResolvedField::Known("high".to_string()),
-                observed_model: CodexParentResolvedField::Known("gpt-5-codex".to_string()),
-                observed_effort: CodexParentResolvedField::Known("high".to_string()),
+                observed_model: CodexParentResolvedField::Unknown,
+                observed_effort: CodexParentResolvedField::Unknown,
                 server_rerouted_model: None,
                 model_mismatch: false,
                 turn_usage: CodexParentTurnUsage::Known {
@@ -862,7 +962,45 @@ mod tests {
     }
 
     #[test]
-    fn ephemeral_app_server_evidence_uses_provider_start_settings_without_rollout() {
+    fn native_provider_response_preserves_reports_and_refuses_contradictions_or_missing_model() {
+        let cwd = Path::new("/work/tree");
+        let inputs = inputs(cwd);
+        for (model, effort, accepted) in [
+            (Some("gpt-5-codex"), Some("high"), true),
+            (Some("gpt-5-codex"), None, true),
+            (Some("gpt-5-codex"), Some("low"), false),
+            (Some("gpt-5-codex"), Some("xhigh"), false),
+            (Some("other-model"), Some("high"), false),
+            (None, Some("high"), false),
+        ] {
+            let lines = [
+                format!(r#"{{"type":"thread.started","thread_id":"{THREAD}"}}"#),
+                serde_json::json!({"type":"response.completed","response":{
+                    "status":"completed","model":model,"reasoning":{"effort":effort}
+                }})
+                .to_string(),
+                r#"{"type":"turn.completed","usage":{"input_tokens":10,"output_tokens":2}}"#.into(),
+            ];
+            let captured = parse_exec_stream(lines.join("\n").as_bytes());
+            let rollout = RolloutResolution {
+                model: CodexParentResolvedField::Known("gpt-5-codex".into()),
+                effort: CodexParentResolvedField::Known("high".into()),
+                failure: None,
+            };
+            let evidence = assemble_evidence(&inputs, captured, rollout);
+            assert_eq!(evidence.observed_model.known(), model);
+            assert_eq!(evidence.observed_effort.known(), effort);
+            assert_eq!(
+                evidence.identity_matches_request(),
+                accepted,
+                "{model:?}/{effort:?}"
+            );
+        }
+        assert!(parse_exec_stream(br#"{"type":"response.completed","response":{"status":"completed","model":"one","model":"two"}}"#).is_err());
+    }
+
+    #[test]
+    fn ephemeral_app_server_settings_are_requested_identity_without_rollout() {
         use super::super::codex_app_server::{
             AppServerTokenUsage, CommandExecutionEvidence, TurnTerminalStatus,
         };
@@ -914,20 +1052,14 @@ mod tests {
         outcome.resolved_model = "gpt-5.6-luna".to_string();
         let fallback =
             codex_parent_evidence_from_app_server_run(&inputs, Some(&outcome), &codex_home);
-        assert_eq!(fallback.usage_model(), Some("gpt-5.6-luna"));
+        assert_eq!(fallback.usage_model(), None);
         assert!(fallback.model_mismatch);
         assert_eq!(fallback.requested_model.as_deref(), Some("gpt-5.6-sol"));
         outcome.resolved_model = "gpt-5.6-sol".to_string();
-        assert_eq!(evidence.rollout_model, CodexParentResolvedField::Unknown);
-        assert_eq!(evidence.rollout_effort, CodexParentResolvedField::Unknown);
-        assert_eq!(
-            evidence.observed_model,
-            CodexParentResolvedField::Known("gpt-5.6-sol".to_string())
-        );
-        assert_eq!(
-            evidence.observed_effort,
-            CodexParentResolvedField::Known("xhigh".to_string())
-        );
+        assert_eq!(evidence.rollout_model.known(), Some("gpt-5.6-sol"));
+        assert_eq!(evidence.rollout_effort.known(), Some("xhigh"));
+        assert_eq!(evidence.observed_model, CodexParentResolvedField::Unknown);
+        assert_eq!(evidence.observed_effort, CodexParentResolvedField::Unknown);
         assert!(matches!(
             evidence.turn_usage,
             CodexParentTurnUsage::Known {
@@ -941,7 +1073,7 @@ mod tests {
         assert_eq!(
             codex_parent_evidence_from_app_server_run(&inputs, Some(&outcome), &codex_home)
                 .resolution_status,
-            "ambiguous"
+            "complete"
         );
         outcome.resolved_effort = Some("xhigh".to_string());
         outcome.token_usage = None;
@@ -1039,10 +1171,7 @@ mod tests {
                 &[&session_meta(cwd), &good(None)],
             )],
         );
-        assert_eq!(
-            no_effort.failure,
-            Some(CodexParentResolutionStatus::Ambiguous)
-        );
+        assert_eq!(no_effort.failure, None);
         assert_eq!(
             no_effort.model,
             CodexParentResolvedField::Known("gpt-5-codex".to_string())
@@ -1184,7 +1313,7 @@ mod tests {
         ));
         assert_eq!(
             zero_usage.observed_effort,
-            CodexParentResolvedField::Known("high".to_string())
+            CodexParentResolvedField::Unknown
         );
 
         let no_turn = assemble_evidence(&inputs, Ok(stream(&[&started])), rollout());

@@ -2269,14 +2269,7 @@ impl ClaudeNativeEvidence {
         if requested_model != Some(model) {
             return Some("Claude served model does not match the requested model");
         }
-        let Some(effort) = self
-            .observed_effort
-            .as_deref()
-            .filter(|value| !value.is_empty())
-        else {
-            return Some("Claude served effort is unknown in the pinned native stream");
-        };
-        if requested_effort != Some(effort) {
+        if !super::effort_matches_request(requested_effort, self.observed_effort.as_deref()) {
             return Some("Claude served effort does not match the requested effort");
         }
         None
@@ -3076,13 +3069,13 @@ mod tests {
                 Some(CLAUDE_MANAGED_PRIMARY_MODEL)
             );
             assert_eq!(evidence.observed_effort, None);
-            for requested in [Some("high"), Some("low"), None] {
+            for requested in [Some("high"), Some("low")] {
                 assert_eq!(
                     evidence.identity_publication_refusal(
                         Some(CLAUDE_MANAGED_PRIMARY_MODEL),
                         requested
                     ),
-                    Some("Claude served effort is unknown in the pinned native stream")
+                    None
                 );
             }
             assert!(evidence.usage_lower_bound().is_some());
@@ -3344,7 +3337,7 @@ mod tests {
         assert_eq!(evidence.observed_effort, None);
         assert_eq!(
             evidence.identity_publication_refusal(Some(CLAUDE_MANAGED_PRIMARY_MODEL), Some("high")),
-            Some("Claude served effort is unknown in the pinned native stream")
+            None
         );
         assert_eq!(evidence.complete_usage().unwrap().input_tokens, 72);
         assert_eq!(evidence.complete_usage().unwrap().output_tokens, 28);

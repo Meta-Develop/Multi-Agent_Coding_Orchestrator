@@ -2476,6 +2476,65 @@
               }
             ]
           },
+          "runtime_identity": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "effort": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "effort_basis": {
+                    "enum": [
+                      "requested",
+                      "provider_reported",
+                      null
+                    ]
+                  },
+                  "model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "model_basis": {
+                    "enum": [
+                      "requested",
+                      "provider_reported",
+                      null
+                    ]
+                  },
+                  "requested_effort": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "requested_model": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  }
+                },
+                "required": [
+                  "requested_model",
+                  "requested_effort",
+                  "model",
+                  "effort",
+                  "model_basis",
+                  "effort_basis"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "sandbox_denials": {
             "items": {
               "additionalProperties": false,
@@ -7768,6 +7827,65 @@
                           }
                         ]
                       },
+                      "runtime_identity": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "effort_basis": {
+                                "enum": [
+                                  "requested",
+                                  "provider_reported",
+                                  null
+                                ]
+                              },
+                              "model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "model_basis": {
+                                "enum": [
+                                  "requested",
+                                  "provider_reported",
+                                  null
+                                ]
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "requested_model",
+                              "requested_effort",
+                              "model",
+                              "effort",
+                              "model_basis",
+                              "effort_basis"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "sandbox_denials": {
                         "items": {
                           "additionalProperties": false,
@@ -9597,6 +9715,65 @@
                         "status",
                         "input_tokens",
                         "output_tokens"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "runtime_identity": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "effort_basis": {
+                          "enum": [
+                            "requested",
+                            "provider_reported",
+                            null
+                          ]
+                        },
+                        "model": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "model_basis": {
+                          "enum": [
+                            "requested",
+                            "provider_reported",
+                            null
+                          ]
+                        },
+                        "requested_effort": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        },
+                        "requested_model": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "requested_model",
+                        "requested_effort",
+                        "model",
+                        "effort",
+                        "model_basis",
+                        "effort_basis"
                       ],
                       "type": "object"
                     }
@@ -15117,6 +15294,65 @@
                               "status",
                               "input_tokens",
                               "output_tokens"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "runtime_identity": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "effort_basis": {
+                                "enum": [
+                                  "requested",
+                                  "provider_reported",
+                                  null
+                                ]
+                              },
+                              "model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "model_basis": {
+                                "enum": [
+                                  "requested",
+                                  "provider_reported",
+                                  null
+                                ]
+                              },
+                              "requested_effort": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "requested_model": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "requested_model",
+                              "requested_effort",
+                              "model",
+                              "effort",
+                              "model_basis",
+                              "effort_basis"
                             ],
                             "type": "object"
                           }

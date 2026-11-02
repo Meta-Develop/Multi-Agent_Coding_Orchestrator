@@ -11,6 +11,7 @@ use crate::llm::provider::ModelPricing;
 use crate::runtime_adapter::grok::{
     GrokAcpNativeCostEquivalent, GrokAcpParentEvidence, GrokAcpParentResolvedField,
 };
+use crate::runtime_adapter::IdentityBasis;
 use crate::selection::{
     CandidateKey, FailureClass, OutcomeRecord, OutcomeResult, ReasoningEffort, RuntimeCatalog,
     TaskProfile,
@@ -77,9 +78,13 @@ pub(super) struct AttemptOutcomeEvidence {
     pub requested_runtime: String,
     pub requested_model: Option<String>,
     pub requested_effort: Option<String>,
-    /// A configured launch is a request. Only provider/session evidence may set
-    /// this field; current supervisor telemetry cannot resolve it.
+    /// Launch identity from parent-held evidence. The retained wire name does
+    /// not imply a provider observation; the basis fields distinguish requests.
     pub observed_candidate: Option<CandidateKey>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_basis: Option<IdentityBasis>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effort_basis: Option<IdentityBasis>,
     /// A retry is a parent decision (`Rejected` + retry cause). Terminal accept
     /// is stamped by the parent as `Accepted` with
     /// `final_parent_assignment_review`. Frozen history still infers a missing
@@ -258,6 +263,12 @@ pub(super) fn record_child_attempt_outcome_with_account_observe(
             .map(|event| event.provenance.normalized_input.catalogs.as_slice());
     let (observed_candidate, mut worker_observed_microunits) =
         parent_attempt_observation(external_run, frozen_catalogs, dated_plan_pricing);
+    let (model_basis, effort_basis) = parent_attempt_identity_basis(
+        external_run,
+        requested_model,
+        requested_effort,
+        observed_candidate.as_ref(),
+    );
     let mut pricing = Vec::new();
     if let Some((ledger, reservation_id)) = settlement {
         let charge = settled_outcome_charge(ledger, reservation_id)?;
@@ -295,6 +306,8 @@ pub(super) fn record_child_attempt_outcome_with_account_observe(
         requested_model: requested_model.map(str::to_string),
         requested_effort: requested_effort.map(str::to_string),
         observed_candidate,
+        model_basis,
+        effort_basis,
         parent_result: retried.then_some(OutcomeResult::Rejected),
         parent_cause: retried.then(|| PARENT_AUTHORIZED_RETRY_CAUSE.to_string()),
         failure_class: None,
@@ -399,6 +412,60 @@ fn selection_event_for_attempt<'a>(
         })
 }
 
+fn parent_attempt_identity_basis(
+    external_run: Option<&ExternalAgentRun>,
+    requested_model: Option<&str>,
+    requested_effort: Option<&str>,
+    candidate: Option<&CandidateKey>,
+) -> (Option<IdentityBasis>, Option<IdentityBasis>) {
+    let Some(run) = external_run.filter(|_| candidate.is_some()) else {
+        return (None, None);
+    };
+    if let Some(evidence) = run.authenticated_codex_evidence() {
+        let basis = |reported: Option<&str>, bound: Option<&str>, requested: Option<&str>| {
+            if reported.is_some() {
+                Some(IdentityBasis::ProviderReported)
+            } else if requested.is_some() && bound == requested {
+                Some(IdentityBasis::Requested)
+            } else {
+                None
+            }
+        };
+        return (
+            basis(
+                evidence.observed_model.known(),
+                evidence.requested_model.as_deref(),
+                requested_model,
+            ),
+            basis(
+                evidence.observed_effort.known(),
+                evidence.requested_effort.as_deref(),
+                requested_effort,
+            ),
+        );
+    }
+    if let Some(evidence) = &run.grok_acp_parent_evidence {
+        // Client/session acknowledgements are never provider observations.
+        let basis = |acknowledged: Option<&str>, bound: Option<&str>, requested: Option<&str>| {
+            (requested.is_some() && acknowledged == requested && bound == requested)
+                .then_some(IdentityBasis::Requested)
+        };
+        return (
+            basis(
+                resolved_field_known(&evidence.client_resolved_model),
+                evidence.requested_model.as_deref(),
+                requested_model,
+            ),
+            basis(
+                resolved_field_known(&evidence.client_resolved_effort),
+                evidence.requested_effort.as_deref(),
+                requested_effort,
+            ),
+        );
+    }
+    (None, None)
+}
+
 fn parent_attempt_observation(
     external_run: Option<&ExternalAgentRun>,
     frozen_catalogs: Option<&[RuntimeCatalog]>,
@@ -447,7 +514,10 @@ fn complete_codex_session(evidence: &CodexParentEvidence) -> Option<(&str, Reaso
         return None;
     }
     let model = evidence.usage_model()?;
-    let effort_label = evidence.observed_effort.known()?;
+    let effort_label = evidence
+        .observed_effort
+        .known()
+        .or(evidence.requested_effort.as_deref())?;
     let effort = reasoning_effort_from_observed_label(effort_label)?;
     Some((model, effort))
 }
@@ -1599,6 +1669,8 @@ mod tests {
             requested_runtime: "codex".to_string(),
             requested_model: Some("fixture-model".to_string()),
             requested_effort: Some("high".to_string()),
+            model_basis: None,
+            effort_basis: None,
             observed_candidate: Some(candidate),
             parent_result: Some(OutcomeResult::Accepted),
             parent_cause: Some(FINAL_PARENT_ASSIGNMENT_REVIEW_CAUSE.to_string()),
@@ -4361,6 +4433,58 @@ mod tests {
         assert_eq!(recorded.costs.review_cost_microunits, Some(0));
         assert_eq!(recorded.costs.rereview_cost_microunits, Some(0));
         assert!(recorded.costs.environment_cost_microunits.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn attempt_journal_exports_requested_and_provider_reported_identity_basis() -> Result<()> {
+        for reported in [false, true] {
+            let (temp, repo) = super::super::tests::injected_repository();
+            let mut evidence = trusted_codex_parent_evidence(TrustedCodexParentEvidenceInput {
+                requested_model: Some("gpt-5.6-sol"),
+                requested_effort: Some("high"),
+                rollout_model: "gpt-5.6-sol",
+                rollout_effort: "high",
+                observed_model: "gpt-5.6-sol",
+                observed_effort: "high",
+                server_rerouted: None,
+                usage: known_codex_usage(10, 4),
+                resolution_status: "complete",
+            });
+            if !reported {
+                evidence.observed_model = CodexParentResolvedField::Unknown;
+                evidence.observed_effort = CodexParentResolvedField::Unknown;
+            }
+            let run = parent_run_with_codex_evidence(&temp, &repo, evidence);
+            let restored: ExternalAgentRun = serde_json::from_slice(&serde_json::to_vec(&run)?)?;
+            let recorded = record_codex_attempt(
+                run,
+                "attempt-identity-basis",
+                1,
+                "gpt-5.6-sol",
+                &BTreeMap::new(),
+                None,
+            )?;
+            assert!(recorded.observed_candidate.is_some());
+            let expected = if reported {
+                IdentityBasis::ProviderReported
+            } else {
+                IdentityBasis::Requested
+            };
+            assert_eq!(recorded.model_basis, Some(expected));
+            assert_eq!(recorded.effort_basis, Some(expected));
+            let wire = serde_json::to_value(&recorded)?;
+            assert_eq!(wire["effort_basis"], serde_json::to_value(expected)?);
+            assert_eq!(
+                parent_attempt_identity_basis(
+                    Some(&restored),
+                    Some("gpt-5.6-sol"),
+                    Some("high"),
+                    recorded.observed_candidate.as_ref()
+                ),
+                (None, None)
+            );
+        }
         Ok(())
     }
 

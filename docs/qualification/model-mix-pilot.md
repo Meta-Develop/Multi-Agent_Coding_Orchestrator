@@ -42,15 +42,17 @@ common-plan and per-profile effective-plan SHA256 hashes. The live comparison
 hash also binds the resolved source commit/tree and frozen runtime executable
 allowlist. Per-cell evidence retains the manifest/profile digest, original and
 effective plan, requested runtime/model/effort for every declared role and
-explicitly unknown observed model/effort when unavailable. Catalog resolution,
-requested effort and usage labels are insufficient provider identity evidence.
-Observed model and effort are projected per role only from authenticated,
-dispatch-bound native evidence after the cell's finalized artifacts and live
-report are verified, and only when every retained dispatch for that role
-agrees. Codex app-server and exec runs can supply both fields. Grok, Claude and
-Gemini supply only their native model, so their effort stays unknown; Cursor
-supplies neither. Missing, mismatched or tampered evidence stays unknown and
-later paid cells are withheld.
+explicitly unknown provider observations when unavailable, plus typed
+`model_basis`/`effort_basis` provenance for every role. The owner policy dated
+2026-11-02 accepts exact launch-bound requested effort without a served-effort
+claim. Codex client settings use requested provenance; native provider response
+fields, when available, use provider_reported provenance. Grok and Claude still
+require matching served models. Cursor records requested model and effort.
+Missing expected models, reported contradictions, incomplete custody/usage and
+unknown retries continue to withhold later cells. Gemini remains model-only
+until an explicit thinking setting is supported and bound by its launch.
+Selection priors must use public per-effort benchmark scores with source URL
+and benchmark/snapshot date; no xhigh-to-low substitution is permitted.
 
 Prepare live inputs under the [shared prerequisites](README.md). Copy the caller
 plan outside the evaluated repository. Complete the existing

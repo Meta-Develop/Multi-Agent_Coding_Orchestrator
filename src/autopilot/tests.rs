@@ -359,6 +359,7 @@ fn synthetic_lens_dispatch_evidence(
         grok_stream_usage_evidence: None,
         grok_acp_parent_evidence: None,
         codex_parent_evidence: None,
+        runtime_identity: None,
         fixed_version_probe_evidence: None,
     };
     review_lens_dispatch_evidence_from_records(

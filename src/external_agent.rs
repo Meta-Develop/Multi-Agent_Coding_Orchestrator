@@ -5121,12 +5121,7 @@ impl ExternalAgentRun {
         !self.stdout.run_metadata.codex_auditor_effort_required
             || self
                 .authenticated_app_server_evidence()
-                .is_some_and(|evidence| {
-                    codex_app_server::observed_effort_meets(
-                        evidence.requested_effort.as_deref(),
-                        evidence.observed_effort.known(),
-                    )
-                })
+                .is_some_and(CodexParentEvidence::identity_matches_request)
     }
 
     fn qualify_codex_auditor_effort(&mut self, spec: &ExternalAgentCommand) {
@@ -5191,7 +5186,10 @@ impl ExternalAgentRun {
 
     pub(crate) fn claude_managed_effort_qualified(&self) -> bool {
         !self.stdout.run_metadata.claude_managed_identity_required
-            || self.authenticated_claude_effort().is_some()
+            || crate::runtime_adapter::effort_matches_request(
+                self.stdout.run_metadata.claude_requested_effort.as_deref(),
+                self.authenticated_claude_effort(),
+            )
     }
 
     #[cfg(test)]
@@ -5745,6 +5743,7 @@ struct ExternalAgentRunMetadata {
     claude_native_evidence: Option<ClaudeNativeEvidence>,
     /// Parent launch shape only; never serialized or inferred from stream claims.
     claude_managed_identity_required: bool,
+    claude_requested_effort: Option<String>,
     managed_grok_selection: Option<ManagedGrokAccountSelectionEvidence>,
     managed_codex_selection: Option<FrozenCodexSelectedBinding>,
     managed_gemini_selection: Option<ManagedGeminiAccountSelectionEvidence>,
@@ -11828,6 +11827,7 @@ fn record_completed_target(
     report.stdout.run_metadata.claude_native_evidence = claude_native_evidence.clone();
     report.stdout.run_metadata.claude_managed_identity_required =
         context.spec.uses_live_claude_managed_worker_budget();
+    report.stdout.run_metadata.claude_requested_effort = context.spec.reasoning_effort.clone();
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
     if let Some(evidence) = context.grok_acp_parent_evidence {
@@ -12020,7 +12020,8 @@ fn record_completed_target(
             .codex_cli_parent_evidence
             .as_ref()
             .is_some_and(|evidence| {
-                evidence.model_mismatch || report.stdout.run_metadata.codex_cli_usage.is_none()
+                !evidence.identity_matches_request()
+                    || report.stdout.run_metadata.codex_cli_usage.is_none()
             })
     {
         report.publishable = false;
@@ -12070,19 +12071,6 @@ fn cursor_managed_publication_refusal(
                 .to_string(),
         );
     }
-    // Identity is mandatory even when the caller omitted its selection. The
-    // pinned stream's token counters do not attest to a served model or effort.
-    if evidence
-        .actual_provider_model
-        .as_ref()
-        .is_none_or(|model| model.trim().is_empty())
-        || evidence
-            .actual_effort
-            .as_ref()
-            .is_none_or(|effort| effort.trim().is_empty())
-    {
-        return Some("managed Cursor served model or effort evidence is missing".to_string());
-    }
     if spec
         .model
         .as_ref()
@@ -12094,14 +12082,20 @@ fn cursor_managed_publication_refusal(
     {
         return Some("managed Cursor selected model or effort is missing".to_string());
     }
-    if spec
-        .model
-        .as_ref()
-        .is_some_and(|model| evidence.actual_provider_model.as_ref() != Some(model))
-        || spec
-            .reasoning_effort
-            .as_ref()
-            .is_some_and(|effort| evidence.actual_effort.as_ref() != Some(effort))
+    if evidence.client_selected_model != spec.model
+        || evidence.client_selected_effort != spec.reasoning_effort
+        || spec.model.as_ref().is_some_and(|model| {
+            evidence
+                .actual_provider_model
+                .as_ref()
+                .is_some_and(|actual| actual != model)
+        })
+        || spec.reasoning_effort.as_ref().is_some_and(|effort| {
+            evidence
+                .actual_effort
+                .as_ref()
+                .is_some_and(|actual| actual != effort)
+        })
     {
         return Some(
             "managed Cursor observed model or effort does not match the selected launch"

@@ -7429,6 +7429,8 @@ pub(super) mod tests {
             requested_runtime: candidate.runtime.clone(),
             requested_model: Some(candidate.model.clone()),
             requested_effort: Some(selector_effort_as_str(candidate.effort).to_string()),
+            model_basis: None,
+            effort_basis: None,
             observed_candidate: Some(candidate.clone()),
             parent_result: Some(result),
             parent_cause: Some("parent_terminal_result".to_string()),

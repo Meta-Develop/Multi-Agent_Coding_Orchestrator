@@ -66,14 +66,9 @@ impl GrokServedIdentityEvidence {
             return Some("Grok admitted effort is missing or unknown");
         }
         match self.observed_effort.as_deref() {
-            // Preserve the existing standard headless xhigh contracts. This is
-            // an evidence gate, not selection eligibility: new model/effort
-            // lanes (including #688 low) still require observed effort.
-            None if matches!(
-                (requested_model, requested_effort),
-                (Some("grok-4.6" | "grok-4.7"), Some("xhigh"))
-            ) => None,
-            None => Some("Grok served effort is unknown; qualification-only writable lanes require observed effort (#688)"),
+            // The exact immutable launch binds the requested effort. Account,
+            // advertised effort support, priors and containment remain separate gates.
+            None => None,
             Some(effort) if !canonical_effort(effort) => Some("Grok served effort is unknown"),
             Some(effort) if Some(effort) != requested_effort => {
                 Some("Grok served effort does not match the admitted request")
@@ -174,8 +169,7 @@ mod tests {
         );
         assert!(observed
             .publication_refusal(Some(model), Some("low"))
-            .unwrap()
-            .contains("served effort is unknown"));
+            .is_none());
     }
 
     #[test]
@@ -206,19 +200,17 @@ mod tests {
     }
 
     #[test]
-    fn qualification_only_lanes_require_observed_effort() {
+    fn supported_requested_lanes_do_not_require_reported_effort() {
         let observed = identity(json!({"grok-4.6-build": {}}));
         for effort in ["none", "minimal", "low", "medium", "high", "max"] {
             assert!(observed
                 .publication_refusal(Some("grok-4.6"), Some(effort))
-                .unwrap()
-                .contains("qualification-only"));
+                .is_none());
         }
-        // A newly requested label is not grandfathered by the model mapping.
+        // Existing explicit model-label equivalence also applies to requested effort.
         assert!(observed
             .publication_refusal(Some("grok-4.6-build"), Some("xhigh"))
-            .unwrap()
-            .contains("qualification-only"));
+            .is_none());
     }
 
     #[test]
@@ -309,9 +301,14 @@ mod tests {
                 true,
             );
             assert_eq!(observed.observed_effort, None);
-            assert!(observed
-                .publication_refusal(Some("grok-4.6"), Some("low"))
-                .is_some());
+            assert_eq!(
+                observed
+                    .publication_refusal(Some("grok-4.6"), Some("low"))
+                    .is_none(),
+                terminal
+                    .get("modelUsage")
+                    .is_some_and(|models| models == &json!({"grok-4.6":{}}))
+            );
         }
         let truncated =
             GrokServedIdentityEvidence::from_terminal(br#"{"modelUsage":{"grok-4.6":{}}}"#, false);

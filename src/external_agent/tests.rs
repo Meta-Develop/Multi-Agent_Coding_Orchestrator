@@ -1609,9 +1609,15 @@ fn read_only_researcher_app_server_incomplete_identity_or_capture_fails_publicat
         let (run, _, _temp) = contained_read_only_researcher_app_server(mode)?;
         assert_eq!(run.exit_code, Some(0));
         assert!(!run.publishable);
-        assert!(run.error.as_deref().is_some_and(
-            |error| error.contains("identity/usage resolution or raw capture is incomplete")
-        ));
+        if mode == "truncated-capture" {
+            assert!(run
+                .error
+                .as_deref()
+                .is_some_and(|error| error
+                    .contains("identity/usage resolution or raw capture is incomplete")));
+        } else {
+            assert!(run.error.is_none(), "{run:?}");
+        }
         let held = run
             .authenticated_app_server_evidence()
             .context("retained lower bound")?;
@@ -1628,7 +1634,7 @@ fn read_only_researcher_app_server_incomplete_identity_or_capture_fails_publicat
             codex_app_server::TurnTerminalStatus::Completed
         );
         if mode == "unknown-effort" {
-            assert_eq!(held.resolution_status, "ambiguous");
+            assert_eq!(held.resolution_status, "complete");
             assert!(matches!(
                 held.observed_effort,
                 CodexParentResolvedField::Unknown
@@ -5612,8 +5618,8 @@ done
                 requested_effort: Some(REQUESTED_EFFORT.to_string()),
                 rollout_model: known(REQUESTED_MODEL),
                 rollout_effort: known(REQUESTED_EFFORT),
-                observed_model: known(REQUESTED_MODEL),
-                observed_effort: known(REQUESTED_EFFORT),
+                observed_model: CodexParentResolvedField::Unknown,
+                observed_effort: CodexParentResolvedField::Unknown,
                 server_rerouted_model: None,
                 model_mismatch: false,
                 turn_usage: CodexParentTurnUsage::Known {
@@ -5666,7 +5672,7 @@ done
     }
 
     #[test]
-    fn turn_context_without_effort_is_ambiguous_but_keeps_the_model() -> Result<()> {
+    fn turn_context_without_effort_uses_exact_requested_effort() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let cwd = temp.path();
         let report = run_fake_codex_supervisor(
@@ -5680,7 +5686,7 @@ done
             },
         )?;
         let evidence = evidence(&report);
-        assert_eq!(evidence.resolution_status, "ambiguous");
+        assert_eq!(evidence.resolution_status, "complete");
         assert_eq!(evidence.rollout_model, known(REQUESTED_MODEL));
         assert_eq!(evidence.rollout_effort, CodexParentResolvedField::Unknown);
         assert_eq!(evidence.observed_effort, CodexParentResolvedField::Unknown);
@@ -7222,14 +7228,12 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
     };
     assert_eq!(
         cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
-        Some("managed Cursor served model or effort evidence is missing")
+        None
     );
     evidence.actual_provider_model = command.model.clone();
     evidence.actual_effort = command.reasoning_effort.clone();
     assert!(cursor_managed_publication_refusal(&command, Some(&evidence)).is_none());
     for (model, effort) in [
-        (None, Some("high")),
-        (Some("cursor-selected-model"), None),
         (Some(""), Some("high")),
         (Some("cursor-selected-model"), Some(" ")),
         (Some("another-model"), Some("high")),
@@ -7259,7 +7263,7 @@ fn cursor_client_selection_is_not_actual_provider_identity() -> Result<()> {
     evidence.actual_effort = None;
     assert_eq!(
         cursor_managed_publication_refusal(&command, Some(&evidence)).as_deref(),
-        Some("managed Cursor served model or effort evidence is missing")
+        Some("managed Cursor selected model or effort is missing")
     );
     Ok(())
 }
@@ -8636,7 +8640,7 @@ fn claude_native_capture_extracts_only_terminal_result_and_private_evidence_does
             &command,
             run.authenticated_claude_native_evidence()
         ),
-        Some("Claude served effort is unknown in the pinned native stream")
+        None
     );
     let restored: ExternalAgentRun = serde_json::from_value(serde_json::to_value(&run)?)?;
     assert!(restored.authenticated_claude_native_evidence().is_none());
@@ -8696,7 +8700,7 @@ fn claude_native_publication_refuses_missing_mismatched_and_unknown_identity() -
         crate::runtime_adapter::claude::collect_native_stream(&exact_claude_native_stream(), false);
     assert_eq!(
         claude_native_identity_publication_refusal(&command, Some(&evidence)),
-        Some("Claude served effort is unknown in the pinned native stream")
+        None
     );
     // Synthetic matcher coverage; the pinned collector never produces observed effort.
     evidence.observed_effort = Some("low".to_string());
@@ -8898,6 +8902,39 @@ fn writable_grok_external_boundary_names_every_selection_and_confinement_refusal
         error.contains("writable grok failed closed before launch")
             && error.contains("blocking_pre_action_callback != All")
     }));
+    Ok(())
+}
+
+#[test]
+fn lower_grok_writable_admission_requires_selection_and_unchanged_confinement() -> Result<()> {
+    for effort in ["low", "medium"] {
+        let unselected = writable_grok_command_before_runtime_selection(
+            "grok",
+            "/workspace",
+            "/run/prompt",
+            "/run",
+        )?
+        .with_model_selection(Some("grok-4.6".into()), Some(effort.into()));
+        assert!(unselected.current_grok_writable_contract().is_err());
+        let selected =
+            unselected.with_writable_runtime_selection("grok-worker", RuntimeId::Grok, true)?;
+        assert!(selected.current_grok_writable_contract().is_ok());
+        let refused = run_external_agent(&selected);
+        assert!(!refused.stdout.target_launch_attempted);
+        assert!(refused
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains(WRITABLE_GROK_CONFINEMENT_PROOF_MISSING)));
+        let selected = selected.with_worktree_writable_confinement(writable_grok_confinement(
+            SideEffectConfinement::Verified,
+        ));
+        assert_eq!(
+            selected.selected_grok_writable_workspace()?,
+            Path::new("/workspace")
+        );
+        let drift = selected.with_model_selection(Some("grok-4.6".into()), Some("xhigh".into()));
+        assert!(drift.current_grok_writable_contract().is_err());
+    }
     Ok(())
 }
 
@@ -9877,7 +9914,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
     );
     // Retained CLI 1.0.60 terminal shape: exact modelUsage label, no effort.
     // Exercise the real publication decision for an already admitted Worker
-    // and the stricter lower-effort qualification through the same path.
+    // and launch-bound lower-effort identity through the same path.
     for (id, label, effort, publishable) in [
         ("served-46", Some("grok-4.6-build"), "xhigh", true),
         ("served-47", Some("grok-4.7-build"), "xhigh", false),
@@ -9888,7 +9925,8 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             false,
         ),
         ("served-missing", None, "xhigh", false),
-        ("served-low", Some("grok-4.6-build"), "low", false),
+        ("served-low", Some("grok-4.6-build"), "low", true),
+        ("served-medium", Some("grok-4.6-build"), "medium", true),
     ] {
         let mut command = grok_command(id)
             .with_workspace_access(WorkspaceAccess::ReadWrite)
@@ -14546,18 +14584,18 @@ fn observed_auditor_transport_retains_private_identity_usage_and_refuses_bad_out
         let held = run
             .authenticated_app_server_evidence()
             .context("private Auditor evidence")?;
-        if mode == "read" {
+        if matches!(mode, "read" | "unknown-effort") {
             assert!(run.error.is_none(), "{run:?}");
             assert_eq!(held.resolution_status, "complete");
-            assert_eq!(held.observed_model.known(), Some("gpt-5.6-sol"));
-            assert_eq!(held.observed_effort.known(), Some("xhigh"));
+            assert!(held.observed_model.known().is_none());
+            assert!(held.observed_effort.known().is_none());
             assert_eq!(
                 run.authenticated_codex_usage().unwrap().total_tokens,
                 37_000
             );
             assert!(matches!(
                 held.rollout_model,
-                CodexParentResolvedField::Unknown
+                CodexParentResolvedField::Known(_)
             ));
             assert_eq!(
                 run.output_last_message(),
@@ -14566,7 +14604,8 @@ fn observed_auditor_transport_retains_private_identity_usage_and_refuses_bad_out
         } else {
             assert!(run.error.is_some(), "{mode}: {run:?}");
             if mode == "low-effort" {
-                assert_eq!(held.observed_effort.known(), Some("high"));
+                assert_eq!(held.rollout_effort.known(), Some("high"));
+                assert!(held.observed_effort.known().is_none());
                 assert!(!run.codex_auditor_effort_qualified());
                 assert!(run.authenticated_codex_usage().is_none());
             }

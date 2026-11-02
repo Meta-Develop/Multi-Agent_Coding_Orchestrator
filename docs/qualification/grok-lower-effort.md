@@ -50,16 +50,21 @@ normally emits them; this preserves the accepted c30b terminal shape. Duplicate,
 ambiguous, malformed or mismatched identity also refuses publication while native
 token charges remain available. Observed effort must be canonical and match.
 
-The existing standard `grok-4.6` / `xhigh` and `grok-4.7` / `xhigh` headless lanes
-keep publication when served effort is explicitly unknown. This preserves their
-existing admission; it does not claim that requested effort was observed. Every
-qualification-only model/effort lane, including #688 `low`, requires **both**
-matching observed model and effort. CLI 1.0.60 cannot pass that strict gate until
-a source-qualified served-effort observation is available. This identity policy
-adds no selection eligibility or priors. Public or restored identity fields cannot
-recreate the private capture. Prior admission and selected-account live acceptance
-remain separate gates; do not launch the lower-effort qualification while its
-served effort is unknown.
+The owner policy dated 2026-11-02 uses the exact launch-bound requested effort
+as effort identity when the provider does not report effort. Reports record
+`effort_basis: requested`; `observed_effort` remains null. This is not a
+served-effort claim. Supported advertised `low` and `medium` lanes can pass this
+identity gate without upgrading to xhigh. A reported effort contradiction still
+refuses. No catalog, prior, containment, launch-proof, journal, complete-usage,
+independent-review, acceptance or publication gate is waived. Public or restored
+identity fields cannot recreate the private capture.
+
+Selection uses dated public per-effort benchmark scores (for example,
+SWE-bench-style leaderboards) as priors, recording the exact source URL and
+benchmark/snapshot date. Never copy an xhigh score to low or invent a score.
+The bundled-prior refusal and selected-account live acceptance remain separate
+open gates; these source changes do not supply a lower-effort prior or qualify
+live execution.
 
 Offline validation (does not evaluate those account/prior gates):
 
@@ -96,7 +101,7 @@ Use `--prior-data` only if an accepted evidence-backed repository-relative
 snapshot already establishes the exact lower-effort eligibility; retain its
 digest. Do not fabricate a snapshot to get through selection.
 
-Acceptance requires requested **and observed served** model/effort identity,
+Acceptance requires a matching served model and explicit launch-bound effort basis,
 the opaque proof bound to exact executable, account, cwd, output/schema,
 permissions, headless protocol and native-delegation denial; complete native
 whole-invocation usage; genuine command/read/edit/check observations; and a
