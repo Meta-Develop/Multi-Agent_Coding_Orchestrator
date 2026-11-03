@@ -3747,6 +3747,7 @@ impl fmt::Display for EvaluationEvidenceKind {
     }
 }
 
+mod coordination_tokens;
 mod executed_experiment;
 mod executed_measurements;
 mod executed_summary;
@@ -3756,6 +3757,12 @@ mod runtime_binding;
 pub use crate::merge::held_out::{CommandObservation, CommandObservationStatus};
 pub use crate::supervise::held_out::{
     HeldOutCandidateEvidence, HeldOutCommandEvidence, HeldOutRunBinding,
+};
+pub use coordination_tokens::{
+    coordination_token_observation, summarize_coordination_observations, CoordinationRoleTokens,
+    CoordinationTokenObservation, CoordinationTokenStatus, CoordinationTokenSummary,
+    COORDINATION_TOKENS_NOT_PROJECTED, SUPERVISOR_AGGREGATE_NOT_OWN_USAGE,
+    SUPERVISOR_USAGE_NOT_RETAINED,
 };
 pub use executed_experiment::{
     run_experiment_with_held_out, run_experiment_with_held_out_and_source,
