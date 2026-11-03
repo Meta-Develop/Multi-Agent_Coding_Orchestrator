@@ -3,6 +3,7 @@
 use super::EvaluationProfile;
 use super::{
     compare_observed_dispatch_records, compare_observed_supervisor_execution,
+    coordination_tokens::{coordination_token_observation, summarize_coordination_observations},
     executed_experiment::ObservedExperimentRun,
     executed_measurements::{
         parent_review_capture_proof_binding_invalid, parent_review_capture_proven,
@@ -11,6 +12,7 @@ use super::{
     DispatchComparabilityClaim, DispatchComparison, ExecutionTelemetryComparability,
     ParetoConclusion, ParetoConclusionStatus, PreciseMean, RequirementFourComparability,
 };
+use crate::evaluation::CoordinationTokenSummary;
 use crate::{artifacts::state_auth::sha256_hex, llm::provider::Usage, supervise::AgentRole};
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -45,6 +47,11 @@ pub struct ExecutedProfileSummary {
     pub repetitions: u32,
     pub mean_wall_time_ms: PreciseMean,
     pub aggregate_reported_usage: Option<Usage>,
+    /// Own tokens of the supervising agent plus any child orchestrator.
+    /// This is not a Pareto axis. `None` means unknown, including when the
+    /// supervisor row is only a child rollup. Historical summaries omit it.
+    #[serde(default)]
+    pub coordination_tokens: CoordinationTokenSummary,
     pub aggregate_reported_cost_usd: Option<f64>,
     pub mean_reported_cost_usd: Option<f64>,
     /// Per-repetition identities are retained because contracts may differ.
@@ -359,11 +366,16 @@ fn aggregate_profiles(
         let mut qualified_total = 0u32;
         let mut quality_refusal: Option<String> = None;
         let mut pricing = Vec::new();
+        let mut coordination_observations = Vec::with_capacity(profile_runs.len());
         for run in profile_runs {
             wall_time_ms = wall_time_ms
                 .checked_add(run.wall_time_ms)
                 .ok_or_else(|| anyhow!("profile wall-time aggregate overflowed"))?;
             let measurements = run.measurements.as_ref();
+            coordination_observations.push(match measurements {
+                Some(measurements) => coordination_token_observation(&measurements.role_usage),
+                None => coordination_token_observation(&BTreeMap::new()),
+            });
             pricing.push(ExecutedRunPricing {
                 repetition: run.held_out.run.repetition,
                 pricing: measurements.and_then(|measurements| measurements.pricing.clone()),
@@ -519,6 +531,7 @@ fn aggregate_profiles(
             repetitions: manifest.repetitions,
             mean_wall_time_ms: precise_mean(wall_time_ms, manifest.repetitions)?,
             aggregate_reported_usage: aggregate_usage,
+            coordination_tokens: summarize_coordination_observations(&coordination_observations),
             aggregate_reported_cost_usd: aggregate_cost,
             mean_reported_cost_usd,
             priced_cost_complete: if pricing.iter().any(|run| {
@@ -1569,5 +1582,133 @@ mod tests {
         assert!(error
             .to_string()
             .contains("baseline differs across experiment profiles"));
+    }
+
+    #[test]
+    fn executed_summary_coordination_tokens_refuse_child_rollup_and_keep_explicit_own_usage() {
+        use crate::llm::provider::Usage;
+        use crate::supervise::{RoleUsageObservation, RoleUsageReport};
+
+        let manifest = observation_manifest();
+        let manifest_sha256 = sha256_hex(&serde_json::to_vec(&manifest).expect("manifest"));
+        let mut aggregate_run =
+            observed_run(&manifest.profiles[0], &manifest_sha256, 0.01, "worker-low");
+        let mut own_run =
+            observed_run(&manifest.profiles[1], &manifest_sha256, 0.03, "worker-high");
+        let worker = Usage {
+            input_tokens: 80,
+            output_tokens: 20,
+            total_tokens: 100,
+        };
+        let own = Usage {
+            input_tokens: 4,
+            output_tokens: 6,
+            total_tokens: 10,
+        };
+        aggregate_run
+            .measurements
+            .as_mut()
+            .expect("measurements")
+            .role_usage
+            .insert(
+                AgentRole::Supervisor,
+                RoleUsageReport {
+                    models: Vec::new(),
+                    usage: Some(worker),
+                    cost_usd: None,
+                    observation: RoleUsageObservation::SupervisorAggregate,
+                    unavailable_reason: None,
+                },
+            );
+        aggregate_run
+            .measurements
+            .as_mut()
+            .expect("measurements")
+            .role_usage
+            .insert(
+                AgentRole::Worker,
+                RoleUsageReport {
+                    models: Vec::new(),
+                    usage: Some(worker),
+                    cost_usd: None,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    unavailable_reason: None,
+                },
+            );
+        own_run
+            .measurements
+            .as_mut()
+            .expect("measurements")
+            .role_usage
+            .insert(
+                AgentRole::Supervisor,
+                RoleUsageReport {
+                    models: Vec::new(),
+                    usage: Some(own),
+                    cost_usd: None,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    unavailable_reason: None,
+                },
+            );
+        own_run
+            .measurements
+            .as_mut()
+            .expect("measurements")
+            .role_usage
+            .insert(
+                AgentRole::Worker,
+                RoleUsageReport {
+                    models: Vec::new(),
+                    usage: Some(worker),
+                    cost_usd: None,
+                    observation: RoleUsageObservation::ProcessObserved,
+                    unavailable_reason: None,
+                },
+            );
+
+        let summary = summarize_executed_observation_runs(
+            &manifest,
+            &manifest_sha256,
+            &[aggregate_run, own_run],
+        )
+        .expect("summary");
+        let rolled_up = summary
+            .profile_summaries
+            .iter()
+            .find(|profile| profile.profile_id == manifest.profiles[0].id)
+            .expect("aggregate profile");
+        assert!(rolled_up.coordination_tokens.aggregate_total.is_none());
+        assert_ne!(rolled_up.coordination_tokens.aggregate_total, Some(worker));
+        assert!(rolled_up
+            .coordination_tokens
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("supervisor_aggregate_not_own_usage"));
+        let owned = summary
+            .profile_summaries
+            .iter()
+            .find(|profile| profile.profile_id == manifest.profiles[1].id)
+            .expect("own profile");
+        assert_eq!(owned.coordination_tokens.aggregate_total, Some(own));
+        assert_eq!(owned.coordination_tokens.repetitions_known, 1);
+        assert!(owned.coordination_tokens.unavailable_reason.is_none());
+
+        let mut value = serde_json::to_value(&summary).expect("summary json");
+        value["profile_summaries"][0]
+            .as_object_mut()
+            .expect("profile object")
+            .remove("coordination_tokens");
+        let historical: ExecutedExperimentSummary =
+            serde_json::from_value(value).expect("historical summary");
+        let omitted = &historical.profile_summaries[0].coordination_tokens;
+        assert!(omitted.aggregate_total.is_none());
+        assert_eq!(omitted.repetitions_known, 0);
+        assert_eq!(omitted.repetitions_unknown, 0);
+        assert!(omitted
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("coordination_tokens_not_projected"));
     }
 }
