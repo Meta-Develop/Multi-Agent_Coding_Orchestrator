@@ -234,6 +234,56 @@ Prerequisites:
   It grants no account, prior, schema, identity or publication exemption.
   4.6 ACP behavior is unchanged. Follow the
   [4.7 ACP qualification command](qualification/grok47-acp.md) for this exception.
+Headless Codex account setup. The Linux Nix `maco` package includes
+`cam-codex-setup`. From a source checkout, use
+`cargo run --locked -p coding-agent-manager --bin cam-codex-setup --` as the
+command prefix instead:
+
+```bash
+cam-codex-setup prepare work
+```
+
+Run the exact command printed by `prepare` in your own terminal:
+
+```text
+env -u OPENAI_API_KEY CODEX_HOME='…' codex login --device-auth
+```
+
+Complete the vendor device login, then inspect the pending account and use its
+`accountIncarnation` as `<n>`:
+
+```bash
+cam-codex-setup status
+cam-codex-setup complete work --incarnation <n>
+```
+
+All three commands accept `--data-dir ABSOLUTE_PATH` before the action; omit it
+for the CAM directory MACO uses by default. `--data-dir` overrides setup only;
+it does not redirect MACO's default registry.
+IDs cannot contain `__`, end with `_`, or use the reserved `codex-cli-on-disk` id.
+`prepare` exclusively reserves a private pending home and never starts login.
+`complete` checks for a bounded, regular, non-symlink JSON object and atomically
+completes and selects that exact pending incarnation. This is a local shape
+check, not proof of vendor acceptance. A stale incarnation, invalid auth, or an
+active login lease refuses completion. There is no import, overwrite, or delete
+command; retained homes are never adopted.
+
+This follows [ADR 0008](../account-manager/docs/adr/0008-vendor-written-auth-json-for-stored-codex-accounts.md):
+the vendor writes auth inside a private managed directory; setup never rewrites
+the file or changes its mode. Selecting this account changes CAM metadata only.
+Supervised Codex launches project the selected auth into a private runtime
+`CODEX_HOME`; other tools keep their live login. No default-home auth is imported.
+When no authority service is installed, leave `MACO_CAM_AUTHORITY_SOCKET` unset
+for local registry selection. A discovered default authority endpoint or an
+explicitly configured socket remains the selection source and must be available.
+
+Use the selected CAM id (`work` here) as the pricing contract scope's
+`account_id`, with exact runtime `codex`, model, and plan id. See
+[operator pricing](OPERATOR_PRICING.md). Login does not populate all catalog
+metadata: CAM observes `{data}/accounts/codex-cli/<id>/models_cache.json`.
+Missing or invalid model/effort metadata still refuses automatic selection;
+setup does not fabricate a cache or make provider calls.
+
 Owner device login. `cam-grok-setup` is Linux-only and does not start login.
 The Nix `maco` package includes the binary. From a source checkout:
 ```bash
