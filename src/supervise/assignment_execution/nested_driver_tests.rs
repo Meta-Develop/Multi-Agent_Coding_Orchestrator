@@ -202,6 +202,10 @@ impl Drop for GrokBinaryEnvironmentGuard {
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
 pub(super) fn driver_fixture(case: &str) -> Result<()> {
+    driver_fixture_with_scheduler(case, None)
+}
+
+fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -> Result<()> {
     let attached_capture = matches!(
         case,
         "attached-capture-success"
@@ -217,14 +221,22 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         )
     });
     let isolated = case.starts_with("managed-cycle-isolated-");
+    let managed_process = case.starts_with("managed-cycle-process-");
     let interrupted_worker = case.starts_with("managed-cycle-isolated-interrupted-");
     let grok_continuation = case == "continuation-grok-happy";
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
     WorktreeManager::init_repository(&repo, "main")?;
     fs::create_dir(repo.join("src"))?;
-    fs::write(repo.join("src/lib.rs"), "pub fn selected() {}\n")?;
-    if isolated {
+    fs::write(
+        repo.join("src/lib.rs"),
+        if scheduler.is_some() {
+            "pub mod shared { pub fn selected() {} }\n"
+        } else {
+            "pub fn selected() {}\n"
+        },
+    )?;
+    if isolated || managed_process {
         fs::write(repo.join("src/other.rs"), "pub fn other() {}\n")?;
     }
     let git = crate::git_repository::open(&repo)?;
@@ -234,7 +246,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     local.set_str("user.email", "fixture@example.invalid")?;
     let mut index = git.index()?;
     index.add_path(Path::new("src/lib.rs"))?;
-    if isolated {
+    if isolated || managed_process {
         index.add_path(Path::new("src/other.rs"))?;
     }
     index.write()?;
@@ -255,10 +267,22 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         let mut second = parent.worker_assignments[0].clone();
         second.id = "worker-two".into();
         second.report_path = Some("worker-two.json".into());
-        if isolated {
+        if isolated || managed_process {
             second.assigned_paths = vec!["src/other.rs".into()];
         }
         parent.worker_assignments.push(second);
+    }
+    if managed_process {
+        parent.task =
+            Some("Implement first() returning 40 and other::second() returning first() + 2".into());
+        parent.worker_assignments[0].task = Some(
+            "Add first() -> u32 returning 40 and expose the other module in src/lib.rs".into(),
+        );
+        parent.worker_assignments[1].task =
+            Some("Add second() -> u32 returning crate::first() + 2 in src/other.rs".into());
+    }
+    if scheduler.is_some() {
+        parent.semantic_modules = vec!["shared".into()];
     }
     let worker: OrchestratorAssignment = serde_json::from_value(json!({
         "id":"worker", "phase":"execution", "role":"worker",
@@ -266,7 +290,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     }))?;
     let mut worker_two = worker.clone();
     worker_two.id = "worker-two".into();
-    if isolated {
+    if isolated || managed_process {
         worker_two.assigned_paths = vec!["src/other.rs".into()];
     }
     let mut plan: SupervisorPlan = serde_json::from_value(json!({
@@ -280,6 +304,27 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             "auditor":{"model":"gpt-6.1-sol", "reasoning_effort":"high"}
         }
     }))?;
+    if scheduler.is_some() {
+        plan.semantic_coordination = SemanticCoordinationMode::Block;
+    }
+    if managed_process {
+        plan.max_depth = 3;
+        plan.max_child_assignments = 3;
+        plan.child_timeout_seconds = 30;
+        plan = validate_supervisor_plan(
+            plan,
+            SupervisorPlanMetadata {
+                assignment_schedule: vec![AssignmentScheduleEntry {
+                    assignment_id: parent.id.clone(),
+                    parent_assignment_id: None,
+                    depth: 2,
+                    flattened_index: 0,
+                }],
+                ..Default::default()
+            },
+        )?
+        .0;
+    }
     let run_id =
         if case.starts_with("managed-cycle-") || attached_capture || bound_parent || unbound_parent
         {
@@ -401,7 +446,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
     let schedule = vec![AssignmentScheduleEntry {
         assignment_id: parent.id.clone(),
         parent_assignment_id: None,
-        depth: 1,
+        depth: if managed_process { 2 } else { 1 },
         flattened_index: 0,
     }];
     super::super::messaging_bridge::initialize_supervisor_messaging_session(
@@ -637,6 +682,15 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         if case == "attached-capture-panic" && subject.id == "parent" {
             panic!("attached parent runner panicked");
         }
+        let parent_claim = if scheduler.is_some() {
+            let claims = sync_store.snapshot().unwrap();
+            assert_eq!(claims.len(), 1);
+            assert_eq!(claims[0].agent_id, "parent");
+            assert_eq!(semantic_store.snapshot().unwrap().len(), 1);
+            claims[0].clone()
+        } else {
+            claim.clone()
+        };
         let launch_claim = if isolated && subject.id != "parent" {
             assert_ne!(
                 command.cwd, worktree.path,
@@ -691,11 +745,11 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                 );
             } else {
                 assert!(
-                    sync_store.snapshot().unwrap() == vec![claim.clone()],
+                    sync_store.snapshot().unwrap() == vec![parent_claim.clone()],
                     "initial parent or serial runner lost the exact parent claim"
                 );
             }
-            claim.clone()
+            parent_claim
         };
         let mut simulated = command.clone();
         simulated.model = None;
@@ -736,9 +790,24 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             &fake_subject,
             &metadata,
             launch_claim.token.get(),
-            None,
+            scheduler.map(|_| semantic_store.snapshot().unwrap()[0].token.get()),
         )
         .unwrap();
+        #[cfg(target_os = "linux")]
+        if case.starts_with("managed-cycle-process-") {
+            let run = super::managed_parent_process_tests::run(
+                case,
+                command,
+                runner_cancellation,
+                &run,
+                &captured_worker_reports,
+            )
+            .unwrap_or_else(|error| panic!("contained fixture failed: {error:#}"));
+            if subject.id == "parent" {
+                parent_running.store(false, Ordering::SeqCst);
+            }
+            return run;
+        }
         let preserved_journals = run.worker_journal_artifacts().to_vec();
         if case == "attached-capture-success"
             || case == "attached-capture-errors"
@@ -876,7 +945,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                         .unwrap(),
                     );
                 } else {
-                    if case == "managed-cycle-isolated-final-panic" {
+                    if case == "managed-cycle-isolated-final-panic"
+                        || case == "managed-cycle-final-panic"
+                    {
                         panic!("injected unknown final runner result");
                     }
                     assert!(command.assignment_messaging_launch().is_none());
@@ -928,7 +999,9 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     if case == "managed-cycle-isolated-final-malformed" {
                         run.output_last_message = Some(b"{invalid final".to_vec());
                     }
-                    if case == "managed-cycle-isolated-final-unknown-containment" {
+                    if case == "managed-cycle-isolated-final-unknown-containment"
+                        || case == "managed-cycle-final-unknown-containment"
+                    {
                         run.process_tree = None;
                     }
                 }
@@ -974,6 +1047,7 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
                     run.exit_code = Some(1)
                 }
                 "bound-evidence-cancel-during" => cancellation.cancel(),
+                "bound-evidence-unquiescent" => run.process_tree = None,
                 _ => {}
             }
         } else if case.starts_with("managed-cycle-") {
@@ -1021,6 +1095,16 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
             if case == "managed-cycle-cancel-after-first" && subject.id == "worker" {
                 cancellation.cancel();
             }
+        }
+        if case == "managed-cycle-worker-unknown-containment" && subject.id == "worker" {
+            run.process_tree = None;
+        }
+        if case == "managed-cycle-worker-unverified-containment" && subject.id == "worker" {
+            // The tree is empty but full containment qualification failed.
+            // Exercise external_containment_failed independently of the nested
+            // unknown-quiescence latch, without weakening the scratch proof.
+            assert!(run.scratch_quiescence_verified());
+            run.codex_permissions = None;
         }
         if case == "managed-cycle-isolated-worker-malformed" && subject.id == "worker" {
             assert!(external_process_completed(&run, SupervisorRuntime::Codex));
@@ -1114,6 +1198,27 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         cancellation: cancellation.clone(),
         external_runner: &runner,
     };
+    if let Some((width, release_per_assignment)) = scheduler {
+        // The controller fixture's hand-built resources are discarded first.
+        // The actual scheduler must prepare its own lease, claim, semantic
+        // reservation and populated outcome through the production entrypoint.
+        drop(preflight);
+        sync_store.release(claim.token)?;
+        super::super::scheduler::exercise_quarantined_assignment_schedule(
+            &context,
+            width,
+            release_per_assignment,
+            case != "managed-cycle-worker-unverified-containment",
+        )?;
+        let expected: &[&str] = match case {
+            "managed-cycle-worker-unknown-containment" => &["parent", "worker"],
+            "managed-cycle-final-panic" => &["parent", "worker", "worker-two", "parent"],
+            "managed-cycle-worker-unverified-containment" => &["parent", "worker"],
+            _ => bail!("unknown scheduler quarantine fixture"),
+        };
+        assert_eq!(*calls.lock().unwrap(), expected);
+        return Ok(());
+    }
     // Keep the real initial-parent endpoint owner alive through collected-turn
     // handoff; a matching launch value alone does not own its journal or service.
     let unbound_binding = if unbound_parent {
@@ -1169,6 +1274,20 @@ pub(super) fn driver_fixture(case: &str) -> Result<()> {
         unbound_launch.as_ref(),
     )?
     else {
+        if matches!(
+            case,
+            "bound-evidence-unquiescent"
+                | "managed-cycle-final-panic"
+                | "managed-cycle-final-unknown-containment"
+        ) {
+            assert!(outcome.nested_quiescence_unknown);
+            finish_assignment_preflight(&mut outcome, preflight);
+            assert!(
+                manager.acquire_write_execution_lease(&parent.id).is_err(),
+                "unknown serial Worker released the parent write lease"
+            );
+            assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);
+        }
         if isolated {
             assert_eq!(
                 fs::read(git.path().join("index"))?,
@@ -1506,6 +1625,7 @@ fn prepare_and_collect_fixture_parent<'a>(
                 | "bound-evidence-widened"
                 | "bound-evidence-failure"
                 | "bound-evidence-cancel-during" => vec!["parent", "worker-two"],
+                "bound-evidence-unquiescent" => vec!["parent", "worker-two"],
                 case if case.starts_with("bound-evidence-handoff-") => vec!["parent", "worker-two"],
                 _ => vec!["parent"],
             };
@@ -2061,4 +2181,28 @@ fn audit_completed_malformed_worker_still_parses_and_fails() -> Result<()> {
 #[test]
 fn audit_isolated_technically_successful_raw_false_worker_reaches_parent() -> Result<()> {
     driver_fixture("managed-cycle-isolated-raw-false")
+}
+
+#[test]
+fn scheduler_quarantine_uncertain_worker_retains_path_and_semantic_authority() -> Result<()> {
+    for mode in [(1, false), (1, true), (2, true)] {
+        driver_fixture_with_scheduler("managed-cycle-worker-unknown-containment", Some(mode))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_quarantine_final_parent_panic_retains_path_and_semantic_authority() -> Result<()> {
+    for mode in [(1, false), (1, true), (2, true)] {
+        driver_fixture_with_scheduler("managed-cycle-final-panic", Some(mode))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn scheduler_quarantine_containment_failure_without_nested_flag_retains_authority() -> Result<()> {
+    for mode in [(1, false), (1, true), (2, true)] {
+        driver_fixture_with_scheduler("managed-cycle-worker-unverified-containment", Some(mode))?;
+    }
+    Ok(())
 }

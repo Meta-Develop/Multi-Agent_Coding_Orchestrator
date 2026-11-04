@@ -58,6 +58,12 @@ pub(super) fn exercise(
     calls: &Mutex<Vec<String>>,
     overlapping_workers: &super::nested_driver_tests::WorkerRendezvous,
 ) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if case.starts_with("managed-cycle-process-") {
+        return super::managed_parent_process_tests::exercise(
+            case, context, preflight, outcome, prepared, calls,
+        );
+    }
     if case.starts_with("managed-cycle-retained-") {
         return exercise_retained_failure(case, context, preflight, outcome, prepared, calls);
     }
@@ -197,6 +203,21 @@ pub(super) fn exercise(
                 fs::read_to_string(context.repo.join("src/lib.rs"))?,
                 "pub fn selected() {}\n"
             );
+        }
+        "managed-cycle-final-unknown-containment" | "managed-cycle-final-panic" => {
+            assert!(result.is_err());
+            assert!(outcome.nested_quiescence_unknown);
+            assert!(outcome.external_containment_failed);
+            assert!(context.cancellation.is_cancelled());
+            assert!(outcome.usage_incomplete);
+            let budget = context.budget_ledger.report()?;
+            assert_eq!(budget.active_reservations, 0);
+            if case == "managed-cycle-final-panic" {
+                assert!(!budget.usage_complete);
+                assert_eq!(budget.consumed.tokens, 44);
+                assert_eq!(budget.charges.len(), 4);
+            }
+            assert_eq!(observed, ["parent", "worker", "worker-two", "parent"]);
         }
         other => bail!("unknown managed cycle case {other}"),
     }
@@ -501,6 +522,17 @@ fn managed_cycle_cancel_after_first_skips_worker_two() -> Result<()> {
 #[test]
 fn managed_cycle_initial_import_error_keeps_worker_edits_unmaterialized() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-initial-import-error")
+}
+
+#[test]
+fn managed_cycle_serial_unknown_final_and_panic_retain_parent_lease() -> Result<()> {
+    for case in [
+        "managed-cycle-final-unknown-containment",
+        "managed-cycle-final-panic",
+    ] {
+        super::nested_driver_tests::driver_fixture(case)?;
+    }
+    Ok(())
 }
 
 // Reuse the managed-cycle runner and ownership fixture; only its returned bytes

@@ -342,6 +342,22 @@ pub(super) fn exercise<'budget>(
         let usage_start = outcome.usage_samples.len();
         let commands_start = outcome.command_records.len();
         let completed = bound.execute_serial(context, preflight, 1, consumer, outcome, &policy);
+        if case == "bound-evidence-unquiescent" {
+            assert!(completed.is_err());
+            assert!(outcome.nested_quiescence_unknown);
+            assert!(context.cancellation.is_cancelled());
+            let error = WorkerRequestInbox::recover(
+                repository_authenticator_key_only(context.repo)?,
+                binding.clone(),
+            )
+            .err()
+            .context("unknown Worker dropped the original frozen inbox lock")?;
+            assert!(matches!(
+                error.downcast_ref::<crate::messaging::store::StoreError>(),
+                Some(crate::messaging::store::StoreError::WriterAlreadyActive { .. })
+            ));
+            return Ok(());
+        }
         if matches!(
             case,
             "bound-evidence-stale"
@@ -625,6 +641,11 @@ pub(super) fn exercise<'budget>(
 fn bound_nested_evidence_two_workers_preserve_frozen_identity_and_block_replay() -> Result<()> {
     nested_driver_tests::driver_fixture("bound-evidence-happy")?;
     nested_driver_tests::driver_fixture("bound-evidence-edits")
+}
+
+#[test]
+fn bound_nested_uncertain_worker_retains_frozen_inbox_and_parent_write_lease() -> Result<()> {
+    nested_driver_tests::driver_fixture("bound-evidence-unquiescent")
 }
 
 #[test]
