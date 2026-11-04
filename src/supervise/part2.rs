@@ -1,4 +1,19 @@
 impl AssignmentExecutionOutcome {
+    fn authority_requires_quarantine(&self) -> bool {
+        self.nested_quiescence_unknown || self.external_containment_failed
+    }
+
+    fn quarantine_execution_authority(&mut self) {
+        if self.authority_requires_quarantine() {
+            self.quarantined_authority
+                .claim_tokens
+                .append(&mut self.claim_tokens);
+            self.quarantined_authority
+                .semantic_tokens
+                .append(&mut self.semantic_tokens);
+        }
+    }
+
     fn fatal(message: impl Into<String>) -> Self {
         Self {
             fatal_error: Some(message.into()),
@@ -8,7 +23,7 @@ impl AssignmentExecutionOutcome {
 
     fn requires_scheduler_abort(&self) -> bool {
         self.fatal_error.is_some()
-            || self.external_containment_failed
+            || self.authority_requires_quarantine()
             || !self.release_errors.is_empty()
             || !self.semantic_release_errors.is_empty()
     }

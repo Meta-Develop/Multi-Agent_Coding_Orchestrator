@@ -987,6 +987,7 @@ pub(super) fn execute_supervisor_assignment(
     if let Some(signal) = &context.admission_commit {
         signal.notify();
     }
+    outcome.quarantine_execution_authority();
     outcome
 }
 
@@ -4293,7 +4294,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
                 && !run.scratch_quiescence_verified()
             {
                 if release_state.is_some() {
-                    // Isolated continuation owns a separate failure disposition.
+                    // The managed controller owns a separate failure disposition.
                     // Keep every real returned resource alive; its controller must
                     // retain the source turn and sibling evidence as quarantine.
                     outcome.external_containment_failed = true;
@@ -4307,7 +4308,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
                         budget_reservation,
                         command,
                     ));
-                    bail!("isolated managed continuation lacks verified scratch quiescence; returned resources quarantined; evidence import: {imported:?}");
+                    bail!("managed continuation lacks verified scratch quiescence; returned resources quarantined; evidence import: {imported:?}");
                 }
                 // All capture, scratch and reservation owners remain in this frame.
                 // As with an attached initial parent, do not detach a possibly live writer.
@@ -8871,32 +8872,21 @@ fn execute_supervisor_assignment_inner(
             completed_assignment_containment,
         )
     })();
-    if outcome.external_containment_failed
-        && managed_isolated_descendants_active(context, &preflight)
-    {
-        // The controller can only borrow this preflight. Retain its real parent
-        // write lease and controls whenever a quarantined descendant/source is
-        // still live; durable claims alone are not process/lease ownership.
-        std::mem::forget(preflight);
-    }
+    finish_assignment_preflight(outcome, preflight);
     result
 }
 
-fn managed_isolated_descendants_active(
-    context: &AssignmentExecutionContext<'_, '_>,
-    preflight: &AssignmentExecutionPreflight<'_>,
-) -> bool {
-    !preflight.assignment.worker_assignments.is_empty()
-        && context.sync_store.snapshot().map_or(true, |claims| {
-            claims.iter().any(|claim| {
-                claim.token != preflight.claim.token
-                    && preflight
-                        .assignment
-                        .worker_assignments
-                        .iter()
-                        .any(|worker| worker.id == claim.agent_id)
-            })
-        })
+fn finish_assignment_preflight(
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: AssignmentExecutionPreflight<'_>,
+) {
+    if outcome.authority_requires_quarantine() {
+        // The controller can only borrow this preflight. Retain its real parent
+        // lease/controls together with the path and semantic reservations. None
+        // may flow to ordinary scheduler or terminal cleanup after uncertainty.
+        outcome.quarantine_execution_authority();
+        std::mem::forget(preflight);
+    }
 }
 
 #[cfg(test)]
@@ -18788,6 +18778,10 @@ mod isolated_worker_evidence_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/managed_parent_controller_tests.rs"]
 mod managed_parent_controller_tests;
+
+#[cfg(all(test, target_os = "linux"))]
+#[path = "assignment_execution/managed_parent_process_tests.rs"]
+mod managed_parent_process_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 mod worker_dispatch_limits_tests;

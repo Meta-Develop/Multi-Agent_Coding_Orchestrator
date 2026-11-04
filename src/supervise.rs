@@ -4561,6 +4561,14 @@ impl PreActionJournalSink for SupervisorPreActionJournalSink<'_, '_> {
 }
 
 #[derive(Default)]
+struct QuarantinedAssignmentAuthority {
+    // These durable reservations have no automatic release. Dropping this local
+    // inventory must leave them active for explicit, quiescence-proven recovery.
+    claim_tokens: Vec<ClaimToken>,
+    semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+}
+
+#[derive(Default)]
 struct AssignmentExecutionOutcome {
     command_records: Vec<CommandRunRecord>,
     usage_samples: Vec<RoleUsageSample>,
@@ -4571,6 +4579,7 @@ struct AssignmentExecutionOutcome {
     claim_tokens: Vec<ClaimToken>,
     claimed_paths: Vec<PathBuf>,
     semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+    quarantined_authority: QuarantinedAssignmentAuthority,
     released_claims: Vec<PathClaim>,
     release_errors: Vec<String>,
     released_semantic_intents: Vec<SemanticIntent>,
@@ -4584,6 +4593,9 @@ struct AssignmentExecutionOutcome {
     assignment_failed: bool,
     budget_dispatch_stopped: bool,
     external_containment_failed: bool,
+    /// Serial Workers borrow the parent's lease instead of acquiring descendant
+    /// claims. Unknown process return must retain that lease and its frozen inbox.
+    nested_quiescence_unknown: bool,
     fatal_error: Option<String>,
 }
 
