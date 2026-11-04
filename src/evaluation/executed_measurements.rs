@@ -74,6 +74,9 @@ pub struct ObservedRunMeasurements {
     pub cost_notice: String,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub role_usage: BTreeMap<AgentRole, RoleUsageReport>,
+    /// Copied from the retained report. Historical measurements omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_own_usage: Option<crate::supervise::SupervisorOwnUsage>,
     pub usage_complete: Option<bool>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub findings: Vec<Finding>,
@@ -156,6 +159,7 @@ fn binding_from_held_out(held_out: &HeldOutCandidateEvidence) -> ObservedRunMeas
         pricing: None,
         cost_notice: reported_cost_notice(),
         role_usage: BTreeMap::new(),
+        supervisor_own_usage: None,
         usage_complete: None,
         findings: Vec::new(),
         observed_dispatch: None,
@@ -262,6 +266,7 @@ fn lift_observational_fields(
     measurements.total_cost_usd = report.total_cost_usd;
     measurements.pricing = ObservedRunPricing::from_report(report);
     measurements.role_usage = report.role_usage.clone();
+    measurements.supervisor_own_usage = report.supervisor_own_usage.clone();
     measurements.usage_complete = Some(report.usage_complete);
     measurements.findings = report.findings.clone();
     match observed_dispatch_record_from_supervisor_final_json(report_bytes) {
@@ -780,6 +785,7 @@ pub(super) fn supervisor_final_report_execution_fixture_bytes() -> Vec<u8> {
         review_lens_total_cost_usd: None,
         total_usage,
         total_cost_usd,
+        supervisor_own_usage: None,
         usage_complete: true,
         commands_run: Vec::new(),
         environment_failures: Vec::new(),

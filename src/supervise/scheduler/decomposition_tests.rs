@@ -3782,6 +3782,130 @@ fn report_builder_keeps_fake_success_nonpublishable() {
 }
 
 #[test]
+fn emitted_supervisor_own_usage_is_an_explicit_zero_and_the_rollup_stays_in_place() {
+    let plan = test_plan(Vec::new());
+    let child = Usage {
+        input_tokens: 7,
+        output_tokens: 3,
+        total_tokens: 10,
+    };
+    let worker = Usage {
+        input_tokens: 80,
+        output_tokens: 20,
+        total_tokens: 100,
+    };
+    let aggregate = Usage {
+        input_tokens: 87,
+        output_tokens: 23,
+        total_tokens: 110,
+    };
+    let mut construction = test_report_construction(
+        &plan,
+        RunId::new("own-usage").expect("valid own-usage run id"),
+    );
+    construction.total_usage = Some(aggregate);
+    construction.role_usage.insert(
+        AgentRole::Supervisor,
+        RoleUsageReport {
+            models: Vec::new(),
+            usage: Some(aggregate),
+            cost_usd: None,
+            observation: RoleUsageObservation::SupervisorAggregate,
+            unavailable_reason: None,
+        },
+    );
+    construction.role_usage.insert(
+        AgentRole::ChildOrchestrator,
+        RoleUsageReport {
+            models: Vec::new(),
+            usage: Some(child),
+            cost_usd: None,
+            observation: RoleUsageObservation::ProcessObserved,
+            unavailable_reason: None,
+        },
+    );
+    construction.role_usage.insert(
+        AgentRole::Worker,
+        RoleUsageReport {
+            models: Vec::new(),
+            usage: Some(worker),
+            cost_usd: None,
+            observation: RoleUsageObservation::ProcessObserved,
+            unavailable_reason: None,
+        },
+    );
+
+    let report = build_supervisor_final_report(construction);
+
+    assert_eq!(report.total_usage, Some(aggregate));
+    assert_eq!(
+        report.role_usage[&AgentRole::Supervisor].observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report.role_usage[&AgentRole::Supervisor].usage,
+        Some(aggregate)
+    );
+    assert_eq!(
+        report.role_usage[&AgentRole::ChildOrchestrator].usage,
+        Some(child)
+    );
+    let execution = report
+        .role_economics_profile
+        .as_ref()
+        .and_then(|profile| profile.execution.as_ref())
+        .expect("execution telemetry");
+    assert_eq!(execution.usage.total_usage, Some(aggregate));
+    assert_eq!(
+        execution.usage.observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    assert_eq!(
+        report.supervisor_own_usage,
+        Some(SupervisorOwnUsage::process_observed_no_provider_client())
+    );
+    assert_eq!(
+        report
+            .supervisor_own_usage
+            .as_ref()
+            .and_then(|own| own.provenance.as_deref()),
+        Some(SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT)
+    );
+
+    let projected = crate::evaluation::coordination_token_observation(
+        &report.role_usage,
+        report.supervisor_own_usage.as_ref(),
+    );
+    assert_eq!(projected.total, Some(child));
+    assert_ne!(projected.total, Some(aggregate));
+    assert!(projected.unavailable_reason.is_none());
+
+    let mut older = serde_json::to_value(&report).expect("serialize emitted report");
+    older
+        .as_object_mut()
+        .expect("report object")
+        .remove("supervisor_own_usage");
+    let older: SupervisorFinalReport =
+        serde_json::from_value(older).expect("older report without own usage");
+    assert!(older.supervisor_own_usage.is_none());
+    assert_eq!(older.total_usage, Some(aggregate));
+    assert_eq!(
+        older.role_usage[&AgentRole::Supervisor].observation,
+        RoleUsageObservation::SupervisorAggregate
+    );
+    let projected = crate::evaluation::coordination_token_observation(
+        &older.role_usage,
+        older.supervisor_own_usage.as_ref(),
+    );
+    assert!(projected.total.is_none());
+    assert!(projected
+        .unavailable_reason
+        .as_deref()
+        .expect("unknown reason")
+        .contains("supervisor_aggregate_not_own_usage"));
+}
+
+#[test]
 fn admission_resolution_uses_strictest_entrypoint_plan_quota_and_host_bound() {
     let temp = tempfile::tempdir().expect("temporary admission repository");
     let plan = SupervisorAdmissionConfig {

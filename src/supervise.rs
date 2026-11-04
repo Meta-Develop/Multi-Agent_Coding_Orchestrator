@@ -3010,6 +3010,11 @@ pub struct SupervisorFinalReport {
     pub total_usage: Option<Usage>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub total_cost_usd: Option<f64>,
+    /// Own provider usage of this supervising process. Historical reports omit
+    /// it; omission is not an observed zero. `role_usage.supervisor` and
+    /// `total_usage` remain the child rollup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub supervisor_own_usage: Option<SupervisorOwnUsage>,
     /// True only when usage was observed for every MACO-launched child-orchestrator and auditor
     /// process. Nested workers are reported separately as not process-observable.
     #[serde(default)]
@@ -3382,6 +3387,62 @@ pub struct RoleUsageReport {
     pub observation: RoleUsageObservation,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub unavailable_reason: Option<String>,
+}
+
+/// Provenance on the explicit zero emitted by the current supervising process.
+///
+/// The zero is process-observed: this process has no provider client. It is not
+/// a fill-in for a missing sample.
+pub const SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT: &str =
+    "process_observed: the supervising process has no provider client and made no provider call";
+
+/// Own provider usage of the supervising process.
+///
+/// This is not `role_usage.supervisor` (`supervisor_aggregate`) and not
+/// `total_usage`. Those stay the launched-child rollup. A future supervising
+/// process that calls a provider puts the real counts here, or leaves the
+/// observation unknown. A missing object is not an observed zero.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SupervisorOwnUsage {
+    pub observation: RoleUsageObservation,
+    /// Explicit counts. Absent usage is unknown, including when every counter
+    /// would otherwise default to zero.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub usage: Option<Usage>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provenance: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
+}
+
+impl SupervisorOwnUsage {
+    /// Explicit zero for the current Rust supervisor, which makes no provider call.
+    pub fn process_observed_no_provider_client() -> Self {
+        Self {
+            observation: RoleUsageObservation::ProcessObserved,
+            usage: Some(Usage {
+                input_tokens: 0,
+                output_tokens: 0,
+                total_tokens: 0,
+            }),
+            provenance: Some(SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT.to_string()),
+            unavailable_reason: None,
+        }
+    }
+
+    /// Real counts from a provider client inside the supervising process.
+    ///
+    /// Callers that did not observe a provider call use
+    /// [`Self::process_observed_no_provider_client`] or leave the field absent.
+    pub fn process_observed_counts(usage: Usage, provenance: impl Into<String>) -> Self {
+        Self {
+            observation: RoleUsageObservation::ProcessObserved,
+            usage: Some(usage),
+            provenance: Some(provenance.into()),
+            unavailable_reason: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
@@ -4027,6 +4088,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
+        supervisor_own_usage: None,
         usage_complete: true,
         commands_run: vec![command],
         environment_failures: Vec::new(),

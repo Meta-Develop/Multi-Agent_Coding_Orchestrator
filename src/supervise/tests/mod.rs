@@ -1240,6 +1240,7 @@ pub(super) fn artifact_test_final_report(run_id: &RunId) -> SupervisorFinalRepor
         review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
+        supervisor_own_usage: None,
         usage_complete: false,
         commands_run: Vec::new(),
         environment_failures: Vec::new(),

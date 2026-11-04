@@ -75,31 +75,39 @@ or raw transcripts in the row. The fields are:
 | --- | --- | --- |
 | Wall-clock to merge-ready | Clock from arm start through the final reviewed head whose required hosted CI is green. `wall_time_ms` on the evaluation cell is supervise duration only. Record both. Do not subtract CI queue time. | Same clock rule. |
 | Total tokens and reported cost per accepted change | `aggregate_reported_usage` and `aggregate_reported_cost_usd` when usage is complete and `priced_cost_complete` is true. Sum every attempt, including rejected ones. Divide by the count of changes accepted by both arms. | Provider usage and reported cost for the root, leaves, and reviewers, same inclusion rule. |
-| Coordination tokens | `profile_summaries[].coordination_tokens` on the executed summary, or `coordination_token_observation` on `supervisor-final.json` `role_usage`. | Root session tokens only. |
+| Coordination tokens | `profile_summaries[].coordination_tokens` on the executed summary. The same projection reads `supervisor-final.json` `supervisor_own_usage` plus process-observed `role_usage.child_orchestrator`. | Root session tokens only. |
 | Review rejection and rework rounds | Count of independent review verdicts that are not a clean accept, plus the fix round that followed each. | Same count from the root's review log. |
 | Hosted CI failures after review | Required CI conclusions that failed on a head that already had a review, before the merge-ready head. One red workflow conclusion is one failure. | Same. |
 | Defects found later | Defects opened against the merged change inside a window declared before the run (14 days, unless the sheet names a shorter checkpoint). | Same window. |
 
 `coordination_tokens.aggregate_total` is the own provider usage of the
-supervising agent plus a process-observed child orchestrator. A missing child
-orchestrator counts as zero. Worker, researcher, gate-classifier, auditor, and
-review-lens tokens stay in the total and out of this field.
+supervising process plus a process-observed child orchestrator. A missing
+child-orchestrator row counts as zero. A present child-orchestrator row that
+is not process-observed stays unknown. Worker, researcher, gate-classifier,
+auditor, and review-lens tokens stay in the total and out of this field.
 
-The supervisor row in `role_usage` is `supervisor_aggregate`: a rollup of
-launched children, already included in `aggregate_reported_usage`. The
-projection refuses that row. `supervisor_aggregate_not_own_usage` means the
-coordination total is unknown. Do not add the rollup to child-orchestrator
-tokens. `supervisor_usage_not_retained` likewise stays unknown. Synthetic fake
-usage is not live coordination evidence.
+Newly finalized reports emit `supervisor_own_usage` beside the child rollup.
+The object is schema-closed. `observation` is `process_observed`,
+`not_process_observable`, or `synthetic_fake`. `supervisor_aggregate` is not
+valid there. The current Rust supervisor makes no provider call, so it records
+an explicit zero (`input_tokens`, `output_tokens`, and `total_tokens` all 0)
+with provenance `process_observed: the supervising process has no provider
+client and made no provider call`. That zero is process-observed. It is not
+inferred and it is not a missing-field default. A future supervising mode that
+calls a provider records the real counts in this object, with process-observed
+provenance, or leaves the observation unknown. `role_usage.supervisor` stays
+`supervisor_aggregate`, and `total_usage` stays that same rollup. Execution
+telemetry still reads the rollup.
 
-An explicit zero is `observation: process_observed` with input, output, and
-total all zero, meaning that process made no provider call. The current
-supervisor report does not emit that shape. It writes the child rollup into the
-supervisor row (`src/supervise/reporting.rs`). Until a report carries
-process-observed own usage without removing the child rollup from
-`total_usage`, every current MACO cell has unknown coordination tokens.
-Replacing the aggregate in place would also break execution telemetry, which
-treats `supervisor_aggregate` as the completed total-economics observation.
+The projection reads `supervisor_own_usage` when the field is present and does
+not add the aggregate row. It still refuses `supervisor_aggregate`,
+`synthetic_fake`, a process-observed object with no usage, inconsistent
+totals, and provenance that does not state the counts were process-observed.
+An older report that omits the field is not an observed zero. The projection
+then classifies the supervisor row: a rollup stays
+`supervisor_aggregate_not_own_usage`, and a missing supervisor row stays
+`supervisor_usage_not_retained`. Do not add the rollup to child-orchestrator
+tokens.
 
 The harness does not count review rounds. Fake-result `churn_count` is not
 rework, and scoring already refuses to substitute churn for a retry/rework
