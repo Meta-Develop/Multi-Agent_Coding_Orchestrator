@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "dataset_id": "public-tb4-2026-11-04",
+  "revision": "2026-11-04.1",
+  "published_on": "2026-11-04",
+  "models": [],
+  "public_benchmarks": [
+    {
+      "task_classes": ["localized_code_change"],
+      "reference_lane": {
+        "runtime": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "low"
+      },
+      "max_age_days": 90,
+      "rows": [
+        {
+          "benchmark_id": "terminal-bench",
+          "benchmark_version": "4.0",
+          "metric": "pass@1",
+          "score": { "numerator": 308, "denominator": 1000 },
+          "runtime": "codex",
+          "model": "gpt-6.1-sol",
+          "requested_effort": "low",
+          "source_url": "https://artificialanalysis.ai/models/releases/comparisons/gpt-6-1-terra-vs-gpt-6-1-sol",
+          "published_on": "2026-10-27",
+          "read_on": "2026-11-04"
+        },
+        {
+          "benchmark_id": "terminal-bench",
+          "benchmark_version": "4.0",
+          "metric": "pass@1",
+          "score": { "numerator": 258, "denominator": 1000 },
+          "runtime": "grok",
+          "model": "grok-4.7",
+          "requested_effort": "xhigh",
+          "source_url": "https://artificialanalysis.ai/models/releases/comparisons/grok-4-7-vs-deepseek-v4-pro",
+          "published_on": "2026-10-27",
+          "read_on": "2026-11-04"
+        },
+        {
+          "benchmark_id": "terminal-bench",
+          "benchmark_version": "4.0",
+          "metric": "pass@1",
+          "score": { "numerator": 247, "denominator": 1000 },
+          "runtime": "grok",
+          "model": "grok-4.7",
+          "requested_effort": "high",
+          "source_url": "https://artificialanalysis.ai/models/releases/comparisons/grok-4-7-vs-deepseek-v4-pro",
+          "published_on": "2026-10-27",
+          "read_on": "2026-11-04"
+        },
+        {
+          "benchmark_id": "terminal-bench",
+          "benchmark_version": "4.0",
+          "metric": "pass@1",
+          "score": { "numerator": 162, "denominator": 1000 },
+          "runtime": "grok",
+          "model": "grok-4.7",
+          "requested_effort": "low",
+          "source_url": "https://artificialanalysis.ai/models/releases/comparisons/grok-4-7-vs-deepseek-v4-pro",
+          "published_on": "2026-10-27",
+          "read_on": "2026-11-04"
+        }
+      ]
+    }
+  ],
+  "capability_policy": {
+    "id": "public-tb4-2026-11-04",
+    "version": 1,
+    "source": "docs/qualification/priors/public-tb4-2026-11-04.md; dated Terminal-Bench 4.0 comparison only; no capability grant and no live qualification",
+    "models": []
+  }
+}

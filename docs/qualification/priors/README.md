@@ -120,3 +120,11 @@ The shape below is **entirely synthetic** and confers no real model eligibility:
 `review_gate` is also the Researcher's terminal task class; its presence here does
 not admit a review/acceptance authority role. The [Grok evidence checkpoint](grok-public-2026-11-03.md)
 contains no reference comparison and continues to grant nothing by itself.
+
+The reference lane is chosen per task class. The
+[Terminal-Bench 4.0 snapshot](public-tb4-2026-11-04.md) maps only bounded
+`localized_code_change` to `codex` / `gpt-6.1-sol` / `low`, the cheapest
+requested effort of the Codex model already used for that class. Review,
+research, delegation, and every judgment role stay unmapped, so a public-only
+lane remains refused there. That file grants no capability, no class-fit
+samples, and no live qualification.
