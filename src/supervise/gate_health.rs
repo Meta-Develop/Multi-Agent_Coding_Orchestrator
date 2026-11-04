@@ -472,6 +472,9 @@ pub(super) fn release_concurrent_assignment(
     sync_store: &SyncStore,
     semantic_store: &SemanticIntentStore,
 ) {
+    // Containment refusal is decided before releasing any authority, including
+    // the serial parent's claim (which has no subordinate-claim release guard).
+    outcome.quarantine_execution_authority();
     let (released_claims, release_errors) =
         release_claims(sync_store, std::mem::take(&mut outcome.claim_tokens));
     let (released_semantic_intents, semantic_release_errors) =
@@ -492,7 +495,7 @@ pub(super) fn release_concurrent_assignment(
 
 pub(super) fn assignment_outcome_succeeded(outcome: &AssignmentExecutionOutcome) -> bool {
     !outcome.assignment_failed
-        && !outcome.external_containment_failed
+        && !outcome.authority_requires_quarantine()
         && outcome.fatal_error.is_none()
         && outcome.release_errors.is_empty()
         && outcome.semantic_release_errors.is_empty()

@@ -237,48 +237,69 @@ impl<'inbox, 'parent> BoundParentTurnYield<'inbox, 'parent> {
             .requests()
             .map(|(r, w)| (r.to_owned(), w.to_owned()))
             .collect::<Vec<_>>();
-        let mut driver = NestedWorkerSerialDriver::from_observation(
-            context,
-            preflight,
-            outcome,
-            current_attempt,
-            self.parent,
-        )?;
-        let mut candidate = self.candidate.clone();
-        let mut workers = Vec::new();
-        for (index, (request_id, worker_id)) in requests.into_iter().enumerate() {
-            self.revalidate_identity(context, preflight, current_attempt, current)?;
-            verify_candidate(&candidate, context, preflight)?;
-            let usage_start = driver.outcome.usage_samples.len();
-            #[cfg(test)]
-            mutate_candidate_at_handoff(true, &preflight.worktree.path)?;
-            let evidence = driver.execute_worker(&worker_id, policy)?;
-            let handoff = (|| -> Result<()> {
+        let execution = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<_> {
+            let mut driver = NestedWorkerSerialDriver::from_observation(
+                context,
+                preflight,
+                outcome,
+                current_attempt,
+                self.parent,
+            )?;
+            let mut candidate = self.candidate.clone();
+            let mut workers = Vec::new();
+            for (index, (request_id, worker_id)) in requests.into_iter().enumerate() {
+                self.revalidate_identity(context, preflight, current_attempt, current)?;
+                verify_candidate(&candidate, context, preflight)?;
+                let usage_start = driver.outcome.usage_samples.len();
                 #[cfg(test)]
-                mutate_candidate_at_handoff(false, &preflight.worktree.path)?;
-                let (before, after) = evidence.candidate_snapshots();
-                if before != &candidate {
-                    bail!("validated Worker candidate does not follow bound predecessor");
+                mutate_candidate_at_handoff(true, &preflight.worktree.path)?;
+                let evidence = driver.execute_worker(&worker_id, policy)?;
+                let handoff = (|| -> Result<()> {
+                    #[cfg(test)]
+                    mutate_candidate_at_handoff(false, &preflight.worktree.path)?;
+                    let (before, after) = evidence.candidate_snapshots();
+                    if before != &candidate {
+                        bail!("validated Worker candidate does not follow bound predecessor");
+                    }
+                    verify_candidate(after, context, preflight)
+                })();
+                if let Err(error) = handoff {
+                    context.cancellation.cancel();
+                    driver.outcome.assignment_failed = true;
+                    driver.outcome.external_containment_failed = true;
+                    return Err(error);
                 }
-                verify_candidate(after, context, preflight)
-            })();
-            if let Err(error) = handoff {
-                context.cancellation.cancel();
-                driver.outcome.assignment_failed = true;
-                driver.outcome.external_containment_failed = true;
+                candidate = evidence.candidate_snapshots().1.clone();
+                workers.push(BoundWorkerResult {
+                    // bind() required only Queued events and sequence == request count.
+                    sequence: index + 1,
+                    request_id,
+                    worker_id,
+                    evidence,
+                    usage: driver.outcome.usage_samples[usage_start..].to_vec(),
+                });
+            }
+            drop(driver);
+            Ok(workers)
+        }));
+        let workers = match execution {
+            Ok(Ok(workers)) => workers,
+            Ok(Err(error)) => {
+                if outcome.nested_quiescence_unknown {
+                    std::mem::forget(self);
+                }
                 return Err(error);
             }
-            candidate = evidence.candidate_snapshots().1.clone();
-            workers.push(BoundWorkerResult {
-                // bind() required only Queued events and sequence == request count.
-                sequence: index + 1,
-                request_id,
-                worker_id,
-                evidence,
-                usage: driver.outcome.usage_samples[usage_start..].to_vec(),
-            });
-        }
-        drop(driver);
+            Err(_) => {
+                context.cancellation.cancel();
+                outcome.assignment_failed = true;
+                outcome.external_containment_failed = true;
+                outcome.nested_quiescence_unknown = true;
+                outcome.usage_incomplete = true;
+                std::mem::forget(self);
+                bail!("serial Worker handoff panicked; frozen source retained for reconciliation");
+            }
+        };
         let completed = BoundNestedWorkerEvidence {
             source: self,
             workers,
