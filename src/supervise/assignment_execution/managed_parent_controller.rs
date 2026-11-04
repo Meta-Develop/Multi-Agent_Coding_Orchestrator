@@ -10,14 +10,14 @@ use anyhow::{bail, Context, Result};
 use super::bound_parent_turn::{BoundIsolatedWorkers, BoundParentTurnYield};
 use super::{
     collect_prepared_managed_parent_final, dispatch_and_capture_attached_parent_attempt,
-    dispatch_and_capture_child_attempt, import_external_attempt_evidence,
-    inspect_attached_parent_capture, prepare_child_attempt, prepare_managed_parent_final_attempt,
-    with_supervisor_artifacts, AgentRole, AssignmentAttemptAuthority, AssignmentBudgetPolicy,
-    AssignmentExecutionContext, AssignmentExecutionDisposition, AssignmentExecutionOutcome,
-    AssignmentExecutionPreflight, AssignmentPhase, AttachedParentCapture, AttachedParentInspection,
-    CollectedChildAttempt, ExternalAttemptEvidenceContext, InspectedAttachedParent,
-    ParentContinuationLaunch, PreparedChildAttempt, PreparedManagedParentFinal, RoleCategory,
-    SupervisorExecutionRuntime, WorkspaceAccess,
+    import_external_attempt_evidence, inspect_attached_parent_capture, prepare_child_attempt,
+    prepare_managed_parent_final_attempt, with_supervisor_artifacts, AgentRole,
+    AssignmentAttemptAuthority, AssignmentBudgetPolicy, AssignmentExecutionContext,
+    AssignmentExecutionDisposition, AssignmentExecutionOutcome, AssignmentExecutionPreflight,
+    AssignmentPhase, AttachedParentCapture, AttachedParentInspection, CollectedChildAttempt,
+    ExternalAttemptEvidenceContext, InspectedAttachedParent, ParentContinuationLaunch,
+    PreparedChildAttempt, PreparedManagedParentFinal, RoleCategory, SupervisorExecutionRuntime,
+    WorkspaceAccess,
 };
 use crate::artifacts::repository_authenticator_key_only;
 use crate::process_runner::ProcessCancellation;
@@ -229,64 +229,94 @@ fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent>(
         outcome,
         budget_policy,
     )?;
-    let continuation = ParentContinuationLaunch::from_bound_completed_workers(
-        context,
-        preflight,
-        source_attempt,
-        turn,
-        &completed,
-    )?;
-    let (_, _, bound_source_attempt, next_attempt) = continuation.binding();
-    if bound_source_attempt != source_attempt {
-        bail!("managed parent continuation left the source attempt");
-    }
-    let mut final_prepared = match prepare_child_attempt(
-        context,
-        outcome,
-        budget_policy,
-        preflight,
-        journal_parent_id,
-        next_attempt,
-        max_attempts,
-        &None,
-        schema_path,
-        worker_schema_path,
-        auditor_schema_path,
-        Some(&continuation),
-    )? {
-        AssignmentExecutionDisposition::Continue(prepared) => prepared,
-        AssignmentExecutionDisposition::Complete => {
-            bail!("managed parent continuation stopped before final parent dispatch")
+    let release_state = std::sync::atomic::AtomicU8::new(0);
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let continuation = ParentContinuationLaunch::from_bound_completed_workers(
+            context,
+            preflight,
+            source_attempt,
+            turn,
+            &completed,
+        )?;
+        let (_, _, bound_source_attempt, next_attempt) = continuation.binding();
+        if bound_source_attempt != source_attempt {
+            bail!("managed parent continuation left the source attempt");
+        }
+        let mut final_prepared = match prepare_child_attempt(
+            context,
+            outcome,
+            budget_policy,
+            preflight,
+            journal_parent_id,
+            next_attempt,
+            max_attempts,
+            &None,
+            schema_path,
+            worker_schema_path,
+            auditor_schema_path,
+            Some(&continuation),
+        )? {
+            AssignmentExecutionDisposition::Continue(prepared) => prepared,
+            AssignmentExecutionDisposition::Complete => {
+                bail!("managed parent continuation stopped before final parent dispatch")
+            }
+        };
+        require_read_only_native_off(&final_prepared, "managed parent continuation")?;
+        final_prepared.command_admission = Some(admit_read_only(
+            context,
+            preflight,
+            next_attempt,
+            &final_prepared.command,
+        )?);
+        continuation.revalidate(context, preflight, next_attempt)?;
+        let mut captured = super::dispatch_and_capture_child_attempt_with_release_state(
+            context,
+            outcome,
+            preflight,
+            journal_parent_id,
+            next_attempt,
+            final_prepared,
+            Some(&release_state),
+        )?;
+        if !captured.external_run.scratch_quiescence_verified()
+            || release_state.load(std::sync::atomic::Ordering::Acquire) != 1
+        {
+            std::mem::forget(captured);
+            bail!("serial final parent capture has unknown quiescence");
+        }
+        if let Some(error) = captured.post_return_error.take() {
+            return Err(error);
+        }
+        let prepared_final = prepare_managed_parent_final_attempt(
+            context,
+            preflight,
+            captured,
+            &continuation,
+            &completed,
+            source_attempt,
+            turn,
+        );
+        drop(continuation);
+        prepared_final
+    }));
+    let result = match result {
+        Ok(result) => result,
+        Err(_) => {
+            outcome.nested_quiescence_unknown = true;
+            Err(anyhow::anyhow!("serial final parent continuation panicked"))
         }
     };
-    require_read_only_native_off(&final_prepared, "managed parent continuation")?;
-    final_prepared.command_admission = Some(admit_read_only(
-        context,
-        preflight,
-        next_attempt,
-        &final_prepared.command,
-    )?);
-    continuation.revalidate(context, preflight, next_attempt)?;
-    let captured = dispatch_and_capture_child_attempt(
-        context,
-        outcome,
-        preflight,
-        journal_parent_id,
-        next_attempt,
-        final_prepared,
-    )?;
-    let prepared_final = prepare_managed_parent_final_attempt(
-        context,
-        preflight,
-        captured,
-        &continuation,
-        &completed,
-        source_attempt,
-        turn,
-    );
-    drop(continuation);
-    drop(completed);
-    prepared_final
+    if release_state.load(std::sync::atomic::Ordering::Acquire) == 2 {
+        outcome.nested_quiescence_unknown = true;
+    }
+    if outcome.nested_quiescence_unknown {
+        context.cancellation.cancel();
+        outcome.assignment_failed = true;
+        outcome.external_containment_failed = true;
+        outcome.usage_incomplete = true;
+        std::mem::forget(completed);
+    }
+    result
 }
 
 #[allow(clippy::too_many_arguments)]

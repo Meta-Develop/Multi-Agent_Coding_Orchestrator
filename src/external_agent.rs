@@ -13725,6 +13725,9 @@ mod managed_readonly_route_tests;
 #[cfg(test)]
 mod tests;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod managed_parent_fixture;
+
 #[cfg(all(test, unix))]
 pub(crate) use tests::claude_identity::record_claude_completion_for_test;
 

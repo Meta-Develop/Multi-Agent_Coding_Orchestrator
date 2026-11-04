@@ -21,6 +21,8 @@ use coding_agent_manager_lib::providers::observe_selected_account;
 
 mod authored_check_admission;
 mod preclaim;
+#[cfg(all(test, target_os = "linux"))]
+mod quarantine_tests;
 pub(super) use preclaim::assignment_requires_file_change;
 #[cfg(test)]
 use preclaim::evaluate_preclaim_viability;
@@ -28,6 +30,8 @@ use preclaim::{
     parked_preclaim_outcome, persist_preclaim_decision, preclaim_assignment, PreclaimDecision,
     PreclaimRunEvidence,
 };
+#[cfg(all(test, target_os = "linux"))]
+pub(super) use quarantine_tests::exercise as exercise_quarantined_assignment_schedule;
 
 /// Admission policy for concurrently runnable supervisor children.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -1602,6 +1606,7 @@ impl Drop for ActiveAssignmentConcurrencyGuard {
 struct CollectedAssignmentOutcomes {
     acquired_claim_tokens: Vec<ClaimToken>,
     acquired_semantic_tokens: Vec<crate::semantic_coord::SemanticIntentToken>,
+    quarantined_authority: QuarantinedAssignmentAuthority,
     concurrently_released_claims: Vec<PathClaim>,
     concurrent_release_errors: Vec<String>,
     concurrently_released_semantic_intents: Vec<SemanticIntent>,
@@ -1627,7 +1632,19 @@ fn collect_indexed_assignment_outcomes(
     collected: &mut CollectedAssignmentOutcomes,
 ) -> Vec<String> {
     let mut fatal_errors = Vec::new();
-    for outcome in indexed_outcomes.into_iter().flatten() {
+    for mut outcome in indexed_outcomes.into_iter().flatten() {
+        // Deferred (serial) cleanup must apply the same quarantine as the
+        // per-assignment path, before collecting any terminal release tokens.
+        outcome.quarantine_execution_authority();
+        collected
+            .quarantined_authority
+            .claim_tokens
+            .append(&mut outcome.quarantined_authority.claim_tokens);
+        collected
+            .quarantined_authority
+            .semantic_tokens
+            .append(&mut outcome.quarantined_authority.semantic_tokens);
+        collected.external_containment_failed |= outcome.authority_requires_quarantine();
         collected.command_records.extend(outcome.command_records);
         collected.usage_samples.extend(outcome.usage_samples);
         collected.usage_incomplete |= outcome.usage_incomplete;
@@ -1644,7 +1661,6 @@ fn collect_indexed_assignment_outcomes(
             .sort_by(|left, right| (left.attempt, left.role).cmp(&(right.attempt, right.role)));
         collected.selection_decisions.extend(selection_decisions);
         collected.assignment_execution_failed |= outcome.assignment_failed;
-        collected.external_containment_failed |= outcome.external_containment_failed;
         if !release_per_assignment {
             collected.acquired_claim_tokens.extend(outcome.claim_tokens);
             collected
@@ -2403,6 +2419,7 @@ fn record_completed_assignment_checkpoint(
     let claim_tokens = outcome
         .claim_tokens
         .iter()
+        .chain(outcome.quarantined_authority.claim_tokens.iter())
         .map(|token| token.get())
         .chain(
             outcome
@@ -3244,6 +3261,9 @@ struct CollectedSchedulerResources {
 
 impl CollectedSchedulerResources {
     fn take_from(collected: &mut CollectedAssignmentOutcomes) -> Self {
+        // Quarantined authority stays in collected, outside both the planned
+        // terminal release and its persistence/error cleanup paths. Store entries
+        // remain reserved after this run; dropping token values cannot release.
         Self {
             acquired_claim_tokens: std::mem::take(&mut collected.acquired_claim_tokens),
             acquired_semantic_tokens: std::mem::take(&mut collected.acquired_semantic_tokens),

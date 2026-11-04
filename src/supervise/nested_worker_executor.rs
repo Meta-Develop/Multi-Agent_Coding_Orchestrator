@@ -438,6 +438,7 @@ pub(super) fn execute_nested_worker_attempt(
     let mut invoked = false;
     let mut spawned = false;
     let mut safety_verified = false;
+    let mut quiescence_verified = false;
     let mut result = (|| -> Result<NestedWorkerAttemptEvidence> {
         let incoming_root = SecureOutputRoot::open_private(incoming.path())?;
         let capture_root = SecureOutputRoot::open_private(capture.path())?;
@@ -559,6 +560,7 @@ pub(super) fn execute_nested_worker_attempt(
         };
         // No early return after invocation until accounting and evidence cleanup have
         // both been attempted. Unknown quiescence retains both private scratch roots.
+        quiescence_verified = run.scratch_quiescence_verified();
         let settlement = reservation.settle_bound_runtime(&run, &command);
         let budget_binding_persistence =
             persist_live_budget_binding(context.artifacts, &reservation, true);
@@ -655,6 +657,8 @@ pub(super) fn execute_nested_worker_attempt(
             context.cancellation.cancel();
             outcome.assignment_failed = true;
             outcome.external_containment_failed |= !safety_verified;
+            outcome.nested_quiescence_unknown |= !quiescence_verified;
+            outcome.usage_incomplete |= !quiescence_verified;
         } else if let Err(cleanup_error) =
             with_supervisor_artifacts(context.artifacts, |writer, _| {
                 discard_invocation_scratches(writer, &incoming, &capture)
