@@ -6498,7 +6498,10 @@ fn add_sensitive_runtime_path_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8])
 }
 
 fn add_credential_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8]) -> Result<()> {
-    if !(MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+    if value.len() > MAX_CREDENTIAL_BYTES {
+        bail!("credential form exceeds the safe redaction byte bound");
+    }
+    if value.len() < MIN_CREDENTIAL_BYTES
         || patterns.iter().any(|existing| existing == value)
     {
         return Ok(());

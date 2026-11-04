@@ -21,8 +21,9 @@ reports one. Telemetry and session-log upload are forced off on every launch.
 not set `production_qualified`. Without a later source change, writable
 admission remains `writable_deepseek_headless_qualification_required`.
 
-When a routing prior file is loaded, it must already contain a dated prior for
-the exact `deepseek:<model>` pair. This page does not invent that prior.
+Selection requires a routing prior file containing a dated prior for the exact
+`deepseek:<model>` pair and effort, plus a frozen canonical DeepSeek executable
+binding alongside Codex. This page does not invent that prior.
 `DEEPSEEK_API_KEY` is supplied by the launch environment only. Do not copy it
 into the evidence directory, the worktree, or the command line.
 
@@ -52,11 +53,15 @@ export MACO_DSH_BIN="$(readlink -f "$(command -v dsh)")"
 test -f "$MACO_DSH_BIN" && test ! -L "$MACO_DSH_BIN" || exit 1
 test -n "${DEEPSEEK_API_KEY:-}" || exit 1
 test -n "$prior_dsh" && test -f "$repo/$prior_dsh" || exit 1
+codex_executable="$(readlink -f "$(command -v codex)")"
+test -f "$codex_executable" && test -x "$codex_executable" || exit 1
 run_id=qualification-deepseek-headless-01
 if timeout --signal=TERM --kill-after=30s 3600 systemd-run --user --scope --quiet -p Delegate=yes \
   --working-directory="$repo" -- env MACO_DSH_BIN="$MACO_DSH_BIN" \
   "$maco" supervise run "$fixture" --runtime codex --repo "$repo" \
-  --run-id "$run_id" --codex-bin codex --qualify-deepseek-headless --prior-data "$prior_dsh" \
+  --run-id "$run_id" --runtime-bin "$codex_executable" \
+  --additional-runtime-bin "deepseek=$MACO_DSH_BIN" \
+  --qualify-deepseek-headless --prior-data "$prior_dsh" \
   --max-concurrent-children 1 --provider-inflight-limit 1 \
   --machine-global-config "$config" --machine-global-runtime-root-id runtime --json \
   > "$OUT/run.json" 2> "$OUT/run.stderr"; then rc=0; else rc=$?; fi

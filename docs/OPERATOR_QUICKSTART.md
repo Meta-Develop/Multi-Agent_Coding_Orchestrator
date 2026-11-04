@@ -532,6 +532,9 @@ length and rejects newlines, then passes that value to the child together with
 rejected key fails closed so headless cannot fall through to `<cwd>/.env` or
 `$DSH_HOME/.env`. Do not put the key in the worktree, the launch patch, or
 argv. Do not set `DSH_HOME` to a real home directory.
+Launch also refuses any key whose raw, JSON-escaped, or nested JSON-escaped
+redaction form exceeds 64 KiB, or whose complete pattern set exceeds the
+redactor's count or aggregate-byte bound.
 
 Each assignment attempt exclusively creates its own MACO-owned patch beside
 the prompt. The launch records its digest and delivers an immutable read-only
@@ -558,8 +561,12 @@ worker launches stay refused with
 `writable_deepseek_headless_qualification_required`.
 `--qualify-deepseek-headless` records an operator marker only;
 `production_qualified` stays false. There is no Coding Agent Manager provider.
-When operator priors are loaded, the prior file must already contain the exact
-model. Advisory catalog names from the provider docs, not a hardcoded
+Codex-supervised selection requires a dated operator prior for the exact model
+and a frozen executable binding: pass an absolute canonical Codex `--runtime-bin`
+and `--additional-runtime-bin "deepseek=$MACO_DSH_BIN"` with `--prior-data`.
+The prior supplies model and effort evidence; the executable binding admits the
+Researcher catalog. Authority and writable Worker roles stay refused.
+Advisory catalog names from the provider docs, not a hardcoded
 allowlist, are text-and-image `deepseek-flash` and text-only `deepseek-v4-pro`.
 
 ## Troubleshooting

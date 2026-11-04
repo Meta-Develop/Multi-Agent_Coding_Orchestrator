@@ -2991,6 +2991,22 @@ fn selection_input_for_role_with_assessment_and_accounts(
         }
     }
     let mut input = combined.context("account catalog set is empty")?;
+    let account_catalog_count = input.catalogs.len();
+    append_deepseek_research_catalog(&mut input.catalogs, &input.task, &input.priors)?;
+    if input.catalogs.len() != account_catalog_count {
+        let primary_pool = input
+            .pools
+            .iter()
+            .find(|pool| pool.runtime == runtime_name(args.runtime))
+            .cloned()
+            .context("account catalog set has no primary admission pool")?;
+        input.pools.extend(pools_for_constructed_catalogs(
+            &input.catalogs[account_catalog_count..],
+            runtime_name(args.runtime),
+            primary_pool,
+        ));
+        input.constraints.allowed_runtimes.insert("deepseek".into());
+    }
     if let Some(quota_context) = args.quota_context {
         apply_live_quota_selection_input(
             &mut input,
@@ -3023,6 +3039,7 @@ fn account_selection_catalogs(
                 priors,
             )?);
         }
+        append_deepseek_research_catalog(&mut catalogs, task, priors)?;
         Ok(catalogs)
     }
     #[cfg(not(target_os = "linux"))]
@@ -3207,7 +3224,46 @@ fn constructed_selection_catalogs(
             )?);
         }
     }
+    append_deepseek_research_catalog(&mut catalogs, task, priors)?;
     Ok(catalogs)
+}
+
+/// DeepSeek has an operator-declared model menu, not a CAM observation or a
+/// live discovery command. Require both the authored prior and frozen binary;
+/// expose it exclusively to the read-only Researcher selection profile.
+fn append_deepseek_research_catalog(
+    catalogs: &mut Vec<RuntimeCatalog>,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<()> {
+    if task.authority_role != AuthorityRole::TerminalLeaf
+        || task.task_class != JUDGMENT_SELECTION_TASK_CLASS
+        || catalogs.iter().any(|catalog| catalog.runtime == "deepseek")
+    {
+        return Ok(());
+    }
+    let Some(program) =
+        super::runtime_executables::bound_catalog_program(SupervisorRuntime::DeepSeek)
+    else {
+        return Ok(());
+    };
+    super::runtime_executables::validate_executable(&program)?;
+    let mut catalog = runtime_catalog_from_priors(
+        "deepseek",
+        &RuntimeModelCatalog::OperatorDeclared,
+        task,
+        priors,
+    )?;
+    if !catalog.models.is_empty() {
+        let binding = serde_json::to_vec(&program)?;
+        catalog.revision = format!(
+            "{};frozen-executable-sha256:{}",
+            catalog.revision,
+            crate::artifacts::state_auth::sha256_hex(&binding)
+        );
+        catalogs.push(catalog);
+    }
+    Ok(())
 }
 
 #[cfg(target_os = "linux")]
@@ -4947,6 +5003,8 @@ pub(super) mod tests {
     use super::*;
     include!("assignment_selection_tests.rs");
     include!("qualification_selection_tests.rs");
+    #[cfg(target_os = "linux")]
+    include!("deepseek_selection_tests.rs");
     #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,

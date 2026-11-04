@@ -267,6 +267,99 @@ fn deepseek_key_echo_is_redacted_through_persistence() -> Result<()> {
     Ok(())
 }
 
+#[test]
+fn deepseek_credential_form_boundaries_fail_closed_before_persistence() -> Result<()> {
+    // The raw key is admissible in both review reproductions, but one of its
+    // required wire forms exceeds the per-pattern bound.
+    for backslashes in [20_000, 40_000] {
+        let secret = format!("{}{}z", "s".repeat(31), "\\".repeat(backslashes));
+        let quoted = serde_json::to_string(&secret)?;
+        let escaped = &quoted[1..quoted.len() - 1];
+        assert!(crate::runtime_adapter::deepseek::api_key_acceptable(
+            &secret
+        ));
+        let temp = tempfile::tempdir()?;
+        let spec = command(temp.path())?;
+        let mut events = fixture_events();
+        events.last_mut().unwrap()["text"] =
+            serde_json::json!(format!("raw={secret} escaped={escaped}"));
+        let error = capture(
+            &spec,
+            stream(&events),
+            false,
+            0,
+            Some(secret.clone()),
+            &BTreeMap::from([("DEEPSEEK_API_KEY".into(), secret)]),
+        )
+        .expect_err("unregisterable credential forms must refuse capture and launch");
+        assert!(error.to_string().contains("redaction byte bound"));
+        assert!(fs::read(&spec.json_log)?.is_empty());
+        assert!(fs::read(&spec.output_last_message)?.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
+fn deepseek_largest_registered_credential_forms_are_redacted_in_persisted_capture() -> Result<()> {
+    // Printable raw key at 64 KiB, and a nested-escaped key at exactly 64 KiB.
+    for secret in [
+        "s".repeat(MAX_CREDENTIAL_BYTES),
+        format!(
+            "{}{}z",
+            "s".repeat(31),
+            "\\".repeat((MAX_CREDENTIAL_BYTES - 32) / 4)
+        ),
+    ] {
+        let quoted = serde_json::to_string(&secret)?;
+        let escaped = &quoted[1..quoted.len() - 1];
+        let nested = serde_json::to_string(escaped)?;
+        let nested = &nested[1..nested.len() - 1];
+        assert_eq!(nested.len(), MAX_CREDENTIAL_BYTES);
+        let temp = tempfile::tempdir()?;
+        let spec = command(temp.path())?;
+        let mut events = fixture_events();
+        events.last_mut().unwrap()["text"] = serde_json::json!(escaped);
+        let report = capture(
+            &spec,
+            stream(&events),
+            false,
+            0,
+            Some(format!("{secret} {escaped} {nested}")),
+            &BTreeMap::from([("DEEPSEEK_API_KEY".into(), secret.clone())]),
+        )?;
+        for bytes in [
+            fs::read(&spec.json_log)?,
+            report.stdout_bytes().to_vec(),
+            report.stderr.bytes.clone(),
+            serde_json::to_vec(&report)?,
+        ] {
+            let text = String::from_utf8(bytes)?;
+            assert!(![secret.as_str(), escaped, nested]
+                .iter()
+                .any(|form| text.contains(form)));
+            assert!(text.contains("[REDACTED]"));
+        }
+        // Crossing the nested bound by one escaped character still fits raw
+        // admission; the real preparation helper must refuse before persisting.
+        let secret = format!("{secret}\\");
+        if crate::runtime_adapter::deepseek::api_key_acceptable(&secret) {
+            let temp = tempfile::tempdir()?;
+            let spec = command(temp.path())?;
+            assert!(capture(
+                &spec,
+                stream(&fixture_events()),
+                false,
+                0,
+                None,
+                &BTreeMap::from([("DEEPSEEK_API_KEY".into(), secret)]),
+            )
+            .is_err());
+            assert!(fs::read(&spec.json_log)?.is_empty());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(target_os = "linux")]
 #[test]
 fn deepseek_profile_hides_executable_sibling_canary() -> Result<()> {
