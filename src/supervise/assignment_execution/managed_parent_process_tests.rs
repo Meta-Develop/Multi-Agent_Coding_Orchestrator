@@ -47,6 +47,18 @@ pub(super) fn run(
             parent.rejected = true;
             parent.status = ReviewStatus::Failed;
         }
+        if case == "isolated-collector-rejected" {
+            parent.gate_denials.push(GateDenial::new(
+                "self-authored-fixture",
+                GateDenialReason::ClaimConflict,
+                crate::gate_denial::VerifiedGateContext::new(
+                    "parent",
+                    crate::gate_denial::GateCheckSource::ClaimAcquisition,
+                    ["src/lib.rs"],
+                )?,
+            )?);
+            assert!(!report_failed(&parent));
+        }
         if case == "forged-report" {
             parent.worker_reports[0].id = "foreign".into();
         }
@@ -178,11 +190,23 @@ pub(super) fn exercise(
                 preflight.child_base_head
             );
         }
-        "isolated-rejected-review" => {
-            assert!(
-                format!("{:#}", result.err().context("rejected parent integrated")?)
-                    .contains("integration is not authorized")
-            );
+        "isolated-rejected-review" | "isolated-collector-rejected" => {
+            if case == "isolated-collector-rejected" {
+                let collected = result?;
+                assert!(report_failed(&collected.attempt_report));
+                assert!(collected
+                    .attempt_report
+                    .findings
+                    .iter()
+                    .any(|finding| finding
+                        .message
+                        .contains("self-assert supervisor-owned gate correction evidence")));
+            } else {
+                assert!(
+                    format!("{:#}", result.err().context("rejected parent integrated")?)
+                        .contains("integration is not authorized")
+                );
+            }
             assert_eq!(
                 fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
                 "pub fn selected() {}\n"
@@ -194,6 +218,14 @@ pub(super) fn exercise(
             assert_eq!(
                 current_head_oid(&preflight.worktree.path)?,
                 preflight.child_base_head
+            );
+            assert_eq!(
+                crate::external_agent::bind_existing_managed_child_git_boundary(
+                    &preflight.worktree.path,
+                )?
+                .revalidate()?,
+                preflight.child_base_head,
+                "rejected parent private commit materialized"
             );
             assert_eq!(outcome.released_claims.len(), 2);
             for worker in ["worker", "worker-two"] {
@@ -208,6 +240,12 @@ pub(super) fn exercise(
                     current_head_oid(&path)?,
                     preflight.child_base_head,
                     "rejected Worker commit materialized"
+                );
+                assert_eq!(
+                    crate::external_agent::bind_existing_managed_child_git_boundary(&path)?
+                        .revalidate()?,
+                    preflight.child_base_head,
+                    "rejected Worker private commit materialized"
                 );
             }
             assert!(
@@ -250,7 +288,11 @@ pub(super) fn exercise(
                 "pub fn selected() {}\n"
             );
         }
-        "happy" | "lost-response" | "rejected-review" | "isolated-happy" => {
+        "happy"
+        | "lost-response"
+        | "rejected-review"
+        | "isolated-happy"
+        | "isolated-masked-rustup" => {
             let collected = result?;
             assert!(
                 collected.report_shape_problems.is_empty(),
@@ -258,9 +300,16 @@ pub(super) fn exercise(
                 collected.report_shape_problems
             );
             assert!(collected.attempt_containment_verified);
-            assert_eq!(observed.len(), 4);
-            assert_eq!(observed.first().unwrap(), "parent");
-            assert_eq!(observed.last().unwrap(), "parent");
+            if case.starts_with("isolated-") {
+                assert_eq!(observed.len(), 4);
+                assert_eq!(observed.first().unwrap(), "parent");
+                assert_eq!(observed.last().unwrap(), "parent");
+                let mut workers = observed[1..3].to_vec();
+                workers.sort();
+                assert_eq!(workers, ["worker", "worker-two"]);
+            } else {
+                assert_eq!(observed, ["parent", "worker", "worker-two", "parent"]);
+            }
             assert_eq!(
                 report_failed(&collected.attempt_report),
                 case == "rejected-review"
@@ -283,7 +332,7 @@ pub(super) fn exercise(
             );
             assert!(worker_charges.iter().all(|charge| charge.tokens == 14));
             assert!(!outcome.usage_incomplete);
-            if case == "isolated-happy" {
+            if case.starts_with("isolated-") {
                 assert_eq!(outcome.released_claims.len(), 2);
                 assert!(
                     !super::super::scheduler::nested_workers_lack_observed_usage(
@@ -383,8 +432,19 @@ fn managed_parent_process_isolated_final_sees_combined_candidate_and_complete_di
 }
 
 #[test]
+fn managed_parent_process_isolated_combined_check_survives_masked_rustup_shim() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-masked-rustup")
+}
+
+#[test]
 fn managed_parent_process_isolated_rejection_discards_tentative_candidate() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-rejected-review")
+}
+
+#[test]
+fn managed_parent_process_isolated_collector_rejection_discards_without_worker_commits(
+) -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-collector-rejected")
 }
 
 #[test]

@@ -140,6 +140,16 @@ else:
     second = (workspace / "src/other.rs").read_text()
     assert "pub fn first() -> u32 { 40 }" in first, first
     assert "pub fn second() -> u32 { crate::first() + 2 }" in second, second
+    if payload["case"] == "isolated-masked-rustup":
+        # Reproduce the hosted runner's masked user-home compiler shim even
+        # when the test host normally supplies rustc from the visible Nix store.
+        try:
+            subprocess.run([payload["masked_rustc"], "--version"], check=True)
+        except (FileNotFoundError, PermissionError):
+            pass
+        else:
+            raise AssertionError("unprojected compiler shim was visible")
+    assert pathlib.Path(payload["rustc"]).is_absolute()
     # Compile and execute the actual functions together. The harness and binary
     # live in private temporary storage; candidate source stays read-only.
     with tempfile.TemporaryDirectory() as temporary:
@@ -150,13 +160,14 @@ else:
             'pub use candidate::*;\n'
             '#[test] fn combined() { assert_eq!(first(), 40); '
             'assert_eq!(other::second(), 42); }\n')
-        for name, argv in (("compile", ["rustc", "--test", str(harness), "-o", str(binary)]),
+        for name, argv in (("compile", [payload["rustc"], "--test", str(harness), "-o", str(binary)]),
                            ("combined", [str(binary)])):
             item = {"id": name, "type": "commandExecution", "command": shlex.join(argv),
                     "cwd": str(workspace), "status": "inProgress", "exitCode": None}
             event("item/started", item)
-            result = subprocess.run(argv, cwd=workspace, check=True, stdout=subprocess.PIPE,
+            result = subprocess.run(argv, cwd=workspace, stdout=subprocess.PIPE,
                                     stderr=subprocess.PIPE)
+            assert result.returncode == 0, result.stderr.decode()
             report["turn"]["report"]["validation_results"].append({
                 "name": "combined check" if name == "combined" else "compile check",
                 "status": "succeeded", "command": argv,

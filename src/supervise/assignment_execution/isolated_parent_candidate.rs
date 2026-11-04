@@ -115,6 +115,12 @@ impl IsolatedParentCandidate {
                 .as_ref()
                 .context("isolated parent lease missing")?,
         )?;
+        let private = crate::external_agent::bind_existing_managed_child_git_boundary(
+            &preflight.worktree.path,
+        )?;
+        if private.revalidate()? != preflight.child_base_head {
+            bail!("isolated parent private ref changed; refusing rollback");
+        }
         let parent = crate::git_repository::open(&preflight.worktree.path)?;
         let aggregate = parent.find_tree(self.tree)?;
         let base = parent.find_commit(preflight.child_base_head)?.tree()?;

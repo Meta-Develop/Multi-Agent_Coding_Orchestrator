@@ -446,46 +446,46 @@ fn collect_isolated_parent_cycle<'budget>(
             "isolated final continuation panicked; held resources require supervisor recovery"
         ))
     });
-    match result {
-        Ok(collected) => {
-            held.retain_on_drop = false;
-            Ok(collected)
-        }
-        Err(error) => {
-            outcome.assignment_failed = true;
-            let never_entered = release_state.load(std::sync::atomic::Ordering::Acquire) == 0;
-            if !final_panicked && (never_entered || verified_final_capture) {
-                let cleanup = completed
-                    .discard_review_candidate(context, preflight)
-                    .and_then(|()| {
-                        completed.release_completed_claims(
-                            context,
-                            preflight,
-                            source_attempt,
-                            turn,
-                            outcome,
-                        )
-                    });
-                match cleanup {
-                    Ok(()) => {
-                        held.retain_on_drop = false;
-                        return Err(error);
-                    }
-                    Err(cleanup_error) => {
-                        outcome.release_errors.push(format!(
-                            "isolated final refusal retained resources: {cleanup_error:#}"
-                        ));
-                    }
-                }
+    if result
+        .as_ref()
+        .is_ok_and(|collected| !super::report_failed(&collected.attempt_report))
+    {
+        held.retain_on_drop = false;
+        return result;
+    }
+    outcome.assignment_failed = true;
+    let never_entered = release_state.load(std::sync::atomic::Ordering::Acquire) == 0;
+    if !final_panicked && (never_entered || verified_final_capture) {
+        let cleanup = completed
+            .discard_review_candidate(context, preflight)
+            .and_then(|()| {
+                completed.release_completed_claims(
+                    context,
+                    preflight,
+                    source_attempt,
+                    turn,
+                    outcome,
+                )
+            });
+        match cleanup {
+            Ok(()) => {
+                held.retain_on_drop = false;
+                return result;
             }
-            // Source drift, cancellation refusal, or unknown returned capture
-            // never relaxes the release API. Keep captures, leases and the frozen
-            // owner in quarantine, including if this frame unwinds unexpectedly.
-            context.cancellation.cancel();
-            outcome.external_containment_failed = true;
-            Err(error).context("isolated final refusal retained resources for supervisor recovery")
+            Err(cleanup_error) => {
+                outcome.release_errors.push(format!(
+                    "isolated final refusal retained resources: {cleanup_error:#}"
+                ));
+            }
         }
     }
+    // Source drift, cancellation refusal, or unknown returned capture never
+    // relaxes release. Rejected Ok reports use this same verified cleanup path.
+    context.cancellation.cancel();
+    outcome.external_containment_failed = true;
+    result
+        .and_then(|_| bail!("isolated final collector rejected its Worker set"))
+        .context("isolated final refusal retained resources for supervisor recovery")
 }
 
 struct IsolatedContinuationWorkers<'inbox, 'parent> {

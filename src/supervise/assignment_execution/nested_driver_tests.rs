@@ -790,6 +790,17 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                     "managed-cycle worker fixture failed to prepare the private child Git boundary",
                 );
         }
+        if isolated
+            && !managed_process
+            && subject.id == "parent"
+            && case != "managed-cycle-isolated-final-ineligible-parent"
+        {
+            // The real contained runner prepares this boundary for read-only
+            // coordination turns too. Acceptance now gates the Worker import
+            // on the parent's complete materialization eligibility.
+            crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+                .expect("isolated parent fixture requires its private Git boundary");
+        }
         let mut run = deterministic_fake_child_run(
             &simulated,
             &fake_subject,

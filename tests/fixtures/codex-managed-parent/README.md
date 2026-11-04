@@ -30,3 +30,12 @@ Overlapping candidate edits refuse before a final parent can run. The same
 cases use explicit Worker token limits and the production host-held invocation
 receipt to check terminal claim bookkeeping and warnings against distinct,
 verified Worker budget settlements (including missing and unverified negatives).
+
+The final peer receives the absolute compiler in a read-only projection of the
+selected sysroot, resolved before containment. User-home rustup shims are hidden
+by `ProtectHome=tmpfs` on hosted runners; Nix store executables remain visible.
+The masked-shim regression reproduces that distinction inside the real sandbox.
+Compiler failures include captured stderr. No timing or quiescence gate is relaxed.
+Collector-side rejection of a successful report with self-authored gate denials
+must also restore the base and leave both Worker HEADs untouched. Serial cases
+retain the exact dispatch sequence; isolated cases require the exact Worker set.
