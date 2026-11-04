@@ -1,5 +1,21 @@
 fn qualification_selection(source: &str) -> Result<SupervisorSelectionResolution> {
+    qualification_selection_with_prior(source, None)
+}
+
+fn qualification_selection_with_prior(
+    source: &str,
+    prior: Option<&str>,
+) -> Result<SupervisorSelectionResolution> {
     let (_temporary, repo) = super::super::tests::injected_repository();
+    let _prior = if let Some(prior) = prior {
+        std::fs::write(repo.join("prior.json"), prior)?;
+        Some(super::super::prior_input::bind_operator_prior_data(
+            &repo,
+            "prior.json",
+        )?)
+    } else {
+        None
+    };
     let mut loaded =
         super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(source, Some(&repo))?;
     let frozen = loaded
@@ -9,7 +25,7 @@ fn qualification_selection(source: &str) -> Result<SupervisorSelectionResolution
         .context("qualification routing policy")?;
     let _policy = crate::selection::routing_policy::bind_routing_policy(Some(frozen))?;
     // Membership is synthetic; effort and authority evidence come exclusively
-    // from the bundled priors, as they do during live selection preflight.
+    // from the active priors, as they do during live selection preflight.
     let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
         loaded
             .plan
@@ -37,6 +53,23 @@ fn qualification_selection(source: &str) -> Result<SupervisorSelectionResolution
         &[],
         loaded.plan_metadata.task_routing_assessment.as_ref(),
     )
+}
+
+#[test]
+fn public_grok_evidence_checkpoint_cannot_admit_unqualified_lanes() -> Result<()> {
+    let prior = include_str!("../../docs/qualification/priors/grok-public-2026-11-03.json");
+    for source in [
+        include_str!("../../examples/supervise/qualification-grok-lower-effort.json"),
+        include_str!("../../examples/supervise/qualification-grok47-acp.json"),
+    ] {
+        let bundled = qualification_selection(source)?;
+        let checkpoint = qualification_selection_with_prior(source, Some(prior))?;
+        assert_eq!(
+            qualification_refusals(&checkpoint)?,
+            qualification_refusals(&bundled)?
+        );
+    }
+    Ok(())
 }
 
 type QualificationRefusal = (
