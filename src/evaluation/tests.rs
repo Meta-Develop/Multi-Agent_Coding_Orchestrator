@@ -2398,17 +2398,33 @@ fn real_provider_request(
     source: HeldOutExplicitSourceBaseline,
     provider_plan: std::path::PathBuf,
 ) -> HeldOutRealProviderExperimentRequest {
+    let runtime_executable = fixture_runtime_executable(
+        provider_plan.parent().expect("provider plan directory"),
+        "primary-runtime-bin",
+    );
     HeldOutRealProviderExperimentRequest {
         execution: EvaluationExecution::RealProvider,
         allow_real_provider: true,
         source,
         provider_plan,
         runtime: crate::supervise::SupervisorRuntime::Grok,
-        runtime_executable: std::path::PathBuf::from("/usr/bin/true"),
+        runtime_executable,
         additional_runtime_executables: Vec::new(),
         prior_data: None,
         machine_global_retention: dummy_retention(),
     }
+}
+
+fn fixture_runtime_executable(dir: &std::path::Path, name: &str) -> std::path::PathBuf {
+    let path = dir.join(name);
+    fs::write(&path, b"#!/bin/sh\nexit 97\n").expect("write unexecuted runtime fixture");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700))
+            .expect("make runtime fixture executable");
+    }
+    path.canonicalize().expect("canonical runtime fixture")
 }
 
 fn artifact_owner() -> (tempfile::TempDir, std::path::PathBuf) {
@@ -2588,18 +2604,19 @@ fn held_out_prior_snapshot_is_identical_across_mixed_runtime_profiles() {
         provider_plan,
     );
     request.runtime = SupervisorRuntime::Codex;
+    let grok = fixture_runtime_executable(plan_workspace.path(), "grok-bin");
     request
         .additional_runtime_executables
         .push(HeldOutAdditionalRuntimeBinding {
             runtime: SupervisorRuntime::Grok,
-            executable: "/usr/bin/true".into(),
+            executable: grok.clone(),
         });
     let _runtime_bindings = crate::supervise::bind_explicit_runtime_executables(
         &source_repo,
         &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
         SupervisorRuntime::Codex,
-        Path::new("/usr/bin/true"),
-        &[(SupervisorRuntime::Grok, "/usr/bin/true".into())],
+        &request.runtime_executable,
+        &[(SupervisorRuntime::Grok, grok)],
     )
     .unwrap();
     request.prior_data = Some(input);
@@ -2981,14 +2998,15 @@ fn held_out_production_entrypoint_refuses_authority_mismatch() {
         manifest.limits.max_dispatches,
         std::sync::Arc::new(std::sync::Mutex::new(writer)),
     );
+    let executable = fixture_runtime_executable(plan_workspace.path(), "authority-runtime-bin");
     let options = isolated.production_options(
         crate::supervise::SupervisorRuntime::Grok,
-        std::path::PathBuf::from("/usr/bin/true"),
+        executable.clone(),
         dummy_retention(),
     );
     let allowlist = crate::supervise::FrozenHeldOutRuntimeAllowlist::from_frozen_bindings(vec![(
         crate::supervise::SupervisorRuntime::Grok,
-        std::path::PathBuf::from("/usr/bin/true"),
+        executable,
     )])
     .expect("primary allowlist");
     let error = crate::supervise::run_held_out_production_experiment(options, authority, allowlist)
@@ -3454,11 +3472,12 @@ fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_befo
         base_commit: base_commit.clone(),
     };
     let (_artifact, artifact_repo) = artifact_owner();
+    let executable = fixture_runtime_executable(plan_workspace.path(), "additional-runtime-bin");
 
     let mut fake_additional = real_provider_request(source.clone(), provider_plan.clone());
     fake_additional.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
         runtime: crate::supervise::SupervisorRuntime::Fake,
-        executable: std::path::PathBuf::from("/usr/bin/true"),
+        executable: executable.clone(),
     }];
     let error = run_held_out_real_provider_experiment(&manifest, fake_additional, &artifact_repo)
         .expect_err("Fake additional binding");
@@ -3478,7 +3497,7 @@ fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_befo
     let mut duplicate_primary = real_provider_request(source.clone(), provider_plan.clone());
     duplicate_primary.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
         runtime: crate::supervise::SupervisorRuntime::Grok,
-        executable: std::path::PathBuf::from("/usr/bin/true"),
+        executable: executable.clone(),
     }];
     let error = run_held_out_real_provider_experiment(&manifest, duplicate_primary, &artifact_repo)
         .expect_err("additional duplicate of primary");
@@ -3493,11 +3512,11 @@ fn held_out_additional_runtime_bindings_refuse_fake_relative_and_duplicates_befo
     duplicate_additional.additional_runtime_executables = vec![
         HeldOutAdditionalRuntimeBinding {
             runtime: crate::supervise::SupervisorRuntime::Grok,
-            executable: std::path::PathBuf::from("/usr/bin/true"),
+            executable,
         },
         HeldOutAdditionalRuntimeBinding {
             runtime: crate::supervise::SupervisorRuntime::Grok,
-            executable: std::path::PathBuf::from("/bin/true"),
+            executable: fixture_runtime_executable(plan_workspace.path(), "other-runtime-bin"),
         },
     ];
     let error =
