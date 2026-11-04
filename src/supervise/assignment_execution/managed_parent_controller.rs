@@ -346,11 +346,12 @@ fn collect_isolated_parent_cycle<'budget>(
         completed: Some(completed),
         retain_on_drop: true,
     };
-    let completed = held.completed.as_ref().expect("owned isolated completion");
+    let completed = held.completed.as_mut().expect("owned isolated completion");
     let release_state = std::sync::atomic::AtomicU8::new(0);
     let mut verified_final_capture = false;
     let mut final_panicked = false;
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        completed.materialize_review_candidate(context, preflight, source_attempt, turn)?;
         let continuation = ParentContinuationLaunch::from_bound_isolated_workers(
             context,
             preflight,
@@ -454,7 +455,18 @@ fn collect_isolated_parent_cycle<'budget>(
             outcome.assignment_failed = true;
             let never_entered = release_state.load(std::sync::atomic::Ordering::Acquire) == 0;
             if !final_panicked && (never_entered || verified_final_capture) {
-                match completed.release_completed_claims(context, preflight, source_attempt, turn) {
+                let cleanup = completed
+                    .discard_review_candidate(context, preflight)
+                    .and_then(|()| {
+                        completed.release_completed_claims(
+                            context,
+                            preflight,
+                            source_attempt,
+                            turn,
+                            outcome,
+                        )
+                    });
+                match cleanup {
                     Ok(()) => {
                         held.retain_on_drop = false;
                         return Err(error);

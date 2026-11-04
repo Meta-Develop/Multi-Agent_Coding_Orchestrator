@@ -7,6 +7,7 @@ import shlex
 import subprocess
 import sys
 import time
+import tempfile
 
 
 def receive():
@@ -104,6 +105,9 @@ elif payload["mode"] == "worker":
     before = datetime.datetime.now(datetime.timezone.utc).isoformat()
     begin = time.monotonic()
     result = subprocess.run(argv, cwd=workspace, check=True)
+    if payload["case"] == "isolated-overlap":
+        other = "src/other.rs" if path == "src/lib.rs" else "src/lib.rs"
+        (workspace / other).write_text("overlapping candidate edit\n")
     if payload["case"] == "widened-worker":
         (workspace / "src/escape.rs").write_text("outside the Worker scope\n")
     elapsed = int((time.monotonic() - begin) * 1000)
@@ -132,6 +136,32 @@ elif payload["mode"] == "worker":
 else:
     assert payload["mode"] == "final"
     assert params["dynamicTools"] == []
+    first = (workspace / "src/lib.rs").read_text()
+    second = (workspace / "src/other.rs").read_text()
+    assert "pub fn first() -> u32 { 40 }" in first, first
+    assert "pub fn second() -> u32 { crate::first() + 2 }" in second, second
+    # Compile and execute the actual functions together. The harness and binary
+    # live in private temporary storage; candidate source stays read-only.
+    with tempfile.TemporaryDirectory() as temporary:
+        harness = pathlib.Path(temporary) / "combined.rs"
+        binary = pathlib.Path(temporary) / "combined"
+        harness.write_text(
+            '#[path = ' + json.dumps(str(workspace / "src/lib.rs")) + '] mod candidate;\n'
+            'pub use candidate::*;\n'
+            '#[test] fn combined() { assert_eq!(first(), 40); '
+            'assert_eq!(other::second(), 42); }\n')
+        for name, argv in (("compile", ["rustc", "--test", str(harness), "-o", str(binary)]),
+                           ("combined", [str(binary)])):
+            item = {"id": name, "type": "commandExecution", "command": shlex.join(argv),
+                    "cwd": str(workspace), "status": "inProgress", "exitCode": None}
+            event("item/started", item)
+            result = subprocess.run(argv, cwd=workspace, check=True, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE)
+            report["turn"]["report"]["validation_results"].append({
+                "name": "combined check" if name == "combined" else "compile check",
+                "status": "succeeded", "command": argv,
+                "message": result.stdout.decode()})
+            event("item/completed", {**item, "status": "completed", "exitCode": result.returncode})
 
 usage = {"inputTokens": 10, "outputTokens": 4, "cachedInputTokens": 0,
          "reasoningOutputTokens": 0, "totalTokens": 14}

@@ -126,6 +126,9 @@ pub(crate) fn run(
         &controls,
         run.scratch_quiescence_verified(),
     ));
+    // Match the production wrapper's host-held invocation receipt. The peer
+    // supplies neither this identity nor a self-asserted budget settlement.
+    run.retain_live_budget_invocation_for_test(spec);
     run.duration_ms = duration_millis(started.elapsed());
     Ok(run)
 }

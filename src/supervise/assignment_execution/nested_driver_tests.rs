@@ -220,7 +220,8 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             None,
         )
     });
-    let isolated = case.starts_with("managed-cycle-isolated-");
+    let isolated = case.starts_with("managed-cycle-isolated-")
+        || case.starts_with("managed-cycle-process-isolated-");
     let managed_process = case.starts_with("managed-cycle-process-");
     let interrupted_worker = case.starts_with("managed-cycle-isolated-interrupted-");
     let grok_continuation = case == "continuation-grok-happy";
@@ -458,7 +459,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         },
     )?;
     let ledger = RunBudgetLedger::new(RunBudgetLimits {
-        hard_tokens: interrupted_worker.then_some(65_000),
+        hard_tokens: (interrupted_worker || managed_process).then_some(65_000),
         ..Default::default()
     })?;
     let metadata = AssignmentMetadata::new();
@@ -503,7 +504,11 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
     }
     let budget_config = SupervisorBudgetConfig {
-        worker_live_token_limits: BTreeMap::new(),
+        worker_live_token_limits: if managed_process {
+            BTreeMap::from([("worker".into(), 1_000), ("worker-two".into(), 1_000)])
+        } else {
+            BTreeMap::new()
+        },
         role_token_reservations: BTreeMap::from([
             (
                 AgentRole::ChildOrchestrator,

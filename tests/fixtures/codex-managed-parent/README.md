@@ -20,3 +20,13 @@ resubmits the same request; separate IPC tests cover a dropped socket response.
 
 These tests stop at final parent collection. They do not qualify provider
 executable preflight, independent review-lens dispatch, or crash recovery launches.
+
+The isolated cases bind an ordered combined candidate before the final parent
+turn. The final peer reads both edits, compiles their actual Rust functions in
+private temporary storage, and runs a combined assertion returning 42. Source
+writes still fail under the outer sandbox. Rejection restores the held base
+without materializing commits; post-capture drift retains authority for recovery.
+Overlapping candidate edits refuse before a final parent can run. The same
+cases use explicit Worker token limits and the production host-held invocation
+receipt to check terminal claim bookkeeping and warnings against distinct,
+verified Worker budget settlements (including missing and unverified negatives).

@@ -393,13 +393,27 @@ fn exercise_isolated_result(
         held_resources(context, preflight)?;
     } else {
         assert!(result.is_err(), "isolated refusal case accepted: {case}");
+        let unknown_final =
+            case.ends_with("final-unknown-containment") || case.ends_with("final-panic");
         assert_eq!(
             fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
-            "pub fn selected() {}\n"
+            if unknown_final {
+                "// written by worker\n"
+            } else {
+                "pub fn selected() {}\n"
+            }
         );
         assert_eq!(
             fs::read_to_string(preflight.worktree.path.join("src/other.rs"))?,
-            "pub fn other() {}\n"
+            if unknown_final {
+                "// written by worker-two\n"
+            } else {
+                "pub fn other() {}\n"
+            }
+        );
+        assert_eq!(
+            current_head_oid(&preflight.worktree.path)?,
+            preflight.child_base_head
         );
         if case.ends_with("unknown-containment") || case.ends_with("final-panic") {
             assert!(outcome.external_containment_failed);

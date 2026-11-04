@@ -2486,6 +2486,33 @@ struct SupervisorFinalReportConstruction<'context> {
     field_guide_mutation_failed: bool,
 }
 
+pub(super) fn nested_workers_lack_observed_usage(
+    plan: &SupervisorPlan,
+    budget: Option<&RunBudgetReport>,
+) -> bool {
+    plan.assignments.iter().any(|parent| {
+        parent.worker_assignments.iter().any(|worker| {
+            !budget.is_some_and(|budget| {
+                budget.dispatch_bindings.iter().any(|binding| {
+                    binding.invocation.assignment_id == worker.id
+                        && binding.invocation.parent_id.as_deref() == Some(parent.id.as_str())
+                        && binding.state == crate::supervise_budget::BudgetDispatchState::Settled
+                        && binding.invocation_verified
+                        && binding.thread_id.is_some()
+                        && binding.turn_id.is_some()
+                        && binding.usage_complete == Some(true)
+                        && budget.charges.iter().any(|charge| {
+                            charge.reservation_id == binding.reservation_id
+                                && charge.role == AgentRole::Worker
+                                && charge.usage_complete
+                                && Some(charge.tokens) == binding.charged_tokens
+                        })
+                })
+            })
+        })
+    })
+}
+
 fn complete_role_usage_reports(
     mut reports: BTreeMap<AgentRole, RoleUsageReport>,
 ) -> BTreeMap<AgentRole, RoleUsageReport> {
@@ -7612,18 +7639,6 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         },
         None => true,
     };
-    let nested_workers_present = plan
-        .assignments
-        .iter()
-        .any(|assignment| !assignment.worker_assignments.is_empty());
-    if nested_workers_present {
-        collected.findings.push(Finding {
-            severity: FindingSeverity::Warning,
-            message: "worker usage is not process-observable because nested-worker delegation is requested through the child-orchestrator contract without a separately MACO-observed worker process or runtime identity; child-orchestrator and auditor process usage remains reportable, while runtime-side role-tagged usage reporting is required before worker usage or cost can be reported"
-                .to_string(),
-            paths: Vec::new(),
-        });
-    }
     let (run_budget_report, budget_accounting_failed) = match budget_ledger.report() {
         Ok(report) => (Some(report), false),
         Err(error) => {
@@ -7635,6 +7650,13 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             (None, true)
         }
     };
+    if nested_workers_lack_observed_usage(&plan, run_budget_report.as_ref()) {
+        collected.findings.push(Finding {
+            severity: FindingSeverity::Warning,
+            message: "separate process usage is unavailable for one or more authored Workers (unlaunched or without verified complete settlements); observed Worker settlements remain included in totals".into(),
+            paths: Vec::new(),
+        });
+    }
     collected.usage_incomplete |= budget_accounting_failed
         || run_budget_report
             .as_ref()
