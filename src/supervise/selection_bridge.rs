@@ -9555,6 +9555,11 @@ pub(super) mod tests {
         let (_temporary, repo) = super::super::tests::injected_repository();
         let primary = repo.join("codex-bin");
         std::fs::write(&primary, b"fixture executable")?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&primary, std::fs::Permissions::from_mode(0o700))?;
+        }
         let catalog = codex_catalog()?;
         let advertised = advertised_with_grok(discover_grok_observation(&grok_listing(
             "grok-4.6",

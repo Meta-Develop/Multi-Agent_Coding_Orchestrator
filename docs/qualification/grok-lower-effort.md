@@ -48,7 +48,7 @@ native usage and one complete, valid model label matching the admitted command
 on every turn. Missing model labels refuse publication because the retained CLI
 normally emits them; this preserves the accepted c30b terminal shape. Duplicate,
 ambiguous, malformed or mismatched identity also refuses publication while native
-token charges remain available. Observed effort must be canonical and match.
+token charges remain available. Any reported effort must be canonical and match.
 
 The owner policy dated 2026-11-02 uses the exact launch-bound requested effort
 as effort identity when the provider does not report effort. Reports record
@@ -66,6 +66,10 @@ The bundled-prior refusal and selected-account live acceptance remain separate
 open gates; these source changes do not supply a lower-effort prior or qualify
 live execution.
 
+The [2026-11-03 public evidence checkpoint](priors/grok-public-2026-11-03.md)
+records exact per-effort scores and missing evidence. Its strict operator
+snapshot adds no eligible rows; both documented prior refusals remain.
+
 Offline validation (does not evaluate those account/prior gates):
 
 ```bash
@@ -79,14 +83,17 @@ After the exact eligibility gates pass, run with the existing managed account:
 ```bash
 export MACO_GROK_BIN="$(readlink -f "$(command -v grok)")"
 test -f "$MACO_GROK_BIN" && test ! -L "$MACO_GROK_BIN" || exit 1
+test -n "$prior" && test -f "$repo/$prior" || exit 1
 unset MACO_GROK_INTERACTION_PROTOCOL
 "$MACO_GROK_BIN" --version > "$OUT/grok-version.txt"
 sha256sum "$MACO_GROK_BIN" > "$OUT/grok-sha256.txt"
+sha256sum "$repo/$prior" > "$OUT/prior-sha256.txt"
 run_id=qualification-grok-low-01
 if timeout --signal=TERM --kill-after=30s 3600 systemd-run --user --scope --quiet -p Delegate=yes \
   --working-directory="$repo" -- env MACO_GROK_BIN="$MACO_GROK_BIN" \
   "$maco" supervise run "$fixture" --runtime codex --repo "$repo" \
-  --run-id "$run_id" --codex-bin codex --max-concurrent-children 1 --provider-inflight-limit 1 \
+  --run-id "$run_id" --codex-bin codex --prior-data "$prior" \
+  --max-concurrent-children 1 --provider-inflight-limit 1 \
   --machine-global-config "$config" --machine-global-runtime-root-id runtime --json \
   > "$OUT/run.json" 2> "$OUT/run.stderr"; then rc=0; else rc=$?; fi
 printf '%s\n' "$rc" > "$OUT/run.exit"
@@ -97,9 +104,9 @@ printf '%s\n' "$rc" > "$OUT/collect.exit"
 
 The 160,000-token ceiling, positive role estimates, 1,200-second child timeout
 and zero retries bound this attempt; they do not assert a strict spending cap.
-Use `--prior-data` only if an accepted evidence-backed repository-relative
-snapshot already establishes the exact lower-effort eligibility; retain its
-digest. Do not fabricate a snapshot to get through selection.
+Set `prior` only to an accepted evidence-backed repository-relative snapshot
+that already establishes the exact lower-effort eligibility; retain its digest.
+Do not fabricate a snapshot to get through selection.
 
 Acceptance requires a matching served model and explicit launch-bound effort basis,
 the opaque proof bound to exact executable, account, cwd, output/schema,

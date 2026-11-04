@@ -1,0 +1,13 @@
+{
+  "schema_version": 1,
+  "dataset_id": "grok-public-qualification-evidence",
+  "revision": "2026-11-03.1-no-new-eligibility",
+  "published_on": "2026-11-03",
+  "models": [],
+  "capability_policy": {
+    "id": "grok-public-qualification-evidence",
+    "version": 1,
+    "source": "docs/qualification/priors/grok-public-2026-11-03.md; public source URLs and dates per row; insufficient evidence for new eligibility",
+    "models": []
+  }
+}

@@ -7,7 +7,9 @@ These fixtures prepare separate acceptance gates for [nested token control](nest
 [DeepSeek Harness headless read-only Researcher](deepseek-headless.md), and a
 [cross-runtime model-mix pilot](model-mix-pilot.md). Nested token control records
 an accepted Linux contained qualification; the other fixtures record no passed
-live run.
+live run. The [manual-distribution comparison](maco-vs-manual.md) is the
+production gate against hand-dispatched leaves. It is not a live fixture and
+records no passed comparison.
 Plan validation is offline and does not assert account access, selector
 eligibility, containment, provider identity, usage, or successful acceptance.
 

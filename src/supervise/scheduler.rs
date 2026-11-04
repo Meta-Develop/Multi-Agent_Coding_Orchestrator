@@ -3901,6 +3901,7 @@ fn prepare_supervisor_run(
     let repo = discover_repo_root(&options.repo)?;
     super::prior_input::require_binding_repo(&repo)?;
     super::runtime_executables::require_binding_repo_run(&repo, &options.run_id)?;
+    super::runtime_executables::validate_plan(&plan, options)?;
     let requested_plan = plan.clone();
     let collision = crate::run_ops::refuse_live_run_collision(
         &repo,
@@ -4332,6 +4333,62 @@ pub(super) fn install_positive_injected_cam_fixture<'a>(
         _owner: owner,
         _same_thread: std::marker::PhantomData,
     })
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(super) fn install_positive_injected_mixed_runtime_fixture<'a>(
+    owner: &'a tempfile::TempDir,
+    catalog: &RuntimeModelCatalog,
+) -> Result<PositiveInjectedCamFixtureGuard<'a>> {
+    use crate::runtime_adapter::grok::{
+        inject_grok_advertised_catalog, GrokModelCatalog, GrokModelCatalogEntry,
+    };
+    use coding_agent_manager_lib::{
+        account_authority::{ModelAccessOutcome, ModelsObservation, ObservedModel},
+        model::{AuthKind, StoredAccountMaterial},
+    };
+    let guard = install_positive_injected_cam_fixture(owner, catalog)?;
+    CAM_OBSERVE_TEST_OVERRIDE.with(|slot| -> Result<()> {
+        let mut slot = slot.borrow_mut();
+        let harness = Arc::get_mut(slot.as_mut().context("installed fixture")?)
+            .context("exclusive mixed fixture setup")?;
+        harness.registry.begin_add(
+            "grok-cli",
+            "synthetic-worker",
+            "Synthetic Worker",
+            AuthKind::OAuth,
+            StoredAccountMaterial::VendorHome,
+        )?;
+        harness
+            .registry
+            .complete_add("grok-cli", "synthetic-worker")?;
+        harness
+            .registry
+            .select_complete_revision("grok-cli", "synthetic-worker", None)?;
+        harness.secondary_adapter = Some(Box::new(GrokReviewFixtureObservation {
+            models: ModelsObservation {
+                models: vec![ObservedModel {
+                    model_id: "grok-4.6".into(),
+                    supported_efforts: Some(vec!["xhigh".into()]),
+                    default_effort: Some("xhigh".into()),
+                    access: ModelAccessOutcome::UnknownAccess,
+                }],
+                provenance: None,
+            },
+        }));
+        let catalog = GrokModelCatalog::from_injected_entries([GrokModelCatalogEntry::new(
+            "grok-4.6",
+            "Synthetic Worker",
+        )?])?;
+        let advertised = inject_grok_advertised_catalog(
+            catalog,
+            Some(1_787_240_463_000),
+            b"synthetic-mixed-executable-test-only",
+        )?;
+        harness.advertised = Some(AdvertisedCatalogSet::with_grok(advertised));
+        Ok(())
+    })?;
+    Ok(guard)
 }
 
 // A repository-root loan for this one real libtest child. This is fixture custody,

@@ -25,6 +25,11 @@ eligibility. A live run requires an accepted evidence-backed `--prior-data`
 snapshot admitting the exact lane; the ACP qualification flag does not supply
 that evidence or override selection.
 
+The [2026-11-03 public evidence checkpoint](priors/grok-public-2026-11-03.md)
+distinguishes published xhigh scores from the announcement's high-only DeepSWE
+cell. Its strict operator snapshot adds no eligible rows and does not unblock
+this fixture.
+
 Before release, retain non-secret evidence for the selected CAM `work2`
 principal/incarnation and selection revision, valid Codex control account,
 exact Grok executable/version/digest, current 4.7/xhigh catalog and available

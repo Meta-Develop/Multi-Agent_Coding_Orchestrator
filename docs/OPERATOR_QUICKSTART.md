@@ -220,9 +220,10 @@ Prerequisites:
 - Leave `MACO_CAM_AUTHORITY_SOCKET` unset unless that authority is the
   selection source. A configured socket with no carried Grok binding is a
   refusal.
-- The Grok program comes from `MACO_GROK_BIN`; `--codex-bin codex` below
-  configures the Codex control runtime. Held-out evaluation, where `--runtime-bin` must
-  match `MACO_GROK_BIN`, is outside this quickstart.
+- For this explicitly bound run, `--runtime-bin "$codex_executable"` configures
+  Codex control and `--additional-runtime-bin "grok=$MACO_GROK_BIN"` configures
+  the Grok Worker. These bindings take precedence over ambient executable
+  settings; no undeclared runtime or ambient executable fallback is admitted.
 - Unset `MACO_GROK_INTERACTION_PROTOCOL`. Unset, the protocol is
   headless streaming JSON. The only other accepted value is `acp_stdio`.
   Grok 4.7 ACP writable launches are refused with
@@ -431,19 +432,42 @@ Run the mixed plan:
 ```bash
 timeout --signal=TERM 3600 systemd-run --user --scope --quiet -p Delegate=yes \
   --working-directory="$repo" -- \
-  env MACO_GROK_BIN="$MACO_GROK_BIN" \
   "$maco" supervise run "$base/plan.json" \
-    --runtime codex --repo . --run-id "$run_id" --codex-bin codex \
+    --runtime codex --repo . --run-id "$run_id" --runtime-bin "$codex_executable" \
+    --additional-runtime-bin "grok=$MACO_GROK_BIN" \
     --machine-global-config "$base/machine-global.json" \
     --machine-global-runtime-root-id runtime --json
 "$maco" supervise collect "$run_id" --repo "$repo" --json
 ```
+The repeatable flag syntax is
+`--additional-runtime-bin RUNTIME=ABSOLUTE_EXECUTABLE`. Each additional runtime
+must be distinct from the primary runtime and all other bindings, and cannot
+be `fake`. Set both executables to their canonical regular executable files
+(for example, use `readlink -f`); symlinks, relative paths, non-canonical paths,
+missing files and non-executable files are refused before reservation. All
+authored assignment runtimes must be bound. Binding executables neither rewrites
+the plan nor grants model eligibility or Grok control/review authority.
+
+The allowlist is frozen before reservation, archived as authenticated private
+evidence, propagated to assignment threads and follow-ups, and checked again
+immediately before each launch. To resume, repeat the same plan/run-id command.
+The executable flags may be omitted: resume restores and rechecks every archived
+binding. If supplied, the primary and complete additional binding set must
+match the archive exactly. Changed paths, removed executables, symlink
+replacement, partial additional sets and unauthenticated binding archives are
+refused; an unrestricted older run cannot acquire additional bindings on resume.
+
+This command is also the separate live selected-account smoke gate. Retain run
+and collect output/exit status, the Grok Worker identity/usage/journal and
+candidate-path evidence, independent Codex Auditor acceptance, and quiescent
+cleanup evidence. A deterministic fixture test or catalog-only success does
+not establish that gate or production cost/quality economics.
 The report path is the same
 `<repo>/.maco/o2/runs/<run-id>/reports/supervisor-final.json` path as Codex.
 
 The example [`examples/supervise/mixed-codex-grok-plan.json`](../examples/supervise/mixed-codex-grok-plan.json)
 and executable [`scripts/run-mixed-codex-grok.sh`](../scripts/run-mixed-codex-grok.sh)
-use this contract for the exact README append task. Export `maco`, `repo`, `base`,
+use this contract for the exact README append task. Export `maco`, `repo`, `base`, `codex_executable`,
 `run_id`, and `OUT` together with the session and Grok variables above, then
 run `./scripts/run-mixed-codex-grok.sh` from the checkout root (Python 3 is required).
 The script first saves the non-spawning shared-state
