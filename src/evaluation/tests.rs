@@ -366,6 +366,81 @@ fn legacy_or_incomplete_execution_metadata_is_incomparable() {
 }
 
 #[test]
+fn token_complete_unpriced_cost_is_economically_incomparable_to_explicit_zero() {
+    let priced = complete_supervisor_execution_record();
+    let mut unpriced = priced.clone();
+    let usage = &mut unpriced
+        .supervisor_execution
+        .as_mut()
+        .expect("execution")
+        .usage;
+    usage.usage_complete = true;
+    usage.total_usage = Some(Usage {
+        input_tokens: 22_669,
+        output_tokens: 0,
+        total_tokens: 22_669,
+    });
+    usage.total_cost_usd = None;
+    usage.unavailable_reason = Some("pricing was incomplete".to_string());
+    assert!(usage.usage_complete);
+    assert!(usage.total_cost_usd.is_none());
+
+    let unpriced_execution = unpriced.supervisor_execution.as_ref();
+    assert_eq!(
+        compare_observed_supervisor_execution(unpriced_execution, unpriced_execution),
+        ExecutionTelemetryComparability::Incomparable
+    );
+    let mut explicit_zero = unpriced.clone();
+    explicit_zero
+        .supervisor_execution
+        .as_mut()
+        .expect("execution")
+        .usage
+        .total_cost_usd = Some(0.0);
+    explicit_zero
+        .supervisor_execution
+        .as_mut()
+        .expect("execution")
+        .usage
+        .unavailable_reason = None;
+    assert_eq!(
+        compare_observed_supervisor_execution(
+            unpriced_execution,
+            explicit_zero.supervisor_execution.as_ref(),
+        ),
+        ExecutionTelemetryComparability::Incomparable
+    );
+    assert_eq!(
+        compare_observed_supervisor_execution(
+            unpriced_execution,
+            priced.supervisor_execution.as_ref(),
+        ),
+        ExecutionTelemetryComparability::Incomparable
+    );
+    let mut other_zero = explicit_zero.clone();
+    assert_eq!(
+        compare_observed_supervisor_execution(
+            explicit_zero.supervisor_execution.as_ref(),
+            other_zero.supervisor_execution.as_ref(),
+        ),
+        ExecutionTelemetryComparability::Equivalent
+    );
+    other_zero
+        .supervisor_execution
+        .as_mut()
+        .expect("execution")
+        .usage
+        .total_cost_usd = Some(0.02);
+    assert_eq!(
+        compare_observed_supervisor_execution(
+            explicit_zero.supervisor_execution.as_ref(),
+            other_zero.supervisor_execution.as_ref(),
+        ),
+        ExecutionTelemetryComparability::Different
+    );
+}
+
+#[test]
 fn unresolved_runtime_binding_remains_explicit_and_incomparable() {
     let valid = complete_supervisor_execution_record();
     let mut document: Value =

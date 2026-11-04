@@ -3199,6 +3199,265 @@ fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runti
 }
 
 #[test]
+fn placeholder_zero_catalog_fails_closed_for_paid_usd_ceilings() {
+    let catalog = crate::llm::provider::default_model_pricing_catalog();
+    assert_eq!(
+        catalog.notice,
+        crate::llm::provider::DEFAULT_MODEL_PRICING_CATALOG_NOTICE
+    );
+    assert!(catalog.notice.contains("not vendor list prices"));
+    for model in ["gpt-5.6-sol", "gpt-5.6-luna", "fake"] {
+        let resolved =
+            crate::llm::provider::resolve_model_pricing(&BTreeMap::new(), model).expect(model);
+        assert_eq!(resolved.pricing.input_usd_per_million_tokens, 0.0);
+        assert_eq!(resolved.pricing.output_usd_per_million_tokens, 0.0);
+        assert_eq!(
+            resolved.provenance,
+            crate::llm::provider::ModelPricingProvenance::ProjectPolicyDefault
+        );
+    }
+    assert!(
+        crate::llm::provider::resolve_model_pricing(&BTreeMap::new(), "unknown-model").is_none()
+    );
+
+    let hard_ceiling = injected_run_budget(None, Some(100), None, Some(2.0), 50, 50);
+    for runtime in [
+        SupervisorRuntime::Codex,
+        SupervisorRuntime::Grok,
+        SupervisorRuntime::Cursor,
+        SupervisorRuntime::ClaudeCode,
+        SupervisorRuntime::GeminiCli,
+    ] {
+        for model in ["gpt-5.6-sol", "gpt-5.6-luna", "fake", "unknown-model"] {
+            assert_placeholder_ceiling_refuses(runtime, model, &hard_ceiling);
+        }
+    }
+    let soft_only = injected_run_budget(None, Some(100), Some(2.0), None, 50, 50);
+    assert_placeholder_ceiling_refuses(SupervisorRuntime::Codex, "gpt-5.6-sol", &soft_only);
+
+    // A plan table of zeros is still not a versioned operator contract.
+    let mut unbound = injected_plan(injected_assignment(false), 0);
+    unbound.model_pricing.insert(
+        "gpt-5.6-sol".to_string(),
+        ModelPricing {
+            input_usd_per_million_tokens: 0.0,
+            output_usd_per_million_tokens: 0.0,
+        },
+    );
+    let resolved =
+        crate::llm::provider::resolve_model_pricing(&unbound.model_pricing, "gpt-5.6-sol")
+            .expect("unbound plan zero");
+    assert_eq!(
+        resolved.provenance,
+        crate::llm::provider::ModelPricingProvenance::PlanOverride
+    );
+    assert_placeholder_ceiling_refuses_with_plan(
+        &unbound,
+        SupervisorRuntime::Codex,
+        "gpt-5.6-sol",
+        &hard_ceiling,
+    );
+
+    for model in ["gpt-5.6-sol", "unknown-model"] {
+        assert_catalog_model_settlement(model, None, None);
+    }
+    assert_catalog_model_settlement("gpt-5.6-sol", Some(2.0), Some(10.0 * 2.0 / 1_000_000.0));
+    assert_catalog_model_settlement("gpt-5.6-luna", Some(0.0), Some(0.0));
+}
+
+fn assert_placeholder_ceiling_refuses(
+    runtime: SupervisorRuntime,
+    model: &str,
+    budget: &SupervisorBudgetConfig,
+) {
+    let plan = injected_plan(injected_assignment(false), 0);
+    assert_placeholder_ceiling_refuses_with_plan(&plan, runtime, model, budget);
+}
+
+fn assert_placeholder_ceiling_refuses_with_plan(
+    plan: &SupervisorPlan,
+    runtime: SupervisorRuntime,
+    model: &str,
+    budget: &SupervisorBudgetConfig,
+) {
+    if runtime != SupervisorRuntime::Fake {
+        assert!(pricing_for_runtime(plan, model, runtime).is_none());
+    }
+    let ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some(model.to_string());
+    let refused = reserve_dispatch_budget(
+        plan,
+        budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, runtime),
+        &command,
+    )
+    .expect("admission");
+    assert!(
+        matches!(
+            refused,
+            DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::MissingCostEstimate)
+        ),
+        "{runtime:?} {model} must fail closed under a USD ceiling"
+    );
+    let report = ledger.report().expect("refusal report");
+    assert!(report.charges.is_empty());
+    assert_eq!(report.consumed.tokens, 0);
+    assert_eq!(report.reserved.tokens, 0);
+    assert_eq!(report.active_reservations, 0);
+    assert!(report.usage_complete);
+    assert!(!report.new_dispatch_allowed);
+    assert!(report.reasons.contains(&BudgetReason::MissingPricing));
+    assert_eq!(report.action, BudgetAction::OwnerEscalation);
+    assert!(ledger.dispatch_stopped());
+    assert!(matches!(
+        reserve_dispatch_budget(
+            plan,
+            budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, runtime),
+            &command,
+        )
+        .expect("latched admission"),
+        DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::NewDispatchStopped)
+    ));
+    let latched = ledger.report().expect("latched report");
+    assert!(latched.charges.is_empty());
+    assert_eq!(latched.consumed.tokens, 0);
+}
+
+fn assert_catalog_model_settlement(model: &str, rate: Option<f64>, expected_cost: Option<f64>) {
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    if let Some(rate) = rate {
+        plan.model_pricing.insert(
+            model.to_string(),
+            ModelPricing {
+                input_usd_per_million_tokens: rate,
+                output_usd_per_million_tokens: rate,
+            },
+        );
+    }
+    let budget = injected_run_budget(None, Some(100), None, expected_cost.map(|_| 2.0), 50, 50);
+    let mut ledger = RunBudgetLedger::new(budget.limits).expect("ledger");
+    if rate.is_some() {
+        operator_pricing::synthetic_ledger(&plan, &mut ledger);
+    }
+    let catalog_default = crate::llm::provider::resolve_model_pricing(&BTreeMap::new(), model);
+    if model == "unknown-model" {
+        assert!(catalog_default.is_none());
+    } else {
+        let catalog_default = catalog_default.expect("catalog placeholder");
+        assert_eq!(catalog_default.pricing.input_usd_per_million_tokens, 0.0);
+        assert_eq!(
+            catalog_default.provenance,
+            crate::llm::provider::ModelPricingProvenance::ProjectPolicyDefault
+        );
+    }
+    let temp = tempfile::tempdir().expect("command root");
+    let mut command = ExternalAgentCommand::codex(
+        "unused",
+        temp.path(),
+        temp.path().join("prompt.md"),
+        temp.path().join("capture.jsonl"),
+        temp.path().join("report.json"),
+        Duration::from_secs(1),
+    );
+    command.model = Some(model.to_string());
+    let mut reservation = match reserve_dispatch_budget(
+        &plan,
+        &budget,
+        &ledger,
+        (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+        &command,
+    )
+    .expect("token or contract admission")
+    {
+        DispatchBudgetAdmission::Admitted(reservation) => reservation,
+        DispatchBudgetAdmission::Refused(refusal) => panic!("unexpected refusal: {refusal:?}"),
+    };
+    reservation
+        .mark_invoked_for_runtime(SupervisorRuntime::Codex)
+        .expect("bound invocation");
+    write_injected_usage(&command, 7, 3);
+    let mut run = injected_verified_run_without_journals(&command);
+    retain_attribution_fixture(&mut run, &command, Some(model), false, false);
+    let settlement = reservation
+        .settle_bound_runtime(&run, &command)
+        .expect("settlement");
+    assert_eq!(settlement.reliability, DispatchUsageReliability::Reliable);
+    assert_eq!(
+        settlement.reliable_usage().expect("tokens").total_tokens,
+        10
+    );
+    assert_eq!(settlement.cost_usd, expected_cost);
+    let report = ledger.report().expect("settled report");
+    assert_eq!(report.consumed.tokens, 10);
+    assert_eq!(report.consumed.cost_usd, expected_cost);
+    assert!(report.usage_complete);
+    assert_eq!(report.cost_complete, expected_cost.is_some());
+    assert_eq!(report.charges.len(), 1);
+    let charge = &report.charges[0];
+    assert_eq!(charge.tokens, 10);
+    assert_eq!(charge.cost_usd, expected_cost);
+    assert!(charge.usage_complete);
+    if expected_cost.is_some() {
+        assert_eq!(
+            charge.pricing.basis,
+            ChargePricingBasis::OperatorContractEstimate
+        );
+        let provenance = report
+            .pricing_contract
+            .as_ref()
+            .expect("explicit contract provenance");
+        assert_eq!(provenance.contract.contract_id, "synthetic-test-rates");
+        assert_eq!(provenance.contract.revision, "fixture-1");
+        assert_eq!(provenance.contract.schema_version, 1);
+        assert_eq!(provenance.contract.price_map_sha256.len(), 64);
+        assert_eq!(provenance.normalized_sha256.len(), 64);
+        assert_eq!(charge.pricing.contract.as_ref(), Some(provenance));
+        assert!(report.new_dispatch_allowed);
+    } else {
+        assert_eq!(charge.pricing.basis, ChargePricingBasis::Unpriced);
+        assert!(report.pricing_contract.is_none());
+        assert!(charge.pricing.contract.is_none());
+        assert!(report.reasons.contains(&BudgetReason::MissingActualCost));
+        assert!(report.new_dispatch_allowed);
+    }
+    let encoded_budget = serde_json::to_value(&report).expect("budget json");
+    if expected_cost.is_none() {
+        assert!(encoded_budget["consumed"].get("cost_usd").is_none());
+        assert!(encoded_budget["charges"][0]["cost_usd"].is_null());
+    }
+    let aggregation = role_usage_report(
+        &plan,
+        vec![settlement
+            .role_sample(AgentRole::ChildOrchestrator, None)
+            .expect("role sample")],
+    )
+    .expect("role usage");
+    assert_eq!(aggregation.total_usage.expect("tokens").total_tokens, 10);
+    assert_eq!(aggregation.total_cost_usd, expected_cost);
+    let role = &aggregation.reports[&AgentRole::ChildOrchestrator];
+    assert!(role.usage.is_some());
+    assert_eq!(role.cost_usd, expected_cost);
+    let encoded_role = serde_json::to_value(role).expect("role json");
+    if expected_cost.is_none() {
+        assert!(encoded_role.get("cost_usd").is_none());
+    } else {
+        assert_eq!(encoded_role["cost_usd"], serde_json::json!(expected_cost));
+    }
+}
+
+#[test]
 fn pricing_guard_reservation_runtime_cannot_drift_from_fake_to_real() {
     let plan = injected_plan(injected_assignment(false), 0);
     let budget = injected_run_budget(None, Some(100), None, Some(1.0), 50, 50);

@@ -2087,6 +2087,20 @@ is supplied, the run budget ledger also retains the original plan and CLI
 values under `run_budget.sources` so the override is visible independently of
 the composed `limits`.
 
+A per-run or rolling USD ceiling is enforceable for a real paid-provider
+dispatch only when an explicit versioned operator pricing contract applies to
+that runtime, model, account, and plan. The project catalog publishes
+placeholder rates, including zero rates, and its notice states that those rates
+are not vendor list prices. Placeholder rates, and any model without an
+applicable contract, leave cost unavailable. Admission then fails closed with
+`MissingCostEstimate` and leaves priced spend unavailable for that dispatch. An
+explicit zero-price contract remains valid when the run records its provenance.
+With no USD ceiling, token-only admission stays available: reports keep complete
+token usage separate from complete priced cost (`usage_complete` and
+`cost_complete`). Economic comparison stays incomparable while priced cost is
+unavailable, including when token usage is already complete. See
+[Operator pricing](docs/OPERATOR_PRICING.md).
+
 `maco supervise run` and `maco inbox run` also accept optional workspace rolling-quota ceilings:
 
 - `--max-rolling-tokens`
@@ -4471,7 +4485,12 @@ workspace rolling ledger; they are not the supervise/autopilot per-run
 `inbox run` rejects. `inbox watch` and `inbox workspace run|watch` do not
 expose the rolling-quota flags. When a rolling quota refuses further work,
 the run records `status=refused` and the next action asks the operator to
-increase or wait for the quota.
+increase or wait for the quota. A rolling USD ceiling follows the same
+operator-contract rule as `--max-cost-usd`: placeholder catalog rates leave
+cost unavailable, and admission fails closed with `MissingCostEstimate` until
+an explicit versioned contract applies. An explicit zero-price contract remains
+valid with recorded provenance. See
+[Operator pricing](docs/OPERATOR_PRICING.md).
 
 Inbox runs write public-safe artifacts under `.maco/inbox/runs/<run-id>/`,
 including `scan-report.json`, `selected-items.json`, `item-<n>-plan.json`,
