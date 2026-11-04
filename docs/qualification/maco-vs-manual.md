@@ -101,8 +101,11 @@ telemetry still reads the rollup.
 
 The projection reads `supervisor_own_usage` when the field is present and does
 not add the aggregate row. It still refuses `supervisor_aggregate`,
-`synthetic_fake`, a process-observed object with no usage, inconsistent
-totals, and provenance that does not state the counts were process-observed.
+`synthetic_fake`, a process-observed object with no usage, and inconsistent
+totals. Provenance is accepted only as the exact no-provider-client sentence
+or as text that starts with the case-sensitive token `process_observed:`.
+Leading whitespace, a different case, and a negated label such as
+`not_process_observed:` stay unknown.
 An older report that omits the field is not an observed zero. The projection
 then classifies the supervisor row: a rollup stays
 `supervisor_aggregate_not_own_usage`, and a missing supervisor row stays

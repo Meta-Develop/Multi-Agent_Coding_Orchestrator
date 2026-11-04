@@ -11,7 +11,10 @@
 
 use crate::{
     llm::provider::Usage,
-    supervise::{AgentRole, RoleUsageObservation, RoleUsageReport, SupervisorOwnUsage},
+    supervise::{
+        AgentRole, RoleUsageObservation, RoleUsageReport, SupervisorOwnUsage,
+        SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT,
+    },
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
@@ -282,19 +285,36 @@ fn explicit_process_observed_usage(
             "usage_total_inconsistent: supervisor total_tokens must equal input_tokens plus output_tokens",
         );
     };
-    match provenance.map(str::trim).filter(|text| !text.is_empty()) {
-        Some(text) if provenance_states_process_observed(text) => {
-            CoordinationRoleTokens::known(usage)
-        }
-        _ => CoordinationRoleTokens::unknown(
+    if provenance.is_some_and(provenance_states_process_observed) {
+        CoordinationRoleTokens::known(usage)
+    } else {
+        CoordinationRoleTokens::unknown(
             "supervisor_own_usage_not_explicit: process-observed supervisor own usage requires explicit token counts and process-observed provenance",
-        ),
+        )
     }
 }
 
+/// Affirmative process-observed provenance only.
+///
+/// Accepted text is the exact no-provider-client constant, or a string that
+/// starts with the case-sensitive token `process_observed:`. Leading
+/// whitespace, a different case, and a negated label (`not_`, `non-`, `non_`,
+/// `un`) do not match that token. Child-orchestrator rows have no provenance
+/// field, so [`classify_role`] does not use this check.
 fn provenance_states_process_observed(provenance: &str) -> bool {
-    let normalized = provenance.to_ascii_lowercase();
-    normalized.contains("process_observed") || normalized.contains("process-observed")
+    if provenance == SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT {
+        return true;
+    }
+    let Some(rest) = provenance.strip_prefix("process_observed:") else {
+        return false;
+    };
+    let lowered = rest.to_ascii_lowercase();
+    !lowered.contains("not_process_observed")
+        && !lowered.contains("not-process-observed")
+        && !lowered.contains("non_process_observed")
+        && !lowered.contains("non-process-observed")
+        && !lowered.contains("unprocess_observed")
+        && !lowered.contains("unprocess-observed")
 }
 
 fn classify_role(role: AgentRole, report: Option<&RoleUsageReport>) -> CoordinationRoleTokens {
@@ -762,6 +782,49 @@ mod tests {
             .unavailable_reason
             .unwrap()
             .contains("synthetic_fake_not_live_coordination"));
+    }
+
+    #[test]
+    fn negated_or_noncanonical_own_usage_provenance_stays_unknown() {
+        let child = usage(1, 1);
+        let roles = map(&[(
+            AgentRole::ChildOrchestrator,
+            report(RoleUsageObservation::ProcessObserved, Some(child)),
+        )]);
+        let copied_aggregate = usage(70, 30);
+        let cases = [
+            (
+                Usage::default(),
+                "not_process_observed: zero was defaulted because the observation was unavailable",
+            ),
+            (
+                copied_aggregate,
+                "not_process_observed: counts copied from supervisor aggregate",
+            ),
+            (
+                usage(4, 1),
+                "  Process_Observed: provider client reported these counts",
+            ),
+        ];
+        for (counts, provenance) in cases {
+            let own = SupervisorOwnUsage {
+                observation: RoleUsageObservation::ProcessObserved,
+                usage: Some(counts),
+                provenance: Some(provenance.to_string()),
+                unavailable_reason: None,
+            };
+            let observed = coordination_token_observation(&roles, Some(&own));
+            assert!(
+                observed.total.is_none(),
+                "accepted non-affirmative provenance {provenance}"
+            );
+            assert_ne!(observed.supervisor_own.usage, Some(counts));
+            assert_ne!(observed.supervisor_own.usage, Some(Usage::default()));
+            assert!(observed
+                .unavailable_reason
+                .unwrap()
+                .contains("supervisor_own_usage_not_explicit"));
+        }
     }
 
     #[test]
