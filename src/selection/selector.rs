@@ -1428,7 +1428,10 @@ fn evaluate_loaded_policy_candidate(
             .iter()
             .find(|fit| fit.task_class == input.task.task_class && fit.effort == candidate.effort)
     });
-    let public_applies = fit.is_none() && input.priors.public_benchmark_applies(&candidate);
+    let public_applies = fit.is_none()
+        && input
+            .priors
+            .public_benchmark_applies(&candidate, &input.task);
     let public = fit
         .is_none()
         .then(|| input.priors.relative_public_prior(&candidate, &input.task))

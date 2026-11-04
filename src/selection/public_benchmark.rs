@@ -63,6 +63,31 @@ fn invalid(message: &str) -> SelectionError {
     SelectionError::InvalidInput(message.into())
 }
 
+fn valid_source_url(source: &str) -> bool {
+    // Reject URL-parser repairs of missing authorities, backslashes and whitespace.
+    let Some(authority) = source
+        .strip_prefix("https://")
+        .and_then(|rest| rest.split(['/', '?', '#']).next())
+    else {
+        return false;
+    };
+    if authority.is_empty()
+        || authority.contains('@')
+        || source.contains('\\')
+        || source
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return false;
+    }
+    url::Url::parse(source).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| !host.is_empty())
+            && url.username().is_empty()
+            && url.password().is_none()
+    })
+}
+
 // Dates are validated first; Gregorian day number, independent of host time.
 fn day_number(date: &str) -> Result<u32, SelectionError> {
     super::validate_prior_date("public_benchmark.date", date)?;
@@ -100,11 +125,53 @@ impl PublicBenchmarkRow {
 }
 
 impl PublicBenchmarkSnapshot {
+    fn validate(&self) -> Result<(), SelectionError> {
+        if self.max_age_days == 0
+            || self.max_age_days > 90
+            || self.task_classes.is_empty()
+            || self
+                .task_classes
+                .iter()
+                .any(|class| class.trim().is_empty())
+        {
+            return Err(invalid(
+                "public benchmark requires task classes and a 1..=90 day window",
+            ));
+        }
+        let mut rows = BTreeSet::new();
+        for row in &self.rows {
+            if [
+                &row.benchmark_id,
+                &row.benchmark_version,
+                &row.metric,
+                &row.runtime,
+                &row.model,
+            ]
+            .iter()
+            .any(|value| value.trim().is_empty())
+                || !valid_source_url(&row.source_url)
+                || row.score.denominator == 0
+                || row.score.numerator > row.score.denominator
+            {
+                return Err(invalid(
+                    "malformed public benchmark row or missing HTTPS provenance",
+                ));
+            }
+            day_number(&row.published_on)?;
+            day_number(&row.read_on)?;
+            if !rows.insert((&row.runtime, &row.model, row.requested_effort)) {
+                return Err(invalid("ambiguous public benchmark lane within snapshot"));
+            }
+        }
+        Ok(())
+    }
+
     pub fn relative_prior(
         &self,
         candidate: &CandidateKey,
         as_of: &str,
     ) -> Option<RelativePublicBenchmarkPrior> {
+        self.validate().ok()?;
         let reference_key = self.reference_lane.as_ref()?;
         let reference = self.rows.iter().find(|row| row.matches(reference_key))?;
         let lane = self.rows.iter().find(|row| row.matches(candidate))?;
@@ -156,44 +223,9 @@ impl PriorDataset {
         }
         let mut seen = BTreeSet::new();
         for snapshot in &self.public_benchmarks {
-            if snapshot.max_age_days == 0
-                || snapshot.max_age_days > 90
-                || snapshot.task_classes.is_empty()
-                || snapshot
-                    .task_classes
-                    .iter()
-                    .any(|class| class.trim().is_empty())
-            {
-                return Err(invalid(
-                    "public benchmark requires task classes and a 1..=90 day window",
-                ));
-            }
-            let mut rows = BTreeSet::new();
+            snapshot.validate()?;
             for row in &snapshot.rows {
-                if [
-                    &row.benchmark_id,
-                    &row.benchmark_version,
-                    &row.metric,
-                    &row.runtime,
-                    &row.model,
-                ]
-                .iter()
-                .any(|value| value.trim().is_empty())
-                    || !row.source_url.starts_with("https://")
-                    || row.source_url.len() <= 8
-                    || row.score.denominator == 0
-                    || row.score.numerator > row.score.denominator
-                {
-                    return Err(invalid(
-                        "malformed public benchmark row or missing HTTPS provenance",
-                    ));
-                }
-                day_number(&row.published_on)?;
-                day_number(&row.read_on)?;
                 let key = (&row.runtime, &row.model, row.requested_effort);
-                if !rows.insert(key) {
-                    return Err(invalid("ambiguous public benchmark lane within snapshot"));
-                }
                 for class in &snapshot.task_classes {
                     if !seen.insert((class, key)) {
                         return Err(invalid(
@@ -206,12 +238,18 @@ impl PriorDataset {
         Ok(())
     }
 
-    pub(crate) fn public_benchmark_applies(&self, candidate: &CandidateKey) -> bool {
+    pub(crate) fn public_benchmark_applies(
+        &self,
+        candidate: &CandidateKey,
+        task: &TaskProfile,
+    ) -> bool {
         self.public_benchmarks.iter().any(|snapshot| {
-            snapshot
-                .rows
-                .iter()
-                .any(|row| row.runtime == candidate.runtime && row.model == candidate.model)
+            // Task scope survives deletion of candidate rows and model identities.
+            snapshot.task_classes.contains(&task.task_class)
+                || snapshot
+                    .rows
+                    .iter()
+                    .any(|row| row.runtime == candidate.runtime && row.model == candidate.model)
         })
     }
 
@@ -220,6 +258,7 @@ impl PriorDataset {
         candidate: &CandidateKey,
         task: &TaskProfile,
     ) -> Option<RelativePublicBenchmarkPrior> {
+        self.validate_public_benchmarks().ok()?;
         let ceiling = TaskShapeCeiling::bounded_terminal();
         if task.authority_role != AuthorityRole::TerminalLeaf
             || !ceiling.boundedness.contains(&task.boundedness)
@@ -352,6 +391,188 @@ pub(crate) mod tests {
             runtime: "codex".into(),
             model: "synthetic-worker".into(),
             effort: ReasoningEffort::Low,
+        }
+    }
+
+    #[test]
+    fn follow_up_1_missing_candidate_rows_stay_in_public_task_scope() -> anyhow::Result<()> {
+        let mut input = input();
+        let candidate = CandidateKey {
+            runtime: "grok".into(),
+            model: "grok-4.7".into(),
+            effort: ReasoningEffort::Xhigh,
+        };
+        let row = &mut input.priors.public_benchmarks[0].rows[1];
+        row.runtime.clone_from(&candidate.runtime);
+        row.model.clone_from(&candidate.model);
+        row.requested_effort = Some(candidate.effort);
+        row.published_on = "2026-08-04".into();
+        input.priors.add_public_benchmark_models();
+        input.catalogs[0].runtime.clone_from(&candidate.runtime);
+        input.catalogs[0].models[0]
+            .model
+            .clone_from(&candidate.model);
+        input.catalogs[0].models[0].supported_efforts = vec![candidate.effort];
+        let receipt = loaded_policy_test_receipt()?;
+        let stale = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        assert!(stale.choice.is_none(), "stale control");
+
+        input.priors.public_benchmarks[0].rows.remove(1);
+        for retained_identity in [true, false] {
+            if !retained_identity {
+                input.priors.models.retain(|prior| {
+                    prior.runtime != candidate.runtime || prior.model != candidate.model
+                });
+            }
+            let decision =
+                selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+            assert!(
+                decision.choice.is_none(),
+                "missing row, retained identity={retained_identity}: {decision:?}"
+            );
+            assert!(decision.candidate_set[0]
+                .ineligibility_reasons
+                .iter()
+                .any(|reason| reason.code == IneligibilityCode::MissingClassFitEvidence));
+        }
+        input.priors.public_benchmarks[0].rows.clear();
+        assert!(
+            selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?
+                .choice
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_up_1_public_task_scope_preserves_exact_operator_fits() -> anyhow::Result<()> {
+        let mut input = selection::selection_test_base_input();
+        input.catalogs.truncate(1);
+        input.catalogs[0].models.truncate(1);
+        input.catalogs[0].models[0].supported_efforts = vec![ReasoningEffort::High];
+        let receipt = loaded_policy_test_receipt()?;
+        let before = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        assert!(before.choice.is_some());
+        let mut snapshot = synthetic_snapshot();
+        snapshot.rows.clear();
+        input.priors.public_benchmarks = vec![snapshot];
+        let after = selection::select_with_loaded_routing_policy(&input, &[], Some(&receipt))?;
+        assert_eq!(before.choice, after.choice);
+        assert_eq!(
+            before.candidate_set[0].loaded_policy_evidence,
+            after.candidate_set[0].loaded_policy_evidence,
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn follow_up_1_provenance_requires_absolute_hosted_https_without_userinfo() -> anyhow::Result<()>
+    {
+        for url in [
+            "https:///",
+            "https://",
+            "https://?query",
+            "https://#fragment",
+            "https:///example.invalid/path",
+            "https://user@example.invalid/path",
+            "https://user:password@example.invalid/path",
+            "https://@example.invalid/path",
+            "https://example.invalid:bad/path",
+            "https://[invalid]/path",
+            "https://example.invalid/\npath",
+            "https://example.invalid\\path",
+            "http://example.invalid/path",
+            "/relative/path",
+        ] {
+            let mut input = input();
+            input.priors.public_benchmarks[0].rows[1].source_url = url.into();
+            assert!(
+                selection::validate_prior_dataset(&input.priors).is_err(),
+                "{url:?}"
+            );
+            assert!(
+                input.priors.public_benchmarks[0]
+                    .relative_prior(&key(), "2026-11-03")
+                    .is_none(),
+                "{url:?}"
+            );
+            assert!(
+                input
+                    .priors
+                    .relative_public_prior(&key(), &input.task)
+                    .is_none(),
+                "{url:?}"
+            );
+            assert!(
+                selection::select_with_loaded_routing_policy(
+                    &input,
+                    &[],
+                    Some(&loaded_policy_test_receipt()?),
+                )
+                .is_err(),
+                "{url:?}"
+            );
+        }
+        for url in [
+            "https://example.invalid",
+            "https://example.invalid:443/benchmark?q=1#results",
+            "https://[2001:db8::1]/benchmark",
+        ] {
+            let mut input = input();
+            input.priors.public_benchmarks[0].rows[1].source_url = url.into();
+            assert!(
+                selection::validate_prior_dataset(&input.priors).is_ok(),
+                "{url:?}"
+            );
+            assert!(
+                input
+                    .priors
+                    .relative_public_prior(&key(), &input.task)
+                    .is_some(),
+                "{url:?}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn follow_up_1_direct_relative_prior_rejects_duplicate_lane_identities() {
+        for row_index in [0, 1] {
+            for numerator in [0, 100] {
+                let mut snapshot = synthetic_snapshot();
+                let mut duplicate = snapshot.rows[row_index].clone();
+                duplicate.score.numerator = numerator;
+                snapshot.rows.push(duplicate);
+                for reverse in [false, true] {
+                    if reverse {
+                        snapshot.rows.reverse();
+                    }
+                    assert!(
+                        snapshot.relative_prior(&key(), "2026-11-03").is_none(),
+                        "row={row_index}, score={numerator}, reverse={reverse}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn follow_up_1_direct_dataset_prior_rejects_conflicting_snapshots() {
+        let mut input = input();
+        let mut conflict = synthetic_snapshot();
+        conflict.rows[1].score.numerator = 0;
+        input.priors.public_benchmarks.push(conflict);
+        for reverse in [false, true] {
+            if reverse {
+                input.priors.public_benchmarks.reverse();
+            }
+            assert!(
+                input
+                    .priors
+                    .relative_public_prior(&key(), &input.task)
+                    .is_none(),
+                "reverse={reverse}"
+            );
         }
     }
 

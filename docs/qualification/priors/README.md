@@ -9,7 +9,8 @@ For each terminal task class, name a reference runtime/model/**requested effort*
 and supply its row alongside the candidate rows. Every row records benchmark ID,
 benchmark version, metric, an exact higher-is-better fraction (numerator and
 positive denominator, each a u32), runtime, model, requested effort, HTTPS source
-URL, publication date and read date. Use the actual source publication/update
+URL (absolute HTTPS, with a nonempty host and no userinfo), publication date and
+read date. Use the actual source publication/update
 date; a new read does not refresh old evidence. Do not import a score with an
 unstated effort, infer effort from a column contradicted by a footnote, or copy
 scores between efforts. If the publication date or effort is unknown, retain
@@ -37,7 +38,14 @@ versions, and unmapped tasks produce **unknown**, never a fabricated zero or an
 eligible public comparison. Ambiguous duplicate lane/task mappings across
 snapshots are rejected, including across different benchmarks. Choose one
 reviewed benchmark for each lane/task mapping; there is no cross-benchmark ranking
-or averaging. Unknown comparisons do not become exploratory eligible candidates.
+or averaging. Both exported normalization APIs reject ambiguous inputs, including
+duplicate reference identities, before choosing any row. Unknown comparisons do
+not become exploratory eligible candidates. Within a snapshot's configured task
+classes, every candidate without an exact operator class-fit needs a valid public
+comparison. Deleting its row or its public-only model identity leaves it refused,
+including when an observed catalog still advertises that model and effort. A
+public lane also remains refused outside its mapped task classes. Exact operator
+class-fits retain their existing behavior.
 
 The existing 8000-bp floor applies to the **relative** quality (or a stricter loaded
 role floor). For example, entirely synthetic scores of 45/100 and reference
