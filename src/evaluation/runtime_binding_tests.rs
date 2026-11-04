@@ -221,18 +221,19 @@ fn cross_runtime_unknown_identity_withholds_later_paid_cells_and_rejects_tamperi
         .unwrap_err();
     assert!(refused.to_string().contains("allowlist"));
     no_reserved_runs(&artifact_repo);
+    let grok = fixture_runtime_executable(dir.path(), "grok-bin");
     request
         .additional_runtime_executables
         .push(HeldOutAdditionalRuntimeBinding {
             runtime: SupervisorRuntime::Grok,
-            executable: "/usr/bin/true".into(),
+            executable: grok.clone(),
         });
     let _runtime_bindings = crate::supervise::bind_explicit_runtime_executables(
         &request.source.source_repo,
         &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
         SupervisorRuntime::Codex,
-        std::path::Path::new("/usr/bin/true"),
-        &[(SupervisorRuntime::Grok, "/usr/bin/true".into())],
+        &request.runtime_executable,
+        &[(SupervisorRuntime::Grok, grok)],
     )
     .unwrap();
     let results =
@@ -284,6 +285,79 @@ fn cross_runtime_unknown_identity_withholds_later_paid_cells_and_rejects_tamperi
     assert!(
         summarize_executed_observation_runs(&manifest, &results.manifest_sha256, &runs).is_err()
     );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn evaluation_preflight_refuses_symlinked_runtime_bindings_before_reservation() {
+    let manifest = pilot_manifest();
+    let (_source, source_repo, base_commit) = init_committed_source_repo("baseline");
+    let plans = tempfile::TempDir::new().unwrap();
+    let (_artifact, artifact_repo) = artifact_owner();
+    let mut request = real_provider_request(
+        HeldOutExplicitSourceBaseline {
+            source_repo,
+            base_commit,
+        },
+        direct_plan(plans.path()),
+    );
+    request.runtime = SupervisorRuntime::Codex;
+    let grok = fixture_runtime_executable(plans.path(), "grok-bin");
+    request.additional_runtime_executables = vec![HeldOutAdditionalRuntimeBinding {
+        runtime: SupervisorRuntime::Grok,
+        executable: grok.clone(),
+    }];
+    let run_id = crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap();
+    drop(
+        crate::supervise::bind_explicit_runtime_executables(
+            &request.source.source_repo,
+            &run_id,
+            request.runtime,
+            &request.runtime_executable,
+            &[(SupervisorRuntime::Grok, grok)],
+        )
+        .expect("canonical evaluation fixture bindings"),
+    );
+    for runtime in [SupervisorRuntime::Codex, SupervisorRuntime::Grok] {
+        let mut aliased = request.clone();
+        let executable = if runtime == SupervisorRuntime::Codex {
+            &mut aliased.runtime_executable
+        } else {
+            &mut aliased.additional_runtime_executables[0].executable
+        };
+        let alias = plans.path().join(format!("{}-alias", runtime.as_str()));
+        std::os::unix::fs::symlink(&*executable, &alias).unwrap();
+        *executable = alias;
+        let error = (|| {
+            let additional = aliased
+                .additional_runtime_executables
+                .iter()
+                .map(|binding| (binding.runtime, binding.executable.clone()))
+                .collect::<Vec<_>>();
+            let _runtime_bindings = crate::supervise::bind_explicit_runtime_executables(
+                &aliased.source.source_repo,
+                &run_id,
+                aliased.runtime,
+                &aliased.runtime_executable,
+                &additional,
+            )?;
+            super::super::executed_experiment::run_held_out_real_provider_experiment_with_dispatch(
+                &manifest,
+                aliased,
+                &artifact_repo,
+                |_, _, _| panic!("symlinked runtime binding must refuse before dispatch"),
+            )
+        })()
+        .expect_err("symlinked evaluation runtime binding");
+        assert!(
+            error
+                .to_string()
+                .contains("canonical path without symlinks"),
+            "{runtime:?}: {error:#}"
+        );
+        no_reserved_runs(&request.source.source_repo);
+        no_reserved_runs(&artifact_repo);
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -349,6 +423,7 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
         direct_plan(plans.path()),
     );
     request.runtime = SupervisorRuntime::Codex;
+    let grok = fixture_runtime_executable(plans.path(), "grok-bin");
     if matches!(
         case,
         IdentityReceiptCase::Grok | IdentityReceiptCase::LegacyGrok
@@ -357,7 +432,7 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
             .additional_runtime_executables
             .push(HeldOutAdditionalRuntimeBinding {
                 runtime: SupervisorRuntime::Grok,
-                executable: "/usr/bin/true".into(),
+                executable: grok.clone(),
             });
     }
     let _runtime_bindings = (matches!(
@@ -369,8 +444,8 @@ fn identity_receipt_experiment(case: IdentityReceiptCase) -> (ExecutedExperiment
             &request.source.source_repo,
             &crate::orchestrator::RunId::new("held-out-runtime-binding-preflight").unwrap(),
             SupervisorRuntime::Codex,
-            std::path::Path::new("/usr/bin/true"),
-            &[(SupervisorRuntime::Grok, "/usr/bin/true".into())],
+            &request.runtime_executable,
+            &[(SupervisorRuntime::Grok, grok)],
         )
         .unwrap()
     });
