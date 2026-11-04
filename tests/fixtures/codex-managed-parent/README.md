@@ -39,3 +39,9 @@ Compiler failures include captured stderr. No timing or quiescence gate is relax
 Collector-side rejection of a successful report with self-authored gate denials
 must also restore the base and leave both Worker HEADs untouched. Serial cases
 retain the exact dispatch sequence; isolated cases require the exact Worker set.
+
+A successful final report that omits its changed paths must use acceptance's
+supervisor-corrected path set before the terminal handoff. Real private Git index
+locks exercise partial Worker materialization failure and a later parent import
+rejection: both retain sibling leases, captures, the frozen source and the parent
+union claim for supervisor recovery. No rollback drops an advanced private ref.

@@ -385,6 +385,7 @@ impl<'inbox, 'parent> BoundParentTurnYield<'inbox, 'parent> {
             workers,
             review_candidate: None,
             claims_released: std::cell::Cell::new(false),
+            worker_materialization_started: std::cell::Cell::new(false),
         };
         completed.revalidate(context, preflight, parent_attempt, current)?;
         Ok(completed)
@@ -676,6 +677,9 @@ pub(super) struct BoundIsolatedWorkers<'inbox, 'parent> {
     workers: Vec<IsolatedWorkerAttemptEvidence>,
     review_candidate: Option<isolated_parent_candidate::IsolatedParentCandidate>,
     claims_released: std::cell::Cell<bool>,
+    // Monotonic: only complete final acceptance permits dropping the owner once
+    // supervisor Git operations may have advanced any Worker's private ref.
+    worker_materialization_started: std::cell::Cell<bool>,
 }
 
 impl BoundIsolatedWorkers<'_, '_> {
@@ -720,9 +724,27 @@ impl BoundIsolatedWorkers<'_, '_> {
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
     ) -> Result<()> {
+        self.require_pre_materialization_cleanup()?;
         if let Some(view) = &self.review_candidate {
             view.discard(context, preflight, &self.source.candidate)?;
             self.review_candidate = None;
+        }
+        Ok(())
+    }
+
+    pub(super) fn begin_worker_materialization(&self) -> Result<()> {
+        if !self.claims_released.get() || self.worker_materialization_started.replace(true) {
+            bail!("isolated Worker materialization requires a once-only terminal handoff");
+        }
+        Ok(())
+    }
+
+    fn require_pre_materialization_cleanup(&self) -> Result<()> {
+        if self.worker_materialization_started.get() {
+            // Parent rollback alone cannot restore Worker private refs or undo
+            // imported objects. Retain all leases/captures and the frozen source
+            // for supervisor recovery, including partial and rejected Ok imports.
+            bail!("isolated Worker materialization started; held resources require supervisor recovery");
         }
         Ok(())
     }
@@ -775,8 +797,8 @@ impl BoundIsolatedWorkers<'_, '_> {
         outcome: &mut AssignmentExecutionOutcome,
     ) -> Result<()> {
         if self.claims_released.get() {
-            // A supervisor import failure can reach cleanup after the terminal
-            // handoff. Do not release spent tokens or reopen Worker authority.
+            self.require_pre_materialization_cleanup()?;
+            // Do not release spent tokens or reopen Worker authority.
             self.source
                 .revalidate_identity(context, preflight, parent_attempt, current)?;
             return verify_candidate(self.parent_candidate(), context, preflight);

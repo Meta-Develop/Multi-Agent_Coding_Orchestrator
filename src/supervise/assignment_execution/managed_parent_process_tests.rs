@@ -39,6 +39,9 @@ pub(super) fn run(
         parent.worker_reports = workers.lock().unwrap().clone();
         parent.worker_reports.sort_by(|a, b| a.id.cmp(&b.id));
         parent.files_changed = vec!["src/lib.rs".into(), "src/other.rs".into()];
+        if case == "isolated-misreported-paths" {
+            parent.files_changed.clear();
+        }
         parent.remaining_risk = "offline managed process fixture".into();
         parent.audit_reports.clear();
         parent.review_lens_aggregate = None;
@@ -89,6 +92,33 @@ pub(super) fn run(
             .clone();
         fs::write(worker.join("src/lib.rs"), "tampered after capture\n")?;
     }
+    if mode == "final"
+        && matches!(
+            case,
+            "isolated-worker-import-failure" | "isolated-parent-import-failure"
+        )
+    {
+        let workspace = if case == "isolated-parent-import-failure" {
+            command.cwd.clone()
+        } else {
+            workers
+                .lock()
+                .unwrap()
+                .iter()
+                .find(|worker| worker.id == "worker-two")
+                .context("fixture second Worker")?
+                .commands_run[0]
+                .cwd
+                .clone()
+        };
+        let boundary = crate::external_agent::bind_existing_managed_child_git_boundary(&workspace)?;
+        // A real Git lock makes a later materialization fail without changing
+        // the source snapshot or invalidating the verified process capture.
+        fs::write(
+            boundary.private_git_dir().join("index.lock"),
+            b"fixture lock",
+        )?;
+    }
     if mode == "worker" {
         if case == "cancel-active-worker" && identity.task_id == "worker" {
             assert!(cancellation.is_cancelled());
@@ -137,7 +167,10 @@ pub(super) fn exercise(
     let budget = context.budget_ledger.report()?;
     assert_eq!(budget.active_reservations, 0);
     assert_eq!(budget.reserved.tokens, 0);
-    if case != "isolated-tampered" {
+    if !matches!(
+        case,
+        "isolated-tampered" | "isolated-worker-import-failure" | "isolated-parent-import-failure"
+    ) {
         assert_eq!(
             context.sync_store.snapshot()?,
             vec![preflight.claim.clone()]
@@ -276,6 +309,73 @@ pub(super) fn exercise(
                 "drift must retain authority"
             );
         }
+        "isolated-worker-import-failure" | "isolated-parent-import-failure" => {
+            assert!(
+                result.is_err(),
+                "post-materialization refusal dropped its recovery owner"
+            );
+            assert!(outcome.external_containment_failed);
+            assert!(!outcome.usage_incomplete);
+            assert_eq!(outcome.released_claims.len(), 2);
+            assert_eq!(
+                context.sync_store.snapshot()?,
+                vec![preflight.claim.clone()]
+            );
+            assert_eq!(outcome.claim_tokens, vec![preflight.claim.token]);
+            assert!(
+                outcome
+                    .release_errors
+                    .iter()
+                    .any(|error| error.contains("Worker materialization started")),
+                "{:?}",
+                outcome.release_errors
+            );
+            assert!(outcome
+                .release_errors
+                .iter()
+                .all(|error| !error.contains("not active")));
+            assert!(
+                fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?
+                    .contains("pub fn first() -> u32 { 40 }")
+            );
+            assert!(
+                fs::read_to_string(preflight.worktree.path.join("src/other.rs"))?
+                    .contains("pub fn second() -> u32 { crate::first() + 2 }")
+            );
+            assert_eq!(
+                crate::external_agent::bind_existing_managed_child_git_boundary(
+                    &preflight.worktree.path
+                )?
+                .revalidate()?,
+                preflight.child_base_head
+            );
+            for worker in ["worker", "worker-two"] {
+                let path = context
+                    .manager
+                    .list_managed_verified()?
+                    .into_iter()
+                    .find(|record| record.name == worker)
+                    .context("fixture Worker")?
+                    .path;
+                let head = crate::external_agent::bind_existing_managed_child_git_boundary(&path)?
+                    .revalidate()?;
+                assert_eq!(
+                    head == preflight.child_base_head,
+                    case == "isolated-worker-import-failure" && worker == "worker-two"
+                );
+                assert!(
+                    context
+                        .manager
+                        .acquire_write_execution_lease(worker)
+                        .is_err(),
+                    "post-materialization refusal released the Worker lease"
+                );
+            }
+            assert!(
+                preflight.issue_nested_turn(1).is_err(),
+                "spent turn replayed"
+            );
+        }
         "isolated-overlap" => {
             assert!(result.is_err(), "overlapping candidate accepted");
             assert!(!observed.iter().skip(1).any(|id| id == "parent"));
@@ -292,7 +392,8 @@ pub(super) fn exercise(
         | "lost-response"
         | "rejected-review"
         | "isolated-happy"
-        | "isolated-masked-rustup" => {
+        | "isolated-masked-rustup"
+        | "isolated-misreported-paths" => {
             let collected = result?;
             assert!(
                 collected.report_shape_problems.is_empty(),
@@ -300,6 +401,17 @@ pub(super) fn exercise(
                 collected.report_shape_problems
             );
             assert!(collected.attempt_containment_verified);
+            if case == "isolated-misreported-paths" {
+                assert_eq!(
+                    collected.attempt_report.files_changed,
+                    vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/other.rs")]
+                );
+                assert!(collected
+                    .attempt_report
+                    .findings
+                    .iter()
+                    .any(|finding| finding.message.contains("using supervisor-inspected paths")));
+            }
             if case.starts_with("isolated-") {
                 assert_eq!(observed.len(), 4);
                 assert_eq!(observed.first().unwrap(), "parent");
@@ -455,4 +567,23 @@ fn managed_parent_process_isolated_refuses_post_capture_tampering() -> Result<()
 #[test]
 fn managed_parent_process_isolated_refuses_overlapping_candidate_paths() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-overlap")
+}
+
+#[test]
+fn managed_parent_process_isolated_uses_corrected_final_report_paths() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-misreported-paths")
+}
+
+#[test]
+fn managed_parent_process_isolated_worker_import_failure_retains_recovery() -> Result<()> {
+    super::nested_driver_tests::driver_fixture(
+        "managed-cycle-process-isolated-worker-import-failure",
+    )
+}
+
+#[test]
+fn managed_parent_process_isolated_parent_import_rejection_retains_recovery() -> Result<()> {
+    super::nested_driver_tests::driver_fixture(
+        "managed-cycle-process-isolated-parent-import-failure",
+    )
 }

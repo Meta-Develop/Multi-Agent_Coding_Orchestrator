@@ -5534,11 +5534,10 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
         bail!("isolated parent rejected its Worker set; integration is not authorized");
     }
     let expected_candidate = prepared.collection.expected_candidate.clone();
-    let reported_paths = prepared.collection.parsed.report.files_changed.clone();
     prepared.collection.authorizes_materialization = true;
     // Ordinary acceptance can reject a schema-valid, successful parent report.
     // Run it before any Worker commit/import, using the same held report and journals.
-    let mut integrate = |outcome: &mut AssignmentExecutionOutcome| {
+    let mut integrate = |outcome: &mut AssignmentExecutionOutcome, accepted_paths: &[PathBuf]| {
         integrate_accepted_isolated_workers(
             context,
             outcome,
@@ -5547,7 +5546,7 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
             source_attempt,
             current,
             &expected_candidate,
-            &reported_paths,
+            accepted_paths,
         )
     };
     collect_captured_child_attempt(
@@ -5569,7 +5568,7 @@ fn integrate_accepted_isolated_workers(
     source_attempt: usize,
     current: &WorkerInboxTurn<'_>,
     expected_candidate: &PrimaryWorktreeSnapshot,
-    reported_paths: &[PathBuf],
+    accepted_paths: &[PathBuf],
 ) -> Result<()> {
     let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
     if context.cancellation.is_cancelled()
@@ -5582,6 +5581,38 @@ fn integrate_accepted_isolated_workers(
     let primary_head = current_head_oid(context.repo)?;
     let mut candidates = Vec::new();
     let review_candidate = completed.review_candidate()?;
+    // Acceptance replaces self-reported paths with supervisor-inspected paths.
+    // Check that corrected set before releasing claims or advancing private refs.
+    if review_candidate.paths != accepted_paths
+        || review_candidate.paths.iter().any(|path| {
+            !preflight
+                .assignment
+                .assigned_paths
+                .iter()
+                .any(|scope| path_is_covered_by_claim(path, scope))
+        })
+    {
+        bail!("isolated candidate differs from the accepted final parent report or union scope");
+    }
+    let parent_lease = preflight
+        .worktree_write_lease
+        .as_ref()
+        .context("isolated parent lease missing")?;
+    context
+        .manager
+        .verify_write_execution_lease(&preflight.assignment.id, parent_lease)?;
+    let parent_candidate = crate::merge::capture_exact_base_worktree_with_write_lease(
+        context.repo,
+        &preflight.assignment.id,
+        &preflight.assignment.assigned_paths,
+        parent_lease,
+        source_head,
+    )?;
+    if parent_candidate.snapshot_tree != review_candidate.tree
+        || parent_candidate.changed_paths != accepted_paths
+    {
+        bail!("isolated parent tree differs from its accepted reviewed candidate");
+    }
     for (worker, expected) in workers.iter().zip(&review_candidate.workers) {
         if !worker.run().publishable
             || !external_process_completed(worker.run(), worker.model_provenance().launch_runtime)
@@ -5613,6 +5644,9 @@ fn integrate_accepted_isolated_workers(
     // This is the sole terminal handoff; durable spent grants forbid replay.
     // The parent union still covers every child scope while all leases stay held.
     completed.release_completed_claims(context, preflight, source_attempt, current, outcome)?;
+    // From the first possible private Git mutation onward, every refusal (also
+    // the ordinary parent's rejected Ok import) must preserve the held owner.
+    completed.begin_worker_materialization()?;
     let primary = crate::git_repository::open(context.repo)?;
     let base = primary.find_commit(source_head)?.tree()?;
     let mut aggregate_oid = base.id();
@@ -5668,18 +5702,8 @@ fn integrate_accepted_isolated_workers(
             })
             .collect(),
     )?;
-    if aggregate_oid != review_candidate.tree
-        || paths != review_candidate.paths
-        || paths != reported_paths
-        || paths.iter().any(|path| {
-            !preflight
-                .assignment
-                .assigned_paths
-                .iter()
-                .any(|scope| path_is_covered_by_claim(path, scope))
-        })
-    {
-        bail!("isolated aggregate differs from the final parent report or union scope");
+    if aggregate_oid != review_candidate.tree || paths != review_candidate.paths {
+        bail!("isolated imported aggregate differs from the reviewed candidate");
     }
     if context.cancellation.is_cancelled()
         || !context.sync_store.snapshot()?.contains(&preflight.claim)
@@ -5741,7 +5765,7 @@ fn collect_ordinary_child_attempt<'a>(
 }
 
 type ManagedChildMaterializationHook<'hook> =
-    &'hook mut dyn FnMut(&mut AssignmentExecutionOutcome) -> Result<()>;
+    &'hook mut dyn FnMut(&mut AssignmentExecutionOutcome, &[PathBuf]) -> Result<()>;
 
 fn collect_captured_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -5917,7 +5941,7 @@ fn collect_captured_child_attempt<'a>(
     }
     let managed_child_git_import = if materialization_gate.eligible() {
         if let Some(integrate) = before_materialization {
-            integrate(outcome)?;
+            integrate(outcome, &attempt_report.files_changed)?;
         }
         let captured_primary_head = if context.worktree_creation.expected_source_head().is_some() {
             primary_before
