@@ -145,7 +145,7 @@
           # Select the public CLI and, on Linux, the CAM authority and setup tools.
           cargoBuildFlags = [ "--locked" "-p" "multi-agent-coding-orchestrator" "--bin" "maco" ]
             ++ lib.optionals pkgs.stdenv.hostPlatform.isLinux [
-              "-p" "coding-agent-manager" "--bin" "account-authority" "--bin" "cam-grok-setup"
+              "-p" "coding-agent-manager" "--bin" "account-authority" "--bin" "cam-grok-setup" "--bin" "cam-codex-setup"
             ];
 
           nativeBuildInputs = [
@@ -191,11 +191,17 @@
             setup_help="$("$out/bin/cam-grok-setup" --help)"
             printf '%s\n' "$setup_help" | grep -Fx "Usage: cam-grok-setup [--data-dir ABSOLUTE_PATH] prepare ACCOUNT_ID"
             printf '%s\n' "$setup_help" | grep -Fx "No passwords, tokens, auth paths, or default-home import are accepted."
+            test -f "$out/bin/cam-codex-setup"
+            test ! -L "$out/bin/cam-codex-setup"
+            test -x "$out/bin/cam-codex-setup"
+            codex_setup_help="$("$out/bin/cam-codex-setup" --help)"
+            printf '%s\n' "$codex_setup_help" | grep -Fx "Usage: cam-codex-setup [--data-dir ABSOLUTE_PATH] prepare ACCOUNT_ID"
+            printf '%s\n' "$codex_setup_help" | grep -Fx "No passwords, tokens, auth paths, or default-home import are accepted."
             test -f "$out/source-manifest.json"
             test ! -L "$out/source-manifest.json"
             cmp "${sourceManifest}" "$out/source-manifest.json"
             cmp "$out/source-manifest.json" "$out/share/maco/source-manifest.json"
-            ${pkgs.python3}/bin/python3 - "$out" "${macoSrc}/src/bin/maco.rs" "${macoSrc}/account-manager/core/src/bin/grok_setup.rs" <<'PY'
+            ${pkgs.python3}/bin/python3 - "$out" "${macoSrc}/src/bin/maco.rs" "${macoSrc}/account-manager/core/src/bin/grok_setup.rs" "${macoSrc}/account-manager/core/src/bin/codex_setup.rs" <<'PY'
             import hashlib
             import json
             import pathlib
@@ -206,7 +212,7 @@
             def digest(path):
                 with path.open("rb") as source:
                     return hashlib.file_digest(source, "sha256").hexdigest()
-            for name in ("source-manifest.json", "share/maco/source-manifest.json", "share/maco/main-helper.json", "share/maco/grok-setup-helper.json"):
+            for name in ("source-manifest.json", "share/maco/source-manifest.json", "share/maco/main-helper.json", "share/maco/grok-setup-helper.json", "share/maco/codex-setup-helper.json"):
                 metadata = (root / name).lstat()
                 assert stat.S_ISREG(metadata.st_mode)
                 assert 0 < metadata.st_size <= 1024 * 1024
@@ -234,11 +240,25 @@
                 "source_manifest_sha256": digest(root / "share/maco/source-manifest.json"),
                 "setup_entry_sha256": digest(pathlib.Path(sys.argv[3])),
             }
+            setup = root / "bin/cam-codex-setup"
+            metadata = setup.lstat()
+            assert stat.S_ISREG(metadata.st_mode) and metadata.st_mode & 0o111
+            assert metadata.st_mode & 0o6022 == 0
+            with setup.open("rb") as source:
+                assert source.read(4) == b"\x7fELF"
+            assert json.loads((root / "share/maco/codex-setup-helper.json").read_text()) == {
+                "schema": "maco-source-bound-codex-setup-helper-v1",
+                "binary_sha256": digest(setup),
+                "source_manifest_sha256": digest(root / "share/maco/source-manifest.json"),
+                "setup_entry_sha256": digest(pathlib.Path(sys.argv[4])),
+            }
             PY
           '' + lib.optionalString (!pkgs.stdenv.hostPlatform.isLinux) ''
             test ! -e "$out/bin/account-authority"
             test ! -e "$out/bin/cam-grok-setup"
+            test ! -e "$out/bin/cam-codex-setup"
             test ! -e "$out/share/maco/grok-setup-helper.json"
+            test ! -e "$out/share/maco/codex-setup-helper.json"
             test ! -e "$out/source-manifest.json"
           '' + ''
             runHook postInstallCheck
@@ -253,7 +273,7 @@
 
           # Strip/patchelf must finish before binding the installed native image.
           postFixup = lib.optionalString pkgs.stdenv.hostPlatform.isLinux ''
-            ${pkgs.python3}/bin/python3 - "$out" "${macoSrc}/src/bin/maco.rs" "${macoSrc}/account-manager/core/src/bin/grok_setup.rs" <<'PY'
+            ${pkgs.python3}/bin/python3 - "$out" "${macoSrc}/src/bin/maco.rs" "${macoSrc}/account-manager/core/src/bin/grok_setup.rs" "${macoSrc}/account-manager/core/src/bin/codex_setup.rs" <<'PY'
             import hashlib
             import json
             import pathlib
@@ -280,6 +300,15 @@
             }
             path = root / "share/maco/grok-setup-helper.json"
             path.write_text(json.dumps(setup_declaration, sort_keys=True, separators=(",", ":")) + "\n")
+            path.chmod(0o444)
+            codex_setup_declaration = {
+                "schema": "maco-source-bound-codex-setup-helper-v1",
+                "binary_sha256": digest(root / "bin/cam-codex-setup"),
+                "source_manifest_sha256": digest(root / "share/maco/source-manifest.json"),
+                "setup_entry_sha256": digest(pathlib.Path(sys.argv[4])),
+            }
+            path = root / "share/maco/codex-setup-helper.json"
+            path.write_text(json.dumps(codex_setup_declaration, sort_keys=True, separators=(",", ":")) + "\n")
             path.chmod(0o444)
             PY
           '';

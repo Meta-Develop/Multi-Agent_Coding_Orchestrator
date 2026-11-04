@@ -10396,6 +10396,77 @@ mod selection_policy_tests {
         }
 
         #[test]
+        fn headless_codex_setup_selection_supplies_managed_catalog_and_launch_binding() -> Result<()>
+        {
+            use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
+            use coding_agent_manager_lib::providers::codex_cli::{device_setup, CodexCliAdapter};
+            let _socket = crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
+            let (root, registry) = isolated_registry();
+            let data = registry.metadata_path().parent().unwrap().to_path_buf();
+            let setup = |args: &[&str]| -> Result<String> {
+                let args: Vec<String> = ["--data-dir", data.to_str().unwrap()]
+                    .into_iter()
+                    .chain(args.iter().copied())
+                    .map(str::to_string)
+                    .collect();
+                device_setup::run(&args).map_err(|message| anyhow!(message))
+            };
+            setup(&["prepare", "headless-work"])?;
+            let pending = registry.account("codex-cli", "headless-work")?;
+            let home = data.join("accounts/codex-cli/headless-work");
+            std::fs::write(
+                home.join("auth.json"),
+                br#"{"tokens":{"access_token":"FAKE-owner-login"}}"#,
+            )?;
+            setup(&[
+                "complete",
+                "headless-work",
+                "--incarnation",
+                &pending.account_incarnation,
+            ])?;
+            let selected = registry
+                .selected_binding("codex-cli")?
+                .context("headless selection")?;
+            std::fs::write(home.join("models_cache.json"), br#"{"models":[{"slug":"headless-model","supported_reasoning_levels":[{"effort":"high"}],"default_reasoning_level":"high"}]}"#)?;
+            let _cam = activate_cam_observe_test_harness(CamObserveTestHarness {
+                registry,
+                adapter: Box::new(
+                    CodexCliAdapter::with_home(root.path().join("unused-live-home"))
+                        .with_data_dir(&data),
+                ),
+                secondary_adapter: None,
+                advertised: None,
+                resolved_auditor: None,
+                _root: root,
+            });
+            let run = "headless-codex-catalog";
+            let observation =
+                account_observation_for_launch_runtime(SupervisorRuntime::Codex, Some(run))?
+                    .context("managed catalog")?;
+            assert_eq!(observation.binding, selected);
+            let models = observation
+                .models
+                .as_ref()
+                .and_then(|category| category.content.as_ref())
+                .context("cached models")?;
+            let catalog = CodexRuntimeModelCatalog::from_observed_models(models)?;
+            assert!(catalog.contains("headless-model"));
+            assert!(catalog.supports_effort("headless-model", "high"));
+            let Some(CodexRunAccountBinding::Selected(frozen)) = codex_run_account_binding(run)
+            else {
+                bail!("missing selected launch binding")
+            };
+            assert_eq!(frozen.to_selected_binding(), selected);
+            assert_eq!(frozen.authority_socket, None);
+            freeze_selected_codex_launch_binding(Some("headless-codex-secondary"))?;
+            assert_eq!(
+                codex_run_account_binding("headless-codex-secondary"),
+                Some(CodexRunAccountBinding::Selected(frozen))
+            );
+            Ok(())
+        }
+
+        #[test]
         fn codex_scheduler_observation_and_secondary_selection_are_frozen_per_run() -> Result<()> {
             use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
             let _guard = activate_stub(true, SchedulerObserveStubMode::ObservedModels);

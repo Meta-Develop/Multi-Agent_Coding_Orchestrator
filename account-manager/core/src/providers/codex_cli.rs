@@ -14,6 +14,8 @@
 //! replacement of that one file. `CODEX_HOME` relocates the whole directory
 //! [verified-docs], which gives a second, less invasive switching strategy.
 
+pub mod device_setup;
+
 use std::fs;
 use std::io::ErrorKind;
 use std::path::{Path, PathBuf};

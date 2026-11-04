@@ -20,6 +20,10 @@ path = "src/bin/account_authority.rs"
 name = "cam-grok-setup"
 path = "src/bin/grok_setup.rs"
 
+[[bin]]
+name = "cam-codex-setup"
+path = "src/bin/codex_setup.rs"
+
 [dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
