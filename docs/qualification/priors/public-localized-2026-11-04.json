@@ -1,0 +1,62 @@
+{
+  "schema_version": 1,
+  "dataset_id": "public-localized-2026-11-04",
+  "revision": "2026-11-04.1",
+  "published_on": "2026-11-04",
+  "models": [],
+  "public_benchmarks": [
+    {
+      "task_classes": ["localized_code_change"],
+      "reference_lane": {
+        "runtime": "codex",
+        "model": "gpt-6.1-sol",
+        "effort": "high"
+      },
+      "max_age_days": 90,
+      "rows": [
+        {
+          "benchmark_id": "vulcanbench-frontier",
+          "benchmark_version": "v4",
+          "metric": "hidden_behaviours_fixed",
+          "score": { "numerator": 231, "denominator": 231 },
+          "runtime": "codex",
+          "model": "gpt-6.1-sol",
+          "requested_effort": "high",
+          "source_url": "https://vulcanbench.com/benchmarks/swe-v4-gpt61-sol-v318.html",
+          "published_on": "2026-10-01",
+          "read_on": "2026-11-04"
+        },
+        {
+          "benchmark_id": "vulcanbench-frontier",
+          "benchmark_version": "v4",
+          "metric": "hidden_behaviours_fixed",
+          "score": { "numerator": 230, "denominator": 231 },
+          "runtime": "grok",
+          "model": "grok-4.7",
+          "requested_effort": "high",
+          "source_url": "https://vulcanbench.com/benchmarks/swe-v4-grok47-cursor-v320.html",
+          "published_on": "2026-10-04",
+          "read_on": "2026-11-04"
+        },
+        {
+          "benchmark_id": "vulcanbench-frontier",
+          "benchmark_version": "v4",
+          "metric": "hidden_behaviours_fixed",
+          "score": { "numerator": 231, "denominator": 231 },
+          "runtime": "grok",
+          "model": "grok-4.7",
+          "requested_effort": "xhigh",
+          "source_url": "https://vulcanbench.com/benchmarks/swe-v4-grok47-cursor-v320.html",
+          "published_on": "2026-10-04",
+          "read_on": "2026-11-04"
+        }
+      ]
+    }
+  ],
+  "capability_policy": {
+    "id": "public-localized-2026-11-04",
+    "version": 1,
+    "source": "docs/qualification/priors/public-localized-2026-11-04.md; VulcanBench Frontier v4 hidden behaviours for localized_code_change only; no capability grant and no live qualification",
+    "models": []
+  }
+}

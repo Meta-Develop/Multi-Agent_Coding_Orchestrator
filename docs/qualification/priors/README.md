@@ -122,9 +122,10 @@ not admit a review/acceptance authority role. The [Grok evidence checkpoint](gro
 contains no reference comparison and continues to grant nothing by itself.
 
 The reference lane is chosen per task class. The
-[Terminal-Bench 4.0 snapshot](public-tb4-2026-11-04.md) maps only bounded
-`localized_code_change` to `codex` / `gpt-6.1-sol` / `low`, the cheapest
-requested effort of the Codex model already used for that class. Review,
-research, delegation, and every judgment role stay unmapped, so a public-only
-lane remains refused there. That file grants no capability, no class-fit
-samples, and no live qualification.
+[localized code-change snapshot](public-localized-2026-11-04.md) maps only
+bounded `localized_code_change` to `codex` / `gpt-6.1-sol` / `high` on
+VulcanBench Frontier v4 hidden behaviours, read on 2026-11-04. `grok-4.7`
+high and xhigh are the candidate rows. `grok-4.7` low and the undated
+Artificial Analysis Terminal-Bench 4.0 cells stay outside the active rows.
+Review, research, delegation, and every judgment role stay unmapped. That
+file grants no capability, no class-fit samples, and no live qualification.

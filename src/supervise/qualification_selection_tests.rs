@@ -241,29 +241,29 @@ fn synthetic_relative_public_prior_admits_only_requested_terminal_qualification_
     Ok(())
 }
 
-const PUBLIC_TB4_PRIOR: &str =
-    include_str!("../../docs/qualification/priors/public-tb4-2026-11-04.json");
-const PUBLIC_TB4_RELATIVE: &str = "docs/qualification/priors/public-tb4-2026-11-04.json";
-const PUBLIC_TB4_EVALUATED_ON: &str = "2026-11-04";
+const PUBLIC_LOCALIZED_PRIOR: &str =
+    include_str!("../../docs/qualification/priors/public-localized-2026-11-04.json");
+const PUBLIC_LOCALIZED_RELATIVE: &str = "docs/qualification/priors/public-localized-2026-11-04.json";
+const PUBLIC_LOCALIZED_EVALUATED_ON: &str = "2026-11-04";
 
-fn write_tb4_prior(repo: &Path, bytes: &[u8]) -> Result<()> {
-    let path = repo.join(PUBLIC_TB4_RELATIVE);
+fn write_localized_prior(repo: &Path, bytes: &[u8]) -> Result<()> {
+    let path = repo.join(PUBLIC_LOCALIZED_RELATIVE);
     fs::create_dir_all(path.parent().context("public prior parent")?)?;
     fs::write(path, bytes)?;
     Ok(())
 }
 
-fn qualification_selection_with_tb4(
+fn qualification_selection_with_localized(
     source: &str,
     prior_bytes: &[u8],
     primary: SupervisorRuntime,
 ) -> Result<SupervisorSelectionResolution> {
     let (_temporary, repo) = super::super::tests::injected_repository();
-    write_tb4_prior(&repo, prior_bytes)?;
+    write_localized_prior(&repo, prior_bytes)?;
     let _prior = super::super::prior_input::bind_operator_prior_data_evaluated_on(
         &repo,
-        PUBLIC_TB4_RELATIVE,
-        PUBLIC_TB4_EVALUATED_ON,
+        PUBLIC_LOCALIZED_RELATIVE,
+        PUBLIC_LOCALIZED_EVALUATED_ON,
     )?;
     let mut loaded =
         super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(source, Some(&repo))?;
@@ -343,65 +343,94 @@ fn set_assignment_runtime(source: &mut serde_json::Value, role: &str, runtime: &
 }
 
 #[test]
-fn public_tb4_prior_data_digest_uses_the_tracked_file() -> Result<()> {
+fn public_localized_prior_data_digest_uses_the_tracked_file() -> Result<()> {
     let (_temporary, repo) = super::super::tests::injected_repository();
-    write_tb4_prior(&repo, PUBLIC_TB4_PRIOR.as_bytes())?;
-    let production = super::super::prior_input::bind_operator_prior_data(&repo, PUBLIC_TB4_RELATIVE)?;
+    write_localized_prior(&repo, PUBLIC_LOCALIZED_PRIOR.as_bytes())?;
+    let production =
+        super::super::prior_input::bind_operator_prior_data(&repo, PUBLIC_LOCALIZED_RELATIVE)?;
     let production_provenance =
         super::super::prior_input::current_provenance().context("production provenance")?;
-    assert_eq!(production_provenance.relative_path, PUBLIC_TB4_RELATIVE);
+    assert_eq!(
+        production_provenance.relative_path,
+        PUBLIC_LOCALIZED_RELATIVE
+    );
     assert_eq!(
         production_provenance.raw_sha256,
-        crate::artifacts::state_auth::sha256_hex(PUBLIC_TB4_PRIOR.as_bytes())
+        crate::artifacts::state_auth::sha256_hex(PUBLIC_LOCALIZED_PRIOR.as_bytes())
     );
     drop(production);
     let _frozen = super::super::prior_input::bind_operator_prior_data_evaluated_on(
         &repo,
-        PUBLIC_TB4_RELATIVE,
-        PUBLIC_TB4_EVALUATED_ON,
+        PUBLIC_LOCALIZED_RELATIVE,
+        PUBLIC_LOCALIZED_EVALUATED_ON,
     )?;
     let provenance = super::super::prior_input::current_provenance().context("frozen provenance")?;
     assert_eq!(provenance.raw_sha256, production_provenance.raw_sha256);
-    assert_eq!(provenance.relative_path, PUBLIC_TB4_RELATIVE);
+    assert_eq!(provenance.relative_path, PUBLIC_LOCALIZED_RELATIVE);
     let priors = super::super::prior_input::current_priors().context("frozen priors")?;
     assert_eq!(
         priors.public_benchmarks_evaluated_on.as_deref(),
-        Some(PUBLIC_TB4_EVALUATED_ON)
+        Some(PUBLIC_LOCALIZED_EVALUATED_ON)
     );
     assert_eq!(priors.public_benchmarks.len(), 1);
+    let snapshot = &priors.public_benchmarks[0];
     assert_eq!(
-        priors.public_benchmarks[0].task_classes,
-        BTreeSet::from(["localized_code_change".to_string()])
+        snapshot.task_classes,
+        ["localized_code_change".to_string()].into_iter().collect()
     );
+    assert_eq!(
+        snapshot.reference_lane.as_ref(),
+        Some(&CandidateKey {
+            runtime: "codex".to_string(),
+            model: "gpt-6.1-sol".to_string(),
+            effort: SelectorEffort::High,
+        })
+    );
+    assert_eq!(snapshot.rows.len(), 3);
     let grok = priors
         .models
         .iter()
-        .find(|prior| prior.model == "grok-4.7")
-        .context("public-only grok identity")?;
-    assert!(grok.class_fit.is_empty() && grok.authority_evidence.is_empty());
+        .find(|prior| prior.runtime == "grok" && prior.model == "grok-4.7")
+        .context("public grok identity")?;
+    assert!(grok.class_fit.is_empty());
+    assert!(grok.authority_evidence.is_empty());
     assert_eq!(grok.strength_rank, 0);
+    assert_eq!(grok.source_id, "dated-public-benchmark");
+    assert!(!grok.prohibited);
+    assert!(priors.models.iter().any(|prior| {
+        prior.model == "gpt-6.1-sol"
+            && prior.source_id == "owner-policy-gpt-6-1-sol-all-codex-roles-2026-10-22"
+    }));
     let worker = super::task_profile_for_role(AgentRole::Worker);
+    let reference = CandidateKey {
+        runtime: "codex".to_string(),
+        model: "gpt-6.1-sol".to_string(),
+        effort: SelectorEffort::High,
+    };
     assert_eq!(
         priors
-            .relative_public_prior(&grok_candidate(SelectorEffort::Xhigh), &worker)
-            .context("xhigh ratio")?
-            .quality_basis_points,
-        8_376
+            .relative_public_prior(&reference, &worker)
+            .map(|prior| prior.quality_basis_points),
+        Some(10_000)
     );
     assert_eq!(
         priors
             .relative_public_prior(&grok_candidate(SelectorEffort::High), &worker)
-            .context("high ratio")?
-            .quality_basis_points,
-        8_019
+            .map(|prior| prior.quality_basis_points),
+        Some(9956)
     );
     assert_eq!(
         priors
-            .relative_public_prior(&grok_candidate(SelectorEffort::Low), &worker)
-            .context("low ratio")?
-            .quality_basis_points,
-        5_259
+            .relative_public_prior(&grok_candidate(SelectorEffort::Xhigh), &worker)
+            .map(|prior| prior.quality_basis_points),
+        Some(10_000)
     );
+    assert!(priors
+        .relative_public_prior(&grok_candidate(SelectorEffort::Low), &worker)
+        .is_none());
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("213"));
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("2026-10-27"));
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("\"requested_effort\": \"low\""));
     let mut review = super::task_profile_for_role(AgentRole::Researcher);
     assert!(priors
         .relative_public_prior(&grok_candidate(SelectorEffort::Xhigh), &review)
@@ -474,63 +503,40 @@ fn public_tb4_prior_data_digest_uses_the_tracked_file() -> Result<()> {
 }
 
 #[test]
-fn public_tb4_prior_admits_only_bounded_localized_grok_lanes() -> Result<()> {
+fn public_localized_prior_admits_high_and_xhigh_only() -> Result<()> {
     let fixture = include_str!("../../examples/supervise/qualification-grok47-acp.json");
     for (effort, basis_points) in [
-        (SelectorEffort::Xhigh, 8_376_u16),
-        (SelectorEffort::High, 8_019_u16),
+        (SelectorEffort::High, 9956u16),
+        (SelectorEffort::Xhigh, 10_000u16),
     ] {
         let mut source: serde_json::Value = serde_json::from_str(fixture)?;
         set_role_model(&mut source, "worker", "grok-4.7", effort.as_str());
-        let selected = qualification_selection_with_tb4(
+        let selected = qualification_selection_with_localized(
             &serde_json::to_string(&source)?,
-            PUBLIC_TB4_PRIOR.as_bytes(),
+            PUBLIC_LOCALIZED_PRIOR.as_bytes(),
             SupervisorRuntime::Codex,
         )?;
         assert!(
             selected.selection_preflight_failure.is_none(),
-            "{effort:?}: {selected:?}"
+            "{effort:?}: {:?}",
+            selected.selection_preflight_failure
         );
-        let evaluation = worker_lane(&selected, effort)?;
-        assert!(evaluation.eligible);
-        assert_eq!(
-            evaluation
-                .loaded_policy_evidence
-                .as_ref()
-                .context("loaded evidence")?
-                .quality_basis_points,
-            Some(basis_points)
-        );
-        assert_eq!(
-            evaluation
-                .loaded_policy_evidence
-                .as_ref()
-                .context("loaded evidence")?
-                .samples,
-            0
-        );
-        assert_eq!(
-            evaluation
-                .score
-                .as_ref()
-                .context("selected score")?
-                .posterior_quality_basis_points,
-            basis_points
-        );
+        let lane = worker_lane(&selected, effort)?;
+        assert!(lane.eligible, "{effort:?}");
+        let evidence = lane
+            .loaded_policy_evidence
+            .as_ref()
+            .context("public evidence")?;
+        assert_eq!(evidence.quality_basis_points, Some(basis_points), "{effort:?}");
+        assert_eq!(evidence.samples, 0, "{effort:?}");
         let decision = selected
             .decisions
             .iter()
             .find(|decision| decision.role == AgentRole::Worker)
             .context("worker decision")?;
-        assert_eq!(
-            decision
-                .provenance
-                .choice
-                .as_ref()
-                .context("worker choice")?
-                .candidate,
-            grok_candidate(effort)
-        );
+        assert_eq!(decision.provenance.status, DecisionStatus::Selected);
+        let choice = decision.provenance.choice.as_ref().context("worker choice")?;
+        assert_eq!(choice.candidate, grok_candidate(effort));
         assert_eq!(
             decision
                 .provenance
@@ -538,64 +544,59 @@ fn public_tb4_prior_admits_only_bounded_localized_grok_lanes() -> Result<()> {
                 .as_ref()
                 .context("prior provenance")?
                 .raw_sha256,
-            crate::artifacts::state_auth::sha256_hex(PUBLIC_TB4_PRIOR.as_bytes())
+            crate::artifacts::state_auth::sha256_hex(PUBLIC_LOCALIZED_PRIOR.as_bytes())
         );
         for other in &selected.decisions {
             if other.role == AgentRole::Worker {
                 continue;
             }
-            let choice = other
+            assert_eq!(
+                other.provenance.status,
+                DecisionStatus::Selected,
+                "{:?}",
+                other.role
+            );
+            let other_choice = other
                 .provenance
                 .choice
                 .as_ref()
                 .context("control-role choice")?;
-            assert!(!choice.candidate.model.starts_with("grok-"), "{:?}", other.role);
-            assert_eq!(other.provenance.status, DecisionStatus::Selected);
+            assert!(
+                !other_choice.candidate.model.starts_with("grok-"),
+                "{:?}",
+                other.role
+            );
         }
     }
 
     let mut low: serde_json::Value = serde_json::from_str(fixture)?;
     set_role_model(&mut low, "worker", "grok-4.7", "low");
-    let refused = qualification_selection_with_tb4(
+    let refused = qualification_selection_with_localized(
         &serde_json::to_string(&low)?,
-        PUBLIC_TB4_PRIOR.as_bytes(),
+        PUBLIC_LOCALIZED_PRIOR.as_bytes(),
         SupervisorRuntime::Codex,
     )?;
     assert_eq!(
         qualification_refusals(&refused)?,
         vec![(
             AgentRole::Worker,
-            selection_preflight::SelectionPreflightRejection::Eligibility,
+            selection_preflight::SelectionPreflightRejection::EffortIncompatible,
             json!({"runtime": "grok", "model": "grok-4.7", "effort": "low"}),
         )]
     );
-    let evaluation = worker_lane(&refused, SelectorEffort::Low)?;
-    assert!(!evaluation.eligible);
-    assert_eq!(
-        evaluation
-            .loaded_policy_evidence
-            .as_ref()
-            .context("low evidence")?
-            .quality_basis_points,
-        Some(5_259)
-    );
-    assert!(evaluation
-        .ineligibility_reasons
-        .iter()
-        .any(|reason| reason.code == selection::IneligibilityCode::QualityBarNotMet));
     Ok(())
 }
 
 #[test]
-fn public_tb4_prior_refuses_unmapped_classes_authority_and_deleted_rows() -> Result<()> {
+fn public_localized_prior_refuses_unmapped_classes_and_low() -> Result<()> {
     let mut researcher: serde_json::Value = serde_json::from_str(include_str!(
         "../../examples/supervise/qualification-researcher-source-input.json"
     ))?;
     set_role_model(&mut researcher, "researcher", "grok-4.7", "xhigh");
     set_assignment_runtime(&mut researcher, "researcher", "grok");
-    let rejected_researcher = qualification_selection_with_tb4(
+    let rejected_researcher = qualification_selection_with_localized(
         &serde_json::to_string(&researcher)?,
-        PUBLIC_TB4_PRIOR.as_bytes(),
+        PUBLIC_LOCALIZED_PRIOR.as_bytes(),
         SupervisorRuntime::Codex,
     );
     assert!(
@@ -608,9 +609,9 @@ fn public_tb4_prior_refuses_unmapped_classes_authority_and_deleted_rows() -> Res
         "../../examples/supervise/qualification-researcher-source-input.json"
     ))?;
     set_role_model(&mut researcher_codex, "researcher", "grok-4.7", "xhigh");
-    let researcher_model = qualification_selection_with_tb4(
+    let researcher_model = qualification_selection_with_localized(
         &serde_json::to_string(&researcher_codex)?,
-        PUBLIC_TB4_PRIOR.as_bytes(),
+        PUBLIC_LOCALIZED_PRIOR.as_bytes(),
         SupervisorRuntime::Codex,
     )?;
     assert!(qualification_refusals(&researcher_model)?
@@ -626,9 +627,9 @@ fn public_tb4_prior_refuses_unmapped_classes_authority_and_deleted_rows() -> Res
     ))?;
     set_role_model(&mut nested, "child_orchestrator", "grok-4.7", "xhigh");
     set_assignment_runtime(&mut nested, "child_orchestrator", "grok");
-    let nested = qualification_selection_with_tb4(
+    let nested = qualification_selection_with_localized(
         &serde_json::to_string(&nested)?,
-        PUBLIC_TB4_PRIOR.as_bytes(),
+        PUBLIC_LOCALIZED_PRIOR.as_bytes(),
         SupervisorRuntime::Codex,
     )?;
     assert!(qualification_refusals(&nested)?.iter().any(|refusal| {
@@ -642,9 +643,9 @@ fn public_tb4_prior_refuses_unmapped_classes_authority_and_deleted_rows() -> Res
     for role in ["supervisor", "gate_classifier", "auditor"] {
         set_role_model(&mut judgment, role, "grok-4.7", "xhigh");
     }
-    let judgment = qualification_selection_with_tb4(
+    let judgment = qualification_selection_with_localized(
         &serde_json::to_string(&judgment)?,
-        PUBLIC_TB4_PRIOR.as_bytes(),
+        PUBLIC_LOCALIZED_PRIOR.as_bytes(),
         SupervisorRuntime::Grok,
     )?;
     let refusals = qualification_refusals(&judgment)?;
@@ -663,65 +664,35 @@ fn public_tb4_prior_refuses_unmapped_classes_authority_and_deleted_rows() -> Res
             "{role:?}: {refusals:?}"
         );
     }
+    assert!(
+        !refusals
+            .iter()
+            .any(|refusal| refusal.0 == AgentRole::Worker),
+        "worker xhigh is a tracked row: {refusals:?}"
+    );
     let worker = judgment
         .decisions
         .iter()
         .find(|decision| decision.role == AgentRole::Worker)
-        .context("worker still decided")?;
-    assert_eq!(
-        worker
-            .provenance
-            .choice
-            .as_ref()
-            .context("bounded worker still selected")?
-            .candidate,
-        grok_candidate(SelectorEffort::Xhigh)
-    );
+        .context("worker decision")?;
+    assert_eq!(worker.provenance.status, DecisionStatus::Selected);
+    let choice = worker.provenance.choice.as_ref().context("worker choice")?;
+    assert_eq!(choice.candidate, grok_candidate(SelectorEffort::Xhigh));
+    let evidence = worker_lane(&judgment, SelectorEffort::Xhigh)?
+        .loaded_policy_evidence
+        .as_ref()
+        .context("worker evidence")?;
+    assert_eq!(evidence.quality_basis_points, Some(10_000));
+    assert_eq!(evidence.samples, 0);
 
-    let mut deleted: serde_json::Value = serde_json::from_str(PUBLIC_TB4_PRIOR)?;
-    let rows = deleted["public_benchmarks"][0]["rows"]
-        .as_array_mut()
-        .context("benchmark rows")?;
-    let before = rows.len();
-    rows.retain(|row| {
-        !(row["runtime"] == "grok"
-            && row["model"] == "grok-4.7"
-            && row["requested_effort"] == "xhigh")
-    });
-    assert_eq!(rows.len(), before - 1);
-    assert!(PUBLIC_TB4_PRIOR.contains("\"numerator\": 258"));
-    let deleted_bytes = serde_json::to_vec(&deleted)?;
-    let mut worker_source: serde_json::Value =
-        serde_json::from_str(include_str!("../../examples/supervise/qualification-grok47-acp.json"))?;
-    set_role_model(&mut worker_source, "worker", "grok-4.7", "xhigh");
-    let missing = qualification_selection_with_tb4(
-        &serde_json::to_string(&worker_source)?,
-        &deleted_bytes,
-        SupervisorRuntime::Codex,
-    )?;
-    assert_eq!(
-        qualification_refusals(&missing)?,
-        vec![(
-            AgentRole::Worker,
-            selection_preflight::SelectionPreflightRejection::EffortIncompatible,
-            json!({"runtime": "grok", "model": "grok-4.7", "effort": "xhigh"}),
-        )]
-    );
-    set_role_model(&mut worker_source, "worker", "grok-4.7", "high");
-    let high = qualification_selection_with_tb4(
-        &serde_json::to_string(&worker_source)?,
-        &deleted_bytes,
-        SupervisorRuntime::Codex,
-    )?;
-    assert!(high.selection_preflight_failure.is_none(), "{high:?}");
-    let evaluation = worker_lane(&high, SelectorEffort::High)?;
-    assert_eq!(
-        evaluation
-            .loaded_policy_evidence
-            .as_ref()
-            .context("retained high row")?
-            .quality_basis_points,
-        Some(8_019)
-    );
+    let tracked: serde_json::Value = serde_json::from_str(PUBLIC_LOCALIZED_PRIOR)?;
+    let benchmarks = tracked["public_benchmarks"]
+        .as_array()
+        .context("public benchmarks")?;
+    assert_eq!(benchmarks.len(), 1);
+    assert_eq!(benchmarks[0]["rows"].as_array().context("rows")?.len(), 3);
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("213"));
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("2026-10-27"));
+    assert!(!PUBLIC_LOCALIZED_PRIOR.contains("\"requested_effort\": \"low\""));
     Ok(())
 }
