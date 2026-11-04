@@ -194,6 +194,108 @@ fn operator_contract_binding_rejects_oversized_rolling_provenance() {
     assert_eq!(ledger.report().unwrap().charges.len(), 1);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn headless_codex_selected_cam_id_admits_only_its_pricing_scope() -> Result<()> {
+    use coding_agent_manager_lib::{
+        account_authority::{authority_id_for, StoredAccountRegistry},
+        paths::stored_accounts_path,
+        providers::codex_cli::device_setup,
+    };
+    let _socket =
+        crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(
+            None,
+        );
+    let temp = tempfile::tempdir()?;
+    let data = temp.path().join("cam");
+    let setup = |args: &[&str]| -> Result<String> {
+        let args: Vec<String> = ["--data-dir", data.to_str().unwrap()]
+            .into_iter()
+            .chain(args.iter().copied())
+            .map(str::to_string)
+            .collect();
+        device_setup::run(&args).map_err(|message| anyhow!(message))
+    };
+    setup(&["prepare", "priced-work"])?;
+    let registry = StoredAccountRegistry::new(stored_accounts_path(&data));
+    let pending = registry.account("codex-cli", "priced-work")?;
+    fs::write(
+        data.join("accounts/codex-cli/priced-work/auth.json"),
+        br#"{"tokens":{"access_token":"FAKE-owner-login"}}"#,
+    )?;
+    setup(&[
+        "complete",
+        "priced-work",
+        "--incarnation",
+        &pending.account_incarnation,
+    ])?;
+    let selected = registry
+        .selected_binding("codex-cli")?
+        .context("setup selection")?;
+    let run_id = "headless-codex-selected-pricing";
+    crate::account_authority::record_observed_codex_selection_from_source(
+        Some(run_id),
+        "codex-cli",
+        Some(authority_id_for(registry.metadata_path())),
+        Some(&selected),
+        None,
+    );
+    let mut plan = injected_plan(injected_assignment(false), 0);
+    inject_priced_process_roles(&mut plan, "synthetic-model", 2.0);
+    let mut document = operator_pricing_document(&plan);
+    let mut command = ExternalAgentCommand::codex(
+        "never-launch",
+        temp.path(),
+        temp.path().join("prompt"),
+        temp.path().join("usage"),
+        temp.path().join("report"),
+        Duration::from_secs(1),
+    )
+    .with_agent_lifecycle(temp.path(), "worker", run_id, "pricing-check");
+    command.model = Some("synthetic-model".into());
+    let Some(crate::account_authority::CodexRunAccountBinding::Selected(carried)) =
+        crate::account_authority::codex_run_account_binding(run_id)
+    else {
+        bail!("selected CAM binding was not carried into command");
+    };
+    assert_eq!(carried.account_id, "priced-work");
+    let budget = injected_run_budget(None, Some(1000), None, Some(1.0), 50, 50);
+    for (scope, expected_admission) in [("priced-work", true), ("another-account", false)] {
+        document["pricing_contract"]["scopes"][0]["account_id"] = json!(scope);
+        let loaded = parse_supervisor_plan_with_consultant(&document.to_string())?;
+        let mut ledger = RunBudgetLedger::new(budget.limits)?;
+        ledger.operator_pricing = Some(
+            loaded
+                .plan_metadata
+                .operator_pricing
+                .as_ref()
+                .unwrap()
+                .bind(run_id)?,
+        );
+        let admission = reserve_dispatch_budget(
+            &loaded.plan,
+            &budget,
+            &ledger,
+            (AgentRole::ChildOrchestrator, SupervisorRuntime::Codex),
+            &command,
+        )?;
+        match admission {
+            DispatchBudgetAdmission::Admitted(_) => assert!(expected_admission),
+            DispatchBudgetAdmission::Refused(BudgetAdmissionRefusal::MissingCostEstimate) => {
+                assert!(!expected_admission);
+                assert!(operator_pricing::missing_cost_estimate_guidance(
+                    SupervisorRuntime::Codex,
+                    &command,
+                    &ledger
+                )
+                .contains("account_id='priced-work'"));
+            }
+            _ => bail!("unexpected budget refusal"),
+        }
+    }
+    Ok(())
+}
+
 #[test]
 fn operator_contract_absent_or_mismatched_refuses_before_launch() {
     let mut plan = injected_plan(injected_assignment(false), 0);
