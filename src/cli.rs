@@ -1942,8 +1942,8 @@ struct RunSuperviseArgs {
     /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
-    /// Additional exact executable for a distinct runtime in this supervise run.
-    /// Requires an absolute primary --runtime-bin as well.
+    /// Additional canonical executable for a distinct non-Fake runtime in this Linux supervise run.
+    /// Requires a canonical absolute primary --runtime-bin; resume must match the frozen allowlist.
     #[arg(
         long = "additional-runtime-bin",
         value_name = "RUNTIME=ABSOLUTE_EXECUTABLE",

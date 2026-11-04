@@ -28,6 +28,7 @@ FIXTURE_MODULE_SHARDS = {
     "prompts_gates": "supervise-fixtures-budget",
     "licensed_breakage": "supervise-fixtures-licensed",
     "plan_runtime": "supervise-fixtures-runtime",
+    "mixed_runtime": "supervise-fixtures-runtime",
     "qualification_handoff": "supervise-fixtures-runtime",
     "reaudit": "supervise-fixtures-runtime",
     "run_artifacts": "supervise-fixtures-runtime",

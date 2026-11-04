@@ -5,6 +5,8 @@ mod catalog_preflight_admission;
 mod decomposition_acceptance;
 mod environment_controls;
 mod licensed_breakage;
+#[cfg(target_os = "linux")]
+mod mixed_runtime;
 mod plan_runtime;
 mod primary_worktree;
 mod prompts_gates;
