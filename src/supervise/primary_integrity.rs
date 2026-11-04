@@ -378,12 +378,7 @@ pub(super) fn primary_status_snapshot(
         runtime,
     )
     .context("failed to run Git CLI primary status snapshot")?;
-    if !output.status.success() {
-        bail!(
-            "Git CLI primary status snapshot failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    require_successful_primary_git_snapshot("status", &output)?;
 
     let records = output.stdout.split(|byte| *byte == 0).collect::<Vec<_>>();
     let mut entries = BTreeMap::new();
@@ -424,6 +419,20 @@ pub(super) fn primary_status_snapshot(
     Ok(entries)
 }
 
+fn require_successful_primary_git_snapshot(
+    kind: &str,
+    output: &std::process::Output,
+) -> Result<()> {
+    if !output.status.success() {
+        bail!(
+            "Git CLI primary {kind} snapshot failed: status={}; stderr={:?}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(())
+}
+
 fn primary_index_snapshot(
     workdir: &Path,
     runtime: SupervisorExecutionRuntime,
@@ -434,12 +443,7 @@ fn primary_index_snapshot(
         runtime,
     )
     .context("failed to run Git CLI primary index snapshot")?;
-    if !output.status.success() {
-        bail!(
-            "Git CLI primary index snapshot failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
+    require_successful_primary_git_snapshot("index", &output)?;
 
     let mut entries = BTreeMap::new();
     for record in output
@@ -1182,6 +1186,25 @@ mod snapshot_git_retry_tests {
         assert!(!hidden.status.success());
         assert!(hidden.stdout.is_empty());
         assert!(String::from_utf8_lossy(&hidden.stderr).contains("Permission denied"));
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unsuccessful_snapshot_git_without_stderr_reports_exit_status() -> Result<()> {
+        let (_temp, path) = crate::supervise::tests::injected_repository();
+        // A missing configuration key is a real nonzero Git exit with no stderr.
+        let output = sanitized_git_output_once(
+            &path,
+            &["config", "--get", "snapshot.absent"],
+            SupervisorExecutionRuntime::Verified,
+        )?;
+        assert_eq!(output.status.code(), Some(1));
+        assert!(output.stderr.is_empty());
+        let error = require_successful_primary_git_snapshot("index", &output).unwrap_err();
+        let message = error.to_string();
+        assert!(message.contains("status=exit status: 1"), "{message}");
+        assert!(message.contains("stderr=\"\""), "{message}");
         Ok(())
     }
 

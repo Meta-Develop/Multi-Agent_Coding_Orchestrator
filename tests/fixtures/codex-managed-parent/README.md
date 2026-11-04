@@ -45,3 +45,7 @@ supervisor-corrected path set before the terminal handoff. Real private Git inde
 locks exercise partial Worker materialization failure and a later parent import
 rejection: both retain sibling leases, captures, the frozen source and the parent
 union claim for supervisor recovery. No rollback drops an advanced private ref.
+
+A private directory at the initial report destination refuses evidence import
+before any isolated Worker dispatch. No Worker worktrees or private commits are
+created, and the parent remains at the captured base without needing quarantine.

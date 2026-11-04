@@ -108,7 +108,11 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
         .collect::<Vec<_>>();
     require_exact_authored_workers(preflight, &requested)?;
     if bound.selects_isolated_route(context, preflight, source_attempt, &turn)? {
-        let result = collect_isolated_parent_cycle(
+        // Persist the quiescent initial turn before any Worker can run or
+        // materialize. No fallible evidence import may follow owner release.
+        import_held_initial_parent_evidence(context, &parent)
+            .context("isolated initial parent evidence import failed")?;
+        return collect_isolated_parent_cycle(
             context,
             outcome,
             preflight,
@@ -122,18 +126,8 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
             worker_schema_path,
             auditor_schema_path,
         );
-        let imported = import_initial_parent_evidence(context, parent);
-        return match (result, imported) {
-            (Ok(collected), Ok(())) => Ok(collected),
-            (Ok(_), Err(error)) => {
-                Err(error).context("isolated initial parent evidence import failed")
-            }
-            (Err(error), Ok(())) => Err(error),
-            (Err(error), Err(import_error)) => Err(error).context(format!(
-                "isolated initial parent evidence import also failed: {import_error:#}"
-            )),
-        };
     }
+
     // A serial Worker refusal still leaves the quiescent initial parent owned
     // here. Retain the error until its evidence and scratch have been consumed.
     let prepared_final = prepare_serial_parent_continuation(
@@ -616,6 +610,29 @@ fn refuse_attached_parent<'budget>(
         "fatal: attached parent owner remained live without verified scratch quiescence; aborting rather than detaching owned execution"
     );
     std::process::abort()
+}
+
+// The inspected capture is quiescent and remains borrowed by the frozen turn.
+// Its descriptor-held evidence can be imported without consuming that binding.
+fn import_held_initial_parent_evidence(
+    context: &AssignmentExecutionContext<'_, '_>,
+    parent: &InspectedAttachedParent<'_>,
+) -> Result<()> {
+    let prepared = &parent.prepared;
+    with_supervisor_artifacts(context.artifacts, |writer, _| {
+        import_external_attempt_evidence(
+            writer,
+            ExternalAttemptEvidenceContext {
+                incoming_scratch: &prepared.incoming_scratch,
+                capture_scratch: &prepared.capture_scratch,
+                artifacts: &prepared.attempt_artifacts,
+                external_run: &parent.external_run,
+                external_command: &prepared.command,
+                raw_report_validated: true,
+                runtime: prepared.launch_runtime,
+            },
+        )
+    })
 }
 
 #[inline(never)]

@@ -150,6 +150,16 @@ pub(super) fn exercise(
     // preflight's pending token so terminal cleanup can detect double releases.
     outcome.claim_tokens.push(preflight.claim.token);
     let schemas = &context.dirs.schemas;
+    if case == "isolated-initial-import-failure" {
+        let destination = context
+            .run_dir
+            .join(&prepared.attempt_artifacts.raw_report_relative);
+        use std::os::unix::fs::DirBuilderExt;
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(destination)?;
+    }
     let result = super::managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
         context,
         outcome,
@@ -195,6 +205,37 @@ pub(super) fn exercise(
         "pub fn selected() {}\n"
     );
     match case {
+        "isolated-initial-import-failure" => {
+            let error = result.err().context("initial evidence refusal accepted")?;
+            assert!(
+                format!("{error:#}").contains("initial parent evidence import failed"),
+                "{error:#}"
+            );
+            assert_eq!(
+                crate::external_agent::bind_existing_managed_child_git_boundary(
+                    &preflight.worktree.path
+                )?
+                .revalidate()?,
+                preflight.child_base_head,
+                "initial evidence refusal advanced the parent private ref"
+            );
+            assert_eq!(
+                observed,
+                ["parent"],
+                "Workers dispatched before initial evidence import"
+            );
+            assert!(!outcome.authority_requires_quarantine());
+            assert!(outcome.released_claims.is_empty());
+            assert!(context
+                .manager
+                .list_managed_verified()?
+                .iter()
+                .all(|record| record.name != "worker" && record.name != "worker-two"));
+            assert_eq!(
+                fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
+                "pub fn selected() {}\n"
+            );
+        }
         "forged-identity" | "widened-request" => {
             assert!(result.is_err(), "invalid request accepted");
             assert_eq!(observed, ["parent"]);
@@ -585,5 +626,13 @@ fn managed_parent_process_isolated_worker_import_failure_retains_recovery() -> R
 fn managed_parent_process_isolated_parent_import_rejection_retains_recovery() -> Result<()> {
     super::nested_driver_tests::driver_fixture(
         "managed-cycle-process-isolated-parent-import-failure",
+    )
+}
+
+#[test]
+fn managed_parent_process_isolated_initial_evidence_refusal_precedes_worker_dispatch() -> Result<()>
+{
+    super::nested_driver_tests::driver_fixture(
+        "managed-cycle-process-isolated-initial-import-failure",
     )
 }

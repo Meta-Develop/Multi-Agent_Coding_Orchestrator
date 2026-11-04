@@ -1311,7 +1311,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 "protected primary index bytes changed"
             );
         }
-        if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
+        if case == "managed-cycle-process-isolated-initial-import-failure" {
+            assert!(overlapping_workers.state.lock().unwrap().workers.is_empty());
+        } else if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
             let live = overlapping_workers.state.lock().unwrap().workers.clone();
             assert_eq!(live.len(), 2);
             let latest_start = live.iter().map(|entry| entry.2).max().unwrap();
