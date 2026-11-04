@@ -246,6 +246,29 @@ pub fn bind_operator_prior_data(
     Ok(install(Some(snapshot.0)))
 }
 
+/// Test binder that freezes the public-benchmark evaluation date.
+/// Production `--prior-data` reads continue to freeze the current UTC date.
+#[cfg(test)]
+pub(crate) fn bind_operator_prior_data_evaluated_on(
+    repo: impl AsRef<Path>,
+    relative_path: impl AsRef<Path>,
+    evaluated_on: &str,
+) -> Result<OperatorPriorDataGuard> {
+    require_supported_prior_input_platform()?;
+    let repo = crate::artifacts::discover_repo_root(repo.as_ref())?;
+    let relative_path = normalize_repo_relative_path(relative_path.as_ref())
+        .context("operator prior-data path must be repository-relative")?;
+    let raw =
+        BoundedRegularReader::read_relative(&repo, &relative_path, MAX_OPERATOR_PRIOR_INPUT_BYTES)
+            .context("failed to read bounded repository-local operator prior data")?;
+    Ok(install(Some(bind_from_bytes(
+        repo,
+        relative_path,
+        raw,
+        Some(evaluated_on),
+    )?)))
+}
+
 fn bind_from_bytes(
     repo: PathBuf,
     relative_path: PathBuf,
