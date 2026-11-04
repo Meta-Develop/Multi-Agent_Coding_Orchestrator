@@ -15,7 +15,7 @@ pub(super) fn validate_researcher_assignment(assignment: &OrchestratorAssignment
     if assignment.runtime.is_some_and(|runtime| {
         !matches!(
             runtime,
-            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli | SupervisorRuntime::DeepSeek
         )
     }) {
         bail!("researcher requires a supported strict Linux read-only runtime");
@@ -30,7 +30,7 @@ pub(super) fn configure_researcher_command(
     if !cfg!(target_os = "linux")
         || !matches!(
             runtime,
-            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli | SupervisorRuntime::DeepSeek
         )
     {
         bail!("researcher requires a supported strict Linux read-only runtime");
@@ -616,8 +616,18 @@ mod tests {
         };
         let configured_gemini =
             configure_researcher_command(gemini(), SupervisorRuntime::GeminiCli);
+        let configured_deepseek =
+            configure_researcher_command(command(), SupervisorRuntime::DeepSeek);
         let configured = configure_researcher_command(command(), SupervisorRuntime::Codex);
         if cfg!(target_os = "linux") {
+            let configured_deepseek = configured_deepseek?;
+            assert_eq!(
+                configured_deepseek.workspace_access,
+                WorkspaceAccess::ReadOnly
+            );
+            let wrong_role =
+                command().with_agent_lifecycle(".", "worker", "research-run", "research");
+            assert!(configure_researcher_command(wrong_role, SupervisorRuntime::DeepSeek).is_err());
             let configured_gemini = configured_gemini?;
             assert_eq!(
                 configured_gemini.workspace_access,
@@ -638,6 +648,7 @@ mod tests {
                 .any(|pair| pair == [OsStr::new("--disable"), OsStr::new("multi_agent")]));
         } else {
             assert!(configured_gemini.is_err());
+            assert!(configured_deepseek.is_err());
             assert!(configured.is_err());
         }
         Ok(())

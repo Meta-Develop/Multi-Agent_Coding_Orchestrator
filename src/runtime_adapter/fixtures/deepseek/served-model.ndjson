@@ -1,0 +1,9 @@
+# Citation: the 0.2.2-alpha.3 headless projection does not emit a model field
+# (packages/bundle/headless/src/json-stream.ts). This fixture adds the optional
+# top-level model string the supervisor checks when a future event reports one.
+{"type":"session","sessionId":"session-documented","cwd":"/work","model":"deepseek-v4-pro"}
+{"type":"status","phase":"turn_start","turn":1}
+{"type":"status","phase":"step_start","turn":1,"step":1}
+{"type":"status","phase":"step_end","turn":1,"step":1,"usage":{"inputTokens":1,"outputTokens":1}}
+{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"completed"}}
+{"type":"final","sessionId":"session-documented","reason":{"kind":"completed"},"text":"ok"}

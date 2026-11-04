@@ -462,7 +462,8 @@ const fn external_sandbox_requirement(
         ExternalAgentInvocation::CodexSupervisor
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::ClaudeConsultant
-        | ExternalAgentInvocation::GeminiCli => EnvironmentSandboxCapability::VerifiedExternalCodex,
+        | ExternalAgentInvocation::GeminiCli
+        | ExternalAgentInvocation::DeepSeek => EnvironmentSandboxCapability::VerifiedExternalCodex,
     };
     EnvironmentRequirement::sandbox(capability)
 }
@@ -544,6 +545,14 @@ fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, 
         ExternalAgentInvocation::Cursor => !matches!(
             key,
             "HOME" | "CURSOR_CONFIG_DIR" | "AGENT_CLI_CREDENTIAL_STORE" | "CURSOR_API_KEY"
+        ),
+        ExternalAgentInvocation::DeepSeek => !matches!(
+            key,
+            "HOME"
+                | "DSH_HOME"
+                | "DSH_PERMISSION_MODE"
+                | "DSH_TELEMETRY_OTLP_URL"
+                | "DEEPSEEK_API_KEY"
         ),
         _ => true,
     }
@@ -5367,6 +5376,18 @@ impl ExternalProviderProfile {
                 (ExternalAgentInvocation::Cursor, WorkspaceAccess::ReadWrite, _) => {
                     Self::Cursor(ExternalCursorProfile::read_write(&spec.cwd))
                 }
+                (ExternalAgentInvocation::DeepSeek, WorkspaceAccess::ReadWrite, _) => {
+                    let bound = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+                        crate::supervise::deepseek_qualification::operator_flag_bound(
+                            &identity.registry_repo,
+                            &identity.run_id,
+                        )
+                    });
+                    bail!(
+                        "{}",
+                        crate::supervise::deepseek_qualification::writable_refusal(bound)
+                    );
+                }
                 (_, WorkspaceAccess::ReadOnly, _) => {
                     Self::Codex(ExternalCodexProfile::read_only(&spec.cwd))
                 }
@@ -5516,7 +5537,8 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::Grok
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
-        | ExternalAgentInvocation::GeminiCli => {
+        | ExternalAgentInvocation::GeminiCli
+        | ExternalAgentInvocation::DeepSeek => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
@@ -5578,7 +5600,10 @@ fn external_side_effect_profile_with_claude_relay(
                 }
             }
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
-            if spec.invocation == ExternalAgentInvocation::Grok {
+            if matches!(
+                spec.invocation,
+                ExternalAgentInvocation::Grok | ExternalAgentInvocation::DeepSeek
+            ) {
                 // ProtectHome hides custom installations. Expose the executable itself,
                 // not adjacent home files, and keep it read-only even inside the workspace.
                 profile = profile.with_visible_read_only_file(program);
@@ -5600,6 +5625,11 @@ fn external_side_effect_profile_with_claude_relay(
                 // runner still owns prompt validation; expose only that exact held input to the
                 // contained child instead of its parent directory.
                 profile = profile.with_visible_read_only_file(&spec.prompt);
+            }
+            if spec.invocation == ExternalAgentInvocation::DeepSeek {
+                profile = profile.with_visible_read_only_file(
+                    crate::runtime_adapter::deepseek::launch_patch_path(&spec.prompt),
+                );
             }
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
@@ -6366,6 +6396,7 @@ impl CredentialRedactor {
             "OPENAI_API_KEY",
             "CODEX_API_KEY",
             "CODEX_ACCESS_TOKEN",
+            "DEEPSEEK_API_KEY",
         ] {
             if let Some(value) = environment.get(key) {
                 add_credential_pattern(&mut patterns, value.as_bytes())?;
@@ -6375,6 +6406,16 @@ impl CredentialRedactor {
                         .and_then(|value| value.strip_suffix('"'))
                     {
                         add_credential_pattern(&mut patterns, escaped.as_bytes())?;
+                        if key == "DEEPSEEK_API_KEY" {
+                            // final.text contains a JSON ResearcherReport inside the NDJSON
+                            // envelope; tool results can likewise contain JSON text. Redact
+                            // that additional wire escaping before the raw stream is persisted.
+                            let nested = serde_json::to_string(escaped)?;
+                            add_credential_pattern(
+                                &mut patterns,
+                                &nested.as_bytes()[1..nested.len() - 1],
+                            )?;
+                        }
                     }
                 }
             }
@@ -6457,7 +6498,10 @@ fn add_sensitive_runtime_path_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8])
 }
 
 fn add_credential_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8]) -> Result<()> {
-    if !(MIN_CREDENTIAL_BYTES..=MAX_CREDENTIAL_BYTES).contains(&value.len())
+    if value.len() > MAX_CREDENTIAL_BYTES {
+        bail!("credential form exceeds the safe redaction byte bound");
+    }
+    if value.len() < MIN_CREDENTIAL_BYTES
         || patterns.iter().any(|existing| existing == value)
     {
         return Ok(());
@@ -6629,7 +6673,8 @@ fn command_argv_with_controls_and_service_tier_input(
         ExternalAgentInvocation::Grok
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
-        | ExternalAgentInvocation::GeminiCli => runtime_adapter_argv(spec),
+        | ExternalAgentInvocation::GeminiCli
+        | ExternalAgentInvocation::DeepSeek => runtime_adapter_argv(spec),
     }
 }
 
@@ -6669,6 +6714,7 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
             ExternalAgentInvocation::Cursor => RuntimeId::Cursor,
             ExternalAgentInvocation::ClaudeCode => RuntimeId::ClaudeCode,
             ExternalAgentInvocation::GeminiCli => RuntimeId::GeminiCli,
+            ExternalAgentInvocation::DeepSeek => RuntimeId::DeepSeek,
             _ => RuntimeId::Codex,
         })
     });

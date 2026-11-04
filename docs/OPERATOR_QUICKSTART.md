@@ -495,6 +495,80 @@ stdout to `$OUT/run.json` and stderr to `$OUT/run.stderr`,
 and returns maco's status through `systemd-run --scope`. Use a fresh run id and
 a clean target repository; the plan copy requires no target-repository change.
 
+## DeepSeek Harness runtime
+
+MACO can launch DeepSeek Harness (`dsh`) as a read-only Researcher. The
+integration surface is `dsh --profile headless --json`. That profile is the
+documented one-task supervisor contract: the process exits 0 and the NDJSON
+stream contains `final.reason.kind` of `completed`. The ACP profile only serves
+until the client disconnects and is not used.
+
+The adapter is pinned to deepseek-harness protocol **0.2.2-alpha.3** (headless
+README, CLI help, and the JSON stream projector). The published npm package
+observed separately is `@deepseek-ai/dsh@0.2.1-rc.5`. Those versions are not
+interchangeable. Record `dsh --version` and `node --version` and refuse a
+headless help or flag mismatch. See
+[deepseek-headless qualification](qualification/deepseek-headless.md).
+
+Install Node, then the package. The install note for `npx @deepseek-ai/dsh`
+asks for Node >= 22.19. The pinned protocol source declares
+`engines.node >= 24.9.0`. Use a Node that satisfies the package you install.
+
+```bash
+npx @deepseek-ai/dsh@0.2.1-rc.5 --version
+export MACO_DSH_BIN="$(readlink -f "$(command -v dsh)")"
+test -f "$MACO_DSH_BIN" && test ! -L "$MACO_DSH_BIN" || exit 1
+```
+
+`MACO_DSH_BIN` must be an absolute path to a non-symlink regular file. Ambient
+`PATH` lookup and the bare name `dsh` are refused. There is no Nix store pin.
+The sandbox exposes the exact executable file. Runtime dependencies must
+already be visible through the standard system or Nix runtime bindings;
+adjacent installation files and the executable's parent directory are not exposed.
+
+`DEEPSEEK_API_KEY` is taken from the launch environment only. MACO checks its
+length and rejects newlines, then passes that value to the child together with
+`DSH_TELEMETRY_DISABLED=1` and `DSH_TELEMETRY_MODE=DISABLED`. A missing or
+rejected key fails closed so headless cannot fall through to `<cwd>/.env` or
+`$DSH_HOME/.env`. Do not put the key in the worktree, the launch patch, or
+argv. Do not set `DSH_HOME` to a real home directory.
+Launch also refuses any key whose raw, JSON-escaped, or nested JSON-escaped
+redaction form exceeds 64 KiB, or whose complete pattern set exceeds the
+redactor's count or aggregate-byte bound.
+
+Each assignment attempt exclusively creates its own MACO-owned patch beside
+the prompt. The launch records its digest and delivers an immutable read-only
+snapshot of those exact bytes. It disables
+`session-telemetry-otel` (`mode: DISABLED`) and the `session-log-deepseek`
+upload contributor (`enabled: false`). Headless has no model or effort flag.
+The same patch sets `agent-default-model` to provider `deepseek-official`, the
+requested model, and `reasoningEffort` of `off`, `low`, `high`, or `max`.
+Requested effort is the identity. A served model is accepted only when an
+event reports one and it matches the request. The argv is
+`--profile headless --patch <patch> --json --permission-mode read-only
+--approval-policy never -`. `--add-dir` is not passed. Supervisor assignments
+start a fresh session and omit `--session-id`.
+
+The parent validates exit status and the NDJSON stream, keeps the redacted
+stream as evidence, and parses the unique completed `final.text` as a native
+read-only ResearcherReport. Inspection requires the exact normalized assigned
+path in the native `read` tool's absolute `file_path` and a matching successful result.
+Truncated or ambiguous evidence fails closed. Raw and JSON-escaped launch
+keys are redacted from captured output, diagnostics and persisted reports.
+
+Admission is a Linux read-only Researcher with no nested assignments. Writable
+worker launches stay refused with
+`writable_deepseek_headless_qualification_required`.
+`--qualify-deepseek-headless` records an operator marker only;
+`production_qualified` stays false. There is no Coding Agent Manager provider.
+Codex-supervised selection requires a dated operator prior for the exact model
+and a frozen executable binding: pass an absolute canonical Codex `--runtime-bin`
+and `--additional-runtime-bin "deepseek=$MACO_DSH_BIN"` with `--prior-data`.
+The prior supplies model and effort evidence; the executable binding admits the
+Researcher catalog. Authority and writable Worker roles stay refused.
+Advisory catalog names from the provider docs, not a hardcoded
+allowlist, are text-and-image `deepseek-flash` and text-only `deepseek-v4-pro`.
+
 ## Troubleshooting
 
 Managed headless Grok writable publication checks exact `end.modelUsage` keys

@@ -2872,7 +2872,12 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
         ));
     }
 
-    if spec.read_only_input_snapshots.len() > 8 {
+    let launch_patches = spec
+        .read_only_input_snapshots
+        .iter()
+        .filter(|input| input.is_launch_patch())
+        .count();
+    if launch_patches > 1 || spec.read_only_input_snapshots.len() - launch_patches > 8 {
         return Err(std::io::Error::other(
             "source input snapshot bound exceeded",
         ));
@@ -2886,7 +2891,11 @@ fn resolve_systemd_sandbox(spec: &ProcessSpec) -> std::io::Result<Option<Resolve
     for snapshot in &read_only_input_snapshots {
         if config.workspace_access != WorkspaceAccess::ReadOnly
             || !visible_read_only_files.contains(&snapshot.path)
-            || !snapshot.path.starts_with(&workspace_root)
+            || (!snapshot.launch_patch && !snapshot.path.starts_with(&workspace_root))
+            || visible_read_write_files.contains(&snapshot.path)
+            || visible_read_write_roots
+                .iter()
+                .any(|root| snapshot.path.starts_with(root))
             || !snapshot_paths.insert(&snapshot.path)
         {
             return Err(std::io::Error::other(

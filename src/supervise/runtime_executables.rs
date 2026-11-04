@@ -291,6 +291,15 @@ pub(super) fn runtime_allowed(runtime: SupervisorRuntime) -> bool {
     captured_binding().is_none_or(|binding| binding.allowlist.executable_for(runtime).is_some())
 }
 
+/// An authored catalog may use only an executable in the frozen run binding.
+/// Unlike runtime_allowed, absence of a binding never admits ambient programs.
+pub(super) fn bound_catalog_program(runtime: SupervisorRuntime) -> Option<PathBuf> {
+    captured_binding()?
+        .allowlist
+        .executable_for(runtime)
+        .map(Path::to_path_buf)
+}
+
 pub(super) fn constrain_selection(input: &mut crate::selection::SelectionInput) {
     if let Some(binding) = captured_binding() {
         for catalog in &input.catalogs {

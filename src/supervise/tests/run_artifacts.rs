@@ -94,6 +94,7 @@ fn production_persistence_emits_schema_valid_finalized_reports_for_every_runtime
         SupervisorRuntime::Cursor,
         SupervisorRuntime::ClaudeCode,
         SupervisorRuntime::GeminiCli,
+        SupervisorRuntime::DeepSeek,
     ];
     let tracked_schema: serde_json::Value = serde_json::from_str(include_str!(concat!(
         env!("CARGO_MANIFEST_DIR"),

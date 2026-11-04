@@ -1356,6 +1356,17 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             } else {
                 None
             };
+            let _deepseek_qualification = if args.qualify_deepseek_headless {
+                if resume_existing || goal_spec.is_some() || normal_document.is_some() {
+                    bail!("--qualify-deepseek-headless requires a fresh explicit supervisor plan");
+                }
+                Some(supervise::deepseek_qualification::bind_operator_run(
+                    &resolved_repo,
+                    resolved_run_id.as_str(),
+                )?)
+            } else {
+                None
+            };
             let mut options = SupervisorRunOptions {
                 repo: resolved_repo,
                 plan_file,
@@ -1913,6 +1924,10 @@ struct RunSuperviseArgs {
     /// Recorded in run evidence; does not bypass account, prior, containment or publication gates.
     #[arg(long, requires_all = ["runtime", "run_id"], conflicts_with_all = ["from_goal", "literal_goal", "allow_primary_worktree"])]
     qualify_grok47_acp: bool,
+    /// Qualification marker only. Does not admit a writable DeepSeek launch.
+    /// `production_qualified` stays false until a live qualification passes.
+    #[arg(long, requires_all = ["runtime", "run_id"], conflicts_with_all = ["from_goal", "literal_goal", "allow_primary_worktree"])]
+    qualify_deepseek_headless: bool,
     /// JSON supervisor plan file to run.
     #[arg(
         value_name = "SUPERVISOR_PLAN",
@@ -6070,6 +6085,9 @@ mod cli_integration_tests {
         assert!(!supervise_run_args(&argv).qualify_grok47_acp);
         argv.push("--qualify-grok47-acp");
         assert!(supervise_run_args(&argv).qualify_grok47_acp);
+        assert!(!supervise_run_args(&argv).qualify_deepseek_headless);
+        argv.push("--qualify-deepseek-headless");
+        assert!(supervise_run_args(&argv).qualify_deepseek_headless);
         let no_run_id: Vec<_> = argv
             .iter()
             .copied()

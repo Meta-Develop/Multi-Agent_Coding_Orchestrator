@@ -3184,6 +3184,7 @@ fn pricing_guard_unknown_and_placeholder_costs_are_not_reservable_for_real_runti
         SupervisorRuntime::Cursor,
         SupervisorRuntime::ClaudeCode,
         SupervisorRuntime::GeminiCli,
+        SupervisorRuntime::DeepSeek,
     ] {
         for model in [
             FRONTIER_PROFILE_MODEL,

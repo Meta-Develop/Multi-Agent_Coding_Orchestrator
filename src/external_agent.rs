@@ -87,6 +87,7 @@ use std::{
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
 mod codex_parent_evidence;
+mod deepseek_capture;
 #[allow(dead_code, unused_imports)]
 #[doc(hidden)]
 pub mod executor;
@@ -2976,13 +2977,14 @@ pub enum ExternalAgentInvocation {
     Cursor,
     ClaudeCode,
     GeminiCli,
+    DeepSeek,
 }
 
 impl ExternalAgentInvocation {
     pub const fn is_adapter_subprocess(self) -> bool {
         matches!(
             self,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli
+            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek
         )
     }
 
@@ -2993,6 +2995,7 @@ impl ExternalAgentInvocation {
             Self::Grok => Some(AdapterId::Grok),
             Self::Cursor => Some(AdapterId::Cursor),
             Self::GeminiCli => Some(AdapterId::GeminiCli),
+            Self::DeepSeek => Some(AdapterId::DeepSeek),
         }
     }
 }
@@ -3880,6 +3883,7 @@ impl ExternalAgentCommand {
                 RuntimeId::Cursor => ExternalAgentInvocation::Cursor,
                 RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
                 RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
+                RuntimeId::DeepSeek => ExternalAgentInvocation::DeepSeek,
                 RuntimeId::Codex | RuntimeId::Fake => {
                     return self;
                 }
@@ -3927,6 +3931,18 @@ impl ExternalAgentCommand {
         runtime: RuntimeId,
         non_delegating_terminal_worker: bool,
     ) -> Result<Self> {
+        if runtime == RuntimeId::DeepSeek {
+            let bound = self.agent_lifecycle.as_ref().is_some_and(|identity| {
+                crate::supervise::deepseek_qualification::operator_flag_bound(
+                    &identity.registry_repo,
+                    &identity.run_id,
+                )
+            });
+            bail!(
+                "{}",
+                crate::supervise::deepseek_qualification::writable_refusal(bound)
+            );
+        }
         if !matches!(
             runtime,
             RuntimeId::Grok | RuntimeId::ClaudeCode | RuntimeId::GeminiCli | RuntimeId::Cursor
@@ -5483,6 +5499,8 @@ impl ExternalAgentRun {
 
 #[derive(Serialize)]
 struct ExternalAgentRunWireRef<'a> {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    deepseek_launch_patch: &'a Option<deepseek_capture::LaunchPatch>,
     command: &'a [String],
     cwd: &'a Path,
     timeout_seconds: u64,
@@ -5604,6 +5622,7 @@ impl Serialize for ExternalAgentRun {
         let sandbox_denials = canonicalize_sandbox_denials(self.sandbox_denials().to_vec())
             .map_err(serde::ser::Error::custom)?;
         ExternalAgentRunWireRef {
+            deepseek_launch_patch: &self.stdout.run_metadata.deepseek_launch_patch,
             command: &self.command,
             cwd: &self.cwd,
             timeout_seconds: self.timeout_seconds,
@@ -5702,6 +5721,8 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 
 #[derive(Clone, Default, PartialEq, Eq)]
 struct ExternalAgentRunMetadata {
+    /// Live snapshot custody; public launch descriptions never restore this evidence.
+    deepseek_launch_patch: Option<deepseek_capture::LaunchPatch>,
     selected_merge_completion: Option<SelectedMergeCompletionBinding>,
     gemini_bridge: Option<gemini_bridge::HeldEvidence>,
     read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
@@ -7133,7 +7154,8 @@ fn assignment_process_launch_kind_allowed_for_invocation(
             | ExternalAgentInvocation::Grok
             | ExternalAgentInvocation::Cursor
             | ExternalAgentInvocation::ClaudeCode
-            | ExternalAgentInvocation::GeminiCli => true,
+            | ExternalAgentInvocation::GeminiCli
+            | ExternalAgentInvocation::DeepSeek => true,
             ExternalAgentInvocation::CodexConsultant
             | ExternalAgentInvocation::ClaudeConsultant => false,
         },
@@ -7446,6 +7468,21 @@ fn run_external_agent_runtime_inner(
         );
     }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
+        if spec.invocation == ExternalAgentInvocation::DeepSeek {
+            let bound = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
+                crate::supervise::deepseek_qualification::operator_flag_bound(
+                    &identity.registry_repo,
+                    &identity.run_id,
+                )
+            });
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                crate::supervise::deepseek_qualification::writable_refusal(bound),
+            );
+        }
         if let Some(adapter) = spec.invocation.adapter_id() {
             let managed_native_runtime = match adapter {
                 AdapterId::Grok => Some(RuntimeId::Grok),
@@ -7853,6 +7890,17 @@ fn run_external_agent_runtime_inner(
         codex_parent_evidence: None,
     };
 
+    if spec.invocation == ExternalAgentInvocation::DeepSeek {
+        if let Err(error) = deepseek_capture::bind_launch(spec, &mut report) {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&resolved_program, &argv),
+                false,
+                format!("DeepSeek launch patch refused: {error:#}"),
+            );
+        }
+    }
     let mut codex_version = None;
     let mut preflight_process_evidence = EnvironmentPreflightProcessEvidence::default();
     let agent_lifecycle = match &spec.agent_lifecycle {
@@ -8515,6 +8563,25 @@ fn run_external_agent_runtime_inner(
     };
     let mut external_environment =
         external_environment_for_command(spec, target_spec.runtime_adapter.as_ref(), program_trust);
+    if spec.invocation == ExternalAgentInvocation::DeepSeek {
+        match crate::runtime_adapter::deepseek::privacy_environment(|key| std::env::var(key).ok()) {
+            Ok(pairs) => {
+                for (key, value) in pairs {
+                    external_environment.insert(key.to_string(), value);
+                }
+            }
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::MissingCredential,
+                    None,
+                    format!("DeepSeek launch privacy environment refused: {error:#}"),
+                );
+                return report;
+            }
+        }
+    }
     #[cfg(target_os = "linux")]
     if let Some(session) = grok_session.as_ref() {
         if let Err(error) =
@@ -9211,6 +9278,11 @@ fn run_external_agent_runtime_inner(
     }
     process_spec.read_only_input_snapshots =
         report.stdout.run_metadata.read_only_input_snapshots.clone();
+    if let Some(patch) = &report.stdout.run_metadata.deepseek_launch_patch {
+        process_spec
+            .read_only_input_snapshots
+            .push(patch.snapshot());
+    }
 
     if cancellation.is_cancelled() {
         report.duration_ms = duration_millis(started.elapsed());
@@ -11495,6 +11567,14 @@ fn runtime_adapter_captured_output_with_claude_evidence(
     claude_evidence: Option<&ClaudeNativeEvidence>,
     grok_headless_schema: Option<&serde_json::Value>,
 ) -> Result<RuntimeAdapterCapturedOutput> {
+    if spec.invocation == ExternalAgentInvocation::DeepSeek {
+        if !target_completed_successfully {
+            return Ok(RuntimeAdapterCapturedOutput::Unavailable);
+        }
+        return Ok(RuntimeAdapterCapturedOutput::Captured(
+            deepseek_capture::capture(spec, stdout)?,
+        ));
+    }
     if spec.invocation == ExternalAgentInvocation::Grok {
         if grok_acp_stdio_protocol_selected(spec) {
             return Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput);
@@ -11769,7 +11849,9 @@ fn record_completed_target(
     let target_completed_successfully = !output.timed_out
         && output.status.is_some_and(|status| status.success())
         && output.process_error.is_none()
-        && output.stdin_error.is_none();
+        && output.stdin_error.is_none()
+        && (context.spec.invocation != ExternalAgentInvocation::DeepSeek
+            || !output.stdout.is_truncated());
     let mut claude_native_evidence =
         (context.spec.invocation == ExternalAgentInvocation::ClaudeCode).then(|| {
             crate::runtime_adapter::claude::collect_native_stream(
@@ -11830,6 +11912,13 @@ fn record_completed_target(
     report.stdout.run_metadata.claude_requested_effort = context.spec.reasoning_effort.clone();
     report.stdout.run_metadata.sandbox_denials = sandbox_denials;
     report.stderr = summarize_redacted_output(&output.stderr, credential_redactor);
+    if context.spec.invocation == ExternalAgentInvocation::DeepSeek && output.stdout.is_truncated()
+    {
+        report.error = append_external_error(
+            report.error.take(),
+            Some("DeepSeek stdout capture is truncated".into()),
+        );
+    }
     if let Some(evidence) = context.grok_acp_parent_evidence {
         report.grok_acp_parent_evidence = Some(evidence.clone());
     } else if context.spec.invocation == ExternalAgentInvocation::Grok {
@@ -11900,6 +11989,13 @@ fn record_completed_target(
     {
         Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput) => true,
         Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
+            // DeepSeek reports are JSON text nested inside the event stream. Keep the
+            // parent's intermediate report staging free of launch credentials too.
+            let captured = if context.spec.invocation == ExternalAgentInvocation::DeepSeek {
+                credential_redactor.redact_bytes(&captured)
+            } else {
+                captured
+            };
             match staged_output.write_bytes_atomic(&captured, OUTPUT_TEE_LIMIT_BYTES) {
                 Ok(()) => {
                     validated_grok_native_output_staged = context.spec.invocation
@@ -13622,6 +13718,8 @@ mod preflight_quiescence_regression {
     }
 }
 
+#[cfg(all(test, unix))]
+pub(crate) mod deepseek_tests;
 #[cfg(test)]
 mod managed_readonly_route_tests;
 #[cfg(test)]
