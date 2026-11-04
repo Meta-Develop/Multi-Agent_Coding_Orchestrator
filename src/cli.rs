@@ -1645,6 +1645,10 @@ struct RunBudgetArgs {
     ///
     /// Tightens the plan `run_budget` by taking the minimum and is retained on
     /// the run budget ledger as `sources.cli` alongside the original plan values.
+    /// Placeholder catalog rates leave cost unavailable. Admission fails closed
+    /// with `MissingCostEstimate` until an explicit versioned operator pricing
+    /// contract applies. An explicit zero-price contract remains valid when its
+    /// provenance is recorded. Omit this flag for token-only admission.
     #[arg(
         long = "max-cost-usd",
         visible_alias = "max-total-cost-usd",
@@ -1670,6 +1674,11 @@ struct RunBudgetArgs {
     max_rolling_tokens: Option<usize>,
     /// Hard ceiling for provider cost consumed across supervise/autopilot runs
     /// in the workspace rolling window, in USD.
+    ///
+    /// Placeholder catalog rates leave that cost unavailable. Admission fails
+    /// closed with `MissingCostEstimate` until an explicit versioned operator
+    /// pricing contract applies. An explicit zero-price contract remains valid
+    /// when its provenance is recorded. Omit this flag for token-only admission.
     #[arg(
         long = "max-rolling-cost-usd",
         value_parser = parse_positive_finite_f64

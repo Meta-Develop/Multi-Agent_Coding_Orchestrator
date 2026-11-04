@@ -4,6 +4,11 @@ USD ceilings and rolling USD quotas require an applicable operator contract
 before a real dispatch. A catalog placeholder or a selector cost prior cannot
 establish a price. `MissingCostEstimate` preserves those limits and refuses
 launch; token-only execution can retain complete tokens with unavailable cost.
+`--max-cost-usd` and `--max-rolling-cost-usd` set these ceilings from the CLI.
+The project catalog keeps its notice that default rates are placeholders and
+are not vendor list prices. Real paid-provider admission treats those defaults,
+including catalog zeros, as unavailable cost. Reports and economic comparison
+keep complete token usage separate from complete priced cost.
 
 Copy the fields from
 [`operator-pricing.template.json`](../examples/supervise/operator-pricing.template.json)
