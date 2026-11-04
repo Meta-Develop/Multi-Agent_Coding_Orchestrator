@@ -3386,6 +3386,9 @@ fn catalog_model_from_observed(
             maximum_horizon: TaskHorizon::Long,
             long_context: false,
         });
+    if let Some(prior) = prior {
+        add_public_terminal_capabilities(&mut capabilities, prior, priors, task);
+    }
     if prior.is_none() {
         selection::effective_task_shape_ceiling(runtime, &observed.model_id, None)?
             .constrain(&mut capabilities);
@@ -3404,6 +3407,23 @@ fn catalog_model_from_observed(
         supported_efforts,
         capabilities,
     }))
+}
+
+fn add_public_terminal_capabilities(
+    capabilities: &mut CandidateCapabilities,
+    prior: &selection::ModelPrior,
+    priors: &selection::PriorDataset,
+    task: &TaskProfile,
+) {
+    if !priors
+        .public_benchmark_efforts(&prior.runtime, &prior.model, task)
+        .is_empty()
+    {
+        capabilities.task_classes.insert(task.task_class.clone());
+        capabilities
+            .authority_roles
+            .insert(AuthorityRole::TerminalLeaf);
+    }
 }
 
 fn capabilities_from_prior(
@@ -3571,7 +3591,7 @@ fn runtime_catalog_from_unavailable_priors(
         .models
         .iter()
         .filter(|prior| prior.runtime == runtime_name)
-        .filter_map(|prior| catalog_model_from_prior(prior, task, false).transpose())
+        .filter_map(|prior| catalog_model_from_prior(prior, priors, task, false).transpose())
         .collect::<Result<Vec<_>>>()?;
     models.sort_by(|left, right| left.model.cmp(&right.model));
     Ok(RuntimeCatalog {
@@ -3638,7 +3658,7 @@ fn runtime_catalog_from_advertised_slugs<'a>(
         if !advertised.contains(&prior.model) {
             continue;
         }
-        if let Some(model) = catalog_model_from_prior(prior, task, true)? {
+        if let Some(model) = catalog_model_from_prior(prior, priors, task, true)? {
             models.push(model);
         }
     }
@@ -3653,6 +3673,7 @@ fn runtime_catalog_from_advertised_slugs<'a>(
 
 fn catalog_model_from_prior(
     prior: &selection::ModelPrior,
+    priors: &selection::PriorDataset,
     task: &TaskProfile,
     available: bool,
 ) -> Result<Option<CatalogModel>> {
@@ -3671,6 +3692,7 @@ fn catalog_model_from_prior(
                 .map(|evidence| evidence.effort),
         )
         .chain(prior.strong_gate_fallback_efforts.iter().copied())
+        .chain(priors.public_benchmark_efforts(&prior.runtime, &prior.model, task))
         .collect::<BTreeSet<_>>()
         .into_iter()
         .collect::<Vec<_>>();
@@ -3683,7 +3705,11 @@ fn catalog_model_from_prior(
         available,
         access: None,
         supported_efforts,
-        capabilities: capabilities_from_prior(prior, task)?,
+        capabilities: {
+            let mut capabilities = capabilities_from_prior(prior, task)?;
+            add_public_terminal_capabilities(&mut capabilities, prior, priors, task);
+            capabilities
+        },
     }))
 }
 
@@ -3702,7 +3728,7 @@ pub(super) fn runtime_catalog_from_priors(
         let available = catalog
             .availability(Some(&prior.model), runtime_from_name(runtime_name)?)?
             == RoleModelAvailability::Available;
-        if let Some(model) = catalog_model_from_prior(prior, task, available)? {
+        if let Some(model) = catalog_model_from_prior(prior, priors, task, available)? {
             models.push(model);
         }
     }
@@ -11312,6 +11338,7 @@ pub(super) mod tests {
             "retained ReviewAuditor profile must advertise a review-gate effort menu"
         );
         let snapshot = OperatorPriorSnapshot {
+            public_benchmarks: Vec::new(),
             schema_version: 1,
             dataset_id: "synthetic-grok-review-account-prior".to_string(),
             revision: format!("{}+synthetic-grok-review-account", base.revision),
@@ -11349,7 +11376,7 @@ pub(super) mod tests {
             .models
             .iter()
             .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Grok))
-            .filter_map(|prior| catalog_model_from_prior(prior, &task, false).transpose())
+            .filter_map(|prior| catalog_model_from_prior(prior, &priors, &task, false).transpose())
             .collect::<Result<Vec<_>>>()?
             .into_iter()
             .filter_map(|mut model| {

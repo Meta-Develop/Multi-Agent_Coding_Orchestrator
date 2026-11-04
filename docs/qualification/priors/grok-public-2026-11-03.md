@@ -24,15 +24,18 @@ The DeepSWE low row comes from the publisher's embedded data, rather than the
 default best-effort chart. Its public API benchmark cost is not Build quota
 consumption or MACO execution plus independent-review/rework cost.
 
-No reviewed calibration maps these scores to MACO's `localized_code_change`
-class-fit and `terminal_leaf` authority quality/sample/cost fields. The bundled
-minimum quality is 8000 basis points; directly treating the reported coding
-success fractions as that quality would not clear it either. We do not change
-that gate, manufacture sample counts for the announcement, or fill unknown
-review/rework costs with zero. Consequently the strict snapshot has no new
-`ModelPrior` or capability rows. An owner-reviewed, evidence-backed mapping
-that satisfies the unchanged selector contract remains necessary before either
-live run. A raw public score alone does not establish local acceptance.
+The [dated public benchmark mechanism](README.md) now supports a relative
+lane/reference comparison on exactly the same benchmark/version/metric within
+a stated date window. It preserves unknown costs and does not invent class-fit
+samples or judgment authority. The unchanged 8000-bp floor applies to this
+relative quality, rather than directly to raw coding success fractions.
+
+This checkpoint has no named reference lane or paired reference rows, and its
+strict JSON contains no `public_benchmarks`. It therefore still adds no
+`ModelPrior` or capability eligibility. Before either live run, a separately
+reviewed dated snapshot must supply the exact requested effort, matching
+reference evidence and terminal task applicability through that mechanism.
+A raw public score alone does not establish local acceptance.
 
 After that prior gate, selected-account authentication, exact advertised
 model/effort, principal/incarnation/revision, available capacity, Codex control,

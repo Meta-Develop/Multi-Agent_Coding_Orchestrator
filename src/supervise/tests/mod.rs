@@ -732,6 +732,7 @@ fn run_supervisor_plan_with_selected_nested_review_fixture(
         });
     }
     let snapshot = OperatorPriorSnapshot {
+        public_benchmarks: Vec::new(),
         schema_version: 1,
         dataset_id: "synthetic-nested-review-prior".to_string(),
         revision: format!("{}+nested-review-fixture", base.revision),
