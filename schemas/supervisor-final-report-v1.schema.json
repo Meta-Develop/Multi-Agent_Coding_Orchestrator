@@ -21644,6 +21644,185 @@
                                 },
                                 "type": "array"
                               },
+                              "public_benchmarks": {
+                                "items": {
+                                  "additionalProperties": false,
+                                  "properties": {
+                                    "max_age_days": {
+                                      "maximum": 90,
+                                      "minimum": 1,
+                                      "type": "integer"
+                                    },
+                                    "reference_lane": {
+                                      "oneOf": [
+                                        {
+                                          "additionalProperties": false,
+                                          "properties": {
+                                            "effort": {
+                                              "enum": [
+                                                "none",
+                                                "minimal",
+                                                "low",
+                                                "medium",
+                                                "high",
+                                                "xhigh",
+                                                "max",
+                                                "ultra"
+                                              ],
+                                              "type": "string"
+                                            },
+                                            "model": {
+                                              "minLength": 1,
+                                              "type": "string"
+                                            },
+                                            "runtime": {
+                                              "minLength": 1,
+                                              "type": "string"
+                                            }
+                                          },
+                                          "required": [
+                                            "runtime",
+                                            "model",
+                                            "effort"
+                                          ],
+                                          "type": "object"
+                                        },
+                                        {
+                                          "type": "null"
+                                        }
+                                      ]
+                                    },
+                                    "rows": {
+                                      "items": {
+                                        "additionalProperties": false,
+                                        "properties": {
+                                          "benchmark_id": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "benchmark_version": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "cost_per_task_microunits": {
+                                            "oneOf": [
+                                              {
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "metric": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "model": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "published_on": {
+                                            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                                            "type": "string"
+                                          },
+                                          "read_on": {
+                                            "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                                            "type": "string"
+                                          },
+                                          "requested_effort": {
+                                            "oneOf": [
+                                              {
+                                                "enum": [
+                                                  "none",
+                                                  "minimal",
+                                                  "low",
+                                                  "medium",
+                                                  "high",
+                                                  "xhigh",
+                                                  "max",
+                                                  "ultra"
+                                                ],
+                                                "type": "string"
+                                              },
+                                              {
+                                                "type": "null"
+                                              }
+                                            ]
+                                          },
+                                          "runtime": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          },
+                                          "score": {
+                                            "additionalProperties": false,
+                                            "properties": {
+                                              "denominator": {
+                                                "maximum": 4294967295,
+                                                "minimum": 1,
+                                                "type": "integer"
+                                              },
+                                              "numerator": {
+                                                "maximum": 4294967295,
+                                                "minimum": 0,
+                                                "type": "integer"
+                                              }
+                                            },
+                                            "required": [
+                                              "numerator",
+                                              "denominator"
+                                            ],
+                                            "type": "object"
+                                          },
+                                          "source_url": {
+                                            "minLength": 1,
+                                            "type": "string"
+                                          }
+                                        },
+                                        "required": [
+                                          "benchmark_id",
+                                          "benchmark_version",
+                                          "metric",
+                                          "score",
+                                          "runtime",
+                                          "model",
+                                          "source_url",
+                                          "published_on",
+                                          "read_on"
+                                        ],
+                                        "type": "object"
+                                      },
+                                      "type": "array"
+                                    },
+                                    "task_classes": {
+                                      "items": {
+                                        "minLength": 1,
+                                        "type": "string"
+                                      },
+                                      "type": "array",
+                                      "uniqueItems": true
+                                    }
+                                  },
+                                  "required": [
+                                    "task_classes",
+                                    "rows"
+                                  ],
+                                  "type": "object"
+                                },
+                                "type": "array"
+                              },
+                              "public_benchmarks_evaluated_on": {
+                                "oneOf": [
+                                  {
+                                    "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
                               "published_on": {
                                 "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$",
                                 "type": "string"

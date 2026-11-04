@@ -22,7 +22,8 @@ release with `model_unavailable` for Worker `grok` / `grok-4.7` / `xhigh`:
 there is no bundled prior row for that task profile, even if the catalog
 advertises the model. Offline plan parsing does not establish selection
 eligibility. A live run requires an accepted evidence-backed `--prior-data`
-snapshot admitting the exact lane; the ACP qualification flag does not supply
+snapshot with a [dated same-benchmark reference comparison](priors/README.md)
+admitting the exact lane; the ACP qualification flag does not supply
 that evidence or override selection.
 
 The [2026-11-03 public evidence checkpoint](priors/grok-public-2026-11-03.md)

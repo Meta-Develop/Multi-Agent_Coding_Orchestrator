@@ -85,6 +85,7 @@ fn validate_task_shape_ceiling(ceiling: &TaskShapeCeiling) -> Result<(), Selecti
 /// Validate an operator-provided prior snapshot before it can enter a run.
 /// The selector validates the same fields again on each normalized decision.
 pub fn validate_prior_dataset(priors: &PriorDataset) -> Result<(), SelectionError> {
+    priors.validate_public_benchmarks()?;
     validate_identifier("priors.dataset_id", &priors.dataset_id)?;
     validate_identifier("priors.revision", &priors.revision)?;
     validate_calendar_date("priors.published_on", &priors.published_on)?;
@@ -523,6 +524,16 @@ fn normalize_input(input: &mut SelectionInput) {
         prior.limitations.sort();
         prior.limitations.dedup();
     }
+    for snapshot in &mut input.priors.public_benchmarks {
+        snapshot.rows.sort_by(|left, right| {
+            (&left.runtime, &left.model, left.requested_effort).cmp(&(
+                &right.runtime,
+                &right.model,
+                right.requested_effort,
+            ))
+        });
+    }
+    input.priors.public_benchmarks.sort();
     // A valid ledger has globally unique attempt IDs, so this is a total order over valid records.
     input
         .outcomes
@@ -537,6 +548,7 @@ fn normalize_input(input: &mut SelectionInput) {
 }
 
 fn validate_input(input: &SelectionInput) -> Result<(), SelectionError> {
+    input.priors.validate_public_benchmarks()?;
     validate_identifier("task.task_class", &input.task.task_class)?;
     if input.task.risk == RiskLevel::Unknown {
         return invalid("task.risk must be known before candidate evaluation");
@@ -1416,6 +1428,30 @@ fn evaluate_loaded_policy_candidate(
             .iter()
             .find(|fit| fit.task_class == input.task.task_class && fit.effort == candidate.effort)
     });
+    let public_applies = fit.is_none()
+        && input
+            .priors
+            .public_benchmark_applies(&candidate, &input.task);
+    let public = fit
+        .is_none()
+        .then(|| input.priors.relative_public_prior(&candidate, &input.task))
+        .flatten();
+    if public_applies {
+        if input.task.authority_role != AuthorityRole::TerminalLeaf {
+            reject(
+                &mut reasons,
+                IneligibilityCode::MissingAuthorityEvidence,
+                "public benchmarks never establish judgment or delegation authority",
+            );
+        }
+        if public.is_none() {
+            reject(
+                &mut reasons,
+                IneligibilityCode::MissingClassFitEvidence,
+                "public benchmark relative quality is unknown for this exact lane and task",
+            );
+        }
+    }
     let quality = fit
         .map(|fit| posterior_quality_basis_points(fit, &ledger))
         .transpose()?;
@@ -1426,8 +1462,22 @@ fn evaluate_loaded_policy_candidate(
         ((u64::from(ledger.accepted) * 10_000) / u64::from(ledger.quality_attempts)).min(10_000)
             as u16
     });
-    let quality = quality.or(observed_quality);
-    if quality.is_some_and(|value| value < role.minimum_quality_basis_points) {
+    // Relative evidence is not an acceptance-rate pseudo-sample. Real observed
+    // quality can constrain it, but cannot rescue an unknown public comparison.
+    let quality = quality
+        .or(public.map(|prior| {
+            observed_quality.map_or(prior.quality_basis_points, |observed| {
+                observed.min(prior.quality_basis_points)
+            })
+        }))
+        .or(observed_quality);
+    let quality_floor = if public.is_some() {
+        role.minimum_quality_basis_points
+            .max(profile.minimum_quality_basis_points)
+    } else {
+        role.minimum_quality_basis_points
+    };
+    if quality.is_some_and(|value| value < quality_floor) {
         reject(
             &mut reasons,
             IneligibilityCode::QualityBarNotMet,
@@ -1455,6 +1505,9 @@ fn evaluate_loaded_policy_candidate(
     let mut limitations = prior
         .map(|prior| prior.limitations.clone())
         .unwrap_or_default();
+    if public.is_some() {
+        limitations.push("Quality is a same-benchmark reference ratio, not measured class-fit samples or acceptance probability; benchmark task cost is only a routing proxy; accepted-cycle review/rework costs remain unknown".into());
+    }
     if evidence_unknown {
         limitations.push("Model quality and accepted-cycle cost are unknown; routing uses a loaded-policy inference penalty, not fabricated benchmark evidence".to_string());
     }
@@ -1463,7 +1516,7 @@ fn evaluate_loaded_policy_candidate(
     } else if let Some(fit) = fit {
         Some(expected_cost_per_accepted(fit, &ledger)?)
     } else {
-        None
+        public.and_then(|prior| prior.cost_per_task_microunits)
     };
     let score = if reasons.is_empty() {
         let switch = resolve_switch_cost(input, &candidate, switch_evidence)?;
@@ -1499,7 +1552,10 @@ fn evaluate_loaded_policy_candidate(
                 SelectionError::InvalidInput("loaded routing objective overflow".into())
             })
         };
-        let evidence_penalty = if evidence_unknown || expected_cost.is_none() {
+        let evidence_penalty = if evidence_unknown
+            || expected_cost.is_none()
+            || (public.is_some() && ledger.accepted == 0)
+        {
             policy.objective.unknown_evidence_penalty
         } else {
             0
@@ -1658,7 +1714,10 @@ fn evaluate_loaded_policy_candidate(
             quality_basis_points: quality,
             expected_accepted_cycle_cost_microunits: expected_cost,
             samples,
-            uncertainty_penalty: if evidence_unknown || expected_cost.is_none() {
+            uncertainty_penalty: if evidence_unknown
+                || expected_cost.is_none()
+                || (public.is_some() && ledger.accepted == 0)
+            {
                 policy.objective.unknown_evidence_penalty
             } else {
                 0
