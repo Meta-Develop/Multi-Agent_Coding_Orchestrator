@@ -206,6 +206,7 @@ sys.exit(7)
             .env("XDG_RUNTIME_DIR", root)
             .env("DBUS_SESSION_BUS_ADDRESS", "fixture")
             .env("MACO_GROK_BIN", "/fixture/grok")
+            .env("codex_executable", "/fixture/codex")
             .output()
             .unwrap();
         assert_eq!(
@@ -252,6 +253,12 @@ sys.exit(7)
             assert_eq!(&args[executable + 1..executable + 3], ["supervise", "run"]);
             assert_eq!(fs::read_to_string(&args[executable + 3]).unwrap(), plan);
             assert!(args.windows(2).any(|pair| pair == ["--runtime", "codex"]));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--runtime-bin", "/fixture/codex"]));
+            assert!(args
+                .windows(2)
+                .any(|pair| pair == ["--additional-runtime-bin", "grok=/fixture/grok"]));
             assert!(args
                 .windows(2)
                 .any(|pair| pair == ["--run-id", "mixed-regression"]));

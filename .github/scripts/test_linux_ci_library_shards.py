@@ -100,6 +100,7 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
             "supervise::tests::budget::new",
             "supervise::tests::prompts_gates::new",
             "supervise::tests::licensed_breakage::new",
+            "supervise::tests::mixed_runtime::new",
             "supervise::tests::plan_runtime::new",
             "supervise::tests::qualification_handoff::new",
             "supervise::tests::reaudit::new",

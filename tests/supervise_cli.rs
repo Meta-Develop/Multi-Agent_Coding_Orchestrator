@@ -34,6 +34,111 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
+#[cfg(target_os = "linux")]
+#[test]
+fn explicit_mixed_runtime_binding_errors_never_reserve_or_launch() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    let temp = TempDir::new()?;
+    let repo = create_committed_repo(temp.path())?;
+    let plan = temp.path().join("mixed-plan.json");
+    fs::write(
+        &plan,
+        include_str!("../examples/supervise/mixed-codex-grok-plan.json"),
+    )?;
+    let primary = temp.path().join("codex-fixture");
+    let grok = temp.path().join("grok-fixture");
+    for path in [&primary, &grok] {
+        fs::write(path, "#!/bin/sh\nexit 97\n")?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let alias = temp.path().join("grok-alias");
+    symlink(&grok, &alias)?;
+    let binding = format!("grok={}", grok.display());
+    let duplicate_primary = format!("codex={}", grok.display());
+    let fake = format!("fake={}", grok.display());
+    let missing = format!("grok={}/missing", temp.path().display());
+    let noncanonical = format!("grok={}/./grok-fixture", temp.path().display());
+    let symlinked = format!("grok={}", alias.display());
+    for (runtime, supplied_primary, additional, expected) in [
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![binding.as_str(), binding.as_str()],
+            "is duplicated",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![duplicate_primary.as_str()],
+            "duplicates the primary",
+        ),
+        (
+            "codex",
+            None,
+            vec![binding.as_str()],
+            "requires an explicit --runtime-bin",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![fake.as_str()],
+            "refuses Fake",
+        ),
+        (
+            "fake",
+            Some(primary.as_path()),
+            vec![binding.as_str()],
+            "refuse Fake",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![missing.as_str()],
+            "is missing",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec!["grok=grok"],
+            "absolute path",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![noncanonical.as_str()],
+            "canonical path",
+        ),
+        (
+            "codex",
+            Some(primary.as_path()),
+            vec![symlinked.as_str()],
+            "canonical path",
+        ),
+    ] {
+        let mut args = vec![
+            "supervise",
+            "run",
+            path_str(&plan)?,
+            "--repo",
+            path_str(&repo)?,
+            "--run-id",
+            "invalid-mixed-bindings",
+            "--runtime",
+            runtime,
+        ];
+        if let Some(path) = supplied_primary {
+            args.extend(["--runtime-bin", path_str(path)?]);
+        }
+        for entry in additional {
+            args.extend(["--additional-runtime-bin", entry]);
+        }
+        let stderr = run_failure_stderr(&args)?;
+        assert!(stderr.contains(expected), "expected {expected}: {stderr}");
+        assert!(!repo.join(".maco/o2/runs/invalid-mixed-bindings").exists());
+    }
+    Ok(())
+}
+
 #[test]
 fn selection_only_reports_all_override_failures_without_dispatch() -> Result<()> {
     let temp = TempDir::new()?;
