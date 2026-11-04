@@ -202,3 +202,41 @@ fn qualification_original_medium_efforts_are_refused_before_release() -> Result<
     }
     Ok(())
 }
+
+#[test]
+fn synthetic_relative_public_prior_admits_only_requested_terminal_qualification_lane() -> Result<()> {
+    // Synthetic scores exercise the reader/plan/bridge/selector path, not real qualification.
+    for (source, model, effort) in [
+        (include_str!("../../examples/supervise/qualification-grok-lower-effort.json"), "grok-4.6", selection::ReasoningEffort::Low),
+        (include_str!("../../examples/supervise/qualification-grok47-acp.json"), "grok-4.7", selection::ReasoningEffort::Xhigh),
+    ] {
+        let mut public = selection::public_benchmark_test_snapshot();
+        let today = crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())?;
+        let today = &today[..10];
+        for row in &mut public.rows {
+            row.published_on = today.into();
+            row.read_on = today.into();
+        }
+        public.rows[1].runtime = "grok".into();
+        public.rows[1].model = model.into();
+        public.rows[1].requested_effort = Some(effort);
+        let prior = serde_json::json!({
+            "schema_version": 1, "dataset_id": "synthetic-public-qualification", "revision": "synthetic-only",
+            "published_on": today, "models": [], "public_benchmarks": [public],
+            "capability_policy": { "id": "synthetic-public-qualification", "version": 1,
+                "source": "synthetic test evidence; no actual qualification", "models": [] }
+        });
+        let selected = qualification_selection_with_prior(source, Some(&serde_json::to_string(&prior)?))?;
+        assert!(selected.selection_preflight_failure.is_none(), "{model}: {selected:?}");
+        for decision in &selected.decisions {
+            let choice = decision.provenance.choice.as_ref().context("qualified fixture choice")?;
+            if decision.role == AgentRole::Worker {
+                assert_eq!(choice.candidate.model, model);
+                assert_eq!(choice.candidate.effort, effort);
+            } else {
+                assert!(!choice.candidate.model.starts_with("grok-"));
+            }
+        }
+    }
+    Ok(())
+}

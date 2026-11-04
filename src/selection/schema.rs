@@ -350,15 +350,48 @@ fn model_prior() -> Value {
     )
 }
 
+fn public_benchmark_row() -> Value {
+    let mut schema = strict_object!(
+        "benchmark_id" => nonempty_string(),
+        "benchmark_version" => nonempty_string(),
+        "metric" => nonempty_string(),
+        "score" => strict_object!(
+            "numerator" => json!({"type": "integer", "minimum": 0, "maximum": 4294967295u64}),
+            "denominator" => json!({"type": "integer", "minimum": 1, "maximum": 4294967295u64}),
+        ),
+        "runtime" => nonempty_string(),
+        "model" => nonempty_string(),
+        "source_url" => nonempty_string(),
+        "published_on" => date(),
+        "read_on" => date(),
+    );
+    schema["properties"]["requested_effort"] = nullable(reasoning_effort());
+    schema["properties"]["cost_per_task_microunits"] = nullable(nonnegative_integer());
+    schema
+}
+
+fn public_benchmark_snapshot() -> Value {
+    let mut schema = strict_object!(
+        "task_classes" => set(nonempty_string()),
+        "rows" => array(public_benchmark_row()),
+    );
+    schema["properties"]["reference_lane"] = nullable(candidate_key());
+    schema["properties"]["max_age_days"] = json!({"type": "integer", "minimum": 1, "maximum": 90});
+    schema
+}
+
 fn prior_dataset() -> Value {
-    strict_object!(
+    let mut schema = strict_object!(
         "schema_version" => json!({"type": "integer", "const": 2}),
         "dataset_id" => nonempty_string(),
         "revision" => nonempty_string(),
         "published_on" => date(),
         "objective_profiles" => array(selector_calibration()),
         "models" => array(model_prior()),
-    )
+    );
+    schema["properties"]["public_benchmarks"] = array(public_benchmark_snapshot());
+    schema["properties"]["public_benchmarks_evaluated_on"] = nullable(date());
+    schema
 }
 
 fn environment_failure() -> Value {
@@ -954,6 +987,9 @@ mod tests {
         let policy_path =
             "$/properties/provenance/properties/routing_policy/properties/frozen/properties/policy";
         let role_map_path = format!("{policy_path}/properties/role_preferences");
+        let priors_path = "$/properties/provenance/properties/normalized_input/properties/priors";
+        let benchmark_path = format!("{priors_path}/properties/public_benchmarks/items");
+        let benchmark_row_path = format!("{benchmark_path}/properties/rows/items");
         match schema {
             Value::Object(object) => {
                 if object.get("type") == Some(&Value::String("object".to_string())) {
@@ -980,6 +1016,12 @@ mod tests {
                         &["access"][..]
                     } else if path == "$/properties/provenance/properties/candidate_set/items" {
                         &["loaded_policy_evidence"][..]
+                    } else if path == priors_path {
+                        &["public_benchmarks", "public_benchmarks_evaluated_on"][..]
+                    } else if path == benchmark_path {
+                        &["reference_lane", "max_age_days"][..]
+                    } else if path == benchmark_row_path {
+                        &["requested_effort", "cost_per_task_microunits"][..]
                     } else if path == policy_path {
                         &["task_estimation"][..]
                     } else if path == format!("{policy_path}/properties/default_role")

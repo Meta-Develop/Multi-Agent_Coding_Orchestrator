@@ -463,6 +463,7 @@ fn bind_priced_budget_fixture_prior(
         "synthetic nonlive budget profile; grants no account or launch authority".to_string(),
     );
     let snapshot = OperatorPriorSnapshot {
+        public_benchmarks: Vec::new(),
         schema_version: 1,
         dataset_id: "synthetic-budget-prior".to_string(),
         revision: format!("{}+budget-fixture", base.revision),

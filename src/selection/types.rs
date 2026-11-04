@@ -441,6 +441,11 @@ pub struct PriorDataset {
     /// Dated selector quality gates and cost calibration, not an objective.
     pub objective_profiles: Vec<SelectorCalibration>,
     pub models: Vec<ModelPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_benchmarks: Vec<super::PublicBenchmarkSnapshot>,
+    /// Frozen UTC read date supplied by the production reader; replay retains it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub public_benchmarks_evaluated_on: Option<String>,
 }
 
 /// Dated catalog/evidence eligibility for a model/authority pair.

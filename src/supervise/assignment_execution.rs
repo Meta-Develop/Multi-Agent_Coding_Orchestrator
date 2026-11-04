@@ -11049,6 +11049,7 @@ mod decomposition_tests {
                 "retained ReviewAuditor profile must advertise a review-gate effort menu"
             );
             let snapshot = OperatorPriorSnapshot {
+                public_benchmarks: Vec::new(),
                 schema_version: 1,
                 dataset_id: "synthetic-grok-review-cost-prior".to_string(),
                 revision: format!("{}+synthetic-grok-review-cost", base.revision),
@@ -16830,6 +16831,7 @@ done
         prior.source_id = "operator-cursor-fixture".to_string();
         prior.prior_scope = "operator dated adapter admission fixture".to_string();
         let mut snapshot = OperatorPriorSnapshot {
+            public_benchmarks: Vec::new(),
             schema_version: 1,
             dataset_id: "operator-cursor-test".to_string(),
             revision: format!("{}+operator-cursor-test", base.revision),

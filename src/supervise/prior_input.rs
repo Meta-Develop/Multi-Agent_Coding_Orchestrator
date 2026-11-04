@@ -40,8 +40,8 @@ fn require_supported_prior_input_platform() -> Result<()> {
     Ok(())
 }
 
-/// Only model rows are operator-editable. The bundled objective calibration is
-/// retained exactly, including all quality/sample/cost gates.
+/// Operator model rows and dated public comparisons extend bundled evidence.
+/// The bundled calibration and existing class-fit/sample/cost gates are retained.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct OperatorPriorSnapshot {
@@ -50,6 +50,8 @@ pub struct OperatorPriorSnapshot {
     pub revision: String,
     pub published_on: String,
     pub models: Vec<ModelPrior>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub public_benchmarks: Vec<selection::PublicBenchmarkSnapshot>,
     pub capability_policy: ModelCapabilityPolicy,
 }
 
@@ -94,7 +96,13 @@ impl FrozenOperatorPriorData {
             MAX_OPERATOR_PRIOR_INPUT_BYTES,
         )
         .context("failed to read bounded repository-local operator prior data")?;
-        Ok(Self(bind_from_bytes(repo, relative_path, raw)?))
+        let read_on = crate::orchestration_event::format_rfc3339_utc(std::time::SystemTime::now())?;
+        Ok(Self(bind_from_bytes(
+            repo,
+            relative_path,
+            raw,
+            Some(&read_on[..10]),
+        )?))
     }
 
     pub(crate) fn verify_source(&self, repo: &Path) -> Result<()> {
@@ -242,6 +250,7 @@ fn bind_from_bytes(
     repo: PathBuf,
     relative_path: PathBuf,
     raw: Vec<u8>,
+    evaluated_on: Option<&str>,
 ) -> Result<Arc<BoundPriorData>> {
     let snapshot: OperatorPriorSnapshot =
         serde_json::from_slice(&raw).context("operator prior data is not valid strict JSON")?;
@@ -305,9 +314,14 @@ fn bind_from_bytes(
         }
         priors.models.push(row.clone());
     }
+    priors.public_benchmarks = snapshot.public_benchmarks;
+    if !priors.public_benchmarks.is_empty() {
+        priors.public_benchmarks_evaluated_on = evaluated_on.map(str::to_string);
+    }
     priors.dataset_id = snapshot.dataset_id;
     priors.revision = snapshot.revision;
     priors.published_on = snapshot.published_on;
+    priors.add_public_benchmark_models();
     selection::validate_prior_dataset(&priors).map_err(|error| anyhow::anyhow!(error))?;
 
     snapshot.capability_policy.validate()?;
@@ -438,9 +452,17 @@ pub fn bind_frozen_operator_prior_data_for_run(
             bail!("--prior-data changed from the frozen source snapshot");
         }
     }
-    let binding = bind_from_bytes(repo, relative_path, raw)?;
     let saved_effective: EffectivePriorSnapshot =
         serde_json::from_slice(&reader.read(EFFECTIVE_ARTIFACT)?)?;
+    let binding = bind_from_bytes(
+        repo,
+        relative_path,
+        raw,
+        saved_effective
+            .priors
+            .public_benchmarks_evaluated_on
+            .as_deref(),
+    )?;
     if binding.provenance != saved_provenance
         || binding.effective.priors != saved_effective.priors
         || binding.effective.capability_policy != saved_effective.capability_policy
@@ -475,6 +497,7 @@ mod tests {
         prior.source_id = "operator-declared-new-model".to_string();
         prior.prior_scope = "operator dated prior for focused admission test".to_string();
         Ok(OperatorPriorSnapshot {
+            public_benchmarks: Vec::new(),
             schema_version: PRIOR_INPUT_SCHEMA_VERSION,
             dataset_id: "operator-prior-test".to_string(),
             revision: format!("{}+operator-prior-test", base.revision),
@@ -501,8 +524,107 @@ mod tests {
             PathBuf::from("fixture-repo"),
             PathBuf::from("prior.json"),
             raw,
+            None,
         )?;
         Ok(install(Some(binding)))
+    }
+
+    #[test]
+    fn public_benchmark_reader_preserves_operator_rows_and_denies_judgment() -> Result<()> {
+        let mut snapshot = new_model_snapshot("synthetic-worker")?;
+        snapshot.published_on = "2026-11-03".into();
+        snapshot.models.clear();
+        snapshot.capability_policy.models.clear();
+        snapshot.public_benchmarks = vec![selection::public_benchmark_test_snapshot()];
+        let _guard = bind_fixture(&snapshot)?;
+        let priors = current_priors().context("public evidence bound")?;
+        assert_eq!(priors.public_benchmarks, snapshot.public_benchmarks);
+        let model = priors
+            .models
+            .iter()
+            .find(|row| row.model == "synthetic-worker")
+            .context("bounded identity")?;
+        assert!(model.class_fit.is_empty() && model.authority_evidence.is_empty());
+        assert_eq!(model.strength_rank, 0);
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Auditor,
+            AgentRole::GateClassifier,
+        ] {
+            assert!(validate_known_judgment_role_model(role, Some("synthetic-worker")).is_err());
+        }
+        // Benchmarks are selection evidence, not a new static capability grant.
+        assert!(authorize_known_executor_role_model(
+            AgentRole::Worker,
+            Some("synthetic-worker"),
+            None
+        )
+        .is_err());
+        for base in base_selector_priors_with_terminal_worker_economics()?.models {
+            assert_eq!(
+                Some(&base),
+                priors
+                    .models
+                    .iter()
+                    .find(|row| row.runtime == base.runtime && row.model == base.model)
+            );
+        }
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn public_benchmark_evaluation_date_is_frozen_for_replay_and_new_reads_expire() -> Result<()> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let mut snapshot = new_model_snapshot("synthetic-worker")?;
+        snapshot.models.clear();
+        snapshot.capability_policy.models.clear();
+        snapshot.published_on = "2026-11-03".into();
+        snapshot.public_benchmarks = vec![selection::public_benchmark_test_snapshot()];
+        let raw = serde_json::to_vec(&snapshot)?;
+        let binding = bind_from_bytes(
+            repo.clone(),
+            "prior.json".into(),
+            raw.clone(),
+            Some("2026-11-03"),
+        )?;
+        let original = binding.effective.priors.clone();
+        let expired = bind_from_bytes(repo.clone(), "prior.json".into(), raw, Some("2027-02-01"))?;
+        let key = selection::CandidateKey {
+            runtime: "codex".into(),
+            model: "synthetic-worker".into(),
+            effort: selection::ReasoningEffort::Low,
+        };
+        let task = selection::selection_test_base_input().task;
+        assert!(original.relative_public_prior(&key, &task).is_some());
+        assert!(expired
+            .effective
+            .priors
+            .relative_public_prior(&key, &task)
+            .is_none());
+        let run_id = RunId::new("public-prior-replay")?;
+        {
+            let _guard = install(Some(binding));
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                run_id.clone(),
+                "public-prior-replay-test",
+            )?;
+            archive_current(&mut writer, &repo)?;
+            let final_path = RunArtifactFamily::Supervise.final_report_relative_path();
+            writer.write_json(
+                &final_path,
+                &serde_json::json!({"run_id": run_id.as_str()}),
+                ArtifactFileDisposition::Publishable,
+            )?;
+            writer.finalize(&final_path, false)?;
+        }
+        let _guard = bind_frozen_operator_prior_data_for_run(&repo, &run_id, None)?
+            .context("replayed public binding")?;
+        assert_eq!(current_priors(), Some(original));
+        Ok(())
     }
 
     #[test]
@@ -666,6 +788,7 @@ mod tests {
             PathBuf::from("fixture-repo"),
             PathBuf::from("prior.json"),
             serde_json::to_vec(&value)?,
+            None,
         )
         .is_err());
         Ok(())
@@ -698,6 +821,7 @@ mod tests {
                 PathBuf::from("fixture-repo"),
                 PathBuf::from("prior.json"),
                 serde_json::to_vec(&new_model_snapshot(model)?)?,
+                None,
             )
         });
         let bindings = bindings.into_iter().collect::<Result<Vec<_>>>()?;

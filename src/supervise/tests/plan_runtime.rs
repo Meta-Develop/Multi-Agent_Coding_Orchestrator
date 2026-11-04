@@ -898,6 +898,7 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
         }
     }
     let snapshot = super::prior_input::OperatorPriorSnapshot {
+        public_benchmarks: Vec::new(),
         schema_version: 1,
         dataset_id: "synthetic-objective-profile".to_string(),
         revision: format!("{}+effort-tradeoff-fixture", priors.revision),

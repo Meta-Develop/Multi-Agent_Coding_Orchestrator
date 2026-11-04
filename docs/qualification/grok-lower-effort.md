@@ -18,7 +18,8 @@ admit the exact lane. The bundled terminal prior historically selects `xhigh`;
 parser success or generic protocol support does not establish a `low` prior.
 Until all gates are established, record **unknown/refused before release** and
 do not run a paid probe, switch accounts or silently select another effort.
-Any necessary evidence-backed prior update is a separate reviewed change.
+Prepare an accepted [dated public benchmark snapshot](priors/README.md) with a
+matching reference lane before changing this prior gate.
 With synthetic model membership and the bundled priors, selection preflight
 returns the typed refusal `effort_incompatible` for this Worker: `low` is
 absent from its prior-backed effort menu. The providerless qualification
@@ -61,7 +62,9 @@ identity fields cannot recreate the private capture.
 
 Selection uses dated public per-effort benchmark scores (for example,
 SWE-bench-style leaderboards) as priors, recording the exact source URL and
-benchmark/snapshot date. Never copy an xhigh score to low or invent a score.
+benchmark/snapshot date. The [relative normalization contract](priors/README.md)
+requires a same-benchmark/version reference within the dated window and keeps
+unknown costs explicit. Never copy an xhigh score to low or invent a score.
 The bundled-prior refusal and selected-account live acceptance remain separate
 open gates; these source changes do not supply a lower-effort prior or qualify
 live execution.

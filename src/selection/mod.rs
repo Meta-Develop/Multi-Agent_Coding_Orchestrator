@@ -5,6 +5,7 @@
 //! the returned decision contains the normalized-input digests and every
 //! candidate considered.
 
+mod public_benchmark;
 mod quota_input;
 pub mod routing_policy;
 pub(crate) mod runtime_model_policy;
@@ -12,6 +13,9 @@ mod schema;
 mod selector;
 mod types;
 
+pub use public_benchmark::{
+    PublicBenchmarkRow, PublicBenchmarkScore, PublicBenchmarkSnapshot, RelativePublicBenchmarkPrior,
+};
 pub use quota_input::{
     apply_fail_closed_quota_pools, fail_closed_quota_selector_input, runtime_pool_states,
 };
@@ -28,3 +32,6 @@ mod tests;
 
 #[cfg(test)]
 pub(crate) use tests::base_input as selection_test_base_input;
+
+#[cfg(test)]
+pub(crate) use public_benchmark::tests::synthetic_snapshot as public_benchmark_test_snapshot;
