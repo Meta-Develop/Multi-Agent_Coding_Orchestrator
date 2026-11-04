@@ -26721,6 +26721,74 @@
     "success": {
       "type": "boolean"
     },
+    "supervisor_own_usage": {
+      "additionalProperties": false,
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "observation": {
+                "const": "process_observed"
+              }
+            },
+            "required": [
+              "observation"
+            ]
+          },
+          "then": {
+            "required": [
+              "usage",
+              "provenance"
+            ]
+          }
+        }
+      ],
+      "description": "Own provider usage of the supervising process. This is not role_usage.supervisor, which remains the launched-child rollup (supervisor_aggregate), and not total_usage. The current Rust supervisor records an explicit zero here because that process has no provider client and made no provider call. A future mode that calls a provider must record the real counts, with process-observed provenance, or leave the observation unknown. A missing object is not an observed zero. supervisor_aggregate is not a valid observation on this object.",
+      "properties": {
+        "observation": {
+          "enum": [
+            "process_observed",
+            "not_process_observable",
+            "synthetic_fake"
+          ],
+          "type": "string"
+        },
+        "provenance": {
+          "minLength": 1,
+          "type": "string"
+        },
+        "unavailable_reason": {
+          "type": "string"
+        },
+        "usage": {
+          "additionalProperties": false,
+          "properties": {
+            "input_tokens": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "output_tokens": {
+              "minimum": 0,
+              "type": "integer"
+            },
+            "total_tokens": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          },
+          "required": [
+            "input_tokens",
+            "output_tokens",
+            "total_tokens"
+          ],
+          "type": "object"
+        }
+      },
+      "required": [
+        "observation"
+      ],
+      "type": "object"
+    },
     "total_cost_usd": {
       "minimum": 0,
       "type": "number"
@@ -26816,6 +26884,7 @@
     "semantic_intent_tokens",
     "role_economics_profile",
     "role_usage",
+    "supervisor_own_usage",
     "usage_complete",
     "commands_run",
     "environment_failures",

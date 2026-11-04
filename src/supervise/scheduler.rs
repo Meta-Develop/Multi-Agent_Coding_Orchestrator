@@ -3133,6 +3133,7 @@ fn build_supervisor_final_report(
         review_lens_total_cost_usd,
         total_usage,
         total_cost_usd,
+        supervisor_own_usage: Some(SupervisorOwnUsage::process_observed_no_provider_client()),
         usage_complete,
         commands_run: collected.command_records,
         environment_failures: environment_failures.clone(),

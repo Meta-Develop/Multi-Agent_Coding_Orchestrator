@@ -567,6 +567,7 @@ fn supervisor_report(run_id: &RunId, repo: &Path) -> SupervisorFinalReport {
         review_lens_total_cost_usd: None,
         total_usage: None,
         total_cost_usd: None,
+        supervisor_own_usage: None,
         usage_complete: false,
         commands_run: Vec::new(),
         environment_failures: Vec::new(),

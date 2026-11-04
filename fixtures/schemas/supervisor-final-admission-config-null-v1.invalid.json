@@ -134,6 +134,15 @@
       "observation": "synthetic_fake"
     }
   },
+  "supervisor_own_usage": {
+    "observation": "process_observed",
+    "usage": {
+      "input_tokens": 0,
+      "output_tokens": 0,
+      "total_tokens": 0
+    },
+    "provenance": "process_observed: the supervising process has no provider client and made no provider call"
+  },
   "usage_complete": true,
   "commands_run": [],
   "environment_failures": [],

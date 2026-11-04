@@ -373,8 +373,11 @@ fn aggregate_profiles(
                 .ok_or_else(|| anyhow!("profile wall-time aggregate overflowed"))?;
             let measurements = run.measurements.as_ref();
             coordination_observations.push(match measurements {
-                Some(measurements) => coordination_token_observation(&measurements.role_usage),
-                None => coordination_token_observation(&BTreeMap::new()),
+                Some(measurements) => coordination_token_observation(
+                    &measurements.role_usage,
+                    measurements.supervisor_own_usage.as_ref(),
+                ),
+                None => coordination_token_observation(&BTreeMap::new(), None),
             });
             pricing.push(ExecutedRunPricing {
                 repetition: run.held_out.run.repetition,
@@ -1167,6 +1170,7 @@ mod tests {
             review_lens_total_cost_usd: None,
             total_usage,
             total_cost_usd: Some(cost_usd),
+            supervisor_own_usage: None,
             usage_complete: true,
             commands_run: Vec::new(),
             environment_failures: Vec::new(),
@@ -1710,5 +1714,144 @@ mod tests {
             .as_deref()
             .unwrap()
             .contains("coordination_tokens_not_projected"));
+    }
+
+    #[test]
+    fn executed_summary_projects_emitted_supervisor_own_usage_and_refuses_an_older_report() {
+        use crate::supervise::{
+            RoleUsageObservation, RoleUsageReport, SupervisorOwnUsage,
+            SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT,
+        };
+
+        let mut manifest = observation_manifest();
+        manifest.profiles.truncate(1);
+        let manifest_sha256 = sha256_hex(&serde_json::to_vec(&manifest).expect("manifest"));
+        let profile = &manifest.profiles[0];
+        let profile_sha256 = sha256_hex(&serde_json::to_vec(profile).expect("profile"));
+        let binding = held_out_binding(manifest_sha256.as_str(), &profile.id, &profile_sha256, 0);
+        let held_out = passed_held_out(binding);
+        let workspace = tempfile::TempDir::new().expect("workspace");
+        let repo = workspace.path().join("repo");
+        git2::Repository::init(&repo).expect("init");
+
+        let child = Usage {
+            input_tokens: 7,
+            output_tokens: 3,
+            total_tokens: 10,
+        };
+        let worker = Usage {
+            input_tokens: 80,
+            output_tokens: 20,
+            total_tokens: 100,
+        };
+        let aggregate = Usage {
+            input_tokens: 87,
+            output_tokens: 23,
+            total_tokens: 110,
+        };
+        let mut report = build_supervisor_report(0.01, "worker-low", true);
+        report.total_usage = Some(aggregate);
+        report.supervisor_own_usage =
+            Some(SupervisorOwnUsage::process_observed_no_provider_client());
+        report.role_usage.insert(
+            AgentRole::Supervisor,
+            RoleUsageReport {
+                models: Vec::new(),
+                usage: Some(aggregate),
+                cost_usd: None,
+                observation: RoleUsageObservation::SupervisorAggregate,
+                unavailable_reason: None,
+            },
+        );
+        report.role_usage.insert(
+            AgentRole::ChildOrchestrator,
+            RoleUsageReport {
+                models: Vec::new(),
+                usage: Some(child),
+                cost_usd: None,
+                observation: RoleUsageObservation::ProcessObserved,
+                unavailable_reason: None,
+            },
+        );
+        report.role_usage.insert(
+            AgentRole::Worker,
+            RoleUsageReport {
+                models: Vec::new(),
+                usage: Some(worker),
+                cost_usd: None,
+                observation: RoleUsageObservation::ProcessObserved,
+                unavailable_reason: None,
+            },
+        );
+        let bytes = serde_json::to_vec(&report).expect("report bytes");
+        let measurements = observed_run_measurements_from_captured_supervisor_final_report(
+            &held_out,
+            &report,
+            &bytes,
+            &repo,
+            &BTreeSet::new(),
+        )
+        .expect("measurements");
+        assert_eq!(
+            measurements
+                .supervisor_own_usage
+                .as_ref()
+                .and_then(|own| own.provenance.as_deref()),
+            Some(SUPERVISOR_OWN_USAGE_NO_PROVIDER_CLIENT)
+        );
+        assert_eq!(measurements.total_usage, Some(aggregate));
+
+        let mut run = observed_run(profile, &manifest_sha256, 0.01, "worker-low");
+        run.measurements = Some(measurements);
+        let summary =
+            summarize_executed_observation_runs(&manifest, &manifest_sha256, &[run.clone()])
+                .expect("summary");
+        let projected = summary
+            .profile_summaries
+            .iter()
+            .find(|summary| summary.profile_id == profile.id)
+            .expect("profile");
+        assert_eq!(projected.coordination_tokens.aggregate_total, Some(child));
+        assert_ne!(
+            projected.coordination_tokens.aggregate_total,
+            Some(aggregate)
+        );
+        assert!(projected.coordination_tokens.unavailable_reason.is_none());
+
+        let mut older_report = serde_json::to_value(&report).expect("serialize report");
+        older_report
+            .as_object_mut()
+            .expect("report object")
+            .remove("supervisor_own_usage");
+        let older_report: SupervisorFinalReport =
+            serde_json::from_value(older_report).expect("older report");
+        assert!(older_report.supervisor_own_usage.is_none());
+        let older_bytes = serde_json::to_vec(&older_report).expect("older bytes");
+        let older_measurements = observed_run_measurements_from_captured_supervisor_final_report(
+            &held_out,
+            &older_report,
+            &older_bytes,
+            &repo,
+            &BTreeSet::new(),
+        )
+        .expect("older measurements");
+        assert!(older_measurements.supervisor_own_usage.is_none());
+        let mut older_run = run;
+        older_run.measurements = Some(older_measurements);
+        let summary =
+            summarize_executed_observation_runs(&manifest, &manifest_sha256, &[older_run])
+                .expect("older summary");
+        let unknown = summary
+            .profile_summaries
+            .iter()
+            .find(|summary| summary.profile_id == profile.id)
+            .expect("profile");
+        assert!(unknown.coordination_tokens.aggregate_total.is_none());
+        assert!(unknown
+            .coordination_tokens
+            .unavailable_reason
+            .as_deref()
+            .unwrap()
+            .contains("supervisor_aggregate_not_own_usage"));
     }
 }

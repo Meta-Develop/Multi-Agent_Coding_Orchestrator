@@ -562,7 +562,12 @@ pub(super) fn supervisor_collect_report_schema_value() -> serde_json::Value {
     );
 
     let mut required = supervisor_report_required_fields();
-    required.retain(|field| !matches!(*field, "role_economics_profile" | "role_usage"));
+    required.retain(|field| {
+        !matches!(
+            *field,
+            "role_economics_profile" | "role_usage" | "supervisor_own_usage"
+        )
+    });
     required.extend([
         "artifact_kind",
         "schema",
@@ -617,6 +622,7 @@ fn supervisor_report_required_fields() -> Vec<&'static str> {
         "semantic_intent_tokens",
         "role_economics_profile",
         "role_usage",
+        "supervisor_own_usage",
         "usage_complete",
         "commands_run",
         "environment_failures",
@@ -673,6 +679,7 @@ fn supervisor_report_properties_value(run_lifecycle: &str) -> serde_json::Value 
           "review_lens_total_cost_usd": {"type": "number", "minimum": 0},
           "total_usage": usage_schema_value(),
           "total_cost_usd": {"type": "number", "minimum": 0},
+          "supervisor_own_usage": supervisor_own_usage_schema_value(),
           "usage_complete": {"type": "boolean"},
           "commands_run": {"type": "array", "items": command_run_record_schema_value()},
           "environment_failures": {"type": "array", "items": environment_failure_schema_value()},
@@ -765,7 +772,8 @@ fn collect_nonfinal_state_schema_value(
         "not": {
             "anyOf": [
                 {"required": ["role_economics_profile"]},
-                {"required": ["role_usage"]}
+                {"required": ["role_usage"]},
+                {"required": ["supervisor_own_usage"]}
             ]
         }
     })
@@ -781,7 +789,7 @@ fn collect_finalized_state_schema_value() -> serde_json::Value {
         },
         "required": [
             "collection_state", "final_report_available", "run_lifecycle",
-            "role_economics_profile", "role_usage"
+            "role_economics_profile", "role_usage", "supervisor_own_usage"
         ],
         "not": {
             "properties": {
@@ -2115,6 +2123,31 @@ fn autonomy_kpi_report_schema_value() -> serde_json::Value {
             },
             "unavailable_reason": {"type": "string"}
         }
+    })
+}
+
+fn supervisor_own_usage_schema_value() -> serde_json::Value {
+    json!({
+        "description": "Own provider usage of the supervising process. This is not role_usage.supervisor, which remains the launched-child rollup (supervisor_aggregate), and not total_usage. The current Rust supervisor records an explicit zero here because that process has no provider client and made no provider call. A future mode that calls a provider must record the real counts, with process-observed provenance, or leave the observation unknown. A missing object is not an observed zero. supervisor_aggregate is not a valid observation on this object.",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["observation"],
+        "properties": {
+            "observation": {
+                "type": "string",
+                "enum": ["process_observed", "not_process_observable", "synthetic_fake"]
+            },
+            "usage": usage_schema_value(),
+            "provenance": {"type": "string", "minLength": 1},
+            "unavailable_reason": {"type": "string"}
+        },
+        "allOf": [{
+            "if": {
+                "properties": {"observation": {"const": "process_observed"}},
+                "required": ["observation"]
+            },
+            "then": {"required": ["usage", "provenance"]}
+        }]
     })
 }
 
@@ -6342,10 +6375,10 @@ mod selection_schema_tests {
                     supervisor_collect_report_schema_value(),
                 ),
             ] {
-                println!(
-                    "GENERATED_REPORT_SCHEMA:{name}:{}",
-                    serde_json::to_string_pretty(&schema)?
-                );
+                let path = format!("schemas/{name}");
+                let body = format!("{}\n", serde_json::to_string_pretty(&schema)?);
+                std::fs::write(&path, body)?;
+                println!("WROTE_REPORT_SCHEMA:{path}");
             }
             return Ok(());
         }
