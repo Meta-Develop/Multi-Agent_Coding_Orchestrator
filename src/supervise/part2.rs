@@ -363,6 +363,10 @@ impl DispatchBudgetReservation<'_> {
             // Native headless usage does not attest the provider's actual model.
             SupervisorRuntime::Grok => None,
             SupervisorRuntime::ClaudeCode => run.authenticated_claude_model().map(str::to_owned),
+            SupervisorRuntime::DeepSeek => crate::runtime_adapter::deepseek::served_model(
+                run.stdout_bytes(),
+                command.model.as_deref(),
+            ),
             _ => command.model.clone(),
         };
         let pricing = match launch_runtime {
@@ -387,6 +391,17 @@ impl DispatchBudgetReservation<'_> {
                 .authenticated_grok_usage(command)
                 .is_some_and(|(_, complete)| complete),
             SupervisorRuntime::ClaudeCode => run.authenticated_claude_usage_complete(),
+            SupervisorRuntime::DeepSeek => {
+                crate::runtime_adapter::deepseek::run_completed(
+                    run.stdout_bytes(),
+                    command.model.as_deref(),
+                    command.reasoning_effort.as_deref(),
+                ) && external_safety_verified(run, launch_runtime)
+                    && run.publishable
+                    && run.exit_code == Some(0)
+                    && !run.timed_out
+                    && run.error.is_none()
+            }
             _ if run.authenticated_codex_evidence().is_some() => {
                 run.authenticated_codex_usage_complete()
             }
@@ -614,7 +629,8 @@ fn test_runtime_model_catalog(
         SupervisorRuntime::Grok
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => Ok(RuntimeModelCatalog::OperatorDeclared),
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::DeepSeek => Ok(RuntimeModelCatalog::OperatorDeclared),
     }
 }
 

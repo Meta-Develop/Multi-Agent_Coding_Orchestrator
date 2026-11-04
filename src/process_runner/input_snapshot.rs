@@ -1,4 +1,4 @@
-//! Private source bytes are materialized per launch, mounted read-only, then unlinked
+//! Private input bytes are materialized per launch, mounted read-only, then unlinked
 //! before target release. No mutable operator pathname backs the target's input.
 use super::*;
 
@@ -7,6 +7,7 @@ pub(crate) struct ReadOnlyInputSnapshot {
     pub(super) path: PathBuf,
     sha256: String,
     bytes: Arc<[u8]>,
+    launch_patch: bool,
 }
 impl fmt::Debug for ReadOnlyInputSnapshot {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -26,7 +27,31 @@ impl ReadOnlyInputSnapshot {
             path: path.to_path_buf(),
             sha256: expected_hash.to_owned(),
             bytes: bytes.into(),
+            launch_patch: false,
         })
+    }
+
+    /// One parent-owned launch patch may live beside the assignment prompt, outside the
+    /// source workspace. It still needs an exact read-only file mount and verified containment.
+    pub(crate) fn capture_launch_patch(path: &Path, expected_hash: &str) -> io::Result<Self> {
+        if !path.is_absolute()
+            || !path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().ends_with(".dsh-launch.patch"))
+            || fs::canonicalize(path)? != path
+        {
+            return Err(io::Error::other(
+                "launch patch snapshot path is not an exact canonical patch file",
+            ));
+        }
+        let mut snapshot = Self::capture(path, expected_hash)?;
+        snapshot.launch_patch = true;
+        Ok(snapshot)
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn is_launch_patch(&self) -> bool {
+        self.launch_patch
     }
 
     #[cfg(target_os = "linux")]
@@ -57,6 +82,7 @@ impl ReadOnlyInputSnapshot {
             root,
             file,
             unlinked: AtomicBool::new(false),
+            launch_patch: self.launch_patch,
         };
         mounted.verify()?;
         Ok(mounted)
@@ -70,6 +96,7 @@ pub(super) struct MountedInputSnapshot {
     root: tempfile::TempDir,
     file: File,
     unlinked: AtomicBool,
+    pub(super) launch_patch: bool,
 }
 #[cfg(target_os = "linux")]
 impl MountedInputSnapshot {

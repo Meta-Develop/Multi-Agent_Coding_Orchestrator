@@ -1042,6 +1042,7 @@ mod tests {
                 SupervisorRuntime::Cursor,
                 SupervisorRuntime::ClaudeCode,
                 SupervisorRuntime::GeminiCli,
+                SupervisorRuntime::DeepSeek,
             ] {
                 for result in [
                     authorize_resolved_executor_model(

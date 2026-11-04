@@ -4220,7 +4220,8 @@
                         "grok",
                         "cursor",
                         "claude-code",
-                        "gemini-cli"
+                        "gemini-cli",
+                        "deepseek"
                       ]
                     },
                     "selection_source": {
@@ -11343,7 +11344,8 @@
                               "grok",
                               "cursor",
                               "claude-code",
-                              "gemini-cli"
+                              "gemini-cli",
+                              "deepseek"
                             ]
                           },
                           "selection_source": {
@@ -20799,7 +20801,8 @@
                                                                 "grok",
                                                                 "cursor",
                                                                 "claude-code",
-                                                                "gemini-cli"
+                                                                "gemini-cli",
+                                                                "deepseek"
                                                               ]
                                                             }
                                                           },
@@ -25866,7 +25869,8 @@
                                         "grok",
                                         "cursor",
                                         "claude-code",
-                                        "gemini-cli"
+                                        "gemini-cli",
+                                        "deepseek"
                                       ]
                                     }
                                   },
@@ -26310,7 +26314,8 @@
                               "grok",
                               "cursor",
                               "claude-code",
-                              "gemini-cli"
+                              "gemini-cli",
+                              "deepseek"
                             ]
                           }
                         },
@@ -26627,7 +26632,8 @@
         "grok",
         "cursor",
         "claude-code",
-        "gemini-cli"
+        "gemini-cli",
+        "deepseek"
       ],
       "type": "string"
     },

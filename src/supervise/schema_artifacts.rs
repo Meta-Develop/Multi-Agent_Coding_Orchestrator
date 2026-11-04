@@ -82,7 +82,7 @@ fn operator_pricing_contract_schema_value() -> serde_json::Value {
                     "type": "object", "additionalProperties": false,
                     "required": ["runtime", "model", "account_id", "plan_id"],
                     "properties": {
-                        "runtime": {"enum": ["fake", "codex", "grok", "cursor", "claude-code", "gemini-cli"]},
+                        "runtime": {"enum": ["fake", "codex", "grok", "cursor", "claude-code", "gemini-cli", "deepseek"]},
                         "model": {"type": "string", "minLength": 1},
                         "account_id": {"type": "string", "minLength": 1},
                         "plan_id": {"type": "string", "minLength": 1}
@@ -436,13 +436,14 @@ pub(super) fn write_worktree_writable_admission_schema(
     write_schema(writer, relative, worktree_writable_admission_schema_value())
 }
 
-const REACHABLE_SUPERVISOR_RUNTIMES: [SupervisorRuntime; 6] = [
+const REACHABLE_SUPERVISOR_RUNTIMES: [SupervisorRuntime; 7] = [
     SupervisorRuntime::Codex,
     SupervisorRuntime::Fake,
     SupervisorRuntime::Grok,
     SupervisorRuntime::Cursor,
     SupervisorRuntime::ClaudeCode,
     SupervisorRuntime::GeminiCli,
+    SupervisorRuntime::DeepSeek,
 ];
 
 fn supervisor_runtime_schema_value() -> serde_json::Value {
@@ -2884,7 +2885,7 @@ fn orchestrator_assignment_schema_value() -> serde_json::Value {
         "properties": {
             "id": identifier_schema_value(),
             "phase": {"enum": ["planning", "execution"]},
-            "runtime": {"enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli"]},
+            "runtime": {"enum": ["codex", "fake", "grok", "cursor", "claude-code", "gemini-cli", "deepseek"]},
             "role": {"enum": ["child_orchestrator", "worker", "researcher"]},
             "role_category": role_category_schema_value(),
             "selection_source": assignment_selection_source_schema_value(),

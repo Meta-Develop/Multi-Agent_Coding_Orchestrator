@@ -311,6 +311,7 @@ fn fresh_worker_admission_selected_adapter_projection_retains_one_shot_identity(
         SupervisorRuntime::Cursor,
         SupervisorRuntime::ClaudeCode,
         SupervisorRuntime::GeminiCli,
+        SupervisorRuntime::DeepSeek,
     ] {
         let fixture = FreshFixture::new()?;
         let mut parent = fixture.plan.assignments[0].clone();

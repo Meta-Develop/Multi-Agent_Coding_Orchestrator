@@ -1051,7 +1051,8 @@ fn external_process_quiescent_for_scratch(
         SupervisorRuntime::Grok
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => run.scratch_quiescence_verified(),
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::DeepSeek => run.scratch_quiescence_verified(),
     }
 }
 
@@ -2236,7 +2237,8 @@ pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: Supervis
         SupervisorRuntime::Grok
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => {
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::DeepSeek => {
             run.process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)
                 && run
@@ -2292,6 +2294,15 @@ pub(super) fn external_process_completed(
     if runtime == SupervisorRuntime::Fake {
         return run.simulation_succeeded()
             && run.program_trust == ExternalProgramTrust::ExplicitCustom;
+    }
+    if runtime == SupervisorRuntime::DeepSeek {
+        return run.publishable
+            && run.exit_code == Some(0)
+            && !run.timed_out
+            && run.error.is_none()
+            && crate::runtime_adapter::deepseek::parse_event_stream(run.stdout_bytes(), None)
+                .is_ok_and(|parsed| parsed.completed)
+            && external_safety_verified(run, runtime);
     }
     run.publishable
         && run.exit_code == Some(0)
@@ -2374,9 +2385,89 @@ pub(super) fn external_usage_for_runtime(
         cursor_managed_usage(run).map(|(usage, _)| usage)
     } else if runtime == SupervisorRuntime::GeminiCli {
         run.gemini_bridge_evidence()?.usage_for_command(command)
+    } else if runtime == SupervisorRuntime::DeepSeek {
+        let (input, output, total) =
+            crate::runtime_adapter::deepseek::usage_tokens(run.stdout_bytes())?;
+        let input_tokens = usize::try_from(input).ok()?;
+        let output_tokens = usize::try_from(output).ok()?;
+        let total_tokens = usize::try_from(total).ok()?;
+        if input_tokens.checked_add(output_tokens) != Some(total_tokens) {
+            return None;
+        }
+        Some(Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
     } else {
         complete_external_codex_usage(run, command)
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn deepseek_completion_usage_and_identity_follow_the_headless_stream() -> Result<()> {
+    let raw = include_str!("../runtime_adapter/fixtures/deepseek/completed.ndjson");
+    let bytes = raw
+        .lines()
+        .filter(|line| !line.is_empty() && !line.starts_with('#'))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let command = ExternalAgentCommand::codex(
+        "/usr/bin/dsh",
+        "/work",
+        "/work/prompt.txt",
+        "/work/log.jsonl",
+        "/work/report.json",
+        std::time::Duration::from_secs(30),
+    )
+    .with_model_selection(
+        Some("deepseek-v4-pro".to_string()),
+        Some("high".to_string()),
+    );
+    let stdout = crate::external_agent::CapturedOutput::from_captured_bytes_for_test(
+        &crate::process_runner::CapturedBytes::from_bytes_for_test(bytes.into_bytes()),
+    );
+    let mut run = deterministic_fake_run(&command, Vec::new());
+    run.publishable = true;
+    run.program_trust = ExternalProgramTrust::ExplicitCustom;
+    run.stdout = stdout;
+    run.process_tree = Some(crate::process_runner::ProcessTreeEvidence::VerifiedEmpty(
+        crate::process_runner::ContainmentBackend::SystemdUserService,
+    ));
+    run.side_effects = Some(
+        crate::process_runner::SideEffectConfinementEvidence::Verified(
+            crate::process_runner::SideEffectConfinementProfileKind::ExternalCodex,
+        ),
+    );
+    assert!(external_process_completed(
+        &run,
+        SupervisorRuntime::DeepSeek
+    ));
+    assert_eq!(
+        external_usage_for_runtime(&run, &command, SupervisorRuntime::DeepSeek),
+        Some(Usage {
+            input_tokens: 14,
+            output_tokens: 9,
+            total_tokens: 23,
+        })
+    );
+    let identity = crate::runtime_adapter::RuntimeIdentityObservation::capture(
+        &run,
+        &command,
+        SupervisorRuntime::DeepSeek,
+    );
+    assert!(identity.model.is_none());
+    assert_eq!(
+        identity.effort_basis,
+        Some(crate::runtime_adapter::IdentityBasis::Requested)
+    );
+    run.exit_code = Some(1);
+    assert!(!external_process_completed(
+        &run,
+        SupervisorRuntime::DeepSeek
+    ));
+    Ok(())
 }
 
 #[cfg(all(test, target_os = "linux"))]

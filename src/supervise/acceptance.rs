@@ -472,7 +472,9 @@ fn collect_child_report_from_source(
                     },
                 )
             } else if assignment.role == AgentRole::Researcher {
-                if runtime == SupervisorRuntime::GeminiCli && external_command.uses_gemini_bridge()
+                if (runtime == SupervisorRuntime::GeminiCli
+                    && external_command.uses_gemini_bridge())
+                    || runtime == SupervisorRuntime::DeepSeek
                 {
                     read_researcher_native_report(external_run.output_last_message(), report_path)
                 } else {
@@ -666,6 +668,28 @@ fn collect_child_report_from_source(
                 }
                 Ok(())
             })
+        } else if runtime == SupervisorRuntime::DeepSeek {
+            (|| {
+                let paths = external_run.deepseek_research_paths(external_command)?;
+                if !report.commands_run.is_empty() || !report.validation_results.is_empty() {
+                    bail!("DeepSeek read-only research cannot attest shell or check commands");
+                }
+                if report.status == ReviewStatus::Succeeded {
+                    for assigned in &assignment.assigned_paths {
+                        let display = assigned.display().to_string();
+                        let expected = crate::runtime_adapter::deepseek::normalized_source_path(
+                            assigned,
+                            &external_command.cwd,
+                        )?;
+                        if !paths.contains(&expected) {
+                            bail!(
+                                "DeepSeek research has no matching successful exact read of assigned path {display}"
+                            );
+                        }
+                    }
+                }
+                Ok(())
+            })()
         } else {
             Err(anyhow!(
                 "researcher command evidence requires a trusted read-only Codex launch"
