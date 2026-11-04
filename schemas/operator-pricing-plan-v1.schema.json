@@ -51,7 +51,8 @@
                   "grok",
                   "cursor",
                   "claude-code",
-                  "gemini-cli"
+                  "gemini-cli",
+                  "deepseek"
                 ]
               }
             },

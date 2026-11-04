@@ -2012,7 +2012,7 @@ pub(super) fn frozen_review_account_binding(
                 .map(|binding| binding.to_selected_binding()),
             SupervisorRuntime::Cursor => authority::cursor_run_account_binding(run)
                 .map(|binding| binding.to_selected_binding()),
-            SupervisorRuntime::Fake => None,
+            SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
         };
     binding
         .map(Some)
@@ -4908,6 +4908,7 @@ pub(super) fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
         "cursor" => Ok(SupervisorRuntime::Cursor),
         "claude-code" | "claude" => Ok(SupervisorRuntime::ClaudeCode),
         "gemini-cli" | "gemini" => Ok(SupervisorRuntime::GeminiCli),
+        "deepseek" | "dsh" => Ok(SupervisorRuntime::DeepSeek),
         _ => bail!("selector runtime '{runtime}' is not executable by the supervisor"),
     }
 }

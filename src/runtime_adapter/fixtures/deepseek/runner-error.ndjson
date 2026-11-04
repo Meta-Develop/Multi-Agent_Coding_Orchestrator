@@ -1,0 +1,4 @@
+# Citation: documented event shapes, not a live capture.
+# deepseek-harness 0.2.2-alpha.3 packages/bundle/headless/README.md
+# A runner failure outside a turn writes an error event and no final.
+{"type":"error","message":"unknown session"}

@@ -3,7 +3,8 @@
 These fixtures prepare separate acceptance gates for [nested token control](nested-codex-budget.md),
 [read-only source inspection](researcher-source-input.md), a
 [lower-effort writable lane](grok-lower-effort.md),
-[4.7 ACP managed-child execution](grok47-acp.md), and a
+[4.7 ACP managed-child execution](grok47-acp.md), a
+[DeepSeek Harness headless read-only Researcher](deepseek-headless.md), and a
 [cross-runtime model-mix pilot](model-mix-pilot.md). Nested token control records
 an accepted Linux contained qualification; the other fixtures record no passed
 live run.

@@ -94,6 +94,26 @@ impl RuntimeIdentityObservation {
                     // The private bridge observes modelVersion, but no served thinking effort.
                 }
             }
+            SupervisorRuntime::DeepSeek => {
+                let model_ok =
+                    crate::runtime_adapter::deepseek::validate_model(command.model.as_deref())
+                        .is_ok();
+                let effort_ok = crate::runtime_adapter::deepseek::validate_effort(
+                    command.reasoning_effort.as_deref(),
+                )
+                .is_ok();
+                if model_ok && effort_ok {
+                    if let Ok(parsed) = crate::runtime_adapter::deepseek::parse_event_stream(
+                        run.stdout_bytes(),
+                        command.model.as_deref(),
+                    ) {
+                        if !parsed.model_contradicted {
+                            identity.model.clone_from(&parsed.served_model);
+                            identity.effort_basis = Some(IdentityBasis::Requested);
+                        }
+                    }
+                }
+            }
             SupervisorRuntime::Cursor => {
                 if run
                     .cursor_managed_parent_evidence

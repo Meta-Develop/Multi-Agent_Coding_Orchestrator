@@ -147,6 +147,14 @@ pub(crate) fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
 ) -> Result<PathBuf> {
+    if launch_runtime == SupervisorRuntime::DeepSeek {
+        let frozen = super::runtime_executables::selected_program(launch_runtime, options)?;
+        let program = frozen
+            .as_deref()
+            .map(|path| path.as_os_str().to_os_string())
+            .or_else(|| std::env::var_os("MACO_DSH_BIN"));
+        return crate::runtime_adapter::deepseek::resolve_configured_executable(program.as_deref());
+    }
     if let Some(program) = super::runtime_executables::selected_program(launch_runtime, options)? {
         return Ok(program);
     }
@@ -171,6 +179,9 @@ pub(crate) fn selected_runtime_program(
         SupervisorRuntime::Codex | SupervisorRuntime::Fake => {
             Ok(PathBuf::from(launch_runtime.default_binary()))
         }
+        SupervisorRuntime::DeepSeek => {
+            unreachable!("DeepSeek executable is resolved before this match")
+        }
     }
 }
 
@@ -187,7 +198,8 @@ fn bind_runtime_output_schema(
         SupervisorRuntime::Grok => Some(schema_path.to_path_buf()),
         SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => None,
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::DeepSeek => None,
     };
     Ok(command)
 }
@@ -610,10 +622,32 @@ fn bind_selected_runtime_launch(
         validate_researcher_assignment(assignment)?;
         if !matches!(
             launch_runtime,
-            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli
+            SupervisorRuntime::Codex | SupervisorRuntime::GeminiCli | SupervisorRuntime::DeepSeek
         ) {
             bail!("researcher requires a supported strict Linux read-only runtime");
         }
+    }
+    let deepseek_read_only = launch_runtime == SupervisorRuntime::DeepSeek
+        && assignment.role == AgentRole::Researcher
+        && assignment.effective_role_category().is_read_only()
+        && assignment.worker_assignments.is_empty();
+    if launch_runtime == SupervisorRuntime::DeepSeek && !deepseek_read_only {
+        let writable_worker = assignment.phase == AssignmentPhase::Execution
+            && assignment.role == AgentRole::Worker
+            && assignment.effective_role_category() == RoleCategory::NonDelegatingTerminalWorker
+            && assignment.worker_assignments.is_empty();
+        if writable_worker {
+            bail!(
+                "{}",
+                super::deepseek_qualification::writable_refusal(
+                    super::deepseek_qualification::operator_flag_bound(
+                        &options.repo,
+                        options.run_id.as_str(),
+                    )
+                )
+            );
+        }
+        bail!("DeepSeek headless is admitted only as a read-only Researcher");
     }
     let configured = effective_role_model_selection(plan, assignment.role);
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
@@ -649,7 +683,11 @@ fn bind_selected_runtime_launch(
         && assignment.phase == AssignmentPhase::Execution
         && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
         && !assignment.worker_assignments.is_empty();
-    if launch_runtime.is_adapter_subprocess() && !gemini_read_only && !loaded_route {
+    if launch_runtime.is_adapter_subprocess()
+        && !gemini_read_only
+        && !deepseek_read_only
+        && !loaded_route
+    {
         authorize_bounded_leaf_runtime_role(assignment.role).with_context(|| {
             format!(
                 "selected runtime '{}' cannot launch judgment or delegating role '{}'",
@@ -680,7 +718,10 @@ fn bind_selected_runtime_launch(
         );
     }
     admit_assignment_role_category(assignment, launch_runtime, &resolution)?;
-    if gemini_read_only || (managed_control_parent && launch_runtime != SupervisorRuntime::Fake) {
+    if gemini_read_only
+        || deepseek_read_only
+        || (managed_control_parent && launch_runtime != SupervisorRuntime::Fake)
+    {
         command = command.with_workspace_access(WorkspaceAccess::ReadOnly);
     }
     if launch_runtime.is_adapter_subprocess()
@@ -731,6 +772,24 @@ fn bind_selected_runtime_launch(
         }
         command = command
             .with_model_selection(Some(model), resolution.selection.reasoning_effort.clone());
+        if deepseek_read_only {
+            let context = crate::runtime_adapter::LaunchContext {
+                prompt: &command.prompt,
+                model: command.model.as_deref(),
+                effort: command.reasoning_effort.as_deref(),
+                cwd: &command.cwd,
+                output: &command.output_last_message,
+            };
+            let config = command
+                .runtime_adapter
+                .as_ref()
+                .context("DeepSeek researcher launch has no adapter configuration")?;
+            let contract =
+                crate::runtime_adapter::deepseek::prove_read_only_launch(config, &context, None)?;
+            if contract.admits_worktree_writable || !contract.side_effect_confinement_verified {
+                bail!("DeepSeek read-only headless contract was not proved");
+            }
+        }
         prerender_selected_runtime_adapter_command(&command, launch_runtime)?;
         return Ok(BoundSelectedRuntimeLaunch {
             command,
@@ -4207,7 +4266,8 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             SupervisorRuntime::Grok
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
-            | SupervisorRuntime::GeminiCli,
+            | SupervisorRuntime::GeminiCli
+            | SupervisorRuntime::DeepSeek,
         ) => {
             if let Some(state) = release_state {
                 state.store(2, Ordering::Release);
@@ -7246,6 +7306,9 @@ fn dispatch_and_collect_parent_auditor(
             record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
             Ok(external_runner(&auditor_command, cancellation, None))
         }
+        SupervisorRuntime::DeepSeek => {
+            bail!("DeepSeek headless is admitted only as a read-only Researcher");
+        }
         SupervisorRuntime::Fake => {
             if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)
             {
@@ -9027,6 +9090,7 @@ mod decomposition_tests {
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
         ] {
             let ledger = RunBudgetLedger::new(RunBudgetLimits {
                 hard_tokens: Some(100),
@@ -14377,6 +14441,7 @@ done
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
         ] {
             assert!(!runtime.capabilities().admits_worktree_writable());
             assert_eq!(
@@ -14643,6 +14708,7 @@ done
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
         ] {
             let adapter = bind_runtime_read_only_schema_files(
                 bind_runtime_output_schema(launch_fixture_command(), runtime, schema)?,
@@ -14756,6 +14822,7 @@ done
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
         ] {
             assert!(bind_runtime_output_schema(
                 launch_fixture_command(),

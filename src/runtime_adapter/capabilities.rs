@@ -24,6 +24,8 @@ pub enum AdapterId {
     ClaudeCode,
     #[serde(rename = "gemini-cli")]
     GeminiCli,
+    #[serde(rename = "deepseek")]
+    DeepSeek,
 }
 
 impl AdapterId {
@@ -57,13 +59,14 @@ impl AdapterId {
         Ok(self.managed_parent_control_protocol())
     }
 
-    pub const ALL: [Self; 6] = [
+    pub const ALL: [Self; 7] = [
         Self::Codex,
         Self::Fake,
         Self::Grok,
         Self::Cursor,
         Self::ClaudeCode,
         Self::GeminiCli,
+        Self::DeepSeek,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -74,6 +77,7 @@ impl AdapterId {
             Self::Cursor => "cursor",
             Self::ClaudeCode => "claude-code",
             Self::GeminiCli => "gemini-cli",
+            Self::DeepSeek => "deepseek",
         }
     }
 
@@ -85,6 +89,7 @@ impl AdapterId {
             "cursor" => Some(Self::Cursor),
             "claude-code" | "claude" => Some(Self::ClaudeCode),
             "gemini-cli" | "gemini" => Some(Self::GeminiCli),
+            "deepseek" | "dsh" => Some(Self::DeepSeek),
             _ => None,
         }
     }
@@ -97,6 +102,8 @@ impl AdapterId {
             Self::Cursor => "cursor-agent",
             Self::ClaudeCode => "claude",
             Self::GeminiCli => "gemini",
+            // Resolution refuses this bare name. Launch requires absolute MACO_DSH_BIN.
+            Self::DeepSeek => "dsh",
         }
     }
 
@@ -106,6 +113,7 @@ impl AdapterId {
             Self::Cursor => Some("MACO_CURSOR"),
             Self::ClaudeCode => Some("MACO_CLAUDE"),
             Self::GeminiCli => Some("MACO_GEMINI"),
+            Self::DeepSeek => Some("MACO_DSH"),
             Self::Codex | Self::Fake => None,
         }
     }
@@ -122,6 +130,7 @@ impl AdapterId {
             RuntimeId::Cursor => Self::Cursor,
             RuntimeId::ClaudeCode => Self::ClaudeCode,
             RuntimeId::GeminiCli => Self::GeminiCli,
+            RuntimeId::DeepSeek => Self::DeepSeek,
         }
     }
 
@@ -133,6 +142,7 @@ impl AdapterId {
             Self::Cursor => Some(RuntimeId::Cursor),
             Self::ClaudeCode => Some(RuntimeId::ClaudeCode),
             Self::GeminiCli => Some(RuntimeId::GeminiCli),
+            Self::DeepSeek => Some(RuntimeId::DeepSeek),
         }
     }
 
@@ -161,6 +171,7 @@ impl AdapterId {
             Self::Cursor => RuntimeCapabilities::CURSOR,
             Self::ClaudeCode => RuntimeCapabilities::CLAUDE_CODE,
             Self::GeminiCli => RuntimeCapabilities::GEMINI_CLI,
+            Self::DeepSeek => RuntimeCapabilities::DEEPSEEK,
         }
     }
 
@@ -169,7 +180,7 @@ impl AdapterId {
         match self {
             Self::Codex => AdapterTrustClass::TrustedSystem,
             Self::Fake => AdapterTrustClass::LocalDeterministic,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli => {
+            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek => {
                 AdapterTrustClass::ExplicitCustom
             }
         }
@@ -197,6 +208,12 @@ impl AdapterId {
             Self::GeminiCli => Some(PrivateRuntimeStateHome {
                 env_var: "GEMINI_CLI_HOME",
                 relative_path: ".gemini",
+            }),
+            // Declared so the private runtime home stays inside the contained HOME.
+            // Launch does not point DSH_HOME at the operator's real home.
+            Self::DeepSeek => Some(PrivateRuntimeStateHome {
+                env_var: "DSH_HOME",
+                relative_path: ".dsh",
             }),
             Self::Fake => None,
         }
@@ -464,6 +481,26 @@ impl RuntimeCapabilities {
         model_catalog: ModelCatalogSource::OperatorDeclared,
         usage_reporting: UsageReporting::None,
         session_resume: SessionResume::Supported,
+    };
+
+    /// Static row. Side effects stay unverified until a launch proves the
+    /// headless read-only contract. Writable admission stays closed.
+    pub const DEEPSEEK: Self = Self {
+        blocking_pre_action_callback: BlockingPreActionCallback::None,
+        writable_workspace: WorkspaceWritability::Partial,
+        side_effect_confinement: SideEffectConfinement::Unverified,
+        model_catalog: ModelCatalogSource::OperatorDeclared,
+        usage_reporting: UsageReporting::Aggregate,
+        session_resume: SessionResume::Unsupported,
+    };
+
+    /// Proved headless read-only contract. Writability stays unsupported so a
+    /// verified confinement proof cannot admit worktree writes.
+    pub const DEEPSEEK_HEADLESS_READ_ONLY: Self = Self {
+        side_effect_confinement: SideEffectConfinement::Verified,
+        writable_workspace: WorkspaceWritability::Unsupported,
+        session_resume: SessionResume::Unsupported,
+        ..Self::DEEPSEEK
     };
 
     pub const fn matrix_cells(self) -> [(&'static str, MatrixStatus); 6] {
@@ -835,6 +872,27 @@ mod tests {
     }
 
     #[test]
+    fn deepseek_identity_round_trips_as_one_word() {
+        assert_eq!(RuntimeId::DeepSeek.as_str(), "deepseek");
+        assert_eq!(
+            serde_json::to_string(&RuntimeId::DeepSeek).unwrap(),
+            "\"deepseek\""
+        );
+        assert_eq!(
+            serde_json::from_str::<RuntimeId>("\"deepseek\"").unwrap(),
+            RuntimeId::DeepSeek
+        );
+        assert!(serde_json::from_str::<RuntimeId>("\"deep_seek\"").is_err());
+        assert!(serde_json::from_str::<RuntimeId>("\"deep-seek\"").is_err());
+        let json = serde_json::to_string(&AdapterId::DeepSeek).unwrap();
+        assert_eq!(json, "\"deepseek\"");
+        assert_eq!(
+            serde_json::from_str::<AdapterId>(&json).unwrap(),
+            AdapterId::DeepSeek
+        );
+    }
+
+    #[test]
     fn gemini_cli_identity_round_trips_through_serde_and_parse() {
         assert_eq!(AdapterId::parse("gemini-cli"), Some(AdapterId::GeminiCli));
         assert_eq!(AdapterId::parse("gemini"), Some(AdapterId::GeminiCli));
@@ -972,6 +1030,7 @@ mod tests {
             (AdapterId::Cursor, "CURSOR_CONFIG_DIR", ".cursor"),
             (AdapterId::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude"),
             (AdapterId::GeminiCli, "GEMINI_CLI_HOME", ".gemini"),
+            (AdapterId::DeepSeek, "DSH_HOME", ".dsh"),
         ];
         for (adapter, env_var, relative_path) in homes {
             let home = adapter
@@ -1008,6 +1067,20 @@ mod tests {
         assert_eq!(
             AdapterId::ClaudeCode.capabilities().model_catalog,
             ModelCatalogSource::OperatorDeclared
+        );
+        assert_eq!(
+            AdapterId::DeepSeek.capabilities().model_catalog,
+            ModelCatalogSource::OperatorDeclared
+        );
+        assert_eq!(
+            AdapterId::DeepSeek.capabilities().usage_reporting,
+            UsageReporting::Aggregate
+        );
+        assert!(!RuntimeCapabilities::DEEPSEEK.admits_worktree_writable());
+        assert!(!RuntimeCapabilities::DEEPSEEK_HEADLESS_READ_ONLY.admits_worktree_writable());
+        assert_eq!(
+            RuntimeCapabilities::DEEPSEEK_HEADLESS_READ_ONLY.worktree_writable_refusal(),
+            Some("writable_workspace == unsupported")
         );
     }
 }

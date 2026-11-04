@@ -11,6 +11,7 @@ pub mod cursor;
 #[cfg(target_os = "linux")]
 #[path = "cursor/managed_parent.rs"]
 pub(crate) mod cursor_managed_parent;
+pub mod deepseek;
 pub mod gemini;
 pub mod grok;
 pub(crate) mod grok_acp;
@@ -118,6 +119,9 @@ pub enum RuntimeId {
     ClaudeCode,
     #[serde(rename = "gemini-cli")]
     GeminiCli,
+    #[serde(rename = "deepseek")]
+    #[value(name = "deepseek", alias = "dsh")]
+    DeepSeek,
 }
 
 /// Common launch boundary implemented by every subprocess runtime adapter.
@@ -345,6 +349,30 @@ pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
         AdapterId::Cursor => Box::new(CursorAdapter::from_environment()),
         AdapterId::ClaudeCode => Box::new(ClaudeCodeAdapter::from_environment()),
         AdapterId::GeminiCli => Box::new(GeminiAdapter::from_environment()),
+        AdapterId::DeepSeek => Box::new(DeepSeekAdapter::from_environment()),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeepSeekAdapter {
+    config: RuntimeAdapterConfig,
+}
+
+impl DeepSeekAdapter {
+    pub fn from_environment() -> Self {
+        Self {
+            config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::DeepSeek),
+        }
+    }
+}
+
+impl AgentRuntimeAdapter for DeepSeekAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::DeepSeek
+    }
+
+    fn config(&self) -> &RuntimeAdapterConfig {
+        &self.config
     }
 }
 
@@ -602,6 +630,12 @@ impl RuntimeAdapterConfig {
                 OutputCaptureMode::Stdout,
                 false,
             ),
+            AdapterId::DeepSeek => (
+                deepseek::immutable_argument_template(),
+                // Headless `--json` writes NDJSON on stdout. The task is stdin (`-`).
+                OutputCaptureMode::Stdout,
+                true,
+            ),
             AdapterId::Codex | AdapterId::Fake => (Vec::new(), OutputCaptureMode::default(), false),
         };
         let binary = if adapter == AdapterId::ClaudeCode {
@@ -660,6 +694,7 @@ impl RuntimeAdapterConfig {
                 config.restore_immutable_grok_descriptor();
             }
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
             _ => {}
         }
         Ok(config)
@@ -701,13 +736,25 @@ impl RuntimeAdapterConfig {
         match adapter {
             AdapterId::Grok => config.restore_immutable_grok_descriptor(),
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
+            AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
             _ => {}
         }
         config
     }
 
+    fn restore_immutable_deepseek_descriptor(&mut self) {
+        self.argument_template = deepseek::immutable_argument_template();
+        self.env_passthrough.clear();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = true;
+    }
+
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
-        if matches!(adapter, AdapterId::Grok | AdapterId::ClaudeCode) {
+        if matches!(
+            adapter,
+            AdapterId::Grok | AdapterId::ClaudeCode | AdapterId::DeepSeek
+        ) {
             return;
         }
         self.argument_template = args.split_whitespace().map(str::to_string).collect();
@@ -908,6 +955,21 @@ impl RuntimeAdapterConfig {
         let binary = self.binary_path();
         if binary.as_os_str().is_empty() {
             bail!("runtime adapter binary is not configured")
+        }
+        if self
+            .argument_template
+            .iter()
+            .any(|token| token == "{deepseek_patch}" || token == "{session_id}")
+        {
+            let argv = deepseek::substitute(&self.argument_template, context.prompt, None)?;
+            let env = collect_screened_passthrough_env(&self.env_passthrough)?;
+            return Ok(LaunchSpec {
+                program: binary.to_path_buf(),
+                argv,
+                cwd: context.cwd.to_path_buf(),
+                env,
+                output_capture: self.output_capture,
+            });
         }
         let prompt_text = if self
             .argument_template
@@ -2040,6 +2102,47 @@ mod tests {
             &[("MACO_GROK_INTERACTION_PROTOCOL", "native")],
         )?;
         assert_eq!(cursor, RuntimeAdapterConfig::defaults(RuntimeId::Cursor));
+        Ok(())
+    }
+
+    #[test]
+    fn deepseek_loader_keeps_the_headless_contract_despite_operator_overrides() -> Result<()> {
+        let config = RuntimeAdapterConfig::try_from_adapter_environment_vars(
+            AdapterId::DeepSeek,
+            &[
+                ("MACO_DSH_ARGS", "--profile acp --add-dir /tmp"),
+                ("MACO_DSH_STDIN_PROMPT", "0"),
+                ("MACO_DSH_OUTPUT_CAPTURE", "output_file"),
+                ("MACO_DSH_CWD_FLAG", "--cwd"),
+                (
+                    "MACO_DSH_ENV",
+                    "DSH_HOME,DSH_PERMISSION_MODE,DSH_TELEMETRY_OTLP_URL",
+                ),
+                ("MACO_DSH_BIN", "/opt/dsh"),
+            ],
+        )?;
+        assert_eq!(
+            config.argument_template,
+            deepseek::immutable_argument_template()
+        );
+        assert!(config.feed_prompt_on_stdin);
+        assert_eq!(config.output_capture, OutputCaptureMode::Stdout);
+        assert!(config.working_dir_flag.is_none());
+        assert!(config.env_passthrough.is_empty());
+        assert_eq!(config.binary_path(), Path::new("/opt/dsh"));
+        let spec = config.render(&launch_context(
+            Path::new("prompt.txt"),
+            Some("deepseek-v4-pro"),
+            Some("high"),
+            Path::new("/tmp/work"),
+            Path::new("out.txt"),
+        ))?;
+        assert_eq!(
+            spec.argv,
+            deepseek::render_read_only_argv(Path::new("prompt.txt"), None)?
+        );
+        assert!(!spec.argv.iter().any(|arg| arg == "--add-dir"));
+        assert!(spec.env.is_empty());
         Ok(())
     }
 

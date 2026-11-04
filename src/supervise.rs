@@ -332,6 +332,7 @@ mod environment_observation;
 mod outcome_history;
 mod prior_input;
 pub(crate) use prior_input::{FrozenOperatorPriorData, OperatorPriorDataGuard};
+pub(crate) mod deepseek_qualification;
 pub(crate) mod grok_acp_qualification;
 mod runtime_executables;
 use outcome_history::*;
@@ -1355,7 +1356,8 @@ pub(crate) fn admit_production_supervisor_catalog_preflight_grant(
         | SupervisorRuntime::Grok
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => Ok(None),
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::DeepSeek => Ok(None),
     }
 }
 
@@ -1411,7 +1413,8 @@ impl RuntimeModelCatalog {
             SupervisorRuntime::Grok
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
-            | SupervisorRuntime::GeminiCli => Ok(Self::OperatorDeclared),
+            | SupervisorRuntime::GeminiCli
+            | SupervisorRuntime::DeepSeek => Ok(Self::OperatorDeclared),
         }
     }
 

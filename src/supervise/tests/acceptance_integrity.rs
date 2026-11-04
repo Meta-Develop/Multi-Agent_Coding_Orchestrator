@@ -1,5 +1,133 @@
 use super::*;
 
+#[cfg(unix)]
+#[test]
+fn deepseek_cited_capture_to_researcher_acceptance_requires_successful_exact_read() {
+    use crate::external_agent::deepseek_tests::{capture, command, fixture_events, stream};
+    let (temp, repo_path) = injected_repository();
+    for root in [".maco", ".maco-cache", ".codex", ".agents"] {
+        fs::create_dir_all(repo_path.join(root)).unwrap();
+    }
+    let mut assignment = injected_assignment(false);
+    assignment.role = AgentRole::Researcher;
+    assignment.role_category = Some(RoleCategory::ReadOnlyResearcher);
+    assignment.worker_assignments.clear();
+    assignment.assigned_paths = vec![PathBuf::from("README.md")];
+    let mut child = injected_child_report(&assignment);
+    child.role = AgentRole::Researcher;
+    child.worker_reports.clear();
+    child.audit_reports.clear();
+    child.files_changed.clear();
+    child.commands_run.clear();
+    child.validation_results.clear();
+    let mut wire = serde_json::to_value(&child).unwrap();
+    wire["read_only"] = json!(true);
+    wire["no_further_delegation"] = json!(true);
+    for case in [
+        "valid",
+        "failed-bash",
+        "wrong-path",
+        "relative-read",
+        "failed-read",
+        "missing-result",
+        "truncated-call",
+        "truncated-result",
+        "duplicate-call",
+        "duplicate-result",
+        "wrong-result-id",
+        "nonzero",
+        "stream-truncated",
+        "observed-diff",
+        "claimed-shell",
+        "truncated-progress",
+    ] {
+        let root = temp.path().join(case);
+        fs::create_dir(&root).unwrap();
+        let mut command = command(&root).unwrap();
+        command.cwd = repo_path.clone();
+        let mut events = fixture_events();
+        events[0]["cwd"] = json!(repo_path);
+        let call = events
+            .iter()
+            .position(|e| e["type"] == "tool_call")
+            .unwrap();
+        let result = call + 1;
+        events[call]["input"] = json!({"file_path": repo_path.join("README.md")});
+        match case {
+            "failed-bash" => {
+                events[call]["tool"] = json!("bash");
+                events[call]["input"] = json!({"command":"echo README.md"});
+                events[result]["status"] = json!("error");
+            }
+            "wrong-path" => {
+                events[call]["input"] = json!({"file_path":repo_path.join("other-README.md")})
+            }
+            "relative-read" => events[call]["input"] = json!({"file_path":"README.md"}),
+            "failed-read" => events[result]["status"] = json!("error"),
+            "missing-result" => {
+                events.remove(result);
+            }
+            "truncated-call" => events[call]["truncated"] = json!(true),
+            "truncated-result" => events[result]["truncated"] = json!(true),
+            "duplicate-call" => events.insert(call, events[call].clone()),
+            "duplicate-result" => events.insert(result, events[result].clone()),
+            "wrong-result-id" => events[result]["callId"] = json!("unmatched"),
+            "truncated-progress" => {
+                events[call - 1] =
+                    json!({"type":"thinking","text":"bounded progress","truncated":true})
+            }
+            _ => {}
+        }
+        let mut report_wire = wire.clone();
+        if case == "claimed-shell" {
+            report_wire["commands_run"] = json!([injected_command_record()]);
+        }
+        events.last_mut().unwrap()["text"] = json!(report_wire.to_string());
+        let run = capture(
+            &command,
+            stream(&events),
+            case == "stream-truncated",
+            if case == "nonzero" { 1 } else { 0 },
+            None,
+            &BTreeMap::new(),
+        )
+        .unwrap();
+        let changed = if case == "observed-diff" {
+            assignment.assigned_paths.clone()
+        } else {
+            vec![]
+        };
+        let (report, problems) = collect_child_report_for_runtime(
+            ChildReportCollectionContext {
+                assignment: &assignment,
+                assignment_metadata: &AssignmentMetadata::new(),
+                report_path: &command.output_last_message,
+                external_run: &run,
+                external_command: &command,
+                worktree_path: &repo_path,
+                child_base_head: &injected_repository_head(&repo_path),
+                observed_changed_paths: Some(&changed),
+                worker_journals: &WorkerExecutionJournalEvidenceSet::default(),
+                evidence_only_source: None,
+            },
+            SupervisorRuntime::DeepSeek,
+        );
+        if matches!(case, "valid" | "truncated-progress") {
+            assert!(problems.is_empty(), "{problems:?}");
+            assert!(!report_failed(&report), "{:?}", report.findings);
+            assert!(parent_auditor_required(&assignment, &report));
+            let mut accepted = report;
+            let mut audit = injected_auditor_report(&assignment, &accepted);
+            audit.commands_run.push(injected_command_record());
+            accepted.audit_reports.push(audit);
+            validate_auditor_reports(&assignment, &command.output_last_message, &mut accepted);
+            assert!(!report_failed(&accepted), "{:?}", accepted.findings);
+        } else {
+            assert!(report_failed(&report), "accepted {case}");
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn managed_parent_collection<'a>(
     assignment: &'a OrchestratorAssignment,
@@ -3372,6 +3500,10 @@ fn contained_adapter_timeout_is_not_completion_or_acceptance_evidence() {
         (
             SupervisorRuntime::GeminiCli,
             SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        ),
+        (
+            SupervisorRuntime::DeepSeek,
+            SideEffectConfinementProfileKind::ExternalCodex,
         ),
     ] {
         let mut run = injected_verified_run_without_journals(&command);

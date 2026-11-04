@@ -4162,7 +4162,7 @@ fn cam_provider_id_for_supervisor_runtime(runtime: SupervisorRuntime) -> Option<
         SupervisorRuntime::GeminiCli => Some("gemini-cli"),
         SupervisorRuntime::ClaudeCode => Some("claude-code"),
         SupervisorRuntime::Cursor => Some("cursor"),
-        SupervisorRuntime::Fake => None,
+        SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
     }
 }
 
@@ -7973,6 +7973,7 @@ mod selection_policy_tests {
             SupervisorRuntime::Cursor,
             SupervisorRuntime::ClaudeCode,
             SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
         ] {
             assert!(terminal_publishable(
                 true,
@@ -10273,6 +10274,7 @@ mod selection_policy_tests {
                 SupervisorRuntime::Cursor,
                 SupervisorRuntime::ClaudeCode,
                 SupervisorRuntime::GeminiCli,
+                SupervisorRuntime::DeepSeek,
             ] {
                 plan.assignments[0].runtime = Some(authored_runtime);
                 let mut request = prepared_codex_request(&repo, &catalog, &admission);
@@ -11146,6 +11148,10 @@ mod selection_policy_tests {
             );
             assert_eq!(
                 cam_provider_id_for_supervisor_runtime(SupervisorRuntime::Fake),
+                None
+            );
+            assert_eq!(
+                cam_provider_id_for_supervisor_runtime(SupervisorRuntime::DeepSeek),
                 None
             );
         }
