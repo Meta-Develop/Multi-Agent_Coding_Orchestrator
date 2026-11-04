@@ -99,6 +99,26 @@ fn require_linux() -> Result<()> {
     Ok(())
 }
 
+/// Explicit ordinary-run bindings name the actual executable, not an alias
+/// that could resolve differently after reservation or on resume.
+pub(super) fn validate_executable(path: &Path) -> Result<()> {
+    let canonical = super::assignment_execution::canonicalize_explicit_runtime_executable(path)?;
+    if canonical.as_os_str() != path.as_os_str() {
+        bail!(
+            "runtime executable must be an absolute canonical path without symlinks: {}",
+            path.display()
+        );
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if std::fs::metadata(path)?.permissions().mode() & 0o111 == 0 {
+            bail!("runtime executable is not executable: {}", path.display());
+        }
+    }
+    Ok(())
+}
+
 fn bound_from_allowlist(
     repo: &Path,
     run_id: &RunId,
@@ -204,6 +224,7 @@ pub(crate) fn bind_resume(
         bail!("archived runtime executable binding changed after canonicalization");
     }
     if let Some(path) = supplied_primary {
+        validate_executable(path)?;
         let supplied = super::assignment_execution::canonicalize_explicit_runtime_executable(path)?;
         if supplied != first.executable {
             bail!("--runtime-bin differs from the frozen supervise executable");
@@ -215,7 +236,11 @@ pub(crate) fn bind_resume(
             &first.executable,
             supplied_additional,
         )?;
-        if supplied != allowlist {
+        if supplied.bindings().len() != allowlist.bindings().len()
+            || supplied.bindings().iter().any(|entry| {
+                allowlist.executable_for(entry.runtime) != Some(entry.executable.as_path())
+            })
+        {
             bail!("--additional-runtime-bin differs from the frozen supervise allowlist");
         }
     }
@@ -307,6 +332,7 @@ pub(crate) fn catalog_program(
 
 pub(crate) fn validate_launch(command: &ExternalAgentCommand) -> Result<()> {
     if let Some(binding) = captured_binding() {
+        validate_executable(&command.program)?;
         plan_api::validate_held_out_declared_launch(command, &binding.allowlist)
             .context("ordinary supervise refused a command outside its frozen runtime allowlist")?;
     }
@@ -349,9 +375,40 @@ pub(crate) fn archive_current(
     Ok(())
 }
 
+pub(super) fn validate_plan(
+    plan: &super::SupervisorPlan,
+    options: &SupervisorRunOptions,
+) -> Result<()> {
+    let Some(binding) = require_current(options)? else {
+        return Ok(());
+    };
+    if binding.allowlist.primary_runtime() != options.runtime {
+        bail!("primary runtime differs from the frozen supervise runtime binding");
+    }
+    for assignment in &plan.assignments {
+        let runtime = assignment.runtime.unwrap_or(options.runtime);
+        if binding.allowlist.executable_for(runtime).is_none() {
+            bail!(
+                "assignment '{}' runtime '{}' has no frozen executable binding",
+                assignment.id,
+                runtime.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    fn executable(path: &Path) -> Result<()> {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::write(path, b"#!/bin/sh\nexit 0\n")?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+        Ok(())
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -359,8 +416,8 @@ mod tests {
         let (_temporary, repo) = super::super::tests::injected_repository();
         let primary = repo.join("codex-bin");
         let grok = repo.join("grok-bin");
-        std::fs::write(&primary, b"codex")?;
-        std::fs::write(&grok, b"grok")?;
+        executable(&primary)?;
+        executable(&grok)?;
         let run_id = RunId::new("mixed-runtime-bindings")?;
         let additional = [(SupervisorRuntime::Grok, grok.clone())];
         let guard = bind_new(
@@ -475,7 +532,7 @@ mod tests {
     fn single_runtime_binding_is_archived_restored_and_enforced_on_dispatch() -> Result<()> {
         let (_temporary, repo) = super::super::tests::injected_repository();
         let primary = repo.join("codex-bin");
-        std::fs::write(&primary, b"fixture executable")?;
+        executable(&primary)?;
         let run_id = RunId::new("codex-only-runtime")?;
         {
             let _guard = bind_new(&repo, &run_id, SupervisorRuntime::Codex, &primary, &[])?;
@@ -530,16 +587,20 @@ mod tests {
         let grok = repo.join("grok-bin");
         let other = repo.join("other-bin");
         for path in [&primary, &grok, &other] {
-            std::fs::write(path, b"executable")?;
+            executable(path)?;
         }
         let run_id = RunId::new("mixed-runtime-resume")?;
+        let additional = [
+            (SupervisorRuntime::Grok, grok.clone()),
+            (SupervisorRuntime::Cursor, primary.clone()),
+        ];
         {
             let _guard = bind_new(
                 &repo,
                 &run_id,
                 SupervisorRuntime::Codex,
                 &primary,
-                &[(SupervisorRuntime::Grok, grok.clone())],
+                &additional,
             )?;
             let mut writer = ArtifactRunWriter::reserve(
                 &repo,
@@ -569,6 +630,35 @@ mod tests {
             Some(grok.as_path())
         );
         drop(guard);
+        let (guard, _) = bind_resume(
+            &repo,
+            &run_id,
+            SupervisorRuntime::Codex,
+            Some(&primary),
+            &additional,
+        )?
+        .context("matching explicit resume")?;
+        drop(guard);
+        assert!(bind_resume(
+            &repo,
+            &run_id,
+            SupervisorRuntime::Codex,
+            None,
+            &additional[..1]
+        )
+        .is_err());
+        let alias = repo.join("codex-alias");
+        let (guard, _) = bind_resume(
+            &repo,
+            &run_id,
+            SupervisorRuntime::Codex,
+            None,
+            &[additional[1].clone(), additional[0].clone()],
+        )?
+        .context("same bindings in a different flag order")?;
+        drop(guard);
+        std::os::unix::fs::symlink(&primary, &alias)?;
+        assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Codex, Some(&alias), &[]).is_err());
         assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Grok, None, &[]).is_err());
         assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Codex, Some(&other), &[]).is_err());
         assert!(bind_resume(
@@ -576,9 +666,125 @@ mod tests {
             &run_id,
             SupervisorRuntime::Codex,
             None,
-            &[(SupervisorRuntime::Grok, other)]
+            &[
+                (SupervisorRuntime::Grok, other),
+                (SupervisorRuntime::Cursor, primary.clone()),
+            ]
         )
         .is_err());
+        assert!(bind_resume(
+            &repo,
+            &run_id,
+            SupervisorRuntime::Codex,
+            None,
+            &[
+                (SupervisorRuntime::Grok, primary.clone()),
+                (SupervisorRuntime::Cursor, grok.clone()),
+            ]
+        )
+        .is_err());
+        // A frozen path must remain the exact regular executable on resume,
+        // including when the caller omits every executable flag.
+        std::fs::remove_file(&grok)?;
+        assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Codex, None, &[]).is_err());
+        std::os::unix::fs::symlink(&primary, &grok)?;
+        assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Codex, None, &[]).is_err());
+        std::fs::remove_file(&grok)?;
+        executable(&grok)?;
+        std::fs::write(
+            repo.join(RunArtifactFamily::Supervise.run_root())
+                .join(run_id.as_str())
+                .join(ARTIFACT),
+            b"{}\n",
+        )?;
+        assert!(bind_resume(&repo, &run_id, SupervisorRuntime::Codex, None, &[]).is_err());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn explicit_bindings_refuse_aliases_and_recheck_before_launch() -> Result<()> {
+        use std::os::unix::fs::{symlink, PermissionsExt};
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let primary = repo.join("codex-bin");
+        let grok = repo.join("grok-bin");
+        executable(&primary)?;
+        executable(&grok)?;
+        let alias = repo.join("alias");
+        symlink(&grok, &alias)?;
+        let run = RunId::new("runtime-binding-recheck")?;
+        for path in [
+            &alias,
+            &repo.join("./grok-bin"),
+            &repo.join("../repo/grok-bin"),
+        ] {
+            assert!(bind_new(
+                &repo,
+                &run,
+                SupervisorRuntime::Codex,
+                &primary,
+                &[(SupervisorRuntime::Grok, path.clone())]
+            )
+            .is_err());
+        }
+        std::fs::set_permissions(&grok, std::fs::Permissions::from_mode(0o600))?;
+        assert!(bind_new(
+            &repo,
+            &run,
+            SupervisorRuntime::Codex,
+            &primary,
+            &[(SupervisorRuntime::Grok, grok.clone())]
+        )
+        .is_err());
+        executable(&grok)?;
+        assert!(bind_new(&repo, &run, SupervisorRuntime::Fake, &primary, &[]).is_err());
+        let _guard = bind_new(
+            &repo,
+            &run,
+            SupervisorRuntime::Codex,
+            &primary,
+            &[(SupervisorRuntime::Grok, grok.clone())],
+        )?;
+        let command = ExternalAgentCommand::codex(
+            &grok,
+            &repo,
+            repo.join("prompt"),
+            repo.join("log"),
+            repo.join("report"),
+            std::time::Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            SupervisorRuntime::Grok,
+            crate::runtime_adapter::RuntimeAdapterConfig::defaults(SupervisorRuntime::Grok),
+        );
+        validate_launch(&command)?;
+        std::fs::remove_file(&grok)?;
+        symlink(&primary, &grok)?;
+        assert!(validate_launch(&command).is_err());
+        assert!(!repo
+            .join(RunArtifactFamily::Supervise.run_root())
+            .join(run.as_str())
+            .exists());
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn unfinalized_binding_refuses_resume_without_ambient_fallback() -> Result<()> {
+        let (_temp, repo) = super::super::tests::injected_repository();
+        let primary = repo.join("codex-bin");
+        executable(&primary)?;
+        let run = RunId::new("runtime-binding-unfinalized")?;
+        let _guard = bind_new(&repo, &run, SupervisorRuntime::Codex, &primary, &[])?;
+        let mut writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run.clone(),
+            "binding-test",
+        )?;
+        archive_current(&mut writer, &repo, &run)?;
+        drop(writer);
+        assert!(bind_resume(&repo, &run, SupervisorRuntime::Codex, None, &[]).is_err());
         Ok(())
     }
 }

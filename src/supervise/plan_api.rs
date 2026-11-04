@@ -5116,6 +5116,10 @@ pub(crate) fn freeze_supervise_runtime_allowlist(
         bail!("explicit supervise runtime bindings refuse Fake as the primary runtime");
     }
     refuse_held_out_additional_runtime_bindings(primary_runtime, additional)?;
+    super::runtime_executables::validate_executable(primary_executable)?;
+    for (_, executable) in additional {
+        super::runtime_executables::validate_executable(executable)?;
+    }
     let mut bindings = vec![(
         primary_runtime,
         assignment_execution::canonicalize_explicit_runtime_executable(primary_executable)?,

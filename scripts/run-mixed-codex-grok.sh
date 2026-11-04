@@ -10,6 +10,7 @@ set -euo pipefail
 : "${XDG_RUNTIME_DIR:?Export XDG_RUNTIME_DIR}"
 : "${DBUS_SESSION_BUS_ADDRESS:?Export DBUS_SESSION_BUS_ADDRESS}"
 : "${MACO_GROK_BIN:?Export MACO_GROK_BIN}"
+: "${codex_executable:?Export codex_executable as the canonical trusted Codex executable}"
 
 maco=$(realpath -- "$maco")
 repo=$(cd -- "$repo" && pwd -P)
@@ -116,7 +117,8 @@ PYCOMPAT
 exec systemd-run --user --scope --quiet -p Delegate=yes \
   --working-directory="$repo" -- \
   "$maco" supervise run "$plan_dir/plan.json" \
-    --runtime codex --repo . --run-id "$run_id" --codex-bin codex \
+    --runtime codex --repo . --run-id "$run_id" --runtime-bin "$codex_executable" \
+    --additional-runtime-bin "grok=$MACO_GROK_BIN" \
     --machine-global-config "$base/machine-global.json" \
     --machine-global-runtime-root-id runtime --json \
     >"$OUT/run.json" 2>"$OUT/run.stderr"
