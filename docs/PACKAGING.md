@@ -57,7 +57,11 @@ and exactly `binary_sha256`, `source_manifest_sha256`, and `setup_entry_sha256`
 in addition to `schema`. It binds the final setup ELF, the same source manifest,
 and immutable `account-manager/core/src/bin/grok_setup.rs`. Packaging checks
 its metadata-only `--help` route without preparing an account or starting
-vendor login.
+vendor login. At runtime, `complete` and `refresh-models` on `cam-codex-setup`
+and `cam-grok-setup` run one catalog-only vendor command and report the
+observed model count in text and JSON. A failed refresh leaves the account
+complete and prints the `refresh-models` command. The install check does not
+run those commands.
 
 The main and setup binaries are regular native ELFs. Both manifest copies and
 the declarations are regular, bounded files installed with mode
