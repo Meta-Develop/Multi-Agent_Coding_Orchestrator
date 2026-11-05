@@ -217,7 +217,30 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
         let baseline = previous.map(|last| last.after.clone()).unwrap_or_default();
         let before = snapshot(&repository, &binding)?;
         if !observe_changes && before != baseline {
-            bail!("unobserved edits precede this command; journal the native edit immediately with --observe-changes");
+            // This is the only pending-delta recovery: all identity, journal,
+            // HEAD and snapshot checks passed, and no intent was appended or
+            // argv launched. Observation remains an explicit separate action.
+            let observation_argv = serde_json::to_string(&serde_json::json!([
+                std::env::current_exe()?,
+                "supervise",
+                "journal-append",
+                "--journal",
+                path,
+                "--device",
+                expected.device.to_string(),
+                "--inode",
+                expected.file.to_string(),
+                "--cwd",
+                entry.cwd,
+                "--auto-timestamps",
+                "--observe-changes",
+                "--",
+                "true"
+            ]))?;
+            bail!(
+                "WorkerJournalObservationRequired: no command launched; journal unchanged; unobserved edits precede this command. Run the observation below as the very next action; it records the pending delta without executing argv or reapplying edits. Only after successful observation may the rejected command be retried once. Other journal failures still require stopping.\nExecution tool workdir: {}\nObservation argv (JSON array): {observation_argv}",
+                serde_json::to_string(&entry.cwd)?,
+            );
         }
         let mut record = entry.clone();
         record.changed_paths.clear();
