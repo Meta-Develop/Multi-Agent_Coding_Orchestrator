@@ -283,8 +283,10 @@ Use the selected CAM id (`work` here) as the pricing contract scope's
 [operator pricing](OPERATOR_PRICING.md). After `complete` selects the account,
 setup runs `codex debug models` with `CODEX_HOME` set to the managed home and
 the working directory inside that home. The vendor alone writes
-`{data}/accounts/codex-cli/<id>/models_cache.json`. Setup reports the observed
-model count in text and one JSON object. If the refresh fails, the account
+`{data}/accounts/codex-cli/<id>/models_cache.json`. Setup reports the count of
+models with a non-empty known effort menu, in text and one JSON object, and
+holds that account's use lease until the vendor exits. Models that omit
+supported efforts stay unobserved for this report. If the refresh fails, the account
 stays complete and selected, the command exits 0, and the output prints the
 exact `cam-codex-setup refresh-models <id>` command (including `--data-dir`
 when one was resolved). Setup does not fabricate a cache. Missing or invalid
@@ -317,8 +319,10 @@ cam-grok-setup complete <id> --incarnation <n>
 selects it, then runs `grok --no-auto-update models` with `GROK_HOME` set to
 the managed home and with `GROK_AUTH_PATH`, `XAI_API_KEY`, and `OPENAI_API_KEY`
 removed. The vendor alone writes
-`{data}/accounts/grok-cli/<id>/models_cache.json`. Setup reports the observed
-model count in text and one JSON object. A failed refresh leaves the account
+`{data}/accounts/grok-cli/<id>/models_cache.json`. Setup reports the count of
+models with a non-empty known effort menu, in text and one JSON object, and
+holds that account's use lease until the vendor exits. Models that omit
+supported efforts stay unobserved for this report. A failed refresh leaves the account
 complete and selected, exits 0, and prints the exact
 `cam-grok-setup refresh-models <id>` command. `refresh-models` repeats only
 that catalog refresh for an existing complete account. Setup does not

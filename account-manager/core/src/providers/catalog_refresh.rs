@@ -11,12 +11,14 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::account_authority::{CategoryObservation, ModelsObservation, ObservationOutcome};
+use crate::account_authority::{
+    model_has_selectable_efforts, CategoryObservation, ModelsObservation, ObservationOutcome,
+};
 
 pub(crate) const CATALOG_REFRESH_TIMEOUT: Duration = Duration::from_secs(30);
 
 const TRUSTED_PATH: &str = "/run/current-system/sw/bin:/usr/bin:/bin";
-#[cfg(not(test))]
+#[cfg(not(all(test, unix)))]
 const TRUSTED_VENDOR_DIRS: &[&str] = &["/run/current-system/sw/bin", "/usr/bin", "/bin"];
 
 pub(crate) struct VendorCatalogCommand {
@@ -102,8 +104,14 @@ pub(crate) fn observed_model_count(
     if observation.outcome != ObservationOutcome::Observed {
         return None;
     }
-    let count = observation.content.as_ref()?.models.len();
-    (count > 0).then_some(count)
+    let usable = observation
+        .content
+        .as_ref()?
+        .models
+        .iter()
+        .filter(|model| model_has_selectable_efforts(model))
+        .count();
+    (usable > 0).then_some(usable)
 }
 
 pub(crate) fn managed_models_cache_is_regular_file(home: &Path) -> bool {
@@ -159,16 +167,14 @@ fn vendor_catalog_exited_zero_within(
 }
 
 fn contained_path(program: &Path) -> OsString {
-    let trusted = OsString::from(TRUSTED_PATH);
-    match program.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => {
-            let mut path = parent.as_os_str().to_os_string();
-            path.push(":");
-            path.push(&trusted);
-            path
+    let mut entries = Vec::new();
+    if let Some(parent) = program.parent() {
+        if !parent.as_os_str().is_empty() {
+            entries.push(parent.to_path_buf());
         }
-        _ => trusted,
     }
+    entries.extend(TRUSTED_PATH.split(':').map(PathBuf::from));
+    std::env::join_paths(entries).unwrap_or_else(|_| OsString::from(TRUSTED_PATH))
 }
 
 fn trusted_cert_bundle() -> Option<PathBuf> {
@@ -186,7 +192,7 @@ fn trusted_cert_bundle() -> Option<PathBuf> {
 }
 
 fn resolve_vendor_program(name: &str) -> Option<PathBuf> {
-    #[cfg(test)]
+    #[cfg(all(test, unix))]
     {
         let _ = name;
         PROGRAM_OVERRIDE.with(|slot| {
@@ -195,16 +201,16 @@ fn resolve_vendor_program(name: &str) -> Option<PathBuf> {
                 .and_then(|path| validated_vendor_program(path))
         })
     }
-    #[cfg(not(test))]
+    #[cfg(not(all(test, unix)))]
     {
         resolve_allowlisted_vendor_program(name)
     }
 }
 
-/// PATH is searched before the fixed system directories so an owner-supplied
-/// test double is selected ahead of a host binary. Every candidate still has
-/// to be the named program and a regular, non-writable executable.
-#[cfg(not(test))]
+/// Absolute PATH entries precede the fixed system directories so an
+/// owner-supplied test double is selected ahead of a host binary. Every
+/// candidate still has to pass the ancestor and file trust check.
+#[cfg(not(all(test, unix)))]
 fn resolve_allowlisted_vendor_program(name: &str) -> Option<PathBuf> {
     let mut candidates = Vec::new();
     if let Some(path) = std::env::var_os("PATH") {
@@ -223,24 +229,142 @@ fn resolve_allowlisted_vendor_program(name: &str) -> Option<PathBuf> {
 }
 
 fn validated_vendor_program(path: &Path) -> Option<PathBuf> {
-    let listed = fs::symlink_metadata(path).ok()?;
-    if !(listed.file_type().is_symlink() || listed.is_file()) {
-        return None;
-    }
-    let canonical = fs::canonicalize(path).ok()?;
-    let metadata = fs::symlink_metadata(&canonical).ok()?;
-    if metadata.file_type().is_symlink() || !metadata.is_file() {
-        return None;
-    }
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = metadata.permissions().mode();
-        if mode & 0o111 == 0 || mode & 0o022 != 0 {
+        resolve_trusted_executable(path)
+    }
+    #[cfg(not(unix))]
+    {
+        let listed = fs::symlink_metadata(path).ok()?;
+        if listed.file_type().is_symlink() || !listed.is_file() {
+            return None;
+        }
+        let canonical = fs::canonicalize(path).ok()?;
+        let metadata = fs::symlink_metadata(&canonical).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            return None;
+        }
+        Some(canonical)
+    }
+}
+
+/// Follow every symlink and require each directory and the final file to be
+/// owned by the caller or root and not group- or world-writable. A root-owned
+/// sticky directory is the only writable ancestor that is accepted.
+#[cfg(unix)]
+fn resolve_trusted_executable(path: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::PermissionsExt;
+
+    const MAX_SYMLINKS: u8 = 16;
+    let mut current = path.to_path_buf();
+    for _ in 0..MAX_SYMLINKS {
+        match walk_executable_path(&current)? {
+            ExecutableWalk::File(resolved) => {
+                let metadata = fs::symlink_metadata(&resolved).ok()?;
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return None;
+                }
+                let mode = metadata.permissions().mode();
+                if mode & 0o111 == 0 || mode & 0o022 != 0 {
+                    return None;
+                }
+                if crate::account_authority::reject_owner_and_mode(&resolved, &metadata).is_err() {
+                    return None;
+                }
+                return Some(resolved);
+            }
+            ExecutableWalk::Follow { link, target, rest } => {
+                current = normalize_symlink(&link, &target, &rest)?;
+            }
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+enum ExecutableWalk {
+    File(PathBuf),
+    Follow {
+        link: PathBuf,
+        target: PathBuf,
+        rest: Vec<OsString>,
+    },
+}
+
+#[cfg(unix)]
+fn walk_executable_path(path: &Path) -> Option<ExecutableWalk> {
+    use std::path::Component;
+
+    if !path.is_absolute() {
+        return None;
+    }
+    let components: Vec<_> = path.components().collect();
+    let mut current = PathBuf::new();
+    for (index, component) in components.iter().enumerate() {
+        match component {
+            Component::RootDir => current.push(component.as_os_str()),
+            Component::Normal(name) => current.push(name),
+            Component::CurDir | Component::ParentDir | Component::Prefix(_) => return None,
+        }
+        let metadata = fs::symlink_metadata(&current).ok()?;
+        if metadata.file_type().is_symlink() {
+            let target = fs::read_link(&current).ok()?;
+            let rest = components[index + 1..]
+                .iter()
+                .map(|later| later.as_os_str().to_os_string())
+                .collect();
+            return Some(ExecutableWalk::Follow {
+                link: current,
+                target,
+                rest,
+            });
+        }
+        if crate::account_authority::reject_owner_and_mode(&current, &metadata).is_err() {
+            return None;
+        }
+        let last = index + 1 == components.len();
+        if last {
+            return metadata.is_file().then_some(ExecutableWalk::File(current));
+        }
+        if !metadata.is_dir() {
             return None;
         }
     }
-    Some(canonical)
+    None
+}
+
+#[cfg(unix)]
+fn normalize_symlink(link: &Path, target: &Path, rest: &[OsString]) -> Option<PathBuf> {
+    use std::path::Component;
+
+    let mut names = Vec::new();
+    if !target.is_absolute() {
+        let parent = link.parent()?;
+        for component in parent.components() {
+            match component {
+                Component::RootDir => {}
+                Component::Normal(name) => names.push(name.to_os_string()),
+                Component::CurDir | Component::ParentDir | Component::Prefix(_) => return None,
+            }
+        }
+    }
+    for component in target.components() {
+        match component {
+            Component::RootDir => names.clear(),
+            Component::CurDir => {}
+            Component::ParentDir => {
+                names.pop()?;
+            }
+            Component::Normal(name) => names.push(name.to_os_string()),
+            Component::Prefix(_) => return None,
+        }
+    }
+    names.extend(rest.iter().cloned());
+    let mut resolved = PathBuf::from(Component::RootDir.as_os_str());
+    for name in names {
+        resolved.push(name);
+    }
+    Some(resolved)
 }
 
 fn wait_for_exit(child: Child, timeout: Duration) -> bool {
@@ -294,22 +418,22 @@ fn wait_for_exit(child: Child, timeout: Duration) -> bool {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 thread_local! {
     static PROGRAM_OVERRIDE: std::cell::RefCell<Option<PathBuf>> = const { std::cell::RefCell::new(None) };
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) struct ProgramOverrideGuard;
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 impl Drop for ProgramOverrideGuard {
     fn drop(&mut self) {
         PROGRAM_OVERRIDE.with(|slot| *slot.borrow_mut() = None);
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) fn override_vendor_program_for_test(path: PathBuf) -> ProgramOverrideGuard {
     PROGRAM_OVERRIDE.with(|slot| {
         assert!(slot.borrow().is_none(), "nested vendor program override");
@@ -373,7 +497,7 @@ mod tests {
         executable(
             &program,
             &format!(
-                "#!/bin/sh\ncp /proc/self/environ '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'VENDOR-STDOUT-SECRET\\n'\nexit 0\n",
+                "#!/bin/sh\n/usr/bin/env > '{}'\nprintf '%s\\n' \"$@\" > '{}'\nprintf 'VENDOR-STDOUT-SECRET\\n'\nexit 0\n",
                 env_file.display(),
                 argv_file.display()
             ),
@@ -384,14 +508,18 @@ mod tests {
         assert!(!home.join("models_cache.json").exists());
         let argv = fs::read_to_string(argv_file).unwrap();
         assert_eq!(argv, "debug\nmodels\n");
-        let environ = fs::read(env_file).unwrap();
-        let text = String::from_utf8_lossy(&environ);
+        let text = fs::read_to_string(env_file).unwrap();
         assert!(!text.contains("FAKE-openai"));
         assert!(!text.contains("FAKE-xai"));
         assert!(!text.contains("FAKE-grok-auth"));
-        assert!(!text.contains("OPENAI_API_KEY"));
-        assert!(!text.contains("XAI_API_KEY"));
-        assert!(!text.contains("GROK_AUTH_PATH"));
+        for name in ["OPENAI_API_KEY", "XAI_API_KEY", "GROK_AUTH_PATH"] {
+            assert!(
+                !text
+                    .split(['\0', '\n'])
+                    .any(|entry| entry.starts_with(&format!("{name}="))),
+                "{name} was present"
+            );
+        }
         assert!(text.contains(&format!("CODEX_HOME={}", home.display())));
         assert!(text.contains(&format!("HOME={}", home.display())));
     }
@@ -422,5 +550,66 @@ mod tests {
         executable(&program, "#!/bin/sh\nexit 0\n");
         fs::set_permissions(&program, fs::Permissions::from_mode(0o722)).unwrap();
         assert!(validated_vendor_program(&program).is_none());
+    }
+
+    #[test]
+    fn shared_writable_directory_and_symlink_target_are_rejected() {
+        let root = tempfile::tempdir().unwrap();
+        let untrusted = root.path().join("untrusted");
+        fs::create_dir(&untrusted).unwrap();
+        fs::set_permissions(&untrusted, fs::Permissions::from_mode(0o777)).unwrap();
+        let planted = untrusted.join("codex");
+        executable(&planted, "#!/bin/sh\nexit 0\n");
+        fs::set_permissions(&planted, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validated_vendor_program(&planted).is_none());
+
+        let safe = root.path().join("safe");
+        fs::create_dir(&safe).unwrap();
+        fs::set_permissions(&safe, fs::Permissions::from_mode(0o700)).unwrap();
+        let link_to_untrusted = safe.join("codex");
+        std::os::unix::fs::symlink(&planted, &link_to_untrusted).unwrap();
+        assert!(validated_vendor_program(&link_to_untrusted).is_none());
+
+        let real = safe.join("real");
+        executable(&real, "#!/bin/sh\nexit 0\n");
+        let link_in_untrusted = untrusted.join("via-link");
+        std::os::unix::fs::symlink(&real, &link_in_untrusted).unwrap();
+        assert!(validated_vendor_program(&link_in_untrusted).is_none());
+        assert!(validated_vendor_program(&real).is_some());
+    }
+}
+
+#[cfg(test)]
+mod effort_metadata_tests {
+    use super::*;
+    use crate::account_authority::{ModelAccessOutcome, ObservedModel};
+
+    fn model(id: &str, efforts: Option<&[&str]>) -> ObservedModel {
+        ObservedModel {
+            model_id: id.to_string(),
+            supported_efforts: efforts
+                .map(|items| items.iter().map(|item| (*item).to_string()).collect()),
+            default_effort: None,
+            access: ModelAccessOutcome::UnknownAccess,
+        }
+    }
+
+    fn observed(models: Vec<ObservedModel>) -> CategoryObservation<ModelsObservation> {
+        CategoryObservation::observed(ModelsObservation {
+            models,
+            provenance: None,
+        })
+    }
+
+    #[test]
+    fn models_without_usable_efforts_do_not_count_as_observed() {
+        let missing = observed(vec![model("gpt-a", None), model("gpt-b", None)]);
+        assert!(observed_model_count(&missing).is_none());
+        let unknown = observed(vec![model("gpt-a", Some(&["deep"]))]);
+        assert!(observed_model_count(&unknown).is_none());
+        let empty = observed(vec![model("gpt-a", Some(&[]))]);
+        assert!(observed_model_count(&empty).is_none());
+        let mixed = observed(vec![model("gpt-a", Some(&["high"])), model("gpt-b", None)]);
+        assert_eq!(observed_model_count(&mixed), Some(1));
     }
 }

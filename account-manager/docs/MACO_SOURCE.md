@@ -69,7 +69,8 @@ file using the adapter, and atomically marks the account complete and selects
 it. It then runs `grok --no-auto-update models` with `GROK_HOME` set to the
 managed home and with `GROK_AUTH_PATH`, `XAI_API_KEY`, and `OPENAI_API_KEY`
 removed. Only that vendor command may write `models_cache.json`. Setup reports
-the observed model count in text and JSON. If the refresh fails, the account
+the count of models with a non-empty known effort menu, and holds that account's
+use lease until the vendor exits. If the refresh fails, the account
 stays complete and selected, the command exits 0, and the output gives
 `cam-grok-setup --data-dir … refresh-models <id>`. `refresh-models` repeats
 only that catalog refresh for an existing complete account. `complete` may

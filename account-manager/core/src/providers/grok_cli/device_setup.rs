@@ -20,7 +20,8 @@ it never starts login. status shows metadata, including accountIncarnation.
 complete validates vendor-written auth and explicitly selects the account,
 replacing any previous selection only if no CAM use/login lease is active.
 It then runs `grok --no-auto-update models` in the managed home so the vendor
-can write models_cache.json, and reports the observed model count. A failed
+can write models_cache.json, and reports how many models have a usable effort
+menu. The vendor runs while that account's use lease is held. A failed
 refresh leaves the account complete and prints the refresh-models command.
 refresh-models repeats only that catalog refresh for one complete account.
 Setup never writes models_cache.json itself.
@@ -210,10 +211,9 @@ fn observed_model_count_after_catalog(
     id: &str,
     data_dir: &Path,
 ) -> Option<usize> {
-    let account = registry.account(PROVIDER_ID, id).ok()?;
-    if account.state != StoredAccountState::Complete {
-        return None;
-    }
+    let (_lease, account) = registry
+        .acquire_complete_account_use(PROVIDER_ID, id)
+        .ok()?;
     let home = adapter.managed_home(&account).ok()?;
     validate_managed_directories(data_dir, &home, false).ok()?;
     let _operation = HomeOperationGuard::acquire(&home).ok()?;

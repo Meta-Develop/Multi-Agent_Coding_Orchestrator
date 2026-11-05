@@ -59,7 +59,8 @@ and immutable `account-manager/core/src/bin/grok_setup.rs`. Packaging checks
 its metadata-only `--help` route without preparing an account or starting
 vendor login. At runtime, `complete` and `refresh-models` on `cam-codex-setup`
 and `cam-grok-setup` run one catalog-only vendor command and report the
-observed model count in text and JSON. A failed refresh leaves the account
+count of models with a non-empty known effort menu in text and JSON. The
+command holds that account's use lease until the vendor exits. A failed refresh leaves the account
 complete and prints the `refresh-models` command. The install check does not
 run those commands.
 
