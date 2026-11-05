@@ -3034,3 +3034,46 @@ fn supervise_machine_global_binding_names_each_missing_flag() {
         "{root}"
     );
 }
+
+#[test]
+fn supervise_feedback_parses_fake_and_rejects_git_forge() {
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "feedback",
+        "--run-id",
+        "run-1",
+        "--repo",
+        ".",
+        "--forge",
+        "fake",
+        "--dry-run",
+        "--json",
+    ])
+    .expect("feedback command parses");
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Feedback(args) = supervise.command else {
+        panic!("expected supervise feedback");
+    };
+    assert_eq!(args.run_id, "run-1");
+    assert_eq!(args.repo, PathBuf::from("."));
+    assert_eq!(args.forge, supervise::FeedbackForge::Fake);
+    assert!(args.dry_run);
+    assert!(args.json);
+
+    let error = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "feedback",
+        "--run-id",
+        "run-1",
+        "--forge",
+        "git",
+    ])
+    .expect_err("git is not a feedback forge");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("expected one of: fake, github"),
+        "{rendered}"
+    );
+}

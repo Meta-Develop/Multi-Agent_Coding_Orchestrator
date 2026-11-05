@@ -131,6 +131,7 @@ The current implementation covers a local-first command-line slice:
 - `maco pr publish --forge fake|github` turns a safe agent worktree result into a local agent-worktree commit when validation is not required, or publishes a committed `--from-branch` task branch through the same gates. `--squash-onto <base>` builds a deterministic import commit on a disjoint base lineage, and `--exclude <path>` refuses referenced-but-missing exclusions. Publication re-previews the exact candidate before either emitting a deterministic fake PR URL or, with explicit `--forge github`, publishing an OID-bound remote ref and verifying the resulting GitHub receipt. A durable transaction journal reconciles a lost push or `gh` response when the same command is rerun. With `--require-validation`, publication is a two-stage workflow: commit or preview first, validate that exact binding, then publish with the bound envelope.
 - `maco issue preview` redacts issue bodies without creating anything.
 - `maco issue create --forge fake|github` creates a deterministic fake issue URL locally or, with explicit `--forge github`, shells out to `gh issue create`.
+- `maco supervise feedback --run-id <ID> --forge fake|github` files a redacted defect issue when a finished supervise run did not succeed. A succeeded run is a no-op. `--dry-run` prints the redacted title, body, and fingerprint without contacting a forge. `--forge fake` reads `.maco/feedback/fake-open-issues.json` when that file is present.
 - `maco live status`, `maco live validate`, `maco live apply`,
   `maco live heartbeat`, `maco live release`, and `maco live override-release`
   expose and safely mutate repo-local Markdown claim liveness for active,
@@ -3459,6 +3460,34 @@ publication, issue creation does not yet have a write-ahead receipt or retry
 reconciliation protocol; if the remote creates an issue but the response is
 lost, an operator retry can duplicate it. Treat an ambiguous issue-create result
 as a manual reconciliation point.
+
+Beta feedback:
+
+```bash
+cargo run -- supervise feedback --run-id <ID> --repo . --forge fake --dry-run --json
+cargo run -- supervise feedback --run-id <ID> --repo . --forge fake --json
+cargo run -- supervise feedback --run-id <ID> --repo . --forge github --json
+```
+
+`maco supervise feedback` reads that run's finished `supervisor-final.json` and
+the gate or finding records it references. A succeeded run returns
+`created=false` with reason `run_succeeded`. An unfinished run is refused. A
+failed or refused run builds a neutral defect record with Summary, Expected
+behavior, Actual behavior, Reproduction, Evidence, and Impact. The record names
+the failing gate or stage, the finding kind and exact finding line, the package
+version and source revision, the plan shape (roles, runtimes, models, and
+efforts), usage totals, and report paths relative to the repository. Paths,
+home directories, user and host names, network addresses, emails, account ids,
+and token-shaped text are redacted before anything leaves the process. A match
+that remains after redaction refuses the command. The body ends with a hidden
+`<!-- maco-feedback:<fingerprint> -->` marker. An open issue that already
+contains that marker is returned with `created=false` and reason `duplicate`.
+A new issue uses the label `beta-feedback` through the same issue-create path.
+`--forge fake` searches `.maco/feedback/fake-open-issues.json` when that file
+exists and otherwise creates a deterministic local URL. `--dry-run` prints the
+redacted title, body, and fingerprint and does not contact a forge. `--forge
+github` searches and creates through the same contained, allowlisted `gh`
+boundary as `maco issue create`.
 
 Inspect and refresh live work claims:
 

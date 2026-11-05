@@ -1539,6 +1539,15 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             }
             Ok(())
         }
+        SuperviseSubcommand::Feedback(args) => {
+            let report = supervise::supervise_feedback(supervise::FeedbackOptions {
+                repo: args.repo,
+                run_id: args.run_id,
+                forge: args.forge,
+                dry_run: args.dry_run,
+            })?;
+            print_feedback_report(&report, args.json)
+        }
         SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
     }
 }
@@ -1568,6 +1577,8 @@ enum SuperviseSubcommand {
     Resume(ResumeSuperviseArgs),
     /// Collect the durable supervisor final report.
     Collect(CollectSuperviseArgs),
+    /// File a redacted defect issue for a finished run that did not succeed.
+    Feedback(FeedbackSuperviseArgs),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
 }
@@ -2128,6 +2139,25 @@ struct CollectSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct FeedbackSuperviseArgs {
+    /// Finished supervise run id.
+    #[arg(long)]
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Issue forge. `fake` stays local; `github` uses the existing gh boundary.
+    #[arg(long, value_parser = parse_feedback_forge)]
+    forge: supervise::FeedbackForge,
+    /// Print the redacted title, body, and fingerprint without contacting a forge.
+    #[arg(long)]
+    dry_run: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

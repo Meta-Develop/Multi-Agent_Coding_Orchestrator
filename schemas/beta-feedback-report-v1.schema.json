@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://raw.githubusercontent.com/Meta-Develop/Multi-Agent_Coding_Orchestrator/main/schemas/beta-feedback-report-v1.schema.json",
+  "title": "MACO beta feedback report v1",
+  "description": "Contract for `maco supervise feedback --json`. A succeeded run omits body. A created issue serializes reason as null.",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "created",
+    "url",
+    "fingerprint",
+    "reason",
+    "title"
+  ],
+  "properties": {
+    "created": {
+      "type": "boolean"
+    },
+    "url": {
+      "type": ["string", "null"]
+    },
+    "fingerprint": {
+      "type": "string",
+      "pattern": "^$|^[0-9a-f]{64}$"
+    },
+    "reason": {
+      "anyOf": [
+        {
+          "type": "null"
+        },
+        {
+          "type": "string",
+          "enum": ["run_succeeded", "duplicate", "dry_run"]
+        }
+      ]
+    },
+    "title": {
+      "type": "string"
+    },
+    "body": {
+      "type": "string"
+    }
+  }
+}
