@@ -298,6 +298,17 @@ fn push_identity(
 }
 
 fn current_host_name() -> Option<String> {
+    let name = host_name_from_platform()?;
+    let name = name.trim();
+    if name.chars().count() < 3 {
+        None
+    } else {
+        Some(name.to_string())
+    }
+}
+
+#[cfg(unix)]
+fn host_name_from_platform() -> Option<String> {
     let mut buffer = [0u8; 256];
     // SAFETY: `buffer` is a 256-byte writable NUL-terminated region owned by this
     // function. On success, libc writes a host name and a trailing NUL within it.
@@ -309,12 +320,18 @@ fn current_host_name() -> Option<String> {
         .iter()
         .position(|byte| *byte == 0)
         .unwrap_or(buffer.len());
-    let name = std::str::from_utf8(&buffer[..end]).ok()?.trim();
-    if name.chars().count() < 3 {
-        None
-    } else {
-        Some(name.to_string())
-    }
+    std::str::from_utf8(&buffer[..end]).ok().map(str::to_string)
+}
+
+#[cfg(windows)]
+fn host_name_from_platform() -> Option<String> {
+    // libc has no `gethostname` on this target. COMPUTERNAME is the process-visible host name.
+    std::env::var("COMPUTERNAME").ok()
+}
+
+#[cfg(not(any(unix, windows)))]
+fn host_name_from_platform() -> Option<String> {
+    None
 }
 
 fn run_succeeded(report: &SupervisorFinalReport) -> bool {
@@ -1039,6 +1056,7 @@ fn match_token(text: &str, index: usize) -> Option<usize> {
         .or_else(|| match_aws_key(text, index))
         .or_else(|| match_bearer(text, index))
         .or_else(|| match_prefixed_token(text, index))
+        .or_else(|| match_hex_secret(text, index))
         .or_else(|| match_mixed_secret(text, index))
 }
 
@@ -1101,14 +1119,13 @@ fn match_bearer(text: &str, index: usize) -> Option<usize> {
     if !boundary_before(text, index) {
         return None;
     }
-    let rest = text.get(index..)?;
-    if rest.len() < 6 || !rest[..6].eq_ignore_ascii_case("bearer") {
+    let bytes = text.as_bytes().get(index..)?;
+    if bytes.len() < 6 || !bytes[..6].eq_ignore_ascii_case(b"bearer") {
         return None;
     }
     if !boundary_after(text, index + 6) {
         return None;
     }
-    let bytes = rest.as_bytes();
     let mut cursor = 6;
     while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
         cursor += 1;
@@ -1158,6 +1175,42 @@ fn match_prefixed_token(text: &str, index: usize) -> Option<usize> {
     Some(index + cursor)
 }
 
+fn match_hex_secret(text: &str, index: usize) -> Option<usize> {
+    if !boundary_before(text, index) {
+        return None;
+    }
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
+        cursor += 1;
+    }
+    let len = cursor - index;
+    if len < 32 || !boundary_after(text, cursor) {
+        return None;
+    }
+    if hex_is_recorded_source_revision(text, index, cursor) {
+        return None;
+    }
+    Some(cursor)
+}
+
+/// A git digest is kept only when it is the entire recorded source-revision field.
+fn hex_is_recorded_source_revision(text: &str, start: usize, end: usize) -> bool {
+    const LABEL: &str = "Source revision: ";
+    let label = LABEL.as_bytes();
+    if start < label.len() || (end - start != 40 && end - start != 64) {
+        return false;
+    }
+    let line_start = start - label.len();
+    if text.as_bytes().get(line_start..start) != Some(label) {
+        return false;
+    }
+    if line_start > 0 && text.as_bytes()[line_start - 1] != b'\n' {
+        return false;
+    }
+    matches!(text.as_bytes().get(end), None | Some(b'\n' | b'\r'))
+}
+
 fn match_mixed_secret(text: &str, index: usize) -> Option<usize> {
     if !boundary_before(text, index) {
         return None;
@@ -1167,19 +1220,14 @@ fn match_mixed_secret(text: &str, index: usize) -> Option<usize> {
     let mut upper = false;
     let mut lower = false;
     let mut digit = false;
-    let mut hex_only = true;
     while cursor < bytes.len() && is_mixed_secret_char(bytes[cursor]) {
         let byte = bytes[cursor];
         upper |= byte.is_ascii_uppercase();
         lower |= byte.is_ascii_lowercase();
         digit |= byte.is_ascii_digit();
-        hex_only &= byte.is_ascii_hexdigit();
         cursor += 1;
     }
     let len = cursor - index;
-    if hex_only && (len == 40 || len == 64) {
-        return None;
-    }
     if len >= 32 && upper && lower && digit && boundary_after(text, cursor) {
         Some(cursor)
     } else {
@@ -1198,10 +1246,7 @@ fn redact_secret_assignments(text: &str, replacement: &str) -> String {
                 value_start += 1;
             }
             if value_start < bytes.len() && !bytes[value_start].is_ascii_whitespace() {
-                let mut value_end = value_start;
-                while value_end < bytes.len() && !bytes[value_end].is_ascii_whitespace() {
-                    value_end += 1;
-                }
+                let value_end = secret_value_end(bytes, value_start);
                 let value = &text[value_start..value_end];
                 if !value.starts_with("<redacted:") && value != "<n>" {
                     output.push_str(&text[cursor..value_start]);
@@ -1225,10 +1270,31 @@ fn has_raw_secret_assignment(text: &str) -> bool {
     redact_secret_assignments(text, "<redacted:secret>") != text
 }
 
+fn secret_value_end(bytes: &[u8], value_start: usize) -> usize {
+    let quote = bytes[value_start];
+    if quote == b'"' || quote == b'\'' {
+        let mut end = value_start + 1;
+        while end < bytes.len() && bytes[end] != quote {
+            end += 1;
+        }
+        if end < bytes.len() {
+            end + 1
+        } else {
+            end
+        }
+    } else {
+        let mut end = value_start;
+        while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
+            end += 1;
+        }
+        end
+    }
+}
+
 fn trailing_key(prefix: &str) -> &str {
     let trimmed = prefix.trim_end();
     let start = trimmed
-        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || ch == '_' || ch == '-'))
+        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '"' | '\'')))
         .map(|index| {
             index
                 + trimmed[index..]
@@ -1245,7 +1311,10 @@ fn is_secret_key(key: &str) -> bool {
     if key.is_empty() {
         return false;
     }
-    let normalized = key.to_ascii_uppercase().replace('-', "_");
+    let normalized = key
+        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
+        .to_ascii_uppercase()
+        .replace('-', "_");
     [
         "SECRET",
         "TOKEN",
@@ -1287,6 +1356,10 @@ fn match_email(text: &str, index: usize) -> Option<usize> {
     let domain_start = cursor;
     while cursor < bytes.len() && is_email_domain(bytes[cursor]) {
         if bytes[cursor] == b'.' {
+            let next = cursor + 1;
+            if next >= bytes.len() || !is_email_label_char(bytes[next]) {
+                break;
+            }
             if label_len == 0 {
                 return None;
             }
@@ -1338,7 +1411,15 @@ fn match_ipv4(text: &str, index: usize) -> Option<usize> {
             return None;
         }
     }
-    if cursor < bytes.len() && (bytes[cursor].is_ascii_digit() || bytes[cursor] == b'.') {
+    if cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
+        return None;
+    }
+    if cursor < bytes.len()
+        && bytes[cursor] == b'.'
+        && bytes
+            .get(cursor + 1)
+            .is_some_and(|byte| byte.is_ascii_digit())
+    {
         return None;
     }
     if !boundary_after(text, cursor) {
@@ -1458,6 +1539,24 @@ fn match_absolute_path(
         }
         return Some((cursor, "<path>".to_string()));
     }
+    if bytes[index] == b'\\'
+        && index + 1 < bytes.len()
+        && bytes[index + 1] == b'\\'
+        && boundary_before(text, index)
+    {
+        let mut cursor = index + 2;
+        if cursor >= bytes.len() || !is_unc_name_char(bytes[cursor]) {
+            return None;
+        }
+        while cursor < bytes.len() && is_windows_path_char(bytes[cursor]) {
+            cursor += 1;
+        }
+        cursor = strip_trailing_dot(text, index, cursor);
+        if cursor > index + 2 {
+            return Some((cursor, "<path>".to_string()));
+        }
+        return None;
+    }
     if bytes[index] != b'/' || slash_is_url(text, index) {
         return None;
     }
@@ -1551,21 +1650,65 @@ fn match_account(text: &str, index: usize) -> Option<(usize, usize)> {
     }
     const LABELS: &[&str] = &["account_id", "account-id", "accountid", "acct_id", "acct"];
     let rest = text.get(index..)?;
-    let label = LABELS.iter().find(|label| {
-        rest.len() >= label.len() && rest[..label.len()].eq_ignore_ascii_case(label)
-    })?;
+    let label = LABELS
+        .iter()
+        .find(|label| ascii_starts_with_ignore_case(rest, label))?;
+    let label_len = label.len();
     let bytes = rest.as_bytes();
-    let mut cursor = label.len();
-    if cursor >= bytes.len() || !is_account_char(bytes[cursor]) {
+    if let Some(end) = match_account_assignment(bytes, label_len) {
+        return Some((index + end, label_len));
+    }
+    if label_len >= bytes.len() || !is_account_char(bytes[label_len]) {
         return None;
     }
+    let mut cursor = label_len;
     while cursor < bytes.len() && is_account_char(bytes[cursor]) {
         cursor += 1;
     }
     if !boundary_after(text, index + cursor) {
         return None;
     }
-    Some((index + cursor, label.len()))
+    Some((index + cursor, label_len))
+}
+
+fn match_account_assignment(bytes: &[u8], label_len: usize) -> Option<usize> {
+    let mut cursor = label_len;
+    while cursor < bytes.len() && bytes[cursor] == b' ' {
+        cursor += 1;
+    }
+    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+        cursor += 1;
+        while cursor < bytes.len() && bytes[cursor] == b' ' {
+            cursor += 1;
+        }
+    }
+    if cursor >= bytes.len() || !matches!(bytes[cursor], b'=' | b':') {
+        return None;
+    }
+    cursor += 1;
+    while cursor < bytes.len() && bytes[cursor] == b' ' {
+        cursor += 1;
+    }
+    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+        cursor += 1;
+    }
+    let value_start = cursor;
+    while cursor < bytes.len() && is_account_char(bytes[cursor]) {
+        cursor += 1;
+    }
+    if cursor == value_start {
+        return None;
+    }
+    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
+        cursor += 1;
+    }
+    Some(cursor)
+}
+
+fn ascii_starts_with_ignore_case(text: &str, prefix: &str) -> bool {
+    let bytes = text.as_bytes();
+    let prefix = prefix.as_bytes();
+    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
 }
 
 fn account_label(label: &str) -> &str {
@@ -1754,6 +1897,11 @@ fn replace_numbers(text: &str) -> String {
     let mut output = String::with_capacity(text.len());
     let mut index = 0;
     while index < bytes.len() {
+        if let Some(end) = match_uuid(text, index) {
+            output.push_str("<n>");
+            index = end;
+            continue;
+        }
         if bytes[index].is_ascii_hexdigit() {
             let start = index;
             while index < bytes.len() && bytes[index].is_ascii_hexdigit() {
@@ -1775,6 +1923,37 @@ fn replace_numbers(text: &str) -> String {
         index += ch.len_utf8();
     }
     output
+}
+
+fn match_uuid(text: &str, index: usize) -> Option<usize> {
+    if !boundary_before(text, index) {
+        return None;
+    }
+    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
+    let bytes = text.as_bytes();
+    let mut cursor = index;
+    for (group, len) in GROUPS.into_iter().enumerate() {
+        if group > 0 {
+            if bytes.get(cursor) != Some(&b'-') {
+                return None;
+            }
+            cursor += 1;
+        }
+        let end = cursor + len;
+        if end > bytes.len()
+            || !bytes[cursor..end]
+                .iter()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return None;
+        }
+        cursor = end;
+    }
+    if boundary_after(text, cursor) {
+        Some(cursor)
+    } else {
+        None
+    }
 }
 
 fn boundary_before(text: &str, index: usize) -> bool {
@@ -1821,12 +2000,20 @@ fn is_email_domain(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
 }
 
+fn is_email_label_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'-'
+}
+
 fn is_path_char(byte: u8) -> bool {
     byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~')
 }
 
 fn is_windows_path_char(byte: u8) -> bool {
     is_path_char(byte) || byte == b'\\'
+}
+
+fn is_unc_name_char(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
 }
 
 fn is_account_char(byte: u8) -> bool {
@@ -2137,9 +2324,19 @@ mod tests {
         assert!(preserved.contains("9.9.9"), "{preserved}");
         assert!(preserved.contains("12:30:00"), "{preserved}");
         assert!(
-            preserved.contains("0123456789abcdef0123456789abcdef01234567"),
+            !preserved.contains("0123456789abcdef0123456789abcdef01234567"),
             "{preserved}"
         );
+        assert!(preserved.contains("<redacted:token>"), "{preserved}");
+        let revision = redact_feedback_text(
+            "Source revision: 0123456789abcdef0123456789abcdef01234567\n",
+            &ctx,
+        );
+        assert!(
+            revision.contains("Source revision: 0123456789abcdef0123456789abcdef01234567"),
+            "{revision}"
+        );
+        ensure_redacted(&revision, &ctx).expect("recorded revision");
         let prose = redact_feedback_text("The AI agent and agents failed", &ctx);
         assert_eq!(prose, "The system worker and worker failed");
         let maco = FeedbackRedactionContext::explicit(
@@ -2426,5 +2623,122 @@ mod tests {
         if host.chars().count() >= 3 && !is_ignored_identity(&host) {
             assert!(!body.contains(&host), "{body}");
         }
+    }
+
+    fn assert_redacted_and_published(message: &str, absent: &[&str], present: &[&str]) {
+        let ctx = context();
+        let redacted = redact_feedback_text(message, &ctx);
+        for secret in absent {
+            assert!(!redacted.contains(secret), "{secret} leaked in {redacted}");
+        }
+        ensure_redacted(&redacted, &ctx)
+            .unwrap_or_else(|error| panic!("residual after redaction: {error:#} text={redacted}"));
+        let (_temp, repo) = init_repo();
+        let report = failed_report(&repo, "feedback-regression", message);
+        finalize(&repo, &report);
+        let published = feedback(&repo, "feedback-regression", FeedbackForge::Fake, false);
+        assert!(published.created, "{published:?}");
+        let body = published.body.expect("body");
+        for secret in absent {
+            assert!(!body.contains(secret), "{secret} leaked in body:\n{body}");
+        }
+        for marker in present {
+            assert!(body.contains(marker), "{marker} missing:\n{body}");
+        }
+    }
+
+    #[test]
+    fn sentence_punctuation_does_not_keep_email_or_ipv4() {
+        let message =
+            "mail ada@example.com. bind 203.0.113.9. also ada@example.net! and 198.51.100.24?";
+        assert_redacted_and_published(
+            message,
+            &[
+                "ada@example.com",
+                "ada@example.net",
+                "203.0.113.9",
+                "198.51.100.24",
+            ],
+            &["<redacted:email>", "<redacted:ipv4>"],
+        );
+    }
+
+    #[test]
+    fn labeled_account_assignment_is_redacted() {
+        let message = "account_id=123456789012";
+        let redacted = redact_feedback_text(message, &context());
+        assert!(redacted.contains("account_id(23)"), "{redacted}");
+        assert!(!redacted.contains("123456789012"), "{redacted}");
+        assert_redacted_and_published(message, &["123456789012"], &["account_id("]);
+    }
+
+    #[test]
+    fn unc_path_is_redacted() {
+        let message = r"share \\fileserver\homes\private\notes.txt";
+        assert_redacted_and_published(
+            message,
+            &["fileserver", "homes", "private", "notes.txt"],
+            &["<path>"],
+        );
+        let error = ensure_redacted(message, &context()).expect_err("unc");
+        assert!(format!("{error:#}").contains("path"), "{error:#}");
+    }
+
+    #[test]
+    fn hex_secret_in_a_finding_is_redacted_and_source_revision_remains() {
+        let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        assert_eq!(secret.len(), 64);
+        let mixed = "AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789";
+        assert_eq!(mixed.len(), 64);
+        let message = format!("digest {secret} mixed {mixed}");
+        assert_redacted_and_published(
+            &message,
+            &[secret, mixed],
+            &[
+                "<redacted:token>",
+                "Source revision: 0123456789abcdef0123456789abcdef01234567",
+            ],
+        );
+    }
+
+    #[test]
+    fn quoted_api_key_is_redacted() {
+        let message = r#"{"api_key":"lowercase-secret-value"}"#;
+        assert_redacted_and_published(message, &["lowercase-secret-value"], &["<redacted:secret>"]);
+    }
+
+    #[test]
+    fn unicode_finding_does_not_panic() {
+        for sample in ["café", "abcd€", "bearer café", "acct café"] {
+            assert!(match_account(sample, 0).is_none(), "{sample:?}");
+            assert!(match_bearer(sample, 0).is_none(), "{sample:?}");
+            let redacted = redact_feedback_text(sample, &context());
+            ensure_redacted(&redacted, &context())
+                .unwrap_or_else(|error| panic!("{sample:?} residual: {error:#}"));
+        }
+        assert_redacted_and_published("café abcd€", &[], &["café"]);
+    }
+
+    #[test]
+    fn fingerprint_ignores_request_uuid() {
+        let (_temp, repo) = init_repo();
+        let first = "550e8400-e29b-41d4-a716-446655440000";
+        let second = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
+        assert_eq!(
+            replace_numbers(&format!("request {first}")),
+            replace_numbers(&format!("request {second}"))
+        );
+        for (run_id, uuid) in [("feedback-uuid-a", first), ("feedback-uuid-b", second)] {
+            let report = failed_report(&repo, run_id, &format!("check failed request {uuid}"));
+            finalize(&repo, &report);
+        }
+        let left = feedback(&repo, "feedback-uuid-a", FeedbackForge::Fake, true);
+        let right = feedback(&repo, "feedback-uuid-b", FeedbackForge::Fake, true);
+        assert_eq!(left.fingerprint, right.fingerprint);
+        assert_ne!(left.body, right.body);
+        let left_body = left.body.expect("left");
+        let right_body = right.body.expect("right");
+        assert!(left_body.contains(first), "{left_body}");
+        assert!(right_body.contains(second), "{right_body}");
     }
 }
