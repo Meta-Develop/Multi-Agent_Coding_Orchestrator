@@ -5285,6 +5285,7 @@ fn inspect_attached_parent_capture<'budget, 'turn>(
 struct ManagedParentCollection {
     parsed: ParsedReport<OrchestratorReviewReport>,
     journals: WorkerExecutionJournalEvidenceSet,
+    worker_worktree_bindings: Option<super::acceptance::WorkerJournalWorktreeBindings>,
     expected_candidate: PrimaryWorktreeSnapshot,
     /// Set only after bound worker evidence revalidates. Never taken from parent JSON.
     authorizes_materialization: bool,
@@ -5454,6 +5455,7 @@ fn prepare_managed_parent_final_attempt<'a>(
         collection: ManagedParentCollection {
             parsed,
             journals,
+            worker_worktree_bindings: None,
             expected_candidate,
             authorizes_materialization: true,
         },
@@ -5491,8 +5493,9 @@ fn prepare_managed_parent_isolated_final_attempt<'a>(
         bail!("isolated parent final report substitutes the actual ordered Worker captures");
     }
     let mut journals = WorkerExecutionJournalEvidenceSet::default();
+    let mut worker_worktree_bindings = super::acceptance::WorkerJournalWorktreeBindings::new();
     for worker in workers {
-        let id = worker.report().id.clone();
+        let id = worker.identity().2.to_string();
         if worker.journals().len() != 1 || journals.contains_key(&id) {
             bail!("isolated parent journal set is not exact and unique");
         }
@@ -5504,12 +5507,27 @@ fn prepare_managed_parent_isolated_final_attempt<'a>(
                 .context("isolated Worker journal missing")?
                 .clone(),
         );
+        worker_worktree_bindings.insert(
+            id.clone(),
+            super::acceptance::WorkerJournalWorktreeBinding::from_write_lease(
+                context.manager,
+                &id,
+                worker.lease(),
+                worker
+                    .candidate_snapshots()
+                    .0
+                    .head
+                    .target
+                    .context("isolated Worker base HEAD missing")?,
+            )?,
+        );
     }
     Ok(Box::new(PreparedManagedParentFinal {
         captured,
         collection: ManagedParentCollection {
             parsed,
             journals,
+            worker_worktree_bindings: Some(worker_worktree_bindings),
             expected_candidate: completed.parent_candidate().clone(),
             authorizes_materialization: false,
         },
@@ -5784,16 +5802,22 @@ fn collect_captured_child_attempt<'a>(
     } = context;
     let assignment = &preflight.assignment;
     let worktree = &preflight.worktree;
-    let (parsed, managed_journals, expected_candidate, authorizes_materialization) =
-        match managed_parent {
-            Some(managed) => (
-                Some(managed.parsed),
-                Some(managed.journals),
-                Some(managed.expected_candidate),
-                managed.authorizes_materialization,
-            ),
-            None => (None, None, None, false),
-        };
+    let (
+        parsed,
+        managed_journals,
+        worker_worktree_bindings,
+        expected_candidate,
+        authorizes_materialization,
+    ) = match managed_parent {
+        Some(managed) => (
+            Some(managed.parsed),
+            Some(managed.journals),
+            managed.worker_worktree_bindings,
+            Some(managed.expected_candidate),
+            managed.authorizes_materialization,
+        ),
+        None => (None, None, None, None, false),
+    };
     let attempt_artifacts = captured.attempt_artifacts;
     let corrective_retry_used = captured.corrective_retry_used;
     let model_provenance = captured.model_provenance;
@@ -5909,6 +5933,7 @@ fn collect_captured_child_attempt<'a>(
             report_collection,
             launch_runtime,
             Ok(parsed),
+            worker_worktree_bindings.as_ref(),
         )
     } else {
         collect_child_report_for_runtime(report_collection, launch_runtime)

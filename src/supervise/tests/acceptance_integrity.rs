@@ -217,6 +217,7 @@ fn managed_parent_report_rejects_asserted_codex_parent_evidence() {
             report: asserted,
             recovered: false,
         }),
+        None,
     );
     assert!(!report.accepted);
     assert!(report.rejected);
@@ -266,6 +267,7 @@ fn managed_parent_report_rejects_self_supplied_audit_and_aggregate_evidence() {
             report: asserted,
             recovered: false,
         }),
+        None,
     );
     assert!(!report.accepted);
     assert!(report.rejected);
@@ -306,6 +308,7 @@ fn managed_parent_parsed_error_or_wrong_role_cannot_become_accepted() {
         context,
         SupervisorRuntime::Codex,
         Err(anyhow!("managed parent parser rejected the continuation")),
+        None,
     );
     assert!(!report.accepted);
     assert!(report.rejected);
@@ -340,6 +343,7 @@ fn managed_parent_parsed_error_or_wrong_role_cannot_become_accepted() {
             report: success,
             recovered: false,
         }),
+        None,
     );
     assert!(!report.accepted);
     assert!(report.rejected);

@@ -444,6 +444,9 @@ fn collect_isolated_parent_cycle<'budget>(
         .as_ref()
         .is_ok_and(|collected| !super::report_failed(&collected.attempt_report))
     {
+        // Outer review captures its candidate after this controller returns.
+        // Preserve the accepted union; refusal cleanup below must still retain
+        // recovery ownership once Worker materialization has started.
         held.retain_on_drop = false;
         return result;
     }
