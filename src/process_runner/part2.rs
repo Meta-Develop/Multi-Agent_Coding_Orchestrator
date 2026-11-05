@@ -632,7 +632,7 @@ fn configure_stdin(command: &mut Command, stdin: &StdinMode) {
 }
 
 #[cfg(target_os = "windows")]
-const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004;
+const WINDOWS_PROCESS_CREATION_FLAGS: u32 = 0x0000_0200 | 0x0000_0004 | 0x0800_0000;
 
 include!("containment_platform.rs");
 
