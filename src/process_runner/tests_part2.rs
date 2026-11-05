@@ -787,11 +787,17 @@
 
     #[cfg(target_os = "windows")]
     #[test]
-    fn windows_children_start_suspended_in_a_new_process_group() {
+    fn windows_children_start_suspended_in_a_new_process_group_without_a_console() {
         const CREATE_SUSPENDED: u32 = 0x0000_0004;
         const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_CONSOLE: u32 = 0x0000_0010;
         assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_SUSPENDED, 0);
         assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_NEW_PROCESS_GROUP, 0);
+        assert_ne!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_NO_WINDOW, 0);
+        assert_eq!(WINDOWS_PROCESS_CREATION_FLAGS & DETACHED_PROCESS, 0);
+        assert_eq!(WINDOWS_PROCESS_CREATION_FLAGS & CREATE_NEW_CONSOLE, 0);
     }
 
     #[cfg(target_os = "windows")]
