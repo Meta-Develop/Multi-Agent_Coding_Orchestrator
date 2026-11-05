@@ -29,7 +29,7 @@ pub(super) fn verified_worker_completion_runtime(
 
 impl<'evidence> ParentContinuationLaunch<'evidence> {
     /// Isolated siblings keep independent candidate snapshots and claims. The
-    /// parent's candidate is unchanged; no serial predecessor chain is inferred.
+    /// parent's tentative combined view is bound separately from the sibling snapshots.
     pub(super) fn from_bound_isolated_workers(
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
@@ -38,13 +38,16 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
         completed: &'evidence bound_parent_turn::BoundIsolatedWorkers<'_, '_>,
     ) -> Result<Self> {
         let (view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
+        let candidate = completed.review_candidate()?;
         let attempt = source_attempt
             .checked_add(1)
             .context("isolated parent turn overflow")?;
         let mut summaries = Vec::new();
         let mut held_workers = Vec::new();
         let mut ordered_worker_ids = Vec::new();
-        for (request, worker) in view.requests.iter().zip(workers) {
+        for ((request, worker), captured) in
+            view.requests.iter().zip(workers).zip(&candidate.workers)
+        {
             let evidence = worker.evidence();
             let bytes = evidence
                 .run()
@@ -62,7 +65,10 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
                 "launch_runtime":runtime, "launched_model":evidence.model_provenance().launched_model,
                 "report_artifact":evidence.artifacts().raw_report_relative,
                 "execution_workspace":"isolated_sibling", "worktree":worker.lease().record().name,
-                "claim_token":worker.claim().token.get()
+                "claim_token":worker.claim().token.get(),
+                "candidate_tree":captured.snapshot_tree.to_string(),
+                "combined_candidate_tree":candidate.tree.to_string(),
+                "parent_view":"tentative_combined_candidate"
             }));
             if serde_json::to_vec(&summaries)?.len() > MAX_PARENT_CONTINUATION_BYTES {
                 bail!("isolated continuation summaries exceed the bounded payload");

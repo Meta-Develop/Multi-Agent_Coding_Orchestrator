@@ -20,6 +20,7 @@ mod bound_parent_turn;
 #[allow(dead_code)]
 mod parent_continuation_binding;
 // Staged continuation response; controller is the next leaf.
+mod isolated_parent_candidate;
 mod isolated_worker_evidence;
 #[allow(dead_code)]
 mod managed_parent_controller;
@@ -5528,20 +5529,91 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
     current: &WorkerInboxTurn<'_>,
 ) -> Result<CollectedChildAttempt<'a>> {
     require_managed_parent_final_capture(context, preflight, &prepared.captured)?;
-    let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
+    completed.revalidate(context, preflight, source_attempt, current)?;
     if report_failed(&prepared.collection.parsed.report) {
         bail!("isolated parent rejected its Worker set; integration is not authorized");
     }
+    let expected_candidate = prepared.collection.expected_candidate.clone();
+    prepared.collection.authorizes_materialization = true;
+    // Ordinary acceptance can reject a schema-valid, successful parent report.
+    // Run it before any Worker commit/import, using the same held report and journals.
+    let mut integrate = |outcome: &mut AssignmentExecutionOutcome, accepted_paths: &[PathBuf]| {
+        integrate_accepted_isolated_workers(
+            context,
+            outcome,
+            preflight,
+            completed,
+            source_attempt,
+            current,
+            &expected_candidate,
+            accepted_paths,
+        )
+    };
+    collect_captured_child_attempt(
+        context,
+        outcome,
+        preflight,
+        prepared.captured,
+        Some(prepared.collection),
+        Some(&mut integrate),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_accepted_isolated_workers(
+    context: &AssignmentExecutionContext<'_, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    completed: &bound_parent_turn::BoundIsolatedWorkers<'_, '_>,
+    source_attempt: usize,
+    current: &WorkerInboxTurn<'_>,
+    expected_candidate: &PrimaryWorktreeSnapshot,
+    accepted_paths: &[PathBuf],
+) -> Result<()> {
+    let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
     if context.cancellation.is_cancelled()
         || primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
-            != prepared.collection.expected_candidate
+            != *expected_candidate
     {
         bail!("isolated parent candidate changed before final materialization handoff");
     }
     let source_head = preflight.child_base_head;
     let primary_head = current_head_oid(context.repo)?;
     let mut candidates = Vec::new();
-    for worker in workers {
+    let review_candidate = completed.review_candidate()?;
+    // Acceptance replaces self-reported paths with supervisor-inspected paths.
+    // Check that corrected set before releasing claims or advancing private refs.
+    if review_candidate.paths != accepted_paths
+        || review_candidate.paths.iter().any(|path| {
+            !preflight
+                .assignment
+                .assigned_paths
+                .iter()
+                .any(|scope| path_is_covered_by_claim(path, scope))
+        })
+    {
+        bail!("isolated candidate differs from the accepted final parent report or union scope");
+    }
+    let parent_lease = preflight
+        .worktree_write_lease
+        .as_ref()
+        .context("isolated parent lease missing")?;
+    context
+        .manager
+        .verify_write_execution_lease(&preflight.assignment.id, parent_lease)?;
+    let parent_candidate = crate::merge::capture_exact_base_worktree_with_write_lease(
+        context.repo,
+        &preflight.assignment.id,
+        &preflight.assignment.assigned_paths,
+        parent_lease,
+        source_head,
+    )?;
+    if parent_candidate.snapshot_tree != review_candidate.tree
+        || parent_candidate.changed_paths != accepted_paths
+    {
+        bail!("isolated parent tree differs from its accepted reviewed candidate");
+    }
+    for (worker, expected) in workers.iter().zip(&review_candidate.workers) {
         if !worker.run().publishable
             || !external_process_completed(worker.run(), worker.model_provenance().launch_runtime)
             || !external_containment_verified(
@@ -5560,15 +5632,21 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
             worker.lease(),
             source_head,
         )?;
-        if captured.changed_paths != worker.report().files_changed {
-            bail!("isolated tree paths differ from the held Worker report");
+        if captured.changed_paths != worker.report().files_changed
+            || captured.snapshot_tree != expected.snapshot_tree
+            || captured.raw_diff != expected.raw_diff
+        {
+            bail!("isolated tree differs from the exact candidate reviewed by the parent");
         }
         candidates.push((worker, captured));
     }
     completed.revalidate(context, preflight, source_attempt, current)?;
     // This is the sole terminal handoff; durable spent grants forbid replay.
     // The parent union still covers every child scope while all leases stay held.
-    completed.release_completed_claims(context, preflight, source_attempt, current)?;
+    completed.release_completed_claims(context, preflight, source_attempt, current, outcome)?;
+    // From the first possible private Git mutation onward, every refusal (also
+    // the ordinary parent's rejected Ok import) must preserve the held owner.
+    completed.begin_worker_materialization()?;
     let primary = crate::git_repository::open(context.repo)?;
     let base = primary.find_commit(source_head)?.tree()?;
     let mut aggregate_oid = base.id();
@@ -5624,21 +5702,13 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
             })
             .collect(),
     )?;
-    if paths != prepared.collection.parsed.report.files_changed
-        || paths.iter().any(|path| {
-            !preflight
-                .assignment
-                .assigned_paths
-                .iter()
-                .any(|scope| path_is_covered_by_claim(path, scope))
-        })
-    {
-        bail!("isolated aggregate differs from the final parent report or union scope");
+    if aggregate_oid != review_candidate.tree || paths != review_candidate.paths {
+        bail!("isolated imported aggregate differs from the reviewed candidate");
     }
     if context.cancellation.is_cancelled()
         || !context.sync_store.snapshot()?.contains(&preflight.claim)
         || primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
-            != prepared.collection.expected_candidate
+            != *expected_candidate
     {
         bail!("isolated aggregate lost its held parent candidate or union claim");
     }
@@ -5649,23 +5719,22 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
             .as_ref()
             .context("isolated parent lease missing")?,
     )?;
-    let parent = crate::git_repository::open(&preflight.worktree.path)?;
-    let parent_aggregate = parent.find_tree(aggregate_oid)?;
-    let mut checkout = git2::build::CheckoutBuilder::new();
-    checkout.safe().recreate_missing(true).update_index(false);
-    parent.checkout_tree(parent_aggregate.as_object(), Some(&mut checkout))?;
-    let after = primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?;
-    let changes = primary_integrity_changes(&prepared.collection.expected_candidate, &after);
-    if after.inspection_problem().is_some()
-        || changes.paths != paths
-        || !primary_integrity_changes_outside_scope(&changes, &preflight.assignment.assigned_paths)
-            .is_empty()
-    {
-        bail!("isolated aggregate checkout failed the exact parent scope binding");
+    // The exact combined view was already checked by the read-only final turn.
+    // Recheck its tree before the ordinary collector can create a parent commit.
+    let captured = crate::merge::capture_exact_base_worktree_with_write_lease(
+        context.repo,
+        &preflight.assignment.id,
+        &preflight.assignment.assigned_paths,
+        preflight
+            .worktree_write_lease
+            .as_ref()
+            .context("isolated parent lease missing")?,
+        source_head,
+    )?;
+    if captured.snapshot_tree != review_candidate.tree || captured.changed_paths != paths {
+        bail!("isolated parent tree differs from its reviewed candidate");
     }
-    prepared.collection.expected_candidate = after;
-    prepared.collection.authorizes_materialization = true;
-    collect_prepared_managed_parent_final(context, outcome, preflight, prepared)
+    Ok(())
 }
 
 fn collect_prepared_managed_parent_final<'a>(
@@ -5680,6 +5749,7 @@ fn collect_prepared_managed_parent_final<'a>(
         preflight,
         prepared.captured,
         Some(prepared.collection),
+        None,
     )
 }
 
@@ -5691,8 +5761,11 @@ fn collect_ordinary_child_attempt<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     captured: Box<CapturedChildAttempt<'a>>,
 ) -> Result<CollectedChildAttempt<'a>> {
-    collect_captured_child_attempt(context, outcome, preflight, captured, None)
+    collect_captured_child_attempt(context, outcome, preflight, captured, None, None)
 }
+
+type ManagedChildMaterializationHook<'hook> =
+    &'hook mut dyn FnMut(&mut AssignmentExecutionOutcome, &[PathBuf]) -> Result<()>;
 
 fn collect_captured_child_attempt<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
@@ -5700,6 +5773,7 @@ fn collect_captured_child_attempt<'a>(
     preflight: &AssignmentExecutionPreflight<'_>,
     captured: Box<CapturedChildAttempt<'a>>,
     managed_parent: Option<ManagedParentCollection>,
+    before_materialization: Option<ManagedChildMaterializationHook<'_>>,
 ) -> Result<CollectedChildAttempt<'a>> {
     let AssignmentExecutionContext {
         assignment_metadata,
@@ -5859,7 +5933,16 @@ fn collect_captured_child_attempt<'a>(
         pre_action_refusals_absent: pre_action_refusals.is_empty(),
         external_side_effect_absent: external_side_effect_state.is_none(),
     };
+    if before_materialization.is_some()
+        && !materialization_gate.eligible()
+        && !report_failed(&attempt_report)
+    {
+        bail!("isolated parent failed ordinary materialization eligibility");
+    }
     let managed_child_git_import = if materialization_gate.eligible() {
+        if let Some(integrate) = before_materialization {
+            integrate(outcome, &attempt_report.files_changed)?;
+        }
         let captured_primary_head = if context.worktree_creation.expected_source_head().is_some() {
             primary_before
                 .head

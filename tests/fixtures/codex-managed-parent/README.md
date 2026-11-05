@@ -20,3 +20,32 @@ resubmits the same request; separate IPC tests cover a dropped socket response.
 
 These tests stop at final parent collection. They do not qualify provider
 executable preflight, independent review-lens dispatch, or crash recovery launches.
+
+The isolated cases bind an ordered combined candidate before the final parent
+turn. The final peer reads both edits, compiles their actual Rust functions in
+private temporary storage, and runs a combined assertion returning 42. Source
+writes still fail under the outer sandbox. Rejection restores the held base
+without materializing commits; post-capture drift retains authority for recovery.
+Overlapping candidate edits refuse before a final parent can run. The same
+cases use explicit Worker token limits and the production host-held invocation
+receipt to check terminal claim bookkeeping and warnings against distinct,
+verified Worker budget settlements (including missing and unverified negatives).
+
+The final peer receives the absolute compiler in a read-only projection of the
+selected sysroot, resolved before containment. User-home rustup shims are hidden
+by `ProtectHome=tmpfs` on hosted runners; Nix store executables remain visible.
+The masked-shim regression reproduces that distinction inside the real sandbox.
+Compiler failures include captured stderr. No timing or quiescence gate is relaxed.
+Collector-side rejection of a successful report with self-authored gate denials
+must also restore the base and leave both Worker HEADs untouched. Serial cases
+retain the exact dispatch sequence; isolated cases require the exact Worker set.
+
+A successful final report that omits its changed paths must use acceptance's
+supervisor-corrected path set before the terminal handoff. Real private Git index
+locks exercise partial Worker materialization failure and a later parent import
+rejection: both retain sibling leases, captures, the frozen source and the parent
+union claim for supervisor recovery. No rollback drops an advanced private ref.
+
+A private directory at the initial report destination refuses evidence import
+before any isolated Worker dispatch. No Worker worktrees or private commits are
+created, and the parent remains at the captured base without needing quarantine.

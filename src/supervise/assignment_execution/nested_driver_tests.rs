@@ -220,7 +220,8 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             None,
         )
     });
-    let isolated = case.starts_with("managed-cycle-isolated-");
+    let isolated = case.starts_with("managed-cycle-isolated-")
+        || case.starts_with("managed-cycle-process-isolated-");
     let managed_process = case.starts_with("managed-cycle-process-");
     let interrupted_worker = case.starts_with("managed-cycle-isolated-interrupted-");
     let grok_continuation = case == "continuation-grok-happy";
@@ -458,7 +459,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         },
     )?;
     let ledger = RunBudgetLedger::new(RunBudgetLimits {
-        hard_tokens: interrupted_worker.then_some(65_000),
+        hard_tokens: (interrupted_worker || managed_process).then_some(65_000),
         ..Default::default()
     })?;
     let metadata = AssignmentMetadata::new();
@@ -503,7 +504,11 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         record_assignment_started_checkpoint(&artifacts, &parent, 0, &ledger)?;
     }
     let budget_config = SupervisorBudgetConfig {
-        worker_live_token_limits: BTreeMap::new(),
+        worker_live_token_limits: if managed_process {
+            BTreeMap::from([("worker".into(), 1_000), ("worker-two".into(), 1_000)])
+        } else {
+            BTreeMap::new()
+        },
         role_token_reservations: BTreeMap::from([
             (
                 AgentRole::ChildOrchestrator,
@@ -784,6 +789,17 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 .expect(
                     "managed-cycle worker fixture failed to prepare the private child Git boundary",
                 );
+        }
+        if isolated
+            && !managed_process
+            && subject.id == "parent"
+            && case != "managed-cycle-isolated-final-ineligible-parent"
+        {
+            // The real contained runner prepares this boundary for read-only
+            // coordination turns too. Acceptance now gates the Worker import
+            // on the parent's complete materialization eligibility.
+            crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
+                .expect("isolated parent fixture requires its private Git boundary");
         }
         let mut run = deterministic_fake_child_run(
             &simulated,
@@ -1295,7 +1311,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 "protected primary index bytes changed"
             );
         }
-        if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
+        if case == "managed-cycle-process-isolated-initial-import-failure" {
+            assert!(overlapping_workers.state.lock().unwrap().workers.is_empty());
+        } else if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
             let live = overlapping_workers.state.lock().unwrap().workers.clone();
             assert_eq!(live.len(), 2);
             let latest_start = live.iter().map(|entry| entry.2).max().unwrap();

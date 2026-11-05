@@ -4,6 +4,31 @@
 
 use super::*;
 
+fn rust_toolchain() -> Result<&'static Path> {
+    static ROOT: std::sync::OnceLock<std::result::Result<PathBuf, String>> =
+        std::sync::OnceLock::new();
+    ROOT.get_or_init(|| {
+        // Resolve rustup on the host, before ProtectHome masks its shim and
+        // toolchains. Expose only the selected compiler's immutable sysroot.
+        let output = std::process::Command::new("rustc")
+            .args(["--print", "sysroot"])
+            .current_dir(env!("CARGO_MANIFEST_DIR"))
+            .output()
+            .map_err(|error| format!("offline fixture compiler lookup failed: {error}"))?;
+        if !output.status.success() {
+            return Err("offline fixture compiler lookup did not succeed".into());
+        }
+        let root = std::str::from_utf8(&output.stdout).map_err(|error| error.to_string())?;
+        let root = fs::canonicalize(root.trim()).map_err(|error| error.to_string())?;
+        if !root.join("bin/rustc").is_file() {
+            return Err("offline fixture sysroot omitted rustc".into());
+        }
+        Ok(root)
+    })
+    .as_deref()
+    .map_err(|error| anyhow::anyhow!(error.clone()))
+}
+
 pub(crate) fn run(
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
@@ -39,7 +64,21 @@ pub(crate) fn run(
     else {
         bail!("offline fixture requires the Codex outer profile");
     };
-    let profile = profile.with_visible_read_only_root(fixture.path());
+    let mut profile = profile.with_visible_read_only_root(fixture.path());
+    if payload["mode"] == "final" {
+        let toolchain = rust_toolchain()?;
+        profile = profile.with_visible_read_only_root(toolchain);
+        payload["rustc"] = serde_json::json!(toolchain.join("bin/rustc"));
+        if payload["case"] == "isolated-masked-rustup" {
+            let shims = fixture.path().join("rustup-shims");
+            fs::create_dir(&shims)?;
+            let shim = shims.join("rustc");
+            std::os::unix::fs::symlink(toolchain.join("bin/rustc"), &shim)?;
+            assert!(shim.is_file());
+            profile = profile.with_hidden_root(&shims);
+            payload["masked_rustc"] = serde_json::json!(shim);
+        }
+    }
     let argv = audited_codex_app_server_argv(spec, &controls, EnvironmentVersion::new(0, 162, 0))?;
     let process = ProcessSpec::direct(
         "offline managed parent app-server peer",
@@ -126,6 +165,9 @@ pub(crate) fn run(
         &controls,
         run.scratch_quiescence_verified(),
     ));
+    // Match the production wrapper's host-held invocation receipt. The peer
+    // supplies neither this identity nor a self-asserted budget settlement.
+    run.retain_live_budget_invocation_for_test(spec);
     run.duration_ms = duration_millis(started.elapsed());
     Ok(run)
 }

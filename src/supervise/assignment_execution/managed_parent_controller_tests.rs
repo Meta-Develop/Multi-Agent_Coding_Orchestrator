@@ -384,6 +384,14 @@ fn exercise_isolated_result(
         assert_eq!(observed.len(), 4);
         assert_eq!(observed.last().map(String::as_str), Some("parent"));
         assert_eq!(collected._worker_journal_evidence.len(), 2);
+        assert_ne!(
+            crate::external_agent::bind_existing_managed_child_git_boundary(
+                &preflight.worktree.path,
+            )?
+            .revalidate()?,
+            preflight.child_base_head,
+            "accepted isolated parent candidate was not committed"
+        );
         for (path, worker) in [("src/lib.rs", "worker"), ("src/other.rs", "worker-two")] {
             assert_eq!(
                 fs::read_to_string(preflight.worktree.path.join(path))?,
@@ -393,15 +401,37 @@ fn exercise_isolated_result(
         held_resources(context, preflight)?;
     } else {
         assert!(result.is_err(), "isolated refusal case accepted: {case}");
+        if case == "managed-cycle-isolated-final-ineligible-parent" {
+            assert!(format!("{:#}", result.err().unwrap())
+                .contains("isolated parent failed ordinary materialization eligibility"));
+        }
+        let unknown_final = case.ends_with("final-unknown-containment")
+            || case.ends_with("final-panic")
+            || case.ends_with("final-ineligible-parent");
         assert_eq!(
             fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
-            "pub fn selected() {}\n"
+            if unknown_final {
+                "// written by worker\n"
+            } else {
+                "pub fn selected() {}\n"
+            }
         );
         assert_eq!(
             fs::read_to_string(preflight.worktree.path.join("src/other.rs"))?,
-            "pub fn other() {}\n"
+            if unknown_final {
+                "// written by worker-two\n"
+            } else {
+                "pub fn other() {}\n"
+            }
         );
-        if case.ends_with("unknown-containment") || case.ends_with("final-panic") {
+        assert_eq!(
+            current_head_oid(&preflight.worktree.path)?,
+            preflight.child_base_head
+        );
+        if case.ends_with("unknown-containment")
+            || case.ends_with("final-panic")
+            || case.ends_with("final-ineligible-parent")
+        {
             assert!(outcome.external_containment_failed);
             let claims = context.sync_store.snapshot()?;
             assert!(claims.contains(&preflight.claim));
@@ -437,6 +467,11 @@ fn exercise_isolated_result(
         }
     }
     Ok(())
+}
+
+#[test]
+fn managed_cycle_isolated_ineligible_parent_refuses_before_worker_import() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-isolated-final-ineligible-parent")
 }
 
 #[test]
