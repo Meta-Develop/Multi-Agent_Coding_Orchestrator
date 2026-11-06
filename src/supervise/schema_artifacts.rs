@@ -147,7 +147,7 @@ pub(super) fn parent_continuation_schema_value(
         "title": "ParentContinuationTurn", "type": "object", "additionalProperties": false,
         "required": ["version", "run_id", "parent_id", "source_parent_attempt", "parent_attempt", "completed_worker_ids", "turn"],
         "properties": {
-            "version": {"type": "integer", "const": 1},
+            "version": {"type": "integer", "const": super::assignment_execution::parent_continuation_response::PARENT_CONTINUATION_VERSION},
             "run_id": {"type": "string", "const": run_id},
             "parent_id": {"type": "string", "const": parent_id},
             "source_parent_attempt": {"type": "integer", "const": source_attempt},
@@ -165,13 +165,42 @@ pub(super) fn parent_continuation_schema_value(
                     }}
                  }},
                 {"type": "object", "additionalProperties": false,
-                 "required": ["outcome", "report"], "properties": {
+                 "required": ["outcome", "report", "worker_report_refs"], "properties": {
                     "outcome": {"type": "string", "const": "final_report"},
-                    "report": orchestrator_report_schema_value()
+                    "worker_report_refs": worker_report_references_schema_value(),
+                    "report": parent_continuation_report_schema_value()
                  }}
             ]}
         }
     })
+}
+
+fn worker_report_references_schema_value() -> serde_json::Value {
+    json!({"type":"array", "items":{
+        "type":"object", "additionalProperties":false,
+        "required":["assignment_id", "capture_sha256"],
+        "properties":{
+            "assignment_id":{"type":"string", "minLength":1},
+            "capture_sha256":{"type":"string", "pattern":"^[0-9a-f]{64}$"}
+        }
+    }})
+}
+
+fn omit_continuation_worker_reports(schema: &mut serde_json::Value) {
+    schema["properties"]
+        .as_object_mut()
+        .expect("report properties")
+        .remove("worker_reports");
+    schema["required"]
+        .as_array_mut()
+        .expect("report required")
+        .retain(|name| name != "worker_reports");
+}
+
+fn parent_continuation_report_schema_value() -> serde_json::Value {
+    let mut schema = orchestrator_report_schema_value();
+    omit_continuation_worker_reports(&mut schema);
+    schema
 }
 
 pub(super) fn write_parent_continuation_schemas(
@@ -183,8 +212,9 @@ pub(super) fn write_parent_continuation_schemas(
     // Project the nested final report separately so supervisor-owned fields are
     // removed just as they are for the existing top-level report schema.
     let mut codex = schema.clone();
-    codex["properties"]["turn"]["oneOf"][1]["properties"]["report"] =
-        codex_response_format_schema(orchestrator_report_schema_value())?;
+    let mut report_schema = codex_response_format_schema(orchestrator_report_schema_value())?;
+    omit_continuation_worker_reports(&mut report_schema);
+    codex["properties"]["turn"]["oneOf"][1]["properties"]["report"] = report_schema;
     // The envelope has no serde Option fields. Its report has already passed
     // the existing title-specific projection; keep that default guard unchanged.
     make_codex_response_format_compatible(&mut codex)?;
