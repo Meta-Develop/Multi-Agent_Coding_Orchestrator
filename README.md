@@ -3474,12 +3474,16 @@ the gate or finding records it references. A succeeded run returns
 `created=false` with reason `run_succeeded`. An unfinished run is refused. A
 failed or refused run builds a neutral defect record with Summary, Expected
 behavior, Actual behavior, Reproduction, Evidence, and Impact. The record names
-the failing gate or stage, the finding kind and exact finding line, the package
+the failing gate or stage, the finding kind and sanitized finding line, the package
 version and source revision, the plan shape (roles, runtimes, models, and
-efforts), usage totals, and report paths relative to the repository. Paths,
-home directories, user and host names, network addresses, emails, account ids,
-and token-shaped text are redacted before anything leaves the process. A match
-that remains after redaction refuses the command. The body ends with a hidden
+efforts), usage totals, and report paths relative to the repository. Free text is
+filtered before truncation: known process identities and sensitive-key line tails
+are withheld, and only short ASCII words/identifiers, small numbers, and relative
+source locations survive. Other tokens become `<redacted>`. Trusted run fields
+are rendered separately; diagnostic text cannot impersonate them. A final
+residual check refuses unsafe output, and previews and published bodies use the
+same bytes. An unlabeled short private word that fits an allowed diagnostic shape
+cannot be distinguished from ordinary prose. The body ends with a hidden
 `<!-- maco-feedback:<fingerprint> -->` marker. An open issue that already
 contains that marker is returned with `created=false` and reason `duplicate`.
 A new issue uses the label `beta-feedback` through the same issue-create path.

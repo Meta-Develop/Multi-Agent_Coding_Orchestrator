@@ -76,16 +76,7 @@ pub struct FeedbackReport {
 
 #[derive(Debug, Clone)]
 pub(crate) struct FeedbackRedactionContext {
-    repo_root: PathBuf,
-    home_dirs: Vec<PathBuf>,
-    identities: Vec<IdentityRule>,
-}
-
-#[derive(Debug, Clone)]
-struct IdentityRule {
-    name: String,
-    class: &'static str,
-    replacement: &'static str,
+    identities: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -94,7 +85,7 @@ struct Cause {
     gate: String,
     location: String,
     message: String,
-    finding_line: String,
+    show_message: bool,
     extra: usize,
     status: String,
 }
@@ -132,9 +123,9 @@ pub fn supervise_feedback(options: FeedbackOptions) -> Result<FeedbackReport> {
         });
     }
 
-    let context = FeedbackRedactionContext::from_process(repo_root.clone());
-    let cause = select_cause(&report);
-    let fingerprint = fingerprint_for(&cause, &context);
+    let context = FeedbackRedactionContext::from_process();
+    let cause = select_cause(&report).sanitized(&context);
+    let fingerprint = fingerprint_for(&cause);
     let title = cap_chars(
         &redact_feedback_text(
             &format!("Defect: {} at {}", cause.kind, cause.gate),
@@ -145,20 +136,15 @@ pub fn supervise_feedback(options: FeedbackOptions) -> Result<FeedbackReport> {
     let title = if title.trim().is_empty() {
         "Defect".to_string()
     } else {
-        title.replace(['\n', '\r'], " ")
+        collapse_ws(&title)
     };
-    let body = render_body(&report, &run_id, &repo_root, &cause);
-    let body = redact_feedback_text(&body, &context);
+    let mut body = render_body(&report, &run_id, &repo_root, &cause, &context);
     ensure_redacted(&title, &context)?;
-    ensure_redacted(&body, &context)?;
     let marker = format!("<!-- maco-feedback:{fingerprint} -->");
     validate_feedback_marker(&marker).context("supervise feedback fingerprint was malformed")?;
-    let mut published = body;
-    if !published.ends_with('\n') {
-        published.push('\n');
-    }
-    published.push_str(&marker);
-    published.push('\n');
+    body.trusted(&format!("{marker}\n"));
+    body.ensure_redacted(&context)?;
+    let published = body.text;
 
     if let Some(url) = find_duplicate(&options, &repo_root, &marker)? {
         return Ok(FeedbackReport {
@@ -192,126 +178,306 @@ pub fn supervise_feedback(options: FeedbackOptions) -> Result<FeedbackReport> {
     })
 }
 
+const REDACTED: &str = "<redacted>";
+
+/// Sanitize the complete input before selecting a display line or imposing a cap.
+/// Unknown tokens are withheld; recognizing a particular secret format is unnecessary.
 pub(crate) fn redact_feedback_text(text: &str, ctx: &FeedbackRedactionContext) -> String {
-    let text = redact_private_keys(text, "<redacted:private_key>");
-    let text = redact_tokens(&text, "<redacted:token>");
-    let text = redact_secret_assignments(&text, "<redacted:secret>");
-    let text = redact_emails(&text, "<redacted:email>");
-    let text = redact_ipv4(&text, "<redacted:ipv4>");
-    let text = redact_ipv6(&text, "<redacted:ipv6>");
-    let text = redact_paths(&text, ctx);
-    let text = redact_accounts(&text, None);
-    let text = redact_identities(&text, &ctx.identities);
-    scrub_prose(&text)
+    let original = text;
+    let text = remove_identities(text, &ctx.identities);
+    // Removing an identity must not erase a key and expose its former value.
+    if sensitive_key_count(original) > sensitive_key_count(&text) {
+        return REDACTED.to_string();
+    }
+    let mut output = String::new();
+    let mut previous_redacted = false;
+    for (index, line) in text.split('\n').enumerate() {
+        if index > 0 {
+            output.push('\n');
+        }
+        let key = sensitive_key_start(line);
+        let prefix = key.map_or(line, |start| &line[..start]);
+        let mut words = Vec::new();
+        for token in prefix.split_whitespace().chain(key.map(|_| REDACTED)) {
+            let token = scrub_prose(token);
+            let token =
+                if allowed_token(&token) && remove_identities(&token, &ctx.identities) == token {
+                    token
+                } else {
+                    REDACTED.to_string()
+                };
+            if token == REDACTED && previous_redacted {
+                continue;
+            }
+            previous_redacted = token == REDACTED;
+            words.push(token);
+        }
+        output.push_str(&words.join(" "));
+    }
+    output.trim().to_string()
 }
 
 pub(crate) fn ensure_redacted(text: &str, ctx: &FeedbackRedactionContext) -> Result<()> {
-    if let Some(class) = residual_class(text, ctx) {
-        bail!("supervise feedback refused residual {class}");
+    if redact_feedback_text(text, ctx) != text {
+        bail!("supervise feedback refused residual free text");
     }
     Ok(())
 }
 
+/// The renderer records provenance as it appends fields. No rendered label or
+/// diagnostic can create a trusted range. The final check covers every free-text
+/// range as well as the complete body at the issue publisher's boundary.
+#[derive(Default)]
+struct FeedbackBody {
+    text: String,
+    free_text: Vec<std::ops::Range<usize>>,
+}
+
+impl FeedbackBody {
+    fn trusted(&mut self, value: &str) {
+        self.text.push_str(value);
+    }
+
+    fn sanitized(&mut self, value: &str) {
+        let start = self.text.len();
+        self.text.push_str(value);
+        self.free_text.push(start..self.text.len());
+    }
+
+    fn ensure_redacted(&self, ctx: &FeedbackRedactionContext) -> Result<()> {
+        for range in &self.free_text {
+            ensure_redacted(&self.text[range.clone()], ctx)?;
+        }
+        if self.text.contains(['@', '\\']) || !self.text.is_ascii() {
+            bail!("supervise feedback refused residual unsafe characters");
+        }
+        if crate::llm::Redactor::new().redact(&self.text).text != self.text {
+            bail!("supervise feedback refused residual secret assignment");
+        }
+        Ok(())
+    }
+}
+
+impl Cause {
+    fn sanitized(mut self, ctx: &FeedbackRedactionContext) -> Self {
+        self.kind = redact_feedback_text(&self.kind, ctx);
+        self.gate = redact_feedback_text(&self.gate, ctx);
+        self.location = redact_feedback_text(&self.location, ctx);
+        self.message = redact_feedback_text(&self.message, ctx);
+        self
+    }
+}
+
 impl FeedbackRedactionContext {
-    pub(crate) fn from_process(repo_root: PathBuf) -> Self {
+    pub(crate) fn from_process() -> Self {
+        Self::from_values(
+            [
+                "USER",
+                "LOGNAME",
+                "HOME",
+                "USERNAME",
+                "USERPROFILE",
+                "COMPUTERNAME",
+            ]
+            .into_iter()
+            .filter_map(|key| std::env::var_os(key).and_then(|value| value.into_string().ok()))
+            .chain(host_name_from_platform()),
+        )
+    }
+
+    fn from_values(values: impl IntoIterator<Item = String>) -> Self {
         let mut identities = Vec::new();
-        for key in ["USER", "LOGNAME"] {
-            if let Some(name) = std::env::var_os(key).and_then(|value| value.into_string().ok()) {
-                push_identity(&mut identities, &name, "user", "<redacted:user>");
+        for value in values {
+            if value.is_empty() {
+                continue;
             }
-        }
-        let mut home_dirs = Vec::new();
-        if let Some(home) = std::env::var_os("HOME").and_then(|value| value.into_string().ok()) {
-            let home = home.trim().trim_end_matches(['/', '\\']);
-            if !home.is_empty() {
-                if let Some(base) = Path::new(home).file_name().and_then(|name| name.to_str()) {
-                    push_identity(&mut identities, base, "user", "<redacted:user>");
+            identities.push(value.clone());
+            // Both native and foreign-platform home paths occur in run data.
+            if let Some(base) = value
+                .trim_end_matches(['/', '\\'])
+                .rsplit(['/', '\\'])
+                .next()
+            {
+                if !base.is_empty() {
+                    identities.push(base.to_string());
                 }
-                home_dirs.push(PathBuf::from(home));
             }
         }
-        for identity in identities
-            .iter()
-            .filter(|identity| identity.class == "user")
-            .map(|identity| identity.name.clone())
-            .collect::<Vec<_>>()
-        {
-            home_dirs.push(PathBuf::from(format!("/home/{identity}")));
-            home_dirs.push(PathBuf::from(format!("/Users/{identity}")));
-        }
-        if let Some(host) = current_host_name() {
-            push_identity(&mut identities, &host, "host", "<redacted:host>");
-        }
-        home_dirs.sort_by_key(|path| std::cmp::Reverse(path.as_os_str().len()));
-        home_dirs.dedup();
-        Self {
-            repo_root,
-            home_dirs,
-            identities,
-        }
+        identities.sort_by(|a, b| b.len().cmp(&a.len()).then_with(|| a.cmp(b)));
+        identities.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        Self { identities }
     }
 
     #[cfg(test)]
-    fn explicit(repo_root: PathBuf, homes: &[&str], users: &[&str], hosts: &[&str]) -> Self {
-        let mut identities = Vec::new();
-        for user in users {
-            push_identity(&mut identities, user, "user", "<redacted:user>");
-        }
-        for host in hosts {
-            push_identity(&mut identities, host, "host", "<redacted:host>");
-        }
-        let mut home_dirs = homes.iter().map(PathBuf::from).collect::<Vec<_>>();
-        home_dirs.sort_by_key(|path| std::cmp::Reverse(path.as_os_str().len()));
-        Self {
-            repo_root,
-            home_dirs,
-            identities,
-        }
+    fn explicit(_repo_root: PathBuf, homes: &[&str], users: &[&str], hosts: &[&str]) -> Self {
+        Self::from_values(
+            homes
+                .iter()
+                .chain(users)
+                .chain(hosts)
+                .map(|value| value.to_string()),
+        )
     }
 }
 
-fn push_identity(
-    identities: &mut Vec<IdentityRule>,
-    name: &str,
-    class: &'static str,
-    replacement: &'static str,
-) {
-    let name = name.trim();
-    if name.chars().count() < 3
-        || name
-            .chars()
-            .any(|ch| ch.is_whitespace() || ch == '/' || ch == '\\')
-    {
-        return;
+fn remove_identities(text: &str, identities: &[String]) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0;
+    while cursor < text.len() {
+        // This fixed marker carries no run value, even when an identity happens
+        // to be a substring of its spelling. Keep the filter idempotent.
+        if text[cursor..].starts_with(REDACTED) {
+            output.push_str(REDACTED);
+            cursor += REDACTED.len();
+            continue;
+        }
+        if let Some(identity) = identities.iter().find(|identity| {
+            text.get(cursor..cursor + identity.len())
+                .is_some_and(|value| value.eq_ignore_ascii_case(identity))
+        }) {
+            output.push_str(" <redacted> ");
+            cursor += identity.len();
+        } else {
+            let ch = text[cursor..].chars().next().expect("character boundary");
+            output.push(ch);
+            cursor += ch.len_utf8();
+        }
     }
-    if identities
+    output
+}
+
+fn sensitive_key_start(line: &str) -> Option<usize> {
+    let mut start = None;
+    for (index, ch) in line
+        .char_indices()
+        .chain(std::iter::once((line.len(), ' ')))
+    {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-') {
+            start.get_or_insert(index);
+        } else if let Some(start) = start.take() {
+            if is_sensitive_key(&line[start..index]) {
+                // Drop the key too, so a later publisher cannot reinterpret it
+                // together with neighboring text as another assignment.
+                return Some(start);
+            }
+        }
+    }
+    None
+}
+
+fn sensitive_key_count(text: &str) -> usize {
+    text.split(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')))
+        .filter(|key| is_sensitive_key(key))
+        .count()
+}
+
+fn is_sensitive_key(key: &str) -> bool {
+    let key = key.to_ascii_uppercase().replace('-', "_");
+    matches!(key.as_str(), "KEY" | "AUTH" | "USER" | "OWNER")
+        || key.ends_with("_ID")
+        || [
+            "SECRET",
+            "TOKEN",
+            "PASSWORD",
+            "PASSWD",
+            "CREDENTIAL",
+            "PRIVATE",
+            "API_KEY",
+            "APIKEY",
+            "ACCESS_KEY",
+            "AUTHORIZATION",
+            "BEARER",
+            "ACCOUNT",
+            "ACCT",
+            "USERNAME",
+            "USER_ID",
+            "USERID",
+            "LOGIN",
+            "EMAIL",
+            "TENANT",
+            "CLIENT_ID",
+            "CUSTOMER",
+            "SUBSCRIPTION",
+        ]
         .iter()
-        .any(|identity| identity.name.eq_ignore_ascii_case(name))
-    {
-        return;
-    }
-    identities.push(IdentityRule {
-        name: name.to_string(),
-        class,
-        replacement,
-    });
+        .any(|part| key.contains(part))
 }
 
-fn current_host_name() -> Option<String> {
-    let name = host_name_from_platform()?;
-    let name = name.trim();
-    if name.chars().count() < 3 {
-        None
-    } else {
-        Some(name.to_string())
+fn allowed_token(token: &str) -> bool {
+    if token == REDACTED {
+        return true;
     }
+    if !token.is_ascii() || token.contains(['@', '\\']) {
+        return false;
+    }
+    // Remove prose wrappers without concealing a path prefix or an IP address.
+    let unwrapped = token.trim_matches(|ch: char| {
+        ch.is_ascii_punctuation() && !matches!(ch, '_' | '-' | '/' | '~' | '.' | ':' | '@')
+    });
+    if unwrapped.starts_with(['/', '~', '.'])
+        || (unwrapped.as_bytes().get(1) == Some(&b':')
+            && unwrapped.as_bytes()[0].is_ascii_alphabetic())
+        || unwrapped
+            .trim_end_matches('.')
+            .parse::<std::net::IpAddr>()
+            .is_ok()
+    {
+        return false;
+    }
+    let core = unwrapped.trim_end_matches(['.', ':']);
+    if core.bytes().all(|byte| byte.is_ascii_digit()) {
+        return !core.is_empty() && core.len() <= 4;
+    }
+    allowed_identifier(core) || allowed_source_location(unwrapped.trim_end_matches(['.', ':']))
+}
+
+fn allowed_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 24
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+        && value.bytes().any(|byte| byte.is_ascii_alphabetic())
+        && value.bytes().filter(u8::is_ascii_digit).count() <= 4
+        && !(value.len() >= 8 && value.bytes().all(|byte| byte.is_ascii_hexdigit()))
+        && !(value.len() > 12
+            && value.bytes().any(|byte| byte.is_ascii_digit())
+            && value.bytes().any(|byte| byte.is_ascii_lowercase())
+            && value.bytes().any(|byte| byte.is_ascii_uppercase()))
+}
+
+fn allowed_source_location(value: &str) -> bool {
+    let Some((path, line)) = value.rsplit_once(':') else {
+        return false;
+    };
+    if line.is_empty()
+        || line.len() > 6
+        || !line.bytes().all(|byte| byte.is_ascii_digit())
+        || path.starts_with(['/', '\\', '~', '.'])
+        || path.contains("..")
+    {
+        return false;
+    }
+    let Some((stem, extension)) = path.rsplit_once('.') else {
+        return false;
+    };
+    if ![
+        "rs", "c", "h", "cc", "cpp", "hpp", "go", "py", "js", "jsx", "ts", "tsx", "java", "kt",
+        "swift", "sh",
+    ]
+    .contains(&extension)
+    {
+        return false;
+    }
+    stem.split('/')
+        .all(|segment| segment.split('.').all(allowed_identifier))
 }
 
 #[cfg(unix)]
 fn host_name_from_platform() -> Option<String> {
     let mut buffer = [0u8; 256];
-    // SAFETY: `buffer` is a 256-byte writable NUL-terminated region owned by this
-    // function. On success, libc writes a host name and a trailing NUL within it.
+    // SAFETY: buffer is writable for its full length; the result is read only
+    // after success and is bounded even if the platform omits a terminating NUL.
     let rc = unsafe { libc::gethostname(buffer.as_mut_ptr().cast::<libc::c_char>(), buffer.len()) };
     if rc != 0 {
         return None;
@@ -325,7 +491,6 @@ fn host_name_from_platform() -> Option<String> {
 
 #[cfg(windows)]
 fn host_name_from_platform() -> Option<String> {
-    // libc has no `gethostname` on this target. COMPUTERNAME is the process-visible host name.
     std::env::var("COMPUTERNAME").ok()
 }
 
@@ -380,7 +545,6 @@ fn finding_cause(
         .first()
         .map(|path| path.display().to_string())
         .unwrap_or_default();
-    let line = first.message.lines().next().unwrap_or("").to_string();
     Some(Cause {
         kind: wire(&severity),
         gate: gate
@@ -388,7 +552,7 @@ fn finding_cause(
             .unwrap_or_else(|| "finding".to_string()),
         location,
         message: first.message.clone(),
-        finding_line: line,
+        show_message: true,
         extra: matching.len().saturating_sub(1),
         status: String::new(),
     })
@@ -411,7 +575,7 @@ fn denial_cause(denial: &GateDenial, status: String) -> Cause {
         kind: family.clone(),
         gate: family,
         location,
-        finding_line: message.clone(),
+        show_message: true,
         message,
         extra: 0,
         status,
@@ -432,7 +596,7 @@ fn validation_cause(validation: &ValidationResult, status: String) -> Cause {
             validation.name.clone()
         },
         location: String::new(),
-        finding_line: message.lines().next().unwrap_or("").to_string(),
+        show_message: true,
         message,
         extra: 0,
         status,
@@ -444,7 +608,7 @@ fn gap_cause(gap: &SupervisorCoverageGap, status: String) -> Cause {
         kind: wire(&gap.kind),
         gate: "coverage".to_string(),
         location: String::new(),
-        finding_line: gap.message.lines().next().unwrap_or("").to_string(),
+        show_message: true,
         message: gap.message.clone(),
         extra: 0,
         status,
@@ -456,7 +620,7 @@ fn environment_cause(failure: &EnvironmentFailure, status: String) -> Cause {
         kind: wire(&failure.category),
         gate: "environment".to_string(),
         location: String::new(),
-        finding_line: failure.summary.lines().next().unwrap_or("").to_string(),
+        show_message: true,
         message: failure.summary.clone(),
         extra: 0,
         status,
@@ -474,7 +638,7 @@ fn status_cause(report: &SupervisorFinalReport) -> Cause {
         } else {
             format!("{kind}\n{}", report.remaining_risk)
         },
-        finding_line: kind,
+        show_message: false,
         extra: 0,
         status: wire(&report.status),
     }
@@ -600,7 +764,8 @@ fn render_body(
     run_id: &RunId,
     repo_root: &Path,
     cause: &Cause,
-) -> String {
+    ctx: &FeedbackRedactionContext,
+) -> FeedbackBody {
     let identity = report
         .executable
         .clone()
@@ -610,65 +775,88 @@ fn render_body(
     } else {
         cause.status.clone()
     };
-    let line = cap_chars(
-        &cause.finding_line.replace(['\r', '\n'], " "),
-        FINDING_LINE_CHARS,
-    );
+    let message = if cause.show_message {
+        &cause.message
+    } else {
+        &cause.kind
+    };
+    let line = cap_chars(message.lines().next().unwrap_or("none"), FINDING_LINE_CHARS);
     let line = if line.trim().is_empty() {
-        "none".to_string()
+        "none"
     } else {
-        line
+        line.trim_end()
     };
-    let location = if cause.location.trim().is_empty() {
-        "none".to_string()
+    let location = if cause.location.is_empty() {
+        "none"
     } else {
-        cause.location.clone()
+        &cause.location
     };
-    let mut body = String::new();
-    body.push_str("## Summary\n");
-    body.push_str(&format!(
-        "The finished run did not succeed. Failing gate or stage: {}. Finding kind: {}.\n",
-        cause.gate, cause.kind
-    ));
+    let mut body = FeedbackBody::default();
+    body.trusted("## Summary\nThe finished run did not succeed. Failing gate or stage: ");
+    body.sanitized(&cause.gate);
+    body.trusted(". Finding kind: ");
+    body.sanitized(&cause.kind);
+    body.trusted(".\n");
     if cause.extra > 0 {
-        body.push_str(&format!("Additional findings: {}.\n", cause.extra));
+        body.trusted(&format!("Additional findings: {}.\n", cause.extra));
     }
-    body.push_str("\n## Expected behavior\n");
-    body.push_str("The run finishes with a succeeded status and no failing gate or finding.\n");
-    body.push_str("\n## Actual behavior\n");
-    body.push_str(&format!("Status: {status}\n"));
-    body.push_str(&format!("Finding kind: {}\n", cause.kind));
-    body.push_str(&format!("Finding: {line}\n"));
-    body.push_str("\n## Reproduction\n");
-    body.push_str(&format!("Package version: {}\n", identity.package_version));
-    body.push_str(&format!(
-        "Source revision: {}\n",
+    body.trusted("\n## Expected behavior\nThe run finishes with a succeeded status and no failing gate or finding.\n");
+    body.trusted("\n## Actual behavior\n");
+    body.trusted(&format!("Status: {status}\n"));
+    body.trusted("Finding kind: ");
+    body.sanitized(&cause.kind);
+    body.trusted("\nFinding: ");
+    body.sanitized(line);
+    body.trusted("\n\n## Reproduction\nPackage version: ");
+    // A typed field can carry its documented format; arbitrary diagnostic text
+    // never obtains this privilege by imitating the field's label.
+    body.trusted(package_version(&identity.package_version));
+    body.trusted("\nSource revision: ");
+    body.trusted(
         identity
             .source_revision
-            .filter(|revision| !revision.trim().is_empty())
-            .unwrap_or_else(|| "unknown".to_string())
-    ));
-    body.push_str(&format!(
-        "Source state: {}\n",
+            .as_deref()
+            .filter(|revision| {
+                matches!(revision.len(), 40 | 64)
+                    && revision.bytes().all(|byte| byte.is_ascii_hexdigit())
+            })
+            .unwrap_or("unknown"),
+    );
+    body.trusted(&format!(
+        "\nSource state: {}\nPlan shape:\n",
         source_state_label(identity.source_state)
     ));
-    body.push_str("Plan shape:\n");
-    for line in plan_lines(report) {
-        body.push_str(&format!("- {line}\n"));
-    }
-    body.push_str("Usage:\n");
+    render_plan(report, ctx, &mut body);
+    body.trusted("Usage:\n");
     for line in usage_lines(report) {
-        body.push_str(&format!("- {line}\n"));
+        body.trusted(&format!("- {line}\n"));
     }
-    body.push_str("\n## Evidence\n");
-    body.push_str("Report paths:\n");
-    for path in evidence_paths(repo_root, run_id) {
-        body.push_str(&format!("- {path}\n"));
+    body.trusted("\n## Evidence\nReport paths:\n");
+    let safe_run_id = redact_feedback_text(run_id.as_str(), ctx);
+    for relative in evidence_paths(repo_root, run_id) {
+        body.trusted("- .maco/o2/runs/");
+        body.sanitized(&safe_run_id);
+        body.trusted("/");
+        body.trusted(relative);
+        body.trusted("\n");
     }
-    body.push_str(&format!("Source location: {location}\n"));
-    body.push_str("\n## Impact\n");
-    body.push_str("The finished run did not succeed, so its result cannot be treated as ready.\n");
+    body.trusted("Source location: ");
+    body.sanitized(location);
+    body.trusted("\n\n## Impact\nThe finished run did not succeed, so its result cannot be treated as ready.\n");
     body
+}
+
+fn package_version(value: &str) -> &str {
+    let components = value.split('.').collect::<Vec<_>>();
+    if components.len() == 3
+        && components.iter().all(|part| {
+            !part.is_empty() && part.len() <= 4 && part.bytes().all(|byte| byte.is_ascii_digit())
+        })
+    {
+        value
+    } else {
+        "unknown"
+    }
 }
 
 fn source_state_label(state: SourceState) -> &'static str {
@@ -679,42 +867,61 @@ fn source_state_label(state: SourceState) -> &'static str {
     }
 }
 
-fn plan_lines(report: &SupervisorFinalReport) -> Vec<String> {
+fn render_plan(
+    report: &SupervisorFinalReport,
+    ctx: &FeedbackRedactionContext,
+    body: &mut FeedbackBody,
+) {
     if let Some(profile) = report.role_economics_profile.as_ref() {
         if let Some(execution) = profile.execution.as_ref() {
             if !execution.assignment_selection_ledger.is_empty() {
-                return execution
-                    .assignment_selection_ledger
-                    .iter()
-                    .map(|entry| {
-                        format!(
-                            "role={} runtime={} model={} effort={}",
-                            entry.role.as_str(),
-                            display_opt(entry.selected_runtime.as_deref()),
-                            display_opt(entry.selected_model.as_deref()),
-                            display_opt(entry.selected_reasoning_effort.as_deref())
-                        )
-                    })
-                    .collect();
+                for entry in &execution.assignment_selection_ledger {
+                    body.trusted(&format!("- role={} runtime=", entry.role.as_str()));
+                    body.sanitized(&redact_feedback_text(
+                        display_opt(entry.selected_runtime.as_deref()),
+                        ctx,
+                    ));
+                    render_model(
+                        body,
+                        entry.selected_model.as_deref(),
+                        entry.selected_reasoning_effort.as_deref(),
+                        ctx,
+                    );
+                }
+                return;
             }
         }
         if !profile.role_models.is_empty() {
-            let runtime = runtime_wire(report.runtime);
-            return profile
-                .role_models
-                .iter()
-                .map(|(role, selection)| {
-                    format!(
-                        "role={} runtime={runtime} model={} effort={}",
-                        role.as_str(),
-                        display_opt(selection.model.as_deref()),
-                        display_opt(selection.reasoning_effort.as_deref())
-                    )
-                })
-                .collect();
+            for (role, selection) in &profile.role_models {
+                body.trusted(&format!(
+                    "- role={} runtime={}",
+                    role.as_str(),
+                    runtime_wire(report.runtime)
+                ));
+                render_model(
+                    body,
+                    selection.model.as_deref(),
+                    selection.reasoning_effort.as_deref(),
+                    ctx,
+                );
+            }
+            return;
         }
     }
-    vec![format!("runtime={}", runtime_wire(report.runtime))]
+    body.trusted(&format!("- runtime={}\n", runtime_wire(report.runtime)));
+}
+
+fn render_model(
+    body: &mut FeedbackBody,
+    model: Option<&str>,
+    effort: Option<&str>,
+    ctx: &FeedbackRedactionContext,
+) {
+    body.trusted(" model=");
+    body.sanitized(&redact_feedback_text(display_opt(model), ctx));
+    body.trusted(" effort=");
+    body.sanitized(&redact_feedback_text(display_opt(effort), ctx));
+    body.trusted("\n");
 }
 
 fn display_opt(value: Option<&str>) -> &str {
@@ -763,11 +970,8 @@ fn format_cost(value: Option<f64>) -> String {
     }
 }
 
-fn evidence_paths(repo_root: &Path, run_id: &RunId) -> Vec<String> {
-    let mut paths = vec![format!(
-        ".maco/o2/runs/{}/reports/supervisor-final.json",
-        run_id.as_str()
-    )];
+fn evidence_paths(repo_root: &Path, run_id: &RunId) -> Vec<&'static str> {
+    let mut paths = vec!["reports/supervisor-final.json"];
     let Ok(reader) = ArtifactRunReader::open(repo_root, RunArtifactFamily::Supervise, run_id)
     else {
         return paths;
@@ -777,32 +981,18 @@ fn evidence_paths(repo_root: &Path, run_id: &RunId) -> Vec<String> {
         SELECTION_LEDGER_RELATIVE,
     ] {
         if reader.read(Path::new(relative)).is_ok() {
-            paths.push(format!(".maco/o2/runs/{}/{relative}", run_id.as_str()));
+            paths.push(relative);
         }
     }
     paths
 }
 
-fn fingerprint_for(cause: &Cause, ctx: &FeedbackRedactionContext) -> String {
-    let kind = collapse_ws(&cause.kind).to_ascii_lowercase();
-    let gate = collapse_ws(&cause.gate).to_ascii_lowercase();
-    let location = normalize_fingerprint_piece(&cause.location, ctx);
-    let message = normalize_fingerprint_piece(&cause.message, ctx);
-    let material = format!("{kind}\n{gate}\n{location}\n{message}");
-    crate::artifacts::state_auth::sha256_hex(material.as_bytes())
-}
-
-fn normalize_fingerprint_piece(text: &str, ctx: &FeedbackRedactionContext) -> String {
-    let text = redact_private_keys(text, "<n>");
-    let text = redact_tokens(&text, "<n>");
-    let text = redact_secret_assignments(&text, "<n>");
-    let text = redact_emails(&text, "<n>");
-    let text = redact_ipv4(&text, "<n>");
-    let text = redact_ipv6(&text, "<n>");
-    let text = redact_paths(&text, ctx);
-    let text = redact_accounts(&text, Some("<n>"));
-    let text = replace_numbers(&text);
-    collapse_ws(&text)
+fn fingerprint_for(cause: &Cause) -> String {
+    // Cause strings have already passed the same filter used by the renderer.
+    // Normalize surviving small counters and source-line numbers as well.
+    let pieces = [&cause.kind, &cause.gate, &cause.location, &cause.message]
+        .map(|piece| collapse_ws(&replace_numbers(piece)).to_ascii_lowercase());
+    crate::artifacts::state_auth::sha256_hex(pieces.join("\n").as_bytes())
 }
 
 fn find_duplicate(
@@ -898,11 +1088,17 @@ fn discover_repo_root(repo_path: &Path) -> Result<PathBuf> {
 }
 
 fn cap_chars(text: &str, max_chars: usize) -> String {
-    if text.chars().count() <= max_chars {
-        text.to_string()
+    let Some((end, next)) = text.char_indices().nth(max_chars) else {
+        return text.to_string();
+    };
+    let prefix = &text[..end];
+    // A source location or redaction marker must not be cut into another shape.
+    let end = if next.is_whitespace() {
+        prefix.len()
     } else {
-        text.chars().take(max_chars).collect()
-    }
+        prefix.rfind(char::is_whitespace).unwrap_or(0)
+    };
+    prefix[..end].trim_end().to_string()
 }
 
 fn collapse_ws(text: &str) -> String {
@@ -920,946 +1116,6 @@ fn collapse_ws(text: &str) -> String {
         output.push(ch);
     }
     output
-}
-
-fn rewrite<F>(text: &str, mut matcher: F) -> String
-where
-    F: FnMut(&str, usize) -> Option<(usize, String)>,
-{
-    let mut output = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < text.len() {
-        if let Some((end, replacement)) = matcher(text, index) {
-            if end > index && text.is_char_boundary(end) {
-                output.push_str(&replacement);
-                index = end;
-                continue;
-            }
-        }
-        let Some(ch) = text[index..].chars().next() else {
-            break;
-        };
-        output.push(ch);
-        index += ch.len_utf8();
-    }
-    output
-}
-
-fn residual_class(text: &str, ctx: &FeedbackRedactionContext) -> Option<&'static str> {
-    if contains_private_key(text) {
-        return Some("private_key");
-    }
-    if has_span(text, match_token) {
-        return Some("token");
-    }
-    if has_raw_secret_assignment(text) {
-        return Some("secret");
-    }
-    if has_span(text, match_email) {
-        return Some("email");
-    }
-    if has_span(text, match_ipv4) {
-        return Some("ipv4");
-    }
-    if has_span(text, match_ipv6) {
-        return Some("ipv6");
-    }
-    if has_span(text, |value, index| {
-        match_absolute_path(value, index, ctx).map(|(end, _)| end)
-    }) {
-        return Some("path");
-    }
-    if has_span(text, |value, index| {
-        match_account(value, index).map(|(end, _)| end)
-    }) {
-        return Some("account_id");
-    }
-    if let Some(class) = residual_identity(text, &ctx.identities) {
-        return Some(class);
-    }
-    None
-}
-
-fn has_span<F>(text: &str, mut matcher: F) -> bool
-where
-    F: FnMut(&str, usize) -> Option<usize>,
-{
-    let mut index = 0;
-    while index < text.len() {
-        if let Some(end) = matcher(text, index) {
-            if end > index {
-                return true;
-            }
-        }
-        let Some(ch) = text[index..].chars().next() else {
-            break;
-        };
-        index += ch.len_utf8();
-    }
-    false
-}
-
-fn redact_private_keys(text: &str, replacement: &str) -> String {
-    let mut output = String::with_capacity(text.len());
-    let mut rest = text;
-    while let Some(start) = find_ascii_ignore_case(rest, "-----BEGIN ") {
-        let after_begin = start + "-----BEGIN ".len();
-        let Some(header_end) = rest[after_begin..].find("-----") else {
-            output.push_str(rest);
-            return output;
-        };
-        let header = &rest[after_begin..after_begin + header_end];
-        if !header.to_ascii_uppercase().contains("PRIVATE KEY") {
-            output.push_str(&rest[..after_begin]);
-            rest = &rest[after_begin..];
-            continue;
-        }
-        let search_from = after_begin + header_end;
-        let Some(end_rel) = find_ascii_ignore_case(&rest[search_from..], "-----END ") else {
-            output.push_str(rest);
-            return output;
-        };
-        let end_header = search_from + end_rel + "-----END ".len();
-        let Some(end_close) = rest[end_header..].find("-----") else {
-            output.push_str(rest);
-            return output;
-        };
-        output.push_str(&rest[..start]);
-        output.push_str(replacement);
-        rest = &rest[end_header + end_close + 5..];
-    }
-    output.push_str(rest);
-    output
-}
-
-fn contains_private_key(text: &str) -> bool {
-    let upper = text.to_ascii_uppercase();
-    upper.contains("-----BEGIN ") && upper.contains("PRIVATE KEY")
-}
-
-fn find_ascii_ignore_case(haystack: &str, needle: &str) -> Option<usize> {
-    haystack
-        .as_bytes()
-        .windows(needle.len())
-        .position(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
-}
-
-fn redact_tokens(text: &str, replacement: &str) -> String {
-    let replacement = replacement.to_string();
-    rewrite(text, |text, index| {
-        match_token(text, index).map(|end| (end, replacement.clone()))
-    })
-}
-
-fn match_token(text: &str, index: usize) -> Option<usize> {
-    match_jwt(text, index)
-        .or_else(|| match_aws_key(text, index))
-        .or_else(|| match_bearer(text, index))
-        .or_else(|| match_prefixed_token(text, index))
-        .or_else(|| match_hex_secret(text, index))
-        .or_else(|| match_mixed_secret(text, index))
-}
-
-fn match_jwt(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let rest = text.get(index..)?;
-    if !rest.starts_with("eyJ") {
-        return None;
-    }
-    let bytes = rest.as_bytes();
-    let mut cursor = 0;
-    for segment in 0..3 {
-        let start = cursor;
-        while cursor < bytes.len() && is_base64url(bytes[cursor]) {
-            cursor += 1;
-        }
-        if cursor - start < 3 {
-            return None;
-        }
-        if segment < 2 {
-            if cursor >= bytes.len() || bytes[cursor] != b'.' {
-                return None;
-            }
-            cursor += 1;
-        }
-    }
-    if cursor < 20 || !boundary_after(text, index + cursor) {
-        return None;
-    }
-    Some(index + cursor)
-}
-
-fn match_aws_key(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let rest = text.get(index..)?;
-    if !(rest.starts_with("AKIA") || rest.starts_with("ASIA")) {
-        return None;
-    }
-    let bytes = rest.as_bytes();
-    if bytes.len() < 20 {
-        return None;
-    }
-    if !bytes[4..20]
-        .iter()
-        .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-    {
-        return None;
-    }
-    if !boundary_after(text, index + 20) {
-        return None;
-    }
-    Some(index + 20)
-}
-
-fn match_bearer(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes().get(index..)?;
-    if bytes.len() < 6 || !bytes[..6].eq_ignore_ascii_case(b"bearer") {
-        return None;
-    }
-    if !boundary_after(text, index + 6) {
-        return None;
-    }
-    let mut cursor = 6;
-    while cursor < bytes.len() && bytes[cursor].is_ascii_whitespace() {
-        cursor += 1;
-    }
-    let start = cursor;
-    while cursor < bytes.len() && is_token_char(bytes[cursor]) {
-        cursor += 1;
-    }
-    if cursor - start < 8 {
-        return None;
-    }
-    Some(index + cursor)
-}
-
-fn match_prefixed_token(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    const PREFIXES: &[&str] = &[
-        "github_pat_",
-        "sk_live_",
-        "sk_test_",
-        "ghp_",
-        "gho_",
-        "ghu_",
-        "ghs_",
-        "ghr_",
-        "xoxb-",
-        "xoxa-",
-        "xoxp-",
-        "xoxr-",
-        "xoxs-",
-        "ya29.",
-        "sk-",
-        "AIza",
-    ];
-    let rest = text.get(index..)?;
-    let prefix = PREFIXES.iter().find(|prefix| rest.starts_with(*prefix))?;
-    let bytes = rest.as_bytes();
-    let mut cursor = prefix.len();
-    while cursor < bytes.len() && is_token_char(bytes[cursor]) {
-        cursor += 1;
-    }
-    if cursor - prefix.len() < 8 || !boundary_after(text, index + cursor) {
-        return None;
-    }
-    Some(index + cursor)
-}
-
-fn match_hex_secret(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut cursor = index;
-    while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
-        cursor += 1;
-    }
-    let len = cursor - index;
-    if len < 32 || !boundary_after(text, cursor) {
-        return None;
-    }
-    if hex_is_recorded_source_revision(text, index, cursor) {
-        return None;
-    }
-    Some(cursor)
-}
-
-/// A git digest is kept only when it is the entire recorded source-revision field.
-fn hex_is_recorded_source_revision(text: &str, start: usize, end: usize) -> bool {
-    const LABEL: &str = "Source revision: ";
-    let label = LABEL.as_bytes();
-    if start < label.len() || (end - start != 40 && end - start != 64) {
-        return false;
-    }
-    let line_start = start - label.len();
-    if text.as_bytes().get(line_start..start) != Some(label) {
-        return false;
-    }
-    if line_start > 0 && text.as_bytes()[line_start - 1] != b'\n' {
-        return false;
-    }
-    matches!(text.as_bytes().get(end), None | Some(b'\n' | b'\r'))
-}
-
-fn match_mixed_secret(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut cursor = index;
-    let mut upper = false;
-    let mut lower = false;
-    let mut digit = false;
-    while cursor < bytes.len() && is_mixed_secret_char(bytes[cursor]) {
-        let byte = bytes[cursor];
-        upper |= byte.is_ascii_uppercase();
-        lower |= byte.is_ascii_lowercase();
-        digit |= byte.is_ascii_digit();
-        cursor += 1;
-    }
-    let len = cursor - index;
-    if len >= 32 && upper && lower && digit && boundary_after(text, cursor) {
-        Some(cursor)
-    } else {
-        None
-    }
-}
-
-fn redact_secret_assignments(text: &str, replacement: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut output = String::with_capacity(text.len());
-    let mut cursor = 0;
-    while cursor < bytes.len() {
-        if matches!(bytes[cursor], b'=' | b':') && is_secret_key(trailing_key(&text[..cursor])) {
-            let mut value_start = cursor + 1;
-            while value_start < bytes.len() && bytes[value_start] == b' ' {
-                value_start += 1;
-            }
-            if value_start < bytes.len() && !bytes[value_start].is_ascii_whitespace() {
-                let value_end = secret_value_end(bytes, value_start);
-                let value = &text[value_start..value_end];
-                if !value.starts_with("<redacted:") && value != "<n>" {
-                    output.push_str(&text[cursor..value_start]);
-                    output.push_str(replacement);
-                    cursor = value_end;
-                    continue;
-                }
-            }
-        }
-        let ch = text[cursor..].chars().next().unwrap_or('\0');
-        if ch == '\0' {
-            break;
-        }
-        output.push(ch);
-        cursor += ch.len_utf8();
-    }
-    output
-}
-
-fn has_raw_secret_assignment(text: &str) -> bool {
-    redact_secret_assignments(text, "<redacted:secret>") != text
-}
-
-fn secret_value_end(bytes: &[u8], value_start: usize) -> usize {
-    let quote = bytes[value_start];
-    if quote == b'"' || quote == b'\'' {
-        let mut end = value_start + 1;
-        while end < bytes.len() && bytes[end] != quote {
-            end += 1;
-        }
-        if end < bytes.len() {
-            end + 1
-        } else {
-            end
-        }
-    } else {
-        let mut end = value_start;
-        while end < bytes.len() && !bytes[end].is_ascii_whitespace() {
-            end += 1;
-        }
-        end
-    }
-}
-
-fn trailing_key(prefix: &str) -> &str {
-    let trimmed = prefix.trim_end();
-    let start = trimmed
-        .rfind(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-' | '"' | '\'')))
-        .map(|index| {
-            index
-                + trimmed[index..]
-                    .chars()
-                    .next()
-                    .map(char::len_utf8)
-                    .unwrap_or(1)
-        })
-        .unwrap_or(0);
-    &trimmed[start..]
-}
-
-fn is_secret_key(key: &str) -> bool {
-    if key.is_empty() {
-        return false;
-    }
-    let normalized = key
-        .trim_matches(|ch: char| ch == '"' || ch == '\'' || ch.is_whitespace())
-        .to_ascii_uppercase()
-        .replace('-', "_");
-    [
-        "SECRET",
-        "TOKEN",
-        "PASSWORD",
-        "PRIVATE_KEY",
-        "API_KEY",
-        "AUTHORIZATION",
-        "BEARER",
-    ]
-    .iter()
-    .any(|word| normalized.contains(word))
-}
-
-fn redact_emails(text: &str, replacement: &str) -> String {
-    let replacement = replacement.to_string();
-    rewrite(text, |text, index| {
-        match_email(text, index).map(|end| (end, replacement.clone()))
-    })
-}
-
-fn match_email(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    let mut cursor = index;
-    if cursor >= bytes.len() || !is_email_local(bytes[cursor]) {
-        return None;
-    }
-    while cursor < bytes.len() && is_email_local(bytes[cursor]) {
-        cursor += 1;
-    }
-    if cursor >= bytes.len() || bytes[cursor] != b'@' {
-        return None;
-    }
-    cursor += 1;
-    let mut dots = 0;
-    let mut label_len = 0;
-    let domain_start = cursor;
-    while cursor < bytes.len() && is_email_domain(bytes[cursor]) {
-        if bytes[cursor] == b'.' {
-            let next = cursor + 1;
-            if next >= bytes.len() || !is_email_label_char(bytes[next]) {
-                break;
-            }
-            if label_len == 0 {
-                return None;
-            }
-            dots += 1;
-            label_len = 0;
-        } else {
-            label_len += 1;
-        }
-        cursor += 1;
-    }
-    if dots < 1 || label_len < 2 || cursor == domain_start || !boundary_after(text, cursor) {
-        return None;
-    }
-    Some(cursor)
-}
-
-fn redact_ipv4(text: &str, replacement: &str) -> String {
-    let replacement = replacement.to_string();
-    rewrite(text, |text, index| {
-        match_ipv4(text, index).map(|end| (end, replacement.clone()))
-    })
-}
-
-fn match_ipv4(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    if index >= bytes.len() || !bytes[index].is_ascii_digit() {
-        return None;
-    }
-    let mut cursor = index;
-    for part in 0..4 {
-        if part > 0 {
-            if cursor >= bytes.len() || bytes[cursor] != b'.' {
-                return None;
-            }
-            cursor += 1;
-        }
-        let start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_digit() && cursor - start < 3 {
-            cursor += 1;
-        }
-        if cursor == start {
-            return None;
-        }
-        let value = text[start..cursor].parse::<u16>().ok()?;
-        if value > 255 {
-            return None;
-        }
-    }
-    if cursor < bytes.len() && bytes[cursor].is_ascii_digit() {
-        return None;
-    }
-    if cursor < bytes.len()
-        && bytes[cursor] == b'.'
-        && bytes
-            .get(cursor + 1)
-            .is_some_and(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    if !boundary_after(text, cursor) {
-        return None;
-    }
-    Some(cursor)
-}
-
-fn redact_ipv6(text: &str, replacement: &str) -> String {
-    let replacement = replacement.to_string();
-    rewrite(text, |text, index| {
-        match_ipv6(text, index).map(|end| (end, replacement.clone()))
-    })
-}
-
-fn match_ipv6(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    let bytes = text.as_bytes();
-    if index >= bytes.len() || !(bytes[index].is_ascii_hexdigit() || bytes[index] == b':') {
-        return None;
-    }
-    let mut cursor = index;
-    let mut groups = 0usize;
-    let mut saw_compression = false;
-    let mut saw_letter = false;
-    let mut saw_group = false;
-    while cursor < bytes.len() {
-        if bytes[cursor] == b':' {
-            if cursor + 1 < bytes.len() && bytes[cursor + 1] == b':' {
-                if saw_compression {
-                    break;
-                }
-                saw_compression = true;
-                saw_group = false;
-                cursor += 2;
-                continue;
-            }
-            if !saw_group {
-                break;
-            }
-            saw_group = false;
-            cursor += 1;
-            continue;
-        }
-        if !bytes[cursor].is_ascii_hexdigit() {
-            break;
-        }
-        let start = cursor;
-        while cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() && cursor - start < 4 {
-            if bytes[cursor].is_ascii_alphabetic() {
-                saw_letter = true;
-            }
-            cursor += 1;
-        }
-        if cursor < bytes.len() && bytes[cursor].is_ascii_hexdigit() {
-            return None;
-        }
-        groups += 1;
-        saw_group = true;
-        if groups > 8 {
-            return None;
-        }
-    }
-    if cursor > index && bytes[cursor - 1] == b':' && !(cursor >= 2 && bytes[cursor - 2] == b':') {
-        cursor -= 1;
-    }
-    if cursor <= index || !boundary_after(text, cursor) {
-        return None;
-    }
-    let token = &text[index..cursor];
-    let ipv6 = token.contains("::") || groups >= 6 || (groups >= 4 && saw_letter);
-    if ipv6 {
-        Some(cursor)
-    } else {
-        None
-    }
-}
-
-fn redact_paths(text: &str, ctx: &FeedbackRedactionContext) -> String {
-    rewrite(text, |text, index| match_absolute_path(text, index, ctx))
-}
-
-fn match_absolute_path(
-    text: &str,
-    index: usize,
-    ctx: &FeedbackRedactionContext,
-) -> Option<(usize, String)> {
-    let bytes = text.as_bytes();
-    if index >= bytes.len() {
-        return None;
-    }
-    if bytes[index] == b'~' {
-        let mut cursor = index + 1;
-        if cursor < bytes.len() && bytes[cursor] == b'/' {
-            cursor += 1;
-            while cursor < bytes.len() && is_path_char(bytes[cursor]) {
-                cursor += 1;
-            }
-        }
-        cursor = strip_trailing_dot(text, index, cursor);
-        if cursor > index + 1 {
-            return Some((cursor, "<path>".to_string()));
-        }
-        return None;
-    }
-    if bytes[index].is_ascii_alphabetic()
-        && index + 2 < bytes.len()
-        && bytes[index + 1] == b':'
-        && matches!(bytes[index + 2], b'\\' | b'/')
-        && boundary_before(text, index)
-    {
-        let mut cursor = index + 3;
-        while cursor < bytes.len() && is_windows_path_char(bytes[cursor]) {
-            cursor += 1;
-        }
-        return Some((cursor, "<path>".to_string()));
-    }
-    if bytes[index] == b'\\'
-        && index + 1 < bytes.len()
-        && bytes[index + 1] == b'\\'
-        && boundary_before(text, index)
-    {
-        let mut cursor = index + 2;
-        if cursor >= bytes.len() || !is_unc_name_char(bytes[cursor]) {
-            return None;
-        }
-        while cursor < bytes.len() && is_windows_path_char(bytes[cursor]) {
-            cursor += 1;
-        }
-        cursor = strip_trailing_dot(text, index, cursor);
-        if cursor > index + 2 {
-            return Some((cursor, "<path>".to_string()));
-        }
-        return None;
-    }
-    if bytes[index] != b'/' || slash_is_url(text, index) {
-        return None;
-    }
-    if index > 0 && (bytes[index - 1].is_ascii_alphanumeric() || bytes[index - 1] == b'_') {
-        return None;
-    }
-    let mut cursor = index + 1;
-    if cursor >= bytes.len() || !is_path_char(bytes[cursor]) {
-        return None;
-    }
-    while cursor < bytes.len() && is_path_char(bytes[cursor]) {
-        cursor += 1;
-    }
-    cursor = strip_trailing_dot(text, index, cursor);
-    if cursor <= index + 1 {
-        return None;
-    }
-    let path = &text[index..cursor];
-    let replacement = repo_relative(path, &ctx.repo_root)
-        .or_else(|| home_path_replacement(path, &ctx.home_dirs))
-        .unwrap_or_else(|| "<path>".to_string());
-    Some((cursor, replacement))
-}
-
-fn home_path_replacement(path: &str, homes: &[PathBuf]) -> Option<String> {
-    let matched = homes.iter().any(|home| {
-        let Some(home) = home.to_str() else {
-            return false;
-        };
-        let home = home.trim_end_matches(['/', '\\']);
-        !home.is_empty()
-            && (path == home
-                || path.starts_with(&format!("{home}/"))
-                || path.starts_with(&format!("{home}\\")))
-    });
-    if matched {
-        Some("<path>".to_string())
-    } else {
-        None
-    }
-}
-
-fn strip_trailing_dot(text: &str, start: usize, end: usize) -> usize {
-    if end > start + 1 && text.as_bytes()[end - 1] == b'.' && text.as_bytes()[end - 2] != b'.' {
-        end - 1
-    } else {
-        end
-    }
-}
-
-fn slash_is_url(text: &str, index: usize) -> bool {
-    let bytes = text.as_bytes();
-    (index > 0 && bytes[index - 1] == b':')
-        || (index >= 2 && bytes[index - 2] == b':' && bytes[index - 1] == b'/')
-}
-
-fn repo_relative(path: &str, repo_root: &Path) -> Option<String> {
-    let repo = repo_root.to_str()?.trim_end_matches('/');
-    if repo.is_empty() {
-        return None;
-    }
-    if path == repo {
-        return Some(".".to_string());
-    }
-    let rest = path.strip_prefix(repo)?.strip_prefix('/')?;
-    if rest.is_empty() {
-        Some(".".to_string())
-    } else {
-        Some(rest.to_string())
-    }
-}
-
-fn redact_accounts(text: &str, fingerprint_replacement: Option<&str>) -> String {
-    rewrite(text, |text, index| {
-        match_account(text, index).map(|(end, label_len)| {
-            let replacement = if let Some(replacement) = fingerprint_replacement {
-                replacement.to_string()
-            } else {
-                let token_len = end - index;
-                let label = account_label(&text[index..index + label_len]);
-                format!("{label}({token_len})")
-            };
-            (end, replacement)
-        })
-    })
-}
-
-fn match_account(text: &str, index: usize) -> Option<(usize, usize)> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    const LABELS: &[&str] = &["account_id", "account-id", "accountid", "acct_id", "acct"];
-    let rest = text.get(index..)?;
-    let label = LABELS
-        .iter()
-        .find(|label| ascii_starts_with_ignore_case(rest, label))?;
-    let label_len = label.len();
-    let bytes = rest.as_bytes();
-    if let Some(end) = match_account_assignment(bytes, label_len) {
-        return Some((index + end, label_len));
-    }
-    if label_len >= bytes.len() || !is_account_char(bytes[label_len]) {
-        return None;
-    }
-    let mut cursor = label_len;
-    while cursor < bytes.len() && is_account_char(bytes[cursor]) {
-        cursor += 1;
-    }
-    if !boundary_after(text, index + cursor) {
-        return None;
-    }
-    Some((index + cursor, label_len))
-}
-
-fn match_account_assignment(bytes: &[u8], label_len: usize) -> Option<usize> {
-    let mut cursor = label_len;
-    while cursor < bytes.len() && bytes[cursor] == b' ' {
-        cursor += 1;
-    }
-    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
-        cursor += 1;
-        while cursor < bytes.len() && bytes[cursor] == b' ' {
-            cursor += 1;
-        }
-    }
-    if cursor >= bytes.len() || !matches!(bytes[cursor], b'=' | b':') {
-        return None;
-    }
-    cursor += 1;
-    while cursor < bytes.len() && bytes[cursor] == b' ' {
-        cursor += 1;
-    }
-    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
-        cursor += 1;
-    }
-    let value_start = cursor;
-    while cursor < bytes.len() && is_account_char(bytes[cursor]) {
-        cursor += 1;
-    }
-    if cursor == value_start {
-        return None;
-    }
-    if cursor < bytes.len() && matches!(bytes[cursor], b'"' | b'\'') {
-        cursor += 1;
-    }
-    Some(cursor)
-}
-
-fn ascii_starts_with_ignore_case(text: &str, prefix: &str) -> bool {
-    let bytes = text.as_bytes();
-    let prefix = prefix.as_bytes();
-    bytes.len() >= prefix.len() && bytes[..prefix.len()].eq_ignore_ascii_case(prefix)
-}
-
-fn account_label(label: &str) -> &str {
-    if label.eq_ignore_ascii_case("account_id") {
-        "account_id"
-    } else if label.eq_ignore_ascii_case("account-id") {
-        "account-id"
-    } else if label.eq_ignore_ascii_case("accountid") {
-        "accountid"
-    } else if label.eq_ignore_ascii_case("acct_id") {
-        "acct_id"
-    } else {
-        "acct"
-    }
-}
-
-fn redact_identities(text: &str, identities: &[IdentityRule]) -> String {
-    let mut ordered = identities.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|identity| std::cmp::Reverse(identity.name.len()));
-    rewrite(text, |text, index| {
-        identity_at(text, index, &ordered)
-            .map(|(end, identity)| (end, identity.replacement.to_string()))
-    })
-}
-
-fn residual_identity(text: &str, identities: &[IdentityRule]) -> Option<&'static str> {
-    let mut ordered = identities.iter().collect::<Vec<_>>();
-    ordered.sort_by_key(|identity| std::cmp::Reverse(identity.name.len()));
-    let mut index = 0;
-    while index < text.len() {
-        if let Some((_, identity)) = identity_at(text, index, &ordered) {
-            return Some(identity.class);
-        }
-        let ch = text[index..].chars().next()?;
-        index += ch.len_utf8();
-    }
-    None
-}
-
-fn identity_at<'a>(
-    text: &str,
-    index: usize,
-    identities: &[&'a IdentityRule],
-) -> Option<(usize, &'a IdentityRule)> {
-    if !boundary_before(text, index) || prev_is_dot(text, index) {
-        return None;
-    }
-    for identity in identities {
-        if is_ignored_identity(&identity.name) || identity.name.chars().count() < 3 {
-            continue;
-        }
-        let Some(len) = prefix_eq_ignore_ascii_case(&text[index..], &identity.name) else {
-            continue;
-        };
-        if boundary_after(text, index + len) {
-            return Some((index + len, identity));
-        }
-    }
-    None
-}
-
-fn prefix_eq_ignore_ascii_case(text: &str, name: &str) -> Option<usize> {
-    let mut bytes = 0;
-    let mut chars = text.chars();
-    for expected in name.chars() {
-        let actual = chars.next()?;
-        if !actual.eq_ignore_ascii_case(&expected) {
-            return None;
-        }
-        bytes += actual.len_utf8();
-    }
-    Some(bytes)
-}
-
-fn is_ignored_identity(name: &str) -> bool {
-    const WORDS: &[&str] = &[
-        "actual",
-        "additional",
-        "assignment",
-        "assignments",
-        "auditor",
-        "behavior",
-        "cannot",
-        "clean",
-        "codex",
-        "cost",
-        "count",
-        "cursor",
-        "deepseek",
-        "defect",
-        "dirty",
-        "effort",
-        "email",
-        "evidence",
-        "expected",
-        "failing",
-        "fake",
-        "feedback",
-        "final",
-        "finding",
-        "findings",
-        "finished",
-        "gate",
-        "grok",
-        "host",
-        "impact",
-        "input",
-        "json",
-        "kind",
-        "ledger",
-        "location",
-        "model",
-        "none",
-        "output",
-        "package",
-        "path",
-        "paths",
-        "plan",
-        "ready",
-        "redacted",
-        "report",
-        "reports",
-        "reproduction",
-        "researcher",
-        "result",
-        "revision",
-        "role",
-        "run",
-        "runs",
-        "selection",
-        "shape",
-        "source",
-        "stage",
-        "state",
-        "status",
-        "succeed",
-        "succeeded",
-        "supervisor",
-        "system",
-        "total",
-        "treated",
-        "unavailable",
-        "unknown",
-        "usage",
-        "usd",
-        "user",
-        "version",
-        "with",
-        "worker",
-    ];
-    WORDS.iter().any(|word| word.eq_ignore_ascii_case(name))
 }
 
 fn scrub_prose(text: &str) -> String {
@@ -1893,131 +1149,20 @@ fn scrub_prose(text: &str) -> String {
 }
 
 fn replace_numbers(text: &str) -> String {
-    let bytes = text.as_bytes();
-    let mut output = String::with_capacity(text.len());
-    let mut index = 0;
-    while index < bytes.len() {
-        if let Some(end) = match_uuid(text, index) {
-            output.push_str("<n>");
-            index = end;
-            continue;
-        }
-        if bytes[index].is_ascii_hexdigit() {
-            let start = index;
-            while index < bytes.len() && bytes[index].is_ascii_hexdigit() {
-                index += 1;
-            }
-            let token = &text[start..index];
-            if token.len() >= 8 || token.bytes().all(|byte| byte.is_ascii_digit()) {
+    let mut output = String::new();
+    let mut in_number = false;
+    for ch in text.chars() {
+        if ch.is_ascii_digit() {
+            if !in_number {
                 output.push_str("<n>");
-            } else {
-                output.push_str(token);
             }
-            continue;
+            in_number = true;
+        } else {
+            in_number = false;
+            output.push(ch);
         }
-        let ch = text[index..].chars().next().unwrap_or('\0');
-        if ch == '\0' {
-            break;
-        }
-        output.push(ch);
-        index += ch.len_utf8();
     }
     output
-}
-
-fn match_uuid(text: &str, index: usize) -> Option<usize> {
-    if !boundary_before(text, index) {
-        return None;
-    }
-    const GROUPS: [usize; 5] = [8, 4, 4, 4, 12];
-    let bytes = text.as_bytes();
-    let mut cursor = index;
-    for (group, len) in GROUPS.into_iter().enumerate() {
-        if group > 0 {
-            if bytes.get(cursor) != Some(&b'-') {
-                return None;
-            }
-            cursor += 1;
-        }
-        let end = cursor + len;
-        if end > bytes.len()
-            || !bytes[cursor..end]
-                .iter()
-                .all(|byte| byte.is_ascii_hexdigit())
-        {
-            return None;
-        }
-        cursor = end;
-    }
-    if boundary_after(text, cursor) {
-        Some(cursor)
-    } else {
-        None
-    }
-}
-
-fn boundary_before(text: &str, index: usize) -> bool {
-    index == 0
-        || !text
-            .as_bytes()
-            .get(index - 1)
-            .is_some_and(|byte| is_word_byte(*byte))
-}
-
-fn boundary_after(text: &str, index: usize) -> bool {
-    index >= text.len()
-        || !text
-            .as_bytes()
-            .get(index)
-            .is_some_and(|byte| is_word_byte(*byte))
-}
-
-fn prev_is_dot(text: &str, index: usize) -> bool {
-    index > 0 && text.as_bytes()[index - 1] == b'.'
-}
-
-fn is_word_byte(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'_'
-}
-
-fn is_token_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-}
-
-fn is_mixed_secret_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-' | b'+' | b'/' | b'=')
-}
-
-fn is_base64url(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
-}
-
-fn is_email_local(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'%' | b'+' | b'-')
-}
-
-fn is_email_domain(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-')
-}
-
-fn is_email_label_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || byte == b'-'
-}
-
-fn is_path_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b'~')
-}
-
-fn is_windows_path_char(byte: u8) -> bool {
-    is_path_char(byte) || byte == b'\\'
-}
-
-fn is_unc_name_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-')
-}
-
-fn is_account_char(byte: u8) -> bool {
-    byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-')
 }
 
 #[cfg(test)]
@@ -2202,7 +1347,7 @@ mod tests {
     fn failed_run_body_has_required_sections_and_survives_issue_redaction() {
         let (_temp, repo) = init_repo();
         let message = format!(
-            "check failed at {}/src/lib.rs:12 id run-111\nCHAT TRANSCRIPT prompt: hidden",
+            "check failed at {}/src/lib.rs:12 (src/lib.rs:12) id run-111\nCHAT TRANSCRIPT prompt: hidden",
             repo.display()
         );
         let report = failed_report(&repo, "feedback-failed", &message);
@@ -2270,130 +1415,133 @@ mod tests {
     #[test]
     fn redaction_covers_each_privacy_class() {
         let ctx = context();
-        let cases = [
+        for (input, absent) in [
             (
                 "-----BEGIN PRIVATE KEY-----\nABC\n-----END PRIVATE KEY-----",
-                "<redacted:private_key>",
                 "-----BEGIN PRIVATE KEY-----",
             ),
             (
                 "prefix ghp_abcdefghijklmnopqrstuvwxyz012345 suffix",
-                "<redacted:token>",
                 "ghp_abcdefghijklmnopqrstuvwxyz012345",
             ),
-            (
-                "API_TOKEN=supersecretvalue next",
-                "API_TOKEN=<redacted:secret> next",
-                "supersecretvalue",
-            ),
-            (
-                "mail ada@example.com today",
-                "<redacted:email>",
-                "ada@example.com",
-            ),
-            ("bind 203.0.113.9 now", "<redacted:ipv4>", "203.0.113.9"),
-            ("bind 2001:db8::1 now", "<redacted:ipv6>", "2001:db8::1"),
-            (
-                "see /var/lib/secret-file now",
-                "<path>",
-                "/var/lib/secret-file",
-            ),
-            (
-                "see /srv/repo/src/lib.rs now",
-                "src/lib.rs",
-                "/srv/repo/src/lib.rs",
-            ),
-            ("see /home/ada/notes now", "<path>", "/home/ada"),
-            ("acct_ABCDEFGHIJKLMNOP", "acct(21)", "acct_ABCDEFGHIJKLMNOP"),
-            ("operator ada ran", "<redacted:user>", "ada"),
-            ("box buildbox ran", "<redacted:host>", "buildbox"),
-        ];
-        for (input, expected, absent) in cases {
+            ("API_TOKEN=supersecretvalue next", "supersecretvalue"),
+            ("mail ada@example.com today", "ada@example.com"),
+            ("bind 203.0.113.9 now", "203.0.113.9"),
+            ("bind 2001:db8::1 now", "2001:db8::1"),
+            ("see /var/lib/secret-file now", "/var/lib/secret-file"),
+            ("see /srv/repo/src/lib.rs now", "/srv/repo/src/lib.rs"),
+            ("see /home/ada/notes now", "/home/ada"),
+            ("acct_ABCDEFGHIJKLMNOP", "acct_ABCDEFGHIJKLMNOP"),
+            ("operator ada ran", "ada"),
+            ("box buildbox ran", "buildbox"),
+        ] {
             let redacted = redact_feedback_text(input, &ctx);
-            assert!(
-                redacted.contains(expected),
-                "input {input:?} redacted to {redacted:?}, expected {expected:?}"
-            );
+            assert!(redacted.contains(REDACTED), "{input:?} -> {redacted:?}");
             assert!(!redacted.contains(absent), "{redacted}");
             ensure_redacted(&redacted, &ctx).expect("redacted text");
         }
-        let preserved = redact_feedback_text(
-            "version 9.9.9 at 12:30:00 rev 0123456789abcdef0123456789abcdef01234567",
-            &ctx,
-        );
-        assert!(preserved.contains("9.9.9"), "{preserved}");
-        assert!(preserved.contains("12:30:00"), "{preserved}");
-        assert!(
-            !preserved.contains("0123456789abcdef0123456789abcdef01234567"),
-            "{preserved}"
-        );
-        assert!(preserved.contains("<redacted:token>"), "{preserved}");
-        let revision = redact_feedback_text(
+        let spoof = redact_feedback_text(
             "Source revision: 0123456789abcdef0123456789abcdef01234567\n",
             &ctx,
         );
-        assert!(
-            revision.contains("Source revision: 0123456789abcdef0123456789abcdef01234567"),
-            "{revision}"
+        assert!(!spoof.contains("0123456789abcdef"), "{spoof}");
+        assert_eq!(
+            redact_feedback_text("The AI agent and agents failed", &ctx),
+            "The system worker and worker failed"
         );
-        ensure_redacted(&revision, &ctx).expect("recorded revision");
-        let prose = redact_feedback_text("The AI agent and agents failed", &ctx);
-        assert_eq!(prose, "The system worker and worker failed");
-        let maco = FeedbackRedactionContext::explicit(
-            PathBuf::from("/srv/repo"),
-            &["/var/lib/maco"],
-            &["maco"],
-            &["maco-campaign"],
-        );
-        let path = redact_feedback_text(
-            "path .maco/o2/runs/demo/reports/supervisor-final.json user maco host maco-campaign",
-            &maco,
-        );
-        assert!(
-            path.contains(".maco/o2/runs/demo/reports/supervisor-final.json"),
-            "{path}"
-        );
-        assert!(path.contains("<redacted:user>"), "{path}");
-        assert!(path.contains("<redacted:host>"), "{path}");
-        assert!(!path.contains("maco-campaign"), "{path}");
     }
 
     #[test]
     fn residual_scan_refuses_each_class_without_echoing_it() {
         let ctx = context();
-        let samples = [
-            (
-                "private_key",
-                "-----BEGIN PRIVATE KEY-----\nABC\n-----END PRIVATE KEY-----",
-            ),
-            ("token", "ghp_abcdefghijklmnopqrstuvwxyz012345"),
-            ("secret", "API_TOKEN=supersecretvalue"),
-            ("email", "ada@example.com"),
-            ("ipv4", "203.0.113.9"),
-            ("ipv6", "2001:db8::1"),
-            ("path", "/var/lib/secret-file"),
-            ("account_id", "acct_ABCDEFGHIJKLMNOP"),
-            ("user", "operator ada ran"),
-            ("host", "box buildbox ran"),
-        ];
-        for (class, sample) in samples {
-            let error = ensure_redacted(sample, &ctx).expect_err(class);
-            let rendered = format!("{error:#}");
-            assert!(rendered.contains(class), "{class}: {rendered}");
-            assert!(!rendered.contains("PRIVATE KEY"), "{rendered}");
-            assert!(!rendered.contains("ghp_"), "{rendered}");
-            assert!(!rendered.contains("supersecretvalue"), "{rendered}");
-            assert!(!rendered.contains("ada@example.com"), "{rendered}");
-            assert!(!rendered.contains("203.0.113.9"), "{rendered}");
-            assert!(!rendered.contains("2001:db8::1"), "{rendered}");
-            assert!(!rendered.contains("/var/lib/secret-file"), "{rendered}");
-            assert!(!rendered.contains("acct_ABCDEFGHIJKLMNOP"), "{rendered}");
-            assert!(!rendered.contains("buildbox"), "{rendered}");
-            let redacted = redact_feedback_text(sample, &ctx);
-            ensure_redacted(&redacted, &ctx).unwrap_or_else(|error| {
-                panic!("{class} still residual after redaction: {error:#} text={redacted}")
-            });
+        for sample in [
+            "-----BEGIN PRIVATE KEY-----\nABC\n-----END PRIVATE KEY-----",
+            "ghp_abcdefghijklmnopqrstuvwxyz012345",
+            "API_TOKEN=supersecretvalue",
+            "ada@example.com",
+            "203.0.113.9",
+            "2001:db8::1",
+            "/var/lib/secret-file",
+            "acct_ABCDEFGHIJKLMNOP",
+            "operator ada ran",
+            "box buildbox ran",
+        ] {
+            let error = ensure_redacted(sample, &ctx).expect_err("residual");
+            assert_eq!(
+                error.to_string(),
+                "supervise feedback refused residual free text"
+            );
+            ensure_redacted(&redact_feedback_text(sample, &ctx), &ctx).expect("filtered text");
         }
+        let mut body = FeedbackBody::default();
+        body.trusted("## Evidence\nSource revision: ");
+        // Inject an unsanitized diagnostic directly into the renderer's free
+        // field to prove the final-body check, independently of the first pass.
+        body.sanitized("a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4a1b2c3d4");
+        body.trusted("\n");
+        assert!(body.ensure_redacted(&ctx).is_err());
+    }
+
+    #[test]
+    fn identity_values_are_removed_longest_first_without_word_exemptions() {
+        let ctx = FeedbackRedactionContext::from_values([
+            "Fixture".into(),
+            "Fixture Person".into(),
+            "failed".into(),
+            "xy".into(),
+            r"C:\Users\Other Person".into(),
+        ]);
+        let text = redact_feedback_text("Fixture Person failed xy Other Person", &ctx);
+        assert_eq!(text, REDACTED);
+        let ctx = FeedbackRedactionContext::from_values(["redacted".into(), "worker".into()]);
+        let text = redact_feedback_text("agent <redacted>", &ctx);
+        assert_eq!(text, REDACTED);
+        ensure_redacted(&text, &ctx).expect("neutral prose and markers stay sanitized");
+        let ctx = FeedbackRedactionContext::from_values(["api_key".into()]);
+        let text = redact_feedback_text("check failed api_key: shortprivate", &ctx);
+        assert!(!text.contains("shortprivate"));
+        ensure_redacted(&text, &ctx).expect("identity removal cannot erase key context");
+    }
+
+    #[test]
+    fn display_caps_keep_filtered_tokens_and_character_boundaries() {
+        assert_eq!(cap_chars("check <redacted>", 12), "check");
+        assert_eq!(cap_chars("éé test", 3), "éé");
+        let message = format!("{}src/lib.rs:1234", "check ".repeat(82));
+        assert_redacted_and_published(&message, &[], &["Finding: check"]);
+    }
+
+    #[test]
+    fn default_deny_keeps_only_documented_token_shapes() {
+        let ctx = context();
+        for token in [
+            "longopaquestringabcdefghijklmnopqrstuvwxyz",
+            "a1b2c3d4",
+            "123456789012",
+            "AbCdEfGhIjKlMnOpQr12",
+            "someone@example.invalid",
+            "::1",
+            "[::1].",
+            "203.0.113.9.",
+            "/src/lib.rs:12",
+            "./src/lib.rs:12",
+            "../src/lib.rs:12",
+            "src/../lib.rs:12",
+            "~/lib.rs:12",
+            "C:/lib.rs:12",
+            r"src\lib.rs:12",
+            "src/lib.txt:12",
+            "src/lib.rs",
+            "café",
+            "src/secret/",
+            "C:",
+        ] {
+            assert_eq!(redact_feedback_text(token, &ctx), REDACTED, "{token}");
+        }
+        assert_eq!(
+            redact_feedback_text("opaqueabcdefghijklmnopqrstuvwxyz café ::1", &ctx),
+            REDACTED
+        );
     }
 
     #[test]
@@ -2589,7 +1737,7 @@ mod tests {
     fn command_redacts_process_identity_and_planted_secrets() {
         let (_temp, repo) = init_repo();
         let user = std::env::var("USER").unwrap_or_default();
-        let host = current_host_name().unwrap_or_default();
+        let host = host_name_from_platform().unwrap_or_default();
         let message = format!(
             "failed ghp_abcdefghijklmnopqrstuvwxyz012345 API_TOKEN=supersecretvalue ada@example.com 203.0.113.9 2001:db8::1 /var/lib/secret-file acct_ABCDEFGHIJKLMNOP -----BEGIN PRIVATE KEY----- ABC -----END PRIVATE KEY----- user {user} host {host} AI agent"
         );
@@ -2611,18 +1759,50 @@ mod tests {
             assert!(!body.contains(secret), "{secret} leaked:\n{body}");
         }
         assert!(
-            body.contains(".maco/o2/runs/feedback-secrets/reports/supervisor-final.json"),
+            body.contains(".maco/o2/runs/<redacted>/reports/supervisor-final.json"),
             "{body}"
         );
         assert!(body.contains("<!-- maco-feedback:"));
         assert!(!body.to_ascii_lowercase().contains("agent"));
-        if user.chars().count() >= 3 && !is_ignored_identity(&user) {
+        if !user.is_empty() {
             assert!(!body.contains(&format!("user {user}")), "{body}");
-            assert!(body.contains("<redacted:user>"), "{body}");
+            assert!(body.contains(REDACTED), "{body}");
         }
-        if host.chars().count() >= 3 && !is_ignored_identity(&host) {
+        if !host.is_empty() {
             assert!(!body.contains(&host), "{body}");
         }
+    }
+
+    fn assert_feedback_bodies(
+        repo: &Path,
+        run_id: &str,
+        absent: &[&str],
+        present: &[&str],
+    ) -> String {
+        let output = feedback(repo, run_id, FeedbackForge::Fake, false);
+        assert!(output.created, "{output:?}");
+        let returned = output.body.expect("returned body");
+        let dry = feedback(repo, run_id, FeedbackForge::Fake, true)
+            .body
+            .expect("dry-run body");
+        let created = create_feedback_issue(repo, &output.title, &returned, FeedbackForge::Fake)
+            .expect("fake issue");
+        assert!(created.created);
+        assert_eq!(
+            output.url, created.url,
+            "the fake issue must use these exact bytes"
+        );
+        for body in [&returned, &dry, &created.redacted_body] {
+            for secret in absent {
+                assert!(!body.contains(secret), "{secret} leaked in body:\n{body}");
+            }
+            for marker in present {
+                assert!(body.contains(marker), "{marker} missing:\n{body}");
+            }
+        }
+        assert_eq!(returned, dry);
+        assert_eq!(returned.as_bytes(), created.redacted_body.as_bytes());
+        returned
     }
 
     fn assert_redacted_and_published(message: &str, absent: &[&str], present: &[&str]) {
@@ -2631,71 +1811,51 @@ mod tests {
         for secret in absent {
             assert!(!redacted.contains(secret), "{secret} leaked in {redacted}");
         }
-        ensure_redacted(&redacted, &ctx)
-            .unwrap_or_else(|error| panic!("residual after redaction: {error:#} text={redacted}"));
+        ensure_redacted(&redacted, &ctx).expect("filtered text");
         let (_temp, repo) = init_repo();
         let report = failed_report(&repo, "feedback-regression", message);
         finalize(&repo, &report);
-        let published = feedback(&repo, "feedback-regression", FeedbackForge::Fake, false);
-        assert!(published.created, "{published:?}");
-        let body = published.body.expect("body");
-        for secret in absent {
-            assert!(!body.contains(secret), "{secret} leaked in body:\n{body}");
-        }
-        for marker in present {
-            assert!(body.contains(marker), "{marker} missing:\n{body}");
-        }
+        assert_feedback_bodies(&repo, "feedback-regression", absent, present);
     }
 
+    // First review: seven independent regressions, including both address shapes.
     #[test]
     fn sentence_punctuation_does_not_keep_email_or_ipv4() {
-        let message =
-            "mail ada@example.com. bind 203.0.113.9. also ada@example.net! and 198.51.100.24?";
         assert_redacted_and_published(
-            message,
+            "mail ada@example.com. bind 203.0.113.9. also ada@example.net! and 198.51.100.24?",
             &[
                 "ada@example.com",
                 "ada@example.net",
                 "203.0.113.9",
                 "198.51.100.24",
             ],
-            &["<redacted:email>", "<redacted:ipv4>"],
+            &[REDACTED],
         );
     }
 
     #[test]
     fn labeled_account_assignment_is_redacted() {
-        let message = "account_id=123456789012";
-        let redacted = redact_feedback_text(message, &context());
-        assert!(redacted.contains("account_id(23)"), "{redacted}");
-        assert!(!redacted.contains("123456789012"), "{redacted}");
-        assert_redacted_and_published(message, &["123456789012"], &["account_id("]);
+        assert_redacted_and_published("account_id=123456789012", &["123456789012"], &[REDACTED]);
     }
 
     #[test]
     fn unc_path_is_redacted() {
-        let message = r"share \\fileserver\homes\private\notes.txt";
         assert_redacted_and_published(
-            message,
+            r"share \\fileserver\homes\private\notes.txt",
             &["fileserver", "homes", "private", "notes.txt"],
-            &["<path>"],
+            &[REDACTED],
         );
-        let error = ensure_redacted(message, &context()).expect_err("unc");
-        assert!(format!("{error:#}").contains("path"), "{error:#}");
     }
 
     #[test]
     fn hex_secret_in_a_finding_is_redacted_and_source_revision_remains() {
         let secret = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        assert_eq!(secret.len(), 64);
         let mixed = "AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789AbCdEf0123456789";
-        assert_eq!(mixed.len(), 64);
-        let message = format!("digest {secret} mixed {mixed}");
         assert_redacted_and_published(
-            &message,
+            &format!("digest {secret} mixed {mixed}"),
             &[secret, mixed],
             &[
-                "<redacted:token>",
+                REDACTED,
                 "Source revision: 0123456789abcdef0123456789abcdef01234567",
             ],
         );
@@ -2703,20 +1863,18 @@ mod tests {
 
     #[test]
     fn quoted_api_key_is_redacted() {
-        let message = r#"{"api_key":"lowercase-secret-value"}"#;
-        assert_redacted_and_published(message, &["lowercase-secret-value"], &["<redacted:secret>"]);
+        assert_redacted_and_published(
+            r#"{"api_key":"lowercase-secret-value"}"#,
+            &["lowercase-secret-value"],
+            &[REDACTED],
+        );
     }
 
     #[test]
     fn unicode_finding_does_not_panic() {
         for sample in ["café", "abcd€", "bearer café", "acct café"] {
-            assert!(match_account(sample, 0).is_none(), "{sample:?}");
-            assert!(match_bearer(sample, 0).is_none(), "{sample:?}");
-            let redacted = redact_feedback_text(sample, &context());
-            ensure_redacted(&redacted, &context())
-                .unwrap_or_else(|error| panic!("{sample:?} residual: {error:#}"));
+            assert_redacted_and_published(sample, &["café", "abcd€"], &[REDACTED]);
         }
-        assert_redacted_and_published("café abcd€", &[], &["café"]);
     }
 
     #[test]
@@ -2724,21 +1882,167 @@ mod tests {
         let (_temp, repo) = init_repo();
         let first = "550e8400-e29b-41d4-a716-446655440000";
         let second = "6ba7b810-9dad-11d1-80b4-00c04fd430c8";
-        assert_eq!(
-            replace_numbers(&format!("request {first}")),
-            replace_numbers(&format!("request {second}"))
-        );
         for (run_id, uuid) in [("feedback-uuid-a", first), ("feedback-uuid-b", second)] {
             let report = failed_report(&repo, run_id, &format!("check failed request {uuid}"));
             finalize(&repo, &report);
+            assert_feedback_bodies(&repo, run_id, &[first, second], &["check failed request"]);
         }
         let left = feedback(&repo, "feedback-uuid-a", FeedbackForge::Fake, true);
         let right = feedback(&repo, "feedback-uuid-b", FeedbackForge::Fake, true);
         assert_eq!(left.fingerprint, right.fingerprint);
-        assert_ne!(left.body, right.body);
-        let left_body = left.body.expect("left");
-        let right_body = right.body.expect("right");
-        assert!(left_body.contains(first), "{left_body}");
-        assert!(right_body.contains(second), "{right_body}");
+    }
+
+    // Second review: retain each of the twelve supplied counterexamples.
+    #[test]
+    fn audit_account_tab_assignment() {
+        assert_redacted_and_published("account_id=\t123456789012", &["123456789012"], &[REDACTED]);
+    }
+
+    #[test]
+    fn audit_account_unicode_whitespace() {
+        assert_redacted_and_published(
+            "account_id=\u{a0}123456789012",
+            &["123456789012"],
+            &[REDACTED],
+        );
+    }
+
+    #[test]
+    fn audit_windows_path_space() {
+        assert_redacted_and_published(
+            r#"could not open "C:\Users\Fixture Person\confidential.txt""#,
+            &[r"Person\confidential.txt"],
+            &["could not open"],
+        );
+    }
+
+    #[test]
+    fn audit_windows_path_unicode() {
+        assert_redacted_and_published(
+            r#"could not open "C:\Users\Δelta\confidential.txt""#,
+            &[r"Δelta\confidential.txt"],
+            &["could not open"],
+        );
+    }
+
+    #[test]
+    fn audit_unc_path_space() {
+        assert_redacted_and_published(
+            r#"could not open "\\fixturebox\Private Share\confidential.txt""#,
+            &[r"Share\confidential.txt"],
+            &["could not open"],
+        );
+    }
+
+    #[test]
+    fn audit_bearer_plus() {
+        assert_redacted_and_published(
+            "request failed for Bearer abcdefgh+ijklmnopqrstuvwxyz",
+            &["ijklmnopqrstuvwxyz"],
+            &["request failed for"],
+        );
+    }
+
+    #[test]
+    fn audit_bearer_dot() {
+        assert_redacted_and_published(
+            "request failed for Bearer abcdefgh.ijklmnopqrstuvwxyz",
+            &["ijklmnopqrstuvwxyz"],
+            &["request failed for"],
+        );
+    }
+
+    #[test]
+    fn audit_source_revision_line_spoof() {
+        let (_temp, repo) = init_repo();
+        let secret = "a1b2c3d4".repeat(8);
+        let mut report = failed_report(&repo, "feedback-spoof", "check failed");
+        report.findings[0].paths = vec![PathBuf::from(format!(
+            "src/lib.rs\nSource revision: {secret}\n"
+        ))];
+        finalize(&repo, &report);
+        assert_feedback_bodies(
+            &repo,
+            "feedback-spoof",
+            &[&secret],
+            &["Source revision: 0123456789abcdef0123456789abcdef01234567"],
+        );
+    }
+
+    #[test]
+    fn audit_secret_tab_returned_body() {
+        assert_redacted_and_published(
+            "api_key:\tlowercase-secret-value",
+            &["lowercase-secret-value"],
+            &[REDACTED],
+        );
+    }
+
+    #[test]
+    fn audit_escaped_quote_returned_body() {
+        assert_redacted_and_published(
+            r#"{"api_key":"lowercase\"privatefragment"}"#,
+            &["privatefragment"],
+            &[REDACTED],
+        );
+    }
+
+    #[test]
+    #[ignore = "helper executed only with synthetic Windows-style variables"]
+    fn windows_identity_child() {
+        let ctx = FeedbackRedactionContext::from_process();
+        let sample = "check failed for operator FixturePerson";
+        assert!(!redact_feedback_text(sample, &ctx).contains("FixturePerson"));
+        let (_temp, repo) = init_repo();
+        let report = failed_report(&repo, "feedback-identity", sample);
+        finalize(&repo, &report);
+        assert_feedback_bodies(&repo, "feedback-identity", &["FixturePerson"], &[REDACTED]);
+        assert!(!redact_feedback_text("FixtureBox", &ctx).contains("FixtureBox"));
+        assert!(!redact_feedback_text(r"C:\Users\FixturePerson", &ctx).contains("FixturePerson"));
+    }
+
+    #[test]
+    fn audit_windows_username_environment() {
+        let status = Command::new(std::env::current_exe().expect("test harness"))
+            .env_clear()
+            .env("USERNAME", "FixturePerson")
+            .env("USERPROFILE", r"C:\Users\FixturePerson")
+            .env("COMPUTERNAME", "FixtureBox")
+            .args([
+                "--exact",
+                "supervise::beta_feedback::tests::windows_identity_child",
+                "--ignored",
+            ])
+            .status()
+            .expect("isolated identity test");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn audit_truncation_precedes_secret_redaction() {
+        let secret = "a1b2c3d4".repeat(8);
+        assert_redacted_and_published(
+            &format!("{} {secret}", "x".repeat(480)),
+            &[&secret[..19]],
+            &[REDACTED],
+        );
+    }
+
+    #[test]
+    fn normal_diagnostic_text_and_source_locations_survive() {
+        assert_redacted_and_published(
+            "type check failed with E0308 at src/lib.rs:12: expected 3 values, found 4.",
+            &[],
+            &["type check failed with E0308 at src/lib.rs:12: expected 3 values, found 4."],
+        );
+    }
+
+    #[test]
+    fn returned_dry_run_and_fake_created_bodies_are_identical() {
+        assert_redacted_and_published(
+            "check failed api_key:\tprivatefragment",
+            &["privatefragment"],
+            &["check failed"],
+        );
     }
 }
