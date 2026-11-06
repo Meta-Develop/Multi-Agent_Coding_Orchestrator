@@ -520,6 +520,34 @@ impl StoredAccountRegistry {
         Ok((lease, account.clone()))
     }
 
+    /// Shared lease for one complete account incarnation, whether or not it is selected.
+    /// The registry lock is released before the lease is returned.
+    pub(crate) fn acquire_complete_account_use(
+        &self,
+        provider_id: &str,
+        account_id: &str,
+    ) -> Result<(SelectedUseLease, StoredAccountMetadata)> {
+        let _process = in_process_guard()?;
+        let _registry = RegistryFileLock::acquire(&self.path)?;
+        let document = self.read_document_under_lock()?;
+        let account = document
+            .accounts
+            .iter()
+            .find(|account| account.provider_id == provider_id && account.id == account_id)
+            .ok_or_else(|| Error::UnknownAccount(account_id.to_string()))?;
+        if account.state != StoredAccountState::Complete {
+            return Err(Error::UnknownAccount(account_id.to_string()));
+        }
+        let binding = SelectedAccountBinding {
+            provider_id: account.provider_id.clone(),
+            account_id: account.id.clone(),
+            account_incarnation: account.account_incarnation.clone(),
+            selection_revision: selection_revision_for(&document, provider_id),
+        };
+        let lease = SelectedUseLease::acquire_while_registry_held(&self.path, &binding)?;
+        Ok((lease, account.clone()))
+    }
+
     fn update_account(
         &self,
         provider_id: &str,

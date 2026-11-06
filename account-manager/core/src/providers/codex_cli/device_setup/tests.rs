@@ -478,3 +478,88 @@ fn completion_preserves_vendor_file_mode_and_rejects_nonregular_or_oversized_aut
     );
     assert_eq!(fs::read(&auth).unwrap(), AUTH);
 }
+
+fn install_program(path: &std::path::Path, body: &str) {
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700)).unwrap();
+    fs::write(path, body).unwrap();
+    fs::set_permissions(path, fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+#[test]
+fn catalog_vendor_holds_the_account_use_lease() {
+    let fixture = Fixture::new();
+    let account = fixture.prepare("work");
+    fixture.seed_auth(&account);
+    fixture.complete(&account).unwrap();
+    let before = fixture.bytes();
+    let started = fixture._root.path().join("started");
+    let release = fixture._root.path().join("release");
+    let program = fixture._root.path().join("bin/codex");
+    install_program(
+        &program,
+        &format!(
+            "#!/bin/sh\n: > '{}'\nwhile [ ! -f '{}' ]; do sleep 0.05; done\nexit 0\n",
+            started.display(),
+            release.display()
+        ),
+    );
+    let registry =
+        crate::account_authority::StoredAccountRegistry::new(fixture.registry.metadata_path());
+    let denied = std::thread::scope(|scope| {
+        let started = started.clone();
+        let release = release.clone();
+        let waiter = scope.spawn(move || {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !started.exists() {
+                assert!(deadline > std::time::Instant::now(), "vendor did not start");
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            let denied = registry.begin_delete(PROVIDER_ID, "work");
+            fs::write(&release, b"go").unwrap();
+            denied
+        });
+        let _guard = crate::providers::catalog_refresh::override_vendor_program_for_test(program);
+        let output = execute(&fixture.adapter, Action::RefreshModels("work")).unwrap();
+        assert!(output.contains("model metadata is still unobserved"));
+        waiter.join().unwrap()
+    });
+    assert!(matches!(denied, Err(Error::AccountAuthorityBusy { .. })));
+    assert_eq!(fixture.bytes(), before);
+    assert_eq!(
+        fixture.registry.account(PROVIDER_ID, "work").unwrap().state,
+        StoredAccountState::Complete
+    );
+    fixture.registry.begin_delete(PROVIDER_ID, "work").unwrap();
+}
+
+#[test]
+fn catalog_with_only_missing_efforts_warns_and_stays_complete() {
+    let fixture = Fixture::new();
+    let account = fixture.prepare("work");
+    fixture.seed_auth(&account);
+    fixture.complete(&account).unwrap();
+    let program = fixture._root.path().join("bin/codex");
+    install_program(
+        &program,
+        "#!/bin/sh\numask 077\ncat > \"$CODEX_HOME/models_cache.json\" <<'EOF'\n{\"models\":[{\"slug\":\"gpt-a\"},{\"slug\":\"gpt-b\"}]}\nEOF\nexit 0\n",
+    );
+    let _guard = crate::providers::catalog_refresh::override_vendor_program_for_test(program);
+    let output = execute(&fixture.adapter, Action::RefreshModels("work")).unwrap();
+    assert!(output.contains("model metadata is still unobserved"));
+    assert!(output.contains("refresh-models work"));
+    assert!(!output.contains("Observed "));
+    let account = fixture.registry.account(PROVIDER_ID, "work").unwrap();
+    assert_eq!(account.state, StoredAccountState::Complete);
+    assert!(account.is_selected);
+    let observation =
+        crate::providers::ProviderAdapter::observe_models_for_account(&fixture.adapter, &account)
+            .unwrap();
+    assert_eq!(
+        observation.outcome,
+        crate::account_authority::ObservationOutcome::Observed
+    );
+    let models = observation.content.unwrap().models;
+    assert_eq!(models.len(), 2);
+    assert!(models.iter().all(|model| model.supported_efforts.is_none()));
+}

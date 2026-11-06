@@ -17,7 +17,7 @@ from typing import Sequence
 
 SHARDS = (
     "autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
-    "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
+    "supervise-nested-driver", "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
     "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest",
 )
 # Balance the former 2,285-second hosted job using CT101's full fixture run:
@@ -33,6 +33,16 @@ FIXTURE_MODULE_SHARDS = {
     "reaudit": "supervise-fixtures-runtime",
     "run_artifacts": "supervise-fixtures-runtime",
 }
+# Balance the former supervise-nested job (hosted about 28-39 minutes) from a
+# local three-thread run: 2,928s for the driver group and 2,962s for the
+# remainder, summed across test bodies. New assignment-execution modules stay
+# in supervise-nested.
+NESTED_DRIVER_PREFIXES = (
+    "supervise::assignment_execution::nested_driver_tests::",
+    "supervise::assignment_execution::worker_dispatch_limits_tests::",
+    "supervise::assignment_execution::isolated_worker_evidence_tests::",
+    "supervise::assignment_execution::messaging_ipc_tests::",
+)
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
     "runtime_adapter::cursor_managed_parent::tests::offline_check_failure_diagnostic_keeps_untrusted_output_private",
@@ -137,6 +147,8 @@ def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
                     owner = "supervise-decomposition"
                 elif name.startswith("supervise::assignment_execution::managed_parent_controller_tests::"):
                     owner = "supervise-parent"
+                elif any(name.startswith(prefix) for prefix in NESTED_DRIVER_PREFIXES):
+                    owner = "supervise-nested-driver"
                 elif name.startswith("supervise::assignment_execution::") and not name.startswith(
                     "supervise::assignment_execution::attached_parent_capture_tests::"
                 ):
