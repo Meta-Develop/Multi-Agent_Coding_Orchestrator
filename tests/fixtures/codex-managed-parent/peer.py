@@ -1,5 +1,6 @@
 """Deterministic offline app-server peer, executed only by Rust contained tests."""
 import datetime
+import hashlib
 import json
 import os
 import pathlib
@@ -103,6 +104,27 @@ elif payload["mode"] == "worker":
             "cwd": str(workspace), "status": "inProgress", "exitCode": None}
     event("item/started", item)
     before = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    observation = None
+    journal_cwd = str(workspace)
+    if "journal_head" in payload:
+        identity = workspace.stat()
+        observation = {"worktree": str(workspace),
+                       "worktree_identity": {"device": identity.st_dev, "file": identity.st_ino},
+                       "head_oid": payload["journal_head"], "phase": "started",
+                       "before": {}, "after": {}, "declared_paths": [path]}
+        if report["id"] == "worker":
+            observation.update(payload.get("journal_binding", {}))
+            journal_cwd = observation["worktree"]
+            if payload["case"] == "isolated-journal-identity":
+                observation["worktree_identity"]["file"] += 1
+            if payload["case"] == "isolated-journal-base":
+                observation["head_oid"] = "0" * 40
+        with open(payload["journal"], "a") as journal:
+            journal.write(json.dumps({"command": argv, "cwd": journal_cwd,
+                          "start_timestamp": before, "end_timestamp": before,
+                          "changed_paths": [], "observation": observation}) + "\n")
+            journal.flush()
+            os.fsync(journal.fileno())
     begin = time.monotonic()
     result = subprocess.run(argv, cwd=workspace, check=True)
     if payload["case"] == "isolated-overlap":
@@ -112,13 +134,18 @@ elif payload["mode"] == "worker":
         (workspace / "src/escape.rs").write_text("outside the Worker scope\n")
     elapsed = int((time.monotonic() - begin) * 1000)
     after = datetime.datetime.now(datetime.timezone.utc).isoformat()
+    entry = {"command": argv, "cwd": journal_cwd,
+             "start_timestamp": before, "end_timestamp": after, "changed_paths": [path]}
+    if observation is not None:
+        source = workspace / path
+        material = (source.stat().st_mode & 0o111).to_bytes(4, "big") + source.read_bytes()
+        entry["observation"] = {**observation, "phase": "completed",
+                                "after": {path: hashlib.sha256(material).hexdigest()}}
     with open(payload["journal"], "a") as journal:
-        journal.write(json.dumps({"command": argv, "cwd": str(workspace),
-                      "start_timestamp": before, "end_timestamp": after,
-                      "changed_paths": [path]}) + "\n")
+        journal.write(json.dumps(entry) + "\n")
         journal.flush()
         os.fsync(journal.fileno())
-    report["commands_run"] = [{"command": argv, "cwd": str(workspace),
+    report["commands_run"] = [{"command": argv, "cwd": journal_cwd,
         "exit_code": result.returncode, "status": "succeeded", "timeout_seconds": 10,
         "duration_ms": elapsed, "timed_out": False}]
     report["files_changed"] = [path]

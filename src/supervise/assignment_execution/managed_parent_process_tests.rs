@@ -6,6 +6,7 @@ pub(super) fn run(
     cancellation: &ProcessCancellation,
     template: &ExternalAgentRun,
     workers: &Mutex<Vec<WorkerReport>>,
+    journal_worktree: Option<&Path>,
 ) -> Result<ExternalAgentRun> {
     let case = case.strip_prefix("managed-cycle-process-").unwrap();
     let identity = command.agent_lifecycle.as_ref().unwrap();
@@ -18,6 +19,15 @@ pub(super) fn run(
         report = serde_json::from_slice(template.output_last_message().unwrap())?;
         assert_eq!(command.worker_journal_artifacts.len(), 1);
         payload["journal"] = json!(command.worker_journal_artifacts[0].path);
+        if case.starts_with("isolated-") {
+            payload["journal_head"] = json!(current_head_oid(&command.cwd)?.to_string());
+            if let Some(worktree) = journal_worktree {
+                let binding = crate::safe_state::DirectoryBindingGuard::bind(worktree)?;
+                payload["journal_binding"] = json!({
+                    "worktree": worktree, "worktree_identity": binding.identity(),
+                });
+            }
+        }
         payload["edit"] = json!(if identity.task_id == "worker" {
             "pub mod other;\npub fn first() -> u32 { 40 }\n"
         } else {
@@ -264,17 +274,41 @@ pub(super) fn exercise(
                 preflight.child_base_head
             );
         }
-        "isolated-rejected-review" | "isolated-collector-rejected" => {
-            if case == "isolated-collector-rejected" {
+        "isolated-rejected-review"
+        | "isolated-collector-rejected"
+        | "isolated-journal-sibling"
+        | "isolated-journal-parent"
+        | "isolated-journal-identity"
+        | "isolated-journal-base" => {
+            if case != "isolated-rejected-review" {
                 let collected = result?;
                 assert!(report_failed(&collected.attempt_report));
-                assert!(collected
-                    .attempt_report
-                    .findings
-                    .iter()
-                    .any(|finding| finding
-                        .message
-                        .contains("self-assert supervisor-owned gate correction evidence")));
+                let expected = if case == "isolated-collector-rejected" {
+                    "self-assert supervisor-owned gate correction evidence"
+                } else {
+                    "worker 'worker' journal observation is not bound to the supervisor's assigned worktree identity and base HEAD"
+                };
+                assert!(
+                    collected
+                        .attempt_report
+                        .findings
+                        .iter()
+                        .any(|finding| { finding.message.contains(expected) }),
+                    "{:?}",
+                    collected.attempt_report.findings
+                );
+                if case.starts_with("isolated-journal-") {
+                    let reports = &collected.attempt_report.worker_reports;
+                    assert_eq!(reports[0].id, "worker");
+                    assert_eq!(reports[0].status, ReviewStatus::Failed);
+                    assert_eq!(reports[1].id, "worker-two");
+                    assert_eq!(reports[1].status, ReviewStatus::Succeeded);
+                    assert!(!collected.attempt_report.findings.iter().any(|finding| {
+                        finding
+                            .message
+                            .contains("worker 'worker-two' journal observation is not bound")
+                    }));
+                }
             } else {
                 assert!(
                     format!("{:#}", result.err().context("rejected parent integrated")?)
@@ -433,6 +467,7 @@ pub(super) fn exercise(
         | "lost-response"
         | "rejected-review"
         | "isolated-happy"
+        | "isolated-observed-journals"
         | "isolated-masked-rustup"
         | "isolated-misreported-paths" => {
             let collected = result?;
@@ -465,7 +500,9 @@ pub(super) fn exercise(
             }
             assert_eq!(
                 report_failed(&collected.attempt_report),
-                case == "rejected-review"
+                case == "rejected-review",
+                "{:?}",
+                collected.attempt_report.findings
             );
             assert_eq!(collected._worker_journal_evidence.len(), 2);
             let candidate = fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?;
@@ -486,6 +523,7 @@ pub(super) fn exercise(
             assert!(worker_charges.iter().all(|charge| charge.tokens == 14));
             assert!(!outcome.usage_incomplete);
             if case.starts_with("isolated-") {
+                assert_combined_review_handoff(context, preflight, &collected)?;
                 assert_eq!(outcome.released_claims.len(), 2);
                 assert!(
                     !super::super::scheduler::nested_workers_lack_observed_usage(
@@ -531,6 +569,87 @@ pub(super) fn exercise(
             }
         }
         _ => bail!("unknown contained parent fixture case"),
+    }
+    Ok(())
+}
+
+fn assert_combined_review_handoff(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    collected: &CollectedChildAttempt<'_>,
+) -> Result<()> {
+    let mut report = collected.attempt_report.clone();
+    let candidate = super::review_handoff::capture_candidate(context, preflight, &mut report, 2)?;
+    let expected_paths = vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/other.rs")];
+    assert_eq!(candidate.changed_paths, expected_paths);
+    let transcript_path = &collected.attempt_artifacts.raw_stdout_relative;
+    let (transcript, patch, manifest) =
+        with_supervisor_artifacts(context.artifacts, |writer, _| {
+            Ok((
+                read_authenticated_review_transcript(writer, transcript_path)?,
+                String::from_utf8(writer.read_authenticated(
+                    Path::new("reports/parent.candidate.patch"),
+                    REVIEW_LENS_REQUEST_LIMIT_BYTES,
+                )?)?,
+                serde_json::from_slice::<Value>(&writer.read_authenticated(
+                    Path::new("reports/parent.candidate.json"),
+                    MAX_SUPERVISOR_REPORT_BYTES,
+                )?)?,
+            ))
+        })?;
+    assert_eq!(manifest["changed_paths"], json!(expected_paths));
+    let exact = crate::merge::capture_exact_base_worktree_with_write_lease(
+        context.repo,
+        &preflight.assignment.id,
+        &preflight.assignment.assigned_paths,
+        preflight.worktree_write_lease.as_ref().unwrap(),
+        preflight.child_base_head,
+    )?;
+    assert_eq!(
+        manifest["candidate_tree"],
+        json!(exact.snapshot_tree.to_string())
+    );
+    assert!(patch.contains("+pub fn first() -> u32 { 40 }"));
+    assert!(patch.contains("+pub fn second() -> u32 { crate::first() + 2 }"));
+    let mut bindings = supervisor_review_lens_binding_material(
+        &preflight.assignment,
+        &report,
+        Some(&candidate),
+        None,
+    )?;
+    bindings.validation_bindings["worker_execution_evidence"] =
+        with_supervisor_artifacts(context.artifacts, |writer, _| {
+            super::review_handoff::worker_evidence(writer, &collected._worker_journal_evidence)
+        })?;
+    let output = serde_json::to_string(&report)?;
+    let sources = crate::review::BoundedReviewLensRequestSources {
+        child_transcript: &transcript,
+        authoritative_transcript_path: transcript_path,
+        diff: &patch,
+        output_report: &output,
+        bindings: &bindings,
+    };
+    assert_eq!(context.plan.review_lenses.len(), 3);
+    for lens in &context.plan.review_lenses {
+        let request = crate::review::build_bounded_review_lens_request(lens, sources)?;
+        use crate::review::ReviewLensScopedInformation;
+        match request.information {
+            ReviewLensScopedInformation::BoundedFullChildTranscript {
+                diff,
+                output_report,
+                bindings: received,
+                ..
+            } => {
+                assert_eq!(diff, patch);
+                assert_eq!(output_report, output);
+                assert_eq!(received, bindings);
+            }
+            ReviewLensScopedInformation::DiffOnly { diff } => assert_eq!(diff, patch),
+            ReviewLensScopedInformation::OutputReportOnly { output_report } => {
+                assert_eq!(output_report, output);
+            }
+            other => bail!("unexpected review handoff: {other:?}"),
+        }
     }
     Ok(())
 }
@@ -582,6 +701,31 @@ fn managed_parent_process_rejected_parent_review_cannot_accept_workers() -> Resu
 fn managed_parent_process_isolated_final_sees_combined_candidate_and_complete_diagnostics(
 ) -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-happy")
+}
+
+#[test]
+fn managed_parent_process_isolated_observed_journals_reach_all_review_scopes() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-observed-journals")
+}
+
+#[test]
+fn managed_parent_process_isolated_refuses_journal_bound_to_sibling_or_parent() -> Result<()> {
+    for binding in ["sibling", "parent"] {
+        super::nested_driver_tests::driver_fixture(&format!(
+            "managed-cycle-process-isolated-journal-{binding}"
+        ))?;
+    }
+    Ok(())
+}
+
+#[test]
+fn managed_parent_process_isolated_refuses_wrong_journal_identity_or_base() -> Result<()> {
+    for binding in ["identity", "base"] {
+        super::nested_driver_tests::driver_fixture(&format!(
+            "managed-cycle-process-isolated-journal-{binding}"
+        ))?;
+    }
+    Ok(())
 }
 
 #[test]

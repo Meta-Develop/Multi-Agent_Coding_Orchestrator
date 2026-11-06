@@ -18,8 +18,9 @@ Both coordination turns attempt a source write and require the outer sandbox to
 reject it. The receipt replay case discards an acknowledgment at the peer and
 resubmits the same request; separate IPC tests cover a dropped socket response.
 
-These tests stop at final parent collection. They do not qualify provider
-executable preflight, independent review-lens dispatch, or crash recovery launches.
+These tests run final parent collection and construct all three outer review-lens
+requests from the authenticated retained candidate and report. They do not qualify
+provider executable preflight, independent review-lens dispatch, or crash recovery launches.
 
 The isolated cases bind an ordered combined candidate before the final parent
 turn. The final peer reads both edits, compiles their actual Rust functions in
@@ -30,6 +31,15 @@ Overlapping candidate edits refuse before a final parent can run. The same
 cases use explicit Worker token limits and the production host-held invocation
 receipt to check terminal claim bookkeeping and warnings against distinct,
 verified Worker budget settlements (including missing and unverified negatives).
+
+Isolated Workers record observed start/completion pairs with directory identity,
+base HEAD and content digests. Acceptance must check each against its own held
+lease. Negative cases substitute a sibling or parent binding, an incorrect inode,
+or an incorrect base; refusal restores the tentative union without committing
+either Worker. Serial shared-worktree cases retain the original journal format.
+After success, candidate capture must retain both edited paths, the exact combined
+tree and a nonempty patch; the full, diff-only and output-only review requests
+must receive the corresponding accepted candidate evidence.
 
 The final peer receives the absolute compiler in a read-only projection of the
 selected sysroot, resolved before containment. User-home rustup shims are hidden
