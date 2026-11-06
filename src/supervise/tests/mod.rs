@@ -407,6 +407,7 @@ pub(crate) fn single_parent_acceptance_review_lenses() -> Vec<ReviewLensConfig> 
         backend: ReviewLensBackendConfig::Model {
             backend_id: "openai".to_string(),
             model: DEFAULT_PROFILE_MODEL.to_string(),
+            model_provider: None,
             reasoning_effort: Some("xhigh".to_string()),
         },
         information_scope: ReviewInformationScope::FullChildTranscript,

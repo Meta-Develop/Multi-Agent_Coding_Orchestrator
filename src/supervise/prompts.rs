@@ -2035,12 +2035,12 @@ pub(super) fn apply_review_lens_model_selection(
     runtime: SupervisorRuntime,
     catalog: &RuntimeModelCatalog,
 ) -> Result<ExternalAgentCommand> {
-    let ReviewLensBackendConfig::Model {
-        backend_id, model, ..
-    } = &lens.backend
-    else {
+    let ReviewLensBackendConfig::Model { model, .. } = &lens.backend else {
         bail!("precomputed review lenses cannot be dispatched as model processes");
     };
+    // `backend_id` selects the runtime. Codex `model_provider` is a provider
+    // name, so projecting the runtime name (`codex`) fails app-server initialize.
+    let model_provider = crate::review::configured_review_lens_model_provider(lens)?;
     validate_review_lens_runtime_selection(lens, runtime, catalog)?;
     if runtime == SupervisorRuntime::Fake {
         return Ok(command
@@ -2058,7 +2058,7 @@ pub(super) fn apply_review_lens_model_selection(
         )?;
     }
     Ok(command
-        .with_model_provider((backend_id != "automatic").then(|| backend_id.clone()))
+        .with_model_provider(model_provider)
         .with_model_selection(Some(model.clone()), Some(resolved_effort.resolved)))
 }
 
@@ -3095,6 +3095,7 @@ mod regression_tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
                 model: "model-alpha".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -3104,6 +3105,7 @@ mod regression_tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
                 model: "model-beta".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
@@ -3227,16 +3229,10 @@ mod regression_tests {
                 child_worktree.path().to_path_buf()
             ]
         );
-        assert_eq!(
-            diff_command.model_provider.as_deref(),
-            Some("provider-alpha")
-        );
+        assert_eq!(diff_command.model_provider.as_deref(), None);
         assert_eq!(diff_command.model.as_deref(), Some("model-alpha"));
         assert_eq!(diff_command.reasoning_effort.as_deref(), Some("high"));
-        assert_eq!(
-            report_command.model_provider.as_deref(),
-            Some("provider-beta")
-        );
+        assert_eq!(report_command.model_provider.as_deref(), None);
         assert_eq!(report_command.model.as_deref(), Some("model-beta"));
         // Authored report_lens effort ("xhigh") precedes make_command's assignment fallback Max.
         assert_eq!(
@@ -3257,7 +3253,7 @@ mod regression_tests {
             .any(|pair| pair == ["-m", "model-alpha"]));
         assert!(diff_argv
             .iter()
-            .any(|argument| argument == "model_provider=\"provider-alpha\""));
+            .all(|argument| !argument.contains("model_provider")));
         assert!(diff_argv
             .iter()
             .any(|argument| argument == "model_reasoning_effort=\"high\""));
@@ -3266,13 +3262,140 @@ mod regression_tests {
             .any(|pair| pair == ["-m", "model-beta"]));
         assert!(report_argv
             .iter()
-            .any(|argument| argument == "model_provider=\"provider-beta\""));
+            .all(|argument| !argument.contains("model_provider")));
         assert!(
             report_argv
                 .iter()
                 .any(|argument| argument == "model_reasoning_effort=\"xhigh\""),
             "CLI reasoning effort must follow authored report lens xhigh, not fallback Max"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_lens_backend_id_is_not_a_model_provider_override() -> Result<()> {
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs([
+            FRONTIER_PROFILE_MODEL,
+        ])?);
+        let make_command = || {
+            ExternalAgentCommand::codex(
+                "codex",
+                Path::new("/tmp/review-lens-test"),
+                Path::new("/tmp/review-lens-test/prompt.md"),
+                Path::new("/tmp/review-lens-test/log.jsonl"),
+                Path::new("/tmp/review-lens-test/report.json"),
+                Duration::from_secs(30),
+            )
+        };
+        let lens_with = |backend_id: &str, model_provider: Option<&str>| ReviewLensConfig {
+            id: "parent-acceptance".to_string(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: backend_id.to_string(),
+                model: FRONTIER_PROFILE_MODEL.to_string(),
+                model_provider: model_provider.map(str::to_string),
+                reasoning_effort: Some("xhigh".to_string()),
+            },
+            information_scope: ReviewInformationScope::FullChildTranscript,
+        };
+        let argv_of = |command: &ExternalAgentCommand, app_server: bool| -> Vec<String> {
+            let argv = if app_server {
+                crate::external_agent::app_server_command_argv(command)
+            } else {
+                crate::external_agent::command_argv(command)
+            };
+            argv.into_iter()
+                .map(|argument| argument.to_string_lossy().into_owned())
+                .collect()
+        };
+        let assert_omitted = |backend_id: &str| -> Result<()> {
+            let command = apply_review_lens_model_selection(
+                make_command(),
+                &lens_with(backend_id, None),
+                None,
+                SupervisorRuntime::Codex,
+                &catalog,
+            )?;
+            assert!(command.model_provider.is_none());
+            assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
+            assert_eq!(command.reasoning_effort.as_deref(), Some("xhigh"));
+            for app_server in [false, true] {
+                let argv = argv_of(&command, app_server);
+                assert!(
+                    argv.iter()
+                        .all(|argument| !argument.contains("model_provider")),
+                    "{backend_id} app_server={app_server} argv projected a provider: {argv:?}"
+                );
+                assert!(
+                    argv.iter()
+                        .any(|argument| argument == "model_reasoning_effort=\"xhigh\""),
+                    "{backend_id} app_server={app_server} dropped the lens effort: {argv:?}"
+                );
+            }
+            let app_argv = argv_of(&command, true);
+            assert!(app_argv.windows(2).any(|pair| {
+                pair[0] == "-c" && pair[1] == format!("model=\"{FRONTIER_PROFILE_MODEL}\"")
+            }));
+            Ok(())
+        };
+        // Runtime name and a historical provider-shaped selector both stay off argv.
+        assert_omitted("codex")?;
+        assert_omitted("provider-alpha")?;
+
+        let explicit = apply_review_lens_model_selection(
+            make_command(),
+            &lens_with("codex", Some("openai")),
+            None,
+            SupervisorRuntime::Codex,
+            &catalog,
+        )?;
+        assert_eq!(explicit.model_provider.as_deref(), Some("openai"));
+        let explicit_app = argv_of(&explicit, true);
+        assert!(explicit_app
+            .iter()
+            .any(|argument| argument == "model_provider=\"openai\""));
+        assert!(explicit_app
+            .iter()
+            .all(|argument| argument != "model_provider=\"codex\""));
+        let explicit_codex = apply_review_lens_model_selection(
+            make_command(),
+            &lens_with("automatic", Some("codex")),
+            None,
+            SupervisorRuntime::Codex,
+            &catalog,
+        )?;
+        assert_eq!(explicit_codex.model_provider.as_deref(), Some("codex"));
+
+        for provider in ["", " ", "codex/provider", ".openai"] {
+            let lens = lens_with("codex", Some(provider));
+            let error = apply_review_lens_model_selection(
+                make_command(),
+                &lens,
+                None,
+                SupervisorRuntime::Codex,
+                &catalog,
+            )
+            .expect_err("unsafe explicit provider must fail closed before argv");
+            assert!(
+                error.to_string().contains("review lens model provider"),
+                "{provider}: {error:#}"
+            );
+            assert!(crate::review::validate_review_lens_set(
+                std::slice::from_ref(&lens),
+                ReviewLensCorrelation::DistinctScopes,
+            )
+            .is_err());
+        }
+
+        let fake = apply_review_lens_model_selection(
+            make_command(),
+            &lens_with("codex", Some("openai")),
+            None,
+            SupervisorRuntime::Fake,
+            &catalog,
+        )?;
+        assert!(fake.model_provider.is_none());
+        assert!(fake.model.is_none());
+        assert!(fake.reasoning_effort.is_none());
         Ok(())
     }
 
@@ -3377,6 +3500,7 @@ mod regression_tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "openai".to_string(),
                 model: "gpt-5".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::FullChildTranscript,

@@ -11,6 +11,7 @@ fn model_review_lens(
         backend: ReviewLensBackendConfig::Model {
             backend_id: backend_id.to_string(),
             model: model.to_string(),
+            model_provider: None,
             reasoning_effort: None,
         },
         information_scope,
@@ -237,6 +238,81 @@ fn review_lens_deserialized_aggregate_is_explicitly_non_authoritative() -> Resul
 }
 
 #[test]
+fn review_lens_model_provider_is_an_optional_explicit_override() {
+    let omitted = serde_json::json!({
+        "kind": "model",
+        "backend_id": "codex",
+        "model": "gpt-6.1-sol",
+        "reasoning_effort": "xhigh"
+    });
+    let backend: ReviewLensBackendConfig =
+        serde_json::from_value(omitted).expect("omitted provider must load");
+    assert_eq!(backend.backend_id(), "codex");
+    assert_eq!(backend.model_provider(), None);
+    let wire = serde_json::to_value(&backend).expect("serialize omitted provider");
+    assert!(wire.get("model_provider").is_none());
+
+    let explicit = serde_json::json!({
+        "kind": "model",
+        "backend_id": "codex",
+        "model": "gpt-6.1-sol",
+        "model_provider": "openai"
+    });
+    let backend: ReviewLensBackendConfig =
+        serde_json::from_value(explicit.clone()).expect("explicit provider must load");
+    assert_eq!(backend.model_provider(), Some("openai"));
+    assert_eq!(
+        serde_json::to_value(&backend).expect("serialize explicit provider"),
+        explicit
+    );
+    assert!(
+        serde_json::from_value::<ReviewLensBackendConfig>(serde_json::json!({
+            "kind": "precomputed",
+            "backend_id": "codex",
+            "model": "process-evidence-v1",
+            "evidence_kind": "process_evidence",
+            "model_provider": "openai"
+        }))
+        .is_err()
+    );
+}
+
+#[test]
+fn validate_review_lens_set_rejects_unsafe_model_provider() {
+    let lens = |provider: Option<&str>| ReviewLensConfig {
+        id: "parent-acceptance".to_string(),
+        backend: ReviewLensBackendConfig::Model {
+            backend_id: "codex".to_string(),
+            model: "gpt-6.1-sol".to_string(),
+            model_provider: provider.map(str::to_string),
+            reasoning_effort: Some("xhigh".to_string()),
+        },
+        information_scope: ReviewInformationScope::FullChildTranscript,
+    };
+    for provider in ["", " ", "codex/provider", ".openai"] {
+        let error = validate_review_lens_set(
+            std::slice::from_ref(&lens(Some(provider))),
+            ReviewLensCorrelation::DistinctScopes,
+        )
+        .expect_err("unsafe provider must fail closed");
+        assert!(
+            error.to_string().contains("review lens model provider"),
+            "{provider}: {error:#}"
+        );
+    }
+    validate_review_lens_set(
+        std::slice::from_ref(&lens(Some("openai"))),
+        ReviewLensCorrelation::DistinctScopes,
+    )
+    .expect("explicit identifier provider must validate");
+    validate_review_lens_set(
+        std::slice::from_ref(&lens(None)),
+        ReviewLensCorrelation::DistinctScopes,
+    )
+    .expect("omitted provider must validate");
+}
+
+#[test]
 fn review_lens_tagged_wires_reject_unknown_fields() {
     assert!(
         serde_json::from_value::<ReviewLensBackendConfig>(serde_json::json!({
@@ -410,6 +486,7 @@ fn review_lens_aggregate_omits_private_backend_configuration() -> Result<()> {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "fake-local".to_string(),
                 model: "fake-model".to_string(),
+                model_provider: None,
                 reasoning_effort: None,
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
@@ -419,6 +496,7 @@ fn review_lens_aggregate_omits_private_backend_configuration() -> Result<()> {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "external-direct".to_string(),
                 model: "external-model".to_string(),
+                model_provider: None,
                 reasoning_effort: None,
             },
             information_scope: ReviewInformationScope::DiffOnly,

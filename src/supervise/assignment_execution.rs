@@ -6773,7 +6773,9 @@ fn parent_auditor_spawn_payload(
         json!({
             "attempt": auditor_attempt,
             "review_lens_id": lens.id,
-            "backend_id": auditor_command.model_provider.as_deref(),
+            // Runtime selector. An explicit model_provider override stays on the
+            // command and must not replace this identity.
+            "backend_id": lens.backend.backend_id(),
             "model": auditor_command.model.as_deref(),
             "reasoning_effort": auditor_command.reasoning_effort.as_deref(),
             "runtime": launch_runtime,
@@ -13398,10 +13400,12 @@ mod decomposition_tests {
             assert_eq!(intake_judge.id, "parent-acceptance");
             assert_eq!(intake_judge.backend.model(), "automatic");
             let backend_id = intake_judge.backend.backend_id().to_string();
+            let model_provider = intake_judge.backend.model_provider().map(str::to_string);
             let reasoning_effort = intake_judge.backend.reasoning_effort().map(str::to_string);
             intake_judge.backend = crate::review::ReviewLensBackendConfig::Model {
                 backend_id,
                 model: "gpt-6.1-sol".to_string(),
+                model_provider,
                 reasoning_effort,
             };
             assert_eq!(intake_judge.backend.model(), "gpt-6.1-sol");
@@ -15753,6 +15757,7 @@ done
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "custom-provider".to_string(),
                 model: "custom-auditor-model".to_string(),
+                model_provider: Some("openai".to_string()),
                 reasoning_effort: Some("ultra".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
@@ -15899,8 +15904,15 @@ done
             assert_eq!(request.model, lens.backend.model());
             assert_eq!(
                 command.model_provider.as_deref(),
-                Some(lens.backend.backend_id())
+                lens.backend.model_provider()
             );
+            if lens.id == "custom-heterogeneous-lens" {
+                assert_eq!(lens.backend.backend_id(), "custom-provider");
+                assert_eq!(command.model_provider.as_deref(), Some("openai"));
+            } else {
+                assert_eq!(lens.backend.backend_id(), "openai");
+                assert!(command.model_provider.is_none());
+            }
             assert_eq!(command.model.as_deref(), Some(lens.backend.model()));
             assert_eq!(
                 command.reasoning_effort.as_deref(),

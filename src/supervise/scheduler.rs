@@ -8858,6 +8858,7 @@ mod selection_policy_tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "custom-provider".to_string(),
                 model: "custom-auditor".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("ultra".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,

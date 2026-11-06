@@ -5468,6 +5468,10 @@
                               "minLength": 1,
                               "type": "string"
                             },
+                            "model_provider": {
+                              "minLength": 1,
+                              "type": "string"
+                            },
                             "reasoning_effort": {
                               "minLength": 1,
                               "type": "string"
@@ -12589,6 +12593,10 @@
                                     "const": "model"
                                   },
                                   "model": {
+                                    "minLength": 1,
+                                    "type": "string"
+                                  },
+                                  "model_provider": {
                                     "minLength": 1,
                                     "type": "string"
                                   },

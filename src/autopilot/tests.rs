@@ -161,6 +161,7 @@ fn nondefault_test_profile() -> AutopilotProfile {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "profile-provider".to_string(),
                 model: "profile-review-model".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: crate::review::ReviewInformationScope::DiffOnly,
