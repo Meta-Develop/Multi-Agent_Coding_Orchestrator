@@ -351,12 +351,15 @@ impl SecretVault {
     }
 
     /// End-of-run: destroy injection capability and drop residual redaction copies.
+    /// Cleanup completes even if recording teardown fails.
     pub fn finish(&mut self) -> Result<(), SecretLifecycleError> {
-        self.destroy_all()?;
+        let destroy_result = self.destroy_all();
         for record in self.records.values_mut() {
+            record.state = SecretState::Destroyed;
             record.residual.clear();
             record.material = None;
         }
+        destroy_result?;
         self.ensure_audit_capacity()?;
         self.record_allowed(SecretAuditAction::Finish, None, None)
     }
